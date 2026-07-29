@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use leptos::prelude::*;
 
@@ -11,6 +11,8 @@ pub use protocol::MobileServiceAuthState;
 use protocol::types::AgentCompactNotifyPayload;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
+    CompactionObservationId, CompactionOperationId, ContextCompactionCapabilityPayload,
+    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent,
     CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
     MobileAccessErrorCode, Project, ProjectDiffScope, ProjectFileContentsPayload,
@@ -648,12 +650,24 @@ pub struct ChatMessageEntry {
     pub tool_requests: Vec<ToolRequestEntry>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PositionedCompactionMarker {
+    pub message_index: usize,
+    pub event: ContextCompactionTimelineEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSessionHistoryRequest {
+    pub request_id: protocol::HistoryPageRequestId,
+    pub before_seq: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionHistoryState {
     pub message_count: u32,
     pub oldest_seq: Option<u64>,
     pub has_more_before: bool,
-    pub loading: bool,
+    pub pending_request: Option<PendingSessionHistoryRequest>,
 }
 
 #[derive(Clone, Debug)]
@@ -914,6 +928,9 @@ pub struct AppState {
     /// patched in place. Cleared anywhere `chat_messages` is cleared
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
+    pub compaction_markers: RwSignal<HashMap<AgentRef, Vec<PositionedCompactionMarker>>>,
+    pub compaction_marker_ids:
+        RwSignal<HashMap<AgentRef, HashSet<CompactionObservationId>>>,
     /// Server-owned prior-history availability for each agent. The server
     /// sends only this indicator in `AgentBootstrap`; actual prior transcript
     /// rows are fetched explicitly with `FetchSessionHistory` and prepended
@@ -963,6 +980,13 @@ pub struct AppState {
     pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
     pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
     pub agent_compactions: RwSignal<HashMap<AgentRef, AgentCompactNotifyPayload>>,
+    pub context_compaction_operations:
+        RwSignal<HashMap<AgentRef, ContextCompactionNotifyPayload>>,
+    pub context_compaction_capabilities:
+        RwSignal<HashMap<AgentRef, ContextCompactionCapabilityPayload>>,
+    context_compaction_terminal_operations:
+        RwSignal<HashMap<AgentRef, VecDeque<(SessionId, CompactionOperationId)>>>,
+    next_history_request_id: RwSignal<u64>,
 
     // Teams
     pub teams_by_host: RwSignal<HashMap<LocalHostId, HashMap<protocol::TeamId, Team>>>,
@@ -1045,6 +1069,8 @@ impl AppState {
             agent_load_errors: RwSignal::new(HashMap::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
+            compaction_markers: RwSignal::new(HashMap::new()),
+            compaction_marker_ids: RwSignal::new(HashMap::new()),
             session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
@@ -1057,6 +1083,10 @@ impl AppState {
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
             agent_compactions: RwSignal::new(HashMap::new()),
+            context_compaction_operations: RwSignal::new(HashMap::new()),
+            context_compaction_capabilities: RwSignal::new(HashMap::new()),
+            context_compaction_terminal_operations: RwSignal::new(HashMap::new()),
+            next_history_request_id: RwSignal::new(0),
 
             teams_by_host: RwSignal::new(HashMap::new()),
             team_members_by_host: RwSignal::new(HashMap::new()),
@@ -1115,6 +1145,111 @@ impl AppState {
         self.session_history.update(|map| {
             map.remove(agent_ref);
         });
+    }
+
+    pub fn next_history_page_request_id(&self) -> protocol::HistoryPageRequestId {
+        let next = self.next_history_request_id.get_untracked();
+        self.next_history_request_id
+            .set(next.wrapping_add(1));
+        protocol::HistoryPageRequestId(format!("mobile-history-{next}"))
+    }
+
+    pub(crate) fn context_compaction_operation_is_terminal(
+        &self,
+        agent_ref: &AgentRef,
+        logical_session_id: &SessionId,
+        operation_id: &CompactionOperationId,
+    ) -> bool {
+        self.context_compaction_terminal_operations
+            .with_untracked(|operations| {
+                operations.get(agent_ref).is_some_and(|terminal| {
+                    terminal.iter().any(|(session, operation)| {
+                        session == logical_session_id && operation == operation_id
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn remember_terminal_context_compaction_operation(
+        &self,
+        agent_ref: &AgentRef,
+        logical_session_id: SessionId,
+        operation_id: CompactionOperationId,
+    ) {
+        const TERMINAL_OPERATION_LIMIT: usize = 32;
+
+        self.context_compaction_terminal_operations
+            .update(|operations| {
+                let terminal = operations.entry(agent_ref.clone()).or_default();
+                if let Some(index) = terminal.iter().position(|(session, operation)| {
+                    session == &logical_session_id && operation == &operation_id
+                }) {
+                    terminal.remove(index);
+                }
+                terminal.push_back((logical_session_id, operation_id));
+                while terminal.len() > TERMINAL_OPERATION_LIMIT {
+                    terminal.pop_front();
+                }
+            });
+    }
+
+    pub(crate) fn forget_terminal_context_compaction_operations(
+        &self,
+        agent_ref: &AgentRef,
+    ) {
+        self.context_compaction_terminal_operations
+            .update(|operations| {
+                operations.remove(agent_ref);
+            });
+    }
+
+    pub(crate) fn forget_host_terminal_context_compaction_operations(
+        &self,
+        host: &LocalHostId,
+    ) {
+        self.context_compaction_terminal_operations
+            .update(|operations| {
+                operations.retain(|agent_ref, _| agent_ref.local_host_id != *host);
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_context_compaction_operation_count(
+        &self,
+        agent_ref: &AgentRef,
+    ) -> usize {
+        self.context_compaction_terminal_operations
+            .with_untracked(|operations| operations.get(agent_ref).map_or(0, VecDeque::len))
+    }
+
+    pub fn push_context_compaction_marker(
+        &self,
+        agent_ref: &AgentRef,
+        event: ContextCompactionTimelineEvent,
+    ) -> bool {
+        let mut inserted = false;
+        self.compaction_marker_ids.update(|indexes| {
+            inserted = indexes
+                .entry(agent_ref.clone())
+                .or_default()
+                .insert(event.marker_id.clone());
+        });
+        if !inserted {
+            return false;
+        }
+        let message_index = self
+            .chat_messages
+            .with_untracked(|messages| messages.get(agent_ref).map_or(0, Vec::len));
+        self.compaction_markers.update(|markers| {
+            markers
+                .entry(agent_ref.clone())
+                .or_default()
+                .push(PositionedCompactionMarker {
+                    message_index,
+                    event,
+                });
+        });
+        true
     }
 
     pub fn push_chat_message_entry(&self, agent_ref: &AgentRef, entry: ChatMessageEntry) {
@@ -1625,6 +1760,12 @@ impl AppState {
         self.chat_message_index.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
+        self.compaction_markers.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.compaction_marker_ids.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
         self.session_history.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
@@ -1664,6 +1805,15 @@ impl AppState {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.agent_compactions.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.context_compaction_operations.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.context_compaction_capabilities.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.context_compaction_terminal_operations.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.teams_by_host.update(|m| {

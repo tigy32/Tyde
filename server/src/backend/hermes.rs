@@ -10,7 +10,8 @@ use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
     ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
-    RetryAttemptData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
+    CompactionMethod, CompactionMetrics, CompactionStage, RetryAttemptData, SelectOption,
+    SendMessageToolResponse, SessionId, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope,
     TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData,
@@ -29,10 +30,18 @@ use crate::backend::agent_control_progress::{
 };
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
-    tyde_owned_no_root_cwd,
+    Backend, BackendAcceptedCompaction, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
+    BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
+    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
+    BackendCompactionNotDispatchedReason, BackendCompactionProgress,
+    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
+    BackendContextReseatSupport, BackendEvent, BackendSession, BackendSpawnConfig,
+    BackendStartupError, EventStream, PostCompactionTokenCount, StartupMcpServer,
+    StartupMcpTransport, backend_fork_unsupported_message, render_combined_spawn_instructions,
+    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
 };
 use crate::hermes_mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
@@ -260,7 +269,10 @@ pub(crate) static TEST_HERMES_OVERRIDE_LOCK: tokio::sync::Mutex<()> =
 #[derive(Clone)]
 pub struct HermesBackend {
     command_tx: mpsc::UnboundedSender<HermesBackendCommand>,
-    session_id: SessionId,
+    session_id: Arc<std::sync::Mutex<SessionId>>,
+    compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
+    active_compaction:
+        Arc<std::sync::Mutex<Option<(protocol::CompactionOperationId, std::time::Instant)>>>,
 }
 
 enum HermesBackendCommand {
@@ -271,6 +283,10 @@ enum HermesBackendCommand {
     ),
     SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
+    Compact(
+        BackendCompactionRequest,
+        oneshot::Sender<BackendCompactionStart>,
+    ),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -279,15 +295,37 @@ struct HermesGatewayHandle {
     tx: mpsc::UnboundedSender<HermesGatewayCommand>,
     request_timeout: Duration,
     system_overlay_installed: bool,
+    provider_version: Option<String>,
 }
 
 enum HermesGatewayCommand {
     Request {
         method: String,
         params: Value,
-        reply: oneshot::Sender<Result<Value, String>>,
+        reply: oneshot::Sender<Result<Value, HermesRpcError>>,
+        dispatched: Option<oneshot::Sender<Result<(), HermesRpcError>>>,
     },
     Shutdown(oneshot::Sender<()>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HermesRpcError {
+    code: Option<i64>,
+    message: String,
+}
+
+enum HermesDispatchError {
+    NotSent,
+    Uncertain(HermesRpcError),
+}
+
+impl std::fmt::Display for HermesRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(formatter, "Hermes JSON-RPC error {code}: {}", self.message),
+            None => formatter.write_str(&self.message),
+        }
+    }
 }
 
 enum HermesGatewayInbound {
@@ -315,6 +353,7 @@ struct HermesSpawnTarget {
     cwd: Option<String>,
     remote_host: Option<String>,
     display_program: String,
+    provider_version: Option<String>,
 }
 
 struct HermesMcpRuntime {
@@ -365,6 +404,218 @@ struct HermesVersionOutput {
     stderr: String,
 }
 
+fn hermes_compaction_capability(version: Option<&str>) -> BackendCompactionCapability {
+    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::VersionUnavailable,
+            None,
+            BackendCompactionCapabilityEvidence::None,
+        );
+    };
+    let evidence = BackendCompactionCapabilityEvidence::HermesLocalGatewayProbe {
+        version: version.to_string(),
+    };
+    let normalized = version.split_whitespace().rev().find_map(|part| {
+        let part = part.trim_start_matches('v');
+        (part.split('.').count() >= 3
+            && part
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.'))
+        .then(|| part.to_string())
+    });
+    if normalized.as_deref() == Some("0.17.0") {
+        BackendCompactionCapability::native(
+            BackendCompactionMechanism::JsonRpcRequest,
+            normalized,
+            BackendCompactionProtocolConfidence::Verified,
+            BackendContextReseatSupport::PreservedByNative,
+            evidence,
+        )
+    } else {
+        BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+            normalized.or_else(|| Some(version.to_string())),
+            evidence,
+        )
+    }
+}
+
+fn hermes_compaction_pre_dispatch(
+    capability: &BackendCompactionCapability,
+    transcript_authoritative: bool,
+) -> Option<BackendCompactionStart> {
+    if !transcript_authoritative {
+        return Some(BackendCompactionStart::NotDispatched {
+            reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+            ),
+            fallback_safe: true,
+        });
+    }
+    crate::backend::compaction::not_dispatched_for_capability(capability)
+}
+
+fn hermes_dispatch_uncertain_result(
+    operation_id: protocol::CompactionOperationId,
+    live_session_id: String,
+    stored_session_id: SessionId,
+    error: HermesRpcError,
+) -> BackendCompactionResult {
+    BackendCompactionResult {
+        operation_id,
+        dispatch: BackendCompactionDispatchState::MayHaveReachedProvider,
+        mutation: BackendCompactionMutationState::MayHaveMutated,
+        outcome: Err(BackendCompactionFailure {
+            kind: BackendCompactionFailureKind::TransportClosed,
+            message: error.to_string(),
+        }),
+        provider_session_id: Some(stored_session_id.clone()),
+        metrics: CompactionMetrics::default(),
+        post_context_tokens: PostCompactionTokenCount::Unknown,
+        evidence: BackendCompactionTerminalEvidence::Hermes {
+            live_session_id,
+            stored_session_id: stored_session_id.0,
+            response_status: None,
+            rpc_code: error.code,
+        },
+    }
+}
+
+fn classify_hermes_compaction_response(
+    operation_id: protocol::CompactionOperationId,
+    live_session_id: String,
+    stored_before: SessionId,
+    response: Result<Value, HermesRpcError>,
+    stored_session_id: &Arc<std::sync::Mutex<SessionId>>,
+    compaction_capability: &Arc<std::sync::Mutex<BackendCompactionCapability>>,
+) -> BackendCompactionResult {
+    match response {
+        Ok(value) => {
+            let status = optional_string(&value, &["status"]);
+            let info = value.get("info").filter(|info| info.is_object());
+            let new_stored = info
+                .and_then(|info| {
+                    optional_string_any(info, &["resumed", "session_key", "stored_session_id"])
+                })
+                .or_else(|| {
+                    optional_string_any(
+                        &value,
+                        &["resumed", "session_key", "stored_session_id"],
+                    )
+                })
+                .map(SessionId)
+                .unwrap_or_else(|| stored_before.clone());
+            let metrics = CompactionMetrics {
+                before_tokens: value.get("before_tokens").and_then(Value::as_u64),
+                after_tokens: value.get("after_tokens").and_then(Value::as_u64),
+                before_messages: value.get("before_messages").and_then(Value::as_u64),
+                after_messages: value.get("after_messages").and_then(Value::as_u64),
+                messages_summarized: value
+                    .get("removed")
+                    .or_else(|| value.get("messages_summarized"))
+                    .and_then(Value::as_u64),
+                duration_ms: value.get("duration_ms").and_then(Value::as_u64),
+                precomputed: value.get("precomputed").and_then(Value::as_bool),
+                ..CompactionMetrics::default()
+            };
+            let completed = status.as_deref() == Some("compressed")
+                && metrics.before_tokens.is_some()
+                && metrics.after_tokens.is_some()
+                && metrics.before_messages.is_some()
+                && metrics.after_messages.is_some();
+            if completed {
+                *stored_session_id
+                    .lock()
+                    .expect("Hermes stored session id mutex poisoned") = new_stored.clone();
+            }
+            BackendCompactionResult {
+                operation_id,
+                dispatch: BackendCompactionDispatchState::Accepted,
+                mutation: if completed {
+                    BackendCompactionMutationState::Completed
+                } else {
+                    BackendCompactionMutationState::MayHaveMutated
+                },
+                outcome: if completed {
+                    Ok(BackendCompactionSuccess {
+                        mechanism: CompactionMethod::NativeRpc,
+                    })
+                } else {
+                    Err(BackendCompactionFailure {
+                        kind: BackendCompactionFailureKind::ProtocolViolation,
+                        message: format!(
+                            "Hermes session.compress returned an unvalidated terminal response (status {:?})",
+                            status,
+                        ),
+                    })
+                },
+                provider_session_id: Some(new_stored.clone()),
+                post_context_tokens: metrics
+                    .after_tokens
+                    .map(PostCompactionTokenCount::Trusted)
+                    .unwrap_or(PostCompactionTokenCount::Unknown),
+                metrics,
+                evidence: BackendCompactionTerminalEvidence::Hermes {
+                    live_session_id,
+                    stored_session_id: new_stored.0,
+                    response_status: status,
+                    rpc_code: None,
+                },
+            }
+        }
+        Err(error) => {
+            if error.code == Some(-32601) {
+                let previous = compaction_capability
+                    .lock()
+                    .expect("Hermes compaction capability mutex poisoned")
+                    .clone();
+                *compaction_capability
+                    .lock()
+                    .expect("Hermes compaction capability mutex poisoned") =
+                    BackendCompactionCapability::unknown(
+                        BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+                        previous.provider_version,
+                        previous.evidence,
+                    );
+            }
+            BackendCompactionResult {
+                operation_id,
+                dispatch: if error.code.is_some() {
+                    BackendCompactionDispatchState::Accepted
+                } else {
+                    BackendCompactionDispatchState::MayHaveReachedProvider
+                },
+                mutation: if matches!(error.code, Some(4009) | Some(-32601)) {
+                    BackendCompactionMutationState::NotObserved
+                } else {
+                    BackendCompactionMutationState::MayHaveMutated
+                },
+                outcome: Err(BackendCompactionFailure {
+                    kind: if error.message.contains("timed out") {
+                        BackendCompactionFailureKind::TimedOut
+                    } else if matches!(error.code, Some(-32601) | Some(4009)) {
+                        BackendCompactionFailureKind::ProviderRejected
+                    } else if error.code.is_some() {
+                        BackendCompactionFailureKind::ProviderFailed
+                    } else {
+                        BackendCompactionFailureKind::TransportClosed
+                    },
+                    message: error.to_string(),
+                }),
+                provider_session_id: Some(stored_before.clone()),
+                metrics: CompactionMetrics::default(),
+                post_context_tokens: PostCompactionTokenCount::Unknown,
+                evidence: BackendCompactionTerminalEvidence::Hermes {
+                    live_session_id,
+                    stored_session_id: stored_before.0,
+                    response_status: None,
+                    rpc_code: error.code,
+                },
+            }
+        }
+    }
+}
+
 struct HermesSessionIds {
     live_session_id: String,
     stored_session_id: SessionId,
@@ -374,7 +625,11 @@ struct HermesSessionActor {
     gateway: HermesGatewayHandle,
     live_session_id: String,
     mapper: HermesEventMapper,
-    events_tx: mpsc::UnboundedSender<ChatEvent>,
+    events_tx: mpsc::UnboundedSender<BackendEvent>,
+    stored_session_id: Arc<std::sync::Mutex<SessionId>>,
+    compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
+    active_compaction:
+        Arc<std::sync::Mutex<Option<(protocol::CompactionOperationId, std::time::Instant)>>>,
     command_rx: mpsc::UnboundedReceiver<HermesBackendCommand>,
     gateway_events_rx: mpsc::UnboundedReceiver<HermesGatewayEvent>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
@@ -568,11 +823,20 @@ impl Backend for HermesBackend {
         if let Some(notice) = dropped_skills_notice {
             let _ = events_tx.send(ChatEvent::MessageAdded(warning_message(notice)));
         }
+
+        let stored_session_id = Arc::new(std::sync::Mutex::new(ids.stored_session_id));
+        let compaction_capability = Arc::new(std::sync::Mutex::new(
+            hermes_compaction_capability(gateway.provider_version.as_deref()),
+        ));
+        let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
             live_session_id: ids.live_session_id.clone(),
             mapper: HermesEventMapper::default(),
             events_tx,
+            stored_session_id: Arc::clone(&stored_session_id),
+            compaction_capability: Arc::clone(&compaction_capability),
+            active_compaction: Arc::clone(&active_compaction),
             command_rx,
             gateway_events_rx,
             subagent_emitter: None,
@@ -584,9 +848,11 @@ impl Backend for HermesBackend {
         Ok((
             Self {
                 command_tx,
-                session_id: ids.stored_session_id,
+                session_id: stored_session_id,
+                compaction_capability,
+                active_compaction,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -650,7 +916,11 @@ impl Backend for HermesBackend {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (resume_replay_complete_tx, resume_replay_complete_rx) = oneshot::channel();
-        let stored_session_id = SessionId(resumed);
+        let stored_session_id = Arc::new(std::sync::Mutex::new(SessionId(resumed)));
+        let compaction_capability = Arc::new(std::sync::Mutex::new(
+            hermes_compaction_capability(gateway.provider_version.as_deref()),
+        ));
+        let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
             live_session_id,
@@ -659,6 +929,9 @@ impl Backend for HermesBackend {
                 ..HermesEventMapper::default()
             },
             events_tx,
+            stored_session_id: Arc::clone(&stored_session_id),
+            compaction_capability: Arc::clone(&compaction_capability),
+            active_compaction: Arc::clone(&active_compaction),
             command_rx,
             gateway_events_rx,
             subagent_emitter: None,
@@ -675,8 +948,13 @@ impl Backend for HermesBackend {
             Self {
                 command_tx,
                 session_id: stored_session_id,
+                compaction_capability,
+                active_compaction,
             },
-            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            EventStream::new_backend_with_resume_replay_barrier(
+                events_rx,
+                resume_replay_complete_rx,
+            ),
         ))
     }
 
@@ -711,7 +989,75 @@ impl Backend for HermesBackend {
     }
 
     fn session_id(&self) -> SessionId {
-        self.session_id.clone()
+        self.session_id
+            .lock()
+            .expect("Hermes stored session id mutex poisoned")
+            .clone()
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.compaction_capability
+            .lock()
+            .expect("Hermes compaction capability mutex poisoned")
+            .clone()
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        let capability = self
+            .compaction_capability
+            .lock()
+            .expect("Hermes compaction capability mutex poisoned")
+            .clone();
+        if let Some(start) =
+            hermes_compaction_pre_dispatch(&capability, request.transcript_authoritative)
+        {
+            return start;
+        }
+        if self
+            .active_compaction
+            .lock()
+            .expect("Hermes active compaction mutex poisoned")
+            .is_some()
+        {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+            };
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(HermesBackendCommand::Compact(request, reply_tx))
+            .is_err()
+        {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                fallback_safe: false,
+            };
+        }
+        reply_rx.await.unwrap_or(BackendCompactionStart::NotDispatched {
+            reason: BackendCompactionNotDispatchedReason::BackendClosed,
+            fallback_safe: false,
+        })
+    }
+
+    async fn install_continuation_context(
+        &self,
+        context: crate::backend::BackendContinuationContext,
+    ) -> crate::backend::BackendContextReseatResult {
+        let status = |items: &[crate::backend::BackendContinuationItem]| {
+            if items.is_empty() {
+                crate::backend::ContinuationInstallStatus::NotRequired
+            } else {
+                crate::backend::ContinuationInstallStatus::PreservedByNative
+            }
+        };
+        crate::backend::BackendContextReseatResult {
+            required: status(&context.required),
+            advisory: status(&context.advisory),
+        }
     }
 
     async fn send(&self, input: AgentInput) -> bool {
@@ -1458,6 +1804,136 @@ fn model_summary_from_payload(value: &Value) -> Option<String> {
 }
 
 impl HermesSessionActor {
+    async fn handle_compaction(
+        &mut self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        // Transcript authority is the first guard by contract: an exact
+        // provider version must not bypass an unsafe replay source.
+        if !request.transcript_authoritative {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+                ),
+                fallback_safe: true,
+            };
+        }
+        if self
+            .active_compaction
+            .lock()
+            .expect("Hermes active compaction mutex poisoned")
+            .is_some()
+        {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+            };
+        }
+        if self.mapper.current_message_id.is_some()
+            || self.mapper.current_reasoning_seen
+            || !self.mapper.pending_tools.is_empty()
+            || self.mapper.pending_approval_tool_id.is_some()
+            || self.mapper.awaiting_interrupted_complete
+        {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::ActiveTurn,
+            };
+        }
+        if !self.mapper.background_tasks.is_empty() || !self.native_subagents.is_empty() {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::BackgroundMutationActive,
+            };
+        }
+
+        let (terminal_tx, terminal) = oneshot::channel();
+        let operation_id = request.operation_id.clone();
+        let live_session_id = self.live_session_id.clone();
+        let stored_before = self
+            .stored_session_id
+            .lock()
+            .expect("Hermes stored session id mutex poisoned")
+            .clone();
+        let gateway = self.gateway.clone();
+        let focus = request.focus.clone();
+        self.emit_compaction_progress(&operation_id, CompactionStage::Dispatching);
+        let mut params = json!({ "session_id": live_session_id.clone() });
+        if let Some(focus) = focus.filter(|focus| !focus.trim().is_empty()) {
+            params["focus_topic"] = Value::String(focus);
+        }
+        let response = match gateway.dispatch_request("session.compress", params).await {
+            Ok(response) => response,
+            Err(HermesDispatchError::NotSent) => {
+                return BackendCompactionStart::NotDispatched {
+                    reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                    fallback_safe: false,
+                };
+            }
+            Err(HermesDispatchError::Uncertain(error)) => {
+                let result = hermes_dispatch_uncertain_result(
+                    operation_id,
+                    live_session_id,
+                    stored_before,
+                    error,
+                );
+                return BackendCompactionStart::DispatchUncertain(result);
+            }
+        };
+        *self
+            .active_compaction
+            .lock()
+            .expect("Hermes active compaction mutex poisoned") =
+            Some((operation_id.clone(), std::time::Instant::now()));
+        let stored_session_id = Arc::clone(&self.stored_session_id);
+        let compaction_capability = Arc::clone(&self.compaction_capability);
+        let active_compaction = Arc::clone(&self.active_compaction);
+        let events_tx = self.events_tx.clone();
+        let terminal_operation_id = operation_id.clone();
+        tokio::spawn(async move {
+            let response = response.await.unwrap_or_else(|_| {
+                Err(HermesRpcError {
+                    code: None,
+                    message: "Hermes response channel closed during session.compress".to_string(),
+                })
+            });
+            let _ = events_tx.send(BackendEvent::Compaction(
+                BackendCompactionEvent::Progress(BackendCompactionProgress {
+                    operation_id: terminal_operation_id.clone(),
+                    stage: CompactionStage::Finalizing,
+                    elapsed_ms: None,
+                }),
+            ));
+            let result = classify_hermes_compaction_response(
+                terminal_operation_id,
+                live_session_id,
+                stored_before,
+                response,
+                &stored_session_id,
+                &compaction_capability,
+            );
+            *active_compaction
+                .lock()
+                .expect("Hermes active compaction mutex poisoned") = None;
+            let _ = terminal_tx.send(result);
+        });
+        BackendCompactionStart::Accepted(BackendAcceptedCompaction {
+            operation_id,
+            terminal,
+        })
+    }
+
+    fn emit_compaction_progress(
+        &self,
+        operation_id: &protocol::CompactionOperationId,
+        stage: CompactionStage,
+    ) {
+        let _ = self.events_tx.send(BackendEvent::Compaction(
+            BackendCompactionEvent::Progress(BackendCompactionProgress {
+                operation_id: operation_id.clone(),
+                stage,
+                elapsed_ms: None,
+            }),
+        ));
+    }
+
     async fn run(
         mut self,
         initial_input: Option<protocol::SendMessagePayload>,
@@ -1466,7 +1942,7 @@ impl HermesSessionActor {
     ) {
         if let Some((events, barrier)) = replay {
             for event in events {
-                if self.events_tx.send(event).is_err() {
+                if self.events_tx.send(BackendEvent::Chat(event)).is_err() {
                     let _ = barrier.send(());
                     self.gateway.shutdown().await;
                     return;
@@ -1513,6 +1989,10 @@ impl HermesSessionActor {
                         HermesBackendCommand::Interrupt(reply) => {
                             let ok = self.handle_interrupt().await;
                             let _ = reply.send(ok);
+                        }
+                        HermesBackendCommand::Compact(request, reply) => {
+                            let start = self.handle_compaction(request).await;
+                            let _ = reply.send(start);
                         }
                         HermesBackendCommand::Shutdown(reply) => {
                             self.drain_background_tasks();
@@ -1785,6 +2265,29 @@ impl HermesSessionActor {
                 if !event_targets_session(session_id.as_deref(), &self.live_session_id) {
                     return true;
                 }
+                if event_type == "status"
+                    && payload
+                        .as_ref()
+                        .and_then(|value| optional_string(value, &["status", "state"]))
+                        .as_deref()
+                        == Some("compressing")
+                {
+                    let active = self
+                        .active_compaction
+                        .lock()
+                        .expect("Hermes active compaction mutex poisoned")
+                        .clone();
+                    if let Some((operation_id, started_at)) = active {
+                        let _ = self.events_tx.send(BackendEvent::Compaction(
+                            BackendCompactionEvent::Progress(BackendCompactionProgress {
+                                operation_id,
+                                stage: CompactionStage::Compacting,
+                                elapsed_ms: Some(started_at.elapsed().as_millis() as u64),
+                            }),
+                        ));
+                        return true;
+                    }
+                }
                 tracing::debug!(
                     event_type,
                     stream_open = self.mapper.current_message_id.is_some(),
@@ -1814,7 +2317,14 @@ impl HermesSessionActor {
                 true
             }
             HermesGatewayEvent::ProtocolError(message) => {
-                self.emit_turn_failure(format!("Hermes gateway protocol error: {message}"));
+                if self
+                    .active_compaction
+                    .lock()
+                    .expect("Hermes active compaction mutex poisoned")
+                    .is_none()
+                {
+                    self.emit_turn_failure(format!("Hermes gateway protocol error: {message}"));
+                }
                 true
             }
             HermesGatewayEvent::Stderr(line) => {
@@ -1842,7 +2352,14 @@ impl HermesSessionActor {
                     None => "Hermes gateway exited".to_string(),
                 };
                 let message = format_failure_with_stderr_tail(base, &self.recent_stderr);
-                self.emit_turn_failure(message);
+                if self
+                    .active_compaction
+                    .lock()
+                    .expect("Hermes active compaction mutex poisoned")
+                    .is_none()
+                {
+                    self.emit_turn_failure(message);
+                }
                 false
             }
         }
@@ -2057,13 +2574,15 @@ impl HermesSessionActor {
     }
 
     fn emit(&self, event: ChatEvent) {
-        let _ = self.events_tx.send(event);
+        let _ = self.events_tx.send(BackendEvent::Chat(event));
     }
 
     fn emit_error(&self, message: impl Into<String>) {
         let _ = self
             .events_tx
-            .send(ChatEvent::MessageAdded(error_message(message.into())));
+            .send(BackendEvent::Chat(ChatEvent::MessageAdded(error_message(
+                message.into(),
+            ))));
     }
 
     fn emit_turn_failure(&mut self, message: impl Into<String>) {
@@ -2189,6 +2708,7 @@ impl HermesGatewayHandle {
             tx: command_tx,
             request_timeout,
             system_overlay_installed,
+            provider_version: target.provider_version.clone(),
         };
 
         match tokio::time::timeout(startup_timeout, ready_rx).await {
@@ -2230,18 +2750,67 @@ impl HermesGatewayHandle {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_typed(method, params)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_typed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HermesRpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HermesGatewayCommand::Request {
                 method: method.to_string(),
                 params,
                 reply: reply_tx,
+                dispatched: None,
             })
-            .map_err(|_| format!("Hermes gateway is closed; cannot send {method}"))?;
+            .map_err(|_| HermesRpcError {
+                code: None,
+                message: format!("Hermes gateway is closed; cannot send {method}"),
+            })?;
         match tokio::time::timeout(self.request_timeout, reply_rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(format!("Hermes gateway closed while waiting for {method}")),
-            Err(_) => Err(format!("Hermes request timed out for method '{method}'")),
+            Ok(Err(_)) => Err(HermesRpcError {
+                code: None,
+                message: format!("Hermes gateway closed while waiting for {method}"),
+            }),
+            Err(_) => Err(HermesRpcError {
+                code: None,
+                message: format!("Hermes request timed out for method '{method}'"),
+            }),
+        }
+    }
+
+    async fn dispatch_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<oneshot::Receiver<Result<Value, HermesRpcError>>, HermesDispatchError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (dispatched_tx, dispatched_rx) = oneshot::channel();
+        self.tx
+            .send(HermesGatewayCommand::Request {
+                method: method.to_string(),
+                params,
+                reply: reply_tx,
+                dispatched: Some(dispatched_tx),
+            })
+            .map_err(|_| HermesDispatchError::NotSent)?;
+        match tokio::time::timeout(self.request_timeout, dispatched_rx).await {
+            Ok(Ok(Ok(()))) => Ok(reply_rx),
+            Ok(Ok(Err(error))) => Err(HermesDispatchError::Uncertain(error)),
+            Ok(Err(_)) => Err(HermesDispatchError::Uncertain(HermesRpcError {
+                code: None,
+                message: format!("Hermes dispatch channel closed for {method}"),
+            })),
+            Err(_) => Err(HermesDispatchError::Uncertain(HermesRpcError {
+                code: None,
+                message: format!("Hermes dispatch timed out for method '{method}'"),
+            })),
         }
     }
 
@@ -2428,7 +2997,7 @@ async fn run_gateway_actor(
     force_shutdown_tx: mpsc::UnboundedSender<()>,
 ) {
     let mut next_id = 1_u64;
-    let mut pending: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
+    let mut pending: HashMap<u64, oneshot::Sender<Result<Value, HermesRpcError>>> = HashMap::new();
     let mut startup_stderr = VecDeque::new();
     let mut shutdown_reply = None;
     let mut stdin = Some(stdin);
@@ -2438,11 +3007,16 @@ async fn run_gateway_actor(
             maybe_command = command_rx.recv() => {
                 let Some(command) = maybe_command else { break; };
                 match command {
-                    HermesGatewayCommand::Request { method, params, reply } => {
+                    HermesGatewayCommand::Request { method, params, reply, dispatched } => {
                         if shutdown_reply.is_some() {
-                            let _ = reply.send(Err(
-                                "Hermes gateway is shutting down".to_string()
-                            ));
+                            let error = HermesRpcError {
+                                code: None,
+                                message: "Hermes gateway is shutting down".to_string(),
+                            };
+                            if let Some(dispatched) = dispatched {
+                                let _ = dispatched.send(Err(error.clone()));
+                            }
+                            let _ = reply.send(Err(error));
                             continue;
                         }
                         let id = next_id;
@@ -2455,22 +3029,44 @@ async fn run_gateway_actor(
                         });
                         let line = format!("{}\n", frame);
                         let Some(stdin) = stdin.as_mut() else {
-                            let _ = reply.send(Err(
-                                "Hermes gateway is shutting down".to_string()
-                            ));
+                            let error = HermesRpcError {
+                                code: None,
+                                message: "Hermes gateway is shutting down".to_string(),
+                            };
+                            if let Some(dispatched) = dispatched {
+                                let _ = dispatched.send(Err(error.clone()));
+                            }
+                            let _ = reply.send(Err(error));
                             continue;
                         };
                         match stdin.write_all(line.as_bytes()).await {
                             Ok(()) => match stdin.flush().await {
                                 Ok(()) => {
                                     pending.insert(id, reply);
+                                    if let Some(dispatched) = dispatched {
+                                        let _ = dispatched.send(Ok(()));
+                                    }
                                 }
                                 Err(err) => {
-                                    let _ = reply.send(Err(format!("Failed to flush Hermes request {id}: {err}")));
+                                    let error = HermesRpcError {
+                                        code: None,
+                                        message: format!("Failed to flush Hermes request {id}: {err}"),
+                                    };
+                                    if let Some(dispatched) = dispatched {
+                                        let _ = dispatched.send(Err(error.clone()));
+                                    }
+                                    let _ = reply.send(Err(error));
                                 }
                             },
                             Err(err) => {
-                                let _ = reply.send(Err(format!("Failed to write Hermes request {id}: {err}")));
+                                let error = HermesRpcError {
+                                    code: None,
+                                    message: format!("Failed to write Hermes request {id}: {err}"),
+                                };
+                                if let Some(dispatched) = dispatched {
+                                    let _ = dispatched.send(Err(error.clone()));
+                                }
+                                let _ = reply.send(Err(error));
                             }
                         }
                     }
@@ -2513,9 +3109,13 @@ async fn run_gateway_actor(
                     }
                     HermesGatewayInbound::Closed(code) => {
                         for (_id, reply) in pending.drain() {
-                            let _ = reply.send(Err(match code {
+                            let message = match code {
                                 Some(code) => format!("Hermes gateway exited with code {code}"),
                                 None => "Hermes gateway exited".to_string(),
+                            };
+                            let _ = reply.send(Err(HermesRpcError {
+                                code: None,
+                                message,
                             }));
                         }
                         if let Some(tx) = ready_tx.take() {
@@ -2540,7 +3140,10 @@ async fn run_gateway_actor(
     }
 
     for (_id, reply) in pending.drain() {
-        let _ = reply.send(Err("Hermes gateway actor stopped".to_string()));
+        let _ = reply.send(Err(HermesRpcError {
+            code: None,
+            message: "Hermes gateway actor stopped".to_string(),
+        }));
     }
     if let Some(reply) = shutdown_reply {
         let _ = reply.send(());
@@ -2549,7 +3152,7 @@ async fn run_gateway_actor(
 
 fn handle_gateway_stdout_line(
     line: &str,
-    pending: &mut HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+    pending: &mut HashMap<u64, oneshot::Sender<Result<Value, HermesRpcError>>>,
     event_tx: &mpsc::UnboundedSender<HermesGatewayEvent>,
     ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
 ) {
@@ -2600,16 +3203,14 @@ fn handle_gateway_stdout_line(
                 .unwrap_or("Hermes JSON-RPC error")
                 .to_string();
             let code = error.get("code").and_then(Value::as_i64);
-            let _ = reply.send(Err(match code {
-                Some(code) => format!("Hermes JSON-RPC error {code}: {message}"),
-                None => format!("Hermes JSON-RPC error: {message}"),
-            }));
+            let _ = reply.send(Err(HermesRpcError { code, message }));
         } else if let Some(result) = value.get("result") {
             let _ = reply.send(Ok(result.clone()));
         } else {
-            let _ = reply.send(Err(format!(
-                "Hermes response {id} missing both result and error"
-            )));
+            let _ = reply.send(Err(HermesRpcError {
+                code: None,
+                message: format!("Hermes response {id} missing both result and error"),
+            }));
         }
         return;
     }
@@ -4862,6 +5463,7 @@ async fn resolve_gateway_spawn_target(
             env: HashMap::new(),
             cwd,
             remote_host: Some(host),
+            provider_version: None,
         });
     }
 
@@ -4890,6 +5492,7 @@ fn hermes_python_spawn_target(
         env: HashMap::new(),
         cwd: Some(session_cwd(workspace_roots)?),
         remote_host: None,
+        provider_version: None,
     })
 }
 
@@ -4910,6 +5513,7 @@ async fn resolve_hermes_cli_gateway_spawn_target(
                     cwd: Some(session_cwd(workspace_roots)?),
                     remote_host: None,
                     display_program,
+                    provider_version: probe.version,
                 })
             }
             Err(err) => Err(err.explicit_override("HERMES_EXECUTABLE").message),
@@ -4931,6 +5535,7 @@ async fn resolve_hermes_cli_gateway_spawn_target(
                     cwd: Some(session_cwd(workspace_roots)?),
                     remote_host: None,
                     display_program,
+                    provider_version: probe.version,
                 });
             }
             Err(err) => {
@@ -6824,6 +7429,7 @@ for line in sys.stdin:
             cwd: None,
             remote_host: None,
             display_program: "hermes".to_string(),
+            provider_version: None,
         };
 
         let selected = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
@@ -6868,6 +7474,7 @@ for line in sys.stdin:
             cwd: None,
             remote_host: None,
             display_program: "hermes".to_string(),
+            provider_version: None,
         };
 
         let error = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
@@ -10102,5 +10709,133 @@ for line in sys.stdin:
             expand_hermes_path("~someone/skills"),
             PathBuf::from("~someone/skills")
         );
+    }
+
+    #[test]
+    fn compaction_capability_requires_exact_fixture_version() {
+        let verified = hermes_compaction_capability(Some("Hermes Agent v0.17.0"));
+        assert!(matches!(
+            verified.availability,
+            crate::backend::BackendCompactionAvailability::Native {
+                mechanism: BackendCompactionMechanism::JsonRpcRequest
+            }
+        ));
+        assert_eq!(
+            verified.confidence,
+            Some(BackendCompactionProtocolConfidence::Verified)
+        );
+
+        let unreviewed = hermes_compaction_capability(Some("0.17.1"));
+        assert!(matches!(
+            unreviewed.availability,
+            crate::backend::BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::ProtocolNotAllowlisted
+            }
+        ));
+    }
+
+    #[test]
+    fn transcript_guard_precedes_unknown_version() {
+        let unknown = hermes_compaction_capability(None);
+        assert!(matches!(
+            hermes_compaction_pre_dispatch(&unknown, false),
+            Some(BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::TranscriptNotAuthoritative
+                ),
+                fallback_safe: true,
+            })
+        ));
+        assert!(matches!(
+            hermes_compaction_pre_dispatch(&unknown, true),
+            Some(BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(_),
+                fallback_safe: false,
+            })
+        ));
+        assert!(hermes_compaction_pre_dispatch(
+            &hermes_compaction_capability(Some("0.17.0")),
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn typed_rpc_error_preserves_provider_code() {
+        let mut pending = HashMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert(7, reply_tx);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut ready = None;
+        handle_gateway_stdout_line(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":4009,"message":"busy"}}"#,
+            &mut pending,
+            &event_tx,
+            &mut ready,
+        );
+        let error = reply_rx
+            .blocking_recv()
+            .expect("gateway reply")
+            .expect_err("provider error");
+        assert_eq!(error.code, Some(4009));
+        assert_eq!(error.message, "busy");
+    }
+
+    #[test]
+    fn attempted_provider_failures_never_look_fallback_safe() {
+        let stored = Arc::new(std::sync::Mutex::new(SessionId("stored".to_string())));
+        let capability = Arc::new(std::sync::Mutex::new(
+            hermes_compaction_capability(Some("0.17.0")),
+        ));
+        let busy = classify_hermes_compaction_response(
+            protocol::CompactionOperationId("busy".to_string()),
+            "live".to_string(),
+            SessionId("stored".to_string()),
+            Err(HermesRpcError {
+                code: Some(4009),
+                message: "busy".to_string(),
+            }),
+            &stored,
+            &capability,
+        );
+        assert_eq!(busy.dispatch, BackendCompactionDispatchState::Accepted);
+        assert_eq!(busy.mutation, BackendCompactionMutationState::NotObserved);
+        assert!(busy.outcome.is_err());
+
+        let unknown = classify_hermes_compaction_response(
+            protocol::CompactionOperationId("unknown".to_string()),
+            "live".to_string(),
+            SessionId("stored".to_string()),
+            Err(HermesRpcError {
+                code: Some(5005),
+                message: "compress failed".to_string(),
+            }),
+            &stored,
+            &capability,
+        );
+        assert_eq!(
+            unknown.mutation,
+            BackendCompactionMutationState::MayHaveMutated
+        );
+
+        let malformed = classify_hermes_compaction_response(
+            protocol::CompactionOperationId("malformed".to_string()),
+            "live".to_string(),
+            SessionId("stored".to_string()),
+            Ok(json!({"status":"compressed"})),
+            &stored,
+            &capability,
+        );
+        assert_eq!(
+            malformed.mutation,
+            BackendCompactionMutationState::MayHaveMutated
+        );
+        assert!(matches!(
+            malformed.outcome,
+            Err(BackendCompactionFailure {
+                kind: BackendCompactionFailureKind::ProtocolViolation,
+                ..
+            })
+        ));
     }
 }

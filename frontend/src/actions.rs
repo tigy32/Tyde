@@ -11,13 +11,14 @@ use crate::state::{
 use protocol::{
     AgentId, BackendKind, ByteRange, CodeIntelCancelReferencesPayload,
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CustomAgentId, FrameKind,
-    GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchPayload, SessionId, SessionSettingsValues,
-    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    WorkbenchCreatePayload, WorkbenchRemovePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CompactionAvailabilityReason,
+    CustomAgentId, FrameKind, GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
+    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
+    RequestedCompactionAvailability, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload,
+    WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -2058,5 +2059,203 @@ mod wasm_tests {
             Some("sonnet"),
             "user-edited settings must be sent as explicit overrides: {new:?}"
         );
+    }
+}
+
+// ── Context compaction ──────────────────────────────────────────────────
+
+/// Can this agent be asked to compact right now?
+///
+/// Capability answers "is a compaction route available at all", never "is the
+/// agent free this instant". A busy agent still accepts the request and the
+/// server reports it deferred, so momentary activity must not disable the
+/// control — hiding it while the agent is thinking is exactly the behaviour
+/// that made compaction feel unreliable. What *does* disable it: an
+/// already-outstanding request, a disconnected host, and an agent that is
+/// initializing or dead.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompactionControlState {
+    /// Offerable now.
+    Enabled,
+    /// Visible, disabled, with a reason the user can read. `&'static str`
+    /// because every reason is a fixed phrase and the command palette's
+    /// `CommandAvailability::Disabled` requires one — keeping the two the same
+    /// shape stops the header, card, and palette reasons from drifting apart.
+    Disabled(&'static str),
+}
+
+impl CompactionControlState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Enabled => None,
+            Self::Disabled(reason) => Some(reason),
+        }
+    }
+}
+
+fn availability_reason_text(reason: CompactionAvailabilityReason) -> &'static str {
+    match reason {
+        CompactionAvailabilityReason::CapabilityStillDetermining => {
+            "Still checking what this backend supports"
+        }
+        CompactionAvailabilityReason::NativeTriggerUnavailable => {
+            "This backend has no compaction Tyde can trigger"
+        }
+        CompactionAvailabilityReason::BackendAutomaticOnly => {
+            "This backend compacts on its own and cannot be asked to"
+        }
+        CompactionAvailabilityReason::InlineFallbackDisabled => {
+            "Tyde's fallback compaction is turned off"
+        }
+    }
+}
+
+/// The single capability + gate selector every compaction control uses:
+/// the chat header button, the agent card action, the command palette entry,
+/// and the team control. One selector means one set of rules and one place a
+/// rule can be wrong.
+pub fn compaction_control_state(
+    state: &AppState,
+    agent: &ActiveAgentRef,
+) -> CompactionControlState {
+    use crate::state::ConnectionStatus;
+
+    if !matches!(
+        state.connection_status_for_host(&agent.host_id),
+        ConnectionStatus::Connected
+    ) {
+        return CompactionControlState::Disabled("Host is not connected");
+    }
+
+    let agent_info = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|candidate| {
+                candidate.host_id == agent.host_id && candidate.agent_id == agent.agent_id
+            })
+            .cloned()
+    });
+    let Some(agent_info) = agent_info else {
+        return CompactionControlState::Disabled("Agent is not available");
+    };
+    if agent_info.fatal_error.is_some() {
+        return CompactionControlState::Disabled("Agent has stopped");
+    }
+    if !agent_info.started {
+        return CompactionControlState::Disabled("Agent is still starting");
+    }
+
+    // An outstanding request or admitted operation. This is the shared
+    // duplicate-submit gate: whichever control fires first owns the request
+    // and every other control disables until it terminates.
+    let in_flight = state
+        .context_compactions
+        .with_untracked(|map| map.get(&agent.agent_id).is_some_and(|op| op.is_in_flight()));
+    if in_flight {
+        return CompactionControlState::Disabled("Compaction already in progress");
+    }
+
+    // Fail closed. Only an explicit `Available` enables the control: a missing
+    // snapshot means the server has not spoken yet, and dispatching on unknown
+    // capability is how a client sends a request the backend cannot serve and
+    // then has to explain the refusal after the fact. Unknown reads as "still
+    // determining", which is both true and self-resolving.
+    let availability = state
+        .compaction_capability
+        .with_untracked(|map| map.get(&agent.agent_id).map(|snapshot| snapshot.availability));
+    match availability {
+        Some(RequestedCompactionAvailability::Available { .. }) => CompactionControlState::Enabled,
+        None => CompactionControlState::Disabled(availability_reason_text(
+            CompactionAvailabilityReason::CapabilityStillDetermining,
+        )),
+        Some(RequestedCompactionAvailability::Determining { reason })
+        | Some(RequestedCompactionAvailability::AutomaticOnly { reason })
+        | Some(RequestedCompactionAvailability::Unavailable { reason }) => {
+            CompactionControlState::Disabled(availability_reason_text(reason))
+        }
+    }
+}
+
+/// The gate for a team-wide compaction: every bound member must be individually
+/// eligible.
+///
+/// Deliberately the *same* per-agent selector, not a parallel rule. The team
+/// button previously used legacy binding-idle rules and legacy replacement
+/// state, so a team could refuse a request the per-member button accepted (and
+/// vice versa) for the same agents.
+pub fn team_compaction_control_state(
+    state: &AppState,
+    members: &[ActiveAgentRef],
+) -> CompactionControlState {
+    if members.is_empty() {
+        return CompactionControlState::Disabled("No bound team members");
+    }
+    for member in members {
+        match compaction_control_state(state, member) {
+            CompactionControlState::Enabled => {}
+            // The first blocker is the reason shown: it is a real, specific
+            // explanation, and a generic "some member is not ready" would be
+            // less useful than any of the individual reasons.
+            blocked => return blocked,
+        }
+    }
+    CompactionControlState::Enabled
+}
+
+/// The confirmation the user sees before a compaction.
+///
+/// Every clause of the previous copy ("a fresh replacement will start", "the
+/// original session is closed", "it can't be resumed") describes the legacy
+/// replacement protocol and is false for in-place compaction. Promising a
+/// destructive outcome that no longer happens is worse than saying nothing.
+pub fn compaction_confirm_message(agent_name: &str) -> String {
+    format!(
+        "Compact the model context for \"{agent_name}\"?\n\nThe model's working \
+         context will be summarized so it has room to keep going. Your conversation \
+         history here is not changed — nothing is deleted, and the agent, its session, \
+         and your open tabs all stay the same.\n\nIf a turn is running, compaction \
+         waits for it to finish. This can take several minutes."
+    )
+}
+
+/// Confirm, claim the shared gate, and send. Used by every control.
+///
+/// The gate is claimed *before* the send so two controls cannot both submit
+/// while neither has seen an operation id yet.
+pub async fn request_context_compaction(
+    state: AppState,
+    agent: ActiveAgentRef,
+    agent_name: String,
+) {
+    if !compaction_control_state(&state, &agent).is_enabled() {
+        return;
+    }
+    let message = compaction_confirm_message(&agent_name);
+    if !crate::bridge::confirm_dialog("Compact context", &message).await {
+        return;
+    }
+    if !state.begin_compaction_request(&agent.agent_id) {
+        return;
+    }
+    let agent_stream = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|candidate| {
+                candidate.host_id == agent.host_id && candidate.agent_id == agent.agent_id
+            })
+            .map(|candidate| candidate.instance_stream.clone())
+    });
+    let Some(agent_stream) = agent_stream else {
+        state
+            .abandon_compaction_request(&agent.agent_id, "Agent is no longer available".to_owned());
+        return;
+    };
+    if let Err(error) = crate::send::compact_agent(&agent.host_id, agent_stream).await {
+        log::error!("failed to send AgentCompact: {error}");
+        state.abandon_compaction_request(&agent.agent_id, error);
     }
 }

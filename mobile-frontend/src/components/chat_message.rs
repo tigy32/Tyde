@@ -2,6 +2,149 @@ use leptos::prelude::*;
 
 use crate::state::{AgentRef, ChatMessageEntry};
 
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn full_token_count(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
+}
+
+fn compaction_outcome_text(
+    event: &protocol::ContextCompactionTimelineEvent,
+) -> &'static str {
+    use protocol::{CompactionMutation, ContextCompactionTimelineStatus};
+
+    match (event.status, event.mutation) {
+        (
+            ContextCompactionTimelineStatus::Completed,
+            CompactionMutation::NotObserved
+            | CompactionMutation::Completed
+            | CompactionMutation::MayHaveMutated,
+        ) => "Context compacted",
+        (ContextCompactionTimelineStatus::Failed, CompactionMutation::NotObserved) => {
+            "Compaction failed. Context is unchanged."
+        }
+        (ContextCompactionTimelineStatus::Failed, CompactionMutation::Completed) => {
+            "Context compacted, but finalization failed."
+        }
+        (ContextCompactionTimelineStatus::Failed, CompactionMutation::MayHaveMutated) => {
+            "Compaction failed. Context may have changed."
+        }
+    }
+}
+
+#[component]
+pub fn ContextCompactionMarkerView(
+    event: protocol::ContextCompactionTimelineEvent,
+) -> impl IntoView {
+    let outcome = compaction_outcome_text(&event);
+    let suppress_metrics = event.status
+        == protocol::ContextCompactionTimelineStatus::Failed
+        && event.mutation == protocol::CompactionMutation::NotObserved;
+    let metrics = if suppress_metrics {
+        None
+    } else {
+        match (event.metrics.before_tokens, event.metrics.after_tokens) {
+            (Some(before), Some(after)) => Some(format!(
+                "{} → {} tokens",
+                compact_token_count(before),
+                compact_token_count(after)
+            )),
+            (Some(before), None) => {
+                Some(format!("from {} tokens", compact_token_count(before)))
+            }
+            (None, Some(after)) => {
+                Some(format!("to {} tokens", compact_token_count(after)))
+            }
+            (None, None) => None,
+        }
+    };
+    let visible = metrics
+        .as_ref()
+        .map(|compact| format!("{outcome} · {compact}"))
+        .unwrap_or_else(|| outcome.to_owned());
+    let accessible = if suppress_metrics {
+        outcome.to_owned()
+    } else {
+        match (
+            event.status,
+            event.metrics.before_tokens,
+            event.metrics.after_tokens,
+        ) {
+            (protocol::ContextCompactionTimelineStatus::Completed, Some(before), Some(after)) => {
+                format!(
+                    "Context compacted from {} tokens to {} tokens.",
+                    full_token_count(before),
+                    full_token_count(after)
+                )
+            }
+            (protocol::ContextCompactionTimelineStatus::Completed, Some(before), None) => {
+                format!(
+                    "Context compacted from {} tokens. Final token count is unavailable.",
+                    full_token_count(before)
+                )
+            }
+            (protocol::ContextCompactionTimelineStatus::Completed, None, Some(after)) => {
+                format!(
+                    "Context compacted to {} tokens. Prior token count is unavailable.",
+                    full_token_count(after)
+                )
+            }
+            (protocol::ContextCompactionTimelineStatus::Failed, Some(before), Some(after)) => {
+                format!(
+                    "{outcome} Token count changed from {} tokens to {} tokens.",
+                    full_token_count(before),
+                    full_token_count(after)
+                )
+            }
+            (protocol::ContextCompactionTimelineStatus::Failed, Some(before), None) => {
+                format!(
+                    "{outcome} Context was {} tokens before the attempt.",
+                    full_token_count(before)
+                )
+            }
+            (protocol::ContextCompactionTimelineStatus::Failed, None, Some(after)) => {
+                format!(
+                    "{outcome} Context is {} tokens after the attempt.",
+                    full_token_count(after)
+                )
+            }
+            (
+                protocol::ContextCompactionTimelineStatus::Completed
+                | protocol::ContextCompactionTimelineStatus::Failed,
+                None,
+                None,
+            ) => outcome.to_owned(),
+        }
+    };
+
+    view! {
+        <div
+            class="chat-compaction-marker"
+            data-mobile-test="chat-compaction-marker"
+            data-marker-id=event.marker_id.0
+        >
+            <span aria-hidden="true">{visible}</span>
+            <span class="visually-hidden">{accessible}</span>
+        </div>
+    }
+}
+
 /// The per-request token usage shown by default on a mobile chat row, or `None`
 /// when the backend didn't report it (no fake-zero figure). Mirrors the desktop
 /// footer default.
@@ -489,6 +632,111 @@ mod wasm_tests {
         assert!(
             !body.contains("in:0 out:0"),
             "must not show a fake-zero token figure: {body}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_compaction_marker_is_one_silent_non_message_row() {
+        let container = make_container();
+        let event = protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("marker-1".to_owned()),
+            operation_id: None,
+            trigger: protocol::CompactionTrigger::BackendAutomatic,
+            method: protocol::CompactionMethod::BackendAutomatic,
+            backend_kind: protocol::BackendKind::Claude,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: protocol::CompactionMetrics {
+                before_tokens: Some(384_168),
+                after_tokens: Some(12_518),
+                ..Default::default()
+            },
+            continuation: None,
+            message: None,
+            timestamp: 1,
+        };
+        let _handle = mount_to(container.clone(), move || {
+            view! { <ContextCompactionMarkerView event=event.clone() /> }
+        });
+        next_tick().await;
+
+        let rows = container
+            .query_selector_all("[data-mobile-test='chat-compaction-marker']")
+            .unwrap();
+        assert_eq!(rows.length(), 1, "one marker event renders one row");
+        let marker = rows.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        assert!(marker.get_attribute("role").is_none());
+        assert!(marker.get_attribute("aria-live").is_none());
+        assert!(
+            marker
+                .query_selector("[data-mobile-test^='chat-message-']")
+                .unwrap()
+                .is_none(),
+            "the marker must not render as a message bubble"
+        );
+        let text = marker.text_content().unwrap_or_default();
+        assert!(text.contains("384.2k → 12.5k tokens"), "{text}");
+        assert!(
+            text.contains("384,168 tokens") && text.contains("12,518 tokens"),
+            "accessible text keeps full token counts: {text}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_compaction_marker_preserves_partial_noncontradictory_metrics() {
+        let container = make_container();
+        let partial = protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("marker-partial".to_owned()),
+            operation_id: None,
+            trigger: protocol::CompactionTrigger::BackendAutomatic,
+            method: protocol::CompactionMethod::BackendAutomatic,
+            backend_kind: protocol::BackendKind::Claude,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: protocol::CompactionMetrics {
+                before_tokens: Some(384_168),
+                after_tokens: None,
+                ..Default::default()
+            },
+            continuation: None,
+            message: None,
+            timestamp: 1,
+        };
+        let defensive = protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("marker-defensive".to_owned()),
+            status: protocol::ContextCompactionTimelineStatus::Failed,
+            mutation: protocol::CompactionMutation::NotObserved,
+            metrics: protocol::CompactionMetrics {
+                before_tokens: Some(384_168),
+                after_tokens: Some(12_518),
+                ..Default::default()
+            },
+            ..partial.clone()
+        };
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ContextCompactionMarkerView event=partial.clone() />
+                <ContextCompactionMarkerView event=defensive.clone() />
+            }
+        });
+        next_tick().await;
+
+        let rows = container
+            .query_selector_all("[data-mobile-test='chat-compaction-marker']")
+            .unwrap();
+        let partial_text = rows.item(0).unwrap().text_content().unwrap_or_default();
+        assert!(partial_text.contains("from 384.2k tokens"), "{partial_text}");
+        assert!(
+            partial_text.contains("from 384,168 tokens"),
+            "accessible text preserves the known full count: {partial_text}"
+        );
+        let defensive_text = rows.item(1).unwrap().text_content().unwrap_or_default();
+        assert_eq!(
+            defensive_text,
+            "Compaction failed. Context is unchanged.Compaction failed. Context is unchanged.",
+            "NotObserved failure must not claim token counts changed"
         );
     }
 }

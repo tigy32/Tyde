@@ -61,6 +61,11 @@ thread_local! {
     /// borrowing anyone's lifetime.
     static WORKSPACE_WIDTH: ArcRwSignal<Option<f64>> = ArcRwSignal::new(None);
     static ANNOUNCEMENT: ArcRwSignal<String> = ArcRwSignal::new(String::new());
+    /// The assertive channel. Separate signal *and* separate DOM node,
+    /// because politeness is a property of the live region, not of the
+    /// message: writing an urgent string into a `polite` region does not make
+    /// it interrupt, it just queues behind whatever is being read.
+    static ALERT: ArcRwSignal<String> = ArcRwSignal::new(String::new());
 }
 
 /// Measured width of the pane row, or `None` when nothing has measured it yet.
@@ -154,10 +159,39 @@ fn announcement_signal() -> ArcRwSignal<String> {
     ANNOUNCEMENT.with(Clone::clone)
 }
 
+fn alert_signal() -> ArcRwSignal<String> {
+    ALERT.with(Clone::clone)
+}
+
 /// Announce a message politely.
 pub fn announce(message: impl Into<String>) {
     let message = message.into();
     ANNOUNCEMENT.with(|announcement| announcement.set(message));
+}
+
+/// Announce a message assertively — it interrupts whatever is being read.
+///
+/// Reserve this for outcomes the user must not miss and cannot discover by
+/// looking, and emit it exactly once at the moment of the transition. It is a
+/// separate region from [`announce`] because a `polite` region cannot be made
+/// urgent by the text written into it.
+pub fn alert(message: impl Into<String>) {
+    let message = message.into();
+    ALERT.with(|alert| alert.set(message));
+}
+
+/// The polite live region's current text.
+///
+/// Exists so tests can assert on what assistive technology would actually be
+/// told — including that a replay path said *nothing* — rather than inferring
+/// it from which code path ran.
+pub fn current_announcement() -> String {
+    ANNOUNCEMENT.with(|announcement| announcement.get_untracked())
+}
+
+/// The assertive live region's current text.
+pub fn current_alert() -> String {
+    ALERT.with(|alert| alert.get_untracked())
 }
 
 /// Drop everything that only meant something while a workspace was on screen.
@@ -165,6 +199,7 @@ pub fn announce(message: impl Into<String>) {
 fn forget_rendered_workspace() {
     CenterWorkspaceWidth::forget_measurement();
     ANNOUNCEMENT.with(|announcement| announcement.set(String::new()));
+    ALERT.with(|alert| alert.set(String::new()));
 }
 
 /// Show a tab: make it the active tab *of the pane that holds it*, and focus
@@ -1482,6 +1517,7 @@ pub fn CenterZone() -> impl IntoView {
     // handler — reaches it without any of them holding a signal that dies with
     // this component.
     let announcement = announcement_signal();
+    let alert = alert_signal();
     // Both of these describe a *rendered* workspace. When this one goes away the
     // measurement is not stale, it is meaningless — leaving a narrow number
     // behind would disable split for whatever renders next — and a message
@@ -1857,6 +1893,20 @@ pub fn CenterZone() -> impl IntoView {
 
             <div class="visually-hidden" aria-live="polite" data-testid="center-live-region">
                 {move || announcement.get()}
+            </div>
+
+            // Assertive companion. `role="alert"` on a *stable* node whose text
+            // changes — rather than on a node that mounts and unmounts — so it
+            // fires once per real transition and cannot be replayed by a
+            // remount or a route change.
+            <div
+                class="visually-hidden"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+                data-testid="center-alert-region"
+            >
+                {move || alert.get()}
             </div>
 
             <SettingsPanel />

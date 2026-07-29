@@ -23,10 +23,13 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::backend::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    protocol_images_to_attachments, render_combined_spawn_instructions,
-    resolve_settings as resolve_backend_settings,
+    Backend, BackendCompactionAvailability, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
+    BackendCompactionNotDispatchedReason, BackendCompactionRequest, BackendCompactionStart,
+    BackendCompactionUnavailableReason, BackendContextReseatSupport, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, StartupMcpServer, StartupMcpTransport,
+    backend_fork_unsupported_message, protocol_images_to_attachments,
+    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
 };
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
@@ -48,6 +51,7 @@ pub struct AntigravityBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: SessionId,
+    provider_version: Option<String>,
     inner: Arc<AntigravityInner>,
 }
 
@@ -157,12 +161,29 @@ impl Backend for AntigravityBackend {
         }
     }
 
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        antigravity_compaction_capability(self.provider_version.clone())
+    }
+
+    async fn begin_compaction(
+        &self,
+        _request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        BackendCompactionStart::NotDispatched {
+            reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                BackendCompactionUnavailableReason::ManualTriggerAbsent,
+            ),
+            fallback_safe: true,
+        }
+    }
+
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        let conversations_dir = resolve_antigravity_conversations_dir(None)?;
+        let conversations_dir =
+            resolve_antigravity_conversations_dir(config.antigravity_conversations_dir.as_deref())?;
         Self::spawn_with_conversations_dir(
             workspace_roots,
             config,
@@ -177,7 +198,8 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let conversations_dir = resolve_antigravity_conversations_dir(None)?;
+        let conversations_dir =
+            resolve_antigravity_conversations_dir(config.antigravity_conversations_dir.as_deref())?;
         Self::resume_with_conversations_dir(workspace_roots, config, session_id, conversations_dir)
             .await
     }
@@ -236,6 +258,22 @@ impl Backend for AntigravityBackend {
     }
 }
 
+fn antigravity_compaction_capability(
+    provider_version: Option<String>,
+) -> BackendCompactionCapability {
+    BackendCompactionCapability {
+        coordinator: BackendCompactionCoordinator::ContextOperation,
+        availability: BackendCompactionAvailability::AutomaticOnly {
+            reason: BackendCompactionUnavailableReason::ManualTriggerAbsent,
+        },
+        provider_version,
+        protocol_version: None,
+        confidence: None,
+        reseat: BackendContextReseatSupport::Unsupported,
+        evidence: BackendCompactionCapabilityEvidence::AdapterContract,
+    }
+}
+
 impl AntigravityBackend {
     pub(crate) async fn spawn_with_conversations_dir(
         workspace_roots: Vec<String>,
@@ -243,6 +281,7 @@ impl AntigravityBackend {
         initial_input: protocol::SendMessagePayload,
         conversations_dir: PathBuf,
     ) -> Result<(Self, EventStream), String> {
+        let provider_version = config.provider_version.clone();
         let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
         let resolved_settings = resolve_session_settings(&config);
         let _ = selected_model(&resolved_settings)?;
@@ -306,6 +345,7 @@ impl AntigravityBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                provider_version,
                 inner,
             },
             EventStream::new(events_rx),
@@ -318,6 +358,7 @@ impl AntigravityBackend {
         session_id: SessionId,
         conversations_dir: PathBuf,
     ) -> Result<(Self, EventStream), String> {
+        let provider_version = config.provider_version.clone();
         if !is_antigravity_native_session_id(&session_id) {
             return Err(format!(
                 "Antigravity resume requires a native agy conversation UUID, got {session_id}"
@@ -359,6 +400,7 @@ impl AntigravityBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                provider_version,
                 inner,
             },
             EventStream::new(events_rx),
@@ -2252,6 +2294,7 @@ mod tests {
             input_tx,
             interrupt_tx,
             session_id: SessionId("busy-handback-test".to_owned()),
+            provider_version: None,
             inner: Arc::clone(&inner),
         };
 
@@ -2828,5 +2871,53 @@ mod tests {
             "unrestricted args must not enable the sandbox (combining --sandbox \
              with --dangerously-skip-permissions bypasses the sandbox): {args:?}"
         );
+    }
+
+    #[test]
+    fn manual_compaction_is_affirmatively_unavailable() {
+        let capability = antigravity_compaction_capability(None);
+        assert_eq!(capability.provider_version, None);
+        assert!(matches!(
+            capability.availability,
+            BackendCompactionAvailability::AutomaticOnly {
+                reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
+            }
+        ));
+        assert!(matches!(
+            crate::backend::compaction::not_dispatched_for_capability(&capability),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_resume_honors_configured_conversations_directory() {
+        let conversations = tempfile::tempdir().expect("temp conversations directory");
+        let session_id = SessionId("11111111-1111-4111-8111-111111111111".to_owned());
+        std::fs::write(
+            conversations.path().join(format!("{}.db", session_id.0)),
+            [],
+        )
+        .expect("seed conversation database");
+        let config = BackendSpawnConfig {
+            antigravity_conversations_dir: Some(conversations.path().to_path_buf()),
+            ..BackendSpawnConfig::default()
+        };
+
+        let (backend, _events) = <AntigravityBackend as Backend>::resume(
+            vec!["/tmp".to_owned()],
+            config,
+            session_id,
+        )
+        .await
+        .expect("resume from configured conversation directory");
+
+        assert_eq!(
+            backend.inner.state.lock().await.conversations_dir,
+            conversations.path()
+        );
+        backend.shutdown().await;
     }
 }

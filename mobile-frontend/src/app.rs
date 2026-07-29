@@ -1061,6 +1061,12 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.chat_message_index.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
+    state.compaction_markers.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
+    state.compaction_marker_ids.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
     state.session_history.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
@@ -1082,6 +1088,20 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.agent_session_settings.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
+    // A completed legacy replacement is retained while the old agent is removed
+    // inside one connection so its redirect remains actionable. A disconnect is
+    // the authoritative boundary: legacy replacement state is not bootstrapped,
+    // and retaining it would expose a redirect minted by a dead host snapshot.
+    state.agent_compactions.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
+    state.context_compaction_operations.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
+    state.context_compaction_capabilities.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
+    state.forget_host_terminal_context_compaction_operations(host);
     if state
         .active_project
         .get_untracked()
@@ -1267,6 +1287,24 @@ mod wasm_tests {
         std::mem::forget(mount);
         next_tick().await;
         let state = handle.borrow().as_ref().unwrap().clone();
+        let legacy_agent_ref = crate::state::AgentRef {
+            local_host_id: host.clone(),
+            agent_id: protocol::AgentId("agent-1".to_owned()),
+        };
+        state.agent_compactions.update(|compactions| {
+            compactions.insert(
+                legacy_agent_ref.clone(),
+                protocol::types::AgentCompactNotifyPayload {
+                    status: protocol::types::AgentCompactStatus::Completed,
+                    old_agent_id: legacy_agent_ref.agent_id.clone(),
+                    old_session_id: Some(protocol::SessionId("old-session".to_owned())),
+                    new_agent_id: Some(protocol::AgentId("replacement-agent".to_owned())),
+                    new_session_id: Some(protocol::SessionId("new-session".to_owned())),
+                    summary_preview: None,
+                    message: None,
+                },
+            );
+        });
 
         // A message the user discarded *before* the drop. Its tombstone is the only
         // thing stopping the tool card that sent it from going back to claiming it
@@ -1338,6 +1376,12 @@ mod wasm_tests {
         assert!(
             state.agent_load_requests.get_untracked().is_empty(),
             "the load latch must clear so the next connection re-loads the agent"
+        );
+        assert!(
+            state
+                .agent_compactions
+                .with_untracked(|compactions| !compactions.contains_key(&legacy_agent_ref)),
+            "disconnect clears the non-bootstrap legacy redirect from the dead snapshot"
         );
 
         // And the spinner is gone, replaced by something the user can act on.

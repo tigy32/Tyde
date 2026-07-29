@@ -343,6 +343,29 @@ impl CodexCommandHandle {
     async fn update_runtime_settings(&self, settings: Value) -> Result<(), String> {
         self.inner.update_runtime_settings(settings).await
     }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.inner
+            .rpc
+            .compaction_capability
+            .lock()
+            .expect("Codex compaction capability mutex poisoned")
+            .clone()
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        self.inner.begin_compaction(request).await
+    }
+
+    async fn install_continuation_context(
+        &self,
+        context: super::BackendContinuationContext,
+    ) -> super::BackendContextReseatResult {
+        self.inner.install_continuation_context(context).await
+    }
 }
 
 struct CodexSkillProjection {
@@ -1060,7 +1083,7 @@ async fn codex_list_skills(rpc: &CodexRpc, cwd: &str) -> Result<CodexSkillCatalo
 }
 
 async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
-    rpc.request(
+    let response = rpc.request(
         "initialize",
         json!({
             "clientInfo": {
@@ -1073,8 +1096,60 @@ async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
             }
         }),
     )
-    .await
-    .map(|_| ())
+    .await?;
+    let user_agent = response
+        .get("userAgent")
+        .or_else(|| response.get("user_agent"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let capability = codex_compaction_capability(user_agent.as_deref());
+    *rpc
+        .compaction_capability
+        .lock()
+        .expect("Codex compaction capability mutex poisoned") = capability;
+    Ok(())
+}
+
+fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCapability {
+    let Some(user_agent) = user_agent.map(str::trim).filter(|value| !value.is_empty()) else {
+        return BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::VersionUnavailable,
+            None,
+            BackendCompactionCapabilityEvidence::None,
+        );
+    };
+    let provider_version = user_agent
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|part| {
+            let mut components = part.split('.');
+            components.next().is_some_and(|value| !value.is_empty())
+                && components.next().is_some()
+        })
+        .map(str::to_owned);
+    let evidence = BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+        user_agent: user_agent.to_string(),
+    };
+    match provider_version.as_deref() {
+        Some("0.144.3") if !user_agent.contains("0.144.3-") => {
+            BackendCompactionCapability::native(
+            BackendCompactionMechanism::JsonRpcRequest,
+            provider_version,
+            BackendCompactionProtocolConfidence::Verified,
+            BackendContextReseatSupport::InjectAfterNative,
+            evidence,
+            )
+        }
+        Some(version) => BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+            Some(version.to_string()),
+            evidence,
+        ),
+        None => BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::VersionUnparseable,
+            None,
+            evidence,
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -2032,6 +2107,8 @@ impl CodexSession {
                 execution_mode: config.execution_mode,
                 turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
                 active_turn_id: None,
+                pending_compaction: None,
+                pending_continuation: None,
                 active_stream: None,
                 tool_container: None,
                 notification_sequence: 0,
@@ -3136,6 +3213,8 @@ struct CodexState {
     execution_mode: BackendExecutionMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
+    pending_compaction: Option<PendingCodexCompaction>,
+    pending_continuation: Option<PendingCodexContinuation>,
     active_stream: Option<ActiveStreamState>,
     tool_container: Option<ChatMessageId>,
     notification_sequence: u64,
@@ -3179,6 +3258,23 @@ struct CodexState {
     unknown_owner_notifications: HashSet<String>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
+}
+
+struct PendingCodexCompaction {
+    request: BackendCompactionRequest,
+    terminal_tx: Option<oneshot::Sender<BackendCompactionResult>>,
+    accepted: bool,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    item_started: bool,
+    item_completed: bool,
+    turn_status: Option<String>,
+    deprecated_notification_seen: bool,
+}
+
+struct PendingCodexContinuation {
+    terminal_tx: Option<oneshot::Sender<Result<(), String>>>,
+    turn_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -3313,6 +3409,573 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    async fn begin_compaction(
+        self: &Arc<Self>,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        let capability = self
+            .rpc
+            .compaction_capability
+            .lock()
+            .expect("Codex compaction capability mutex poisoned")
+            .clone();
+        if let Some(start) = super::compaction::not_dispatched_for_capability(&capability) {
+            return start;
+        }
+
+        let (terminal_tx, terminal) = oneshot::channel();
+        let thread_id = {
+            let mut state = self.state.lock().await;
+            if state.pending_compaction.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                };
+            }
+            if state.pending_continuation.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::BackgroundMutationActive,
+                };
+            }
+            if state.active_turn_id.is_some()
+                || state.active_stream.is_some()
+                || state.pending_request.is_some()
+            {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::ActiveTurn,
+                };
+            }
+            if state.tool_container.is_some() || !state.pending_tool_call_ids.is_empty() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::ToolLifecycleActive,
+                };
+            }
+            if !state.background_commands.is_empty()
+                || !state.pending_subagent_spawns.is_empty()
+                || !state.registering_subagent_threads.is_empty()
+                || !state.subagent_streams.is_empty()
+            {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::BackgroundMutationActive,
+                };
+            }
+            let thread_id = state.thread_id.clone();
+            state.pending_compaction = Some(PendingCodexCompaction {
+                request: request.clone(),
+                terminal_tx: Some(terminal_tx),
+                accepted: false,
+                turn_id: None,
+                item_id: None,
+                item_started: false,
+                item_completed: false,
+                turn_status: None,
+                deprecated_notification_seen: false,
+            });
+            thread_id
+        };
+
+        self.emitter
+            .compaction_event(&BackendCompactionEvent::Progress(BackendCompactionProgress {
+                operation_id: request.operation_id.clone(),
+                stage: CompactionStage::Dispatching,
+                elapsed_ms: None,
+            }));
+
+        let response = self
+            .rpc
+            .request(
+                "thread/compact/start",
+                json!({
+                    "threadId": thread_id
+                }),
+            )
+            .await;
+        match response {
+            Ok(value) if value.as_object().is_some_and(serde_json::Map::is_empty) => {
+                if let Some(pending) = self.state.lock().await.pending_compaction.as_mut() {
+                    pending.accepted = true;
+                }
+            }
+            Ok(value) => {
+                self.finish_compaction_failure(
+                    BackendCompactionFailureKind::ProtocolViolation,
+                    format!("Codex thread/compact/start returned an unexpected response: {value}"),
+                )
+                .await;
+            }
+            Err(message) => {
+                if message.starts_with("Codex JSON-RPC error")
+                    && let Some(pending) = self.state.lock().await.pending_compaction.as_mut()
+                {
+                    pending.accepted = true;
+                }
+                if message.contains("-32601") {
+                    *self
+                        .rpc
+                        .compaction_capability
+                        .lock()
+                        .expect("Codex compaction capability mutex poisoned") =
+                        BackendCompactionCapability::unknown(
+                            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+                            capability.provider_version.clone(),
+                            capability.evidence.clone(),
+                        );
+                }
+                self.finish_compaction_failure(
+                    BackendCompactionFailureKind::ProviderRejected,
+                    message,
+                )
+                .await;
+            }
+        }
+
+        if self.state.lock().await.pending_compaction.is_some() {
+            let inner = Arc::clone(self);
+            let operation_id = request.operation_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let matches = inner
+                    .state
+                    .lock()
+                    .await
+                    .pending_compaction
+                    .as_ref()
+                    .is_some_and(|pending| pending.request.operation_id == operation_id);
+                if matches {
+                    inner
+                        .finish_compaction_failure(
+                            BackendCompactionFailureKind::TimedOut,
+                            "Codex compaction timed out before correlated completion".to_string(),
+                        )
+                        .await;
+                }
+            });
+        }
+
+        BackendCompactionStart::Accepted(super::BackendAcceptedCompaction {
+            operation_id: request.operation_id,
+            terminal,
+        })
+    }
+
+    async fn install_continuation_context(
+        &self,
+        context: super::BackendContinuationContext,
+    ) -> super::BackendContextReseatResult {
+        let required_present = !context.required.is_empty();
+        let advisory_present = !context.advisory.is_empty();
+        if !required_present && !advisory_present {
+            return super::BackendContextReseatResult {
+                required: super::ContinuationInstallStatus::NotRequired,
+                advisory: super::ContinuationInstallStatus::NotRequired,
+            };
+        }
+        let rendered = [
+            ("Required continuation", &context.required),
+            ("Advisory continuation", &context.advisory),
+        ]
+        .into_iter()
+        .filter(|(_, items)| !items.is_empty())
+        .map(|(label, items)| {
+            let items = items
+                .iter()
+                .map(|item| format!("{}={}", item.kind, item.payload))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("{label}: {items}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let (thread_id, model, effort, approval, access_mode, execution_mode, network, terminal) = {
+            let mut state = self.state.lock().await;
+            if state.active_turn_id.is_some()
+                || state.active_stream.is_some()
+                || state.pending_request.is_some()
+                || state.pending_compaction.is_some()
+                || state.pending_continuation.is_some()
+                || state.tool_container.is_some()
+                || !state.pending_tool_call_ids.is_empty()
+                || !state.background_commands.is_empty()
+                || !state.pending_subagent_spawns.is_empty()
+                || !state.registering_subagent_threads.is_empty()
+                || !state.subagent_streams.is_empty()
+            {
+                let failed = super::ContinuationInstallStatus::Failed {
+                    message: "Codex is not idle for continuation installation".to_string(),
+                };
+                return super::BackendContextReseatResult {
+                    required: if required_present {
+                        failed.clone()
+                    } else {
+                        super::ContinuationInstallStatus::NotRequired
+                    },
+                    advisory: if advisory_present {
+                        failed
+                    } else {
+                        super::ContinuationInstallStatus::NotRequired
+                    },
+                };
+            }
+            let (terminal_tx, terminal) = oneshot::channel();
+            state.pending_continuation = Some(PendingCodexContinuation {
+                terminal_tx: Some(terminal_tx),
+                turn_id: None,
+            });
+            (
+                state.thread_id.clone(),
+                state.model_override.clone(),
+                state.reasoning_effort_override.clone(),
+                state.approval_policy.clone(),
+                state.access_mode,
+                state.execution_mode,
+                state.turn_network_access,
+                terminal,
+            )
+        };
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": rendered,
+                "text_elements": []
+            }],
+            "summary": CODEX_REASONING_SUMMARY_LEVEL,
+            "approvalPolicy": approval
+                .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string()),
+            "sandboxPolicy": codex_sandbox_policy(access_mode, network, execution_mode),
+        });
+        if let Some(model) = model {
+            params["model"] = Value::String(model);
+        }
+        if let Some(effort) = effort {
+            params["effort"] = Value::String(effort);
+        }
+        if let Err(error) = self.rpc.request("turn/start", params).await {
+            self.finish_codex_continuation(Err(error)).await;
+        }
+        let outcome = match tokio::time::timeout(Duration::from_secs(300), terminal).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err("Codex continuation terminal channel closed".to_string()),
+            Err(_) => {
+                self.finish_codex_continuation(Err(
+                    "Codex continuation installation timed out".to_string(),
+                ))
+                .await;
+                Err("Codex continuation installation timed out".to_string())
+            }
+        };
+        let installed = match outcome {
+            Ok(()) => super::ContinuationInstallStatus::Installed,
+            Err(message) => super::ContinuationInstallStatus::Failed { message },
+        };
+        super::BackendContextReseatResult {
+            required: if required_present {
+                installed.clone()
+            } else {
+                super::ContinuationInstallStatus::NotRequired
+            },
+            advisory: if advisory_present {
+                installed
+            } else {
+                super::ContinuationInstallStatus::NotRequired
+            },
+        }
+    }
+
+    async fn finish_codex_continuation(&self, result: Result<(), String>) {
+        let terminal_tx = {
+            let mut state = self.state.lock().await;
+            let Some(mut pending) = state.pending_continuation.take() else {
+                return;
+            };
+            if let Some(turn_id) = pending.turn_id.as_ref() {
+                push_codex_terminated_turn(&mut state.terminated_turns, turn_id.clone());
+            }
+            pending.terminal_tx.take()
+        };
+        if let Some(terminal_tx) = terminal_tx {
+            let _ = terminal_tx.send(result);
+        }
+    }
+
+    async fn finish_compaction_failure(
+        &self,
+        kind: BackendCompactionFailureKind,
+        message: String,
+    ) {
+        let Some(mut pending) = self.state.lock().await.pending_compaction.take() else {
+            return;
+        };
+        let mutation = if pending.item_started || pending.item_completed {
+            BackendCompactionMutationState::MayHaveMutated
+        } else {
+            BackendCompactionMutationState::NotObserved
+        };
+        let dispatch = if pending.accepted {
+            BackendCompactionDispatchState::Accepted
+        } else {
+            BackendCompactionDispatchState::MayHaveReachedProvider
+        };
+        let result = BackendCompactionResult {
+            operation_id: pending.request.operation_id.clone(),
+            dispatch,
+            mutation,
+            outcome: Err(BackendCompactionFailure { kind, message }),
+            provider_session_id: Some(SessionId(
+                self.state.lock().await.thread_id.clone(),
+            )),
+            metrics: CompactionMetrics::default(),
+            post_context_tokens: PostCompactionTokenCount::Unknown,
+            evidence: BackendCompactionTerminalEvidence::Codex {
+                thread_id: self.state.lock().await.thread_id.clone(),
+                turn_id: pending.turn_id,
+                item_id: pending.item_id,
+                deprecated_notification_seen: pending.deprecated_notification_seen,
+            },
+        };
+        if let Some(tx) = pending.terminal_tx.take() {
+            let _ = tx.send(result);
+        }
+    }
+
+    async fn finish_codex_compaction_from_turn(&self) {
+        let Some(mut pending) = self.state.lock().await.pending_compaction.take() else {
+            return;
+        };
+        let thread_id = self.state.lock().await.thread_id.clone();
+        let completed = pending.accepted
+            && pending.item_started
+            && pending.item_completed
+            && pending.turn_status.as_deref() == Some("completed");
+        let result = BackendCompactionResult {
+            operation_id: pending.request.operation_id.clone(),
+            dispatch: BackendCompactionDispatchState::Accepted,
+            mutation: if pending.item_completed {
+                BackendCompactionMutationState::Completed
+            } else if pending.item_started {
+                BackendCompactionMutationState::MayHaveMutated
+            } else {
+                BackendCompactionMutationState::NotObserved
+            },
+            outcome: if completed {
+                Ok(BackendCompactionSuccess {
+                    mechanism: CompactionMethod::NativeRpc,
+                })
+            } else {
+                Err(BackendCompactionFailure {
+                    kind: BackendCompactionFailureKind::ProviderFailed,
+                    message: format!(
+                        "Codex compaction ended without a completed contextCompaction item (turn status {:?})",
+                        pending.turn_status
+                    ),
+                })
+            },
+            provider_session_id: Some(SessionId(thread_id.clone())),
+            metrics: CompactionMetrics::default(),
+            post_context_tokens: PostCompactionTokenCount::Unknown,
+            evidence: BackendCompactionTerminalEvidence::Codex {
+                thread_id,
+                turn_id: pending.turn_id,
+                item_id: pending.item_id,
+                deprecated_notification_seen: pending.deprecated_notification_seen,
+            },
+        };
+        if let Some(tx) = pending.terminal_tx.take() {
+            let _ = tx.send(result);
+        }
+    }
+
+    async fn intercept_compaction_notification(&self, method: &str, params: &Value) -> bool {
+        let thread_id = extract_notification_thread_id(params);
+        let item = params.get("item");
+        let item_type = item
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str);
+        let turn_id = extract_turn_id(params).or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+
+        let mut finish = false;
+        let mut progress = None;
+        let mut observed = None;
+        {
+            let mut state = self.state.lock().await;
+            let belongs_to_root = thread_id.as_ref().is_none_or(|id| id == &state.thread_id);
+            if !belongs_to_root {
+                return false;
+            }
+            if let Some(pending) = state.pending_compaction.as_mut() {
+                match method {
+                    "turn/started" => {
+                        if pending.turn_id.is_none() {
+                            pending.turn_id = turn_id.clone();
+                        }
+                        progress = Some(BackendCompactionProgress {
+                            operation_id: pending.request.operation_id.clone(),
+                            stage: CompactionStage::Compacting,
+                            elapsed_ms: None,
+                        });
+                    }
+                    "item/started" if item_type == Some("contextCompaction") => {
+                        if pending.turn_id.is_none() {
+                            pending.turn_id = turn_id.clone();
+                        }
+                        pending.item_started = true;
+                        pending.item_id = item
+                            .and_then(|value| value.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        progress = Some(BackendCompactionProgress {
+                            operation_id: pending.request.operation_id.clone(),
+                            stage: CompactionStage::Compacting,
+                            elapsed_ms: None,
+                        });
+                    }
+                    "item/completed" if item_type == Some("contextCompaction") => {
+                        if pending.turn_id.is_none() {
+                            pending.turn_id = turn_id.clone();
+                        }
+                        pending.item_started = true;
+                        pending.item_completed = true;
+                        pending.item_id = item
+                            .and_then(|value| value.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .or_else(|| pending.item_id.clone());
+                        progress = Some(BackendCompactionProgress {
+                            operation_id: pending.request.operation_id.clone(),
+                            stage: CompactionStage::Finalizing,
+                            elapsed_ms: None,
+                        });
+                    }
+                    "thread/compacted" => {
+                        pending.deprecated_notification_seen = true;
+                    }
+                    "turn/completed"
+                        if pending.turn_id.is_some()
+                            && turn_id.as_ref() == pending.turn_id.as_ref() =>
+                    {
+                        pending.turn_status = params
+                            .get("turn")
+                            .and_then(|turn| turn.get("status"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        finish = true;
+                    }
+                    _ => {}
+                }
+                if matches!(
+                    method,
+                    "turn/started" | "item/started" | "item/completed" | "turn/completed"
+                ) && (pending.turn_id.as_ref() == turn_id.as_ref()
+                    || item_type == Some("contextCompaction"))
+                {
+                    drop(state);
+                    if let Some(progress) = progress {
+                        self.emitter
+                            .compaction_event(&BackendCompactionEvent::Progress(progress));
+                    }
+                    if finish {
+                        self.finish_codex_compaction_from_turn().await;
+                    }
+                    return true;
+                }
+            } else if method == "item/completed" && item_type == Some("contextCompaction") {
+                let turn_id = turn_id.unwrap_or_else(|| "unknown-turn".to_string());
+                let item_id = item
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown-item")
+                    .to_string();
+                observed = Some(BackendObservedCompaction {
+                    observation_id: super::compaction::stable_observation_id(
+                        "codex",
+                        &state.thread_id,
+                        &format!("{turn_id}:{item_id}"),
+                    ),
+                    trigger: CompactionTrigger::BackendAutomatic,
+                    method: CompactionMethod::BackendAutomatic,
+                    provider_session_id: Some(SessionId(state.thread_id.clone())),
+                    metrics: CompactionMetrics::default(),
+                    source: BackendCompactionObservationSource::CodexItem {
+                        thread_id: state.thread_id.clone(),
+                        turn_id,
+                        item_id,
+                    },
+                    user_focus: None,
+                });
+            }
+        }
+        if let Some(observed) = observed {
+            self.emitter
+                .compaction_event(&BackendCompactionEvent::Observed(observed));
+            return true;
+        }
+        false
+    }
+
+    async fn intercept_continuation_notification(&self, method: &str, params: &Value) -> bool {
+        let notification_thread_id = extract_notification_thread_id(params);
+        let notification_turn_id = extract_turn_id(params).or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let mut terminal = None;
+        let intercept = {
+            let mut state = self.state.lock().await;
+            let root = notification_thread_id
+                .as_ref()
+                .is_none_or(|thread_id| thread_id == &state.thread_id);
+            let Some(pending) = state.pending_continuation.as_mut() else {
+                return false;
+            };
+            if !root {
+                return false;
+            }
+            if pending.turn_id.is_none()
+                && is_codex_response_side_notification(method)
+                && notification_turn_id.is_some()
+            {
+                pending.turn_id = notification_turn_id.clone();
+            }
+            match method {
+                "turn/started" if pending.turn_id.is_none() => {
+                    pending.turn_id = notification_turn_id;
+                    true
+                }
+                "turn/completed"
+                    if pending.turn_id.is_some()
+                        && notification_turn_id.as_ref() == pending.turn_id.as_ref() =>
+                {
+                    let completed = params
+                        .get("turn")
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed");
+                    terminal = Some(if completed {
+                        Ok(())
+                    } else {
+                        Err("Codex continuation turn did not complete".to_string())
+                    });
+                    true
+                }
+                method if is_codex_response_side_notification(method) => true,
+                _ => false,
+            }
+        };
+        if let Some(terminal) = terminal {
+            self.finish_codex_continuation(terminal).await;
+        }
+        intercept
+    }
+
     /// Record a command execution that has started but not finished, and arm
     /// the poll that decides whether it is background work.
     async fn track_command_execution(
@@ -5344,6 +6007,10 @@ impl CodexInner {
         let mut total_bytes = 0u64;
 
         for turn in turns {
+            let turn_id = turn
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown-turn");
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
@@ -5352,6 +6019,32 @@ impl CodexInner {
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
                 match item_type {
+                    "contextCompaction" => {
+                        let item_id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown-item");
+                        let thread_id = self.state.lock().await.thread_id.clone();
+                        self.emitter.compaction_event(&BackendCompactionEvent::Observed(
+                            BackendObservedCompaction {
+                                observation_id: super::compaction::stable_observation_id(
+                                    "codex",
+                                    &thread_id,
+                                    &format!("{turn_id}:{item_id}"),
+                                ),
+                                trigger: CompactionTrigger::BackendAutomatic,
+                                method: CompactionMethod::BackendAutomatic,
+                                provider_session_id: Some(SessionId(thread_id.clone())),
+                                metrics: CompactionMetrics::default(),
+                                source: BackendCompactionObservationSource::CodexItem {
+                                    thread_id,
+                                    turn_id: turn_id.to_string(),
+                                    item_id: item_id.to_string(),
+                                },
+                                user_focus: None,
+                            },
+                        ));
+                    }
                     "userMessage" => {
                         let text = extract_codex_item_text(item);
                         if text.trim().is_empty() {
@@ -5572,6 +6265,15 @@ impl CodexInner {
                 self.emitter.subprocess_stderr(&line);
             }
             CodexInbound::Closed { exit_code } => {
+                self.finish_codex_continuation(Err(
+                    "Codex app-server exited during continuation installation".to_string(),
+                ))
+                .await;
+                self.finish_compaction_failure(
+                    BackendCompactionFailureKind::TransportClosed,
+                    "Codex app-server exited during compaction".to_string(),
+                )
+                .await;
                 self.drain_background_commands().await;
                 self.complete_all_codex_subagents().await;
                 self.emitter.subprocess_exit(exit_code);
@@ -5594,6 +6296,12 @@ impl CodexInner {
     }
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
+        if self.intercept_continuation_notification(method, params).await {
+            return;
+        }
+        if self.intercept_compaction_notification(method, params).await {
+            return;
+        }
         self.trace_notification_structure(method, params).await;
         self.trace_agent_message_identity_event(method, params)
             .await;
@@ -12605,6 +13313,7 @@ struct CodexRpc {
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
 }
 
 impl CodexRpc {
@@ -12784,6 +13493,13 @@ impl CodexRpc {
                 child: child_ref,
                 stdout_task,
                 stderr_task,
+                compaction_capability: Arc::new(std::sync::Mutex::new(
+                    BackendCompactionCapability::unknown(
+                        BackendCompactionUnknownReason::ProcessNotInitialized,
+                        None,
+                        BackendCompactionCapabilityEvidence::None,
+                    ),
+                )),
             },
             inbound_rx,
         ))
@@ -12999,14 +13715,24 @@ impl Drop for CodexRpc {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SpawnCostHint,
+    AgentInput, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics, CompactionStage,
+    CompactionTrigger, MessageSender, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SpawnCostHint,
 };
 
 use super::{
-    Backend, BackendEvent, BackendSession, BackendSpawnConfig, EventStream,
-    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
-    session_settings_to_json,
+    Backend, BackendCompactionAvailability, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
+    BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
+    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
+    BackendCompactionObservationSource,
+    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendCompactionUnknownReason,
+    BackendContextReseatSupport, BackendEvent,
+    BackendObservedCompaction, BackendSession, BackendSpawnConfig, EventStream,
+    PostCompactionTokenCount, protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 pub struct CodexBackend {
@@ -13015,6 +13741,7 @@ pub struct CodexBackend {
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+    compaction_handle: Arc<std::sync::Mutex<Option<CodexCommandHandle>>>,
 }
 
 struct CodexSettingsUpdate {
@@ -13067,6 +13794,9 @@ impl CodexBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
         let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
+        let compaction_handle =
+            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let task_compaction_handle = Arc::clone(&compaction_handle);
 
         tokio::spawn(async move {
             let combined_instructions = (!inference_only)
@@ -13125,6 +13855,9 @@ impl CodexBackend {
             }
 
             let handle = session.command_handle();
+            *task_compaction_handle
+                .lock()
+                .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
             let resolved_settings = if inference_only {
                 protocol::SessionSettingsValues::default()
             } else {
@@ -13376,6 +14109,7 @@ impl CodexBackend {
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
+                compaction_handle,
             },
             EventStream::new_backend(events_rx),
         ))
@@ -13669,6 +14403,18 @@ fn forward_codex_backend_stream_event(
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
     normalization_failures: &mut HashMap<String, PendingToolNormalizationFailure>,
 ) -> bool {
+    if raw.get("kind").and_then(Value::as_str) == Some("BackendCompaction") {
+        let Some(data) = raw.get("data") else {
+            return true;
+        };
+        match serde_json::from_value::<BackendCompactionEvent>(data.clone()) {
+            Ok(event) => return events_tx.send(BackendEvent::Compaction(event)).is_ok(),
+            Err(err) => {
+                tracing::warn!("Failed to decode internal Codex compaction event: {err}");
+                return true;
+            }
+        }
+    }
     if let Some(usage) = model_request_token_usage_from_raw(&raw) {
         return events_tx
             .send(BackendEvent::ModelRequestTokenUsage(usage))
@@ -14072,6 +14818,9 @@ impl Backend for CodexBackend {
             tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let compaction_handle =
+            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let task_compaction_handle = Arc::clone(&compaction_handle);
 
         let session_id = session_id.0;
         let backend_session_id =
@@ -14176,6 +14925,9 @@ impl Backend for CodexBackend {
                     return;
                 }
             }
+            *task_compaction_handle
+                .lock()
+                .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
             if let Some(tx) = resume_replay_complete_tx.take() {
                 let _ = tx.send(());
             }
@@ -14261,6 +15013,7 @@ impl Backend for CodexBackend {
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
+                compaction_handle,
             },
             EventStream::new_backend_with_resume_replay_barrier(
                 events_rx,
@@ -14291,6 +15044,9 @@ impl Backend for CodexBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let compaction_handle =
+            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let task_compaction_handle = Arc::clone(&compaction_handle);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
@@ -14336,6 +15092,9 @@ impl Backend for CodexBackend {
 
             let child_session_id = session.session_id();
             let handle = session.command_handle();
+            *task_compaction_handle
+                .lock()
+                .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
             let maybe_emitter = subagent_emitter_rx.borrow().clone();
             if let Some(emitter) = maybe_emitter
                 && let Err(err) = session.set_subagent_emitter(emitter).await
@@ -14511,6 +15270,7 @@ impl Backend for CodexBackend {
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
+                compaction_handle,
             },
             EventStream::new_backend(events_rx),
         ))
@@ -14518,6 +15278,67 @@ impl Backend for CodexBackend {
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
         Err("CodexBackend::list_sessions requires a live Codex RPC session".to_string())
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.compaction_handle
+            .lock()
+            .expect("Codex compaction handle mutex poisoned")
+            .as_ref()
+            .map(CodexCommandHandle::compaction_capability)
+            .unwrap_or_else(|| {
+                BackendCompactionCapability::unknown(
+                    BackendCompactionUnknownReason::ProcessNotInitialized,
+                    None,
+                    BackendCompactionCapabilityEvidence::None,
+                )
+            })
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        let handle = self
+            .compaction_handle
+            .lock()
+            .expect("Codex compaction handle mutex poisoned")
+            .clone();
+        match handle {
+            Some(handle) => handle.begin_compaction(request).await,
+            None => BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::SessionInitializing,
+            },
+        }
+    }
+
+    async fn install_continuation_context(
+        &self,
+        context: super::BackendContinuationContext,
+    ) -> super::BackendContextReseatResult {
+        let handle = self
+            .compaction_handle
+            .lock()
+            .expect("Codex compaction handle mutex poisoned")
+            .clone();
+        match handle {
+            Some(handle) => handle.install_continuation_context(context).await,
+            None => {
+                let status = |items: &[super::BackendContinuationItem]| {
+                    if items.is_empty() {
+                        super::ContinuationInstallStatus::NotRequired
+                    } else {
+                        super::ContinuationInstallStatus::Failed {
+                            message: "Codex session is still initializing".to_string(),
+                        }
+                    }
+                };
+                super::BackendContextReseatResult {
+                    required: status(&context.required),
+                    advisory: status(&context.advisory),
+                }
+            }
+        }
     }
 
     fn session_id(&self) -> SessionId {
@@ -19583,6 +20404,8 @@ for line in sys.stdin:
             execution_mode: BackendExecutionMode::Agent,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
+            pending_compaction: None,
+            pending_continuation: None,
             active_stream: Some(ActiveStreamState {
                 turn_id: "turn-test".to_string(),
                 message_id: ChatMessageId("msg-seed".to_string()),
@@ -19660,6 +20483,17 @@ for line in sys.stdin:
             child: Arc::new(Mutex::new(Some(child))),
             stdout_task,
             stderr_task,
+            compaction_capability: Arc::new(std::sync::Mutex::new(
+                BackendCompactionCapability::native(
+                    BackendCompactionMechanism::JsonRpcRequest,
+                    Some("0.144.3".to_string()),
+                    BackendCompactionProtocolConfidence::Verified,
+                    BackendContextReseatSupport::InjectAfterNative,
+                    BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+                        user_agent: "codex-cli 0.144.3".to_string(),
+                    },
+                ),
+            )),
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {
@@ -30191,5 +31025,147 @@ Do not describe the tool, and do not skip the tool call."#;
                     "mcp_servers.{AGENT_CONTROL_AWAIT_MCP_SERVER_NAME}.tool_timeout_sec={CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS}"
                 )
         }));
+    }
+
+    #[test]
+    fn compaction_capability_requires_exact_fixture_version() {
+        let verified = codex_compaction_capability(Some("codex-cli 0.144.3"));
+        assert!(matches!(
+            verified.availability,
+            BackendCompactionAvailability::Native {
+                mechanism: BackendCompactionMechanism::JsonRpcRequest
+            }
+        ));
+        assert_eq!(
+            verified.confidence,
+            Some(BackendCompactionProtocolConfidence::Verified)
+        );
+
+        let unreviewed = codex_compaction_capability(Some("codex-cli 0.145.0"));
+        assert!(matches!(
+            unreviewed.availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::ProtocolNotAllowlisted
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_success_requires_correlated_item_and_turn_terminal() {
+        let (inner, mut events) = test_codex_inner();
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn_id = None;
+            state.active_stream = None;
+            state.pending_compaction = Some(PendingCodexCompaction {
+                request: BackendCompactionRequest {
+                    operation_id: protocol::CompactionOperationId("compact-op".to_string()),
+                    trigger: CompactionTrigger::UserRequested,
+                    focus: None,
+                    transcript_authoritative: true,
+                    continuation: crate::backend::BackendContinuationContext {
+                        required: Vec::new(),
+                        advisory: Vec::new(),
+                    },
+                },
+                terminal_tx: Some(terminal_tx),
+                accepted: true,
+                turn_id: None,
+                item_id: None,
+                item_started: false,
+                item_completed: false,
+                turn_status: None,
+                deprecated_notification_seen: false,
+            });
+        }
+
+        assert!(
+            inner
+                .intercept_compaction_notification(
+                    "turn/started",
+                    &json!({"threadId":"thread-test","turn":{"id":"turn-compact"}}),
+                )
+                .await
+        );
+        assert!(
+            inner
+                .intercept_compaction_notification(
+                    "item/started",
+                    &json!({"threadId":"thread-test","turnId":"turn-compact","item":{"id":"item-compact","type":"contextCompaction"}}),
+                )
+                .await
+        );
+        assert!(
+            inner
+                .intercept_compaction_notification(
+                    "item/completed",
+                    &json!({"threadId":"thread-test","turnId":"turn-compact","item":{"id":"item-compact","type":"contextCompaction"}}),
+                )
+                .await
+        );
+        assert!(
+            inner
+                .intercept_compaction_notification(
+                    "turn/completed",
+                    &json!({"threadId":"thread-test","turn":{"id":"turn-compact","status":"completed"}}),
+                )
+                .await
+        );
+
+        let result = terminal_rx.await.expect("terminal compaction result");
+        assert!(result.outcome.is_ok());
+        assert_eq!(result.mutation, BackendCompactionMutationState::Completed);
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event.get("kind").and_then(Value::as_str),
+                Some("StreamStart"),
+                "structured Codex compaction must not open a public stream"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_turn_is_suppressed_from_public_chat() {
+        let (inner, mut events) = test_codex_inner();
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn_id = None;
+            state.active_stream = None;
+            state.pending_continuation = Some(PendingCodexContinuation {
+                terminal_tx: Some(terminal_tx),
+                turn_id: None,
+            });
+        }
+        assert!(
+            inner
+                .intercept_continuation_notification(
+                    "turn/started",
+                    &json!({"threadId":"thread-test","turn":{"id":"turn-continuation"}}),
+                )
+                .await
+        );
+        assert!(
+            inner
+                .intercept_continuation_notification(
+                    "item/agentMessage/delta",
+                    &json!({"threadId":"thread-test","turnId":"turn-continuation","itemId":"hidden","delta":"internal"}),
+                )
+                .await
+        );
+        assert!(
+            inner
+                .intercept_continuation_notification(
+                    "turn/completed",
+                    &json!({"threadId":"thread-test","turn":{"id":"turn-continuation","status":"completed"}}),
+                )
+                .await
+        );
+        assert_eq!(terminal_rx.await.expect("continuation terminal"), Ok(()));
+        assert!(
+            events.try_recv().is_err(),
+            "continuation injection must not emit a public chat lifecycle"
+        );
     }
 }

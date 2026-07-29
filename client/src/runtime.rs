@@ -10,7 +10,8 @@ use protocol::{
     CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
+    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
     HostBootstrapPayload, HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload,
     ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
     MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAccessedPayload,
@@ -23,7 +24,8 @@ use protocol::{
     SessionSettingsPayload, SessionSummaryCountUpdatedPayload, SetAgentNamePayload,
     SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
     StreamPath, TaskTokenUsagePayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamContextCompactionNotifyPayload, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
     TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalClosePayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
@@ -155,6 +157,7 @@ pub enum HostEvent {
     TeamPresetCatalogNotify(TeamPresetCatalogNotifyPayload),
     TeamDraftNotify(TeamDraftNotifyPayload),
     TeamMemberShuffleSuggestionNotify(TeamMemberShuffleSuggestionNotifyPayload),
+    TeamContextCompactionNotify(TeamContextCompactionNotifyPayload),
     WorkflowNotify(WorkflowNotifyPayload),
     WorkflowRunNotify(WorkflowRunNotifyPayload),
     AgentClosed(AgentClosedPayload),
@@ -168,6 +171,8 @@ pub enum AgentEvent {
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
     ActivityStats(AgentActivityStatsPayload),
+    ContextCompactionNotify(ContextCompactionNotifyPayload),
+    ContextCompactionCapability(ContextCompactionCapabilityPayload),
     Chat(Box<ChatEvent>),
     SessionHistory(SessionHistoryPayload),
     SessionSettings(SessionSettingsPayload),
@@ -1125,6 +1130,16 @@ async fn handle_host_envelope(
                 .await;
             true
         }
+        FrameKind::TeamContextCompactionNotify => {
+            let payload: TeamContextCompactionNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::TeamContextCompactionNotify(payload))
+                .await;
+            true
+        }
         FrameKind::SessionSchemas => {
             let payload: SessionSchemasPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1291,11 +1306,132 @@ async fn emit_new_agent_endpoint(
 fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
     match event {
         AgentEvent::Start(payload) => payload.session_id.clone(),
-        AgentEvent::Bootstrap(payload) => payload.events.iter().find_map(|event| match event {
-            protocol::AgentBootstrapEvent::AgentStart(payload) => payload.session_id.clone(),
-            _ => None,
-        }),
-        _ => None,
+        AgentEvent::Bootstrap(payload) => bootstrap_agent_session_id(payload),
+        AgentEvent::ContextCompactionNotify(payload) => {
+            Some(payload.logical_session_id.clone())
+        }
+        AgentEvent::ContextCompactionCapability(payload) => {
+            Some(payload.logical_session_id.clone())
+        }
+        AgentEvent::Renamed(_)
+        | AgentEvent::Error(_)
+        | AgentEvent::ActivityStats(_)
+        | AgentEvent::Chat(_)
+        | AgentEvent::SessionHistory(_)
+        | AgentEvent::SessionSettings(_)
+        | AgentEvent::QueuedMessages(_) => None,
+    }
+}
+
+fn bootstrap_agent_session_id(
+    payload: &AgentBootstrapPayload,
+) -> Option<protocol::SessionId> {
+    let mut logical_session_id = None;
+    for event in &payload.events {
+        let candidate = match event {
+            protocol::AgentBootstrapEvent::AgentStart(payload) => payload.session_id.as_ref(),
+            protocol::AgentBootstrapEvent::ContextCompaction(payload) => {
+                Some(&payload.logical_session_id)
+            }
+            protocol::AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+                Some(&payload.logical_session_id)
+            }
+            protocol::AgentBootstrapEvent::AgentError(_)
+            | protocol::AgentBootstrapEvent::SessionSettings(_)
+            | protocol::AgentBootstrapEvent::QueuedMessages(_)
+            | protocol::AgentBootstrapEvent::AgentActivityStats(_)
+            | protocol::AgentBootstrapEvent::ChatEvent(_)
+            | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => None,
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if let Some(current) = logical_session_id.as_ref()
+            && current != candidate
+        {
+            log::error!(
+                "agent bootstrap carried conflicting logical sessions {} and {}",
+                current.0,
+                candidate.0,
+            );
+            return None;
+        }
+        logical_session_id = Some(candidate.clone());
+    }
+    logical_session_id
+}
+
+#[cfg(test)]
+mod compaction_session_tests {
+    use super::*;
+
+    fn notify(session_id: &str) -> ContextCompactionNotifyPayload {
+        ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId("operation".to_owned()),
+            agent_id: protocol::AgentId("agent".to_owned()),
+            logical_session_id: protocol::SessionId(session_id.to_owned()),
+            backend_kind: protocol::BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: Some(protocol::CompactionMethod::NativeTextCommand),
+            status: protocol::ContextCompactionStatus::Started {
+                stage: protocol::CompactionStage::Compacting,
+            },
+            provider_version: None,
+            metrics: Default::default(),
+            continuation: None,
+            message: None,
+        }
+    }
+
+    fn capability(session_id: &str) -> ContextCompactionCapabilityPayload {
+        ContextCompactionCapabilityPayload {
+            agent_id: protocol::AgentId("agent".to_owned()),
+            logical_session_id: protocol::SessionId(session_id.to_owned()),
+            availability: protocol::RequestedCompactionAvailability::Available {
+                route: protocol::RequestedCompactionRoute::NativePreferred,
+            },
+        }
+    }
+
+    #[test]
+    fn compaction_events_resolve_pending_agent_session_identity() {
+        let session_id = protocol::SessionId("logical-session".to_owned());
+        assert_eq!(
+            agent_event_session_id(&AgentEvent::ContextCompactionNotify(notify(
+                &session_id.0
+            ))),
+            Some(session_id.clone())
+        );
+        assert_eq!(
+            agent_event_session_id(&AgentEvent::ContextCompactionCapability(capability(
+                &session_id.0
+            ))),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn bootstrap_folds_compaction_sessions_and_rejects_conflicts() {
+        let bootstrap = |capability_session: &str| AgentBootstrapPayload {
+            events: vec![
+                protocol::AgentBootstrapEvent::ContextCompaction(notify("logical-session")),
+                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability(
+                    capability_session,
+                )),
+            ],
+            latest_output: Default::default(),
+            turn_active: false,
+        };
+
+        assert_eq!(
+            bootstrap_agent_session_id(&bootstrap("logical-session")),
+            Some(protocol::SessionId("logical-session".to_owned()))
+        );
+        assert_eq!(
+            bootstrap_agent_session_id(&bootstrap("other-session")),
+            None,
+            "a contradictory bootstrap must not assign a logical session"
+        );
     }
 }
 
@@ -1363,6 +1499,32 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 payload.agent_id, envelope.stream
             );
             AgentEvent::ActivityStats(payload)
+        }
+        FrameKind::ContextCompactionNotify => {
+            let payload: ContextCompactionNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            let stream_parts = parse_agent_stream(&envelope.stream);
+            assert_eq!(
+                payload.agent_id, stream_parts.agent_id,
+                "context_compaction_notify payload agent_id {} does not match stream {}",
+                payload.agent_id, envelope.stream
+            );
+            AgentEvent::ContextCompactionNotify(payload)
+        }
+        FrameKind::ContextCompactionCapability => {
+            let payload: ContextCompactionCapabilityPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            let stream_parts = parse_agent_stream(&envelope.stream);
+            assert_eq!(
+                payload.agent_id, stream_parts.agent_id,
+                "context_compaction_capability payload agent_id {} does not match stream {}",
+                payload.agent_id, envelope.stream
+            );
+            AgentEvent::ContextCompactionCapability(payload)
         }
         FrameKind::ChatEvent => {
             let payload: ChatEvent = match envelope.parse_payload() {

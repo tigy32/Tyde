@@ -3560,9 +3560,9 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, empty_session_settings_schema,
-    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
-    session_settings_to_json,
+    Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendSession,
+    BackendSpawnConfig, EventStream, empty_session_settings_schema, protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 const BACKEND_AGENT_NAME: &str = "kiro";
@@ -3607,6 +3607,12 @@ pub(crate) fn resolve_session_settings(
 impl Backend for KiroBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         empty_session_settings_schema(BackendKind::Kiro)
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        BackendCompactionCapability::context_unavailable(
+            BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        )
     }
 
     async fn spawn(

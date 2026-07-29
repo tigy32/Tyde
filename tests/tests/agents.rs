@@ -1703,6 +1703,9 @@ async fn expect_replayed_turn_on_stream(
             stream,
             FetchSessionHistoryPayload {
                 agent_id: agent_id.clone(),
+                request_id: protocol::HistoryPageRequestId(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
                 before_seq: None,
                 limit: 10,
             },

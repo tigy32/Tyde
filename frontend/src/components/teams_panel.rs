@@ -2,9 +2,9 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    AgentControlStatus, AgentId, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint,
-    StreamPath, Team, TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit,
-    TeamDraftMemberId, TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload,
+    AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint, Team,
+    TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload,
     TeamMemberCreateSpec, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
     TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId,
     TeamTemplateId,
@@ -349,68 +349,51 @@ fn TeamCard(
             })
     });
 
-    // Team-level Compact targets: mirror the server's accept/reject
-    // rules so the button only enables when the server would accept the
-    // `TeamCompact` frame. Returns `None` (button disabled) when:
-    //   * any Active member is missing a binding entry (server treats
-    //     this as an internal error),
-    //   * any Active member's binding is not Idle (server rejects with
-    //     conflict), regardless of whether it's bound to a live agent,
-    //   * any Active+Idle+bound member is already mid-compaction,
-    //   * any Active+Idle+bound member is missing from `state.agents`.
-    // Active+Idle members with no `current_agent_id` are skipped — the
-    // server accepts them too (nothing to compact). Members in any
-    // non-Active state are skipped. Returns `None` if the resulting
-    // target list is empty (nothing to compact).
+    // Team-level Compact targets: every Active member with a bound agent.
+    //
+    // Eligibility is deliberately *not* decided here any more. It is decided by
+    // the shared per-agent capability selector, so the team button and the
+    // per-member buttons cannot disagree about the same agents — the previous
+    // split (binding-idle plus legacy replacement state here, capability
+    // there) let a team refuse a request an individual member accepted.
     let host_for_team_targets = host_id.clone();
     let state_for_team_targets = state.clone();
     let members_for_team_targets = members;
-    let team_compact_targets = move || -> Option<Vec<(AgentId, StreamPath)>> {
-        let bindings = state_for_team_targets
+    let team_compact_targets = move || -> Vec<ActiveAgentRef> {
+        let Some(bindings) = state_for_team_targets
             .team_member_bindings
-            .with(|m| m.get(&host_for_team_targets).cloned())?;
-        let compacting = state_for_team_targets
-            .compaction_in_progress
-            .with(|m| m.keys().cloned().collect::<std::collections::HashSet<_>>());
-        let agents_snapshot = state_for_team_targets.agents.get();
-        let mut targets: Vec<(AgentId, StreamPath)> = Vec::new();
+            .with(|m| m.get(&host_for_team_targets).cloned())
+        else {
+            return Vec::new();
+        };
+        let mut targets: Vec<ActiveAgentRef> = Vec::new();
         for member in members_for_team_targets.get() {
             if !matches!(member.state, TeamMemberState::Active) {
                 continue;
             }
-            let binding = bindings.get(&member.id)?;
-            if !matches!(binding.status, protocol::AgentControlStatus::Idle) {
-                return None;
-            }
+            let Some(binding) = bindings.get(&member.id) else {
+                continue;
+            };
             let Some(agent_id) = binding.current_agent_id.clone() else {
                 continue;
             };
-            if compacting.contains(&agent_id) {
-                return None;
-            }
-            let stream = agents_snapshot
-                .iter()
-                .find(|a| a.host_id == host_for_team_targets && a.agent_id == agent_id)
-                .map(|a| a.instance_stream.clone())?;
-            targets.push((agent_id, stream));
+            targets.push(ActiveAgentRef {
+                host_id: host_for_team_targets.clone(),
+                agent_id,
+            });
         }
-        if targets.is_empty() {
-            return None;
-        }
-        Some(targets)
+        targets
     };
 
-    let host_for_team_compact_gate = host_id.clone();
+    // One selector for the team button and every per-member button, so the two
+    // can never disagree about the same agents.
     let state_for_team_compact_gate = state.clone();
     let team_compact_targets_for_gate = team_compact_targets.clone();
-    let can_compact_team = move || {
-        if !matches!(
-            state_for_team_compact_gate.connection_status_for_host(&host_for_team_compact_gate),
-            crate::state::ConnectionStatus::Connected
-        ) {
-            return false;
-        }
-        team_compact_targets_for_gate().is_some()
+    let team_compaction_control = move || {
+        crate::actions::team_compaction_control_state(
+            &state_for_team_compact_gate,
+            &team_compact_targets_for_gate(),
+        )
     };
 
     let host_for_team_compact_click = host_id.clone();
@@ -420,11 +403,15 @@ fn TeamCard(
     let team_compact_targets_for_click = team_compact_targets;
     let on_team_compact_click = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
-        let Some(targets) = team_compact_targets_for_click() else {
-            return;
-        };
-        let host_id = host_for_team_compact_click.clone();
+        let targets = team_compact_targets_for_click();
+        // Re-read after the confirmation await rather than reusing the list
+        // computed before it — bindings can change while the dialog is open.
+        let team_targets_after_confirm = team_compact_targets_for_click.clone();
         let state = state_for_team_compact_click.clone();
+        if !crate::actions::team_compaction_control_state(&state, &targets).is_enabled() {
+            return;
+        }
+        let host_id = host_for_team_compact_click.clone();
         let team_id = team_id_for_compact_click.clone();
         let team_label = team_name_for_compact
             .get_untracked()
@@ -432,35 +419,113 @@ fn TeamCard(
             .unwrap_or_default();
         let count = targets.len();
         let plural = if count == 1 { "agent" } else { "agents" };
+        // Compaction no longer replaces agents or closes sessions, so the copy
+        // must not keep promising that it does. Every member keeps its agent,
+        // its session, and its visible transcript.
         let message = format!(
-            "Compact context for every member of \"{team_label}\"?\n\nEach of the {count} bound {plural} will write a summary of context worth keeping and a fresh replacement will start from that summary. The original sessions are closed and kept in Sessions as read-only records — you can view them, but they can't be resumed."
+            "Compact the model context for every member of \"{team_label}\"?\n\nEach of \
+             the {count} bound {plural} will have its working context summarized so it has \
+             room to keep going. Your conversation history is not changed — nothing is \
+             deleted, and the agents, their sessions, and your open tabs all stay the \
+             same.\n\nMembers running a turn will wait for it to finish. This can take \
+             several minutes."
         );
         spawn_local(async move {
             if !crate::bridge::confirm_dialog("Compact context", &message).await {
                 return;
             }
-            // Optimistically flag every targeted agent in-flight so the
-            // per-member Compact icons and the team button itself
-            // re-gate to disabled until per-agent AgentCompactNotify
-            // events settle. Mirrors the per-member compact path's
-            // double-fire defense.
-            for (agent_id, _) in &targets {
-                state.mark_compaction_started(&host_id, agent_id.clone());
+
+            // Re-evaluate after the await. The dialog is open for as long as the
+            // user takes to read it, and in that window another surface — or
+            // another client — can start a compaction for one of these members.
+            // Eligibility checked before the dialog is stale by the time we act
+            // on it.
+            let targets = team_targets_after_confirm();
+            if !crate::actions::team_compaction_control_state(&state, &targets).is_enabled() {
+                log::info!("team compact: no longer eligible after confirmation; not sending");
+                return;
             }
+
+            // All-or-nothing. `TeamCompact` targets the whole team, not the
+            // subset this client managed to claim, so sending after a partial
+            // claim would issue a duplicate request for the member someone else
+            // already started — and would strand local `Requesting` state on the
+            // members that did claim.
+            let mut claimed: Vec<ActiveAgentRef> = Vec::new();
+            let mut all_claimed = true;
+            for target in &targets {
+                if state.begin_compaction_request(&target.agent_id) {
+                    claimed.push(target.clone());
+                } else {
+                    all_claimed = false;
+                    break;
+                }
+            }
+            let release_all = |claimed: &[ActiveAgentRef], reason: &str| {
+                for target in claimed {
+                    state.abandon_compaction_request(&target.agent_id, reason.to_owned());
+                }
+            };
+            if !all_claimed || claimed.is_empty() {
+                release_all(&claimed, "another compaction started first");
+                log::info!("team compact: could not claim every member; rolled back and not sending");
+                return;
+            }
+
             let Some(host_stream) = state.host_stream_untracked(&host_id) else {
                 log::error!("team compact: no host stream for {host_id}");
-                for (agent_id, _) in targets {
-                    state.finish_compaction_failure(agent_id, "no host stream".to_string());
-                }
+                release_all(&claimed, "no host stream");
                 return;
             };
-            if let Err(e) = crate::send::team_compact(&host_id, host_stream, team_id).await {
-                log::error!("team compact: failed to send TeamCompact: {e}");
-                for (agent_id, _) in targets {
-                    state.finish_compaction_failure(agent_id, e.clone());
-                }
+            if let Err(error) = crate::send::team_compact(&host_id, host_stream, team_id).await {
+                log::error!("team compact: failed to send TeamCompact: {error}");
+                release_all(&claimed, &error);
             }
         });
+    };
+
+    // The aggregate result of the last team compaction, so the team surface
+    // reports its own outcome instead of the user having to infer it from
+    // per-member cards. Includes each member that did not complete, because a
+    // partial team failure is exactly the case a single aggregate word hides.
+    let host_for_team_result = host_id.clone();
+    let team_id_for_result = team_id.clone();
+    let state_for_team_result = state.clone();
+    let team_compaction_summary = move || -> Option<(String, bool)> {
+        let payload = state_for_team_result.team_context_compactions.with(|map| {
+            map.get(&(host_for_team_result.clone(), team_id_for_result.clone()))
+                .cloned()
+        })?;
+        let failed: Vec<&protocol::TeamMemberContextCompactionResult> = payload
+            .members
+            .iter()
+            .filter(|member| {
+                !matches!(member.status, protocol::ContextCompactionStatus::Completed)
+            })
+            .collect();
+        match payload.status {
+            protocol::TeamContextCompactionStatus::Started => {
+                Some(("Compacting team context\u{2026}".to_owned(), false))
+            }
+            protocol::TeamContextCompactionStatus::Completed => Some((
+                "Team context compacted. Conversation history is unchanged.".to_owned(),
+                false,
+            )),
+            protocol::TeamContextCompactionStatus::Failed => {
+                let mut text = payload
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Some members could not be compacted.".to_owned());
+                for member in failed {
+                    if let Some(reason) =
+                        member.message.as_deref().map(str::trim).filter(|r| !r.is_empty())
+                    {
+                        text.push_str(&format!(" {}: {reason}", member.agent_id.0));
+                    }
+                }
+                Some((text, true))
+            }
+        }
     };
 
     let host_for_rows = host_id.clone();
@@ -498,21 +563,36 @@ fn TeamCard(
                         "+ Report"
                     </button>
                     {move || {
-                        let enabled = can_compact_team();
+                        let control = team_compaction_control();
+                        let enabled = control.is_enabled();
+                        let reason = control.reason();
+                        let label = match reason {
+                            None => "Compact context for every bound team member".to_owned(),
+                            Some(reason) => {
+                                format!("Compact context — unavailable: {reason}")
+                            }
+                        };
                         view! {
                             <button
                                 class="filter-toggle team-card-compact"
                                 type="button"
-                                title=if enabled {
-                                    "Compact context for every bound team member"
-                                } else {
-                                    "Compact context (available when every bound member is idle)"
-                                }
-                                aria-label="Compact context"
-                                disabled=!enabled
+                                title=label.clone()
+                                aria-label=label
+                                // `aria-disabled` rather than the native
+                                // `disabled` attribute: a natively-disabled
+                                // button is not focusable, so a keyboard or
+                                // screen-reader user can never reach the
+                                // explanation for why it is unavailable. The
+                                // click handler re-checks the gate.
+                                aria-disabled=move || if enabled { "false" } else { "true" }
+                                data-test="team-card-compact"
                                 on:click=on_team_compact_click.clone()
                             >
                                 "Compact context"
+                                {(!enabled)
+                                    .then(|| reason.map(|reason| view! {
+                                        <span class="team-card-compact-reason">{reason}</span>
+                                    }))}
                             </button>
                         }
                     }}
@@ -525,6 +605,21 @@ fn TeamCard(
                     </button>
                 </div>
             </div>
+            {move || team_compaction_summary().map(|(text, failed)| {
+                // Not a live region: the announcement already happened once,
+                // assertively for a failure, at the moment the result arrived.
+                // A live region here would replay it on every remount.
+                view! {
+                    <div
+                        class=move || if failed {
+                            "team-card-compaction-summary team-card-compaction-summary-failed"
+                        } else {
+                            "team-card-compaction-summary"
+                        }
+                        data-test="team-compaction-summary"
+                    >{text}</div>
+                }
+            })}
             <div class="team-card-roster">
                 <For
                     each=move || members.get()
@@ -662,36 +757,29 @@ fn MemberRow(
         on_promote.run(mid_for_promote.clone());
     };
 
-    // Compact/Rotate action on a team member operates on the live bound
-    // agent. Gated on: there *is* a live binding for this member, that
-    // binding is `Idle`, the binding's agent isn't already mid-
-    // compaction, and the host is connected. Hidden otherwise so the
-    // user never sees an enabled button they can't usefully press.
+    // Compact action on a team member operates on the live bound agent, and
+    // uses exactly the same capability selector and request gate as the chat
+    // header, the agent card, the palette, and the team-wide button.
+    //
+    // It is no longer hidden, and no longer gated on binding-idle: an active
+    // turn is not a refusal, the server defers to a safe point. Hiding a
+    // control whose blocker is transient teaches the user it does not exist.
     let host_for_compact = host_id.clone();
     let binding_for_compact = binding;
     let state_for_compact_gate = state.clone();
-    let can_compact = move || {
+    let member_compaction_control = move || {
         let Some(binding) = binding_for_compact.get() else {
-            return false;
+            return crate::actions::CompactionControlState::Disabled("No bound agent");
         };
-        if binding.current_agent_id.is_none() {
-            return false;
-        }
-        if !matches!(binding.status, protocol::AgentControlStatus::Idle) {
-            return false;
-        }
         let Some(agent_id) = binding.current_agent_id else {
-            return false;
+            return crate::actions::CompactionControlState::Disabled("No bound agent");
         };
-        if state_for_compact_gate
-            .compaction_in_progress
-            .with(|map| map.contains_key(&agent_id))
-        {
-            return false;
-        }
-        matches!(
-            state_for_compact_gate.connection_status_for_host(&host_for_compact),
-            crate::state::ConnectionStatus::Connected
+        crate::actions::compaction_control_state(
+            &state_for_compact_gate,
+            &ActiveAgentRef {
+                host_id: host_for_compact.clone(),
+                agent_id,
+            },
         )
     };
     let host_for_compact_click = host_id.clone();
@@ -707,34 +795,16 @@ fn MemberRow(
         };
         let host_id = host_for_compact_click.clone();
         let state = state_for_compact_click.clone();
-        let agent_stream = state.agents.with_untracked(|agents| {
-            agents
-                .iter()
-                .find(|a| a.host_id == host_id && a.agent_id == agent_id)
-                .map(|a| a.instance_stream.clone())
-        });
-        let Some(agent_stream) = agent_stream else {
-            log::error!(
-                "team-member compact: bound agent {} not found on host {host_id}",
-                agent_id.0
-            );
-            return;
-        };
-        // The server marks the predecessor session non-resumable as
-        // part of the compaction protocol, so don't promise the user
-        // they can pick it back up. The summary stays in Sessions as
-        // a read-only record of what was kept.
-        let message =
-            "Compact agent for this team member?\n\nThe agent will write a summary of context worth keeping and a fresh replacement will start from that summary. The original session is closed and kept in Sessions as a read-only record — you can view it, but it can't be resumed.".to_string();
+        // Routed through the same helper as the chat header, the agent card,
+        // and the command palette, so all four share one capability rule and
+        // one duplicate-submit gate.
         spawn_local(async move {
-            if !crate::bridge::confirm_dialog("Compact agent", &message).await {
-                return;
-            }
-            state.mark_compaction_started(&host_id, agent_id.clone());
-            if let Err(e) = crate::send::compact_agent(&host_id, agent_stream).await {
-                log::error!("team-member compact: failed to send AgentCompact: {e}");
-                state.finish_compaction_failure(agent_id, e);
-            }
+            crate::actions::request_context_compaction(
+                state,
+                crate::state::ActiveAgentRef { host_id, agent_id },
+                "this team member".to_owned(),
+            )
+            .await;
         });
     };
 
@@ -828,15 +898,28 @@ fn MemberRow(
                         on:click=on_promote_click.clone()
                     >"\u{2605}"</button>
                 })}
-                {move || can_compact().then(|| view! {
-                    <button
-                        class="team-member-icon-btn team-member-icon-btn-compact"
-                        type="button"
-                        title="Compact agent"
-                        aria-label="Compact agent"
-                        on:click=on_compact_click.clone()
-                    >"\u{27F2}"</button>
-                })}
+                {move || {
+                    let control = member_compaction_control();
+                    let enabled = control.is_enabled();
+                    let label = match control.reason() {
+                        None => "Compact context".to_owned(),
+                        Some(reason) => format!("Compact context — unavailable: {reason}"),
+                    };
+                    view! {
+                        <button
+                            class="team-member-icon-btn team-member-icon-btn-compact"
+                            type="button"
+                            title=label.clone()
+                            aria-label=label
+                            // `aria-disabled`, not the native attribute: a
+                            // natively-disabled button is unfocusable, so the
+                            // reason would be unreachable by keyboard.
+                            aria-disabled=move || if enabled { "false" } else { "true" }
+                            data-test="team-member-compact"
+                            on:click=on_compact_click.clone()
+                        >"\u{27F2}"</button>
+                    }
+                }}
                 <button
                     class="team-member-icon-btn"
                     type="button"
@@ -2809,15 +2892,24 @@ mod wasm_tests {
         );
     }
 
-    /// Compact icon on a `MemberRow` only shows up when the team member
-    /// has a live binding (`current_agent_id` is `Some`) AND that binding
-    /// is `Idle` AND the bound agent is in `state.agents` (so we can
-    /// route to its instance stream) AND the host is connected.
-    /// Clicking it (through the OK-stubbed confirm dialog) sends a real
-    /// `AgentCompact` frame targeting the *bound agent's* instance
-    /// stream — not the host stream — and flips the in-progress flag.
+    /// Compact control on a `MemberRow`.
+    ///
+    /// The routing and double-submit guarantees are unchanged and remain the
+    /// point of this test: clicking (through the OK-stubbed confirm dialog)
+    /// sends exactly one `AgentCompact` frame targeting the *bound agent's*
+    /// instance stream — not the host stream — with the default payload, and
+    /// the control cannot fire twice.
+    ///
+    /// What changed, and why the assertions below did: the control is now
+    /// **always rendered** and reports unavailability through `aria-disabled`
+    /// plus a reason, rather than disappearing. An active turn is no longer a
+    /// blocker at all — the server defers the request to a safe point — and
+    /// availability is decided by the server-declared capability snapshot,
+    /// which fails closed when absent. The confirmation copy no longer
+    /// promises session replacement, because compaction no longer replaces the
+    /// session.
     #[wasm_bindgen_test]
-    async fn member_row_compact_gated_on_bound_idle_and_routes_to_agent() {
+    async fn member_row_compact_is_capability_gated_and_routes_to_agent() {
         let calls = install_send_stub();
         let _ = js_sys::eval(
             r#"
@@ -2881,18 +2973,38 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // No binding yet → no Compact icon. The other action icons
-        // (Edit, Delete) should still be present per the existing UX so
-        // this assertion is *narrow*: only the compact icon is gated.
-        assert!(
+        let compact_btn = || -> HtmlElement {
             container
                 .query_selector(".team-member-icon-btn-compact")
                 .unwrap()
-                .is_none(),
-            "compact icon must be hidden when the member has no live binding"
+                .expect("the compact control is always rendered, never hidden")
+                .dyn_into()
+                .unwrap()
+        };
+
+        // No binding yet → visible, disabled, and it says why. Hiding it (the
+        // old behaviour) taught the user the control did not exist.
+        let btn = compact_btn();
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "with no bound agent the control is disabled, not hidden"
+        );
+        assert!(
+            !btn.has_attribute("disabled"),
+            "and stays focusable, so its reason is reachable without a pointer"
+        );
+        assert!(
+            btn.get_attribute("aria-label")
+                .unwrap_or_default()
+                .contains("No bound agent"),
+            "the reason is on the accessible name"
         );
 
-        // Bind, but mark as Thinking. Still hidden.
+        // Bind, still Thinking, and declare the capability the server would.
+        // An active turn is no longer a blocker: the server defers to a safe
+        // point, so a client-side idle gate would refuse a request the server
+        // accepts.
         state.team_member_bindings.update(|m| {
             let entry = m.entry(host_id.to_owned()).or_default();
             entry.insert(
@@ -2906,38 +3018,36 @@ mod wasm_tests {
             );
         });
         next_tick().await;
-        assert!(
-            container
-                .query_selector(".team-member-icon-btn-compact")
-                .unwrap()
-                .is_none(),
-            "compact icon must be hidden while the binding is Thinking"
+
+        // Capability still unknown → fails closed.
+        assert_eq!(
+            compact_btn().get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "unknown capability must not optimistically enable the control"
         );
 
-        // Flip to Idle. Compact icon should now render.
-        state.team_member_bindings.update(|m| {
-            let entry = m.entry(host_id.to_owned()).or_default();
-            entry.insert(
-                manager_id.clone(),
-                TeamMemberBindingPayload {
-                    member_id: manager_id.clone(),
-                    current_agent_id: Some(bound_agent_id.clone()),
-                    status: AgentControlStatus::Idle,
-                    last_active_at_ms: Some(456),
+        state.compaction_capability.update(|m| {
+            m.insert(
+                bound_agent_id.clone(),
+                crate::state::CompactionCapabilitySnapshot {
+                    logical_session_id: protocol::SessionId("s-mgr".to_owned()),
+                    availability: protocol::RequestedCompactionAvailability::Available {
+                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                    },
                 },
             );
         });
         next_tick().await;
 
-        let btn: HtmlElement = container
-            .query_selector(".team-member-icon-btn-compact")
-            .unwrap()
-            .expect("compact icon should render for Idle bound member")
-            .dyn_into()
-            .unwrap();
+        let btn = compact_btn();
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("false"),
+            "a declared-available agent is compactable even mid-turn; the server defers"
+        );
         assert_eq!(
             btn.get_attribute("aria-label").as_deref(),
-            Some("Compact agent")
+            Some("Compact context")
         );
 
         // Click → confirm dialog (Ok) → spawn_local → real
@@ -2947,12 +3057,12 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        // The compact button must surface accurate wording in the
-        // confirmation dialog: backend marks the predecessor session
-        // non-resumable, so the dialog must not promise the user they
-        // can pick it back up. Walk the recorded invoke calls,
-        // find the `plugin:dialog|message` invocation, and assert on
-        // the `message` arg.
+        // The confirmation must describe what actually happens. It previously
+        // promised a replacement agent and a closed, non-resumable session;
+        // in-place compaction does none of that, and a dialog that predicts a
+        // destructive outcome the code will not perform is worse than none.
+        // Walk the recorded invoke calls, find the `plugin:dialog|message`
+        // invocation, and assert on the `message` arg.
         let mut dialog_message: Option<String> = None;
         for entry in calls.iter() {
             let arr = entry.dyn_into::<js_sys::Array>().expect("array");
@@ -2968,19 +3078,25 @@ mod wasm_tests {
         }
         let dialog_message = dialog_message
             .expect("team-member compact must open a confirm dialog before sending the frame");
+        let lowered = dialog_message.to_lowercase();
         assert!(
-            !dialog_message.to_lowercase().contains("can be resumed"),
-            "team-member compact dialog must not promise the original session can be resumed; got: {dialog_message:?}"
+            lowered.contains("not changed") || lowered.contains("unchanged"),
+            "the dialog must state the visible conversation is not changed; got: {dialog_message:?}"
         );
         assert!(
-            dialog_message.contains("can't be resumed"),
-            "team-member compact dialog must state the original session can't be resumed; got: {dialog_message:?}"
+            lowered.contains("session"),
+            "and must say what happens to the session; got: {dialog_message:?}"
         );
-        assert!(
-            dialog_message.to_lowercase().contains("read-only")
-                || dialog_message.to_lowercase().contains("read only"),
-            "team-member compact dialog must mention the session remains as a read-only record; got: {dialog_message:?}"
-        );
+        // The specific destructive claims that are now false. Kept as explicit
+        // negatives rather than dropped, so a regression that reintroduces the
+        // old copy fails here.
+        for false_claim in ["can't be resumed", "read-only", "read only", "replacement"] {
+            assert!(
+                !lowered.contains(false_claim),
+                "the dialog must not promise {false_claim:?}, which in-place compaction \
+                 does not do; got: {dialog_message:?}"
+            );
+        }
 
         let frames = recorded_frames(&calls);
         let compact_frames: Vec<_> = frames
@@ -3023,20 +3139,44 @@ mod wasm_tests {
         );
         assert!(
             state
-                .compaction_in_progress
-                .with_untracked(|map| map.contains_key(&bound_agent_id)),
+                .context_compactions
+                .with_untracked(|map| map
+                    .get(&bound_agent_id)
+                    .is_some_and(|operation| operation.is_in_flight())),
             "bound agent should be marked in-flight while the server processes"
         );
 
-        // While in-flight, the compact icon is hidden again so the user
-        // can't double-fire.
+        // The double-submit guarantee is unchanged; only its presentation is.
+        // The control stays visible (so the user can see *why* it is
+        // unavailable) but is disabled and says a compaction is already
+        // running, and a second click sends nothing.
         next_tick().await;
+        let btn = compact_btn();
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "an in-flight compaction disables the control"
+        );
         assert!(
-            container
-                .query_selector(".team-member-icon-btn-compact")
-                .unwrap()
-                .is_none(),
-            "compact icon must be hidden while a compaction is already in flight for the bound agent"
+            btn.get_attribute("aria-label")
+                .unwrap_or_default()
+                .contains("already in progress"),
+            "and says so rather than silently vanishing"
+        );
+
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let compact_frames: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| kind == &FrameKind::AgentCompact.to_string())
+            .collect();
+        assert_eq!(
+            compact_frames.len(),
+            1,
+            "a second click while in flight must not send another frame, all frames: {frames:?}"
         );
     }
 
@@ -5090,16 +5230,20 @@ mod wasm_tests {
         );
     }
 
-    /// Team-level Compact button is enabled only when every Active member
-    /// with a live binding is Idle and not already mid-compaction, and at
-    /// least one member is bound. Clicking it (through the OK-stubbed
-    /// confirm dialog) sends a single `TeamCompact` frame on the host
-    /// stream — server fans out per-member compactions internally.
-    /// While any member is Thinking the button is disabled; while
-    /// compactions are in flight the button stays disabled to prevent
-    /// double-fire.
+    /// Team-level Compact button.
+    ///
+    /// Unchanged guarantees, and still the point of this test: clicking
+    /// (through the OK-stubbed confirm dialog) sends exactly **one**
+    /// `TeamCompact` frame carrying the team id, routed on the **host** stream
+    /// — never an agent instance stream — and it cannot double-fire.
+    ///
+    /// Changed: the button reports unavailability through `aria-disabled` while
+    /// staying focusable, so its reason is reachable without a pointer. Member
+    /// activity is no longer a blocker (the server defers each member to a safe
+    /// point); eligibility comes from the same per-agent capability selector the
+    /// individual controls use, and fails closed when capability is unknown.
     #[wasm_bindgen_test]
-    async fn team_compact_button_gated_on_every_member_idle_and_sends_team_compact_frame() {
+    async fn team_compact_button_is_capability_gated_and_sends_one_host_frame() {
         let calls = install_send_stub();
         let _ = js_sys::eval(
             r#"
@@ -5187,13 +5331,17 @@ mod wasm_tests {
                 .map(|el| el.dyn_into::<HtmlElement>().unwrap())
         };
         let btn = team_compact_btn().expect("team-card-compact button must render");
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "team Compact must be disabled when no member is bound"
+        );
         assert!(
-            btn.has_attribute("disabled"),
-            "team Compact button must be disabled when no member is bound"
+            !btn.has_attribute("disabled"),
+            "and must stay focusable so its reason is reachable without a pointer"
         );
 
-        // Bind manager Idle, reporter Thinking. Mixed state must keep
-        // the button disabled — must not imply the action is safe.
+        // Bind manager Idle, reporter Thinking.
         state.team_member_bindings.update(|m| {
             let entry = m.entry(host_id.to_owned()).or_default();
             entry.insert(
@@ -5217,29 +5365,45 @@ mod wasm_tests {
         });
         next_tick().await;
         let btn = team_compact_btn().expect("team Compact button must still render");
-        assert!(
-            btn.has_attribute("disabled"),
-            "team Compact button must be disabled while any member is Thinking"
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "capability is still unknown for both members, so the gate fails closed"
         );
 
-        // Flip reporter to Idle. Now every bound member is Idle → enabled.
-        state.team_member_bindings.update(|m| {
-            let entry = m.entry(host_id.to_owned()).or_default();
-            entry.insert(
-                report_id.clone(),
-                TeamMemberBindingPayload {
-                    member_id: report_id.clone(),
-                    current_agent_id: Some(rep_agent_id.clone()),
-                    status: AgentControlStatus::Idle,
-                    last_active_at_ms: Some(3),
-                },
-            );
+        // Declare capability for the manager only. One ineligible member still
+        // blocks the whole team — the team frame targets every member, so a
+        // partially-eligible team is not a partially-safe request.
+        let available = || crate::state::CompactionCapabilitySnapshot {
+            logical_session_id: protocol::SessionId(String::new()),
+            availability: protocol::RequestedCompactionAvailability::Available {
+                route: protocol::RequestedCompactionRoute::NativePreferred,
+            },
+        };
+        state.compaction_capability.update(|m| {
+            m.insert(mgr_agent_id.clone(), available());
+        });
+        next_tick().await;
+        assert_eq!(
+            team_compact_btn()
+                .expect("button")
+                .get_attribute("aria-disabled")
+                .as_deref(),
+            Some("true"),
+            "one member without declared capability blocks the whole team"
+        );
+
+        // Declare it for the reporter too. Both are eligible → enabled, even
+        // though the reporter's binding is still Thinking: the server defers.
+        state.compaction_capability.update(|m| {
+            m.insert(rep_agent_id.clone(), available());
         });
         next_tick().await;
         let btn = team_compact_btn().expect("team Compact button must still render");
-        assert!(
-            !btn.has_attribute("disabled"),
-            "team Compact button must be enabled when every bound member is Idle"
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("false"),
+            "every member declared available → enabled, active turns notwithstanding"
         );
 
         // Click → confirm → send a single TeamCompact frame on the
@@ -5287,40 +5451,209 @@ mod wasm_tests {
             "TeamCompact must target the host stream, not an agent instance stream"
         );
 
-        // Both members are flipped to in-progress so the per-member
-        // compact buttons hide and a second click on the team button
-        // becomes a no-op (state guards).
-        assert!(
-            state
-                .compaction_in_progress
-                .with_untracked(|map| map.contains_key(&mgr_agent_id)),
-            "manager agent should be marked in-flight after team compact"
-        );
-        assert!(
-            state
-                .compaction_in_progress
-                .with_untracked(|map| map.contains_key(&rep_agent_id)),
-            "reporter agent should be marked in-flight after team compact"
-        );
-        // With both agents now in compaction_in_progress, gating must
-        // re-disable the team Compact button — same defense the per-
-        // member button has against double-fire.
+        // Every member claimed the shared per-agent gate — the same one the
+        // individual controls use — so neither surface can double-submit for
+        // an agent the other already claimed.
+        for (label, agent_id) in [("manager", &mgr_agent_id), ("reporter", &rep_agent_id)] {
+            assert!(
+                state.context_compactions.with_untracked(|map| map
+                    .get(agent_id)
+                    .is_some_and(|operation| operation.is_in_flight())),
+                "{label} agent should hold the shared request gate after team compact"
+            );
+        }
+
         next_tick().await;
         let btn = team_compact_btn().expect("team Compact button must still render after click");
-        assert!(
-            btn.has_attribute("disabled"),
-            "team Compact button must re-disable while any member is mid-compaction"
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "team Compact re-disables while any member is mid-compaction"
+        );
+
+        // Double-fire defence, asserted rather than implied: a second click
+        // sends nothing.
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(kind, _)| kind == &FrameKind::TeamCompact.to_string())
+                .count(),
+            1,
+            "a second click while members are in flight must not send another frame: {frames:?}"
         );
     }
 
-    /// Server rule: an Active member whose binding is not Idle blocks
-    /// the entire team from compacting, *even if that member has no
-    /// `current_agent_id`*. The frontend gating must match — otherwise
-    /// the user would see an enabled button that the server then
-    /// rejects with a 409. Also asserts that no `TeamCompact` frame is
-    /// sent if the user somehow forces a click in this state.
+    /// The post-confirmation race. The dialog stays open for as long as the
+    /// user takes to read it, and `TeamCompact` targets the whole team rather
+    /// than the subset this client managed to claim — so a member that another
+    /// surface started while the dialog was open must abort the send entirely,
+    /// not produce a partial claim plus a whole-team request.
     #[wasm_bindgen_test]
-    async fn team_compact_disabled_when_active_member_unbound_but_not_idle() {
+    async fn team_compact_aborts_and_rolls_back_when_a_member_is_claimed_during_confirm() {
+        let calls = install_send_stub();
+        // Hold the dialog open until the test releases it, so the state change
+        // lands strictly between the eligibility check and the claim.
+        let _ = js_sys::eval(
+            r#"
+            window.__test_release_dialog = null;
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                if (cmd === 'plugin:dialog|message') {
+                    return new Promise(function (resolve) {
+                        window.__test_release_dialog = function () { resolve('Ok'); };
+                    });
+                }
+                return Promise.resolve();
+            };
+            "#,
+        );
+
+        let host_id = "host-team-compact-race";
+        let manager_id = TeamMemberId("m-mgr".to_owned());
+        let report_id = TeamMemberId("m-rep".to_owned());
+        let mgr_agent_id = AgentId("a-mgr".to_owned());
+        let rep_agent_id = AgentId("a-rep".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-mgr")],
+            vec![
+                make_member("m-mgr", "t-1", "Manager", TeamMemberRole::Manager),
+                make_member("m-rep", "t-1", "Reporter", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        let push_agent = |agent_id: &AgentId, stream: &str| {
+            state.agents.update(|agents| {
+                agents.push(crate::state::AgentInfo {
+                    host_id: host_id.to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Claude,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: StreamPath(stream.to_owned()),
+                    started: true,
+                    fatal_error: None,
+                    activity_summary: Default::default(),
+                });
+            });
+        };
+        push_agent(&mgr_agent_id, "/agent/a-mgr/inst");
+        push_agent(&rep_agent_id, "/agent/a-rep/inst");
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            for (member_id, agent_id) in [
+                (&manager_id, &mgr_agent_id),
+                (&report_id, &rep_agent_id),
+            ] {
+                entry.insert(
+                    member_id.clone(),
+                    TeamMemberBindingPayload {
+                        member_id: member_id.clone(),
+                        current_agent_id: Some(agent_id.clone()),
+                        status: AgentControlStatus::Idle,
+                        last_active_at_ms: Some(1),
+                    },
+                );
+            }
+        });
+        state.compaction_capability.update(|m| {
+            for agent_id in [&mgr_agent_id, &rep_agent_id] {
+                m.insert(
+                    agent_id.clone(),
+                    crate::state::CompactionCapabilitySnapshot {
+                        logical_session_id: protocol::SessionId(String::new()),
+                        availability: protocol::RequestedCompactionAvailability::Available {
+                            route: protocol::RequestedCompactionRoute::NativePreferred,
+                        },
+                    },
+                );
+            }
+        });
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let btn: HtmlElement = container
+            .query_selector(".team-card-compact")
+            .unwrap()
+            .expect("team-card-compact button must render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("false"),
+            "the team is eligible before the click"
+        );
+        btn.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // Another surface starts a compaction for one member while the
+        // confirmation is still open.
+        assert!(state.begin_compaction_request(&rep_agent_id));
+
+        let _ = js_sys::eval("window.__test_release_dialog && window.__test_release_dialog();");
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames
+                .iter()
+                .all(|(kind, _)| kind != &FrameKind::TeamCompact.to_string()),
+            "a whole-team frame must not go out when a member was claimed during the \
+             confirmation: {frames:?}"
+        );
+        assert!(
+            state
+                .context_compactions
+                .with_untracked(|map| !map.contains_key(&mgr_agent_id)),
+            "and the claim this attempt did make must be rolled back, not stranded"
+        );
+        assert!(
+            state.context_compactions.with_untracked(|map| map
+                .get(&rep_agent_id)
+                .is_some_and(|operation| operation.is_in_flight())),
+            "while the other surface's genuine claim is untouched"
+        );
+    }
+
+    /// One ineligible member blocks the whole team.
+    ///
+    /// That contract is unchanged and is what this test exists for:
+    /// `TeamCompact` targets every member, so a partially-eligible team is not
+    /// a partially-safe request, and the client must not show an enabled
+    /// button the server would reject.
+    ///
+    /// What changed is *which* condition makes a member ineligible. Binding
+    /// activity no longer does — the server defers each member to a safe point
+    /// — so the blocking case is now a member the server has not declared
+    /// compactable: here, an Active member bound to an agent this client has no
+    /// capability snapshot for, which fails closed.
+    #[wasm_bindgen_test]
+    async fn team_compact_disabled_when_any_member_lacks_declared_capability() {
         let calls = install_send_stub();
         let _ = js_sys::eval(
             r#"
@@ -5370,11 +5703,33 @@ mod wasm_tests {
                 activity_summary: Default::default(),
             });
         });
-        // Manager: bound, Idle (a valid target on its own).
-        // Reporter: bound but UNBOUND-from-agent (current_agent_id =
-        // None) and status Thinking. This is the case the server
-        // explicitly rejects: not-Idle gates the whole team, even
-        // without a live agent.
+        // A second agent for the reporter, present in `state.agents` so it is a
+        // real target, but with no capability snapshot — the server has not
+        // said it can be compacted.
+        let rep_agent_id = AgentId("a-rep".to_owned());
+        state.agents.update(|agents| {
+            agents.push(crate::state::AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: rep_agent_id.clone(),
+                name: "Reporter Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                workflow: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/a-rep/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+                activity_summary: Default::default(),
+            });
+        });
+        // Manager: bound and declared available — a valid target on its own.
+        // Reporter: bound, but with no capability snapshot, so it fails closed
+        // and must block the whole team.
         state.team_member_bindings.update(|m| {
             let entry = m.entry(host_id.to_owned()).or_default();
             entry.insert(
@@ -5390,9 +5745,20 @@ mod wasm_tests {
                 report_id.clone(),
                 TeamMemberBindingPayload {
                     member_id: report_id.clone(),
-                    current_agent_id: None,
-                    status: AgentControlStatus::Thinking,
+                    current_agent_id: Some(rep_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
                     last_active_at_ms: Some(2),
+                },
+            );
+        });
+        state.compaction_capability.update(|m| {
+            m.insert(
+                mgr_agent_id.clone(),
+                crate::state::CompactionCapabilitySnapshot {
+                    logical_session_id: protocol::SessionId(String::new()),
+                    availability: protocol::RequestedCompactionAvailability::Available {
+                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                    },
                 },
             );
         });
@@ -5412,15 +5778,20 @@ mod wasm_tests {
                 .map(|el| el.dyn_into::<HtmlElement>().unwrap())
         };
         let btn = team_compact_btn().expect("team-card-compact button must render");
+        assert_eq!(
+            btn.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "one member without declared capability must disable the whole team button"
+        );
         assert!(
-            btn.has_attribute("disabled"),
-            "team Compact must be disabled when any Active member binding is non-Idle, \
-             even if unbound — matches server reject"
+            btn.get_attribute("aria-label")
+                .unwrap_or_default()
+                .contains("unavailable:"),
+            "and the button must say why, reachable without a pointer"
         );
 
-        // Defense in depth: even forcing a click does not send a frame
-        // (the click handler short-circuits when `team_compact_targets`
-        // returns None).
+        // Defence in depth: the control stays focusable and clickable, so the
+        // handler itself must refuse — the visual state is not the gate.
         btn.click();
         for _ in 0..4 {
             next_tick().await;

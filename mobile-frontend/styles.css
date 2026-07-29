@@ -1203,6 +1203,28 @@ input, textarea, select {
     padding: var(--space-6);
 }
 
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.chat-compaction-marker {
+    margin: var(--space-3) var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-block: 1px solid var(--border-default);
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.4;
+    text-align: center;
+}
+
 /* ── Chat Messages ──────────────────────────────────────────────────── */
 
 .chat-message {

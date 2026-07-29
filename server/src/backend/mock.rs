@@ -4,11 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentId, AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-    ContextBreakdown, MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo,
-    OperationCancelledData, OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent,
-    OrchestrationId, OrchestrationPayload, SessionId, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
-    ToolRequest, ToolRequestType,
+    CompactionMethod, CompactionMetrics, CompactionOperationId, CompactionStage,
+    CompactionTrigger, ContextBreakdown, MessageMetadataUpdateData, MessageSender,
+    MessageTokenUsage, ModelInfo, OperationCancelledData, OrchestrationAgentOrigin,
+    OrchestrationAgentType, OrchestrationEvent, OrchestrationId, OrchestrationPayload, SessionId,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,7 +21,17 @@ use uuid::Uuid;
 use super::agent_control_progress::{await_progress_data_for_tool, tyde_tool_result};
 use super::empty_session_settings_schema;
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    Backend, BackendAcceptedCompaction, BackendCompactionAvailability,
+    BackendCompactionCapability, BackendCompactionCapabilityEvidence,
+    BackendCompactionCoordinator, BackendCompactionDeferredReason, BackendCompactionDispatchState,
+    BackendCompactionEvent, BackendCompactionFailure, BackendCompactionFailureKind,
+    BackendCompactionMechanism, BackendCompactionMutationState,
+    BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
+    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendContextReseatSupport, BackendEvent, BackendSession,
+    BackendObservedCompaction, BackendSpawnConfig, BackendStartupError, EventStream,
+    PostCompactionTokenCount,
     StartupMcpServer, StartupMcpTransport,
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
@@ -39,6 +50,19 @@ pub(crate) const SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL: &str =
     "__mock_spawn_native_child_and_drop__";
 const MOCK_CANCEL_TURN_SENTINEL: &str = "__mock_cancel__";
 const MOCK_COMPACT_SENTINEL: &str = "/compact";
+pub(crate) const MOCK_NATIVE_COMPACT_SENTINEL: &str = "__mock_native_compact__";
+pub(crate) const MOCK_COMPACT_AUTO_SENTINEL: &str = "__mock_compact_auto__";
+pub(crate) const MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL: &str =
+    "__mock_compact_fail_pre__";
+pub(crate) const MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL: &str =
+    "__mock_compact_fail_post__";
+pub(crate) const MOCK_COMPACT_NO_BOUNDARY_SENTINEL: &str =
+    "__mock_compact_no_boundary__";
+pub(crate) const MOCK_COMPACT_HANG_SENTINEL: &str = "__mock_compact_hang__";
+pub(crate) const MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL: &str =
+    "__mock_compact_capability_unknown__";
+pub(crate) const MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL: &str =
+    "__mock_compact_capability_unavailable__";
 /// Causes `emit_turn` to sleep (see `MOCK_SLOW_SLEEP_MS`) before emitting
 /// `TypingStatusChanged(false)`.  This gives tests a reliable window to send
 /// queued messages while the agent is still in-turn, without relying on
@@ -123,6 +147,7 @@ struct MockSessionRecord {
     skills: Vec<String>,
     tool_policy: ToolPolicy,
     access_mode: BackendAccessMode,
+    compaction_capability: BackendCompactionCapability,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -168,9 +193,17 @@ fn agent_control_await_mcp(
 
 pub struct MockBackend {
     command_tx: mpsc::UnboundedSender<MockCommand>,
+    events_tx: Option<MockEventSender>,
     session_id: SessionId,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     busy_self_turn_fired: Arc<std::sync::atomic::AtomicBool>,
+    active_compaction: Arc<Mutex<Option<MockCompactionFlight>>>,
+    compaction_capability: BackendCompactionCapability,
+}
+
+struct MockCompactionFlight {
+    operation_id: CompactionOperationId,
+    terminal_tx: Option<tokio::sync::oneshot::Sender<BackendCompactionResult>>,
 }
 
 enum MockCommand {
@@ -190,10 +223,86 @@ struct MockLoopConfig {
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
 }
 
+#[derive(Clone)]
+struct MockEventSender {
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    active_turn: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MockEventSender {
+    fn send(
+        &self,
+        event: ChatEvent,
+    ) -> Result<(), mpsc::error::SendError<ChatEvent>> {
+        match event {
+            ChatEvent::TypingStatusChanged(active) => {
+                self.active_turn
+                    .store(active, std::sync::atomic::Ordering::SeqCst);
+                self.tx
+                    .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(active)))
+                    .map_err(|error| match error.0 {
+                        BackendEvent::Chat(event) => mpsc::error::SendError(event),
+                        BackendEvent::ModelRequestTokenUsage(_)
+                        | BackendEvent::Compaction(_) => unreachable!(),
+                    })
+            }
+            event => self
+                .tx
+                .send(BackendEvent::Chat(event))
+                .map_err(|error| match error.0 {
+                    BackendEvent::Chat(event) => mpsc::error::SendError(event),
+                    BackendEvent::ModelRequestTokenUsage(_)
+                    | BackendEvent::Compaction(_) => unreachable!(),
+                }),
+        }
+    }
+
+    fn send_compaction(
+        &self,
+        event: BackendCompactionEvent,
+    ) -> Result<(), mpsc::error::SendError<BackendEvent>> {
+        self.tx.send(BackendEvent::Compaction(event))
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_turn.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 impl MockBackend {
     pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         let _ = self.subagent_emitter_tx.send(Some(emitter));
     }
+}
+
+fn native_mock_compaction_capability() -> BackendCompactionCapability {
+    BackendCompactionCapability {
+        coordinator: BackendCompactionCoordinator::ContextOperation,
+        availability: BackendCompactionAvailability::Native {
+            mechanism: BackendCompactionMechanism::JsonRpcRequest,
+        },
+        provider_version: Some("mock-native-compaction-v1".to_owned()),
+        protocol_version: Some("mock-native-compaction-v1".to_owned()),
+        confidence: Some(BackendCompactionProtocolConfidence::Verified),
+        reseat: BackendContextReseatSupport::PreservedByNative,
+        evidence: BackendCompactionCapabilityEvidence::AdapterContract,
+    }
+}
+
+fn mock_compaction_capability_for_control(control: &str) -> BackendCompactionCapability {
+    if control.contains(MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL) {
+        return BackendCompactionCapability::unknown(
+            super::BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+            Some("mock-unknown".to_owned()),
+            BackendCompactionCapabilityEvidence::AdapterContract,
+        );
+    }
+    if control.contains(MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL) {
+        return BackendCompactionCapability::context_unavailable(
+            super::BackendCompactionUnavailableReason::ProviderDisabledCommand,
+        );
+    }
+    native_mock_compaction_capability()
 }
 
 impl Backend for MockBackend {
@@ -222,6 +331,11 @@ impl Backend for MockBackend {
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
+        let compaction_capability = mock_compaction_capability_for_control(&format!(
+            "{}\n{}",
+            initial_message,
+            resolved_spawn_config.instructions.as_deref().unwrap_or_default()
+        ));
         let slow_initial_turn = resolved_spawn_config
             .instructions
             .as_deref()
@@ -250,6 +364,7 @@ impl Backend for MockBackend {
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
                     access_mode: resolved_spawn_config.access_mode,
+                    compaction_capability: compaction_capability.clone(),
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
@@ -257,7 +372,11 @@ impl Backend for MockBackend {
         }
 
         let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let events_tx = MockEventSender {
+            tx: backend_events_tx,
+            active_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let (subagent_emitter_tx, subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
@@ -265,7 +384,7 @@ impl Backend for MockBackend {
         start_mock_command_loop(
             session_id_for_task,
             command_rx,
-            events_tx,
+            events_tx.clone(),
             subagent_emitter_rx,
             MockLoopConfig {
                 initial_message: Some(initial_message),
@@ -279,11 +398,14 @@ impl Backend for MockBackend {
         Ok((
             Self {
                 command_tx,
+                events_tx: Some(events_tx),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_compaction: Arc::new(Mutex::new(None)),
+                compaction_capability,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -302,7 +424,7 @@ impl Backend for MockBackend {
             })
             .collect::<Vec<_>>();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
-        let replay_prompts = {
+        let (replay_prompts, compaction_capability) = {
             let mut store = session_store()
                 .lock()
                 .expect("mock backend session store mutex poisoned");
@@ -322,11 +444,15 @@ impl Backend for MockBackend {
             record.tool_policy = resolved_spawn_config.tool_policy;
             record.access_mode = resolved_spawn_config.access_mode;
             record.updated_at_ms = now_ms();
-            replay_prompts
+            (replay_prompts, record.compaction_capability.clone())
         };
 
         let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let events_tx = MockEventSender {
+            tx: backend_events_tx,
+            active_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, subagent_emitter_rx) =
@@ -337,20 +463,27 @@ impl Backend for MockBackend {
             .iter()
             .any(|prompt| prompt.contains(MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL))
         {
+            let events_tx_for_close = events_tx.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_millis(100)).await;
-                drop(events_tx);
+                drop(events_tx_for_close);
                 sleep(Duration::from_secs(5)).await;
                 drop(resume_replay_complete_tx);
             });
             return Ok((
                 Self {
                     command_tx,
+                    events_tx: None,
                     session_id,
                     subagent_emitter_tx,
                     busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    active_compaction: Arc::new(Mutex::new(None)),
+                    compaction_capability,
                 },
-                EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+                EventStream::new_backend_with_resume_replay_barrier(
+                    events_rx,
+                    resume_replay_complete_rx,
+                ),
             ));
         }
 
@@ -371,20 +504,27 @@ impl Backend for MockBackend {
         );
 
         let replay_session_id = session_id.clone();
+        let replay_events_tx = events_tx.clone();
         tokio::spawn(async move {
             sleep(Duration::from_millis(MOCK_RESUME_REPLAY_DELAY_MS)).await;
-            emit_mock_resume_history(&events_tx, &replay_session_id, &replay_prompts);
+            emit_mock_resume_history(&replay_events_tx, &replay_session_id, &replay_prompts);
             let _ = resume_replay_complete_tx.send(());
         });
 
         Ok((
             Self {
                 command_tx,
+                events_tx: Some(events_tx),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_compaction: Arc::new(Mutex::new(None)),
+                compaction_capability,
             },
-            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            EventStream::new_backend_with_resume_replay_barrier(
+                events_rx,
+                resume_replay_complete_rx,
+            ),
         ))
     }
 
@@ -408,7 +548,7 @@ impl Backend for MockBackend {
         let now = now_ms();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
 
-        {
+        let compaction_capability = {
             let mut store = session_store()
                 .lock()
                 .expect("mock backend session store mutex poisoned");
@@ -418,6 +558,7 @@ impl Backend for MockBackend {
                     from_session_id.0
                 )));
             };
+            let compaction_capability = source.compaction_capability.clone();
             store.insert(
                 session_id.0.clone(),
                 MockSessionRecord {
@@ -433,21 +574,27 @@ impl Backend for MockBackend {
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
                     access_mode: resolved_spawn_config.access_mode,
+                    compaction_capability: compaction_capability.clone(),
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
             );
-        }
+            compaction_capability
+        };
 
         let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let events_tx = MockEventSender {
+            tx: backend_events_tx,
+            active_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let (subagent_emitter_tx, subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
         start_mock_command_loop(
             session_id_for_task,
             command_rx,
-            events_tx,
+            events_tx.clone(),
             subagent_emitter_rx,
             MockLoopConfig {
                 initial_message: Some(initial_message),
@@ -461,11 +608,14 @@ impl Backend for MockBackend {
         Ok((
             Self {
                 command_tx,
+                events_tx: Some(events_tx),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_compaction: Arc::new(Mutex::new(None)),
+                compaction_capability,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -494,12 +644,190 @@ impl Backend for MockBackend {
         self.session_id.clone()
     }
 
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.compaction_capability.clone()
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        if let Some(start) =
+            super::compaction::not_dispatched_for_capability(&self.compaction_capability)
+        {
+            return start;
+        }
+        let Some(events_tx) = self.events_tx.as_ref().cloned() else {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                fallback_safe: false,
+            };
+        };
+        if events_tx.is_active() {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::ActiveTurn,
+            };
+        }
+        if self
+            .active_compaction
+            .lock()
+            .expect("mock active compaction mutex poisoned")
+            .is_some()
+        {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+            };
+        }
+        if request
+            .focus
+            .as_deref()
+            .is_some_and(|focus| focus.contains(MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL))
+        {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    super::BackendCompactionUnavailableReason::ProviderDisabledCommand,
+                ),
+                fallback_safe: true,
+            };
+        }
+
+        let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
+        let operation_id = request.operation_id.clone();
+        *self
+            .active_compaction
+            .lock()
+            .expect("mock active compaction mutex poisoned") = Some(MockCompactionFlight {
+            operation_id: operation_id.clone(),
+            terminal_tx: Some(terminal_tx),
+        });
+        let _ = events_tx.send_compaction(BackendCompactionEvent::Progress(
+            BackendCompactionProgress {
+                operation_id: operation_id.clone(),
+                stage: CompactionStage::Dispatching,
+                elapsed_ms: Some(0),
+            },
+        ));
+
+        let hangs = request
+            .focus
+            .as_deref()
+            .is_some_and(|focus| focus.contains(MOCK_COMPACT_HANG_SENTINEL));
+        if !hangs {
+            let active_compaction = Arc::clone(&self.active_compaction);
+            let session_id = self.session_id.clone();
+            let fail_after_dispatch = request.focus.as_deref().is_some_and(|focus| {
+                focus.contains(MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL)
+            });
+            let omit_boundary = request
+                .focus
+                .as_deref()
+                .is_some_and(|focus| focus.contains(MOCK_COMPACT_NO_BOUNDARY_SENTINEL));
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = events_tx.send_compaction(BackendCompactionEvent::Progress(
+                    BackendCompactionProgress {
+                        operation_id: operation_id.clone(),
+                        stage: CompactionStage::Finalizing,
+                        elapsed_ms: Some(1),
+                    },
+                ));
+                let terminal_tx = {
+                    let mut active = active_compaction
+                        .lock()
+                        .expect("mock active compaction mutex poisoned");
+                    let Some(flight) = active.as_mut() else {
+                        return;
+                    };
+                    if flight.operation_id != operation_id {
+                        return;
+                    }
+                    flight.terminal_tx.take()
+                };
+                let failure = fail_after_dispatch || omit_boundary;
+                let result = BackendCompactionResult {
+                    operation_id: operation_id.clone(),
+                    dispatch: BackendCompactionDispatchState::Accepted,
+                    mutation: if fail_after_dispatch {
+                        BackendCompactionMutationState::MayHaveMutated
+                    } else if omit_boundary {
+                        BackendCompactionMutationState::NotObserved
+                    } else {
+                        BackendCompactionMutationState::Completed
+                    },
+                    outcome: if failure {
+                        Err(BackendCompactionFailure {
+                            kind: if fail_after_dispatch {
+                                BackendCompactionFailureKind::ProviderFailed
+                            } else {
+                                BackendCompactionFailureKind::ProtocolViolation
+                            },
+                            message: if fail_after_dispatch {
+                                "mock compaction failed after dispatch".to_owned()
+                            } else {
+                                "mock compaction completed without a boundary".to_owned()
+                            },
+                        })
+                    } else {
+                        Ok(BackendCompactionSuccess {
+                            mechanism: CompactionMethod::NativeRpc,
+                        })
+                    },
+                    provider_session_id: Some(session_id),
+                    metrics: CompactionMetrics {
+                        before_tokens: Some(12_000),
+                        after_tokens: (!failure).then_some(3_000),
+                        ..CompactionMetrics::default()
+                    },
+                    post_context_tokens: if failure {
+                        PostCompactionTokenCount::Unknown
+                    } else {
+                        PostCompactionTokenCount::Trusted(3_000)
+                    },
+                    evidence: BackendCompactionTerminalEvidence::None,
+                };
+                if let Some(terminal_tx) = terminal_tx {
+                    let _ = terminal_tx.send(result);
+                }
+                let mut active = active_compaction
+                    .lock()
+                    .expect("mock active compaction mutex poisoned");
+                if active
+                    .as_ref()
+                    .is_some_and(|flight| flight.operation_id == operation_id)
+                {
+                    *active = None;
+                }
+            });
+        }
+
+        BackendCompactionStart::Accepted(BackendAcceptedCompaction {
+            operation_id: request.operation_id,
+            terminal,
+        })
+    }
+
     async fn send(&self, input: AgentInput) -> bool {
+        if self
+            .active_compaction
+            .lock()
+            .expect("mock active compaction mutex poisoned")
+            .is_some()
+        {
+            return false;
+        }
         self.command_tx.send(MockCommand::Input(input)).is_ok()
     }
 
     async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
         use crate::backend::SendOutcome;
+        if self
+            .active_compaction
+            .lock()
+            .expect("mock active compaction mutex poisoned")
+            .is_some()
+        {
+            return SendOutcome::Busy(input);
+        }
         if let AgentInput::SendMessage(payload) = &input
             && payload.message.contains(MOCK_BUSY_SELF_TURN_SENTINEL)
             && !self
@@ -528,7 +856,7 @@ impl Backend for MockBackend {
 fn start_mock_command_loop(
     session_id_for_task: SessionId,
     mut command_rx: mpsc::UnboundedReceiver<MockCommand>,
-    events_tx: mpsc::UnboundedSender<ChatEvent>,
+    events_tx: MockEventSender,
     mut subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
     config: MockLoopConfig,
 ) {
@@ -558,7 +886,7 @@ fn start_mock_command_loop(
                 return;
             }
             record_prompt(&session_id_for_task, &initial_message);
-            if emit_user_bubbles {
+            if emit_user_bubbles && initial_message.trim() != MOCK_COMPACT_SENTINEL {
                 emit_mock_user_bubble(&events_tx, &initial_message);
             }
             if hold_initial_turn
@@ -675,7 +1003,7 @@ fn start_mock_command_loop(
                     if payload.message.contains(MOCK_USER_BUBBLES_SENTINEL) {
                         emit_user_bubbles = true;
                     }
-                    if emit_user_bubbles {
+                    if emit_user_bubbles && payload.message.trim() != MOCK_COMPACT_SENTINEL {
                         emit_mock_user_bubble(&events_tx, &payload.message);
                     }
                     if let Some((agent_id, message)) =
@@ -874,7 +1202,7 @@ async fn maybe_spawn_live_native_child(
 }
 
 async fn emit_held_turn(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     session_id: &SessionId,
     user_message: &str,
 ) -> bool {
@@ -941,12 +1269,63 @@ fn mock_prompt_history(session_id: &SessionId) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn emit_mock_compaction_observation(
+    events_tx: &MockEventSender,
+    session_id: &SessionId,
+    prompt_index: usize,
+    trigger: CompactionTrigger,
+    method: CompactionMethod,
+) -> bool {
+    let event_id = format!("prompt-{prompt_index}-compact");
+    events_tx
+        .send_compaction(BackendCompactionEvent::Observed(
+            BackendObservedCompaction {
+                observation_id: super::compaction::stable_observation_id(
+                    "mock",
+                    &session_id.0,
+                    &event_id,
+                ),
+                trigger,
+                method,
+                provider_session_id: Some(session_id.clone()),
+                metrics: CompactionMetrics {
+                    before_tokens: Some(12_000),
+                    after_tokens: Some(3_000),
+                    ..CompactionMetrics::default()
+                },
+                source: BackendCompactionObservationSource::MockEvent { event_id },
+                user_focus: None,
+            },
+        ))
+        .is_ok()
+}
+
 fn emit_mock_resume_history(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     session_id: &SessionId,
     prompts: &[String],
 ) {
-    for prompt in prompts {
+    for (prompt_index, prompt) in prompts.iter().enumerate() {
+        if prompt.trim() == MOCK_COMPACT_SENTINEL {
+            emit_mock_user_bubble(events_tx, prompt);
+            let _ = emit_mock_compaction_observation(
+                events_tx,
+                session_id,
+                prompt_index,
+                CompactionTrigger::UserTyped,
+                CompactionMethod::NativeTextCommand,
+            );
+            continue;
+        }
+        if prompt.contains(MOCK_COMPACT_AUTO_SENTINEL) {
+            let _ = emit_mock_compaction_observation(
+                events_tx,
+                session_id,
+                prompt_index,
+                CompactionTrigger::BackendAutomatic,
+                CompactionMethod::BackendAutomatic,
+            );
+        }
         // Real backends replay the user side of a resumed transcript too, and
         // that replayed request is exactly what makes a restored agent look
         // like one that just finished work.
@@ -977,7 +1356,7 @@ fn emit_mock_resume_history(
 }
 
 async fn emit_turn(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     session_id: &SessionId,
     user_message: &str,
     force_slow: bool,
@@ -1060,6 +1439,7 @@ async fn emit_turn(
     }
 
     if user_message.trim() == MOCK_COMPACT_SENTINEL {
+        emit_mock_user_bubble(events_tx, user_message);
         let compact_message_id = ChatMessageId(Uuid::new_v4().to_string());
         if events_tx
             .send(ChatEvent::StreamStart(StreamStartData {
@@ -1072,21 +1452,14 @@ async fn emit_turn(
             return false;
         }
 
-        if events_tx
-            .send(ChatEvent::MessageAdded(ChatMessage {
-                message_id: None,
-                timestamp: now_ms(),
-                sender: MessageSender::System,
-                content: "Conversation compacted.".to_string(),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                model_info: None,
-                token_usage: None,
-                context_breakdown: None,
-                images: None,
-            }))
-            .is_err()
-        {
+        let prompt_index = mock_prompt_history(session_id).len().saturating_sub(1);
+        if !emit_mock_compaction_observation(
+            events_tx,
+            session_id,
+            prompt_index,
+            CompactionTrigger::UserTyped,
+            CompactionMethod::NativeTextCommand,
+        ) {
             return false;
         }
 
@@ -1117,6 +1490,19 @@ async fn emit_turn(
         return events_tx
             .send(ChatEvent::TypingStatusChanged(false))
             .is_ok();
+    }
+
+    if user_message.contains(MOCK_COMPACT_AUTO_SENTINEL) {
+        let prompt_index = mock_prompt_history(session_id).len().saturating_sub(1);
+        if !emit_mock_compaction_observation(
+            events_tx,
+            session_id,
+            prompt_index,
+            CompactionTrigger::BackendAutomatic,
+            CompactionMethod::BackendAutomatic,
+        ) {
+            return false;
+        }
     }
 
     if events_tx
@@ -1262,7 +1648,7 @@ fn parse_mock_agent_control_send_message(message: &str) -> Option<(AgentId, Stri
 }
 
 fn emit_mock_agent_control_send_message(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     agent_id: AgentId,
     message: String,
 ) -> bool {
@@ -1330,7 +1716,7 @@ fn emit_mock_agent_control_send_message(
 }
 
 async fn emit_mock_agent_control_await(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     agent_control_await_mcp: Option<&MockAgentControlAwaitMcp>,
     agent_ids: Vec<String>,
 ) -> bool {
@@ -1567,7 +1953,7 @@ fn parse_http_url(url: &str) -> Result<(&str, &str), String> {
 }
 
 async fn emit_exit_plan_mode_request(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     stream_end_before_request: bool,
 ) -> Option<String> {
     if events_tx
@@ -1665,7 +2051,7 @@ async fn emit_exit_plan_mode_request(
 }
 
 async fn handle_exit_plan_mode_tool_response(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     session_id: &SessionId,
     pending_exit_plan_mode: &mut Option<PendingExitPlanMode>,
     tool_response: protocol::SendMessageToolResponse,
@@ -1711,7 +2097,7 @@ async fn handle_exit_plan_mode_tool_response(
 }
 
 async fn emit_exit_plan_mode_completion(
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &MockEventSender,
     session_id: &SessionId,
     tool_call_id: &str,
     decision: protocol::ExitPlanModeDecision,
@@ -1755,7 +2141,7 @@ async fn emit_exit_plan_mode_completion(
     emit_turn(events_tx, session_id, &message, false).await
 }
 
-fn emit_mock_orchestration(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn emit_mock_orchestration(events_tx: &MockEventSender) {
     let _ = events_tx.send(ChatEvent::Orchestration(OrchestrationEvent {
         agent_id: OrchestrationId("mock-root".to_owned()),
         agent_type: OrchestrationAgentType("swarm".to_owned()),
@@ -1776,7 +2162,7 @@ fn emit_mock_orchestration(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
 /// tests pin exact frame sequences. Prompts containing
 /// [`MOCK_USER_BUBBLES_SENTINEL`] opt a session into the realistic behavior
 /// (needed by supervisor tests, whose context reader consumes user bubbles).
-fn emit_mock_user_bubble(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {
+fn emit_mock_user_bubble(events_tx: &MockEventSender, message: &str) {
     let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
         message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
         timestamp: now_ms(),
@@ -1791,7 +2177,7 @@ fn emit_mock_user_bubble(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: 
     }));
 }
 
-fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {
+fn emit_mock_error(events_tx: &MockEventSender, message: &str) {
     let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
         message_id: None,
         timestamp: now_ms(),
@@ -1806,7 +2192,7 @@ fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) 
     }));
 }
 
-fn emit_mock_codex_internal_error_tail(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn emit_mock_codex_internal_error_tail(events_tx: &MockEventSender) {
     const TOOL_CALL_ID: &str = "mock-codex-successful-tool";
     let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
     let _ = events_tx.send(ChatEvent::ToolRequest(ToolRequest {
@@ -1847,7 +2233,7 @@ fn emit_mock_codex_internal_error_tail(events_tx: &mpsc::UnboundedSender<ChatEve
     emit_mock_error(events_tx, "Internal server error");
 }
 
-fn emit_mock_tool_failure_without_idle(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn emit_mock_tool_failure_without_idle(events_tx: &MockEventSender) {
     let message_id = Some(Uuid::new_v4().to_string());
     let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
     let _ = events_tx.send(ChatEvent::StreamStart(StreamStartData {
@@ -2096,7 +2482,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_agent_control_output_uses_one_stream_identity() {
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (backend_events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let events_tx = MockEventSender {
+            tx: backend_events_tx,
+            active_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         assert!(
             emit_turn(
                 &events_tx,
@@ -2107,7 +2497,13 @@ mod tests {
             .await
         );
 
-        let events = std::iter::from_fn(|| events_rx.try_recv().ok()).collect::<Vec<_>>();
+        let events = std::iter::from_fn(|| {
+            events_rx.try_recv().ok().map(|event| match event {
+                BackendEvent::Chat(event) => event,
+                event => panic!("unexpected backend-only event: {event:?}"),
+            })
+        })
+        .collect::<Vec<_>>();
         assert_eq!(events.len(), 4);
         assert!(matches!(&events[0], ChatEvent::TypingStatusChanged(true)));
         let start_id = match &events[1] {
@@ -2147,5 +2543,202 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    fn mock_compaction_request(
+        operation_id: &str,
+        focus: Option<&str>,
+    ) -> BackendCompactionRequest {
+        BackendCompactionRequest {
+            operation_id: CompactionOperationId(operation_id.to_owned()),
+            trigger: CompactionTrigger::UserRequested,
+            focus: focus.map(str::to_owned),
+            transcript_authoritative: true,
+            continuation: super::BackendContinuationContext {
+                required: Vec::new(),
+                advisory: Vec::new(),
+            },
+        }
+    }
+
+    async fn spawn_idle_mock() -> (MockBackend, EventStream) {
+        let (backend, mut events) = MockBackend::spawn(
+            vec!["/tmp".to_owned()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "initial mock turn".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn mock");
+        loop {
+            match events.recv_backend().await {
+                Some(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false))) => break,
+                Some(_) => {}
+                None => panic!("mock stream closed before initial idle"),
+            }
+        }
+        (backend, events)
+    }
+
+    #[tokio::test]
+    async fn mock_declares_context_operation_native_capability() {
+        let (backend, _events) = spawn_idle_mock().await;
+        let capability = backend.compaction_capability();
+        assert_eq!(
+            capability.coordinator,
+            BackendCompactionCoordinator::ContextOperation
+        );
+        assert!(matches!(
+            capability.availability,
+            BackendCompactionAvailability::Native {
+                mechanism: BackendCompactionMechanism::JsonRpcRequest
+            }
+        ));
+    }
+
+    #[test]
+    fn mock_capability_controls_distinguish_unknown_from_unavailable() {
+        let unknown =
+            mock_compaction_capability_for_control(MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL);
+        assert!(matches!(
+            super::super::compaction::not_dispatched_for_capability(&unknown),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: false,
+                ..
+            })
+        ));
+        let unavailable =
+            mock_compaction_capability_for_control(MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL);
+        assert!(matches!(
+            super::super::compaction::not_dispatched_for_capability(&unavailable),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_structured_compaction_correlates_progress_and_terminal_without_chat() {
+        let (backend, mut events) = spawn_idle_mock().await;
+        let accepted = match backend
+            .begin_compaction(mock_compaction_request(
+                "mock-success",
+                Some(MOCK_NATIVE_COMPACT_SENTINEL),
+            ))
+            .await
+        {
+            BackendCompactionStart::Accepted(accepted) => accepted,
+            start => panic!("expected accepted mock compaction, got {start:?}"),
+        };
+        let result = accepted.terminal.await.expect("mock compaction terminal");
+        assert_eq!(
+            result.operation_id,
+            CompactionOperationId("mock-success".to_owned())
+        );
+        assert_eq!(result.mutation, BackendCompactionMutationState::Completed);
+        assert!(result.outcome.is_ok());
+
+        let mut progress = Vec::new();
+        while let Ok(event) = events.try_recv_backend() {
+            match event {
+                BackendEvent::Compaction(BackendCompactionEvent::Progress(event)) => {
+                    progress.push(event.stage);
+                }
+                BackendEvent::Chat(event) => {
+                    panic!("structured compaction leaked public chat event: {event:?}")
+                }
+                BackendEvent::Compaction(BackendCompactionEvent::Observed(event)) => {
+                    panic!("requested compaction became an observation: {event:?}")
+                }
+                BackendEvent::ModelRequestTokenUsage(_) => {}
+            }
+        }
+        assert_eq!(
+            progress,
+            vec![CompactionStage::Dispatching, CompactionStage::Finalizing]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_pre_dispatch_failure_is_fallback_safe_and_writes_nothing() {
+        let (backend, mut events) = spawn_idle_mock().await;
+        let start = backend
+            .begin_compaction(mock_compaction_request(
+                "mock-pre-failure",
+                Some(MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL),
+            ))
+            .await;
+        assert!(matches!(
+            start,
+            BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events.try_recv_backend(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_mock_compaction_emits_marker_evidence_before_terminal_without_notice() {
+        let (_backend, mut events) = MockBackend::spawn(
+            vec!["/tmp".to_owned()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: MOCK_COMPACT_SENTINEL.to_owned(),
+                images: None,
+                origin: Some(protocol::MessageOrigin::User),
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn typed compact mock");
+        let mut observed_position = None;
+        let mut stream_end_position = None;
+        let mut saw_legacy_notice = false;
+        let mut saw_user_echo = false;
+        let mut position = 0usize;
+        loop {
+            let event = events
+                .recv_backend()
+                .await
+                .expect("typed compact mock stream");
+            match event {
+                BackendEvent::Compaction(BackendCompactionEvent::Observed(observed)) => {
+                    assert_eq!(observed.trigger, CompactionTrigger::UserTyped);
+                    observed_position = Some(position);
+                }
+                BackendEvent::Chat(ChatEvent::MessageAdded(message))
+                    if message.content == "Conversation compacted." =>
+                {
+                    saw_legacy_notice = true;
+                }
+                BackendEvent::Chat(ChatEvent::MessageAdded(message))
+                    if matches!(message.sender, MessageSender::User)
+                        && message.content == MOCK_COMPACT_SENTINEL =>
+                {
+                    saw_user_echo = true;
+                }
+                BackendEvent::Chat(ChatEvent::StreamEnd(_)) => {
+                    stream_end_position = Some(position);
+                }
+                BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)) => break,
+                _ => {}
+            }
+            position += 1;
+        }
+        assert!(
+            observed_position.expect("typed compaction observation")
+                < stream_end_position.expect("typed compaction terminal")
+        );
+        assert!(!saw_legacy_notice);
+        assert!(saw_user_echo);
     }
 }

@@ -18,13 +18,16 @@ use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, TabId, TabScrollState,
-    ToolOutputMode, TransientEvent,
+    ActiveAgentRef, AgentInfo, AppState, ChatRowContent, ChatRowHandle, ChatRowId,
+    ContextCompactionUiState, PendingHistoryRequest, TabId, TabScrollState, ToolOutputMode,
+    TransientEvent,
 };
 
 use protocol::{
-    BackendKind, FetchSessionHistoryPayload, FrameKind, ProjectDiffScope, ReviewCreatePayload,
-    ReviewDiffSelection, StreamPath,
+    BackendKind, CompactionMethod, CompactionMutation, CompactionStage, CompactionTrigger,
+    ContextCompactionStatus, ContextCompactionTimelineEvent, ContextCompactionTimelineStatus,
+    FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ProjectDiffScope,
+    ReviewCreatePayload, ReviewDiffSelection, StreamPath,
 };
 
 /// Default per-row height assumed for rows we haven't measured yet.
@@ -214,12 +217,19 @@ pub fn ChatView(
         else {
             return;
         };
-        if history.loading {
+        if history.loading() {
             return;
         }
+        // Stamp the request so the response can be correlated. Without this the
+        // client can only know that *a* fetch is out, and a page from a
+        // previous connection lands in a transcript it does not belong to.
+        let request = PendingHistoryRequest {
+            request_id: HistoryPageRequestId(crate::state::new_history_request_id()),
+            before_seq: history.oldest_seq,
+        };
         state.session_history.update(|map| {
             if let Some(history) = map.get_mut(&agent_ref.agent_id) {
-                history.loading = true;
+                history.pending_request = Some(request.clone());
             }
         });
         let state_for_error = state.clone();
@@ -228,7 +238,8 @@ pub fn ChatView(
             let stream = agent.instance_stream.clone();
             let payload = FetchSessionHistoryPayload {
                 agent_id: agent.agent_id.clone(),
-                before_seq: history.oldest_seq,
+                request_id: request.request_id.clone(),
+                before_seq: request.before_seq,
                 limit: SESSION_HISTORY_PAGE_LIMIT,
             };
             if let Err(error) =
@@ -237,7 +248,11 @@ pub fn ChatView(
                 log::error!("failed to send fetch_session_history: {error}");
                 state_for_error.session_history.update(|map| {
                     if let Some(history) = map.get_mut(&payload.agent_id) {
-                        history.loading = false;
+                        // Only clear if this is still *our* request; a newer
+                        // one may have replaced it.
+                        if history.pending_request.as_ref() == Some(&request) {
+                            history.pending_request = None;
+                        }
                     }
                 });
             }
@@ -279,7 +294,12 @@ pub fn ChatView(
         state.chat_rows.with(|m| {
             let rows = m.get(&id)?;
             for row in rows.iter().rev() {
-                let entry = row.entry.get();
+                // A compaction marker carries no message and no breakdown;
+                // walking past it keeps the search on real turns.
+                let Some(row_entry) = row.message_entry() else {
+                    continue;
+                };
+                let entry = row_entry.get();
                 let is_assistant = matches!(
                     entry.message.sender,
                     protocol::MessageSender::Assistant { .. }
@@ -858,6 +878,7 @@ pub fn ChatView(
                         <ToolOutputModeToggle />
                     </Show>
                     <ReviewChangesButton agent_ref=agent_ref />
+                    <CompactContextButton agent_ref=agent_ref />
                 </div>
                 {move || {
                     view! {
@@ -895,7 +916,7 @@ pub fn ChatView(
                             <div class="chat-history-collapsed">
                                 <button
                                     class="chat-history-load-previous"
-                                    disabled=move || prior_history.get().is_some_and(|history| history.loading)
+                                    disabled=move || prior_history.get().is_some_and(|history| history.loading())
                                     on:click={
                                         let load_prior_history = load_prior_history;
                                         move |event| load_prior_history.run(event)
@@ -905,7 +926,7 @@ pub fn ChatView(
                                         let Some(history) = prior_history.get() else {
                                             return String::new();
                                         };
-                                        if history.loading {
+                                        if history.loading() {
                                             return "Loading earlier messages…".to_owned();
                                         }
                                         if history.message_count > 0 {
@@ -969,6 +990,11 @@ pub fn ChatView(
                                     .with(|w| format!("height: {}px;", w.bottom_pad))
                             }
                         ></div>
+
+                        // Live compaction state. Outside the windowed list, so
+                        // it stays visible wherever the user has scrolled and
+                        // disappears the moment the operation ends.
+                        <ContextCompactionBanner agent_ref=agent_ref />
 
                         // Transient events (retry, cancel) rendered as cards
                         {move || {
@@ -1183,9 +1209,422 @@ fn MeasuredRow(
 
     view! {
         <div class="virt-row" node_ref=node_ref>
-            <ChatMessageView agent_ref=agent_ref row=row />
+            {match row.content {
+                ChatRowContent::Message(entry) => {
+                    view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }.into_any()
+                }
+                ChatRowContent::ContextCompaction(event) => {
+                    view! { <ContextCompactionMarker event=event /> }.into_any()
+                }
+            }}
         </div>
     }
+}
+
+// ── Context compaction ──────────────────────────────────────────────────
+
+/// The chat header's compaction control. Discoverability: the agent-card
+/// action is hover-revealed in a side panel, which is not where a user
+/// working in a long conversation is looking when they need it.
+///
+/// Visible-but-disabled with a reason, never hidden — and enabled during a
+/// turn, because the server defers rather than refuses.
+#[component]
+fn CompactContextButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let control = Signal::derive(move || {
+        let agent = agent_ref.get()?;
+        Some(crate::actions::compaction_control_state(&state, &agent))
+    });
+
+    let on_click = move |_: web_sys::MouseEvent| {
+        let Some(agent) = agent_ref.get_untracked() else {
+            return;
+        };
+        let state: AppState = expect_context::<AppState>();
+        let name = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|candidate| {
+                    candidate.host_id == agent.host_id && candidate.agent_id == agent.agent_id
+                })
+                .map(|candidate| candidate.name.clone())
+                .unwrap_or_else(|| "this agent".to_owned())
+        });
+        wasm_bindgen_futures::spawn_local(async move {
+            crate::actions::request_context_compaction(state, agent, name).await;
+        });
+    };
+
+    view! {
+        {move || {
+            let control = control.get()?;
+            let enabled = control.is_enabled();
+            let label = match control.reason() {
+                None => "Compact context".to_owned(),
+                Some(reason) => format!("Compact context — unavailable: {reason}"),
+            };
+            Some(view! {
+                <button
+                    type="button"
+                    class="chat-header-compact"
+                    title=label.clone()
+                    aria-label=label
+                    // `aria-disabled`, not the native attribute: a natively
+                    // disabled button leaves the tab order and its reason
+                    // becomes hover-only. `request_context_compaction`
+                    // re-checks the gate, so the click is inert regardless.
+                    aria-disabled=move || if enabled { "false" } else { "true" }
+                    data-test="chat-header-compact"
+                    on:click=on_click
+                >
+                    "\u{27F2}"
+                </button>
+            })
+        }}
+    }
+}
+
+/// `384168` → `"384.2K"`. Visible text only; the accessible sentence spells
+/// the number out (see `dispatch::compaction_marker_announcement`).
+fn compaction_token_text(tokens: u64) -> String {
+    crate::components::chat_message::format_compact(tokens)
+}
+
+/// `169775` → `"2m 50s"`, `48200` → `"48s"`.
+fn compaction_duration_text(duration_ms: u64) -> String {
+    let seconds = duration_ms / 1000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let rest = seconds % 60;
+    if rest == 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{minutes}m {rest}s")
+    }
+}
+
+/// Which side did the work. Shown only when it disambiguates something the
+/// user could act on — "Tyde summarized this itself" is materially different
+/// from "the backend compacted its own context".
+fn compaction_method_text(method: CompactionMethod) -> Option<&'static str> {
+    match method {
+        CompactionMethod::NativeTextCommand | CompactionMethod::NativeRpc => None,
+        CompactionMethod::InlineFallback => Some("Tyde fallback"),
+        CompactionMethod::BackendAutomatic => None,
+    }
+}
+
+fn compaction_marker_title(event: &ContextCompactionTimelineEvent) -> &'static str {
+    match event.status {
+        ContextCompactionTimelineStatus::Completed => match event.trigger {
+            CompactionTrigger::BackendAutomatic => "Context compacted automatically",
+            _ => "Context compacted",
+        },
+        // The failure wording is driven by *mutation*, not by the error text.
+        // What the user needs first is whether their model context survived;
+        // the provider's prose is secondary and is appended verbatim below.
+        ContextCompactionTimelineStatus::Failed => match event.mutation {
+            CompactionMutation::NotObserved => "Compaction failed — context unchanged",
+            CompactionMutation::Completed => "Context compacted, but finalizing failed",
+            CompactionMutation::MayHaveMutated => "Compaction failed — context may have changed",
+        },
+    }
+}
+
+/// The durable timeline marker.
+///
+/// Deliberately **not** a chat card: no sender, no timestamp, no copy control,
+/// no markdown body. And deliberately **not** a live region of any kind — the
+/// announcement for a compaction is made once, by the reducer, at the moment
+/// the event arrives live (see `dispatch::apply_chat_event_from` and
+/// `apply_context_compaction_notify`). This row is history; it is re-mounted
+/// on every scroll pass, page-back, and reconnect.
+#[component]
+fn ContextCompactionMarker(event: ArcRwSignal<ContextCompactionTimelineEvent>) -> impl IntoView {
+    // Read reactively: a later, richer sighting of the same marker writes
+    // through this signal rather than appending a row.
+    view! {
+        {move || {
+            let event = event.get();
+            context_compaction_marker_view(&event)
+        }}
+    }
+}
+
+fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> impl IntoView + use<> {
+    let title = compaction_marker_title(event);
+    let failed = matches!(event.status, ContextCompactionTimelineStatus::Failed);
+
+    // Every metric is optional and absence is normal — backends differ in what
+    // they report. A missing figure renders as *nothing*, never as a dash, a
+    // zero, or "unknown": a fabricated 0 reads as "compacted to nothing".
+    let tokens = match (event.metrics.before_tokens, event.metrics.after_tokens) {
+        (Some(before), Some(after)) => Some(format!(
+            "{} → {}",
+            compaction_token_text(before),
+            compaction_token_text(after)
+        )),
+        (Some(before), None) => Some(format!("from {}", compaction_token_text(before))),
+        (None, Some(after)) => Some(format!("to {}", compaction_token_text(after))),
+        (None, None) => None,
+    };
+    let duration = event.metrics.duration_ms.map(compaction_duration_text);
+    let method = compaction_method_text(event.method).map(str::to_owned);
+    let reason = event
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned);
+
+    // Exactly one representation in the accessibility tree.
+    //
+    // The visible row abbreviates for scanning (`384.2K`, `2m 50s`); read
+    // aloud those are ambiguous or spelled as letters. So the whole visible row
+    // is `aria-hidden`, and a single visually-hidden sentence carries the same
+    // facts in full — grouped digits, humanized duration, and the guarantee
+    // about the transcript. Naming the row with `aria-label` instead would
+    // leave the abbreviated descendants in the tree alongside it, which is the
+    // duplicate-metric shape the contract forbids.
+    //
+    // No `role`: V1 is a plain historical element (plan §11). Not
+    // `separator` (risks suppressing its content), not `group` (no
+    // assistive-technology evidence yet), and above all not `status` or
+    // `alert` — the virtualizer mounts and unmounts this row as the user
+    // scrolls, and bootstrap and paging re-mount it wholesale, so live-region
+    // semantics here would replay an old outcome on every pass.
+    let accessible_sentence = crate::dispatch::compaction_marker_announcement(event);
+
+    view! {
+        <div
+            class=move || {
+                if failed {
+                    "context-compaction-marker context-compaction-marker-failed"
+                } else {
+                    "context-compaction-marker"
+                }
+            }
+            data-test="context-compaction-marker"
+        >
+            <span class="visually-hidden">{accessible_sentence}</span>
+            <span class="context-compaction-visual" aria-hidden="true">
+                <span class="context-compaction-rule"></span>
+                <span class="context-compaction-label">
+                    <span class="context-compaction-icon">"\u{27F2}"</span>
+                    <span class="context-compaction-title">{title}</span>
+                    {tokens.map(|tokens| view! {
+                        <span class="context-compaction-metric">{tokens}</span>
+                    })}
+                    {duration.map(|duration| view! {
+                        <span class="context-compaction-metric">{duration}</span>
+                    })}
+                    {method.map(|method| view! {
+                        <span class="context-compaction-method">{method}</span>
+                    })}
+                    {reason.map(|reason| view! {
+                        <span class="context-compaction-reason">{reason}</span>
+                    })}
+                </span>
+                <span class="context-compaction-rule"></span>
+            </span>
+        </div>
+    }
+}
+
+fn compaction_stage_text(stage: CompactionStage) -> &'static str {
+    match stage {
+        CompactionStage::WaitingForIdle => "Waiting for the current turn to finish.",
+        CompactionStage::Dispatching => "Starting.",
+        CompactionStage::Compacting => "Summarizing the conversation for the model.",
+        CompactionStage::Finalizing => "Finalizing.",
+    }
+}
+
+/// The live operation banner.
+///
+/// Operational state, not transcript history: it sits outside the virtualized
+/// list so it stays visible wherever the user has scrolled, and it disappears
+/// the moment the operation ends.
+///
+/// Live-region behaviour is deliberately narrow. Inserting a node into an
+/// `aria-live` region *is* an announcement, so a banner reconstructed from
+/// `AgentBootstrap` renders with `aria-live="off"` — visible, but silent —
+/// until a genuinely live frame updates it. And the retained failure banner is
+/// never an `alert`: the single assertive announcement for a failure is made
+/// once, at the live transition, through the shared live region, so a remount
+/// or a route change cannot replay it.
+#[component]
+fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let operation = Signal::derive(move || {
+        let agent_id = agent_ref.get()?.agent_id;
+        state
+            .context_compactions
+            .with(|map| map.get(&agent_id).cloned())
+    });
+
+    // Elapsed wall-clock for a running operation. Claude's manual compaction
+    // ran 108–189 s in the corpus, and a progress surface with no moving part
+    // over three minutes reads as a hang.
+    //
+    // Keyed on operation *identity*, not on the payload: a progress heartbeat
+    // arrives roughly every 30 s and changes the payload, so an effect that
+    // read the whole operation would reset the count to zero twice a minute
+    // and the timer would never pass 0:30.
+    let operation_key: Memo<Option<(String, bool)>> = Memo::new(move |_| {
+        let agent_id = agent_ref.get()?.agent_id;
+        state.context_compactions.with(|map| {
+            map.get(&agent_id).map(|operation| {
+                (
+                    operation
+                        .operation_id()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    operation.is_in_flight(),
+                )
+            })
+        })
+    });
+
+    let elapsed = RwSignal::new(0u32);
+    let ticker: StoredValue<Option<leptos::prelude::IntervalHandle>> = StoredValue::new(None);
+    let clear_ticker = move || {
+        ticker.update_value(|slot| {
+            if let Some(handle) = slot.take() {
+                handle.clear();
+            }
+        });
+    };
+    Effect::new(move |_| {
+        // Clearing first makes the lifecycle explicit rather than relying on
+        // where an `on_cleanup` registered inside an effect body attaches.
+        clear_ticker();
+        elapsed.set(0);
+        let running = operation_key
+            .get()
+            .is_some_and(|(_, in_flight)| in_flight);
+        if !running {
+            return;
+        }
+        let handle = leptos::prelude::set_interval_with_handle(
+            move || {
+                elapsed.update(|value| *value = value.saturating_add(1));
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .ok();
+        ticker.set_value(handle);
+    });
+    on_cleanup(move || clear_ticker());
+
+    view! {
+        {move || {
+            let operation = operation.get()?;
+            let (title, detail, failed) = match &operation {
+                ContextCompactionUiState::Requesting => (
+                    "Compacting context\u{2026}".to_owned(),
+                    "Requesting.".to_owned(),
+                    false,
+                ),
+                ContextCompactionUiState::Active { payload, .. } => {
+                    let detail = match &payload.status {
+                        ContextCompactionStatus::Deferred { stage }
+                        | ContextCompactionStatus::Started { stage }
+                        | ContextCompactionStatus::Progress { stage } => {
+                            payload
+                                .message
+                                .clone()
+                                .unwrap_or_else(|| compaction_stage_text(*stage).to_owned())
+                        }
+                        // Terminal payloads never live in `Active`, but a
+                        // future status must not render a blank banner.
+                        ContextCompactionStatus::Completed
+                        | ContextCompactionStatus::Failed { .. } => String::new(),
+                    };
+                    let title = if matches!(
+                        payload.status,
+                        ContextCompactionStatus::Deferred { .. }
+                    ) {
+                        "Compaction queued".to_owned()
+                    } else {
+                        "Compacting context\u{2026}".to_owned()
+                    };
+                    (title, detail, false)
+                }
+                ContextCompactionUiState::Failed(payload) => {
+                    let mutation = match payload.status {
+                        ContextCompactionStatus::Failed { mutation, .. } => mutation,
+                        _ => CompactionMutation::MayHaveMutated,
+                    };
+                    let mut detail = payload
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Compaction failed.".to_owned());
+                    detail.push(' ');
+                    detail.push_str(crate::dispatch::compaction_mutation_sentence(mutation));
+                    ("Compaction failed".to_owned(), detail, true)
+                }
+            };
+
+            let announces = operation.announces();
+            let in_flight = operation.is_in_flight();
+            let class = if failed {
+                "chat-card chat-card-compacting chat-card-compacting-failed"
+            } else {
+                "chat-card chat-card-compacting"
+            };
+            Some(view! {
+                <div
+                    class=class
+                    // Always `status`, never `alert`. See the doc comment: the
+                    // one assertive announcement is made by the reducer at the
+                    // live transition, not by this element, so retained failure
+                    // state cannot re-announce when the view remounts.
+                    role="status"
+                    // Silent when reconstructed from bootstrap or when holding
+                    // retained terminal state; polite once genuinely live.
+                    aria-live=move || if announces { "polite" } else { "off" }
+                    // Atomic because the parts change independently: a stage
+                    // change alone ("Finalizing.") is meaningless read on its own.
+                    aria-atomic="true"
+                    data-test="context-compaction-banner"
+                >
+                    <div class="compacting-card-header">
+                        <span class="compacting-card-icon" aria-hidden="true">"\u{27F2}"</span>
+                        <span class="compacting-card-title">{title}</span>
+                        // Hidden from assistive technology: inside an atomic
+                        // live region a per-second counter would re-announce
+                        // the whole banner every tick.
+                        {in_flight.then(|| view! {
+                            <span class="compacting-card-elapsed" aria-hidden="true">
+                                {move || compaction_elapsed_text(elapsed.get())}
+                            </span>
+                        })}
+                    </div>
+                    <div class="compacting-card-body">
+                        <p class="compacting-card-detail">{detail}</p>
+                        // The guarantee the user is most likely to doubt while
+                        // watching a multi-minute operation rewrite "their"
+                        // conversation.
+                        <p class="compacting-card-note">
+                            "Your conversation history here is unchanged."
+                        </p>
+                    </div>
+                </div>
+            })
+        }}
+    }
+}
+
+/// `110` → `"1:50"`. Clock form, because it is read as elapsed time rather
+/// than scanned as a metric.
+fn compaction_elapsed_text(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// Cycle button for the global tool-output verbosity setting. Lives on the
@@ -1723,7 +2162,7 @@ mod wasm_tests {
                         message_count: 25,
                         oldest_seq: Some(42),
                         has_more_before: true,
-                        loading: false,
+                        pending_request: None,
                     },
                 );
             });
@@ -2196,6 +2635,601 @@ mod wasm_tests {
             target,
             Some(("host-a".to_owned(), ProjectId("project-a".to_owned()))),
             "Review changes must open the rendered agent's project even while agent B is globally active"
+        );
+    }
+
+    // ── Context compaction ──────────────────────────────────────────────
+
+    fn compaction_marker_event(
+        marker_id: &str,
+        status: ContextCompactionTimelineStatus,
+        mutation: CompactionMutation,
+        metrics: protocol::CompactionMetrics,
+    ) -> ContextCompactionTimelineEvent {
+        ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId(marker_id.to_owned()),
+            operation_id: None,
+            trigger: CompactionTrigger::UserRequested,
+            method: CompactionMethod::NativeTextCommand,
+            backend_kind: BackendKind::Claude,
+            provider_session_id: None,
+            status,
+            mutation,
+            metrics,
+            continuation: None,
+            message: None,
+            timestamp: 0,
+        }
+    }
+
+    fn full_metrics() -> protocol::CompactionMetrics {
+        protocol::CompactionMetrics {
+            before_tokens: Some(384_168),
+            after_tokens: Some(12_518),
+            duration_ms: Some(169_775),
+            ..Default::default()
+        }
+    }
+
+    fn mount_transcript(
+        agent_id: AgentId,
+        host_id: String,
+        rows: Vec<crate::state::ChatRowHandle>,
+    ) -> HtmlElement {
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.chat_rows.update(|map| {
+                map.insert(agent_id_mount.clone(), rows.clone());
+            });
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_001) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        container
+    }
+
+    fn query(container: &HtmlElement, selector: &str) -> Option<Element> {
+        container
+            .query_selector(selector)
+            .unwrap()
+            .and_then(|node| node.dyn_into::<Element>().ok())
+    }
+
+    /// A marker is a timeline divider, not a chat card. It carries no sender
+    /// label, no copy control, and no message body — an artifact that acquires
+    /// a sender is exactly the "raw summary rendered as a user message" leak
+    /// this work exists to close.
+    #[wasm_bindgen_test]
+    async fn compaction_marker_renders_as_divider_not_chat_card() {
+        ensure_styles_loaded();
+        let container = mount_transcript(
+            AgentId("agent-marker".to_owned()),
+            "host-marker".to_owned(),
+            vec![
+                crate::state::ChatRowHandle::new(mk_user_msg("before compaction")),
+                crate::state::ChatRowHandle::context_compaction(compaction_marker_event(
+                    "m1",
+                    ContextCompactionTimelineStatus::Completed,
+                    CompactionMutation::Completed,
+                    full_metrics(),
+                )),
+                crate::state::ChatRowHandle::new(mk_user_msg("after compaction")),
+            ],
+        );
+        next_tick().await;
+
+        let rows = message_rows(&container);
+        assert_eq!(rows.len(), 3, "the marker occupies one transcript row");
+
+        let marker = &rows[1];
+        let text = marker.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Context compacted"),
+            "the marker states what happened: {text}"
+        );
+        assert!(
+            !text.contains("You") && !text.contains("System"),
+            "a marker has no sender label: {text}"
+        );
+        assert!(
+            marker.query_selector(".chat-card").unwrap().is_none(),
+            "a marker is not rendered as a chat card"
+        );
+        assert!(
+            marker.query_selector("button").unwrap().is_none(),
+            "a marker offers no copy or tool controls"
+        );
+
+        // Both neighbours survive: compaction changes model context, never the
+        // visible transcript.
+        let all = container.text_content().unwrap_or_default();
+        assert!(
+            all.contains("before compaction") && all.contains("after compaction"),
+            "the full transcript stays visible either side of the marker: {all}"
+        );
+    }
+
+    /// The figures are the point of the marker for anyone scanning back through
+    /// a long session.
+    #[wasm_bindgen_test]
+    async fn completed_marker_shows_before_after_tokens_and_duration() {
+        ensure_styles_loaded();
+        let container = mount_transcript(
+            AgentId("agent-metrics".to_owned()),
+            "host-metrics".to_owned(),
+            vec![crate::state::ChatRowHandle::context_compaction(
+                compaction_marker_event(
+                    "m2",
+                    ContextCompactionTimelineStatus::Completed,
+                    CompactionMutation::Completed,
+                    full_metrics(),
+                ),
+            )],
+        );
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("384.2K"), "before-token figure: {text}");
+        assert!(text.contains("12.5K"), "after-token figure: {text}");
+        assert!(text.contains("2m 50s"), "elapsed duration: {text}");
+    }
+
+    /// Metric coverage differs per backend and absence is normal. A missing
+    /// figure renders as nothing — never a zero, which would read as
+    /// "compacted to nothing", and never a placeholder dash.
+    #[wasm_bindgen_test]
+    async fn unknown_metrics_render_no_figures_at_all() {
+        ensure_styles_loaded();
+        let container = mount_transcript(
+            AgentId("agent-nometrics".to_owned()),
+            "host-nometrics".to_owned(),
+            vec![crate::state::ChatRowHandle::context_compaction(
+                compaction_marker_event(
+                    "m3",
+                    ContextCompactionTimelineStatus::Completed,
+                    CompactionMutation::Completed,
+                    protocol::CompactionMetrics::default(),
+                ),
+            )],
+        );
+        next_tick().await;
+
+        let marker = query(&container, ".context-compaction-marker").expect("marker row");
+        let text = marker.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Context compacted"),
+            "title still renders: {text}"
+        );
+        assert!(!text.contains('0'), "no fabricated zero figure: {text}");
+        assert!(!text.contains('→'), "no empty before/after arrow: {text}");
+        assert_eq!(
+            marker
+                .query_selector_all(".context-compaction-metric")
+                .unwrap()
+                .length(),
+            0,
+            "absent metrics produce no metric elements at all"
+        );
+    }
+
+    /// What the user needs first from a failure is whether their model context
+    /// survived — not the provider's prose.
+    #[wasm_bindgen_test]
+    async fn failed_marker_states_whether_context_changed() {
+        ensure_styles_loaded();
+        let container = mount_transcript(
+            AgentId("agent-failed".to_owned()),
+            "host-failed".to_owned(),
+            vec![
+                crate::state::ChatRowHandle::context_compaction(compaction_marker_event(
+                    "m4",
+                    ContextCompactionTimelineStatus::Failed,
+                    CompactionMutation::NotObserved,
+                    protocol::CompactionMetrics::default(),
+                )),
+                crate::state::ChatRowHandle::context_compaction(compaction_marker_event(
+                    "m5",
+                    ContextCompactionTimelineStatus::Failed,
+                    CompactionMutation::MayHaveMutated,
+                    protocol::CompactionMetrics::default(),
+                )),
+            ],
+        );
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("context unchanged"),
+            "a pre-mutation failure says the context is intact: {text}"
+        );
+        assert!(
+            text.contains("may have changed"),
+            "a post-dispatch failure says the context is uncertain: {text}"
+        );
+    }
+
+    /// Historical rows must never be live regions. The virtualizer mounts and
+    /// unmounts them as the user scrolls, and bootstrap/paging re-mount them
+    /// wholesale — a `status` or `alert` role here announces a compaction from
+    /// days ago, repeatedly.
+    #[wasm_bindgen_test]
+    async fn marker_row_is_not_a_live_region_and_exposes_one_full_sentence() {
+        ensure_styles_loaded();
+        let container = mount_transcript(
+            AgentId("agent-a11y".to_owned()),
+            "host-a11y".to_owned(),
+            vec![crate::state::ChatRowHandle::context_compaction(
+                compaction_marker_event(
+                    "m6",
+                    ContextCompactionTimelineStatus::Completed,
+                    CompactionMutation::Completed,
+                    full_metrics(),
+                ),
+            )],
+        );
+        next_tick().await;
+
+        let marker = query(&container, ".context-compaction-marker").expect("marker row");
+        assert!(
+            marker.get_attribute("aria-live").is_none(),
+            "a durable row must not be a live region"
+        );
+        // V1 is a plain element: no `status`/`alert` (the virtualizer remounts
+        // this row on every scroll pass), and no `separator`/`group` either
+        // until real assistive-technology evidence justifies one.
+        assert!(
+            marker.get_attribute("role").is_none(),
+            "the durable marker is a plain element in V1"
+        );
+
+        // Exactly one representation in the accessibility tree: the whole
+        // visible row is hidden, and the visually-hidden sentence carries the
+        // figures in full. Grouped digits and a spoken duration, because
+        // "384168" is read digit-by-digit and "2m 50s" is read as letters.
+        let visual = query(&container, ".context-compaction-visual").expect("visible row");
+        assert_eq!(
+            visual.get_attribute("aria-hidden").as_deref(),
+            Some("true"),
+            "the abbreviated visible metrics are hidden from assistive technology"
+        );
+        let sentence = query(&container, ".context-compaction-marker .visually-hidden")
+            .expect("accessible sentence")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            sentence.contains("384,168") && sentence.contains("12,518"),
+            "grouped exact counts: {sentence}"
+        );
+        assert!(
+            sentence.contains("2 minutes 50 seconds"),
+            "and the humanized duration, which the visible row abbreviates: {sentence}"
+        );
+        assert!(
+            sentence.contains("unchanged"),
+            "and the guarantee the user is most likely to doubt: {sentence}"
+        );
+
+        // The visible abbreviations must not *also* be exposed.
+        assert!(
+            !marker.has_attribute("aria-label"),
+            "naming the row would leave the hidden sentence and the visible \
+             fragments both in the tree"
+        );
+    }
+
+    /// The live banner is the only compaction surface that announces, and it
+    /// is atomic: a stage change on its own ("Finalizing.") is meaningless
+    /// read in isolation.
+    #[wasm_bindgen_test]
+    async fn live_banner_is_polite_atomic_status_and_promises_the_transcript() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-banner".to_owned());
+        let host_id = "host-banner".to_owned();
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.context_compactions.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    ContextCompactionUiState::Active { live: true, payload: protocol::ContextCompactionNotifyPayload {
+                        operation_id: protocol::CompactionOperationId("op-1".to_owned()),
+                        agent_id: agent_id_mount.clone(),
+                        logical_session_id: protocol::SessionId("s".to_owned()),
+                        backend_kind: BackendKind::Claude,
+                        trigger: CompactionTrigger::UserRequested,
+                        method: Some(CompactionMethod::NativeTextCommand),
+                        status: ContextCompactionStatus::Progress {
+                            stage: CompactionStage::Compacting,
+                        },
+                        provider_version: None,
+                        metrics: protocol::CompactionMetrics::default(),
+                        continuation: None,
+                        message: None,
+                    } },
+                );
+            });
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_002) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let banner = query(&container, "[data-test='context-compaction-banner']")
+            .expect("live banner while an operation runs");
+        assert_eq!(banner.get_attribute("role").as_deref(), Some("status"));
+        assert_eq!(banner.get_attribute("aria-live").as_deref(), Some("polite"));
+        assert_eq!(banner.get_attribute("aria-atomic").as_deref(), Some("true"));
+
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Compacting context"),
+            "the banner says what is happening: {text}"
+        );
+        assert!(
+            text.contains("history here is unchanged"),
+            "and restates the guarantee during the multi-minute wait: {text}"
+        );
+
+        // The elapsed counter is inside an atomic live region, so it must be
+        // hidden or every tick re-announces the whole banner.
+        let elapsed = query(&container, ".compacting-card-elapsed")
+            .expect("a multi-minute operation shows elapsed time");
+        assert_eq!(
+            elapsed.get_attribute("aria-hidden").as_deref(),
+            Some("true"),
+            "a per-second counter must not drive an atomic live region"
+        );
+    }
+
+    /// A banner reconstructed from `AgentBootstrap` must be *visible* but
+    /// silent: inserting a node into an `aria-live` region is itself an
+    /// announcement, so suppressing the explicit announce call is not enough.
+    #[wasm_bindgen_test]
+    async fn bootstrap_restored_banner_is_visible_but_not_a_live_region() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-restored".to_owned());
+        let host_id = "host-restored".to_owned();
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.context_compactions.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    ContextCompactionUiState::Active {
+                        // As restored by bootstrap.
+                        live: false,
+                        payload: protocol::ContextCompactionNotifyPayload {
+                            operation_id: protocol::CompactionOperationId("op-boot".to_owned()),
+                            agent_id: agent_id_mount.clone(),
+                            logical_session_id: protocol::SessionId("s".to_owned()),
+                            backend_kind: BackendKind::Claude,
+                            trigger: CompactionTrigger::UserRequested,
+                            method: Some(CompactionMethod::NativeTextCommand),
+                            status: ContextCompactionStatus::Progress {
+                                stage: CompactionStage::Compacting,
+                            },
+                            provider_version: None,
+                            metrics: protocol::CompactionMetrics::default(),
+                            continuation: None,
+                            message: None,
+                        },
+                    },
+                );
+            });
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_005) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let banner = query(&container, "[data-test='context-compaction-banner']")
+            .expect("a reconnect still shows the running operation");
+        assert!(
+            banner
+                .text_content()
+                .unwrap_or_default()
+                .contains("Compacting context"),
+            "the operation is visible after a reconnect"
+        );
+        assert_eq!(
+            banner.get_attribute("aria-live").as_deref(),
+            Some("off"),
+            "but mounting it must not announce old work as if it were new"
+        );
+    }
+
+    /// Retained failure state is never an alert. The one assertive
+    /// announcement happens at the live transition; alert semantics here would
+    /// replay it on every remount and route change.
+    #[wasm_bindgen_test]
+    async fn retained_failure_banner_does_not_reacquire_alert_semantics() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-failbanner".to_owned());
+        let host_id = "host-failbanner".to_owned();
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.context_compactions.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    ContextCompactionUiState::Failed(protocol::ContextCompactionNotifyPayload {
+                        operation_id: protocol::CompactionOperationId("op-failed".to_owned()),
+                        agent_id: agent_id_mount.clone(),
+                        logical_session_id: protocol::SessionId("s".to_owned()),
+                        backend_kind: BackendKind::Claude,
+                        trigger: CompactionTrigger::UserRequested,
+                        method: Some(CompactionMethod::NativeTextCommand),
+                        status: ContextCompactionStatus::Failed {
+                            accepted: true,
+                            mutation: CompactionMutation::MayHaveMutated,
+                        },
+                        provider_version: None,
+                        metrics: protocol::CompactionMetrics::default(),
+                        continuation: None,
+                        message: Some("summarizer timed out".to_owned()),
+                    }),
+                );
+            });
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_006) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let banner = query(&container, "[data-test='context-compaction-banner']")
+            .expect("the failure stays explained on screen");
+        assert_eq!(
+            banner.get_attribute("role").as_deref(),
+            Some("status"),
+            "retained failure presentation is never an alert"
+        );
+        assert_eq!(
+            banner.get_attribute("aria-live").as_deref(),
+            Some("off"),
+            "and is not a live region at all, so a remount cannot replay it"
+        );
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("summarizer timed out") && text.contains("may have changed"),
+            "while still saying what failed and what it means: {text}"
+        );
+    }
+
+    /// A deferred operation is waiting for a safe point, not hung. Saying so
+    /// is the difference between "queued" and "broken".
+    #[wasm_bindgen_test]
+    async fn deferred_operation_reads_as_queued_not_stalled() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-deferred".to_owned());
+        let host_id = "host-deferred".to_owned();
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.context_compactions.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    ContextCompactionUiState::Active { live: true, payload: protocol::ContextCompactionNotifyPayload {
+                        operation_id: protocol::CompactionOperationId("op-2".to_owned()),
+                        agent_id: agent_id_mount.clone(),
+                        logical_session_id: protocol::SessionId("s".to_owned()),
+                        backend_kind: BackendKind::Claude,
+                        trigger: CompactionTrigger::UserRequested,
+                        method: None,
+                        status: ContextCompactionStatus::Deferred {
+                            stage: CompactionStage::WaitingForIdle,
+                        },
+                        provider_version: None,
+                        metrics: protocol::CompactionMetrics::default(),
+                        continuation: None,
+                        message: None,
+                    } },
+                );
+            });
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_003) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let banner = query(&container, "[data-test='context-compaction-banner']")
+            .expect("banner for a deferred operation");
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Compaction queued"),
+            "queued, not compacting: {text}"
+        );
+        assert!(
+            text.contains("Waiting for the current turn to finish"),
+            "and says what it is waiting for: {text}"
+        );
+    }
+
+    /// The header control stays visible and explains itself when it cannot be
+    /// used. Hiding it — the previous behaviour — teaches the user it does not
+    /// exist, and the most common blocker is transient.
+    #[wasm_bindgen_test]
+    async fn header_compact_control_is_visible_and_explains_why_it_is_disabled() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-header".to_owned());
+        let host_id = "host-header".to_owned();
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            // Disconnected host: a real, explainable blocker.
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_004) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let button = query(&container, "[data-test='chat-header-compact']")
+            .expect("the control stays in the header even when unavailable");
+        assert_eq!(
+            button.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "and is disabled rather than hidden"
+        );
+        let label = button.get_attribute("aria-label").unwrap_or_default();
+        assert!(
+            label.contains("unavailable:"),
+            "the accessible name carries the reason: {label}"
+        );
+
+        // A natively-disabled button leaves the tab order, which makes the
+        // reason hover-only. `aria-disabled` keeps it focusable so a keyboard
+        // or screen-reader user can reach the explanation.
+        assert!(
+            !button.has_attribute("disabled"),
+            "the reason must be reachable without a pointer"
         );
     }
 }

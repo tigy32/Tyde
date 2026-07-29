@@ -105,7 +105,6 @@ const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const CLAUDE_WAKE_QUIESCE_WAIT: Duration = Duration::from_secs(5);
 // Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
 const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
-const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a session will hold its output waiting for the CLI to report which
 /// skills it loaded. Matches the handshake timeout in production; shortened in
@@ -134,6 +133,7 @@ static CLAUDE_PROCESS_SPAWN_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<u3
     std::sync::Mutex::new(None);
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(18);
+const CLAUDE_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 const TYDE_CLAUDE_BIN_ENV: &str = "TYDE_CLAUDE_BIN";
 
 #[cfg(test)]
@@ -200,6 +200,29 @@ impl ClaudeCommandHandle {
             payload.tool_response,
         )
         .await
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.compaction_capability.clone())
+            .unwrap_or_else(|_| {
+                BackendCompactionCapability::unknown(
+                    BackendCompactionUnknownReason::CapabilityProbeFailed(
+                        "Claude session state is busy".to_string(),
+                    ),
+                    None,
+                    BackendCompactionCapabilityEvidence::None,
+                )
+            })
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        ClaudeInner::begin_compaction(Arc::clone(&self.inner), request).await
     }
 }
 
@@ -507,6 +530,16 @@ impl ClaudeSession {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                compaction_capability: BackendCompactionCapability::unknown(
+                    BackendCompactionUnknownReason::ProcessNotInitialized,
+                    None,
+                    BackendCompactionCapabilityEvidence::None,
+                ),
+                compact_command_advertised: None,
+                installed_provider_version: None,
+                provider_version: None,
+                process_generation: 0,
+                pending_compaction: None,
                 closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
@@ -551,6 +584,20 @@ impl ClaudeSession {
         }
     }
 
+    async fn seed_installed_provider_version(&self, provider_version: Option<String>) {
+        let provider_version =
+            provider_version.and_then(|version| normalize_nonempty(&version));
+        let mut state = self.inner.state.lock().await;
+        state.installed_provider_version = provider_version.clone();
+        state.provider_version = provider_version;
+        if state.compact_command_advertised.is_some() {
+            state.compaction_capability = claude_compaction_capability(
+                state.compact_command_advertised,
+                state.provider_version.as_deref(),
+            );
+        }
+    }
+
     pub async fn shutdown(self) {
         self.inner.shutdown().await;
     }
@@ -558,11 +605,40 @@ impl ClaudeSession {
 
 struct ActiveTurn {
     id: u64,
+    owner: ClaudeTurnOwner,
     outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
     interrupt_requested: bool,
     pending_ask_user_question: Option<PendingAskUserQuestionControl>,
     pending_exit_plan_mode: Option<PendingExitPlanModeControl>,
     quiesced_waiters: Vec<oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClaudeTurnOwner {
+    User,
+    Compaction(protocol::CompactionOperationId),
+}
+
+struct PendingClaudeCompaction {
+    request: BackendCompactionRequest,
+    terminal_tx: Option<oneshot::Sender<BackendCompactionResult>>,
+    timeout_cancel_tx: Option<oneshot::Sender<()>>,
+    turn_id: u64,
+    process_generation: u64,
+    dispatched_at: std::time::Instant,
+    write_completed: bool,
+    boundary: Option<ClaudeCompactionBoundary>,
+    compact_result: Option<String>,
+    compact_error: Option<String>,
+    terminal_result_seen: bool,
+    result_is_error: bool,
+    diagnostic: Option<String>,
+}
+
+#[derive(Clone)]
+struct ClaudeCompactionBoundary {
+    uuid: String,
+    metrics: CompactionMetrics,
 }
 
 /// How the Claude backend disposed of a send: either it fully handled the
@@ -675,6 +751,12 @@ struct ClaudeState {
     cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
+    compaction_capability: BackendCompactionCapability,
+    compact_command_advertised: Option<bool>,
+    installed_provider_version: Option<String>,
+    provider_version: Option<String>,
+    process_generation: u64,
+    pending_compaction: Option<PendingClaudeCompaction>,
     /// Set by `shutdown`. Blocks new turns (including CLI-initiated ones) and
     /// process respawn after the backend has been told to close.
     closing: bool,
@@ -719,6 +801,16 @@ impl Default for ClaudeState {
             cumulative_usage_complete: true,
             conversation_bytes_total: 0,
             active_turn: None,
+            compaction_capability: BackendCompactionCapability::unknown(
+                BackendCompactionUnknownReason::ProcessNotInitialized,
+                None,
+                BackendCompactionCapabilityEvidence::None,
+            ),
+            compact_command_advertised: None,
+            installed_provider_version: None,
+            provider_version: None,
+            process_generation: 0,
+            pending_compaction: None,
             closing: false,
             restart_process_after_turn: false,
             subagent_emitter: None,
@@ -947,6 +1039,18 @@ struct ClaudeSystemFrame {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    compact_result: Option<String>,
+    #[serde(default)]
+    compact_error: Option<String>,
+    #[serde(default)]
+    compact_metadata: Option<Value>,
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    claude_code_version: Option<String>,
+    #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
@@ -1115,6 +1219,63 @@ fn parse_claude_system_frame(value: &Value) -> Result<ClaudeSystemFrame, String>
         .map_err(|err| format!("invalid Claude system frame: {err}; value={value}"))
 }
 
+fn claude_live_compaction_observation(
+    value: &Value,
+    system: &ClaudeSystemFrame,
+    fallback_session_id: Option<&str>,
+) -> Option<BackendObservedCompaction> {
+    let boundary_uuid = system
+        .uuid
+        .clone()
+        .or_else(|| value.get("uuid").and_then(Value::as_str).map(str::to_owned))?;
+    let session_id = system
+        .session_id
+        .clone()
+        .or_else(|| fallback_session_id.map(str::to_owned))
+        .or_else(|| {
+            value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })?;
+    let metadata = system.compact_metadata.as_ref();
+    let trigger = metadata
+        .and_then(|metadata| metadata.get("trigger"))
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let trigger = if trigger == "manual" {
+        CompactionTrigger::BackendObservedManual
+    } else {
+        CompactionTrigger::BackendAutomatic
+    };
+    Some(BackendObservedCompaction {
+        observation_id: super::compaction::stable_observation_id(
+            "claude",
+            &session_id,
+            &boundary_uuid,
+        ),
+        trigger,
+        method: if trigger == CompactionTrigger::BackendAutomatic {
+            CompactionMethod::BackendAutomatic
+        } else {
+            CompactionMethod::NativeTextCommand
+        },
+        provider_session_id: Some(SessionId(session_id)),
+        metrics: claude_compaction_metrics(metadata),
+        source: BackendCompactionObservationSource::ClaudeBoundary {
+            boundary_uuid,
+        },
+        user_focus: metadata
+            .and_then(|metadata| metadata.get("user_context"))
+            .and_then(Value::as_str)
+            .and_then(normalize_nonempty)
+            .map(|text| BackendCompactionUserFocus {
+                text,
+                provenance: BackendCompactionUserFocusProvenance::ProviderEcho,
+            }),
+    })
+}
+
 #[doc(hidden)]
 pub fn validate_system_frame(value: &Value) -> Result<(), String> {
     parse_claude_system_frame(value).map(|_| ())
@@ -1252,6 +1413,7 @@ enum ClaudeHistoryReplayItem {
     Message(Value),
     ToolRequest(ClaudeToolCall),
     ToolExecutionCompleted(ClaudeReplayToolExecution),
+    Compaction(BackendObservedCompaction),
 }
 
 struct ClaudeSessionReplay {
@@ -1570,6 +1732,7 @@ impl ClaudeInner {
             let (outcome_tx, outcome_rx) = oneshot::channel();
             state.active_turn = Some(ActiveTurn {
                 id: turn_id,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -1640,6 +1803,174 @@ impl ClaudeInner {
         ClaudeSendAdmission::Handled
     }
 
+    async fn begin_compaction(
+        self: Arc<Self>,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        let focus = match claude_compaction_focus(&request) {
+            Err(()) => {
+                return BackendCompactionStart::NotDispatched {
+                    reason: BackendCompactionNotDispatchedReason::InvalidFocus,
+                    fallback_safe: false,
+                };
+            }
+            Ok(focus) => focus,
+        };
+        let (turn_id, terminal_rx, timeout_cancel_rx) = {
+            let mut state = self.state.lock().await;
+            if state.closing {
+                return BackendCompactionStart::NotDispatched {
+                    reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                    fallback_safe: false,
+                };
+            }
+            if state.pending_compaction.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                };
+            }
+            if state.active_turn.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::ActiveTurn,
+                };
+            }
+            if let Some(start) =
+                super::compaction::not_dispatched_for_capability(&state.compaction_capability)
+            {
+                return start;
+            }
+            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let (terminal_tx, terminal_rx) = oneshot::channel();
+            let (timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: turn_id,
+                owner: ClaudeTurnOwner::Compaction(request.operation_id.clone()),
+                outcome_tx: None,
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+            let process_generation = state.process_generation;
+            state.pending_compaction = Some(PendingClaudeCompaction {
+                request: request.clone(),
+                terminal_tx: Some(terminal_tx),
+                timeout_cancel_tx: Some(timeout_cancel_tx),
+                turn_id,
+                process_generation,
+                dispatched_at: std::time::Instant::now(),
+                write_completed: false,
+                boundary: None,
+                compact_result: None,
+                compact_error: None,
+                terminal_result_seen: false,
+                result_is_error: false,
+                diagnostic: None,
+            });
+            (turn_id, terminal_rx, timeout_cancel_rx)
+        };
+
+        if let Err(error) = self.ensure_process_ready().await {
+            self.abandon_undispatched_compaction(turn_id).await;
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(
+                    BackendCompactionUnknownReason::CapabilityProbeFailed(error),
+                ),
+                fallback_safe: false,
+            };
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some(start) =
+                super::compaction::not_dispatched_for_capability(&state.compaction_capability)
+            {
+                drop(state);
+                self.abandon_undispatched_compaction(turn_id).await;
+                return start;
+            }
+            let process_generation = state.process_generation;
+            if let Some(pending) = state.pending_compaction.as_mut() {
+                pending.process_generation = process_generation;
+            }
+        }
+
+        let prompt = focus
+            .as_deref()
+            .map(|focus| format!("/compact {focus}"))
+            .unwrap_or_else(|| "/compact".to_string());
+        let input = build_stream_json_user_message(&prompt, &[]);
+        if let Err(error) = self.write_process_json_line(&input).await {
+            let result = self
+                .finish_compaction(
+                    turn_id,
+                    BackendCompactionFailureKind::TransportClosed,
+                    Some(format!(
+                        "Claude compaction write may have reached the provider: {error}"
+                    )),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|| dispatch_uncertain_claude_result(request.operation_id.clone(), error));
+            return BackendCompactionStart::DispatchUncertain(result);
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some(pending) = state.pending_compaction.as_mut()
+                && pending.turn_id == turn_id
+            {
+                pending.dispatched_at = std::time::Instant::now();
+                pending.write_completed = true;
+            }
+        }
+        let timeout_inner = Arc::clone(&self);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(CLAUDE_COMPACTION_TIMEOUT) => {
+                    let _ = timeout_inner
+                        .finish_compaction(
+                            turn_id,
+                            BackendCompactionFailureKind::TimedOut,
+                            Some("Timed out waiting for Claude compaction to quiesce".to_string()),
+                            false,
+                        )
+                        .await;
+                }
+                _ = timeout_cancel_rx => {}
+            }
+        });
+        BackendCompactionStart::Accepted(super::BackendAcceptedCompaction {
+            operation_id: request.operation_id,
+            terminal: terminal_rx,
+        })
+    }
+
+    async fn abandon_undispatched_compaction(&self, turn_id: u64) {
+        let waiters = {
+            let mut state = self.state.lock().await;
+            if state
+                .pending_compaction
+                .as_ref()
+                .is_some_and(|pending| pending.turn_id == turn_id)
+            {
+                state.pending_compaction.take();
+            }
+            match state.active_turn.as_ref() {
+                Some(active)
+                    if active.id == turn_id
+                        && matches!(active.owner, ClaudeTurnOwner::Compaction(_)) =>
+                {
+                    state
+                        .active_turn
+                        .take()
+                        .map(|active| active.quiesced_waiters)
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        };
+        notify_turn_quiesced(waiters);
+    }
+
     #[cfg(test)]
     async fn run_turn(
         self: &Arc<Self>,
@@ -1681,6 +2012,7 @@ impl ClaudeInner {
             state.tool_policy = tool_policy;
             state.active_turn = Some(ActiveTurn {
                 id: turn_id,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -1903,6 +2235,7 @@ impl ClaudeInner {
             let (outcome_tx, outcome_rx) = oneshot::channel();
             state.active_turn = Some(ActiveTurn {
                 id: turn_id,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -1939,6 +2272,313 @@ impl ClaudeInner {
         });
 
         Some(turn_id)
+    }
+
+    async fn observe_compaction_frame(&self, turn_id: u64, value: &Value) {
+        if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
+            let current_session_id = self.state.lock().await.session_id.clone();
+            if current_session_id
+                .as_deref()
+                .is_some_and(|current| current != session_id)
+            {
+                return;
+            }
+            if current_session_id.is_none() {
+                self.set_session_id(session_id.to_string()).await;
+            }
+        }
+        let message_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match message_type {
+            "system" => {
+                let Ok(system) = parse_claude_system_frame(value) else {
+                    return;
+                };
+                match system.event() {
+                    ClaudeSystemEvent::Status => {
+                        let mut progress = None;
+                        let mut state = self.state.lock().await;
+                        let process_generation = state.process_generation;
+                        let session_matches = system
+                            .session_id
+                            .as_deref()
+                            .or_else(|| value.get("session_id").and_then(Value::as_str))
+                            .is_none_or(|frame_session| {
+                                state.session_id.as_deref() == Some(frame_session)
+                            });
+                        let Some(pending) = state.pending_compaction.as_mut() else {
+                            return;
+                        };
+                        if pending.turn_id != turn_id
+                            || pending.process_generation != process_generation
+                            || !pending.write_completed
+                            || !session_matches
+                        {
+                            return;
+                        }
+                        if system.status.as_deref() == Some("compacting") {
+                            progress = Some(BackendCompactionProgress {
+                                operation_id: pending.request.operation_id.clone(),
+                                stage: CompactionStage::Compacting,
+                                elapsed_ms: Some(
+                                    pending.dispatched_at.elapsed().as_millis() as u64,
+                                ),
+                            });
+                        }
+                        if let Some(compact_result) = system.compact_result {
+                            pending.compact_result = Some(compact_result);
+                            pending.compact_error = system.compact_error;
+                        }
+                        drop(state);
+                        if let Some(progress) = progress {
+                            self.emitter
+                                .compaction_event(&BackendCompactionEvent::Progress(progress));
+                        }
+                    }
+                    ClaudeSystemEvent::CompactBoundary => {
+                        let trigger = system
+                            .compact_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("trigger"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("auto");
+                        if trigger != "manual" {
+                            let session_id = {
+                                let state = self.state.lock().await;
+                                state.session_id.clone()
+                            };
+                            if let Some(observation) = claude_live_compaction_observation(
+                                value,
+                                &system,
+                                session_id.as_deref(),
+                            ) {
+                                self.emitter.compaction_event(
+                                    &BackendCompactionEvent::Observed(observation),
+                                );
+                            }
+                            return;
+                        }
+                        let Some(uuid) = system
+                            .uuid
+                            .clone()
+                            .or_else(|| {
+                                value
+                                    .get("uuid")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                        else {
+                            return;
+                        };
+                        let mut state = self.state.lock().await;
+                        let process_generation = state.process_generation;
+                        let session_matches = system
+                            .session_id
+                            .as_deref()
+                            .or_else(|| value.get("session_id").and_then(Value::as_str))
+                            .is_none_or(|frame_session| {
+                                state.session_id.as_deref() == Some(frame_session)
+                            });
+                        let Some(pending) = state.pending_compaction.as_mut() else {
+                            return;
+                        };
+                        if pending.turn_id != turn_id
+                            || pending.process_generation != process_generation
+                            || !pending.write_completed
+                            || !session_matches
+                        {
+                            return;
+                        }
+                        pending.boundary = Some(ClaudeCompactionBoundary {
+                            uuid,
+                            metrics: claude_compaction_metrics(
+                                system.compact_metadata.as_ref(),
+                            ),
+                        });
+                    }
+                    ClaudeSystemEvent::Init
+                    | ClaudeSystemEvent::TaskStarted
+                    | ClaudeSystemEvent::TaskProgress
+                    | ClaudeSystemEvent::TaskNotification
+                    | ClaudeSystemEvent::BackgroundTasksChanged
+                    | ClaudeSystemEvent::TaskUpdated
+                    | ClaudeSystemEvent::ThinkingTokens
+                    | ClaudeSystemEvent::ApiRetry
+                    | ClaudeSystemEvent::Unknown(_) => {}
+                }
+            }
+            "assistant" => {
+                let diagnostic = value
+                    .get("message")
+                    .and_then(extract_text_from_message)
+                    .and_then(normalize_nonempty);
+                if let Some(diagnostic) = diagnostic {
+                    let mut state = self.state.lock().await;
+                    if let Some(pending) = state.pending_compaction.as_mut()
+                        && pending.turn_id == turn_id
+                    {
+                        pending.diagnostic = Some(diagnostic);
+                    }
+                }
+            }
+            "result" => {
+                let mut state = self.state.lock().await;
+                if let Some(pending) = state.pending_compaction.as_mut()
+                    && pending.turn_id == turn_id
+                {
+                    pending.terminal_result_seen = true;
+                    pending.result_is_error = value
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        || value.get("subtype").and_then(Value::as_str) == Some("error");
+                    if pending.diagnostic.is_none() {
+                        pending.diagnostic = extract_result_error(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn finish_compaction(
+        &self,
+        turn_id: u64,
+        forced_failure_kind: BackendCompactionFailureKind,
+        forced_failure: Option<String>,
+        dispatch_uncertain: bool,
+    ) -> Option<BackendCompactionResult> {
+        let (result, terminal_tx, timeout_cancel_tx, waiters) = {
+            let mut state = self.state.lock().await;
+            let active_matches = state.active_turn.as_ref().is_some_and(|active| {
+                active.id == turn_id
+                    && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+            });
+            if !active_matches {
+                return None;
+            }
+            let mut pending = state.pending_compaction.take()?;
+            if pending.turn_id != turn_id {
+                state.pending_compaction = Some(pending);
+                return None;
+            }
+            let interrupted = state
+                .active_turn
+                .as_ref()
+                .is_some_and(|active| active.interrupt_requested);
+            let boundary = pending.boundary.as_ref();
+            let typed_failed = pending.compact_result.as_deref() == Some("failed");
+            let semantic_failure = forced_failure
+                .or_else(|| interrupted.then(|| "Claude compaction was interrupted".to_string()))
+                .or_else(|| pending.compact_error.clone())
+                .or_else(|| pending.result_is_error.then(|| {
+                    pending
+                        .diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "Claude returned an error result".to_string())
+                }))
+                .or_else(|| typed_failed.then(|| {
+                    pending
+                        .diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "Claude reported compaction failure".to_string())
+                }))
+                .or_else(|| {
+                    (!pending.terminal_result_seen)
+                        .then(|| "Claude compaction did not reach a terminal result".to_string())
+                })
+                .or_else(|| {
+                    boundary
+                        .is_none()
+                        .then(|| "Claude returned a result without a manual compact boundary".to_string())
+                });
+            let dispatch = if dispatch_uncertain {
+                BackendCompactionDispatchState::MayHaveReachedProvider
+            } else {
+                BackendCompactionDispatchState::Accepted
+            };
+            let mutation = if boundary.is_some() {
+                BackendCompactionMutationState::Completed
+            } else if dispatch_uncertain
+                || matches!(
+                    forced_failure_kind,
+                    BackendCompactionFailureKind::TimedOut
+                        | BackendCompactionFailureKind::TransportClosed
+                )
+            {
+                BackendCompactionMutationState::MayHaveMutated
+            } else {
+                BackendCompactionMutationState::NotObserved
+            };
+            let metrics = boundary
+                .map(|boundary| boundary.metrics.clone())
+                .unwrap_or_default();
+            let post_context_tokens = metrics
+                .after_tokens
+                .map(PostCompactionTokenCount::Trusted)
+                .unwrap_or(PostCompactionTokenCount::Unknown);
+            let outcome = if let Some(message) = semantic_failure {
+                Err(BackendCompactionFailure {
+                    kind: if interrupted {
+                        BackendCompactionFailureKind::Interrupted
+                    } else if typed_failed || pending.result_is_error {
+                        BackendCompactionFailureKind::ProviderFailed
+                    } else {
+                        forced_failure_kind
+                    },
+                    message,
+                })
+            } else {
+                Ok(BackendCompactionSuccess {
+                    mechanism: CompactionMethod::NativeTextCommand,
+                })
+            };
+            let result = BackendCompactionResult {
+                operation_id: pending.request.operation_id.clone(),
+                dispatch,
+                mutation,
+                outcome,
+                provider_session_id: state.session_id.clone().map(SessionId),
+                metrics,
+                post_context_tokens,
+                evidence: BackendCompactionTerminalEvidence::Claude {
+                    session_id: state.session_id.clone(),
+                    boundary_uuid: boundary.map(|boundary| boundary.uuid.clone()),
+                    compact_result: pending.compact_result.clone(),
+                    terminal_result_seen: pending.terminal_result_seen,
+                },
+            };
+            let terminal_tx = pending.terminal_tx.take();
+            let timeout_cancel_tx = pending.timeout_cancel_tx.take();
+            let waiters = state
+                .active_turn
+                .take()
+                .map(|active| active.quiesced_waiters)
+                .unwrap_or_default();
+            (result, terminal_tx, timeout_cancel_tx, waiters)
+        };
+        if let Some(timeout_cancel_tx) = timeout_cancel_tx {
+            let _ = timeout_cancel_tx.send(());
+        }
+        if let Some(terminal_tx) = terminal_tx {
+            let _ = terminal_tx.send(result.clone());
+        }
+        notify_turn_quiesced(waiters);
+        if self.take_restart_process_after_turn().await {
+            self.shutdown_process().await;
+        }
+        Some(result)
+    }
+
+    async fn active_turn_owner(&self, turn_id: u64) -> Option<ClaudeTurnOwner> {
+        let state = self.state.lock().await;
+        state
+            .active_turn
+            .as_ref()
+            .filter(|active| active.id == turn_id)
+            .map(|active| active.owner.clone())
     }
 
     async fn write_turn_to_persistent_process(
@@ -2309,12 +2949,20 @@ impl ClaudeInner {
         }
 
         let config = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             // A turn reserved just before shutdown must not respawn the CLI
             // process after `shutdown_process` has killed it.
             if state.closing {
                 return Err("Claude backend is shutting down".to_string());
             }
+            state.process_generation = state.process_generation.saturating_add(1);
+            state.compact_command_advertised = None;
+            state.provider_version = state.installed_provider_version.clone();
+            state.compaction_capability = BackendCompactionCapability::unknown(
+                BackendCompactionUnknownReason::ProcessNotInitialized,
+                None,
+                BackendCompactionCapabilityEvidence::None,
+            );
             ClaudeProcessSpawnConfig {
                 workspace_root: state.workspace_root.clone(),
                 ssh_host: state.ssh_host.clone(),
@@ -2396,6 +3044,31 @@ impl ClaudeInner {
         let emitter = {
             let mut state = self.state.lock().await;
             state.capacity_access = access;
+            state.compact_command_advertised = response
+                .get("commands")
+                .and_then(Value::as_array)
+                .map(|commands| {
+                    commands.iter().any(|command| {
+                        command
+                            .as_str()
+                            .or_else(|| command.get("name").and_then(Value::as_str))
+                            .is_some_and(|name| name.trim_start_matches('/') == "compact")
+                    })
+                });
+            if state.provider_version.is_none() {
+                state.provider_version = response
+                    .get("claudeCodeVersion")
+                    .or_else(|| response.get("version"))
+                    .and_then(Value::as_str)
+                    .and_then(normalize_nonempty);
+            }
+            if state.provider_version.is_some() {
+                state.installed_provider_version = state.provider_version.clone();
+            }
+            state.compaction_capability = claude_compaction_capability(
+                state.compact_command_advertised,
+                state.provider_version.as_deref(),
+            );
             state.subagent_emitter.clone()
         };
         let Some(emitter) = emitter else {
@@ -2415,6 +3088,29 @@ impl ClaudeInner {
         if let Some(capacity) = capacity {
             emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
         }
+    }
+
+    async fn observe_process_metadata(&self, value: &Value) {
+        if value.get("type").and_then(Value::as_str) != Some("system")
+            || value.get("subtype").and_then(Value::as_str) != Some("init")
+        {
+            return;
+        }
+        let version = value
+            .get("claude_code_version")
+            .or_else(|| value.get("version"))
+            .and_then(Value::as_str)
+            .and_then(normalize_nonempty);
+        if version.is_none() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        state.installed_provider_version = version.clone();
+        state.provider_version = version;
+        state.compaction_capability = claude_compaction_capability(
+            state.compact_command_advertised,
+            state.provider_version.as_deref(),
+        );
     }
 
     async fn schedule_capacity_refresh(self: &Arc<Self>) {
@@ -2623,7 +3319,9 @@ impl ClaudeInner {
     async fn active_turn_pending_outcome_id(&self) -> Option<u64> {
         let state = self.state.lock().await;
         state.active_turn.as_ref().and_then(|active| {
-            if active.outcome_tx.is_some() {
+            if active.outcome_tx.is_some()
+                || matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+            {
                 Some(active.id)
             } else {
                 None
@@ -3308,6 +4006,10 @@ impl ClaudeInner {
                         completion.error,
                     );
                 }
+                ClaudeHistoryReplayItem::Compaction(observation) => {
+                    self.emitter
+                        .compaction_event(&BackendCompactionEvent::Observed(observation));
+                }
             }
         }
 
@@ -3530,10 +4232,6 @@ impl ClaudeInner {
         self.emitter.stream_reasoning_delta(message_id, text);
     }
 
-    fn emit_system_message(&self, content: &str) {
-        self.emitter.system_message(content);
-    }
-
     fn emit_stream_end(
         &self,
         content: String,
@@ -3742,9 +4440,7 @@ impl ClaudeInner {
                     selected_model.as_deref(),
                 );
                 match control_event {
-                    ClaudeControlEvent::ConversationCompacted => {
-                        self.emit_system_message(CLAUDE_CONVERSATION_COMPACTED_NOTICE);
-                    }
+                    ClaudeControlEvent::ConversationCompacted => {}
                 }
                 if !self.emitter.is_stream_open() {
                     self.emit_stream_start(
@@ -4331,6 +5027,7 @@ async fn read_claude_stdout_persistent(
         if route_control_response(&value, &control_waiters).await {
             continue;
         }
+        inner.observe_process_metadata(&value).await;
 
         // A cancelled turn is checked before anything below can call this a
         // skill problem. The user stopping a turn is not the skills failing,
@@ -4527,7 +5224,7 @@ async fn read_claude_stdout_persistent(
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
-        let (turn_id, model_hint) =
+        let (turn_id, model_hint, owner) =
             match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
                 Some(turn) => turn,
                 None => {
@@ -4577,6 +5274,24 @@ async fn read_claude_stdout_persistent(
                     }
                 }
             };
+
+        if matches!(owner, ClaudeTurnOwner::Compaction(_)) {
+            inner.observe_compaction_frame(turn_id, &value).await;
+            if value.get("type").and_then(Value::as_str) == Some("result") {
+                turn_state.active_turn_id = None;
+                turn_state.base_message_id.clear();
+                turn_state.current_message_id.clear();
+                let _ = inner
+                    .finish_compaction(
+                        turn_id,
+                        BackendCompactionFailureKind::ProtocolViolation,
+                        None,
+                        false,
+                    )
+                    .await;
+            }
+            continue;
+        }
 
         let interrupt_requested = inner.active_turn_interrupted(turn_id).await;
         consume_claude_stream_value_with_interrupt(
@@ -4633,6 +5348,21 @@ async fn read_claude_stdout_persistent(
         inner.active_turn_pending_outcome_id().await
     };
     if let Some(turn_id) = active_turn_id {
+        if matches!(
+            inner.active_turn_owner(turn_id).await,
+            Some(ClaudeTurnOwner::Compaction(_))
+        ) {
+            let _ = inner
+                .finish_compaction(
+                    turn_id,
+                    BackendCompactionFailureKind::TransportClosed,
+                    Some("Claude process exited before returning a compaction result".to_string()),
+                    false,
+                )
+                .await;
+            inner.mark_process_exited().await;
+            return;
+        }
         if turn_state.active_turn_id.is_some() {
             flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
         }
@@ -4756,16 +5486,21 @@ impl DroppedTurnStartLog {
 async fn prepare_persistent_stdout_turn(
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
-) -> Option<(u64, Option<String>)> {
-    let (turn_id, model_hint) = {
+) -> Option<(u64, Option<String>, ClaudeTurnOwner)> {
+    let (turn_id, model_hint, owner) = {
         let state = inner.state.lock().await;
         let active = state.active_turn.as_ref()?;
-        // A turn that has already handed off its outcome is finished; the
+        let owner = active.owner.clone();
+        // A user turn that has already handed off its outcome is finished; the
         // finalizer that clears it runs concurrently with this reader, so
         // without this check a wake turn arriving inside that window would be
         // consumed against a message id the finalizer has already closed.
-        active.outcome_tx.as_ref()?;
-        (active.id, state.model.clone())
+        // Compaction turns have no user outcome channel and remain routable
+        // until their correlated terminal frame is observed.
+        if matches!(owner, ClaudeTurnOwner::User) {
+            active.outcome_tx.as_ref()?;
+        }
+        (active.id, state.model.clone(), owner)
     };
     inner.disarm_cli_wake();
 
@@ -4778,7 +5513,7 @@ async fn prepare_persistent_stdout_turn(
         turn_state.segment = SegmentState::default();
     }
 
-    Some((turn_id, model_hint))
+    Some((turn_id, model_hint, owner))
 }
 
 fn claude_result_turn_outcome(
@@ -7031,6 +7766,13 @@ fn consume_claude_stream_value_with_interrupt(
                 ClaudeSystemEvent::Status => {}
                 ClaudeSystemEvent::CompactBoundary => {
                     summary.control_event = Some(ClaudeControlEvent::ConversationCompacted);
+                    if let Some(observation) =
+                        claude_live_compaction_observation(value, &system, summary.session_id.as_deref())
+                    {
+                        inner
+                            .emitter
+                            .compaction_event(&BackendCompactionEvent::Observed(observation));
+                    }
                 }
                 // Workflow and local_bash background-command task frames
                 // are consumed pre-gate in `read_claude_stdout_persistent`
@@ -9809,6 +10551,19 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if let Some(observation) = claude_replay_compaction_observation(&value) {
+            flush_unresolved_replay_tool_requests(
+                &mut restored,
+                &mut pending_tool_requests,
+                &mut auto_closed_tool_requests,
+            );
+            restored.push(ClaudeHistoryReplayItem::Compaction(observation));
+            last_emitted_assistant_message_id = None;
+            continue;
+        }
+        if claude_replay_row_is_internal_compaction_bookkeeping(&value) {
+            continue;
+        }
         if line_type == "user"
             && let Some(prompt_id) = replay_top_level_user_prompt_id(&value)
             && invocation_prompt_id.as_deref() != Some(prompt_id.as_str())
@@ -10042,6 +10797,121 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
         cumulative_usage_complete,
         conversation_bytes_total,
     }
+}
+
+fn claude_replay_compaction_observation(value: &Value) -> Option<BackendObservedCompaction> {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("compact_boundary")
+    {
+        return None;
+    }
+    let boundary_uuid = value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)?;
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)?;
+    let metadata = value
+        .get("compactMetadata")
+        .or_else(|| value.get("compact_metadata"))
+        .filter(|value| value.is_object());
+    let trigger = metadata
+        .and_then(|metadata| metadata.get("trigger"))
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let trigger = if trigger == "manual" {
+        CompactionTrigger::BackendObservedManual
+    } else {
+        CompactionTrigger::BackendAutomatic
+    };
+    let metrics = claude_compaction_metrics(metadata);
+    let user_focus = metadata
+        .and_then(|metadata| {
+            metadata
+                .get("userContext")
+                .or_else(|| metadata.get("user_context"))
+        })
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)
+        .map(|text| BackendCompactionUserFocus {
+            text,
+            provenance: BackendCompactionUserFocusProvenance::ProviderEcho,
+        });
+    Some(BackendObservedCompaction {
+        observation_id: super::compaction::stable_observation_id(
+            "claude",
+            &session_id,
+            &boundary_uuid,
+        ),
+        trigger,
+        method: if trigger == CompactionTrigger::BackendAutomatic {
+            CompactionMethod::BackendAutomatic
+        } else {
+            CompactionMethod::NativeTextCommand
+        },
+        provider_session_id: Some(SessionId(session_id)),
+        metrics,
+        source: BackendCompactionObservationSource::ClaudeBoundary {
+            boundary_uuid,
+        },
+        user_focus,
+    })
+}
+
+fn claude_compaction_metrics(metadata: Option<&Value>) -> CompactionMetrics {
+    let get_u64 = |camel: &str, snake: &str| {
+        metadata
+            .and_then(|metadata| metadata.get(camel).or_else(|| metadata.get(snake)))
+            .and_then(Value::as_u64)
+    };
+    CompactionMetrics {
+        before_tokens: get_u64("preTokens", "pre_tokens"),
+        after_tokens: get_u64("postTokens", "post_tokens"),
+        before_messages: get_u64("beforeMessages", "before_messages"),
+        after_messages: get_u64("afterMessages", "after_messages"),
+        messages_summarized: get_u64("messagesSummarized", "messages_summarized"),
+        cumulative_dropped_tokens: get_u64(
+            "cumulativeDroppedTokens",
+            "cumulative_dropped_tokens",
+        ),
+        duration_ms: get_u64("durationMs", "duration_ms"),
+        precomputed: metadata
+            .and_then(|metadata| {
+                metadata
+                    .get("precomputed")
+                    .or_else(|| metadata.get("pre_computed"))
+            })
+            .and_then(Value::as_bool),
+    }
+}
+
+fn claude_replay_row_is_internal_compaction_bookkeeping(value: &Value) -> bool {
+    if value
+        .get("isVisibleInTranscriptOnly")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
+        return true;
+    }
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(message) = value.get("message").filter(|message| message.is_object()) else {
+        return false;
+    };
+    let Some(text) = extract_text_from_message(message) else {
+        return false;
+    };
+    let text = text.trim_start();
+    text.starts_with("<command-name>")
+        || text.starts_with("<local-command-caveat>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<local-command-stderr>")
 }
 
 fn replay_top_level_user_prompt_id(value: &Value) -> Option<String> {
@@ -10728,15 +11598,27 @@ fn notify_turn_quiesced(waiters: Vec<oneshot::Sender<()>>) {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SelectOption,
-    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SpawnCostHint,
+    AgentInput, BackendKind, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
+    CompactionStage, CompactionTrigger, MessageSender, SelectOption, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SpawnCostHint,
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
-    session_settings_to_json,
+    Backend, BackendCompactionAvailability, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
+    BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
+    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
+    BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
+    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
+    BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionUserFocusProvenance, BackendContextReseatResult,
+    BackendContextReseatSupport, BackendContinuationContext, BackendContinuationItem,
+    BackendEvent, BackendObservedCompaction, BackendSession, BackendSpawnConfig,
+    BackendStartupError, ContinuationInstallStatus, EventStream, PostCompactionTokenCount,
+    protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
@@ -10825,7 +11707,7 @@ impl ClaudeBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (subagent_emitter_tx, mut subagent_emitter_rx) = watch::channel(initial_emitter);
@@ -10908,6 +11790,9 @@ impl ClaudeBackend {
                     return;
                 }
             };
+            session
+                .seed_installed_provider_version(config.provider_version.clone())
+                .await;
 
             let handle = session.command_handle();
             *command_handle_task
@@ -11081,7 +11966,7 @@ impl ClaudeBackend {
                 subagent_emitter_tx,
                 command_handle,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 }
@@ -11257,15 +12142,23 @@ fn spawn_claude_subagent_event_bridge(
 
 async fn forward_claude_backend_event(
     raw: Value,
-    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    events_tx: &mpsc::UnboundedSender<BackendEvent>,
     session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
     ready_tx: Option<&ClaudeReadyTx>,
 ) -> bool {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
-        return events_tx.send(event).is_ok();
+        return events_tx.send(BackendEvent::Chat(event)).is_ok();
     }
 
     match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "BackendCompaction" => {
+            let Some(data) = raw.get("data") else {
+                return true;
+            };
+            if let Ok(event) = serde_json::from_value::<BackendCompactionEvent>(data.clone()) {
+                return events_tx.send(BackendEvent::Compaction(event)).is_ok();
+            }
+        }
         "SessionStarted" => {
             if let Some(session_id) = raw
                 .get("data")
@@ -11295,7 +12188,7 @@ async fn forward_claude_backend_event(
                 signal_ready(ready_tx, Err(message.clone())).await;
             }
             if events_tx
-                .send(backend_error_message(message.clone()))
+                .send(BackendEvent::Chat(backend_error_message(message.clone())))
                 .is_err()
             {
                 return false;
@@ -11326,6 +12219,131 @@ fn claude_capacity_access_from_initialize(response: &Value) -> ClaudeCapacityAcc
         }
         Some(_) => ClaudeCapacityAccess::ExternalProvider,
         None => ClaudeCapacityAccess::Unknown,
+    }
+}
+
+fn claude_compaction_capability(
+    compact_command_advertised: Option<bool>,
+    provider_version: Option<&str>,
+) -> BackendCompactionCapability {
+    match compact_command_advertised {
+        None => {
+            return BackendCompactionCapability::unknown(
+                BackendCompactionUnknownReason::ProcessNotInitialized,
+                provider_version.map(str::to_owned),
+                BackendCompactionCapabilityEvidence::None,
+            );
+        }
+        Some(false) => {
+            let mut capability = BackendCompactionCapability::context_unavailable(
+                BackendCompactionUnavailableReason::ProviderDisabledCommand,
+            );
+            capability.provider_version = provider_version.map(str::to_owned);
+            capability.evidence = BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+                name: "compact".to_string(),
+            };
+            return capability;
+        }
+        Some(true) => {}
+    }
+
+    let Some(version) = provider_version.and_then(normalize_nonempty) else {
+        return BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::VersionUnavailable,
+            None,
+            BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+                name: "compact".to_string(),
+            },
+        );
+    };
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok());
+    if major != Some(2) {
+        return BackendCompactionCapability::unknown(
+            if major.is_some() {
+                BackendCompactionUnknownReason::ProtocolNotAllowlisted
+            } else {
+                BackendCompactionUnknownReason::VersionUnparseable
+            },
+            Some(version),
+            BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+                name: "compact".to_string(),
+            },
+        );
+    }
+    let confidence = if version == "2.1.220" {
+        BackendCompactionProtocolConfidence::Verified
+    } else {
+        BackendCompactionProtocolConfidence::Compatible
+    };
+    BackendCompactionCapability::native(
+        BackendCompactionMechanism::InterceptedTextCommand,
+        Some(version),
+        confidence,
+        BackendContextReseatSupport::IncludeInNativeRequest,
+        BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+            name: "compact".to_string(),
+        },
+    )
+}
+
+fn sanitize_claude_compaction_focus(value: &str) -> Result<String, ()> {
+    let sanitized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if sanitized.len() > 4_096 {
+        return Err(());
+    }
+    Ok(sanitized)
+}
+
+fn claude_compaction_focus(
+    request: &BackendCompactionRequest,
+) -> Result<Option<String>, ()> {
+    let mut parts = Vec::new();
+    if let Some(focus) = request.focus.as_deref() {
+        let focus = sanitize_claude_compaction_focus(focus)?;
+        if !focus.is_empty() {
+            parts.push(focus);
+        }
+    }
+    for (label, items) in [
+        ("Required continuation", &request.continuation.required),
+        ("Advisory continuation", &request.continuation.advisory),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        let rendered = items
+            .iter()
+            .map(|item| format!("{}={}", item.kind, item.payload))
+            .collect::<Vec<_>>()
+            .join("; ");
+        parts.push(format!("{label}: {rendered}"));
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let focus = sanitize_claude_compaction_focus(&parts.join(". "))?;
+    Ok(Some(focus))
+}
+
+fn dispatch_uncertain_claude_result(
+    operation_id: protocol::CompactionOperationId,
+    error: String,
+) -> BackendCompactionResult {
+    BackendCompactionResult {
+        operation_id,
+        dispatch: BackendCompactionDispatchState::MayHaveReachedProvider,
+        mutation: BackendCompactionMutationState::MayHaveMutated,
+        outcome: Err(BackendCompactionFailure {
+            kind: BackendCompactionFailureKind::TransportClosed,
+            message: error,
+        }),
+        provider_session_id: None,
+        metrics: CompactionMetrics::default(),
+        post_context_tokens: PostCompactionTokenCount::Unknown,
+        evidence: BackendCompactionTerminalEvidence::DispatchUncertain,
     }
 }
 
@@ -11805,7 +12823,7 @@ impl Backend for ClaudeBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
@@ -11836,6 +12854,9 @@ impl Backend for ClaudeBackend {
         )
         .await
         .map_err(|err| format!("Failed to spawn Claude resume session: {err}"))?;
+        session
+            .seed_installed_provider_version(config.provider_version.clone())
+            .await;
         let mut startup_guard = ClaudeResumeStartupGuard::new(session.clone());
 
         let handle = session.command_handle();
@@ -11987,7 +13008,10 @@ impl Backend for ClaudeBackend {
                 subagent_emitter_tx,
                 command_handle: Arc::new(StdMutex::new(Some(backend_command_handle))),
             },
-            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            EventStream::new_backend_with_resume_replay_barrier(
+                events_rx,
+                resume_replay_complete_rx,
+            ),
         ))
     }
 
@@ -12018,6 +13042,55 @@ impl Backend for ClaudeBackend {
             .expect("claude session_id mutex poisoned")
             .clone()
             .expect("claude session_id not initialized")
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        self.command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .as_ref()
+            .map(ClaudeCommandHandle::compaction_capability)
+            .unwrap_or_else(|| {
+                BackendCompactionCapability::unknown(
+                    BackendCompactionUnknownReason::ProcessNotInitialized,
+                    None,
+                    BackendCompactionCapabilityEvidence::None,
+                )
+            })
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone();
+        match handle {
+            Some(handle) => handle.begin_compaction(request).await,
+            None => BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::SessionInitializing,
+            },
+        }
+    }
+
+    async fn install_continuation_context(
+        &self,
+        context: BackendContinuationContext,
+    ) -> BackendContextReseatResult {
+        let status = |items: &[BackendContinuationItem]| {
+            if items.is_empty() {
+                ContinuationInstallStatus::NotRequired
+            } else {
+                ContinuationInstallStatus::PreservedByNative
+            }
+        };
+        BackendContextReseatResult {
+            required: status(&context.required),
+            advisory: status(&context.advisory),
+        }
     }
 
     async fn send(&self, input: AgentInput) -> bool {
@@ -12399,6 +13472,16 @@ mod tests {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                compaction_capability: BackendCompactionCapability::unknown(
+                    BackendCompactionUnknownReason::ProcessNotInitialized,
+                    None,
+                    BackendCompactionCapabilityEvidence::None,
+                ),
+                compact_command_advertised: None,
+                installed_provider_version: None,
+                provider_version: None,
+                process_generation: 0,
+                pending_compaction: None,
                 closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
@@ -12491,6 +13574,7 @@ mod tests {
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: 42,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -13652,6 +14736,7 @@ sys.exit(1)
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: 77,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -14045,6 +15130,7 @@ for raw_line in sys.stdin:
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: FAKE_TURN_ID,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -14476,6 +15562,7 @@ for raw_line in sys.stdin:
         let mut state = inner.state.lock().await;
         state.active_turn = Some(ActiveTurn {
             id,
+            owner: ClaudeTurnOwner::User,
             outcome_tx: Some(outcome_tx),
             interrupt_requested: true,
             pending_ask_user_question: None,
@@ -14494,6 +15581,7 @@ for raw_line in sys.stdin:
         let mut state = inner.state.lock().await;
         state.active_turn = Some(ActiveTurn {
             id,
+            owner: ClaudeTurnOwner::User,
             outcome_tx: Some(outcome_tx),
             interrupt_requested: false,
             pending_ask_user_question: None,
@@ -14673,6 +15761,7 @@ for raw_line in sys.stdin:
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: 7,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -14698,6 +15787,7 @@ for raw_line in sys.stdin:
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: 55,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -15590,7 +16680,11 @@ for raw_line in sys.stdin:
             let (events_tx, mut events_rx) = mpsc::unbounded_channel();
             let session_id = Arc::new(std::sync::Mutex::new(None));
             assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
-            let event = events_rx.recv().await.expect("adapted child StreamEnd");
+            let BackendEvent::Chat(event) =
+                events_rx.recv().await.expect("adapted child StreamEnd")
+            else {
+                panic!("expected adapted child chat event");
+            };
             let task_usage = crate::agent::task_usage_scope_from_chat_events_for_test(
                 BackendKind::Claude,
                 [event],
@@ -16064,7 +17158,11 @@ for raw_line in sys.stdin:
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
-        let event = events_rx.recv().await.expect("adapted terminal StreamEnd");
+        let BackendEvent::Chat(event) =
+            events_rx.recv().await.expect("adapted terminal StreamEnd")
+        else {
+            panic!("expected adapted terminal chat event");
+        };
         let usage =
             crate::agent::task_usage_scope_from_chat_events_for_test(BackendKind::Claude, [event]);
         assert!(matches!(
@@ -19126,6 +20224,7 @@ for raw_line in sys.stdin:
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
                 id: 4242,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: Some(PendingAskUserQuestionControl {
@@ -23308,7 +24407,7 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn compact_boundary_emits_visible_system_message_and_stream_end() {
+    async fn compact_boundary_closes_existing_stream_without_chat_notice() {
         let (inner, mut rx) = make_test_inner();
         let message_id = "claude-msg-compact";
         inner.emit_stream_start(message_id, None);
@@ -23340,23 +24439,6 @@ for raw_line in sys.stdin:
         assert!(
             emitted,
             "compact boundary should count as a recognized completion"
-        );
-
-        let message_added = rx.recv().await.expect("system message");
-        assert_eq!(event_kind(&message_added), Some("MessageAdded"));
-        assert_eq!(
-            message_added
-                .get("data")
-                .and_then(|data| data.get("sender"))
-                .and_then(Value::as_str),
-            Some("System")
-        );
-        assert_eq!(
-            message_added
-                .get("data")
-                .and_then(|data| data.get("content"))
-                .and_then(Value::as_str),
-            Some("Conversation compacted.")
         );
 
         let stream_end = rx.recv().await.expect("stream end");
@@ -23405,6 +24487,16 @@ for raw_line in sys.stdin:
                     cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
                     active_turn: None,
+                    compaction_capability: BackendCompactionCapability::unknown(
+                        BackendCompactionUnknownReason::ProcessNotInitialized,
+                        None,
+                        BackendCompactionCapabilityEvidence::None,
+                    ),
+                    compact_command_advertised: None,
+                    installed_provider_version: None,
+                    provider_version: None,
+                    process_generation: 0,
+                    pending_compaction: None,
                     closing: false,
                     restart_process_after_turn: false,
                     subagent_emitter: None,
@@ -24506,6 +25598,7 @@ for line in sys.stdin:
             let (outcome_tx, _outcome_rx) = oneshot::channel();
             state.active_turn = Some(ActiveTurn {
                 id: 7,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -24534,6 +25627,7 @@ for line in sys.stdin:
             let (outcome_tx, _outcome_rx) = oneshot::channel();
             state.active_turn = Some(ActiveTurn {
                 id: 11,
+                owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
@@ -24545,7 +25639,7 @@ for line in sys.stdin:
         assert_eq!(
             prepare_persistent_stdout_turn(&inner, &mut turn_state)
                 .await
-                .map(|(id, _)| id),
+                .map(|(id, _, _)| id),
             Some(11),
             "a live turn still owns the stream"
         );
@@ -24830,6 +25924,209 @@ for line in sys.stdin:
         assert_eq!(
             usage.get("cached_prompt_tokens").and_then(Value::as_u64),
             Some(5000)
+        );
+    }
+
+    #[test]
+    fn replay_filters_compaction_bookkeeping_but_keeps_ordered_boundary() {
+        let contents = [
+            json!({"type":"user","message":{"role":"user","content":"before"}}),
+            json!({"type":"user","isMeta":true,"message":{"role":"user","content":"hidden"}}),
+            json!({"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"}}),
+            json!({
+                "type":"system",
+                "subtype":"compact_boundary",
+                "uuid":"boundary-1",
+                "sessionId":"session-1",
+                "compactMetadata":{"trigger":"manual","preTokens":100,"postTokens":20}
+            }),
+            json!({"type":"assistant","isCompactSummary":true,"message":{"role":"assistant","content":"secret summary"}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":"after"}}),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let replay = parse_claude_session_replay(&contents);
+        assert_eq!(replay.items.len(), 3);
+        assert!(matches!(
+            &replay.items[1],
+            ClaudeHistoryReplayItem::Compaction(observed)
+                if observed.observation_id.0 == "claude:session-1:boundary-1"
+                    && observed.metrics.after_tokens == Some(20)
+        ));
+    }
+
+    #[test]
+    fn compaction_capability_requires_catalog_and_supported_major() {
+        let verified = claude_compaction_capability(Some(true), Some("2.1.220"));
+        assert_eq!(
+            verified.confidence,
+            Some(BackendCompactionProtocolConfidence::Verified)
+        );
+        let compatible = claude_compaction_capability(Some(true), Some("2.2.0"));
+        assert_eq!(
+            compatible.confidence,
+            Some(BackendCompactionProtocolConfidence::Compatible)
+        );
+        assert!(matches!(
+            claude_compaction_capability(Some(true), Some("3.0.0")).availability,
+            BackendCompactionAvailability::Unknown { .. }
+        ));
+        assert!(matches!(
+            claude_compaction_capability(Some(false), Some("2.1.220")).availability,
+            BackendCompactionAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn installed_version_enables_capability_after_initialize_before_any_turn() {
+        let (inner, _events) = make_test_inner();
+        let session = ClaudeSession {
+            inner: Arc::new(inner),
+        };
+        session
+            .seed_installed_provider_version(Some("2.1.220".to_owned()))
+            .await;
+        session
+            .inner
+            .configure_capacity_from_initialize(&json!({
+                "commands": [{"name": "compact"}],
+                "account": {}
+            }))
+            .await;
+
+        let capability = session.command_handle().compaction_capability();
+        assert!(matches!(
+            capability.availability,
+            BackendCompactionAvailability::Native { .. }
+        ));
+        assert_eq!(
+            capability.confidence,
+            Some(BackendCompactionProtocolConfidence::Verified)
+        );
+        assert_eq!(capability.provider_version.as_deref(), Some("2.1.220"));
+    }
+
+    #[tokio::test]
+    async fn invalid_focus_and_closed_backend_do_not_authorize_fallback() {
+        let request = |focus: Option<String>| BackendCompactionRequest {
+            operation_id: protocol::CompactionOperationId("compact-policy".to_owned()),
+            trigger: CompactionTrigger::UserRequested,
+            focus,
+            transcript_authoritative: true,
+            continuation: BackendContinuationContext {
+                required: Vec::new(),
+                advisory: Vec::new(),
+            },
+        };
+        let (inner, _events) = make_test_inner();
+        let inner = Arc::new(inner);
+        let invalid = Arc::clone(&inner)
+            .begin_compaction(request(Some("x".repeat(4_097))))
+            .await;
+        assert!(matches!(
+            invalid,
+            BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::InvalidFocus,
+                fallback_safe: false,
+            }
+        ));
+
+        inner.state.lock().await.closing = true;
+        let closed = Arc::clone(&inner).begin_compaction(request(None)).await;
+        assert!(matches!(
+            closed,
+            BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                fallback_safe: false,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_boundary_plus_terminal_succeeds_without_typed_success() {
+        let (inner, mut events) = make_test_inner();
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.session_id = Some("session-compact".to_string());
+            state.active_turn = Some(ActiveTurn {
+                id: 77,
+                owner: ClaudeTurnOwner::Compaction(protocol::CompactionOperationId(
+                    "compact-op".to_string(),
+                )),
+                outcome_tx: None,
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+            let process_generation = state.process_generation;
+            state.pending_compaction = Some(PendingClaudeCompaction {
+                request: BackendCompactionRequest {
+                    operation_id: protocol::CompactionOperationId("compact-op".to_string()),
+                    trigger: CompactionTrigger::UserRequested,
+                    focus: None,
+                    transcript_authoritative: true,
+                    continuation: crate::backend::BackendContinuationContext {
+                        required: Vec::new(),
+                        advisory: Vec::new(),
+                    },
+                },
+                terminal_tx: Some(terminal_tx),
+                timeout_cancel_tx: Some(timeout_cancel_tx),
+                turn_id: 77,
+                process_generation,
+                dispatched_at: std::time::Instant::now(),
+                write_completed: true,
+                boundary: None,
+                compact_result: None,
+                compact_error: None,
+                terminal_result_seen: false,
+                result_is_error: false,
+                diagnostic: None,
+            });
+        }
+        inner
+            .observe_compaction_frame(
+                77,
+                &json!({
+                    "type":"system",
+                    "subtype":"compact_boundary",
+                    "uuid":"boundary-compact",
+                    "session_id":"session-compact",
+                    "compact_metadata":{"trigger":"manual","pre_tokens":100,"post_tokens":20}
+                }),
+            )
+            .await;
+        inner
+            .observe_compaction_frame(
+                77,
+                &json!({"type":"result","session_id":"session-compact","is_error":false}),
+            )
+            .await;
+        let returned = inner
+            .finish_compaction(
+                77,
+                BackendCompactionFailureKind::ProtocolViolation,
+                None,
+                false,
+            )
+            .await
+            .expect("correlated result");
+        let terminal = terminal_rx.await.expect("terminal oneshot");
+        timeout_cancel_rx
+            .await
+            .expect("terminal settlement must cancel its timeout task");
+        assert_eq!(returned, terminal);
+        assert!(terminal.outcome.is_ok());
+        assert_eq!(terminal.mutation, BackendCompactionMutationState::Completed);
+        assert!(
+            events.try_recv().is_err(),
+            "structured Claude compaction must emit no public stream lifecycle"
         );
     }
 
@@ -26718,7 +28015,7 @@ for line in sys.stdin:
     async fn forward_claude_backend_event_fails_ready_on_pre_session_error() {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
 
         let forwarded = forward_claude_backend_event(
@@ -26738,7 +28035,9 @@ for line in sys.stdin:
             Err("Failed to start Claude CLI: No such file or directory".to_string())
         );
 
-        let event = events_rx.recv().await.expect("forwarded chat event");
+        let BackendEvent::Chat(event) = events_rx.recv().await.expect("forwarded chat event") else {
+            panic!("expected forwarded chat event");
+        };
         match event {
             ChatEvent::MessageAdded(message) => {
                 assert!(matches!(message.sender, protocol::MessageSender::Error));

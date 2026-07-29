@@ -4,7 +4,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
+use crate::state::{ActiveAgentRef, ChatMessageEntry, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
 ///
@@ -191,10 +191,8 @@ fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
 #[component]
 pub fn ChatMessageView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
-    row: ChatRowHandle,
+    entry: ArcRwSignal<ChatMessageEntry>,
 ) -> impl IntoView {
-    let entry = row.entry;
-
     // Each Memo reads through `with` to avoid cloning the entire
     // ChatMessageEntry (which carries a potentially-long
     // `message.content: String`) just to extract a field. Memos
@@ -653,7 +651,7 @@ pub(crate) fn format_compact(n: u64) -> String {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AppState, ChatMessageEntry, ChatRowHandle};
+    use crate::state::AppState;
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageTokenUsage,
@@ -1121,8 +1119,8 @@ mod wasm_tests {
             provide_context(state);
             let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
                 RwSignal::new(None).into();
-            let row = ChatRowHandle::new(entry.clone());
-            view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+            let entry = ArcRwSignal::new(entry.clone());
+            view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }
         })
         .forget();
         container
@@ -1593,11 +1591,15 @@ mod wasm_tests {
                 tool_requests: Vec::new(),
             };
             let row = state.push_chat_entry(agent_id_mount.clone(), entry);
+            let entry = row
+                .message_entry()
+                .expect("push_chat_entry builds a message row")
+                .clone();
             *shared_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
                 RwSignal::new(None).into();
-            view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+            view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }
         })
         .forget();
         next_tick().await;

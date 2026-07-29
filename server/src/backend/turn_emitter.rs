@@ -559,6 +559,17 @@ impl TurnEmitter {
         }));
     }
 
+    pub(crate) fn compaction_event(
+        &self,
+        event: &super::compaction::BackendCompactionEvent,
+    ) {
+        let data = serde_json::to_value(event).expect("backend compaction event must serialize");
+        self.lock().send(json!({
+            "kind": "BackendCompaction",
+            "data": data,
+        }));
+    }
+
     // ---------- Misc chat events ----------
 
     pub fn typing_status_changed(&self, typing: bool) {

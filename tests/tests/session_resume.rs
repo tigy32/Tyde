@@ -343,6 +343,9 @@ async fn fetch_history_page(
             stream,
             FetchSessionHistoryPayload {
                 agent_id,
+                request_id: protocol::HistoryPageRequestId(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
                 before_seq,
                 limit,
             },

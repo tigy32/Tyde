@@ -5,7 +5,8 @@ use crate::types::StreamIdentityViolation;
 use crate::types::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactNotifyPayload, AgentCompactPayload,
     BrowseBootstrapPayload, CloseAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
-    ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload, TerminalBootstrapPayload,
+    ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload,
+    TeamContextCompactionNotifyPayload, TerminalBootstrapPayload,
 };
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
@@ -16,6 +17,7 @@ use crate::{
     CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
     CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HeartbeatPayload,
     HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
@@ -547,6 +549,33 @@ impl ProtocolValidator {
             FrameKind::TeamCompactNotify => {
                 parse_host_payload::<TeamCompactNotifyPayload>(self, envelope, "TeamCompactNotify")
             }
+            FrameKind::TeamContextCompactionNotify => {
+                let payload: TeamContextCompactionNotifyPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        self.violation(
+                            envelope,
+                            None,
+                            format!(
+                                "failed to parse TeamContextCompactionNotify payload: {error}"
+                            ),
+                        )
+                    })?;
+                if let Some(member) = payload
+                    .members
+                    .iter()
+                    .find(|member| member.logical_session_id.0.trim().is_empty())
+                {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!(
+                            "TeamContextCompactionNotify member {} has an empty logical_session_id",
+                            member.agent_id
+                        ),
+                    ));
+                }
+                Ok(())
+            }
             FrameKind::TeamDraftCreate => {
                 parse_host_payload::<TeamDraftCreatePayload>(self, envelope, "TeamDraftCreate")
             }
@@ -695,6 +724,9 @@ impl ProtocolValidator {
                     ));
                 }
                 state.saw_agent_start = true;
+                if payload.session_id.is_some() {
+                    state.logical_session_id = payload.session_id;
+                }
             }
             FrameKind::ChatEvent => {
                 let event: ChatEvent = envelope.parse_payload().map_err(|error| {
@@ -772,6 +804,42 @@ impl ProtocolValidator {
                         format!("failed to parse AgentCompactNotify payload: {error}"),
                     )
                 })?;
+            }
+            FrameKind::ContextCompactionNotify => {
+                let payload: ContextCompactionNotifyPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse ContextCompactionNotify payload: {error}"),
+                        )
+                    })?;
+                validate_context_compaction_notify(&recent_frames, envelope, state, &payload)?;
+            }
+            FrameKind::ContextCompactionCapability => {
+                let payload: ContextCompactionCapabilityPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!(
+                                "failed to parse ContextCompactionCapability payload: {error}"
+                            ),
+                        )
+                    })?;
+                if payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "ContextCompactionCapability agent_id {} does not match stream agent_id {}",
+                            payload.agent_id, state.agent_id
+                        ),
+                    ));
+                }
             }
             FrameKind::AgentActivityStats => {
                 if !state.saw_agent_start {
@@ -876,6 +944,7 @@ impl ProtocolValidator {
             AgentStreamState {
                 agent_id: payload.agent_id,
                 backend_kind: payload.backend_kind,
+                logical_session_id: payload.session_id,
                 saw_bootstrap: false,
                 saw_agent_start: false,
                 active_stream: None,
@@ -884,6 +953,7 @@ impl ProtocolValidator {
                 terminal_stream_message_ids: HashSet::new(),
                 pending_tool_calls: HashMap::new(),
                 cancelled_tool_calls: HashMap::new(),
+                compaction_operations: HashMap::new(),
             },
         );
         Ok(())
@@ -1321,6 +1391,9 @@ fn validate_agent_bootstrap_event(
                 build_violation(recent_frames, envelope, Some(state.backend_kind), message)
             })?;
             state.saw_agent_start = true;
+            if payload.session_id.is_some() {
+                state.logical_session_id = payload.session_id;
+            }
             Ok(())
         }
         AgentBootstrapEvent::AgentError(_) => Ok(()),
@@ -1345,6 +1418,31 @@ fn validate_agent_bootstrap_event(
                     Some(state.backend_kind),
                     format!(
                         "AgentActivityStats agent_id {} does not match stream agent_id {}",
+                        payload.agent_id, state.agent_id
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        AgentBootstrapEvent::ContextCompaction(payload) => {
+            if payload.status.is_terminal() {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    "terminal ContextCompaction snapshot must not be bootstrapped".to_owned(),
+                ));
+            }
+            validate_context_compaction_notify(recent_frames, envelope, state, &payload)
+        }
+        AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+            if payload.agent_id != state.agent_id {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "ContextCompactionCapability agent_id {} does not match stream agent_id {}",
                         payload.agent_id, state.agent_id
                     ),
                 ));
@@ -1547,7 +1645,67 @@ fn validate_chat_event(
         ChatEvent::TypingStatusChanged(_)
         | ChatEvent::Orchestration(_)
         | ChatEvent::TaskUpdate(_)
-        | ChatEvent::RetryAttempt(_) => Ok(()),
+        | ChatEvent::RetryAttempt(_)
+        | ChatEvent::ContextCompaction(_) => Ok(()),
+    }
+}
+
+fn validate_context_compaction_notify(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    state: &mut AgentStreamState,
+    payload: &ContextCompactionNotifyPayload,
+) -> Result<(), ProtocolViolation> {
+    if payload.agent_id != state.agent_id {
+        return Err(build_violation(
+            recent_frames,
+            envelope,
+            Some(state.backend_kind),
+            format!(
+                "ContextCompactionNotify agent_id {} does not match stream agent_id {}",
+                payload.agent_id, state.agent_id
+            ),
+        ));
+    }
+    if payload.logical_session_id.0.trim().is_empty() {
+        return Err(build_violation(
+            recent_frames,
+            envelope,
+            Some(state.backend_kind),
+            "ContextCompactionNotify has an empty logical_session_id".to_owned(),
+        ));
+    }
+    if let Some(logical_session_id) = state.logical_session_id.as_ref()
+        && &payload.logical_session_id != logical_session_id
+    {
+        return Err(build_violation(
+            recent_frames,
+            envelope,
+            Some(state.backend_kind),
+            format!(
+                "ContextCompactionNotify logical_session_id {} does not match current session {}",
+                payload.logical_session_id.0, logical_session_id.0
+            ),
+        ));
+    }
+
+    let terminal = payload.status.is_terminal();
+    match state.compaction_operations.get(&payload.operation_id) {
+        Some(true) => Err(build_violation(
+            recent_frames,
+            envelope,
+            Some(state.backend_kind),
+            format!(
+                "ContextCompactionNotify arrived after terminal status for operation {}",
+                payload.operation_id.0
+            ),
+        )),
+        Some(false) | None => {
+            state
+                .compaction_operations
+                .insert(payload.operation_id.clone(), terminal);
+            Ok(())
+        }
     }
 }
 
@@ -1778,6 +1936,7 @@ struct BootstrapStreamState {
 struct AgentStreamState {
     agent_id: crate::AgentId,
     backend_kind: BackendKind,
+    logical_session_id: Option<crate::SessionId>,
     saw_bootstrap: bool,
     saw_agent_start: bool,
     active_stream: Option<ActiveStreamState>,
@@ -1786,6 +1945,7 @@ struct AgentStreamState {
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     pending_tool_calls: HashMap<String, String>,
     cancelled_tool_calls: HashMap<String, String>,
+    compaction_operations: HashMap<crate::CompactionOperationId, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1875,6 +2035,10 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
             data.agent_type,
             data.payload.kind()
         ),
+        ChatEvent::ContextCompaction(data) => format!(
+            "event=context_compaction marker_id={} operation_id={:?} status={:?} mutation={:?}",
+            data.marker_id.0, data.operation_id, data.status, data.mutation
+        ),
     }
 }
 
@@ -1894,6 +2058,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
         ChatEvent::Orchestration(_) => "Orchestration",
+        ChatEvent::ContextCompaction(_) => "ContextCompaction",
     }
 }
 
@@ -2003,6 +2168,82 @@ mod tests {
 
     fn new_agent_envelope() -> Envelope {
         host_bootstrap_with_agents(vec![new_agent_payload(AgentOrigin::User, None, None)])
+    }
+
+    #[test]
+    fn rejects_context_compaction_notify_for_stale_logical_session() {
+        let mut agent = new_agent_payload(AgentOrigin::User, None, None);
+        agent.session_id = Some(crate::SessionId("current-session".to_owned()));
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![agent]))
+            .expect("register agent stream");
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .expect("bootstrap agent stream");
+        let envelope = Envelope::from_payload(
+            agent_stream(),
+            FrameKind::ContextCompactionNotify,
+            1,
+            &ContextCompactionNotifyPayload {
+                operation_id: crate::CompactionOperationId("operation".to_owned()),
+                agent_id: crate::AgentId("test-agent".to_owned()),
+                logical_session_id: crate::SessionId("stale-session".to_owned()),
+                backend_kind: BackendKind::Claude,
+                trigger: crate::CompactionTrigger::UserRequested,
+                method: None,
+                status: crate::ContextCompactionStatus::Deferred {
+                    stage: crate::CompactionStage::WaitingForIdle,
+                },
+                provider_version: None,
+                metrics: Default::default(),
+                continuation: None,
+                message: None,
+            },
+        )
+        .expect("serialize context compaction notify");
+
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("stale logical session must be rejected");
+        assert!(violation.message.contains("does not match current session"));
+    }
+
+    #[test]
+    fn rejects_team_context_result_without_member_logical_session() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(Vec::new()))
+            .expect("bootstrap host stream");
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::TeamContextCompactionNotify,
+            1,
+            &TeamContextCompactionNotifyPayload {
+                team_operation_id: crate::CompactionOperationId("team-operation".to_owned()),
+                team_id: crate::TeamId("team".to_owned()),
+                status: crate::TeamContextCompactionStatus::Failed,
+                members: vec![crate::TeamMemberContextCompactionResult {
+                    agent_id: crate::AgentId("agent".to_owned()),
+                    logical_session_id: crate::SessionId(String::new()),
+                    operation_id: crate::CompactionOperationId("operation".to_owned()),
+                    method: None,
+                    status: crate::ContextCompactionStatus::Failed {
+                        accepted: false,
+                        mutation: crate::CompactionMutation::NotObserved,
+                    },
+                    mutation: crate::CompactionMutation::NotObserved,
+                    message: None,
+                }],
+                message: None,
+            },
+        )
+        .expect("serialize team context compaction notify");
+
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("empty member logical session must be rejected");
+        assert!(violation.message.contains("empty logical_session_id"));
     }
 
     #[test]

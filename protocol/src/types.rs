@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -31,6 +31,150 @@ pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+}
+
+#[cfg(test)]
+mod compaction_contract_tests {
+    use super::*;
+
+    fn metrics() -> CompactionMetrics {
+        CompactionMetrics {
+            before_tokens: Some(100),
+            after_tokens: Some(20),
+            before_messages: Some(10),
+            after_messages: Some(3),
+            messages_summarized: Some(7),
+            cumulative_dropped_tokens: Some(80),
+            duration_ms: Some(12),
+            precomputed: Some(false),
+        }
+    }
+
+    #[test]
+    fn context_compaction_notify_round_trips_all_terminal_failure_fields() {
+        let payload = ContextCompactionNotifyPayload {
+            operation_id: CompactionOperationId("operation".to_owned()),
+            agent_id: AgentId("agent".to_owned()),
+            logical_session_id: SessionId("session".to_owned()),
+            backend_kind: BackendKind::Claude,
+            trigger: CompactionTrigger::UserRequested,
+            method: Some(CompactionMethod::NativeTextCommand),
+            status: ContextCompactionStatus::Failed {
+                accepted: true,
+                mutation: CompactionMutation::MayHaveMutated,
+            },
+            provider_version: Some("1.0.0".to_owned()),
+            metrics: metrics(),
+            continuation: Some(ContinuationInstallSummary::Failed {
+                message: "reseat failed".to_owned(),
+            }),
+            message: Some("provider closed".to_owned()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize notify");
+        let decoded: ContextCompactionNotifyPayload =
+            serde_json::from_value(encoded).expect("deserialize notify");
+        assert_eq!(decoded, payload);
+        assert!(decoded.status.is_terminal());
+    }
+
+    #[test]
+    fn team_context_compaction_result_round_trips_member_session_identity() {
+        let payload = TeamContextCompactionNotifyPayload {
+            team_operation_id: CompactionOperationId("team-operation".to_owned()),
+            team_id: TeamId("team".to_owned()),
+            status: TeamContextCompactionStatus::Completed,
+            members: vec![TeamMemberContextCompactionResult {
+                agent_id: AgentId("agent".to_owned()),
+                logical_session_id: SessionId("session-after-reseat".to_owned()),
+                operation_id: CompactionOperationId("member-operation".to_owned()),
+                method: Some(CompactionMethod::InlineFallback),
+                status: ContextCompactionStatus::Completed,
+                mutation: CompactionMutation::Completed,
+                message: None,
+            }],
+            message: None,
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize team notify");
+        let decoded: TeamContextCompactionNotifyPayload =
+            serde_json::from_value(encoded).expect("deserialize team notify");
+
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            decoded.members[0].logical_session_id.0,
+            "session-after-reseat"
+        );
+    }
+
+    #[test]
+    fn team_context_compaction_result_requires_member_session_identity() {
+        let missing_session = serde_json::json!({
+            "team_operation_id": "team-operation",
+            "team_id": "team",
+            "status": "failed",
+            "members": [{
+                "agent_id": "agent",
+                "operation_id": "member-operation",
+                "status": {
+                    "kind": "failed",
+                    "accepted": false,
+                    "mutation": "not_observed"
+                },
+                "mutation": "not_observed"
+            }]
+        });
+
+        let error = serde_json::from_value::<TeamContextCompactionNotifyPayload>(
+            missing_session,
+        )
+        .expect_err("member logical_session_id is a required wire field");
+        assert!(error.to_string().contains("logical_session_id"));
+    }
+
+    #[test]
+    fn timeline_marker_round_trips_without_becoming_a_message() {
+        let marker = ContextCompactionTimelineEvent {
+            marker_id: CompactionObservationId("marker".to_owned()),
+            operation_id: Some(CompactionOperationId("operation".to_owned())),
+            trigger: CompactionTrigger::SupervisorRequested,
+            method: CompactionMethod::NativeRpc,
+            backend_kind: BackendKind::Codex,
+            provider_session_id: Some(SessionId("provider".to_owned())),
+            status: ContextCompactionTimelineStatus::Completed,
+            mutation: CompactionMutation::Completed,
+            metrics: metrics(),
+            continuation: Some(ContinuationInstallSummary::PreservedByNative),
+            message: None,
+            timestamp: 42,
+        };
+        let event = ChatEvent::ContextCompaction(marker.clone());
+        let decoded: ChatEvent = serde_json::from_value(
+            serde_json::to_value(&event).expect("serialize marker"),
+        )
+        .expect("deserialize marker");
+        assert!(matches!(
+            decoded,
+            ChatEvent::ContextCompaction(decoded_marker)
+                if decoded_marker == marker
+        ));
+    }
+
+    #[test]
+    fn history_response_echoes_request_identity_and_cursor() {
+        let payload = SessionHistoryPayload {
+            agent_id: AgentId("agent".to_owned()),
+            request_id: HistoryPageRequestId("request".to_owned()),
+            request_before_seq: Some(19),
+            events: Vec::new(),
+            has_more_before: false,
+            oldest_seq: None,
+        };
+        let decoded: SessionHistoryPayload = serde_json::from_value(
+            serde_json::to_value(&payload).expect("serialize history"),
+        )
+        .expect("deserialize history");
+        assert_eq!(decoded.request_id, payload.request_id);
+        assert_eq!(decoded.request_before_seq, Some(19));
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1330,8 @@ pub enum FrameKind {
     AgentStart,
     AgentRenamed,
     AgentCompactNotify,
+    ContextCompactionNotify,
+    ContextCompactionCapability,
     AgentClosed,
     ChatEvent,
     SessionHistory,
@@ -1202,6 +1348,7 @@ pub enum FrameKind {
     TeamMemberNotify,
     TeamMemberBindingNotify,
     TeamCompactNotify,
+    TeamContextCompactionNotify,
     TeamPresetCatalogNotify,
     TeamDraftNotify,
     TeamMemberShuffleSuggestionNotify,
@@ -1356,6 +1503,10 @@ impl fmt::Display for FrameKind {
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
+            Self::ContextCompactionNotify => f.write_str("context_compaction_notify"),
+            Self::ContextCompactionCapability => {
+                f.write_str("context_compaction_capability")
+            }
             Self::AgentClosed => f.write_str("agent_closed"),
             Self::ChatEvent => f.write_str("chat_event"),
             Self::SessionHistory => f.write_str("session_history"),
@@ -1372,6 +1523,9 @@ impl fmt::Display for FrameKind {
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
             Self::TeamCompactNotify => f.write_str("team_compact_notify"),
+            Self::TeamContextCompactionNotify => {
+                f.write_str("team_context_compaction_notify")
+            }
             Self::TeamPresetCatalogNotify => f.write_str("team_preset_catalog_notify"),
             Self::TeamDraftNotify => f.write_str("team_draft_notify"),
             Self::TeamMemberShuffleSuggestionNotify => {
@@ -2240,6 +2394,8 @@ pub enum AgentBootstrapEvent {
     SessionSettings(SessionSettingsPayload),
     QueuedMessages(QueuedMessagesPayload),
     AgentActivityStats(AgentActivityStatsPayload),
+    ContextCompaction(ContextCompactionNotifyPayload),
+    ContextCompactionCapability(ContextCompactionCapabilityPayload),
     ChatEvent(ChatEvent),
     HasPriorHistory { message_count: u32, before_seq: u64 },
 }
@@ -2252,6 +2408,8 @@ impl AgentBootstrapEvent {
             Self::SessionSettings(_) => FrameKind::SessionSettings,
             Self::QueuedMessages(_) => FrameKind::QueuedMessages,
             Self::AgentActivityStats(_) => FrameKind::AgentActivityStats,
+            Self::ContextCompaction(_) => FrameKind::ContextCompactionNotify,
+            Self::ContextCompactionCapability(_) => FrameKind::ContextCompactionCapability,
             Self::ChatEvent(_) => FrameKind::ChatEvent,
             Self::HasPriorHistory { .. } => FrameKind::AgentBootstrap,
         }
@@ -3610,6 +3768,192 @@ pub struct AgentCompactNotifyPayload {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompactionOperationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompactionObservationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HistoryPageRequestId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    UserRequested,
+    UserTyped,
+    TeamRequested,
+    SupervisorRequested,
+    BackendAutomatic,
+    BackendObservedManual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMethod {
+    NativeTextCommand,
+    NativeRpc,
+    InlineFallback,
+    BackendAutomatic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMutation {
+    NotObserved,
+    Completed,
+    MayHaveMutated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStage {
+    WaitingForIdle,
+    Dispatching,
+    Compacting,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_messages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_messages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_summarized: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_dropped_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precomputed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContinuationInstallSummary {
+    NotRequired,
+    PreservedByNative,
+    Installed,
+    Unsupported,
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContextCompactionStatus {
+    Deferred { stage: CompactionStage },
+    Started { stage: CompactionStage },
+    Progress { stage: CompactionStage },
+    Completed,
+    Failed {
+        accepted: bool,
+        mutation: CompactionMutation,
+    },
+}
+
+impl ContextCompactionStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionNotifyPayload {
+    pub operation_id: CompactionOperationId,
+    pub agent_id: AgentId,
+    pub logical_session_id: SessionId,
+    pub backend_kind: BackendKind,
+    pub trigger: CompactionTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<CompactionMethod>,
+    pub status: ContextCompactionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+    #[serde(default)]
+    pub metrics: CompactionMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationInstallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedCompactionRoute {
+    NativePreferred,
+    InlineFallbackOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionAvailabilityReason {
+    CapabilityStillDetermining,
+    NativeTriggerUnavailable,
+    BackendAutomaticOnly,
+    InlineFallbackDisabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestedCompactionAvailability {
+    Available {
+        route: RequestedCompactionRoute,
+    },
+    Determining {
+        reason: CompactionAvailabilityReason,
+    },
+    AutomaticOnly {
+        reason: CompactionAvailabilityReason,
+    },
+    Unavailable {
+        reason: CompactionAvailabilityReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionCapabilityPayload {
+    pub agent_id: AgentId,
+    pub logical_session_id: SessionId,
+    pub availability: RequestedCompactionAvailability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionTimelineStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionTimelineEvent {
+    pub marker_id: CompactionObservationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<CompactionOperationId>,
+    pub trigger: CompactionTrigger,
+    pub method: CompactionMethod,
+    pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<SessionId>,
+    pub status: ContextCompactionTimelineStatus,
+    pub mutation: CompactionMutation,
+    #[serde(default)]
+    pub metrics: CompactionMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationInstallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterruptPayload {}
 
@@ -3622,6 +3966,7 @@ pub struct LoadAgentPayload {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchSessionHistoryPayload {
     pub agent_id: AgentId,
+    pub request_id: HistoryPageRequestId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_seq: Option<u64>,
     pub limit: u32,
@@ -3630,6 +3975,9 @@ pub struct FetchSessionHistoryPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHistoryPayload {
     pub agent_id: AgentId,
+    pub request_id: HistoryPageRequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_before_seq: Option<u64>,
     pub events: Vec<ChatEvent>,
     pub has_more_before: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4643,6 +4991,38 @@ pub struct TeamCompactNotifyPayload {
     pub agent_ids: Vec<AgentId>,
     #[serde(default)]
     pub results: Vec<AgentCompactNotifyPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberContextCompactionResult {
+    pub agent_id: AgentId,
+    pub logical_session_id: SessionId,
+    pub operation_id: CompactionOperationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<CompactionMethod>,
+    pub status: ContextCompactionStatus,
+    pub mutation: CompactionMutation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamContextCompactionStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamContextCompactionNotifyPayload {
+    pub team_operation_id: CompactionOperationId,
+    pub team_id: TeamId,
+    pub status: TeamContextCompactionStatus,
+    #[serde(default)]
+    pub members: Vec<TeamMemberContextCompactionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -6731,6 +7111,7 @@ pub enum ChatEvent {
     OperationCancelled(OperationCancelledData),
     RetryAttempt(RetryAttemptData),
     Orchestration(OrchestrationEvent),
+    ContextCompaction(ContextCompactionTimelineEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7728,8 +8109,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_forty() {
-        assert_eq!(PROTOCOL_VERSION, 40);
+    fn protocol_version_is_forty_one() {
+        assert_eq!(PROTOCOL_VERSION, 41);
     }
 
     #[test]

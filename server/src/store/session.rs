@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    BackendKind, CustomAgentId, LaunchProfileId, ProjectId, SessionId, SessionListScope,
-    SessionSettingsValues, SessionSummary, TaskList,
+    BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
+    CompactionTrigger, ContinuationInstallSummary, CustomAgentId, LaunchProfileId, ProjectId,
+    SessionId, SessionListScope, SessionSettingsValues, SessionSummary, TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,63 @@ use crate::backend::BackendSession;
 
 fn default_resumable() -> bool {
     true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BackendSessionBinding {
+    pub generation: u64,
+    pub backend_kind: BackendKind,
+    pub provider_session_id: SessionId,
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub created_by_compaction: Option<CompactionOperationId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StoredCompactionState {
+    Deferred,
+    FallbackPreparing,
+    NativeDispatchPossible,
+    NativeAccepted,
+    FallbackCommitPending,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompactionOperationRecord {
+    pub operation_id: CompactionOperationId,
+    pub logical_session_id: SessionId,
+    pub trigger: CompactionTrigger,
+    pub state: StoredCompactionState,
+    #[serde(default)]
+    pub method: Option<CompactionMethod>,
+    #[serde(default)]
+    pub accepted: bool,
+    pub mutation: CompactionMutation,
+    pub binding_generation_before: u64,
+    #[serde(default)]
+    pub binding_generation_after: Option<u64>,
+    pub transcript_high_water: u64,
+    #[serde(default)]
+    pub metrics: CompactionMetrics,
+    #[serde(default)]
+    pub continuation: Option<ContinuationInstallSummary>,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+}
+
+impl CompactionOperationRecord {
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            StoredCompactionState::Completed | StoredCompactionState::Failed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +114,14 @@ pub struct SessionRecord {
     pub compacted_at_ms: Option<u64>,
     #[serde(default)]
     pub compaction_summary_preview: Option<String>,
+    #[serde(default)]
+    pub backend_bindings: Vec<BackendSessionBinding>,
+    #[serde(default)]
+    pub active_backend_binding_generation: u64,
+    #[serde(default)]
+    pub compaction_epoch: u64,
+    #[serde(default)]
+    pub compaction_operations: Vec<CompactionOperationRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,7 +148,9 @@ impl SessionStore {
         let purged_gemini_session_ids = Self::purge_legacy_gemini_sessions(&path)?;
         Self::mark_non_native_antigravity_sessions_non_resumable(&path)?;
         let _ = Self::read_from_disk(&path)?;
-        Ok((Self { path }, purged_gemini_session_ids))
+        let store = Self { path };
+        let _ = store.reconcile_incomplete_compactions()?;
+        Ok((store, purged_gemini_session_ids))
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -174,6 +242,16 @@ impl SessionStore {
                     compacted_to_session_id: None,
                     compacted_at_ms: None,
                     compaction_summary_preview: None,
+                    backend_bindings: vec![BackendSessionBinding {
+                        generation: 0,
+                        backend_kind: session.backend_kind,
+                        provider_session_id: session.id.clone(),
+                        created_at_ms: session.created_at_ms.unwrap_or(now),
+                        created_by_compaction: None,
+                    }],
+                    active_backend_binding_generation: 0,
+                    compaction_epoch: 0,
+                    compaction_operations: Vec::new(),
                 });
 
             entry.backend_kind = session.backend_kind;
@@ -195,6 +273,16 @@ impl SessionStore {
             entry.updated_at_ms = session.updated_at_ms.unwrap_or(now);
             entry.token_count = session.token_count.or(entry.token_count);
             entry.resumable = session.resumable;
+            if entry.backend_bindings.is_empty() {
+                entry.backend_bindings.push(BackendSessionBinding {
+                    generation: 0,
+                    backend_kind: session.backend_kind,
+                    provider_session_id: session.id.clone(),
+                    created_at_ms: entry.created_at_ms,
+                    created_by_compaction: None,
+                });
+                entry.active_backend_binding_generation = 0;
+            }
 
             entry.clone()
         })
@@ -363,6 +451,196 @@ impl SessionStore {
             new_record.updated_at_ms = now;
             Ok(())
         })?
+    }
+
+    pub(crate) fn compaction_operation(
+        &self,
+        session_id: &SessionId,
+        operation_id: &CompactionOperationId,
+    ) -> Option<CompactionOperationRecord> {
+        self.get(session_id).and_then(|record| {
+            record
+                .compaction_operations
+                .into_iter()
+                .find(|operation| operation.operation_id == *operation_id)
+        })
+    }
+
+    pub(crate) fn put_compaction_operation(
+        &self,
+        session_id: &SessionId,
+        operation: CompactionOperationRecord,
+    ) -> Result<(), String> {
+        self.read_modify_write(|records| {
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or_else(|| format!("missing session {session_id}"))?;
+            if let Some(existing) = record
+                .compaction_operations
+                .iter_mut()
+                .find(|existing| existing.operation_id == operation.operation_id)
+            {
+                if existing.is_terminal() {
+                    return Err(format!(
+                        "compaction operation {} is already terminal",
+                        operation.operation_id.0
+                    ));
+                }
+                *existing = operation;
+            } else {
+                record.compaction_operations.push(operation);
+            }
+            record.updated_at_ms = now_ms();
+            Ok(())
+        })?
+    }
+
+    pub(crate) fn finish_compaction_operation(
+        &self,
+        session_id: &SessionId,
+        operation_id: &CompactionOperationId,
+        state: StoredCompactionState,
+        accepted: bool,
+        mutation: CompactionMutation,
+        method: Option<CompactionMethod>,
+        metrics: CompactionMetrics,
+        continuation: Option<ContinuationInstallSummary>,
+        message: Option<String>,
+    ) -> Result<CompactionOperationRecord, String> {
+        if !matches!(
+            state,
+            StoredCompactionState::Completed | StoredCompactionState::Failed
+        ) {
+            return Err("terminal compaction state required".to_owned());
+        }
+        self.read_modify_write(|records| {
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or_else(|| format!("missing session {session_id}"))?;
+            let operation = record
+                .compaction_operations
+                .iter_mut()
+                .find(|operation| operation.operation_id == *operation_id)
+                .ok_or_else(|| format!("missing compaction operation {}", operation_id.0))?;
+            if operation.is_terminal() {
+                return Ok(operation.clone());
+            }
+            operation.state = state;
+            operation.accepted = accepted;
+            operation.mutation = mutation;
+            operation.method = method;
+            operation.metrics = metrics;
+            operation.continuation = continuation;
+            operation.message = message;
+            operation.finished_at_ms = Some(now_ms());
+            record.compaction_epoch = record.compaction_epoch.saturating_add(1);
+            record.updated_at_ms = now_ms();
+            Ok(operation.clone())
+        })?
+    }
+
+    pub(crate) fn commit_compacted_binding(
+        &self,
+        session_id: &SessionId,
+        operation_id: &CompactionOperationId,
+        expected_generation: u64,
+        backend_kind: BackendKind,
+        provider_session_id: SessionId,
+        metrics: CompactionMetrics,
+        continuation: Option<ContinuationInstallSummary>,
+        message: Option<String>,
+    ) -> Result<(BackendSessionBinding, CompactionOperationRecord), String> {
+        self.read_modify_write(|records| {
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or_else(|| format!("missing session {session_id}"))?;
+            ensure_backend_binding(record);
+            if record.active_backend_binding_generation != expected_generation {
+                return Err(format!(
+                    "binding generation changed from {expected_generation} to {}",
+                    record.active_backend_binding_generation
+                ));
+            }
+            let operation_index = record
+                .compaction_operations
+                .iter()
+                .position(|operation| operation.operation_id == *operation_id)
+                .ok_or_else(|| format!("missing compaction operation {}", operation_id.0))?;
+            if record.compaction_operations[operation_index].is_terminal() {
+                return Err(format!(
+                    "compaction operation {} is already terminal",
+                    operation_id.0
+                ));
+            }
+            let generation = expected_generation.saturating_add(1);
+            let binding = BackendSessionBinding {
+                generation,
+                backend_kind,
+                provider_session_id,
+                created_at_ms: now_ms(),
+                created_by_compaction: Some(operation_id.clone()),
+            };
+            record.backend_bindings.push(binding.clone());
+            record.active_backend_binding_generation = generation;
+            record.backend_kind = backend_kind;
+            record.compaction_epoch = record.compaction_epoch.saturating_add(1);
+            record.updated_at_ms = now_ms();
+
+            let operation = &mut record.compaction_operations[operation_index];
+            operation.state = StoredCompactionState::Completed;
+            operation.accepted = false;
+            operation.mutation = CompactionMutation::Completed;
+            operation.method = Some(CompactionMethod::InlineFallback);
+            operation.binding_generation_after = Some(generation);
+            operation.metrics = metrics;
+            operation.continuation = continuation;
+            operation.message = message;
+            operation.finished_at_ms = Some(now_ms());
+            Ok((binding, operation.clone()))
+        })?
+    }
+
+    pub(crate) fn reconcile_incomplete_compactions(
+        &self,
+    ) -> Result<Vec<CompactionOperationRecord>, String> {
+        self.read_modify_write(|records| {
+            let mut reconciled = Vec::new();
+            for record in records.values_mut() {
+                ensure_backend_binding(record);
+                let mut record_reconciled = false;
+                for operation in &mut record.compaction_operations {
+                    if operation.is_terminal() {
+                        continue;
+                    }
+                    let (accepted, mutation, message) = match operation.state {
+                        StoredCompactionState::NativeDispatchPossible
+                        | StoredCompactionState::NativeAccepted => (
+                            true,
+                            CompactionMutation::MayHaveMutated,
+                            "server restarted while native compaction may have been running",
+                        ),
+                        _ => (
+                            false,
+                            CompactionMutation::NotObserved,
+                            "server restarted before compaction committed",
+                        ),
+                    };
+                    operation.state = StoredCompactionState::Failed;
+                    operation.accepted = accepted;
+                    operation.mutation = mutation;
+                    operation.message = Some(message.to_owned());
+                    operation.finished_at_ms = Some(now_ms());
+                    reconciled.push(operation.clone());
+                    record_reconciled = true;
+                }
+                if record_reconciled {
+                    record.compaction_epoch =
+                        record.compaction_epoch.saturating_add(1);
+                    record.updated_at_ms = now_ms();
+                }
+            }
+            reconciled
+        })
     }
 
     pub fn compacted_successor_chain(
@@ -571,7 +849,12 @@ impl SessionStore {
     fn read_from_disk(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
-                .map(|store| store.records)
+                .map(|mut store| {
+                    for record in store.records.values_mut() {
+                        ensure_backend_binding(record);
+                    }
+                    store.records
+                })
                 .map_err(|err| format!("Failed to parse session store {}: {err}", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
             Err(err) => Err(format!(
@@ -623,6 +906,19 @@ impl SessionStore {
             )
         })?;
         Ok(())
+    }
+}
+
+fn ensure_backend_binding(record: &mut SessionRecord) {
+    if record.backend_bindings.is_empty() {
+        record.backend_bindings.push(BackendSessionBinding {
+            generation: 0,
+            backend_kind: record.backend_kind,
+            provider_session_id: record.id.clone(),
+            created_at_ms: record.created_at_ms,
+            created_by_compaction: None,
+        });
+        record.active_backend_binding_generation = 0;
     }
 }
 
@@ -794,6 +1090,12 @@ mod tests {
         assert!(summary.compacted_to_session_id.is_none());
         assert!(summary.compacted_at_ms.is_none());
         assert!(summary.compaction_summary_preview.is_none());
+        let migrated = store
+            .get(&SessionId("session-1".to_owned()))
+            .expect("migrated record");
+        assert_eq!(migrated.active_backend_binding_generation, 0);
+        assert_eq!(migrated.backend_bindings.len(), 1);
+        assert_eq!(migrated.backend_bindings[0].generation, 0);
     }
 
     #[test]
@@ -1009,6 +1311,53 @@ mod tests {
             compacted_to_session_id: None,
             compacted_at_ms: None,
             compaction_summary_preview: None,
+            backend_bindings: Vec::new(),
+            active_backend_binding_generation: 0,
+            compaction_epoch: 0,
+            compaction_operations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn restart_never_redispatches_an_ambiguous_native_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        let session_id = SessionId("session".to_owned());
+        let operation_id = CompactionOperationId("operation".to_owned());
+        let mut record = test_record(BackendKind::Claude, session_id.clone(), true);
+        record.compaction_operations.push(CompactionOperationRecord {
+            operation_id: operation_id.clone(),
+            logical_session_id: session_id.clone(),
+            trigger: CompactionTrigger::UserRequested,
+            state: StoredCompactionState::NativeDispatchPossible,
+            method: Some(CompactionMethod::NativeTextCommand),
+            accepted: false,
+            mutation: CompactionMutation::NotObserved,
+            binding_generation_before: 0,
+            binding_generation_after: None,
+            transcript_high_water: 9,
+            metrics: CompactionMetrics::default(),
+            continuation: None,
+            message: None,
+            started_at_ms: 1,
+            finished_at_ms: None,
+        });
+        SessionStore::save(
+            &path,
+            &[(session_id.0.clone(), record)].into_iter().collect(),
+        )
+        .expect("write session store");
+
+        let (store, _) =
+            SessionStore::load_with_migration(path).expect("reconcile store");
+        let operation = store
+            .compaction_operation(&session_id, &operation_id)
+            .expect("operation remains durable");
+        assert_eq!(operation.state, StoredCompactionState::Failed);
+        assert!(operation.accepted);
+        assert_eq!(
+            operation.mutation,
+            CompactionMutation::MayHaveMutated
+        );
     }
 }

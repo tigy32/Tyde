@@ -1167,6 +1167,50 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::ContextCompactionNotify => {
+            match envelope.parse_payload::<protocol::ContextCompactionNotifyPayload>() {
+                Ok(payload) => apply_context_compaction_notify(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    payload,
+                    ChatEventSource::Live,
+                ),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse context_compaction_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::TeamContextCompactionNotify => {
+            match envelope.parse_payload::<protocol::TeamContextCompactionNotifyPayload>() {
+                Ok(payload) => apply_team_context_compaction_notify(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse team_context_compaction_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::ContextCompactionCapability => {
+            match envelope.parse_payload::<protocol::ContextCompactionCapabilityPayload>() {
+                Ok(payload) => {
+                    apply_context_compaction_capability(state, host_id, &envelope.stream, payload)
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse context_compaction_capability payload: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
             Ok(payload) => {
                 log::error!(
@@ -2483,6 +2527,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     if let Some(host_map) = map.get_mut(host_id) {
                         host_map.remove(&team.id);
                     }
+                });
+                // The team's last compaction result has nothing left to render
+                // on, and would otherwise outlive the team for the session.
+                state.team_context_compactions.update(|map| {
+                    map.remove(&(host_id.to_owned(), team.id.clone()));
                 });
                 // Drop any members and their bindings that belonged to this
                 // team. Snapshot dropped ids before the retain so the binding
@@ -3932,6 +3981,286 @@ fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayl
     });
 }
 
+/// Reduce a transient context-compaction operation frame.
+///
+/// This is the new, in-place compaction protocol: the agent id and the logical
+/// session id never change, so there is no replacement to wait for and no tab
+/// to retarget. `apply_agent_compact_notify` below is the *legacy* replacement
+/// path and stays untouched — a `Completed` there means "a different agent has
+/// taken over", which is a genuinely different event.
+fn apply_context_compaction_notify(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: protocol::ContextCompactionNotifyPayload,
+    source: ChatEventSource,
+) {
+    // The payload names its own agent, so it has to be checked against the
+    // stream that delivered it — otherwise one agent's stream can drive
+    // another agent's banner. Same guard as `apply_session_history`.
+    match agent_id_from_stream(stream) {
+        Some(stream_agent) if stream_agent == payload.agent_id => {}
+        stream_agent => {
+            report_dispatch_error(
+                state,
+                host_id,
+                stream,
+                FrameKind::ContextCompactionNotify,
+                format!(
+                    "context_compaction_notify names agent {} but its stream resolves to {:?}; dropping",
+                    payload.agent_id.0,
+                    stream_agent.map(|agent| agent.0),
+                ),
+            );
+            return;
+        }
+    }
+
+    // The stream grammar carries the agent but not the session (the instance
+    // segment is opaque), so `logical_session_id` is the only typed field that
+    // can tell a frame for the agent's *current* session from one for a
+    // session it has since left. Without this check a delayed notify from a
+    // previous session overwrites the current banner. Capability already
+    // validates this; operation frames must too.
+    let bound_session = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == payload.agent_id)
+            .and_then(|agent| agent.session_id.clone())
+    });
+    if let Some(bound_session) = bound_session
+        && bound_session != payload.logical_session_id
+    {
+        log::warn!(
+            "context_compaction_notify for agent {} names session {} but the agent is bound to {}; dropping",
+            payload.agent_id.0,
+            payload.logical_session_id.0,
+            bound_session.0,
+        );
+        return;
+    }
+
+    log::info!(
+        "dispatch context_compaction_notify host={} agent_id={} session={} operation_id={} status={:?} method={:?} source={:?}",
+        host_id,
+        payload.agent_id,
+        payload.logical_session_id.0,
+        payload.operation_id.0,
+        payload.status,
+        payload.method,
+        source
+    );
+
+    let agent_id = payload.agent_id.clone();
+    let trigger = payload.trigger;
+    let status = payload.status.clone();
+    let live = source == ChatEventSource::Live;
+    let terminal = state.apply_context_compaction_notify(&agent_id, payload, live);
+
+    // The single announcement point for a structured *individual* operation.
+    //
+    // The durable marker arrives first and deliberately stays silent for any
+    // event carrying an operation id (see the `ContextCompaction` arm), so the
+    // ordered marker→terminal pair says the outcome exactly once. Bootstrap
+    // never announces — `live` is false — and the retained `Failed` banner is
+    // not a live region, so a remount cannot replay it.
+    //
+    // A team run is announced *once, in aggregate*, by
+    // `apply_team_context_compaction_notify`. Members still reduce through
+    // here (their banners and gates are per-agent), but they do not each
+    // announce, or a five-member team would say six things.
+    if terminal && live && trigger != protocol::CompactionTrigger::TeamRequested {
+        match status {
+            protocol::ContextCompactionStatus::Failed { mutation, .. } => {
+                let reason = state
+                    .compaction_errors
+                    .with_untracked(|map| map.get(&agent_id).cloned())
+                    .unwrap_or_else(|| "Compaction failed.".to_owned());
+                // Assertive: the user cannot see this by looking (the banner
+                // is deliberately not a live region), and whether their model
+                // context survived is not something to discover later.
+                crate::components::center_zone::alert(format!(
+                    "{reason} {}",
+                    compaction_mutation_sentence(mutation)
+                ));
+            }
+            protocol::ContextCompactionStatus::Completed => {
+                crate::components::center_zone::announce(
+                    "Context compacted. Your conversation history here is unchanged.".to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Plain-language statement of what happened to the model context. This is the
+/// part of a failure the user actually needs: whether their context is intact.
+pub(crate) fn compaction_mutation_sentence(mutation: protocol::CompactionMutation) -> &'static str {
+    match mutation {
+        protocol::CompactionMutation::NotObserved => "Your model context is unchanged.",
+        protocol::CompactionMutation::Completed => {
+            "Your context was compacted, but finalizing it failed."
+        }
+        protocol::CompactionMutation::MayHaveMutated => "Your model context may have changed.",
+    }
+}
+
+fn apply_context_compaction_capability(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: protocol::ContextCompactionCapabilityPayload,
+) {
+    match agent_id_from_stream(stream) {
+        Some(stream_agent) if stream_agent == payload.agent_id => {}
+        stream_agent => {
+            report_dispatch_error(
+                state,
+                host_id,
+                stream,
+                FrameKind::ContextCompactionCapability,
+                format!(
+                    "context_compaction_capability names agent {} but its stream resolves to {:?}; dropping",
+                    payload.agent_id.0,
+                    stream_agent.map(|agent| agent.0),
+                ),
+            );
+            return;
+        }
+    }
+    log::debug!(
+        "dispatch context_compaction_capability host={} agent_id={} session={} availability={:?}",
+        host_id,
+        payload.agent_id,
+        payload.logical_session_id.0,
+        payload.availability
+    );
+    // The logical session travels with the snapshot: capability describes a
+    // session, not an agent id, and a snapshot for a session the agent is no
+    // longer bound to must not gate the current one. Rejection leaves
+    // capability unknown, which the control selector treats as "still
+    // determining" and disables — fail closed, not open.
+    state.apply_compaction_capability(
+        &payload.agent_id.clone(),
+        crate::state::CompactionCapabilitySnapshot {
+            logical_session_id: payload.logical_session_id,
+            availability: payload.availability,
+        },
+    );
+}
+
+/// Reduce a typed team compaction result.
+///
+/// The team-wide *request* is still `FrameKind::TeamCompact` (the server routes
+/// it to the context-operation path when every bound adapter supports one), but
+/// the *result* comes back typed. Without an explicit arm it fell through
+/// `dispatch_envelope`'s wildcard and was logged as an unexpected frame, so
+/// per-member outcomes never rendered and the members' duplicate-submit gates
+/// never released.
+///
+/// Member results are fanned into the same per-agent operation reducer the
+/// individual controls use, so one agent has one operation state whichever
+/// surface started it.
+fn apply_team_context_compaction_notify(
+    state: &AppState,
+    host_id: &str,
+    payload: protocol::TeamContextCompactionNotifyPayload,
+) {
+    log::info!(
+        "dispatch team_context_compaction_notify host={} team={} team_operation_id={} status={:?} members={}",
+        host_id,
+        payload.team_id.0,
+        payload.team_operation_id.0,
+        payload.status,
+        payload.members.len(),
+    );
+
+    for member in &payload.members {
+        // The member result now names its own logical session authoritatively,
+        // so correlation uses *that* — never the session this client happens to
+        // have cached for the agent. The distinction matters for exactly one
+        // case, and it is the case that silently corrupts state: a member whose
+        // session changed during the team run. Falling back to the local value
+        // would stamp the agent's *new* session onto a result produced for its
+        // old one, and the result would be accepted as current.
+        let Some((backend_kind, bound_session)) = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.host_id == host_id && agent.agent_id == member.agent_id)
+                .map(|agent| (agent.backend_kind, agent.session_id.clone()))
+        }) else {
+            // An agent this client does not know has no banner and no local
+            // gate, so there is nothing to drive; the only thing skipping costs
+            // is a release that was never held.
+            log::warn!(
+                "team_context_compaction_notify names agent {} which is not known on host {}; skipping member result",
+                member.agent_id.0,
+                host_id,
+            );
+            continue;
+        };
+
+        // Same rule as the individual notify path: a result for a session the
+        // agent has left must not drive the current session's UI.
+        if let Some(bound_session) = bound_session.as_ref()
+            && *bound_session != member.logical_session_id
+        {
+            log::warn!(
+                "team_context_compaction_notify member {} names session {} but the agent is bound to {}; skipping member result",
+                member.agent_id.0,
+                member.logical_session_id.0,
+                bound_session.0,
+            );
+            continue;
+        }
+
+        // Rebuild the per-agent payload the individual reducer expects. Every
+        // identity field is either carried by the result or read from the local
+        // agent record; none is invented.
+        let member_payload = protocol::ContextCompactionNotifyPayload {
+            operation_id: member.operation_id.clone(),
+            agent_id: member.agent_id.clone(),
+            logical_session_id: member.logical_session_id.clone(),
+            backend_kind,
+            trigger: protocol::CompactionTrigger::TeamRequested,
+            method: member.method,
+            status: member.status.clone(),
+            provider_version: None,
+            metrics: protocol::CompactionMetrics::default(),
+            continuation: None,
+            message: member.message.clone(),
+        };
+        // Team results arrive on the host stream, so the per-agent stream guard
+        // does not apply; go straight to the state reducer, which owns the
+        // terminal-id memory and the stale-frame rule.
+        state.apply_context_compaction_notify(&member.agent_id, member_payload, true);
+    }
+
+    state.team_context_compactions.update(|map| {
+        map.insert((host_id.to_owned(), payload.team_id.clone()), payload.clone());
+    });
+
+    // The team run's single announcement authority. Members reduce above but
+    // stay silent (their trigger is `TeamRequested`), so a five-member team
+    // says one thing, not six.
+    match payload.status {
+        protocol::TeamContextCompactionStatus::Failed => {
+            let reason = payload
+                .message
+                .clone()
+                .unwrap_or_else(|| "Some team members could not be compacted.".to_owned());
+            crate::components::center_zone::alert(reason);
+        }
+        protocol::TeamContextCompactionStatus::Completed => {
+            crate::components::center_zone::announce(
+                "Team context compacted. Your conversation history is unchanged.".to_owned(),
+            );
+        }
+        protocol::TeamContextCompactionStatus::Started => {}
+    }
+}
+
 fn apply_agent_compact_notify(
     state: &AppState,
     host_id: &str,
@@ -4084,6 +4413,8 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
         map.remove(&agent_id);
     });
     state.forget_session_history(&agent_id);
+    // The agent is gone; nothing compaction-related about it survives.
+    state.forget_context_compaction(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -4512,7 +4843,7 @@ fn clear_session_history_loading_on_error(
     };
     state.session_history.update(|map| {
         if let Some(history) = map.get_mut(&agent_id) {
-            history.loading = false;
+            history.pending_request = None;
         }
     });
 }
@@ -4528,7 +4859,7 @@ fn clear_session_history_loading_for_host(state: &AppState, host_id: &str) {
     state.session_history.update(|map| {
         for agent_id in agent_ids {
             if let Some(history) = map.get_mut(&agent_id) {
-                history.loading = false;
+                history.pending_request = None;
             }
         }
     });
@@ -4579,18 +4910,44 @@ fn apply_session_history(
         }
     }
 
+    // Correlate the page against the request this client is actually waiting
+    // for. A boolean "loading" flag could only say that *some* fetch was out,
+    // so a page from a previous connection — one still in flight when a
+    // reconnect wiped the transcript and re-bootstrapped it — was prepended
+    // into a transcript it does not belong to, duplicating every row it
+    // carried. Matching request id *and* cursor makes that droppable.
+    let outstanding = state
+        .session_history
+        .with_untracked(|map| map.get(&agent_id).and_then(|h| h.pending_request.clone()));
+    match outstanding {
+        Some(pending)
+            if pending.request_id == payload.request_id
+                && pending.before_seq == payload.request_before_seq => {}
+        other => {
+            log::warn!(
+                "session_history dropped as stale agent_id={} response=({}, {:?}) outstanding={:?}",
+                agent_id.0,
+                payload.request_id.0,
+                payload.request_before_seq,
+                other.map(|p| (p.request_id.0, p.before_seq)),
+            );
+            return;
+        }
+    }
+
     let mut replay = HistoryReplay::default();
     for event in payload.events {
         replay.apply(event, host_id, &agent_id);
     }
 
     if !replay.rows.is_empty() {
-        state.chat_rows.update(|map| {
-            let current = map.remove(&agent_id).unwrap_or_default();
-            let mut combined = replay.rows.clone();
-            combined.extend(current);
-            map.insert(agent_id.clone(), combined);
-        });
+        // Markers in the page go through the shared upsert: one already on
+        // screen is *merged* in place rather than dropped (a paged copy can be
+        // richer than the live one that raced past it), and two copies of one
+        // marker id inside this same page collapse into the first. Dropping
+        // duplicates here — the previous behaviour — lost the richer payload
+        // and still allowed an in-page pair to produce two rows.
+        state.prepend_history_page(&agent_id, replay.rows.clone());
         state.chat_message_rows.update(|map| {
             let agent_index = map.entry(agent_id.clone()).or_default();
             for (message_id, row_id) in replay.message_rows {
@@ -4624,7 +4981,7 @@ fn apply_session_history(
         if let Some(history) = map.get_mut(&agent_id) {
             history.oldest_seq = payload.oldest_seq;
             history.has_more_before = payload.has_more_before;
-            history.loading = false;
+            history.pending_request = None;
             history.message_count = 0;
             if !history.has_more_before {
                 remove = true;
@@ -4636,7 +4993,7 @@ fn apply_session_history(
                     message_count: 0,
                     oldest_seq: payload.oldest_seq,
                     has_more_before: payload.has_more_before,
-                    loading: false,
+                    pending_request: None,
                 },
             );
         }
@@ -4706,8 +5063,12 @@ fn chat_row_declaring_tool_call(
             .iter()
             .rev()
             .find(|row| {
-                row.entry.with_untracked(|entry| {
-                    message_declares_tool_call(&entry.message, tool_call_id)
+                // A compaction marker declares no tool calls and must never
+                // capture a card; `message_entry` returning `None` skips it.
+                row.message_entry().is_some_and(|entry| {
+                    entry.with_untracked(|entry| {
+                        message_declares_tool_call(&entry.message, tool_call_id)
+                    })
                 })
             })
             .cloned()
@@ -4738,7 +5099,10 @@ impl HistoryReplay {
                 let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
                     return;
                 };
-                row.entry.update(|entry| {
+                let Some(row_entry) = row.message_entry() else {
+                    return;
+                };
+                row_entry.update(|entry| {
                     if data.model_info.is_some() {
                         entry.message.model_info = data.model_info.clone();
                     }
@@ -4773,16 +5137,27 @@ impl HistoryReplay {
                     .iter()
                     .rev()
                     .find(|row| {
-                        row.entry.with_untracked(|entry| {
-                            message_declares_tool_call(&entry.message, &tool_call_id)
+                        row.message_entry().is_some_and(|entry| {
+                            entry.with_untracked(|entry| {
+                                message_declares_tool_call(&entry.message, &tool_call_id)
+                            })
                         })
                     })
-                    .or_else(|| self.rows.last());
-                if let Some(row) = row {
-                    row.entry.update(|entry| {
+                    // Fall back to the newest *message* row. `last()` alone
+                    // could hand the card to a compaction marker, which has
+                    // nowhere to put it.
+                    .or_else(|| {
+                        self.rows
+                            .iter()
+                            .rev()
+                            .find(|row| row.message_entry().is_some())
+                    });
+                if let Some(row) = row.and_then(|row| row.message_entry().map(|e| (row.id, e))) {
+                    let (row_id, row_entry) = row;
+                    row_entry.update(|entry| {
                         entry.tool_requests.push(tool_entry);
                     });
-                    self.tool_rows.insert(ToolCallId(tool_call_id), row.id);
+                    self.tool_rows.insert(ToolCallId(tool_call_id), row_id);
                 } else {
                     log::error!(
                         "HISTORY TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — history page has no message row",
@@ -4801,7 +5176,10 @@ impl HistoryReplay {
                 let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
                     return;
                 };
-                row.entry.update(|entry| {
+                let Some(row_entry) = row.message_entry() else {
+                    return;
+                };
+                row_entry.update(|entry| {
                     if let Some(tool) = entry
                         .tool_requests
                         .iter_mut()
@@ -4829,12 +5207,28 @@ impl HistoryReplay {
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
+            // A compaction that happened inside this page. Placement among the
+            // message rows matters — the marker's whole job is to say *where*
+            // in the conversation the model's context was rewritten — so it is
+            // pushed in stream order like any other row rather than hoisted.
+            //
+            // Deduplication against rows already on screen happens at
+            // prepend time in `apply_session_history`, not here: this reducer
+            // builds a page in isolation and cannot see the live transcript.
+            ChatEvent::ContextCompaction(event) => {
+                self.rows
+                    .push(crate::state::ChatRowHandle::context_compaction(event));
+            }
         }
     }
 
     fn push_entry(&mut self, entry: ChatMessageEntry) {
         let handle = crate::state::ChatRowHandle::new(entry);
-        let (tool_call_ids, message_id) = handle.entry.with_untracked(|entry| {
+        let entry_signal = handle
+            .message_entry()
+            .expect("push_entry builds a message row")
+            .clone();
+        let (tool_call_ids, message_id) = entry_signal.with_untracked(|entry| {
             (
                 entry
                     .tool_requests
@@ -4854,6 +5248,18 @@ impl HistoryReplay {
     }
 }
 
+/// Why a `ChatEvent` is being reduced.
+///
+/// Only `Live` may announce. Bootstrap replays events that already happened —
+/// announcing them would make a screen reader read out old compactions as if
+/// they were happening now, once per reconnect. (Paged history goes through
+/// `HistoryReplay`, which never announces at all.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatEventSource {
+    Live,
+    Bootstrap,
+}
+
 /// Apply an already-parsed `ChatEvent` to the per-agent state.
 ///
 /// Split out from `dispatch_chat_event` so an `AgentBootstrap` (or any
@@ -4861,6 +5267,18 @@ impl HistoryReplay {
 /// events through the same reducer without re-encoding them through an
 /// `Envelope`.
 pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, event: ChatEvent) {
+    apply_chat_event_from(state, host_id, agent_id, event, ChatEventSource::Live);
+}
+
+/// [`apply_chat_event`] with an explicit source, so replay paths can suppress
+/// live-only side effects (announcements).
+pub fn apply_chat_event_from(
+    state: &AppState,
+    host_id: &str,
+    agent_id: &AgentId,
+    event: ChatEvent,
+    source: ChatEventSource,
+) {
     let agent_id = agent_id.clone();
     match event {
         ChatEvent::TypingStatusChanged(typing) => {
@@ -5061,13 +5479,17 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             // `MessageAdded(Error)` between the `StreamEnd` and the request when a
             // canonical payload fails to normalize, and "last row" then means the
             // error row rather than the row that made the call.
+            // The fallback asks for the last *message* row, not the last row:
+            // a compaction marker can be newest and has nowhere to put a card.
             let row = chat_row_declaring_tool_call(state, &agent_id, &tool_call_id)
-                .or_else(|| state.last_chat_row_untracked(&agent_id));
-            if let Some(row) = row {
-                row.entry.update(|entry| {
+                .or_else(|| state.last_chat_message_row_untracked(&agent_id));
+            if let Some((row_id, row_entry)) =
+                row.and_then(|row| row.message_entry().map(|e| (row.id, e.clone())))
+            {
+                row_entry.update(|entry| {
                     entry.tool_requests.push(tool_entry);
                 });
-                state.index_chat_tool_row(&agent_id, tool_call_id, row.id);
+                state.index_chat_tool_row(&agent_id, tool_call_id, row_id);
             } else {
                 log::error!(
                     "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — agent has no message row",
@@ -5106,9 +5528,12 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     return;
                 }
             }
-            if let Some(row) = state.chat_row_for_tool_untracked(&agent_id, &call_id) {
+            if let Some(row_entry) = state
+                .chat_row_for_tool_untracked(&agent_id, &call_id)
+                .and_then(|row| row.message_entry().cloned())
+            {
                 let mut matched = false;
-                row.entry.update(|entry| {
+                row_entry.update(|entry| {
                     if let Some(tool) = entry
                         .tool_requests
                         .iter_mut()
@@ -5239,7 +5664,179 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     .push(OrchestrationRecord::Event(data));
             });
         }
+        ChatEvent::ContextCompaction(event) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=context_compaction marker_id={} operation_id={:?} status={:?} mutation={:?}",
+                host_id,
+                agent_id,
+                event.marker_id.0,
+                event.operation_id.as_ref().map(|id| &id.0),
+                event.status,
+                event.mutation
+            );
+
+            // The marker is the durable record of a finished compaction, and it
+            // is inert with respect to *every* other read model.
+            //
+            // Turn state: it does not open or close a turn and never sets
+            // typing — the trap `hermes.rs` documents, where a typing marker
+            // starts a Tyde turn and latches the agent busy after a cancel.
+            //
+            // Operation state: it does not terminate a structured operation
+            // either, not even one whose id it carries. The frozen ordering is
+            // nonterminal notify(s) → durable marker → terminal notify, and the
+            // terminal notify is the sole operation-terminal transition. Two
+            // reasons this matters concretely. (a) The actor's operation
+            // snapshot keeps its original event-log position, so a reconnect in
+            // the window after the marker is persisted but before the terminal
+            // notify replays the still-nonterminal snapshot *before* the later
+            // marker — a marker that cleared operations would delete the state
+            // it just restored. (b) Clearing here opens a banner gap on the
+            // ordinary live path between the marker and the terminal notify.
+            let appended = state.push_compaction_marker(agent_id.clone(), event.clone());
+
+            // One announcement per event, from exactly one place.
+            //
+            // A marker carrying an operation id is announced by that
+            // operation's terminal notify, not here — otherwise the ordered
+            // marker-then-terminal pair announces the same outcome twice. An
+            // *observation* (no operation id: backend auto-compaction, which
+            // fires on its own schedule and emits no notify at all) has no
+            // notify to announce it, so it announces here.
+            let is_observation = event.operation_id.is_none();
+            if source == ChatEventSource::Live && appended && is_observation {
+                crate::components::center_zone::announce(compaction_marker_announcement(&event));
+            }
+        }
     }
+}
+
+/// The unabbreviated sentence a screen reader gets when a compaction lands.
+///
+/// Visible text abbreviates (`384.2K`); this does not. "384K" is read out
+/// ambiguously, and the exact figures are the whole point of the marker for a
+/// user who cannot see it.
+pub(crate) fn compaction_marker_announcement(
+    event: &protocol::ContextCompactionTimelineEvent,
+) -> String {
+    use protocol::{CompactionMutation, ContextCompactionTimelineStatus};
+
+    let mut sentence = match event.status {
+        ContextCompactionTimelineStatus::Completed => match (
+            event.metrics.before_tokens,
+            event.metrics.after_tokens,
+        ) {
+            (Some(before), Some(after)) => format!(
+                "Context compacted. {} tokens reduced to {}.",
+                group_digits(before),
+                group_digits(after)
+            ),
+            (Some(before), None) => {
+                format!("Context compacted from {} tokens.", group_digits(before))
+            }
+            (None, Some(after)) => {
+                format!("Context compacted to {} tokens.", group_digits(after))
+            }
+            (None, None) => "Context compacted.".to_owned(),
+        },
+        ContextCompactionTimelineStatus::Failed => {
+            let mut sentence = match event.mutation {
+                CompactionMutation::NotObserved => {
+                    "Compaction failed. Your model context is unchanged.".to_owned()
+                }
+                CompactionMutation::Completed => {
+                    "Context was compacted, but finalizing it failed.".to_owned()
+                }
+                CompactionMutation::MayHaveMutated => {
+                    "Compaction failed. Your model context may have changed.".to_owned()
+                }
+            };
+            // A failure can still carry token figures — `mutation: Completed`
+            // means the context *was* compacted and only finalizing failed, and
+            // `MayHaveMutated` can carry a partial reading. The visible row
+            // renders them either way, and the visible row is hidden from
+            // assistive technology, so omitting them here made those numbers
+            // sighted-only.
+            if let Some(tokens) = token_change_phrase(&event.metrics) {
+                sentence.push(' ');
+                sentence.push_str(&tokens);
+            }
+            sentence
+        }
+    };
+
+    // The duration is on the visible row, so it has to be in the sentence too:
+    // the visible metrics are hidden from assistive technology precisely so
+    // this sentence is the single representation, and dropping a figure here
+    // loses it entirely rather than merely abbreviating it.
+    if let Some(duration_ms) = event.metrics.duration_ms {
+        sentence.push(' ');
+        sentence.push_str(&format!("Took {}.", spoken_duration(duration_ms)));
+    }
+
+    if let Some(message) = event
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        sentence.push(' ');
+        sentence.push_str(message);
+    }
+    // The guarantee the user is most likely to doubt at exactly this moment.
+    sentence.push_str(" Your conversation history here is unchanged.");
+    sentence
+}
+
+/// The token figures as a standalone sentence, for statuses whose leading
+/// sentence does not already carry them.
+fn token_change_phrase(metrics: &protocol::CompactionMetrics) -> Option<String> {
+    match (metrics.before_tokens, metrics.after_tokens) {
+        (Some(before), Some(after)) => Some(format!(
+            "{} tokens reduced to {}.",
+            group_digits(before),
+            group_digits(after)
+        )),
+        (Some(before), None) => Some(format!("Context was {} tokens.", group_digits(before))),
+        (None, Some(after)) => Some(format!("Context is now {} tokens.", group_digits(after))),
+        (None, None) => None,
+    }
+}
+
+/// `384168` → `"384,168"`. Screen readers read an ungrouped run of digits
+/// inconsistently (often digit-by-digit); grouping makes it a number.
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// `169775` → `"2 minutes 50 seconds"`. The visible row abbreviates to
+/// `2m 50s`, which is read as letters.
+fn spoken_duration(duration_ms: u64) -> String {
+    let seconds = duration_ms / 1000;
+    let minutes = seconds / 60;
+    let rest = seconds % 60;
+    let unit = |value: u64, name: &str| {
+        if value == 1 {
+            format!("1 {name}")
+        } else {
+            format!("{value} {name}s")
+        }
+    };
+    if minutes == 0 {
+        return unit(seconds, "second");
+    }
+    if rest == 0 {
+        return unit(minutes, "minute");
+    }
+    format!("{} {}", unit(minutes, "minute"), unit(rest, "second"))
 }
 
 // ── Bootstrap apply helpers ──────────────────────────────────────────────
@@ -5801,6 +6398,14 @@ fn apply_agent_bootstrap(
         map.remove(&agent_id);
     });
     state.forget_session_history(&agent_id);
+    // Bootstrap is authoritative *replacement*, so every compaction read-model
+    // record goes before replay and only what the snapshot carries comes back.
+    // Clearing just the marker index left three ways to keep stale state: a
+    // pre-bootstrap `Requesting` whose frames went to the dead connection could
+    // persist forever, a terminal `Failed` banner could outlive the server's
+    // correct decision not to bootstrap terminal snapshots, and a capability
+    // snapshot from a previous logical session could keep gating the new one.
+    state.reset_compaction_read_model(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -5864,14 +6469,31 @@ fn apply_agent_bootstrap(
                                 message_count,
                                 oldest_seq: Some(before_seq),
                                 has_more_before: true,
-                                loading: false,
+                                pending_request: None,
                             },
                         );
                     });
                 }
             }
             AgentBootstrapEvent::ChatEvent(event) => {
-                apply_chat_event(state, host_id, &agent_id, event);
+                apply_chat_event_from(state, host_id, &agent_id, event, ChatEventSource::Bootstrap);
+            }
+            AgentBootstrapEvent::ContextCompaction(inner) => {
+                // Only a *non-terminal* operation is bootstrapped, so this
+                // silently rebuilds the banner for compaction that is still
+                // running — the case a reconnect during Claude's 108–189 s
+                // window used to lose entirely, leaving the user looking at an
+                // apparently idle agent.
+                apply_context_compaction_notify(
+                    state,
+                    host_id,
+                    stream,
+                    inner,
+                    ChatEventSource::Bootstrap,
+                );
+            }
+            AgentBootstrapEvent::ContextCompactionCapability(inner) => {
+                apply_context_compaction_capability(state, host_id, stream, inner);
             }
             AgentBootstrapEvent::AgentActivityStats(inner) => {
                 apply_agent_activity_stats(state, host_id, inner);
@@ -7497,13 +8119,15 @@ mod tests {
                 .map(|rows| {
                     rows.iter()
                         .map(|row| {
-                            row.entry.with_untracked(|entry| {
-                                entry
-                                    .tool_requests
-                                    .iter()
-                                    .map(|tool| tool.request.tool_call_id.clone())
-                                    .collect::<Vec<_>>()
-                            })
+                            row.message_entry()
+                                .expect("message row")
+                                .with_untracked(|entry| {
+                                    entry
+                                        .tool_requests
+                                        .iter()
+                                        .map(|tool| tool.request.tool_call_id.clone())
+                                        .collect::<Vec<_>>()
+                                })
                         })
                         .collect::<Vec<_>>()
                 })
@@ -7569,10 +8193,12 @@ mod tests {
             let error_visible = state.chat_rows.with_untracked(|map| {
                 map.get(&agent_id).is_some_and(|rows| {
                     rows.iter().any(|row| {
-                        row.entry.with_untracked(|entry| {
-                            matches!(entry.message.sender, protocol::MessageSender::Error)
-                                && entry.message.content.contains("Failed to normalize")
-                        })
+                        row.message_entry()
+                            .expect("message row")
+                            .with_untracked(|entry| {
+                                matches!(entry.message.sender, protocol::MessageSender::Error)
+                                    && entry.message.content.contains("Failed to normalize")
+                            })
                     })
                 })
             });
@@ -7631,12 +8257,14 @@ mod tests {
             let has_result = state.chat_rows.with_untracked(|map| {
                 map.get(&agent_id).and_then(|rows| {
                     rows.first().map(|row| {
-                        row.entry.with_untracked(|entry| {
-                            entry
-                                .tool_requests
-                                .first()
-                                .is_some_and(|tool| tool.result.is_some())
-                        })
+                        row.message_entry()
+                            .expect("message row")
+                            .with_untracked(|entry| {
+                                entry
+                                    .tool_requests
+                                    .first()
+                                    .is_some_and(|tool| tool.result.is_some())
+                            })
                     })
                 })
             });
@@ -7764,12 +8392,14 @@ mod tests {
             let first_row_has_result = state.chat_rows.with_untracked(|map| {
                 map.get(&agent_id).and_then(|rows| {
                     rows.first().map(|row| {
-                        row.entry.with_untracked(|entry| {
-                            entry.tool_requests.first().is_some_and(|tool| {
-                                tool.request.tool_call_id == "tool-background"
-                                    && tool.result.as_ref().is_some_and(|result| result.success)
+                        row.message_entry()
+                            .expect("message row")
+                            .with_untracked(|entry| {
+                                entry.tool_requests.first().is_some_and(|tool| {
+                                    tool.request.tool_call_id == "tool-background"
+                                        && tool.result.as_ref().is_some_and(|result| result.success)
+                                })
                             })
-                        })
                     })
                 })
             });
@@ -7866,7 +8496,10 @@ mod tests {
                 rows[0].id, row_id_before,
                 "row identity preserved by in-place patch"
             );
-            let entry = rows[0].entry.get_untracked();
+            let entry = rows[0]
+                .message_entry()
+                .expect("message row")
+                .get_untracked();
             assert_eq!(entry.message.content, "streamed body");
             assert!(
                 entry
@@ -8142,7 +8775,10 @@ mod tests {
                         message_count: 2,
                         oldest_seq: Some(12),
                         has_more_before: true,
-                        loading: true,
+                        pending_request: Some(crate::state::PendingHistoryRequest {
+                            request_id: protocol::HistoryPageRequestId("test-page".to_owned()),
+                            before_seq: Some(12),
+                        }),
                     },
                 );
             });
@@ -8153,6 +8789,8 @@ mod tests {
                 &stream,
                 SessionHistoryPayload {
                     agent_id: agent_id.clone(),
+                    request_id: protocol::HistoryPageRequestId("test-page".to_owned()),
+                    request_before_seq: Some(12),
                     events: vec![
                         ChatEvent::MessageAdded(message(
                             "older row 2",
@@ -8174,7 +8812,13 @@ mod tests {
                 .expect("history rows");
             let contents = rows
                 .iter()
-                .map(|row| row.entry.get_untracked().message.content)
+                .map(|row| {
+                    row.message_entry()
+                        .expect("message row")
+                        .get_untracked()
+                        .message
+                        .content
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
                 contents,
@@ -8226,12 +8870,32 @@ mod tests {
                 images: None,
             };
 
+            // A page applies only against the request this client is waiting
+            // for, so the test has to register one.
+            let request = crate::state::PendingHistoryRequest {
+                request_id: protocol::HistoryPageRequestId("page-1".to_owned()),
+                before_seq: None,
+            };
+            state.session_history.update(|map| {
+                map.insert(
+                    payload_agent.clone(),
+                    SessionHistoryState {
+                        message_count: 2,
+                        oldest_seq: None,
+                        has_more_before: true,
+                        pending_request: Some(request.clone()),
+                    },
+                );
+            });
+
             apply_session_history(
                 &state,
                 "history-host",
                 &StreamPath("/agent/payload-agent/inst".to_owned()),
                 SessionHistoryPayload {
                     agent_id: payload_agent.clone(),
+                    request_id: request.request_id.clone(),
+                    request_before_seq: request.before_seq,
                     events: vec![
                         ChatEvent::MessageAdded(message("first", "first delivered")),
                         ChatEvent::MessageAdded(message("second", "second delivered")),
@@ -8247,13 +8911,23 @@ mod tests {
                 .expect("payload-owned history rows");
             assert_eq!(
                 rows.iter()
-                    .map(|row| row.entry.get_untracked().message.content)
+                    .map(|row| row
+                        .message_entry()
+                        .expect("message row")
+                        .get_untracked()
+                        .message
+                        .content)
                     .collect::<Vec<_>>(),
                 vec!["first delivered".to_owned(), "second delivered".to_owned()]
             );
             assert_eq!(
                 rows.iter()
-                    .filter_map(|row| row.entry.get_untracked().message.message_id)
+                    .filter_map(|row| row
+                        .message_entry()
+                        .expect("message row")
+                        .get_untracked()
+                        .message
+                        .message_id)
                     .map(|id| id.0)
                     .collect::<Vec<_>>(),
                 vec!["first".to_owned(), "second".to_owned()]
@@ -8300,6 +8974,8 @@ mod tests {
                 &StreamPath("/agent/agent-a/inst".to_owned()),
                 SessionHistoryPayload {
                     agent_id: payload_agent.clone(),
+                    request_id: protocol::HistoryPageRequestId("foreign-page".to_owned()),
+                    request_before_seq: Some(1),
                     events: vec![ChatEvent::MessageAdded(message("older", "foreign history"))],
                     has_more_before: true,
                     oldest_seq: Some(1),
@@ -8312,7 +8988,12 @@ mod tests {
                 .expect("live rows must survive");
             assert_eq!(
                 rows.iter()
-                    .map(|row| row.entry.get_untracked().message.content)
+                    .map(|row| row
+                        .message_entry()
+                        .expect("message row")
+                        .get_untracked()
+                        .message
+                        .content)
                     .collect::<Vec<_>>(),
                 vec!["live row".to_owned()],
                 "a mismatched frame must not prepend foreign history"
@@ -8977,6 +9658,1527 @@ mod tests {
                     Some(TabContent::team_member_draft(host_id.to_owned(), member_id))
                 );
             });
+        });
+    }
+
+    // ── Context compaction ──────────────────────────────────────────────
+
+    fn compaction_agent() -> (AgentId, String, StreamPath) {
+        (
+            AgentId("compact-agent".to_owned()),
+            "compact-host".to_owned(),
+            StreamPath("/agent/compact-agent/inst".to_owned()),
+        )
+    }
+
+    fn marker(
+        marker_id: &str,
+        operation_id: Option<&str>,
+        status: protocol::ContextCompactionTimelineStatus,
+    ) -> protocol::ContextCompactionTimelineEvent {
+        protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId(marker_id.to_owned()),
+            operation_id: operation_id.map(|id| protocol::CompactionOperationId(id.to_owned())),
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: protocol::CompactionMethod::NativeTextCommand,
+            backend_kind: BackendKind::Claude,
+            provider_session_id: None,
+            status,
+            mutation: match status {
+                protocol::ContextCompactionTimelineStatus::Completed => {
+                    protocol::CompactionMutation::Completed
+                }
+                protocol::ContextCompactionTimelineStatus::Failed => {
+                    protocol::CompactionMutation::NotObserved
+                }
+            },
+            metrics: protocol::CompactionMetrics {
+                before_tokens: Some(384_168),
+                after_tokens: Some(12_518),
+                duration_ms: Some(169_775),
+                ..Default::default()
+            },
+            continuation: None,
+            message: None,
+            timestamp: 0,
+        }
+    }
+
+    fn notify(
+        operation_id: &str,
+        agent_id: &AgentId,
+        status: protocol::ContextCompactionStatus,
+    ) -> protocol::ContextCompactionNotifyPayload {
+        protocol::ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId(operation_id.to_owned()),
+            agent_id: agent_id.clone(),
+            logical_session_id: protocol::SessionId("session-1".to_owned()),
+            backend_kind: BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: Some(protocol::CompactionMethod::NativeTextCommand),
+            status,
+            provider_version: None,
+            metrics: protocol::CompactionMetrics::default(),
+            continuation: None,
+            message: None,
+        }
+    }
+
+    /// The marker is a transcript row and nothing else. Appending one must not
+    /// touch the message index, the tool index, or — most importantly — turn
+    /// state: a marker that sets typing starts a Tyde turn and can latch the
+    /// agent busy, the trap `hermes.rs` documents.
+    #[test]
+    fn context_compaction_marker_appends_one_inert_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, _) = compaction_agent();
+
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-1",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("marker row");
+            assert_eq!(rows.len(), 1);
+            assert!(
+                rows[0].compaction_marker().is_some(),
+                "the row is a marker, not a message"
+            );
+            assert!(
+                rows[0].message_entry().is_none(),
+                "a marker exposes no message entry, so nothing can attach a card to it"
+            );
+            assert!(
+                state
+                    .chat_message_rows
+                    .with_untracked(|map| map.get(&agent_id).is_none_or(|i| i.is_empty())),
+                "a marker must not enter the message index"
+            );
+            assert!(
+                state
+                    .chat_tool_rows
+                    .with_untracked(|map| map.get(&agent_id).is_none_or(|i| i.is_empty())),
+                "a marker must not enter the tool index"
+            );
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "a marker is not a turn boundary and must never set typing"
+            );
+        });
+    }
+
+    /// The same compaction can reach this client from live, bootstrap, a paged
+    /// window, and a legacy provider import. All four carry the same
+    /// provider-derived marker id, and it must produce exactly one row.
+    #[test]
+    fn repeated_marker_id_materializes_exactly_one_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, _) = compaction_agent();
+            let event = marker(
+                "marker-dup",
+                None,
+                protocol::ContextCompactionTimelineStatus::Completed,
+            );
+
+            for _ in 0..3 {
+                apply_chat_event(
+                    &state,
+                    &host_id,
+                    &agent_id,
+                    ChatEvent::ContextCompaction(event.clone()),
+                );
+            }
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("marker row");
+            assert_eq!(
+                rows.len(),
+                1,
+                "one marker id is one row, however often it arrives"
+            );
+        });
+    }
+
+    /// A second sighting can be richer than the first — a paged historical
+    /// marker may carry metrics a live one raced past. Refreshing in place
+    /// keeps the better data without adding a row.
+    #[test]
+    fn richer_repeat_updates_the_marker_row_in_place() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, _) = compaction_agent();
+
+            let mut sparse = marker(
+                "marker-rich",
+                None,
+                protocol::ContextCompactionTimelineStatus::Completed,
+            );
+            sparse.metrics = protocol::CompactionMetrics::default();
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(sparse),
+            );
+            let row_id = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).map(|rows| rows[0].id))
+                .expect("marker row");
+
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-rich",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("marker row");
+            assert_eq!(rows.len(), 1, "still one row");
+            assert_eq!(rows[0].id, row_id, "and the same row, updated in place");
+            assert_eq!(
+                rows[0]
+                    .compaction_marker()
+                    .and_then(|event| event.with_untracked(|event| event.metrics.before_tokens)),
+                Some(384_168),
+                "the richer sighting's metrics win"
+            );
+        });
+    }
+
+    /// Completion without a replacement agent is the *normal* path for
+    /// in-place compaction. The legacy handler treated it as an anomaly and
+    /// silently cleared state, which is why a successful compaction produced
+    /// no user-visible signal at all.
+    #[test]
+    fn terminal_notify_clears_the_operation_without_a_replacement_agent() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-1",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Started {
+                        stage: protocol::CompactionStage::Compacting,
+                    },
+                ),
+                ChatEventSource::Live,
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "the banner is up while the operation runs"
+            );
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-1",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+                ChatEventSource::Live,
+            );
+
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "completion clears the operation with no new_agent_id in sight"
+            );
+            assert!(
+                state
+                    .compaction_errors
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "and records no error"
+            );
+            assert!(
+                state
+                    .chat_rows
+                    .with_untracked(|map| map.get(&agent_id).is_none_or(|rows| rows.is_empty())),
+                "a notify never creates a transcript row; the marker is the only producer"
+            );
+        });
+    }
+
+    /// A delayed heartbeat for an operation that already finished must not
+    /// reopen the banner.
+    #[test]
+    fn late_progress_for_a_terminal_operation_is_ignored() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-late",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+                ChatEventSource::Live,
+            );
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-late",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Progress {
+                        stage: protocol::CompactionStage::Compacting,
+                    },
+                ),
+                ChatEventSource::Live,
+            );
+
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "a stale progress frame must not resurrect a finished operation"
+            );
+        });
+    }
+
+    /// No marker terminates an operation — not an observation, and not even
+    /// one carrying the operation's own id. The frozen ordering is
+    /// nonterminal notify(s) → durable marker → terminal notify, and the
+    /// terminal notify is the sole operation-terminal transition.
+    #[test]
+    fn no_marker_terminates_a_running_operation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-running",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Started {
+                        stage: protocol::CompactionStage::Compacting,
+                    },
+                ),
+                ChatEventSource::Live,
+            );
+
+            // An unrequested backend compaction: no operation id.
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-observed",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "an observation must not satisfy a structured operation"
+            );
+
+            // The operation's own marker does not close it either: the
+            // terminal notify does, and it has not arrived yet. Closing here
+            // would open a banner gap between marker and terminal, and would
+            // delete a bootstrap-restored operation in the reconnect window.
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-owned",
+                    Some("op-running"),
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "a matching marker must leave the operation running"
+            );
+
+            // Only the terminal notify closes it.
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-running",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+                ChatEventSource::Live,
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "the terminal notify is the sole operation-terminal transition"
+            );
+        });
+    }
+
+    /// The reconnect window the ordering contract exists for: the actor's
+    /// operation snapshot keeps its original event-log position, so bootstrap
+    /// can replay a still-nonterminal snapshot *before* a marker persisted
+    /// later. A marker that terminated operations would delete the state it had
+    /// just restored.
+    #[test]
+    fn reconnect_ordering_keeps_the_operation_until_the_terminal_notify() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            state.agents.update(|agents| {
+                agents.push(fatal_test_agent(&host_id, &agent_id, &stream));
+            });
+
+            apply_agent_bootstrap(
+                &state,
+                &host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        // Snapshot first (older log position) …
+                        AgentBootstrapEvent::ContextCompaction(notify(
+                            "op-window",
+                            &agent_id,
+                            protocol::ContextCompactionStatus::Progress {
+                                stage: protocol::CompactionStage::Compacting,
+                            },
+                        )),
+                        // … then the marker that was persisted after it.
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker(
+                            "marker-window",
+                            Some("op-window"),
+                            protocol::ContextCompactionTimelineStatus::Completed,
+                        ))),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "the restored operation must survive the later marker in the same bootstrap"
+            );
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-window",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+                ChatEventSource::Live,
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "and terminates only when its terminal notify finally arrives"
+            );
+        });
+    }
+
+    /// Bootstrap is authoritative replacement: whatever the snapshot omits is
+    /// authoritatively absent. Before this, a pre-bootstrap `Requesting` could
+    /// persist forever, a terminal `Failed` banner could outlive the server's
+    /// correct omission of terminal snapshots, and capability could survive a
+    /// session change.
+    #[test]
+    fn bootstrap_omission_clears_stale_operation_and_capability() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            state.agents.update(|agents| {
+                agents.push(fatal_test_agent(&host_id, &agent_id, &stream));
+            });
+
+            // Stale local state of every kind.
+            assert!(state.begin_compaction_request(&agent_id));
+            state.compaction_capability.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    crate::state::CompactionCapabilitySnapshot {
+                        logical_session_id: protocol::SessionId("old-session".to_owned()),
+                        availability: protocol::RequestedCompactionAvailability::Available {
+                            route: protocol::RequestedCompactionRoute::NativePreferred,
+                        },
+                    },
+                );
+            });
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: Some(5),
+                        has_more_before: true,
+                        pending_request: Some(crate::state::PendingHistoryRequest {
+                            request_id: protocol::HistoryPageRequestId("dead-conn".to_owned()),
+                            before_seq: Some(5),
+                        }),
+                    },
+                );
+            });
+
+            // A bootstrap that carries neither an operation nor a capability.
+            apply_agent_bootstrap(
+                &state,
+                &host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: Vec::new(),
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "a Requesting whose frames went to the dead connection must not persist"
+            );
+            assert!(
+                state
+                    .compaction_capability
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "capability from a previous session must not gate the new one"
+            );
+            assert!(
+                state.session_history.with_untracked(|map| map
+                    .get(&agent_id)
+                    .is_none_or(|history| history.pending_request.is_none())),
+                "the page request belonged to the dead connection"
+            );
+        });
+    }
+
+    /// Capability describes a logical session, not an agent id. A snapshot for
+    /// a session the agent is not bound to is rejected, and rejection leaves
+    /// capability *unknown* — which the control selector disables — rather than
+    /// inheriting the previous answer.
+    #[test]
+    fn capability_for_a_foreign_session_is_rejected_and_fails_closed() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            let mut agent = fatal_test_agent(&host_id, &agent_id, &stream);
+            agent.session_id = Some(protocol::SessionId("current".to_owned()));
+            state.agents.update(|agents| agents.push(agent));
+
+            apply_context_compaction_capability(
+                &state,
+                &host_id,
+                &stream,
+                protocol::ContextCompactionCapabilityPayload {
+                    agent_id: agent_id.clone(),
+                    logical_session_id: protocol::SessionId("stale".to_owned()),
+                    availability: protocol::RequestedCompactionAvailability::Available {
+                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                    },
+                },
+            );
+
+            assert!(
+                state
+                    .compaction_capability
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "a snapshot naming another session must not be stored"
+            );
+            assert!(
+                !crate::actions::compaction_control_state(
+                    &state,
+                    &ActiveAgentRef {
+                        host_id: host_id.clone(),
+                        agent_id: agent_id.clone()
+                    }
+                )
+                .is_enabled(),
+                "unknown capability must disable the control, not enable it"
+            );
+        });
+    }
+
+    /// Two copies of one marker inside a single returned page collapsed into
+    /// nothing before: the index was written only after the whole page was
+    /// prepended, so both copies passed the pre-prepend check.
+    #[test]
+    fn duplicate_markers_within_one_page_produce_one_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            let request = crate::state::PendingHistoryRequest {
+                request_id: protocol::HistoryPageRequestId("page-dup".to_owned()),
+                before_seq: None,
+            };
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: None,
+                        has_more_before: true,
+                        pending_request: Some(request.clone()),
+                    },
+                );
+            });
+
+            let mut sparse = marker(
+                "marker-in-page",
+                None,
+                protocol::ContextCompactionTimelineStatus::Completed,
+            );
+            sparse.metrics = protocol::CompactionMetrics::default();
+
+            apply_session_history(
+                &state,
+                &host_id,
+                &stream,
+                SessionHistoryPayload {
+                    agent_id: agent_id.clone(),
+                    request_id: request.request_id.clone(),
+                    request_before_seq: request.before_seq,
+                    events: vec![
+                        ChatEvent::ContextCompaction(sparse),
+                        ChatEvent::ContextCompaction(marker(
+                            "marker-in-page",
+                            None,
+                            protocol::ContextCompactionTimelineStatus::Completed,
+                        )),
+                    ],
+                    has_more_before: false,
+                    oldest_seq: Some(1),
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("rows");
+            assert_eq!(rows.len(), 1, "one marker id is one row within a page too");
+            assert_eq!(
+                rows[0]
+                    .compaction_marker()
+                    .and_then(|event| event.with_untracked(|event| event.metrics.before_tokens)),
+                Some(384_168),
+                "and the richer of the two copies wins"
+            );
+        });
+    }
+
+    /// A paged copy can be richer than the live one that raced past it.
+    /// Dropping it — the previous behaviour — silently lost those metrics.
+    #[test]
+    fn richer_paged_marker_merges_into_the_row_already_on_screen() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            let mut sparse = marker(
+                "marker-merge",
+                None,
+                protocol::ContextCompactionTimelineStatus::Completed,
+            );
+            sparse.metrics = protocol::CompactionMetrics::default();
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(sparse),
+            );
+
+            let request = crate::state::PendingHistoryRequest {
+                request_id: protocol::HistoryPageRequestId("page-merge".to_owned()),
+                before_seq: None,
+            };
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: None,
+                        has_more_before: true,
+                        pending_request: Some(request.clone()),
+                    },
+                );
+            });
+            apply_session_history(
+                &state,
+                &host_id,
+                &stream,
+                SessionHistoryPayload {
+                    agent_id: agent_id.clone(),
+                    request_id: request.request_id.clone(),
+                    request_before_seq: request.before_seq,
+                    events: vec![ChatEvent::ContextCompaction(marker(
+                        "marker-merge",
+                        None,
+                        protocol::ContextCompactionTimelineStatus::Completed,
+                    ))],
+                    has_more_before: false,
+                    oldest_seq: Some(1),
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("rows");
+            assert_eq!(rows.len(), 1, "still one row");
+            assert_eq!(
+                rows[0]
+                    .compaction_marker()
+                    .and_then(|event| event.with_untracked(|event| event.metrics.duration_ms)),
+                Some(169_775),
+                "the paged copy's metrics were merged in, not dropped"
+            );
+        });
+    }
+
+    /// The typed team result must have an explicit arm — a wildcard would log
+    /// it as an unexpected frame, so member outcomes would never render and the
+    /// members' duplicate-submit gates would never release.
+    #[test]
+    fn typed_team_notify_fans_results_into_per_agent_operations() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "team-host".to_owned();
+            let member_a = AgentId("member-a".to_owned());
+            let member_b = AgentId("member-b".to_owned());
+
+            // Real local identity for both members. The reducer correlates
+            // against known agents and skips ones it has never heard of, so a
+            // fixture with no agents would exercise a path production must not
+            // take.
+            for (agent_id, session) in [(&member_a, "session-a"), (&member_b, "session-b")] {
+                let mut agent = fatal_test_agent(
+                    &host_id,
+                    agent_id,
+                    &StreamPath(format!("/agent/{}/inst", agent_id.0)),
+                );
+                agent.session_id = Some(protocol::SessionId(session.to_owned()));
+                state.agents.update(|agents| agents.push(agent));
+            }
+
+            // Both members are mid-request through the shared gate.
+            assert!(state.begin_compaction_request(&member_a));
+            assert!(state.begin_compaction_request(&member_b));
+
+            // The result carries its own session, and correlation uses that
+            // rather than anything cached locally.
+            let result = |agent_id: &AgentId, session: &str, status| {
+                protocol::TeamMemberContextCompactionResult {
+                    agent_id: agent_id.clone(),
+                    logical_session_id: protocol::SessionId(session.to_owned()),
+                    operation_id: protocol::CompactionOperationId(format!("op-{}", agent_id.0)),
+                    method: Some(protocol::CompactionMethod::NativeTextCommand),
+                    status,
+                    mutation: protocol::CompactionMutation::Completed,
+                    message: None,
+                }
+            };
+
+            apply_team_context_compaction_notify(
+                &state,
+                &host_id,
+                protocol::TeamContextCompactionNotifyPayload {
+                    team_operation_id: protocol::CompactionOperationId("team-op".to_owned()),
+                    team_id: protocol::TeamId("team-1".to_owned()),
+                    status: protocol::TeamContextCompactionStatus::Completed,
+                    members: vec![
+                        result(
+                            &member_a,
+                            "session-a",
+                            protocol::ContextCompactionStatus::Completed,
+                        ),
+                        result(
+                            &member_b,
+                            "session-b",
+                            protocol::ContextCompactionStatus::Failed {
+                                accepted: true,
+                                mutation: protocol::CompactionMutation::NotObserved,
+                            },
+                        ),
+                    ],
+                    message: None,
+                },
+            );
+
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&member_a)),
+                "a completed member releases its gate"
+            );
+            assert!(
+                state.context_compactions.with_untracked(|map| map
+                    .get(&member_b)
+                    .is_some_and(|op| !op.is_in_flight())),
+                "a failed member is terminal, so its control re-arms"
+            );
+            assert!(
+                state
+                    .compaction_errors
+                    .with_untracked(|map| map.contains_key(&member_b)),
+                "and its failure is explained on the member's card"
+            );
+            assert!(
+                state.team_context_compactions.with_untracked(|map| map
+                    .contains_key(&(host_id.clone(), protocol::TeamId("team-1".to_owned())))),
+                "the aggregate result is retained for the team surface"
+            );
+
+            // A member this client has never heard of cannot be correlated.
+            // Fabricating identity for it would create synthetic operation
+            // state for an agent that may not even be on this host.
+            let unknown = AgentId("member-unknown".to_owned());
+            apply_team_context_compaction_notify(
+                &state,
+                &host_id,
+                protocol::TeamContextCompactionNotifyPayload {
+                    team_operation_id: protocol::CompactionOperationId("team-op-2".to_owned()),
+                    team_id: protocol::TeamId("team-2".to_owned()),
+                    status: protocol::TeamContextCompactionStatus::Completed,
+                    members: vec![result(
+                        &unknown,
+                        "session-unknown",
+                        protocol::ContextCompactionStatus::Completed,
+                    )],
+                    message: None,
+                },
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&unknown)),
+                "an uncorrelatable member must not create synthetic operation state"
+            );
+        });
+    }
+
+    /// A member whose session changed during the team run.
+    ///
+    /// The result names the session it was produced for. Correlating on the
+    /// agent's *locally cached* session instead would stamp the member's new
+    /// session onto an old result and accept it as current — silently
+    /// misattributing the outcome of a session the agent has already left, and
+    /// releasing a gate that belongs to the new session's request.
+    #[test]
+    fn team_member_result_for_a_changed_session_is_skipped() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "team-session-host".to_owned();
+            let member = AgentId("rotated-member".to_owned());
+            let mut agent = fatal_test_agent(
+                &host_id,
+                &member,
+                &StreamPath("/agent/rotated-member/inst".to_owned()),
+            );
+            // The agent has already moved on to a new session.
+            agent.session_id = Some(protocol::SessionId("session-new".to_owned()));
+            state.agents.update(|agents| agents.push(agent));
+
+            // A request is outstanding for the *current* session.
+            assert!(state.begin_compaction_request(&member));
+
+            apply_team_context_compaction_notify(
+                &state,
+                &host_id,
+                protocol::TeamContextCompactionNotifyPayload {
+                    team_operation_id: protocol::CompactionOperationId("team-op-old".to_owned()),
+                    team_id: protocol::TeamId("team-rotated".to_owned()),
+                    status: protocol::TeamContextCompactionStatus::Completed,
+                    members: vec![protocol::TeamMemberContextCompactionResult {
+                        agent_id: member.clone(),
+                        // …but this result was produced for the old one.
+                        logical_session_id: protocol::SessionId("session-old".to_owned()),
+                        operation_id: protocol::CompactionOperationId("op-old".to_owned()),
+                        method: Some(protocol::CompactionMethod::NativeTextCommand),
+                        status: protocol::ContextCompactionStatus::Completed,
+                        mutation: protocol::CompactionMutation::Completed,
+                        message: None,
+                    }],
+                    message: None,
+                },
+            );
+
+            assert!(
+                state.context_compactions.with_untracked(|map| map
+                    .get(&member)
+                    .is_some_and(|operation| operation.is_in_flight())),
+                "a result for a session the agent has left must not release the \
+                 current session's request"
+            );
+        });
+    }
+
+    /// A team run announces once, in aggregate. Members reduce individually —
+    /// their banners and gates are per-agent — but they do not each announce,
+    /// or a five-member team would say six things.
+    #[test]
+    fn a_team_run_announces_once_in_aggregate() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "team-announce-host".to_owned();
+            let member = AgentId("team-member".to_owned());
+            let stream = StreamPath("/agent/team-member/inst".to_owned());
+            state.agents.update(|agents| {
+                agents.push(fatal_test_agent(&host_id, &member, &stream));
+            });
+
+            crate::components::center_zone::announce(String::new());
+            crate::components::center_zone::alert(String::new());
+
+            // A member's own terminal frame is silent because its trigger is
+            // `TeamRequested`.
+            let mut member_notify = notify(
+                "op-team-member",
+                &member,
+                protocol::ContextCompactionStatus::Failed {
+                    accepted: true,
+                    mutation: protocol::CompactionMutation::NotObserved,
+                },
+            );
+            member_notify.trigger = protocol::CompactionTrigger::TeamRequested;
+            member_notify.message = Some("member reason".to_owned());
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                member_notify,
+                ChatEventSource::Live,
+            );
+            assert!(
+                crate::components::center_zone::current_alert().is_empty()
+                    && crate::components::center_zone::current_announcement().is_empty(),
+                "a team member's own terminal frame must not announce"
+            );
+
+            // The aggregate is the single authority, and a failure is
+            // assertive — the banner is deliberately not a live region, so a
+            // polite queue could leave the user unaware their context changed.
+            apply_team_context_compaction_notify(
+                &state,
+                &host_id,
+                protocol::TeamContextCompactionNotifyPayload {
+                    team_operation_id: protocol::CompactionOperationId("team-op".to_owned()),
+                    team_id: protocol::TeamId("team-1".to_owned()),
+                    status: protocol::TeamContextCompactionStatus::Failed,
+                    members: Vec::new(),
+                    message: Some("1 team member compaction failed".to_owned()),
+                },
+            );
+            assert_eq!(
+                crate::components::center_zone::current_alert(),
+                "1 team member compaction failed",
+                "the aggregate failure is announced assertively, exactly once"
+            );
+            assert!(
+                crate::components::center_zone::current_announcement().is_empty(),
+                "and not also politely"
+            );
+        });
+    }
+
+    /// The stream grammar carries the agent but not the session, so
+    /// `logical_session_id` is the only typed field that can tell a frame for
+    /// the current session from one for a session the agent has left. Without
+    /// this, a delayed prior-session notify overwrites the live banner.
+    #[test]
+    fn notify_for_a_foreign_session_is_dropped() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            let mut agent = fatal_test_agent(&host_id, &agent_id, &stream);
+            agent.session_id = Some(protocol::SessionId("current".to_owned()));
+            state.agents.update(|agents| agents.push(agent));
+
+            // `notify()` stamps `session-1`, which is not the bound session.
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-stale-session",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Started {
+                        stage: protocol::CompactionStage::Compacting,
+                    },
+                ),
+                ChatEventSource::Live,
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "a notify naming another session must not drive this agent's banner"
+            );
+
+            // The same frame for the bound session is accepted.
+            let mut current = notify(
+                "op-current-session",
+                &agent_id,
+                protocol::ContextCompactionStatus::Started {
+                    stage: protocol::CompactionStage::Compacting,
+                },
+            );
+            current.logical_session_id = protocol::SessionId("current".to_owned());
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                current,
+                ChatEventSource::Live,
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "a notify for the bound session is accepted"
+            );
+        });
+    }
+
+    /// A failure can still carry token figures — `mutation: Completed` means
+    /// the context *was* compacted and only finalizing failed. The visible row
+    /// renders them and is hidden from assistive technology, so omitting them
+    /// from the accessible sentence made those numbers sighted-only.
+    #[test]
+    fn a_failed_marker_sentence_carries_its_token_metrics() {
+        let event = marker(
+            "marker-failed-metrics",
+            None,
+            protocol::ContextCompactionTimelineStatus::Failed,
+        );
+        let sentence = compaction_marker_announcement(&event);
+        assert!(
+            sentence.contains("384,168") && sentence.contains("12,518"),
+            "a failed marker must expose its known token figures: {sentence}"
+        );
+        assert!(
+            sentence.contains("unchanged") || sentence.contains("may have changed"),
+            "and still say what happened to the context: {sentence}"
+        );
+    }
+
+    /// One announcement per outcome. The ordered marker→terminal pair used to
+    /// announce a failure twice: once from the marker, once from the notify.
+    #[test]
+    fn a_structured_outcome_announces_exactly_once() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                notify(
+                    "op-once",
+                    &agent_id,
+                    protocol::ContextCompactionStatus::Started {
+                        stage: protocol::CompactionStage::Compacting,
+                    },
+                ),
+                ChatEventSource::Live,
+            );
+
+            crate::components::center_zone::announce(String::new());
+            crate::components::center_zone::alert(String::new());
+            // The marker arrives first and must stay silent, because it
+            // carries an operation id whose terminal notify will announce.
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-once",
+                    Some("op-once"),
+                    protocol::ContextCompactionTimelineStatus::Failed,
+                )),
+            );
+            assert!(
+                crate::components::center_zone::current_announcement().is_empty()
+                    && crate::components::center_zone::current_alert().is_empty(),
+                "a marker belonging to an operation must not announce on either channel"
+            );
+
+            let mut failed = notify(
+                "op-once",
+                &agent_id,
+                protocol::ContextCompactionStatus::Failed {
+                    accepted: true,
+                    mutation: protocol::CompactionMutation::MayHaveMutated,
+                },
+            );
+            failed.message = Some("summarizer timed out".to_owned());
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                failed,
+                ChatEventSource::Live,
+            );
+            assert!(
+                crate::components::center_zone::current_alert()
+                    .contains("summarizer timed out"),
+                "the terminal notify makes the single announcement, assertively"
+            );
+            assert!(
+                crate::components::center_zone::current_announcement().is_empty(),
+                "and does not also queue it politely"
+            );
+        });
+    }
+
+    /// An unrequested backend compaction emits no notify at all, so the marker
+    /// is the only thing that can announce it.
+    #[test]
+    fn an_observation_marker_announces_because_no_notify_will() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, _) = compaction_agent();
+            crate::components::center_zone::announce(String::new());
+            crate::components::center_zone::alert(String::new());
+
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-auto",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+
+            assert!(
+                crate::components::center_zone::current_announcement()
+                    .contains("Context compacted"),
+                "an observation announces from the marker"
+            );
+            assert!(
+                crate::components::center_zone::current_alert().is_empty(),
+                "politely — an unrequested backend compaction is not an alert"
+            );
+        });
+    }
+
+    /// Bootstrap replay must be silent, and a restored banner must not become
+    /// a live region until something genuinely live updates it.
+    #[test]
+    fn bootstrap_restores_the_banner_without_announcing() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            state.agents.update(|agents| {
+                agents.push(fatal_test_agent(&host_id, &agent_id, &stream));
+            });
+            crate::components::center_zone::announce(String::new());
+            crate::components::center_zone::alert(String::new());
+
+            apply_agent_bootstrap(
+                &state,
+                &host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker(
+                            "marker-silent",
+                            None,
+                            protocol::ContextCompactionTimelineStatus::Completed,
+                        ))),
+                        AgentBootstrapEvent::ContextCompaction(notify(
+                            "op-silent",
+                            &agent_id,
+                            protocol::ContextCompactionStatus::Progress {
+                                stage: protocol::CompactionStage::Compacting,
+                            },
+                        )),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert!(
+                crate::components::center_zone::current_announcement().is_empty()
+                    && crate::components::center_zone::current_alert().is_empty(),
+                "replaying history must not announce it on either channel"
+            );
+            assert!(
+                state.context_compactions.with_untracked(|map| map
+                    .get(&agent_id)
+                    .is_some_and(|op| op.is_in_flight() && !op.announces())),
+                "the restored banner is visible but not yet a live region"
+            );
+        });
+    }
+
+    /// A failure keeps a durable row *and* a readable reason on the agent
+    /// card. Nothing about it starts a fallback.
+    #[test]
+    fn failed_notify_records_a_reason_and_never_starts_a_fallback() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            let mut payload = notify(
+                "op-fail",
+                &agent_id,
+                protocol::ContextCompactionStatus::Failed {
+                    accepted: true,
+                    mutation: protocol::CompactionMutation::MayHaveMutated,
+                },
+            );
+            payload.message = Some("summarizer timed out".to_owned());
+            apply_context_compaction_notify(
+                &state,
+                &host_id,
+                &stream,
+                payload,
+                ChatEventSource::Live,
+            );
+
+            assert_eq!(
+                state
+                    .compaction_errors
+                    .with_untracked(|map| map.get(&agent_id).cloned()),
+                Some("summarizer timed out".to_owned()),
+                "the provider's reason is surfaced verbatim, never parsed"
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| !op.is_in_flight())),
+                "a failed operation is terminal, so the control re-arms"
+            );
+        });
+    }
+
+    /// The two reducers — live/bootstrap and paged history — are separate code
+    /// paths. A marker handled in only one of them vanishes on page-back or on
+    /// reconnect, so they must agree.
+    #[test]
+    fn history_replay_and_live_reducer_agree_on_marker_rows() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, _) = compaction_agent();
+            let events = vec![
+                ChatEvent::MessageAdded(protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 0,
+                    sender: protocol::MessageSender::User,
+                    content: "before".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }),
+                ChatEvent::ContextCompaction(marker(
+                    "marker-order",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+                ChatEvent::MessageAdded(protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 0,
+                    sender: protocol::MessageSender::User,
+                    content: "after".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }),
+            ];
+
+            for event in events.clone() {
+                apply_chat_event(&state, &host_id, &agent_id, event);
+            }
+            let live_kinds = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("live rows")
+                .iter()
+                .map(|row| row.compaction_marker().is_some())
+                .collect::<Vec<_>>();
+
+            let mut replay = HistoryReplay::default();
+            for event in events {
+                replay.apply(event, &host_id, &agent_id);
+            }
+            let paged_kinds = replay
+                .rows
+                .iter()
+                .map(|row| row.compaction_marker().is_some())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                live_kinds, paged_kinds,
+                "both reducers must place the marker at the same position among messages"
+            );
+            assert_eq!(
+                live_kinds,
+                vec![false, true, false],
+                "and the marker sits between the messages it separates"
+            );
+        });
+    }
+
+    /// A page from a previous connection, arriving after a reconnect wiped the
+    /// transcript, must not prepend rows it no longer owns.
+    #[test]
+    fn stale_history_page_is_rejected_by_request_correlation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: Some(9),
+                        has_more_before: true,
+                        pending_request: Some(crate::state::PendingHistoryRequest {
+                            request_id: protocol::HistoryPageRequestId("page-2".to_owned()),
+                            before_seq: Some(9),
+                        }),
+                    },
+                );
+            });
+
+            let stale = SessionHistoryPayload {
+                agent_id: agent_id.clone(),
+                request_id: protocol::HistoryPageRequestId("page-1".to_owned()),
+                request_before_seq: Some(20),
+                events: vec![ChatEvent::ContextCompaction(marker(
+                    "marker-stale",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                ))],
+                has_more_before: true,
+                oldest_seq: Some(1),
+            };
+            apply_session_history(&state, &host_id, &stream, stale);
+
+            assert!(
+                state
+                    .chat_rows
+                    .with_untracked(|map| map.get(&agent_id).is_none_or(|rows| rows.is_empty())),
+                "a page this client is not waiting for must not prepend anything"
+            );
+            assert!(
+                state.session_history.with_untracked(|map| map
+                    .get(&agent_id)
+                    .and_then(|h| h.pending_request.clone())
+                    .is_some()),
+                "and must not clear the request that is genuinely outstanding"
+            );
+        });
+    }
+
+    /// An overlapping page must not duplicate a marker already on screen.
+    #[test]
+    fn paged_marker_already_on_screen_is_not_duplicated() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-overlap",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+
+            let request = crate::state::PendingHistoryRequest {
+                request_id: protocol::HistoryPageRequestId("page-overlap".to_owned()),
+                before_seq: None,
+            };
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: None,
+                        has_more_before: true,
+                        pending_request: Some(request.clone()),
+                    },
+                );
+            });
+
+            apply_session_history(
+                &state,
+                &host_id,
+                &stream,
+                SessionHistoryPayload {
+                    agent_id: agent_id.clone(),
+                    request_id: request.request_id.clone(),
+                    request_before_seq: request.before_seq,
+                    events: vec![ChatEvent::ContextCompaction(marker(
+                        "marker-overlap",
+                        None,
+                        protocol::ContextCompactionTimelineStatus::Completed,
+                    ))],
+                    has_more_before: false,
+                    oldest_seq: Some(1),
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "an overlapping page must not add a second row for the same marker"
+            );
+        });
+    }
+
+    /// Reconnect: bootstrap drops the transcript and the marker index, then
+    /// rebuilds both, and separately restores a still-running operation. The
+    /// case this used to lose entirely is a reconnect during Claude's
+    /// 108–189 s compaction window.
+    #[test]
+    fn bootstrap_rebuilds_markers_once_and_restores_a_running_operation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let (agent_id, host_id, stream) = compaction_agent();
+            state.agents.update(|agents| {
+                agents.push(fatal_test_agent(&host_id, &agent_id, &stream));
+            });
+
+            // Pre-existing rows and index from before the reconnect.
+            apply_chat_event(
+                &state,
+                &host_id,
+                &agent_id,
+                ChatEvent::ContextCompaction(marker(
+                    "marker-boot",
+                    None,
+                    protocol::ContextCompactionTimelineStatus::Completed,
+                )),
+            );
+
+            apply_agent_bootstrap(
+                &state,
+                &host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker(
+                            "marker-boot",
+                            None,
+                            protocol::ContextCompactionTimelineStatus::Completed,
+                        ))),
+                        AgentBootstrapEvent::ContextCompaction(notify(
+                            "op-boot",
+                            &agent_id,
+                            protocol::ContextCompactionStatus::Progress {
+                                stage: protocol::CompactionStage::Compacting,
+                            },
+                        )),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "bootstrap replaces the transcript, so the marker rebuilds exactly once"
+            );
+            assert!(
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&agent_id).is_some_and(|op| op.is_in_flight())),
+                "an operation still running across the reconnect is restored"
+            );
         });
     }
 }
@@ -10567,8 +12769,9 @@ mod wasm_tests {
             let agent_ref: Signal<Option<ActiveAgentRef>> = RwSignal::new(None).into();
             view! {
                 <div>
-                    {rows.clone().into_iter().map(|row| {
-                        view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+                    {rows.clone().into_iter().filter_map(|row| {
+                        let entry = row.message_entry()?.clone();
+                        Some(view! { <ChatMessageView agent_ref=agent_ref entry=entry /> })
                     }).collect_view()}
                 </div>
             }
@@ -10709,12 +12912,31 @@ mod wasm_tests {
             ),
         };
 
+        // A page applies only against the request this client is waiting for.
+        let history_request_id = protocol::HistoryPageRequestId("wasm-page".to_owned());
+        state.session_history.update(|map| {
+            map.insert(
+                agent_id.clone(),
+                SessionHistoryState {
+                    message_count: 2,
+                    oldest_seq: None,
+                    has_more_before: true,
+                    pending_request: Some(crate::state::PendingHistoryRequest {
+                        request_id: history_request_id.clone(),
+                        before_seq: None,
+                    }),
+                },
+            );
+        });
+
         apply_session_history(
             &state,
             host_id,
             &stream,
             SessionHistoryPayload {
                 agent_id: agent_id.clone(),
+                request_id: history_request_id.clone(),
+                request_before_seq: None,
                 events: vec![
                     ChatEvent::StreamEnd(protocol::StreamEndData { message: assistant }),
                     ChatEvent::MessageAdded(error),
@@ -10733,14 +12955,16 @@ mod wasm_tests {
         assert_eq!(rows.len(), 2, "assistant row and normalization error row");
         assert_eq!(
             rows[0]
-                .entry
+                .message_entry()
+                .expect("message row")
                 .with_untracked(|entry| entry.tool_requests.len()),
             1,
             "the replayed request belongs to its declaring assistant row"
         );
         assert!(
             rows[1]
-                .entry
+                .message_entry()
+                .expect("message row")
                 .with_untracked(|entry| entry.tool_requests.is_empty()),
             "the replayed error row must not steal the request"
         );
@@ -10751,8 +12975,9 @@ mod wasm_tests {
             let agent_ref: Signal<Option<ActiveAgentRef>> = RwSignal::new(None).into();
             view! {
                 <div>
-                    {rows.clone().into_iter().map(|row| {
-                        view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+                    {rows.clone().into_iter().filter_map(|row| {
+                        let entry = row.message_entry()?.clone();
+                        Some(view! { <ChatMessageView agent_ref=agent_ref entry=entry /> })
                     }).collect_view()}
                 </div>
             }
@@ -11562,17 +13787,20 @@ mod wasm_tests {
             .with_untracked(|map| map.get(&agent_id).cloned())
             .expect("authoritative completion row");
         assert_eq!(rows.len(), 1);
-        rows[0].entry.with_untracked(|entry| {
-            assert_eq!(entry.message.content, "server completion");
-            assert_eq!(
-                entry.message.message_id,
-                Some(protocol::ChatMessageId("end-id".to_owned()))
-            );
-            assert!(matches!(
-                entry.message.sender,
-                protocol::MessageSender::Assistant { .. }
-            ));
-        });
+        rows[0]
+            .message_entry()
+            .expect("message row")
+            .with_untracked(|entry| {
+                assert_eq!(entry.message.content, "server completion");
+                assert_eq!(
+                    entry.message.message_id,
+                    Some(protocol::ChatMessageId("end-id".to_owned()))
+                );
+                assert!(matches!(
+                    entry.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                ));
+            });
         assert!(
             state
                 .streaming_text
@@ -11623,13 +13851,16 @@ mod wasm_tests {
             .with_untracked(|rows| rows.get(&agent_id).cloned())
             .expect("empty completion row");
         assert_eq!(live_empty.len(), 1);
-        live_empty[0].entry.with_untracked(|entry| {
-            assert_eq!(
-                entry.message.message_id,
-                Some(protocol::ChatMessageId("empty-item".to_owned()))
-            );
-            assert!(entry.message.content.is_empty());
-        });
+        live_empty[0]
+            .message_entry()
+            .expect("message row")
+            .with_untracked(|entry| {
+                assert_eq!(
+                    entry.message.message_id,
+                    Some(protocol::ChatMessageId("empty-item".to_owned()))
+                );
+                assert!(entry.message.content.is_empty());
+            });
 
         let mut replay = HistoryReplay::default();
         replay.apply(
@@ -11640,9 +13871,12 @@ mod wasm_tests {
             &agent_id,
         );
         assert_eq!(replay.rows.len(), 1);
-        replay.rows[0].entry.with_untracked(|entry| {
-            assert!(entry.message.content.is_empty());
-        });
+        replay.rows[0]
+            .message_entry()
+            .expect("message row")
+            .with_untracked(|entry| {
+                assert!(entry.message.content.is_empty());
+            });
 
         let mut authoritative = assistant_message("authoritative", "");
         authoritative.reasoning = Some(protocol::ReasoningData {
@@ -11673,18 +13907,21 @@ mod wasm_tests {
             .chat_rows
             .with_untracked(|rows| rows.get(&agent_id).and_then(|rows| rows.last()).cloned())
             .expect("authoritative completion row");
-        authoritative_row.entry.with_untracked(|entry| {
-            assert_eq!(
-                entry
-                    .message
-                    .reasoning
-                    .as_ref()
-                    .map(|value| value.text.as_str()),
-                Some("reasoning only")
-            );
-            assert_eq!(entry.message.tool_calls.len(), 1);
-            assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
-        });
+        authoritative_row
+            .message_entry()
+            .expect("message row")
+            .with_untracked(|entry| {
+                assert_eq!(
+                    entry
+                        .message
+                        .reasoning
+                        .as_ref()
+                        .map(|value| value.text.as_str()),
+                    Some("reasoning only")
+                );
+                assert_eq!(entry.message.tool_calls.len(), 1);
+                assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
+            });
 
         let mut authoritative_replay = HistoryReplay::default();
         authoritative_replay.apply(
@@ -11694,18 +13931,21 @@ mod wasm_tests {
             "host",
             &agent_id,
         );
-        authoritative_replay.rows[0].entry.with_untracked(|entry| {
-            assert_eq!(
-                entry
-                    .message
-                    .reasoning
-                    .as_ref()
-                    .map(|value| value.text.as_str()),
-                Some("reasoning only")
-            );
-            assert_eq!(entry.message.tool_calls.len(), 1);
-            assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
-        });
+        authoritative_replay.rows[0]
+            .message_entry()
+            .expect("message row")
+            .with_untracked(|entry| {
+                assert_eq!(
+                    entry
+                        .message
+                        .reasoning
+                        .as_ref()
+                        .map(|value| value.text.as_str()),
+                    Some("reasoning only")
+                );
+                assert_eq!(entry.message.tool_calls.len(), 1);
+                assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
+            });
 
         let original = assistant_message("message-added", "original");
         let repeated = assistant_message("message-added", "server second row");
@@ -11728,10 +13968,14 @@ mod wasm_tests {
         assert_eq!(
             live_rows
                 .iter()
-                .filter(|row| row.entry.with_untracked(|entry| {
-                    entry.message.message_id
-                        == Some(protocol::ChatMessageId("message-added".to_owned()))
-                }))
+                .filter(|row| {
+                    row.message_entry().is_some_and(|e| {
+                        e.with_untracked(|entry| {
+                            entry.message.message_id
+                                == Some(protocol::ChatMessageId("message-added".to_owned()))
+                        })
+                    })
+                })
                 .count(),
             2,
             "server rows render in order even when they carry the same metadata key"
@@ -11739,11 +13983,16 @@ mod wasm_tests {
         assert_eq!(
             live_rows
                 .iter()
-                .filter_map(|row| row.entry.with_untracked(|entry| {
-                    (entry.message.message_id
-                        == Some(protocol::ChatMessageId("message-added".to_owned())))
-                    .then(|| entry.message.content.clone())
-                }))
+                .filter_map(
+                    |row| row
+                        .message_entry()
+                        .expect("message row")
+                        .with_untracked(|entry| {
+                            (entry.message.message_id
+                                == Some(protocol::ChatMessageId("message-added".to_owned())))
+                            .then(|| entry.message.content.clone())
+                        })
+                )
                 .collect::<Vec<_>>(),
             vec!["original".to_owned(), "server second row".to_owned()]
         );
@@ -11756,20 +14005,23 @@ mod wasm_tests {
             replay
                 .rows
                 .iter()
-                .filter(|row| row.entry.with_untracked(|entry| {
-                    entry.message.message_id
-                        == Some(protocol::ChatMessageId("message-added".to_owned()))
-                }))
+                .filter(|row| {
+                    row.message_entry().is_some_and(|e| {
+                        e.with_untracked(|entry| {
+                            entry.message.message_id
+                                == Some(protocol::ChatMessageId("message-added".to_owned()))
+                        })
+                    })
+                })
                 .count(),
             2
         );
-        assert!(
-            !replay
-                .rows
-                .iter()
-                .any(|row| row.entry.with_untracked(|entry| {
+        assert!(!replay.rows.iter().any(|row| {
+            row.message_entry()
+                .expect("message row")
+                .with_untracked(|entry| {
                     matches!(entry.message.sender, protocol::MessageSender::Error)
-                }))
-        );
+                })
+        }));
     }
 }

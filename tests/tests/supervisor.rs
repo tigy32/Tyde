@@ -301,6 +301,9 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
             &affected.instance_stream,
             FetchSessionHistoryPayload {
                 agent_id: affected.agent_id.clone(),
+                request_id: protocol::HistoryPageRequestId(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
                 before_seq: None,
                 limit: 100,
             },
@@ -371,6 +374,9 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
             &affected.instance_stream,
             FetchSessionHistoryPayload {
                 agent_id: affected.agent_id.clone(),
+                request_id: protocol::HistoryPageRequestId(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
                 before_seq: None,
                 limit: 100,
             },

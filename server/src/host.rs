@@ -26,6 +26,8 @@ use protocol::{
     BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot,
     BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapListing,
     BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
+    CompactionAvailabilityReason, CompactionMethod, CompactionMutation,
+    ContextCompactionNotifyPayload, ContextCompactionStatus,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
@@ -44,7 +46,8 @@ use protocol::{
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
     ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
     ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
+    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload,
     ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
     SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload, SessionId,
     SessionListCursor, SessionListGeneration, SessionListPageInfo, SessionListPageStatus,
@@ -56,10 +59,12 @@ use protocol::{
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
     TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
     TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TeamCreatePayload,
+    TeamContextCompactionNotifyPayload, TeamContextCompactionStatus,
     TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
     TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
     TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
+    TeamMemberContextCompactionResult,
     TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
@@ -433,6 +438,95 @@ const _: () =
 /// itself keeps running server-side either way).
 const SUPERVISION_COMPACTION_OBSERVE_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionRoutingPolicy {
+    pub inline_fallback_enabled: bool,
+}
+
+impl Default for CompactionRoutingPolicy {
+    fn default() -> Self {
+        Self {
+            inline_fallback_enabled: true,
+        }
+    }
+}
+
+impl From<crate::backend::BackendCompactionMutationState> for CompactionMutation {
+    fn from(value: crate::backend::BackendCompactionMutationState) -> Self {
+        match value {
+            crate::backend::BackendCompactionMutationState::NotObserved => Self::NotObserved,
+            crate::backend::BackendCompactionMutationState::Completed => Self::Completed,
+            crate::backend::BackendCompactionMutationState::MayHaveMutated => Self::MayHaveMutated,
+        }
+    }
+}
+
+impl From<crate::backend::BackendCompactionMechanism> for CompactionMethod {
+    fn from(value: crate::backend::BackendCompactionMechanism) -> Self {
+        match value {
+            crate::backend::BackendCompactionMechanism::InterceptedTextCommand => {
+                Self::NativeTextCommand
+            }
+            crate::backend::BackendCompactionMechanism::JsonRpcRequest => Self::NativeRpc,
+        }
+    }
+}
+
+pub(crate) fn requested_compaction_availability(
+    capability: &crate::backend::BackendCompactionCapability,
+    policy: &CompactionRoutingPolicy,
+    transcript_authoritative: bool,
+) -> RequestedCompactionAvailability {
+    use crate::backend::BackendCompactionAvailability as Availability;
+
+    match &capability.availability {
+        Availability::Native { .. } => RequestedCompactionAvailability::Available {
+            route: RequestedCompactionRoute::NativePreferred,
+        },
+        Availability::AutomaticOnly { .. }
+        | Availability::Unavailable { .. }
+            if !transcript_authoritative =>
+        {
+            RequestedCompactionAvailability::Unavailable {
+                reason: CompactionAvailabilityReason::InlineFallbackDisabled,
+            }
+        }
+        Availability::AutomaticOnly { .. } if policy.inline_fallback_enabled => {
+            RequestedCompactionAvailability::Available {
+                route: RequestedCompactionRoute::InlineFallbackOnly,
+            }
+        }
+        Availability::AutomaticOnly { .. } => RequestedCompactionAvailability::AutomaticOnly {
+            reason: CompactionAvailabilityReason::BackendAutomaticOnly,
+        },
+        Availability::Unavailable { .. } if policy.inline_fallback_enabled => {
+            RequestedCompactionAvailability::Available {
+                route: RequestedCompactionRoute::InlineFallbackOnly,
+            }
+        }
+        Availability::Unavailable { .. } => RequestedCompactionAvailability::Unavailable {
+            reason: CompactionAvailabilityReason::NativeTriggerUnavailable,
+        },
+        Availability::Unknown { .. } => RequestedCompactionAvailability::Determining {
+            reason: CompactionAvailabilityReason::CapabilityStillDetermining,
+        },
+    }
+}
+
+fn compaction_barrier_timeout(enabled_stall_timeout: Option<Duration>) -> Duration {
+    Duration::from_secs(600).max(
+        enabled_stall_timeout
+            .unwrap_or_default()
+            .saturating_add(Duration::from_secs(30)),
+    )
+}
+
+fn enabled_supervisor_stall_timeout(settings: protocol::SupervisorSettings) -> Option<Duration> {
+    settings
+        .stall_timeout_enabled
+        .then(|| Duration::from_secs(u64::from(settings.stall_timeout_seconds)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivitySummarySettingsSignal {
     enabled: bool,
@@ -526,6 +620,10 @@ enum SupervisorPhase {
     },
     Dormant {
         idle_since: Instant,
+    },
+    PostCompactionDormant {
+        idle_since: Instant,
+        user_message_count: u32,
     },
     /// A restored session settled into idle while `supervise_restored_agents`
     /// was off. Distinct from `Dormant` so enabling that setting can arm the
@@ -948,6 +1046,7 @@ pub(crate) struct HostState {
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
+    backend_setup: BackendSetupPayload,
     antigravity_conversations_dir: PathBuf,
     codex_probe_program: Option<String>,
     kiro_probe_program: Option<String>,
@@ -990,6 +1089,17 @@ impl Drop for HostState {
         }
         self.mobile_access.shutdown();
     }
+}
+
+fn installed_backend_version(
+    backend_setup: &BackendSetupPayload,
+    backend_kind: BackendKind,
+) -> Option<String> {
+    backend_setup
+        .backends
+        .iter()
+        .find(|setup| setup.backend_kind == backend_kind)
+        .and_then(|setup| setup.installed_version.clone())
 }
 
 pub struct HostHandle {
@@ -2754,6 +2864,7 @@ impl HostHandle {
     ) -> Vec<DeferredAgentAttachment> {
         let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
+        state.backend_setup = backend_setup.clone();
         let host_path = host_stream.path().clone();
 
         let previous = state.host_streams.insert(
@@ -3439,6 +3550,30 @@ impl HostHandle {
         payload: AgentCompactPayload,
         stream: Stream,
     ) -> AppResult<()> {
+        let agent_handle = {
+            let state = self.state.lock().await;
+            state.registry.agent_handle(&agent_id)
+        };
+        if let Some(agent_handle) = agent_handle {
+            let capability = agent_handle.compaction_capability().await;
+            if capability.as_ref().is_some_and(|capability| {
+                capability.coordinator
+                    == crate::backend::BackendCompactionCoordinator::ContextOperation
+            }) {
+                let stall_timeout = enabled_supervisor_stall_timeout(
+                    self.supervisor_settings_signal().await.settings,
+                );
+                agent_handle
+                    .request_context_compaction(
+                        protocol::CompactionTrigger::UserRequested,
+                        payload.summary_prompt,
+                        compaction_barrier_timeout(stall_timeout),
+                    )
+                    .await
+                    .map_err(|message| AppError::conflict("agent_compact", message))?;
+                return Ok(());
+            }
+        }
         let Some(compaction) = self
             .begin_agent_compaction(agent_id, payload, stream, None)
             .await?
@@ -3461,6 +3596,32 @@ impl HostHandle {
         stream: Stream,
     ) -> AppResult<bool> {
         let supervisor_settings_rx = self.supervisor_settings_receiver().await;
+        let agent_handle = {
+            let state = self.state.lock().await;
+            state.registry.agent_handle(&agent_id)
+        };
+        if let Some(agent_handle) = agent_handle {
+            let capability = agent_handle.compaction_capability().await;
+            if capability.as_ref().is_some_and(|capability| {
+                capability.coordinator
+                    == crate::backend::BackendCompactionCoordinator::ContextOperation
+            }) {
+                if !agent_handle.attach(stream).await {
+                    return Ok(false);
+                }
+                let stall_timeout =
+                    enabled_supervisor_stall_timeout(supervisor_settings_rx.borrow().settings);
+                return Ok(agent_handle
+                    .request_context_compaction_if_inactive(
+                        expected_activity_counter,
+                        expected_supervisor_settings_epoch,
+                        supervisor_settings_rx,
+                        compaction_barrier_timeout(stall_timeout),
+                    )
+                    .await
+                    .is_ok());
+            }
+        }
         let Some(compaction) = self
             .begin_agent_compaction(
                 agent_id,
@@ -3489,6 +3650,36 @@ impl HostHandle {
         stream: Stream,
     ) -> AppResult<()> {
         let targets = self.team_compact_targets(&payload.team_id).await?;
+        let mut context_handles = Vec::with_capacity(targets.len());
+        let mut legacy_count = 0;
+        for target in &targets {
+            let handle = self.agent_handle(&target.agent_id).await.ok_or_else(|| {
+                AppError::conflict(
+                    "team_compact",
+                    format!("team agent {} is not running", target.agent_id),
+                )
+            })?;
+            match handle.compaction_capability().await {
+                Some(capability)
+                    if capability.coordinator
+                        == crate::backend::BackendCompactionCoordinator::ContextOperation =>
+                {
+                    context_handles.push((target.clone(), handle));
+                }
+                _ => legacy_count += 1,
+            }
+        }
+        if !context_handles.is_empty() {
+            if legacy_count != 0 {
+                return Err(AppError::conflict(
+                    "team_compact",
+                    "team compaction cannot mix legacy and context-operation adapters",
+                ));
+            }
+            return self
+                .compact_team_context(payload, context_handles, stream)
+                .await;
+        }
         let member_ids = targets
             .iter()
             .map(|target| target.member_id.clone())
@@ -3554,6 +3745,172 @@ impl HostHandle {
         Ok(())
     }
 
+    async fn compact_team_context(
+        &self,
+        payload: TeamCompactPayload,
+        targets: Vec<(TeamCompactTarget, AgentHandle)>,
+        stream: Stream,
+    ) -> AppResult<()> {
+        let team_operation_id =
+            protocol::CompactionOperationId(Uuid::new_v4().to_string());
+        let stall_timeout = enabled_supervisor_stall_timeout(
+            self.supervisor_settings_signal().await.settings,
+        );
+        let mut targets_with_sessions = Vec::with_capacity(targets.len());
+        for (target, handle) in targets {
+            let logical_session_id = handle.snapshot().session_id.ok_or_else(|| {
+                AppError::conflict(
+                    "team_compact",
+                    format!(
+                        "team agent {} has no current logical session",
+                        target.agent_id
+                    ),
+                )
+            })?;
+            targets_with_sessions.push((target, handle, logical_session_id));
+        }
+        send_team_context_compaction_notify(
+            &stream,
+            TeamContextCompactionNotifyPayload {
+                team_operation_id: team_operation_id.clone(),
+                team_id: payload.team_id.clone(),
+                status: TeamContextCompactionStatus::Started,
+                members: Vec::new(),
+                message: None,
+            },
+        );
+        let mut receivers = Vec::with_capacity(targets_with_sessions.len());
+        for (target, handle, logical_session_id) in targets_with_sessions {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let agent_stream = Stream::new(
+                StreamPath(format!(
+                    "/agent/{}/team-context-compact",
+                    target.agent_id
+                )),
+                tx,
+            );
+            if !handle.attach(agent_stream).await {
+                receivers.push((target, handle, logical_session_id, None, rx));
+                continue;
+            }
+            let operation_id = handle
+                .request_context_compaction(
+                    protocol::CompactionTrigger::TeamRequested,
+                    payload.summary_prompt.clone(),
+                    compaction_barrier_timeout(stall_timeout),
+                )
+                .await
+                .ok();
+            receivers.push((target, handle, logical_session_id, operation_id, rx));
+        }
+        let team_id = payload.team_id;
+        tokio::spawn(async move {
+            let mut members = Vec::with_capacity(receivers.len());
+            for (target, handle, initial_session_id, operation_id, mut rx) in receivers {
+                let Some(operation_id) = operation_id else {
+                    let logical_session_id =
+                        handle.snapshot().session_id.unwrap_or(initial_session_id);
+                    members.push(TeamMemberContextCompactionResult {
+                        agent_id: target.agent_id,
+                        logical_session_id,
+                        operation_id: protocol::CompactionOperationId(
+                            "not-admitted".to_owned(),
+                        ),
+                        method: None,
+                        status: ContextCompactionStatus::Failed {
+                            accepted: false,
+                            mutation: CompactionMutation::NotObserved,
+                        },
+                        mutation: CompactionMutation::NotObserved,
+                        message: Some(
+                            "team member compaction was not admitted".to_owned(),
+                        ),
+                    });
+                    continue;
+                };
+                let terminal = tokio::time::timeout(
+                    SUPERVISION_COMPACTION_OBSERVE_TIMEOUT,
+                    async {
+                        while let Some(envelope) = rx.recv().await {
+                            if envelope.kind
+                                != FrameKind::ContextCompactionNotify
+                            {
+                                continue;
+                            }
+                            let Ok(notify) = envelope
+                                .parse_payload::<ContextCompactionNotifyPayload>()
+                            else {
+                                continue;
+                            };
+                            if notify.operation_id == operation_id
+                                && notify.status.is_terminal()
+                            {
+                                return Some(notify);
+                            }
+                        }
+                        None
+                    },
+                )
+                .await
+                .ok()
+                .flatten();
+                match terminal {
+                    Some(notify) => members.push(
+                        team_member_context_compaction_result_from_terminal(
+                            target.agent_id,
+                            operation_id,
+                            notify,
+                        ),
+                    ),
+                    None => {
+                        let logical_session_id = handle
+                            .snapshot()
+                            .session_id
+                            .unwrap_or(initial_session_id);
+                        members.push(TeamMemberContextCompactionResult {
+                            agent_id: target.agent_id,
+                            logical_session_id,
+                            operation_id,
+                            method: None,
+                            status: ContextCompactionStatus::Failed {
+                                accepted: true,
+                                mutation: CompactionMutation::MayHaveMutated,
+                            },
+                            mutation: CompactionMutation::MayHaveMutated,
+                            message: Some(
+                                "team member compaction terminal was not observed"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            let failed = members.iter().filter(|member| {
+                !matches!(
+                    member.status,
+                    ContextCompactionStatus::Completed
+                )
+            }).count();
+            send_team_context_compaction_notify(
+                &stream,
+                TeamContextCompactionNotifyPayload {
+                    team_operation_id,
+                    team_id,
+                    status: if failed == 0 {
+                        TeamContextCompactionStatus::Completed
+                    } else {
+                        TeamContextCompactionStatus::Failed
+                    },
+                    members,
+                    message: (failed != 0).then(|| {
+                        format!("{failed} team member compactions failed")
+                    }),
+                },
+            );
+        });
+        Ok(())
+    }
+
     async fn team_compact_targets(&self, team_id: &TeamId) -> AppResult<Vec<TeamCompactTarget>> {
         const OPERATION: &str = "team_compact";
         let registry = { self.state.lock().await.team_registry.clone() };
@@ -3587,15 +3944,6 @@ impl HostHandle {
                     anyhow!("team member {} has no binding", member.id),
                 ));
             };
-            if binding.status != AgentControlStatus::Idle {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!(
-                        "team member {} is not idle ({:?})",
-                        member.id, binding.status
-                    ),
-                ));
-            }
             let Some(agent_id) = binding.current_agent_id.clone() else {
                 continue;
             };
@@ -3614,12 +3962,6 @@ impl HostHandle {
                     format!("team member {} agent {agent_id} is terminated", member.id),
                 ));
             }
-            if status.is_active() || status.is_plan_approval_pending() {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!("team member {} agent {agent_id} is not idle", member.id),
-                ));
-            }
             targets.push(TeamCompactTarget {
                 member_id: member.id,
                 agent_id,
@@ -3629,7 +3971,7 @@ impl HostHandle {
         if targets.is_empty() {
             return Err(AppError::conflict(
                 OPERATION,
-                format!("team {team_id} has no live idle agents to compact"),
+                format!("team {team_id} has no live agents to compact"),
             ));
         }
         Ok(targets)
@@ -5187,6 +5529,8 @@ impl HostHandle {
             let session_summary_count_tx = state.session_summary_count_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
+            let provider_version =
+                installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
@@ -5197,6 +5541,7 @@ impl HostHandle {
                     capacity_tx,
                     session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
+                    provider_version,
                     antigravity_conversations_dir,
                 },
             );
@@ -5584,6 +5929,8 @@ impl HostHandle {
             let session_summary_count_tx = state.session_summary_count_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
+            let provider_version =
+                installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
@@ -5594,6 +5941,7 @@ impl HostHandle {
                     capacity_tx,
                     session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
+                    provider_version,
                     antigravity_conversations_dir,
                 },
             );
@@ -8652,8 +9000,10 @@ impl HostHandle {
                 })?
         };
 
+        let requested_before_seq = payload.before_seq;
+        let request_id = payload.request_id;
         let Some(window) = agent_handle
-            .fetch_session_history(payload.before_seq, payload.limit as usize)
+            .fetch_session_history(requested_before_seq, payload.limit as usize)
             .await
         else {
             return Err(AppError::not_found(
@@ -8664,6 +9014,8 @@ impl HostHandle {
 
         let response = SessionHistoryPayload {
             agent_id: payload.agent_id,
+            request_id,
+            request_before_seq: requested_before_seq,
             events: window.events,
             has_more_before: window.has_more_before,
             oldest_seq: window.oldest_seq,
@@ -13182,6 +13534,7 @@ fn spawn_host_inner(
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             backend_capacity: initial_backend_capacity_snapshots(),
+            backend_setup: setup::stub_backend_setup(),
             antigravity_conversations_dir,
             codex_probe_program: runtime_config.codex_probe_program.clone(),
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
@@ -13701,7 +14054,27 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                                 entry.last_activity_counter == activity_counter
                                     && matches!(&entry.phase, SupervisorPhase::Compacting)
                             }) {
-                                entries.remove(&agent_id);
+                                let user_message_count =
+                                    if let Some(observation) =
+                                        host.activity_summary_observation(&agent_id).await
+                                    {
+                                        observation
+                                            .handle
+                                            .read_supervision_context()
+                                            .await
+                                            .map_or(0, |context| {
+                                                context.user_message_count
+                                            })
+                                    } else {
+                                        0
+                                    };
+                                finish_supervisor_compaction(
+                                    &mut entries,
+                                    &agent_id,
+                                    activity_counter,
+                                    user_message_count,
+                                    Instant::now(),
+                                );
                             }
                         }
                     }
@@ -13778,10 +14151,33 @@ fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
         | SupervisorPhase::DoneAuthorized { idle_since, .. }
         | SupervisorPhase::AwaitingUser { idle_since, .. }
         | SupervisorPhase::Dormant { idle_since }
+        | SupervisorPhase::PostCompactionDormant { idle_since, .. }
         | SupervisorPhase::RestoreDeferred { idle_since }
         | SupervisorPhase::CompactionPending { idle_since, .. } => Some(*idle_since),
         SupervisorPhase::Active { .. } | SupervisorPhase::Compacting => None,
     }
+}
+
+fn finish_supervisor_compaction(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: &AgentId,
+    activity_counter: u64,
+    user_message_count: u32,
+    idle_since: Instant,
+) -> bool {
+    let Some(entry) = entries.get_mut(agent_id) else {
+        return false;
+    };
+    if entry.last_activity_counter != activity_counter
+        || !matches!(&entry.phase, SupervisorPhase::Compacting)
+    {
+        return false;
+    }
+    entry.phase = SupervisorPhase::PostCompactionDormant {
+        idle_since,
+        user_message_count,
+    };
+    true
 }
 
 /// Phase for an agent that just settled into idle. A session restored from
@@ -14144,6 +14540,23 @@ async fn observe_supervised_agents(
 
         let activity_changed = entry.last_activity_counter != status.activity_counter;
         if activity_changed {
+            if let SupervisorPhase::PostCompactionDormant {
+                user_message_count,
+                ..
+            } = &entry.phase
+            {
+                let current_user_message_count = observation
+                    .handle
+                    .read_supervision_context()
+                    .await
+                    .map_or(*user_message_count, |context| {
+                        context.user_message_count
+                    });
+                if current_user_message_count <= *user_message_count {
+                    entry.last_activity_counter = status.activity_counter;
+                    continue;
+                }
+            }
             if matches!(
                 &entry.phase,
                 SupervisorPhase::CompactionPending { .. } | SupervisorPhase::Compacting
@@ -14523,22 +14936,10 @@ async fn launch_supervision_verdict(
         }
         None => (None, None),
     };
-    if session_record
-        .as_ref()
-        .is_some_and(|record| record.compacted_to_session_id.is_some())
-    {
-        entries.get_mut(&agent_id).expect("entry exists").phase =
-            SupervisorPhase::Dormant { idle_since };
-        return;
-    }
-    if session_record
-        .as_ref()
-        .is_some_and(|record| record.compacted_from_session_id.is_some())
-        && context.user_message_count <= 1
-    {
+    if !supervision_verdict_launch_allows_action(session_record.as_ref(), &context) {
         tracing::debug!(
             agent_id = %agent_id,
-            "skipping supervision: post-compaction bootstrap turn"
+            "skipping supervision: post-compaction dormancy is still active"
         );
         entries.get_mut(&agent_id).expect("entry exists").phase =
             SupervisorPhase::Dormant { idle_since };
@@ -14917,7 +15318,13 @@ async fn accept_supervision_verdict_result(
     if context.last_user_message.as_deref() != Some(result.baseline.last_user_message.as_str())
         || context.kicks_since_user_message != result.baseline.kicks_since_user_message
         || context.cancelled_since_user_message
-        || !supervision_session_allows_action(host, &observation, &context).await
+        || !supervision_session_allows_action(
+            host,
+            &observation,
+            &context,
+            SupervisionAction::Verdict,
+        )
+        .await
     {
         tracing::debug!(
             agent_id = %result.agent_id,
@@ -15083,10 +15490,50 @@ async fn accept_supervision_verdict_result(
     }
 }
 
+#[derive(Clone, Copy)]
+enum SupervisionAction {
+    Verdict,
+    AutoCompaction,
+}
+
+fn supervision_verdict_launch_allows_action(
+    record: Option<&crate::store::session::SessionRecord>,
+    context: &crate::agent::supervisor::SupervisionContextSnapshot,
+) -> bool {
+    supervision_record_allows_action(record, context, SupervisionAction::Verdict)
+}
+
+fn supervision_record_allows_action(
+    record: Option<&crate::store::session::SessionRecord>,
+    context: &crate::agent::supervisor::SupervisionContextSnapshot,
+    action: SupervisionAction,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    if record.compacted_to_session_id.is_some() {
+        return false;
+    }
+    if !record.compaction_operations.is_empty()
+        || context.compaction_user_message_count.is_some()
+    {
+        return match action {
+            SupervisionAction::Verdict => {
+                !context.supervision_verdict_dormant_until_real_user
+            }
+            SupervisionAction::AutoCompaction => {
+                !context.auto_compaction_blocked_until_real_user
+            }
+        };
+    }
+    !(record.compacted_from_session_id.is_some() && context.user_message_count <= 1)
+}
+
 async fn supervision_session_allows_action(
     host: &HostHandle,
     observation: &ActivitySummaryObservation,
     context: &crate::agent::supervisor::SupervisionContextSnapshot,
+    action: SupervisionAction,
 ) -> bool {
     let Some(session_id) = observation.start.session_id.as_ref() else {
         return true;
@@ -15096,10 +15543,7 @@ async fn supervision_session_allows_action(
     let Some(record) = record else {
         return false;
     };
-    if record.compacted_to_session_id.is_some() {
-        return false;
-    }
-    !(record.compacted_from_session_id.is_some() && context.user_message_count <= 1)
+    supervision_record_allows_action(Some(&record), context, action)
 }
 
 async fn launch_supervisor_auto_compaction(
@@ -15159,7 +15603,13 @@ async fn launch_supervisor_auto_compaction(
     if context.last_user_message.as_deref() != Some(baseline.last_user_message.as_str())
         || context.kicks_since_user_message != baseline.kicks_since_user_message
         || context.cancelled_since_user_message
-        || !supervision_session_allows_action(host, &observation, &context).await
+        || !supervision_session_allows_action(
+            host,
+            &observation,
+            &context,
+            SupervisionAction::AutoCompaction,
+        )
+        .await
     {
         entries.get_mut(&agent_id).expect("entry exists").phase =
             SupervisorPhase::Dormant { idle_since };
@@ -15269,6 +15719,31 @@ async fn supervisor_auto_compact(
 
     let observe = async {
         while let Some(envelope) = rx.recv().await {
+            if envelope.kind == FrameKind::ContextCompactionNotify {
+                let Ok(payload) =
+                    envelope.parse_payload::<ContextCompactionNotifyPayload>()
+                else {
+                    continue;
+                };
+                if payload.status.is_terminal() {
+                    match payload.status {
+                        ContextCompactionStatus::Completed => tracing::info!(
+                            agent_id = %agent_id,
+                            operation_id = %payload.operation_id.0,
+                            "supervisor context compaction completed"
+                        ),
+                        ContextCompactionStatus::Failed { .. } => tracing::warn!(
+                            agent_id = %agent_id,
+                            operation_id = %payload.operation_id.0,
+                            message = ?payload.message,
+                            "supervisor context compaction failed"
+                        ),
+                        _ => unreachable!("terminal status checked above"),
+                    }
+                    return;
+                }
+                continue;
+            }
             if envelope.kind != FrameKind::AgentCompactNotify {
                 continue;
             }
@@ -18811,6 +19286,7 @@ async fn emit_launch_profile_catalog_for_subscriber(
 }
 
 async fn fan_out_backend_setup(state: &mut HostState, payload: BackendSetupPayload) {
+    state.backend_setup = payload.clone();
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -18828,6 +19304,27 @@ async fn fan_out_backend_setup(state: &mut HostState, payload: BackendSetupPaylo
 
     for path in dead_paths {
         state.host_streams.remove(&path);
+    }
+}
+
+fn team_member_context_compaction_result_from_terminal(
+    agent_id: AgentId,
+    operation_id: protocol::CompactionOperationId,
+    notify: ContextCompactionNotifyPayload,
+) -> TeamMemberContextCompactionResult {
+    let mutation = match &notify.status {
+        ContextCompactionStatus::Completed => CompactionMutation::Completed,
+        ContextCompactionStatus::Failed { mutation, .. } => *mutation,
+        _ => unreachable!("team member result requires a terminal status"),
+    };
+    TeamMemberContextCompactionResult {
+        agent_id,
+        logical_session_id: notify.logical_session_id,
+        operation_id,
+        method: notify.method,
+        status: notify.status,
+        mutation,
+        message: notify.message,
     }
 }
 
@@ -19571,6 +20068,15 @@ fn send_team_compact_notify(stream: &Stream, payload: TeamCompactNotifyPayload) 
     let _ = stream.send_value(FrameKind::TeamCompactNotify, value);
 }
 
+fn send_team_context_compaction_notify(
+    stream: &Stream,
+    payload: TeamContextCompactionNotifyPayload,
+) {
+    let value = serde_json::to_value(payload)
+        .expect("failed to serialize TeamContextCompactionNotify payload");
+    let _ = stream.send_value(FrameKind::TeamContextCompactionNotify, value);
+}
+
 impl HostHandle {
     /// Record a passive backend capacity update. The host is the sole owner of
     /// this account-wide state; agent connections never retain capacity state.
@@ -19808,15 +20314,72 @@ mod tests {
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
         AgentErrorPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
-        BackendNativeSettingsSnapshot, CustomAgentId, DiffContextMode, Envelope, HostSettingValue,
-        ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProtocolValidator, Review,
-        ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
-        ToolPolicy,
+        BackendNativeSettingsSnapshot, CompactionMetrics, CompactionTrigger, CustomAgentId,
+        DiffContextMode, Envelope, HostSettingValue, ProjectDiffScope, ProjectGitDiffFile,
+        ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
+        ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
     };
     use tokio::time::timeout;
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn installed_backend_version_selects_exact_backend_setup_value() {
+        let mut setup = setup::stub_backend_setup();
+        setup
+            .backends
+            .iter_mut()
+            .find(|entry| entry.backend_kind == BackendKind::Claude)
+            .expect("Claude setup entry")
+            .installed_version = Some("2.1.220".to_owned());
+        setup
+            .backends
+            .iter_mut()
+            .find(|entry| entry.backend_kind == BackendKind::Antigravity)
+            .expect("Antigravity setup entry")
+            .installed_version = Some("antigravity-local-build".to_owned());
+
+        assert_eq!(
+            installed_backend_version(&setup, BackendKind::Claude).as_deref(),
+            Some("2.1.220")
+        );
+        assert_eq!(
+            installed_backend_version(&setup, BackendKind::Antigravity).as_deref(),
+            Some("antigravity-local-build")
+        );
+        assert_eq!(
+            installed_backend_version(&setup, BackendKind::Codex),
+            None
+        );
+    }
+
+    #[test]
+    fn team_member_result_uses_terminal_notify_logical_session() {
+        let result = team_member_context_compaction_result_from_terminal(
+            AgentId("agent".to_owned()),
+            protocol::CompactionOperationId("operation".to_owned()),
+            ContextCompactionNotifyPayload {
+                operation_id: protocol::CompactionOperationId("operation".to_owned()),
+                agent_id: AgentId("agent".to_owned()),
+                logical_session_id: SessionId("session-after-mid-run-change".to_owned()),
+                backend_kind: BackendKind::Claude,
+                trigger: CompactionTrigger::TeamRequested,
+                method: Some(CompactionMethod::InlineFallback),
+                status: ContextCompactionStatus::Completed,
+                provider_version: None,
+                metrics: CompactionMetrics::default(),
+                continuation: None,
+                message: None,
+            },
+        );
+
+        assert_eq!(
+            result.logical_session_id.0,
+            "session-after-mid-run-change"
+        );
+        assert_eq!(result.mutation, CompactionMutation::Completed);
+    }
 
     async fn recv_session_summary_count(
         rx: &mut mpsc::UnboundedReceiver<Envelope>,
@@ -28530,5 +29093,366 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 SupervisionRetrySchedule::Exhausted
             );
         }
+    }
+
+    #[test]
+    fn backend_compaction_mutation_and_method_conversions_are_exhaustive() {
+        assert_eq!(
+            CompactionMutation::from(
+                crate::backend::BackendCompactionMutationState::NotObserved
+            ),
+            CompactionMutation::NotObserved
+        );
+        assert_eq!(
+            CompactionMutation::from(
+                crate::backend::BackendCompactionMutationState::Completed
+            ),
+            CompactionMutation::Completed
+        );
+        assert_eq!(
+            CompactionMutation::from(
+                crate::backend::BackendCompactionMutationState::MayHaveMutated
+            ),
+            CompactionMutation::MayHaveMutated
+        );
+        assert_eq!(
+            CompactionMethod::from(
+                crate::backend::BackendCompactionMechanism::InterceptedTextCommand
+            ),
+            CompactionMethod::NativeTextCommand
+        );
+        assert_eq!(
+            CompactionMethod::from(
+                crate::backend::BackendCompactionMechanism::JsonRpcRequest
+            ),
+            CompactionMethod::NativeRpc
+        );
+    }
+
+    #[test]
+    fn capability_conversion_includes_policy_and_transcript_authority() {
+        let policy = CompactionRoutingPolicy::default();
+        let guarded =
+            crate::backend::BackendCompactionCapability::context_unavailable(
+                crate::backend::BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+            );
+        assert!(matches!(
+            requested_compaction_availability(&guarded, &policy, false),
+            RequestedCompactionAvailability::Unavailable { .. }
+        ));
+        let unavailable =
+            crate::backend::BackendCompactionCapability::context_unavailable(
+                crate::backend::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+            );
+        assert_eq!(
+            requested_compaction_availability(&unavailable, &policy, true),
+            RequestedCompactionAvailability::Available {
+                route: RequestedCompactionRoute::InlineFallbackOnly,
+            }
+        );
+    }
+
+    #[test]
+    fn threshold_zero_remains_blocked_until_a_real_user_message() {
+        assert!(supervisor_auto_compaction_eligible(Some(1), 0));
+        let record: crate::store::session::SessionRecord =
+            serde_json::from_value(serde_json::json!({
+                "id": "session",
+                "backend_kind": "claude",
+                "workspace_roots": [],
+                "created_at_ms": 1,
+                "updated_at_ms": 1
+            }))
+            .expect("session record");
+        let context = crate::agent::supervisor::SupervisionContextSnapshot {
+            auto_compaction_blocked_until_real_user: true,
+            supervision_verdict_dormant_until_real_user: true,
+            compaction_user_message_count: Some(1),
+            user_message_count: 1,
+            ..Default::default()
+        };
+        assert!(!supervision_record_allows_action(
+            Some(&record),
+            &context,
+            SupervisionAction::AutoCompaction,
+        ));
+        assert!(!supervision_record_allows_action(
+            Some(&record),
+            &context,
+            SupervisionAction::Verdict,
+        ));
+        let released = crate::agent::supervisor::SupervisionContextSnapshot {
+            auto_compaction_blocked_until_real_user: false,
+            supervision_verdict_dormant_until_real_user: false,
+            user_message_count: 2,
+            ..context
+        };
+        assert!(supervision_record_allows_action(
+            Some(&record),
+            &released,
+            SupervisionAction::AutoCompaction,
+        ));
+        assert!(supervision_record_allows_action(
+            Some(&record),
+            &released,
+            SupervisionAction::Verdict,
+        ));
+    }
+
+    #[test]
+    fn finished_compaction_remains_dormant_without_a_deadline() {
+        let agent_id = AgentId("post-compaction-dormant".to_owned());
+        let idle_since = Instant::now();
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 9,
+                phase: SupervisorPhase::Compacting,
+            },
+        )]);
+
+        assert!(finish_supervisor_compaction(
+            &mut entries,
+            &agent_id,
+            9,
+            3,
+            idle_since,
+        ));
+        assert!(matches!(
+            &entries.get(&agent_id).expect("scheduler entry").phase,
+            SupervisorPhase::PostCompactionDormant {
+                idle_since: stored_idle,
+                user_message_count: 3,
+            } if *stored_idle == idle_since
+        ));
+        let mut enabled = protocol::SupervisorSettings::default();
+        enabled.enabled = true;
+        enabled.auto_compact_on_success = true;
+        enabled.auto_compact_min_context_tokens = 0;
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal {
+                    settings: enabled,
+                    epoch: 1,
+                },
+                false,
+            ),
+            None,
+            "Finished must not schedule another verdict or zero-threshold compaction"
+        );
+        assert!(
+            !finish_supervisor_compaction(
+                &mut entries,
+                &agent_id,
+                10,
+                3,
+                Instant::now(),
+            ),
+            "a duplicate or stale Finished event must not re-arm the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_compaction_guard_holds_without_mark_compacted_at_both_sites() {
+        let fixture = compact_fixture_without_supervisor_worker().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "typed dormancy fixture").await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("live observation");
+        let session_store = {
+            fixture.host.state.lock().await.session_store.clone()
+        };
+        session_store
+            .lock()
+            .await
+            .put_compaction_operation(
+                &session_id,
+                crate::store::session::CompactionOperationRecord {
+                    operation_id: protocol::CompactionOperationId(
+                        "typed-dormancy-operation".to_owned(),
+                    ),
+                    logical_session_id: session_id.clone(),
+                    trigger: CompactionTrigger::SupervisorRequested,
+                    state: crate::store::session::StoredCompactionState::Completed,
+                    method: Some(CompactionMethod::NativeRpc),
+                    accepted: true,
+                    mutation: CompactionMutation::Completed,
+                    binding_generation_before: 0,
+                    binding_generation_after: None,
+                    transcript_high_water: 1,
+                    metrics: CompactionMetrics::default(),
+                    continuation: None,
+                    message: None,
+                    started_at_ms: 1,
+                    finished_at_ms: Some(2),
+                },
+            )
+            .expect("persist typed compaction fixture");
+        let record = session_store
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("typed session record");
+        assert!(
+            record.compacted_from_session_id.is_none()
+                && record.compacted_to_session_id.is_none(),
+            "context-operation dormancy must not rely on legacy lineage"
+        );
+        let dormant = crate::agent::supervisor::SupervisionContextSnapshot {
+            auto_compaction_blocked_until_real_user: true,
+            supervision_verdict_dormant_until_real_user: true,
+            compaction_user_message_count: Some(1),
+            user_message_count: 1,
+            ..Default::default()
+        };
+        assert!(!supervision_verdict_launch_allows_action(
+            Some(&record),
+            &dormant,
+        ));
+        assert!(
+            !supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &dormant,
+                SupervisionAction::Verdict,
+            )
+            .await
+        );
+        assert!(
+            !supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &dormant,
+                SupervisionAction::AutoCompaction,
+            )
+            .await
+        );
+
+        let released = crate::agent::supervisor::SupervisionContextSnapshot {
+            auto_compaction_blocked_until_real_user: false,
+            supervision_verdict_dormant_until_real_user: false,
+            user_message_count: 2,
+            ..dormant
+        };
+        assert!(supervision_verdict_launch_allows_action(
+            Some(&record),
+            &released,
+        ));
+        assert!(
+            supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &released,
+                SupervisionAction::Verdict,
+            )
+            .await
+        );
+        assert!(
+            supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &released,
+                SupervisionAction::AutoCompaction,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_lineage_guard_remains_compatible_at_both_sites() {
+        let fixture = compact_fixture_without_supervisor_worker().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "legacy dormancy fixture").await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("live observation");
+        let session_store = {
+            fixture.host.state.lock().await.session_store.clone()
+        };
+        session_store
+            .lock()
+            .await
+            .update(&session_id, |record| {
+                record.compacted_from_session_id =
+                    Some(SessionId("legacy-parent".to_owned()));
+                record.compaction_operations.clear();
+            })
+            .expect("persist legacy lineage fixture");
+        let record = session_store
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("legacy session record");
+        let dormant = crate::agent::supervisor::SupervisionContextSnapshot {
+            user_message_count: 1,
+            ..Default::default()
+        };
+        assert!(!supervision_verdict_launch_allows_action(
+            Some(&record),
+            &dormant,
+        ));
+        assert!(
+            !supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &dormant,
+                SupervisionAction::Verdict,
+            )
+            .await
+        );
+        assert!(
+            !supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &dormant,
+                SupervisionAction::AutoCompaction,
+            )
+            .await
+        );
+
+        let released = crate::agent::supervisor::SupervisionContextSnapshot {
+            user_message_count: 2,
+            ..dormant
+        };
+        assert!(supervision_verdict_launch_allows_action(
+            Some(&record),
+            &released,
+        ));
+        assert!(
+            supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &released,
+                SupervisionAction::Verdict,
+            )
+            .await
+        );
+        assert!(
+            supervision_session_allows_action(
+                &fixture.host,
+                &observation,
+                &released,
+                SupervisionAction::AutoCompaction,
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn compaction_barrier_deadline_extends_long_stall_timeout() {
+        assert_eq!(
+            compaction_barrier_timeout(None),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            compaction_barrier_timeout(Some(Duration::from_secs(900))),
+            Duration::from_secs(930)
+        );
     }
 }

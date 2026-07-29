@@ -4,6 +4,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod claude_skills;
 pub mod codex;
+pub(crate) mod compaction;
 pub mod hermes;
 pub mod hermes_config;
 pub mod kiro;
@@ -15,7 +16,7 @@ pub mod turn_emitter;
 pub mod tycode;
 pub mod tycode_config;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
@@ -29,6 +30,23 @@ use tokio::sync::{mpsc, oneshot};
 
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
+
+pub(crate) use compaction::{
+    BackendAcceptedCompaction, BackendCompactionAvailability, BackendCompactionCapability,
+    BackendBindingPrepareError, BackendBindingReadyEvidence, BackendCompactionCapabilityEvidence,
+    BackendCompactionCoordinator,
+    BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
+    BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
+    BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
+    BackendCompactionObservationSource, BackendCompactionProgress,
+    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
+    BackendCompactionUserFocus, BackendCompactionUserFocusProvenance,
+    BackendContextReseatResult, BackendContextReseatSupport, BackendContextSeed,
+    BackendContinuationContext, BackendContinuationItem, BackendObservedCompaction,
+    ContinuationInstallStatus, PostCompactionTokenCount,
+};
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
@@ -157,6 +175,11 @@ pub struct BackendSpawnConfig {
     pub custom_agent_id: Option<CustomAgentId>,
     pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub session_settings: Option<SessionSettingsValues>,
+    /// Installed provider version reported by the host's setup probe.
+    pub provider_version: Option<String>,
+    /// Resolved Antigravity conversation store used by both ordinary and
+    /// prepared replacement bindings.
+    pub antigravity_conversations_dir: Option<PathBuf>,
     /// Host-level deep configuration for this backend (see
     /// [`protocol::BackendConfigSchema`]). Empty when unconfigured.
     pub backend_config: BackendConfigValues,
@@ -170,6 +193,7 @@ pub struct BackendSpawnConfig {
 pub(crate) enum BackendEvent {
     Chat(ChatEvent),
     ModelRequestTokenUsage(ModelRequestTokenUsage),
+    Compaction(BackendCompactionEvent),
 }
 
 enum EventStreamReceiver {
@@ -223,7 +247,7 @@ impl EventStream {
         loop {
             match self.recv_backend().await? {
                 BackendEvent::Chat(event) => return Some(event),
-                BackendEvent::ModelRequestTokenUsage(_) => {}
+                BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
             }
         }
     }
@@ -234,7 +258,7 @@ impl EventStream {
         loop {
             match self.try_recv_backend()? {
                 BackendEvent::Chat(event) => return Ok(event),
-                BackendEvent::ModelRequestTokenUsage(_) => {}
+                BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
             }
         }
     }
@@ -399,6 +423,48 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        BackendCompactionCapability::legacy_unavailable(
+            BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        )
+    }
+
+    fn begin_compaction(
+        &self,
+        _request: BackendCompactionRequest,
+    ) -> impl std::future::Future<Output = BackendCompactionStart> + Send {
+        async {
+            BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+                ),
+                fallback_safe: true,
+            }
+        }
+    }
+
+    fn install_continuation_context(
+        &self,
+        context: BackendContinuationContext,
+    ) -> impl std::future::Future<Output = BackendContextReseatResult> + Send {
+        async move {
+            let required = if context.required.is_empty() {
+                ContinuationInstallStatus::NotRequired
+            } else {
+                ContinuationInstallStatus::Unsupported
+            };
+            let advisory = if context.advisory.is_empty() {
+                ContinuationInstallStatus::NotRequired
+            } else {
+                ContinuationInstallStatus::Unsupported
+            };
+            BackendContextReseatResult {
+                required,
+                advisory,
+            }
+        }
+    }
+
     fn update_session_settings(
         &mut self,
         payload: protocol::SetSessionSettingsPayload,
@@ -423,6 +489,404 @@ pub trait Backend: Send + Sync + 'static {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;
+}
+
+pub(crate) enum PreparedBackendHandle {
+    Tycode(Box<tycode::TycodeBackend>),
+    Kiro(Box<kiro::KiroBackend>),
+    Claude(Box<claude::ClaudeBackend>),
+    Codex(Box<codex::CodexBackend>),
+    Antigravity(Box<antigravity::AntigravityBackend>),
+    Hermes(Box<hermes::HermesBackend>),
+    Mock {
+        declared_kind: BackendKind,
+        backend: Box<mock::MockBackend>,
+    },
+}
+
+pub(crate) struct PreparedBackendBinding {
+    pub backend: PreparedBackendHandle,
+    pub events: EventStream,
+    pub provider_session_id: SessionId,
+    pub ready: BackendBindingReadyEvidence,
+    pub continuation: BackendContextReseatResult,
+}
+
+impl PreparedBackendHandle {
+    pub(crate) fn backend_kind(&self) -> BackendKind {
+        match self {
+            Self::Tycode(_) => BackendKind::Tycode,
+            Self::Kiro(_) => BackendKind::Kiro,
+            Self::Claude(_) => BackendKind::Claude,
+            Self::Codex(_) => BackendKind::Codex,
+            Self::Antigravity(_) => BackendKind::Antigravity,
+            Self::Hermes(_) => BackendKind::Hermes,
+            Self::Mock { declared_kind, .. } => *declared_kind,
+        }
+    }
+
+    pub(crate) async fn shutdown(self) {
+        match self {
+            Self::Tycode(backend) => Backend::shutdown(*backend).await,
+            Self::Kiro(backend) => Backend::shutdown(*backend).await,
+            Self::Claude(backend) => Backend::shutdown(*backend).await,
+            Self::Codex(backend) => Backend::shutdown(*backend).await,
+            Self::Antigravity(backend) => Backend::shutdown(*backend).await,
+            Self::Hermes(backend) => Backend::shutdown(*backend).await,
+            Self::Mock { backend, .. } => Backend::shutdown(*backend).await,
+        }
+    }
+}
+
+pub(crate) async fn prepare_compacted_backend_binding(
+    kind: BackendKind,
+    spawn: BackendSpawnConfig,
+    seed: BackendContextSeed,
+) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
+    let continuation = seed.continuation_result();
+    match kind {
+        BackendKind::Tycode => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<tycode::TycodeBackend>(kind, spawn, seed)
+                    .await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Tycode(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+        BackendKind::Kiro => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<kiro::KiroBackend>(kind, spawn, seed).await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Kiro(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+        BackendKind::Claude => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<claude::ClaudeBackend>(kind, spawn, seed)
+                    .await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Claude(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+        BackendKind::Codex => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<codex::CodexBackend>(kind, spawn, seed).await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Codex(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+        BackendKind::Antigravity => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<antigravity::AntigravityBackend>(
+                    kind, spawn, seed,
+                )
+                .await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Antigravity(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+        BackendKind::Hermes => {
+            let (backend, events, provider_session_id, ready) =
+                prepare_concrete_backend_binding::<hermes::HermesBackend>(kind, spawn, seed)
+                    .await?;
+            Ok(PreparedBackendBinding {
+                backend: PreparedBackendHandle::Hermes(Box::new(backend)),
+                events,
+                provider_session_id,
+                ready,
+                continuation,
+            })
+        }
+    }
+}
+
+pub(crate) async fn prepare_mock_compacted_backend_binding(
+    kind: BackendKind,
+    spawn: BackendSpawnConfig,
+    seed: BackendContextSeed,
+) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
+    let continuation = seed.continuation_result();
+    let (backend, events, provider_session_id, ready) =
+        prepare_concrete_backend_binding::<mock::MockBackend>(kind, spawn, seed).await?;
+    Ok(PreparedBackendBinding {
+        backend: PreparedBackendHandle::Mock {
+            declared_kind: kind,
+            backend: Box::new(backend),
+        },
+        events,
+        provider_session_id,
+        ready,
+        continuation,
+    })
+}
+
+async fn prepare_concrete_backend_binding<B: Backend>(
+    kind: BackendKind,
+    spawn: BackendSpawnConfig,
+    seed: BackendContextSeed,
+) -> Result<(B, EventStream, SessionId, BackendBindingReadyEvidence), BackendBindingPrepareError> {
+    let message = seed.render_hidden_bootstrap()?;
+    let workspace_roots = seed.workspace_roots;
+    let mut bootstrap_spawn = spawn.clone();
+    bootstrap_spawn.resolved_spawn_config.tool_policy =
+        protocol::ToolPolicy::AllowList { tools: Vec::new() };
+    bootstrap_spawn.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
+    let initial_input = SendMessagePayload {
+        message,
+        images: None,
+        origin: None,
+        tool_response: None,
+    };
+    let (bootstrap_backend, mut bootstrap_events) =
+        B::spawn(workspace_roots.clone(), bootstrap_spawn, initial_input)
+        .await
+        .map_err(|message| BackendBindingPrepareError::SpawnFailed {
+            backend_kind: kind,
+            message,
+        })?;
+    let identity_before = bootstrap_backend.session_id();
+    if identity_before.0.trim().is_empty() {
+        bootstrap_backend.shutdown().await;
+        return Err(BackendBindingPrepareError::ProviderIdentityMissing {
+            backend_kind: kind,
+        });
+    }
+    let mut ready = match drain_prepared_binding_bootstrap(
+        kind,
+        identity_before.clone(),
+        &mut bootstrap_events,
+    )
+    .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            bootstrap_backend.shutdown().await;
+            return Err(error);
+        }
+    };
+    let identity_after = bootstrap_backend.session_id();
+    if identity_after != identity_before {
+        bootstrap_backend.shutdown().await;
+        return Err(BackendBindingPrepareError::ProviderIdentityChanged {
+            backend_kind: kind,
+            before: identity_before,
+            after: identity_after,
+        });
+    }
+    bootstrap_backend.shutdown().await;
+
+    let (backend, mut events) = B::resume(
+        workspace_roots,
+        spawn,
+        identity_after.clone(),
+    )
+    .await
+    .map_err(|message| BackendBindingPrepareError::ResumeFailed {
+        backend_kind: kind,
+        provider_session_id: identity_after.clone(),
+        message,
+    })?;
+    if let Some(replay_ready) = events.take_resume_replay_complete() {
+        match tokio::time::timeout(std::time::Duration::from_secs(300), replay_ready).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                backend.shutdown().await;
+                return Err(BackendBindingPrepareError::BootstrapStreamClosed {
+                    backend_kind: kind,
+                });
+            }
+            Err(_) => {
+                backend.shutdown().await;
+                return Err(BackendBindingPrepareError::BootstrapTimedOut {
+                    backend_kind: kind,
+                });
+            }
+        }
+    }
+    if let Err(error) = drain_prepared_binding_replay(kind, &mut events) {
+        backend.shutdown().await;
+        return Err(error);
+    }
+    let resumed_identity = backend.session_id();
+    if resumed_identity != identity_after {
+        backend.shutdown().await;
+        return Err(BackendBindingPrepareError::ProviderIdentityChanged {
+            backend_kind: kind,
+            before: identity_after,
+            after: resumed_identity,
+        });
+    }
+    ready.replay_or_setup_drained = true;
+    ready.provider_session_id = resumed_identity.clone();
+    Ok((backend, events, resumed_identity, ready))
+}
+
+async fn drain_prepared_binding_bootstrap(
+    kind: BackendKind,
+    provider_session_id: SessionId,
+    events: &mut EventStream,
+) -> Result<BackendBindingReadyEvidence, BackendBindingPrepareError> {
+    let drain = async {
+        let mut bootstrap_terminal_seen = false;
+        while let Some(event) = events.recv_backend().await {
+            match event {
+                BackendEvent::Chat(ChatEvent::StreamEnd(_)) => {
+                    bootstrap_terminal_seen = true;
+                }
+                BackendEvent::Chat(ChatEvent::TypingStatusChanged(false))
+                    if bootstrap_terminal_seen =>
+                {
+                    return Ok(BackendBindingReadyEvidence {
+                        backend_kind: kind,
+                        provider_session_id,
+                        bootstrap_terminal_seen: true,
+                        provider_idle_seen: true,
+                        replay_or_setup_drained: true,
+                        unsafe_activity_observed: false,
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::MessageAdded(message))
+                    if matches!(
+                        message.sender,
+                        protocol::MessageSender::Error | protocol::MessageSender::Warning
+                    ) =>
+                {
+                    return Err(BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message: message.content,
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::OperationCancelled(cancelled)) => {
+                    return Err(BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message: cancelled.message,
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::ToolRequest(request)) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("tool request {}", request.tool_name),
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion)) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("tool completion {}", completion.tool_name),
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::Orchestration(_)) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: "orchestration event".to_owned(),
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::ToolProgress(progress)) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("tool progress {:?}", progress.update),
+                    });
+                }
+                BackendEvent::Chat(ChatEvent::TaskUpdate(_)) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: "provider task state".to_owned(),
+                    });
+                }
+                BackendEvent::Chat(_)
+                | BackendEvent::ModelRequestTokenUsage(_)
+                | BackendEvent::Compaction(_) => {}
+            }
+        }
+        Err(BackendBindingPrepareError::BootstrapStreamClosed {
+            backend_kind: kind,
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(300), drain)
+        .await
+        .map_err(|_| BackendBindingPrepareError::BootstrapTimedOut {
+            backend_kind: kind,
+        })?
+}
+
+fn drain_prepared_binding_replay(
+    kind: BackendKind,
+    events: &mut EventStream,
+) -> Result<(), BackendBindingPrepareError> {
+    loop {
+        match events.try_recv_backend() {
+            Ok(BackendEvent::Chat(ChatEvent::MessageAdded(message)))
+                if matches!(
+                    message.sender,
+                    protocol::MessageSender::Error | protocol::MessageSender::Warning
+                ) =>
+            {
+                return Err(BackendBindingPrepareError::BootstrapFailed {
+                    backend_kind: kind,
+                    message: message.content,
+                });
+            }
+            Ok(BackendEvent::Chat(ChatEvent::OperationCancelled(cancelled))) => {
+                return Err(BackendBindingPrepareError::BootstrapFailed {
+                    backend_kind: kind,
+                    message: cancelled.message,
+                });
+            }
+            Ok(BackendEvent::Chat(ChatEvent::ToolRequest(request))) => {
+                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                    backend_kind: kind,
+                    activity: format!("replayed tool request {}", request.tool_name),
+                });
+            }
+            Ok(BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion))) => {
+                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                    backend_kind: kind,
+                    activity: format!("replayed tool completion {}", completion.tool_name),
+                });
+            }
+            Ok(BackendEvent::Chat(ChatEvent::ToolProgress(progress))) => {
+                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                    backend_kind: kind,
+                    activity: format!("replayed tool progress {:?}", progress.update),
+                });
+            }
+            Ok(BackendEvent::Chat(ChatEvent::TaskUpdate(_)))
+            | Ok(BackendEvent::Chat(ChatEvent::Orchestration(_))) => {
+                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                    backend_kind: kind,
+                    activity: "replayed provider task or orchestration state".to_owned(),
+                });
+            }
+            Ok(BackendEvent::Chat(_))
+            | Ok(BackendEvent::ModelRequestTokenUsage(_))
+            | Ok(BackendEvent::Compaction(_)) => {}
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(BackendBindingPrepareError::BootstrapStreamClosed {
+                    backend_kind: kind,
+                });
+            }
+        }
+    }
 }
 
 pub(crate) fn backend_fork_unsupported_message(backend_kind: BackendKind) -> String {
@@ -1082,5 +1546,83 @@ mod tests {
         );
         assert!(instructions.contains("do not use write/edit/apply-patch tools"));
         assert!(!instructions.contains("do not run shell commands"));
+    }
+
+    #[tokio::test]
+    async fn prepared_binding_drain_requires_bootstrap_terminal_before_idle() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(super::BackendEvent::Chat(
+            protocol::ChatEvent::TypingStatusChanged(false),
+        ))
+        .expect("setup idle");
+        tx.send(super::BackendEvent::Chat(protocol::ChatEvent::StreamEnd(
+            protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "mock".to_owned(),
+                    },
+                    content: "READY".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            },
+        )))
+        .expect("bootstrap terminal");
+        tx.send(super::BackendEvent::Chat(
+            protocol::ChatEvent::TypingStatusChanged(false),
+        ))
+        .expect("bootstrap idle");
+        drop(tx);
+        let mut events = super::EventStream::new_backend(rx);
+        let ready = super::drain_prepared_binding_bootstrap(
+            BackendKind::Claude,
+            protocol::SessionId("provider-session".to_owned()),
+            &mut events,
+        )
+        .await
+        .expect("prepared binding ready");
+        assert!(ready.bootstrap_terminal_seen);
+        assert!(ready.provider_idle_seen);
+        assert_eq!(ready.provider_session_id.0, "provider-session");
+    }
+
+    #[tokio::test]
+    async fn mock_prepared_binding_drains_seed_and_reopens_original_configuration() {
+        let mut prepared = super::prepare_mock_compacted_backend_binding(
+            BackendKind::Claude,
+            super::BackendSpawnConfig::default(),
+            super::BackendContextSeed {
+                workspace_roots: vec!["/tmp".to_owned()],
+                summary: "Preserve the compacted mock state.".to_owned(),
+                continuation: super::BackendContinuationContext {
+                    required: Vec::new(),
+                    advisory: Vec::new(),
+                },
+            },
+        )
+        .await
+        .expect("prepare mock binding");
+        assert!(prepared.ready.bootstrap_terminal_seen);
+        assert!(prepared.ready.provider_idle_seen);
+        assert!(prepared.ready.replay_or_setup_drained);
+        assert_eq!(prepared.backend.backend_kind(), BackendKind::Claude);
+        assert!(matches!(
+            prepared.events.try_recv_backend(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            &prepared.backend,
+            super::PreparedBackendHandle::Mock {
+                declared_kind: BackendKind::Claude,
+                ..
+            }
+        ));
+        prepared.backend.shutdown().await;
     }
 }

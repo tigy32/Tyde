@@ -103,6 +103,15 @@ pub(crate) struct SupervisionContextSnapshot {
     /// stopping point. Any later input — a real message or a supervisor kick —
     /// starts a turn of its own and clears this.
     pub last_turn_was_stall_interrupted: bool,
+    /// A confirmed or possibly-mutating compaction suppresses automatic
+    /// compaction until a new real user message arrives, independently of the
+    /// post-compaction token count.
+    pub auto_compaction_blocked_until_real_user: bool,
+    /// A standalone requested compaction also suppresses a fresh supervisor
+    /// verdict for the same user generation.
+    pub supervision_verdict_dormant_until_real_user: bool,
+    /// Canonical real-user count at the most recent compaction boundary.
+    pub compaction_user_message_count: Option<u32>,
     /// A recorded stall-interrupt notice whose cancel event has not been seen
     /// yet. It disarms the very next cancel so the supervisor's own interrupt
     /// is not mistaken for the user pressing stop. Any new message closes the
@@ -143,6 +152,21 @@ pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> Supervisio
                     snapshot.cancelled_since_user_message = true;
                 }
             }
+            ChatEvent::ContextCompaction(marker) => {
+                let context_may_have_changed = matches!(
+                    marker.mutation,
+                    protocol::CompactionMutation::Completed
+                        | protocol::CompactionMutation::MayHaveMutated
+                );
+                if context_may_have_changed {
+                    snapshot.auto_compaction_blocked_until_real_user = true;
+                    snapshot.current_context_input_tokens = marker.metrics.after_tokens;
+                }
+                if marker.operation_id.is_some() {
+                    snapshot.supervision_verdict_dormant_until_real_user = true;
+                }
+                snapshot.compaction_user_message_count = Some(snapshot.user_message_count);
+            }
             _ => {}
         }
     }
@@ -170,6 +194,8 @@ fn observe_message(
                 snapshot.last_error_since_user_message = None;
                 snapshot.last_kick_message = None;
                 snapshot.last_reply_to_kick = None;
+                snapshot.auto_compaction_blocked_until_real_user = false;
+                snapshot.supervision_verdict_dormant_until_real_user = false;
             }
             // Any new message (real or kick) supersedes an earlier cancel:
             // work is running again on purpose.
@@ -301,6 +327,8 @@ fn supervision_spawn_config(
         custom_agent_id: None,
         startup_mcp_servers: Vec::new(),
         session_settings,
+        provider_version: None,
+        antigravity_conversations_dir: None,
         backend_config: Default::default(),
         resolved_spawn_config: super::customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
@@ -1304,5 +1332,141 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             config.resolved_spawn_config.access_mode,
             BackendAccessMode::ReadOnly
         );
+    }
+
+    #[test]
+    fn compaction_marker_changes_only_token_and_guard_fold_fields() {
+        let initial = envelope(0, ChatEvent::MessageAdded(user_message("ship it")));
+        let before = supervision_context_snapshot(std::slice::from_ref(&initial));
+        let marker = ChatEvent::ContextCompaction(
+            protocol::ContextCompactionTimelineEvent {
+                marker_id: protocol::CompactionObservationId("marker".to_owned()),
+                operation_id: Some(protocol::CompactionOperationId(
+                    "operation".to_owned(),
+                )),
+                trigger: protocol::CompactionTrigger::UserRequested,
+                method: protocol::CompactionMethod::NativeTextCommand,
+                backend_kind: BackendKind::Claude,
+                provider_session_id: None,
+                status: protocol::ContextCompactionTimelineStatus::Completed,
+                mutation: protocol::CompactionMutation::Completed,
+                metrics: protocol::CompactionMetrics {
+                    after_tokens: Some(25),
+                    ..protocol::CompactionMetrics::default()
+                },
+                continuation: None,
+                message: None,
+                timestamp: 1,
+            },
+        );
+        let after =
+            supervision_context_snapshot(&[initial, envelope(1, marker)]);
+
+        assert_eq!(after.user_message_count, before.user_message_count);
+        assert_eq!(after.last_user_message, before.last_user_message);
+        assert_eq!(
+            after.kicks_since_user_message,
+            before.kicks_since_user_message
+        );
+        assert_eq!(
+            after.last_assistant_message,
+            before.last_assistant_message
+        );
+        assert!(after.auto_compaction_blocked_until_real_user);
+        assert!(after.supervision_verdict_dormant_until_real_user);
+        assert_eq!(after.compaction_user_message_count, Some(1));
+        assert_eq!(after.current_context_input_tokens, Some(25));
+    }
+
+    #[test]
+    fn non_mutating_failed_compaction_preserves_current_context_tokens() {
+        let assistant = ChatEvent::MessageAdded(ChatMessage {
+            timestamp: 1,
+            content: "working".to_owned(),
+            sender: MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            },
+            message_id: None,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: Some(
+                protocol::MessageTokenUsage::request_and_turn_known(
+                    protocol::TokenUsage {
+                        input_tokens: 800,
+                        output_tokens: 200,
+                        total_tokens: 1_000,
+                        ..protocol::TokenUsage::default()
+                    },
+                    protocol::TokenUsage {
+                        input_tokens: 800,
+                        output_tokens: 200,
+                        total_tokens: 1_000,
+                        ..protocol::TokenUsage::default()
+                    },
+                )
+                .with_cumulative(protocol::TokenUsage {
+                    input_tokens: 800,
+                    output_tokens: 200,
+                    total_tokens: 1_000,
+                    ..protocol::TokenUsage::default()
+                }),
+            ),
+            context_breakdown: None,
+            images: None,
+        });
+        let marker = ChatEvent::ContextCompaction(
+            protocol::ContextCompactionTimelineEvent {
+                marker_id: protocol::CompactionObservationId("failed-marker".to_owned()),
+                operation_id: Some(protocol::CompactionOperationId(
+                    "failed-operation".to_owned(),
+                )),
+                trigger: protocol::CompactionTrigger::UserRequested,
+                method: protocol::CompactionMethod::NativeRpc,
+                backend_kind: BackendKind::Codex,
+                provider_session_id: None,
+                status: protocol::ContextCompactionTimelineStatus::Failed,
+                mutation: protocol::CompactionMutation::NotObserved,
+                metrics: protocol::CompactionMetrics::default(),
+                continuation: None,
+                message: Some("not dispatched".to_owned()),
+                timestamp: 2,
+            },
+        );
+        let snapshot =
+            supervision_context_snapshot(&[envelope(0, assistant), envelope(1, marker)]);
+        assert_eq!(snapshot.current_context_input_tokens, Some(800));
+        assert!(!snapshot.auto_compaction_blocked_until_real_user);
+        assert!(snapshot.supervision_verdict_dormant_until_real_user);
+    }
+
+    #[test]
+    fn real_user_message_releases_both_compaction_guards() {
+        let marker = ChatEvent::ContextCompaction(
+            protocol::ContextCompactionTimelineEvent {
+                marker_id: protocol::CompactionObservationId("marker".to_owned()),
+                operation_id: Some(protocol::CompactionOperationId(
+                    "operation".to_owned(),
+                )),
+                trigger: protocol::CompactionTrigger::UserRequested,
+                method: protocol::CompactionMethod::NativeRpc,
+                backend_kind: BackendKind::Codex,
+                provider_session_id: None,
+                status: protocol::ContextCompactionTimelineStatus::Completed,
+                mutation: protocol::CompactionMutation::Completed,
+                metrics: protocol::CompactionMetrics::default(),
+                continuation: None,
+                message: None,
+                timestamp: 1,
+            },
+        );
+        let snapshot = supervision_context_snapshot(&[
+            envelope(0, ChatEvent::MessageAdded(user_message("first"))),
+            envelope(1, marker),
+            envelope(2, ChatEvent::MessageAdded(user_message("next"))),
+        ]);
+        assert!(!snapshot.auto_compaction_blocked_until_real_user);
+        assert!(!snapshot.supervision_verdict_dormant_until_real_user);
+        assert_eq!(snapshot.user_message_count, 2);
     }
 }

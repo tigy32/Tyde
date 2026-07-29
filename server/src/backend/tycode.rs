@@ -25,9 +25,11 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
-    backend_fork_unsupported_message, render_combined_spawn_instructions,
+    Backend, BackendCompactionCapability, BackendCompactionNotDispatchedReason,
+    BackendCompactionRequest, BackendCompactionStart, BackendCompactionUnavailableReason,
+    BackendSession, BackendSpawnConfig, BackendStartupError, EventStream, StartupMcpServer,
+    StartupMcpTransport, apply_session_settings_update, backend_fork_unsupported_message,
+    render_combined_spawn_instructions,
     setup::{TYCODE_VERSION, ensure_tycode_command_compatible, resolve_tycode_binary_path},
 };
 use crate::agent::customization::SkillSelection;
@@ -1885,6 +1887,24 @@ fn verify_tycode_settings_overlay(expected: &Value, actual: &Value) -> Result<()
 impl Backend for TycodeBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         tycode_session_settings_schema()
+    }
+
+    fn compaction_capability(&self) -> BackendCompactionCapability {
+        BackendCompactionCapability::context_unavailable(
+            BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        )
+    }
+
+    async fn begin_compaction(
+        &self,
+        _request: BackendCompactionRequest,
+    ) -> BackendCompactionStart {
+        BackendCompactionStart::NotDispatched {
+            reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+            ),
+            fallback_safe: true,
+        }
     }
 
     async fn spawn(

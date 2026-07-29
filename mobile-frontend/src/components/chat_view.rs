@@ -6,13 +6,59 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
 use crate::components::chat_input::ChatInput;
-use crate::components::chat_message::ChatMessageView;
+use crate::components::chat_message::{ChatMessageView, ContextCompactionMarkerView};
 use crate::components::pending_submissions::AgentPendingSubmissions;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState, Spinner};
-use crate::state::{AgentRef, AppState, LocalHostId};
+use crate::state::{
+    AgentRef, AppState, ChatMessageEntry, LocalHostId, PendingSessionHistoryRequest,
+    PositionedCompactionMarker,
+};
 
 const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
+
+#[derive(Clone)]
+enum MobileTimelineRow {
+    Message(ChatMessageEntry),
+    ContextCompaction(protocol::ContextCompactionTimelineEvent),
+}
+
+fn merge_timeline_rows(
+    messages: Vec<ChatMessageEntry>,
+    markers: Vec<PositionedCompactionMarker>,
+) -> Vec<MobileTimelineRow> {
+    let mut rows = Vec::with_capacity(messages.len().saturating_add(markers.len()));
+    for message_index in 0..=messages.len() {
+        rows.extend(
+            markers
+                .iter()
+                .filter(|marker| marker.message_index == message_index)
+                .map(|marker| MobileTimelineRow::ContextCompaction(marker.event.clone())),
+        );
+        if let Some(message) = messages.get(message_index) {
+            rows.push(MobileTimelineRow::Message(message.clone()));
+        }
+    }
+    rows
+}
+
+fn context_compaction_status_label(
+    status: &protocol::ContextCompactionStatus,
+) -> Option<&'static str> {
+    use protocol::{CompactionStage, ContextCompactionStatus};
+
+    match status {
+        ContextCompactionStatus::Deferred { .. } => Some("Compaction queued"),
+        ContextCompactionStatus::Started { stage }
+        | ContextCompactionStatus::Progress { stage } => Some(match stage {
+            CompactionStage::WaitingForIdle => "Compaction queued",
+            CompactionStage::Dispatching => "Preparing compaction…",
+            CompactionStage::Compacting => "Compacting context…",
+            CompactionStage::Finalizing => "Finalizing compaction…",
+        }),
+        ContextCompactionStatus::Completed | ContextCompactionStatus::Failed { .. } => None,
+    }
+}
 
 /// Minimum touch-target size, inline so the recovery control stays tappable
 /// independently of the stylesheet.
@@ -441,6 +487,12 @@ pub fn ChatView() -> impl IntoView {
             local_host_id: active.local_host_id.clone(),
             agent_id: active.agent_id.clone(),
         };
+        if let Some(payload) = s_compaction
+            .context_compaction_operations
+            .with(|m| m.get(&ar).cloned())
+        {
+            return context_compaction_status_label(&payload.status).map(str::to_owned);
+        }
         let payload = s_compaction
             .agent_compactions
             .with(|m| m.get(&ar).cloned())?;
@@ -742,8 +794,11 @@ pub fn ChatView() -> impl IntoView {
                     let messages = s_body.chat_messages.with(|m| {
                         m.get(&key).cloned().unwrap_or_default()
                     });
+                    let markers = s_body.compaction_markers.with(|m| {
+                        m.get(&key).cloned().unwrap_or_default()
+                    });
                     let prior_history = s_body.session_history.with(|m| m.get(&key).cloned());
-                    let shown = messages.clone();
+                    let shown = merge_timeline_rows(messages.clone(), markers.clone());
                     let load_state = s_body.clone();
                     let load_key = key.clone();
                     let load_stream = s_body.agents.with(|agents| {
@@ -759,7 +814,7 @@ pub fn ChatView() -> impl IntoView {
                         else {
                             return;
                         };
-                        if history.loading {
+                        if history.pending_request.is_some() {
                             return;
                         }
                         let Some(stream) = load_stream.clone() else {
@@ -770,9 +825,14 @@ pub fn ChatView() -> impl IntoView {
                             );
                             return;
                         };
+                        let request_id = load_state.next_history_page_request_id();
+                        let pending_request = PendingSessionHistoryRequest {
+                            request_id: request_id.clone(),
+                            before_seq: history.oldest_seq,
+                        };
                         load_state.session_history.update(|map| {
                             if let Some(history) = map.get_mut(&load_key) {
-                                history.loading = true;
+                                history.pending_request = Some(pending_request);
                             }
                         });
                         let state_for_error = load_state.clone();
@@ -780,6 +840,7 @@ pub fn ChatView() -> impl IntoView {
                         spawn_local(async move {
                             let payload = protocol::FetchSessionHistoryPayload {
                                 agent_id: key_for_send.agent_id.clone(),
+                                request_id: request_id.clone(),
                                 before_seq: history.oldest_seq,
                                 limit: SESSION_HISTORY_PAGE_LIMIT,
                             };
@@ -794,7 +855,15 @@ pub fn ChatView() -> impl IntoView {
                                 log::error!("failed to send fetch_session_history: {error}");
                                 state_for_error.session_history.update(|map| {
                                     if let Some(history) = map.get_mut(&key_for_send) {
-                                        history.loading = false;
+                                        if history
+                                            .pending_request
+                                            .as_ref()
+                                            .is_some_and(|pending| {
+                                                pending.request_id == request_id
+                                            })
+                                        {
+                                            history.pending_request = None;
+                                        }
                                     }
                                 });
                             }
@@ -805,6 +874,7 @@ pub fn ChatView() -> impl IntoView {
                     let transient = s_body.transient_events.with(|m| m.get(&key).cloned().unwrap_or_default());
 
                     let no_content = messages.is_empty()
+                        && markers.is_empty()
                         && prior_history.is_none()
                         && streaming.is_none()
                         && task_list.is_none()
@@ -895,16 +965,18 @@ pub fn ChatView() -> impl IntoView {
 
                     view! {
                         <div class="chat-transcript" data-mobile-test="chat-transcript">
-                            {prior_history.clone().map(|history| view! {
+                            {prior_history.clone().map(|history| {
+                                let loading = history.pending_request.is_some();
+                                view! {
                                 <div class="chat-history-collapsed" data-mobile-test="chat-history-collapsed">
                                     <button
                                         type="button"
                                         class="chat-history-load-previous"
                                         data-mobile-test="chat-load-previous"
-                                        disabled=history.loading
+                                        disabled=loading
                                         on:click=on_load_previous
                                     >
-                                        {if history.loading {
+                                        {if loading {
                                             "Loading earlier messages…".to_owned()
                                         } else if history.message_count == 1 {
                                             "Load earlier messages (1 message)".to_owned()
@@ -921,6 +993,7 @@ pub fn ChatView() -> impl IntoView {
                                         "Earlier messages are available on demand."
                                     </p>
                                 </div>
+                                }
                             })}
 
                             // Task list
@@ -953,10 +1026,17 @@ pub fn ChatView() -> impl IntoView {
                             // it must travel with the row — not be read back from
                             // `active_agent`, which is navigation state that moves the
                             // moment the user opens another chat.
-                            {shown.into_iter().map(|entry| {
-                                let owner_agent_ref = key.clone();
-                                view! {
-                                    <ChatMessageView owner_agent_ref=owner_agent_ref entry=entry />
+                            {shown.into_iter().map(|row| {
+                                match row {
+                                    MobileTimelineRow::Message(entry) => {
+                                        let owner_agent_ref = key.clone();
+                                        view! {
+                                            <ChatMessageView owner_agent_ref=owner_agent_ref entry=entry />
+                                        }.into_any()
+                                    }
+                                    MobileTimelineRow::ContextCompaction(event) => view! {
+                                        <ContextCompactionMarkerView event=event />
+                                    }.into_any(),
                                 }
                             }).collect::<Vec<_>>()}
 
@@ -1076,6 +1156,9 @@ pub fn ChatView() -> impl IntoView {
 
 fn track_active_chat_content(state: &AppState, key: &AgentRef) {
     state.chat_messages.with(|m| {
+        let _ = m.get(key).map_or(0, Vec::len);
+    });
+    state.compaction_markers.with(|m| {
         let _ = m.get(key).map_or(0, Vec::len);
     });
     state.session_history.with(|m| {
@@ -1776,7 +1859,7 @@ mod wasm_tests {
                     message_count: 25,
                     oldest_seq: Some(42),
                     has_more_before: true,
-                    loading: false,
+                    pending_request: None,
                 },
             );
         });
@@ -2178,6 +2261,125 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "close should move into the More menu"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_header_shows_deferred_and_compacting_context_status() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        let payload = |status| protocol::ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId("mobile-operation".to_owned()),
+            agent_id: agent_ref.agent_id.clone(),
+            logical_session_id: protocol::SessionId("logical-session".to_owned()),
+            backend_kind: protocol::BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: Some(protocol::CompactionMethod::NativeTextCommand),
+            status,
+            provider_version: None,
+            metrics: Default::default(),
+            continuation: None,
+            message: None,
+        };
+
+        state.context_compaction_operations.update(|operations| {
+            operations.insert(
+                agent_ref.clone(),
+                payload(protocol::ContextCompactionStatus::Deferred {
+                    stage: protocol::CompactionStage::WaitingForIdle,
+                }),
+            );
+        });
+        next_tick().await;
+        let subtitle = container
+            .query_selector("[data-mobile-test='chat-subtitle']")
+            .unwrap()
+            .expect("subtitle")
+            .text_content()
+            .unwrap_or_default();
+        assert!(subtitle.contains("Compaction queued"), "{subtitle}");
+
+        state.context_compaction_operations.update(|operations| {
+            operations.insert(
+                agent_ref.clone(),
+                payload(protocol::ContextCompactionStatus::Progress {
+                    stage: protocol::CompactionStage::Compacting,
+                }),
+            );
+        });
+        next_tick().await;
+        let subtitle = container
+            .query_selector("[data-mobile-test='chat-subtitle']")
+            .unwrap()
+            .expect("subtitle")
+            .text_content()
+            .unwrap_or_default();
+        assert!(subtitle.contains("Compacting context"), "{subtitle}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_transcript_renders_one_marker_in_event_order() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.push_chat_message_entry(
+            &agent_ref,
+            make_message(MessageSender::User, "before compaction"),
+        );
+        let marker = protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("mobile-marker".to_owned()),
+            operation_id: None,
+            trigger: protocol::CompactionTrigger::BackendAutomatic,
+            method: protocol::CompactionMethod::BackendAutomatic,
+            backend_kind: protocol::BackendKind::Claude,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: Default::default(),
+            continuation: None,
+            message: None,
+            timestamp: 1,
+        };
+        assert!(state.push_context_compaction_marker(&agent_ref, marker.clone()));
+        assert!(!state.push_context_compaction_marker(&agent_ref, marker));
+        state.push_chat_message_entry(
+            &agent_ref,
+            make_message(MessageSender::Assistant {
+                agent: "Coder".to_owned(),
+            }, "after compaction"),
+        );
+        next_tick().await;
+
+        let rows = container
+            .query_selector_all(
+                ".chat-transcript > .chat-message, .chat-transcript > .chat-compaction-marker",
+            )
+            .unwrap();
+        assert_eq!(rows.length(), 3);
+        let middle = rows.item(1).expect("middle row");
+        assert!(
+            middle
+                .dyn_ref::<web_sys::Element>()
+                .unwrap()
+                .has_attribute("data-mobile-test"),
+            "the marker stays between the surrounding messages"
+        );
+        assert_eq!(
+            middle
+                .dyn_ref::<web_sys::Element>()
+                .unwrap()
+                .get_attribute("data-mobile-test")
+                .as_deref(),
+            Some("chat-compaction-marker")
         );
     }
 

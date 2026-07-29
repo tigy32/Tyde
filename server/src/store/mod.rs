@@ -10,3 +10,4 @@ pub mod session;
 pub mod settings;
 pub mod skills;
 pub mod steering;
+pub(crate) mod transcript;

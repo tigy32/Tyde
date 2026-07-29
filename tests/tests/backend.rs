@@ -225,6 +225,8 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
+                        provider_version: None,
+                        antigravity_conversations_dir: None,
                         backend_config: Default::default(),
                         resolved_spawn_config: Default::default(),
                     },
@@ -266,6 +268,8 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
+                        provider_version: None,
+                        antigravity_conversations_dir: None,
                         backend_config: Default::default(),
                         resolved_spawn_config: Default::default(),
                     },
@@ -307,6 +311,8 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
+                        provider_version: None,
+                        antigravity_conversations_dir: None,
                         backend_config: Default::default(),
                         resolved_spawn_config: Default::default(),
                     },
@@ -3928,7 +3934,7 @@ async fn claude_system_frame_without_subtype_still_fails_loudly() {
 }
 
 #[tokio::test]
-async fn compact_turn_emits_system_message_and_stream_end_without_error() {
+async fn compact_turn_emits_typed_marker_and_stream_end_without_legacy_notice() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
@@ -3965,7 +3971,8 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
 
     expect_fixture_agent_start(&mut fixture.client, &agent_stream, "compact AgentStart").await;
 
-    let mut saw_system_message = false;
+    let mut saw_marker = false;
+    let mut saw_legacy_notice = false;
     let mut saw_stream_end = false;
     let mut saw_typing_false = false;
 
@@ -3986,10 +3993,14 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
         let event: ChatEvent = env.parse_payload().expect("parse compact ChatEvent");
         match event {
             ChatEvent::MessageAdded(message) => {
-                if matches!(message.sender, MessageSender::System) {
-                    assert_eq!(message.content, "Conversation compacted.");
-                    saw_system_message = true;
+                if message.content == "Conversation compacted." {
+                    saw_legacy_notice = true;
                 }
+            }
+            ChatEvent::ContextCompaction(marker) => {
+                assert_eq!(marker.trigger, protocol::CompactionTrigger::UserTyped);
+                assert_eq!(marker.method, protocol::CompactionMethod::NativeTextCommand);
+                saw_marker = true;
             }
             ChatEvent::StreamEnd(data) => {
                 assert!(
@@ -4005,9 +4016,10 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
         }
     }
 
+    assert!(saw_marker, "compact turn should emit one typed marker");
     assert!(
-        saw_system_message,
-        "compact turn should emit a visible system message"
+        !saw_legacy_notice,
+        "compact turn must not emit the superseded system-message notice"
     );
     assert!(saw_stream_end, "compact turn should emit StreamEnd");
 }
@@ -6313,6 +6325,8 @@ async fn real_hermes_openrouter_emits_visible_content() {
             custom_agent_id: None,
             startup_mcp_servers: Vec::new(),
             session_settings: Some(settings),
+            provider_version: None,
+            antigravity_conversations_dir: None,
             backend_config: Default::default(),
             resolved_spawn_config: Default::default(),
         },
@@ -6469,6 +6483,8 @@ for line in sys.stdin:
                 },
             }],
             session_settings: Some(settings),
+            provider_version: None,
+            antigravity_conversations_dir: None,
             backend_config: Default::default(),
             resolved_spawn_config: Default::default(),
         },

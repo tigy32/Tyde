@@ -16,6 +16,7 @@ use protocol::{
     CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
     CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
     HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
@@ -40,7 +41,8 @@ use protocol::{
     TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
     TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
     TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload,
+    TeamSetManagerPayload, TeamContextCompactionNotifyPayload, TerminalBootstrapPayload,
+    TerminalClosePayload, TerminalCreatePayload,
     TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
     TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
     Version, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
@@ -923,6 +925,10 @@ impl Connection {
                     let _: protocol::TeamMemberShuffleSuggestionNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::TeamContextCompactionNotify => {
+                    let _: TeamContextCompactionNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::AgentsViewPreferencesNotify => {
                     let _: AgentsViewPreferencesNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1072,6 +1078,26 @@ impl Connection {
                         self.outgoing_seq.contains_key(&envelope.stream),
                         "AgentActivityStats on stream {} before NewAgent",
                         envelope.stream
+                    );
+                }
+                FrameKind::ContextCompactionNotify => {
+                    let payload: ContextCompactionNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let stream_parts = parse_agent_stream(&envelope.stream);
+                    assert_eq!(
+                        payload.agent_id, stream_parts.agent_id,
+                        "context_compaction_notify payload agent_id {} does not match stream {}",
+                        payload.agent_id, envelope.stream
+                    );
+                }
+                FrameKind::ContextCompactionCapability => {
+                    let payload: ContextCompactionCapabilityPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let stream_parts = parse_agent_stream(&envelope.stream);
+                    assert_eq!(
+                        payload.agent_id, stream_parts.agent_id,
+                        "context_compaction_capability payload agent_id {} does not match stream {}",
+                        payload.agent_id, envelope.stream
                     );
                 }
                 FrameKind::ChatEvent => {

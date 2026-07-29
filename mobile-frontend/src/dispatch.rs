@@ -13,6 +13,7 @@ use protocol::{
     AgentRenamedPayload, AgentStartPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
     BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
     ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
     Envelope, FrameKind, HeartbeatPayload, HostBootstrapPayload, HostBrowseEntriesPayload,
     HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
     LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
@@ -22,6 +23,7 @@ use protocol::{
     ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
     StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
+    TeamContextCompactionNotifyPayload,
     TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
@@ -31,8 +33,9 @@ use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
     HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo,
-    ReviewRef, SessionHistoryState, SessionInfo, SessionListLoadState, StreamingState,
-    ToolRequestEntry, TransientEvent, reduce_project_diff_response, sort_project_infos,
+    PendingSessionHistoryRequest, PositionedCompactionMarker, ReviewRef, SessionHistoryState,
+    SessionInfo, SessionListLoadState, StreamingState, ToolRequestEntry, TransientEvent,
+    reduce_project_diff_response, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -502,30 +505,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
             Ok(payload) => {
-                log::info!(
-                    "mobile_apply_agent_start host={} agent_id={} stream={}",
-                    host,
-                    payload.agent_id,
-                    envelope.stream
-                );
-                state.agents.update(|agents| {
-                    if let Some(agent) = agents
-                        .iter_mut()
-                        .find(|a| a.local_host_id == *host && a.agent_id == payload.agent_id)
-                    {
-                        agent.started = true;
-                        if let Some(session_id) = payload.session_id {
-                            agent.session_id = Some(session_id);
-                        }
-                    } else {
-                        log::error!(
-                            "AgentStart referenced unknown agent host={} agent_id={} stream={}",
-                            host,
-                            payload.agent_id,
-                            envelope.stream
-                        );
-                    }
-                });
+                apply_agent_start(state, host, &envelope.stream, payload);
             }
             Err(error) => log::error!(
                 "failed to parse AgentStart host={} stream={} seq={}: {}",
@@ -588,6 +568,32 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             }
         }
         FrameKind::ChatEvent => dispatch_chat_event(state, host, &envelope.stream, &envelope),
+        FrameKind::ContextCompactionNotify => {
+            match envelope.parse_payload::<ContextCompactionNotifyPayload>() {
+                Ok(payload) => apply_context_compaction_notify(state, host, &envelope.stream, payload),
+                Err(error) => log::error!(
+                    "failed to parse ContextCompactionNotify host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                ),
+            }
+        }
+        FrameKind::ContextCompactionCapability => {
+            match envelope.parse_payload::<ContextCompactionCapabilityPayload>() {
+                Ok(payload) => {
+                    apply_context_compaction_capability(state, host, &envelope.stream, payload)
+                }
+                Err(error) => log::error!(
+                    "failed to parse ContextCompactionCapability host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                ),
+            }
+        }
         FrameKind::SessionHistory => match envelope.parse_payload::<SessionHistoryPayload>() {
             Ok(payload) => apply_session_history(state, host, &envelope.stream, payload),
             Err(error) => log::error!(
@@ -909,6 +915,20 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 apply_team_compact_notify(state, host, payload);
             }
         }
+        FrameKind::TeamContextCompactionNotify => {
+            match envelope.parse_payload::<TeamContextCompactionNotifyPayload>() {
+                Ok(payload) => apply_team_context_compaction_notify(state, host, payload),
+                Err(error) => {
+                    log::error!(
+                        "failed to parse TeamContextCompactionNotify host={} stream={} seq={}: {}",
+                        host,
+                        envelope.stream,
+                        envelope.seq,
+                        error
+                    );
+                }
+            }
+        }
         FrameKind::TeamPresetCatalogNotify => {
             if let Ok(payload) = envelope.parse_payload::<TeamPresetCatalogNotifyPayload>() {
                 state.team_preset_catalog_by_host.update(|map| {
@@ -1180,6 +1200,12 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_message_index.update(|m| {
         m.remove(agent_ref);
     });
+    state.compaction_markers.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.compaction_marker_ids.update(|m| {
+        m.remove(agent_ref);
+    });
     state.forget_session_history(agent_ref);
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
@@ -1199,6 +1225,13 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.agent_session_settings.update(|m| {
         m.remove(agent_ref);
     });
+    state.context_compaction_operations.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.context_compaction_capabilities.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.forget_terminal_context_compaction_operations(agent_ref);
     state.agent_compactions.update(|m| {
         let keep_completed = m.get(agent_ref).is_some_and(|payload| {
             payload.status == AgentCompactStatus::Completed && payload.new_agent_id.is_some()
@@ -1450,7 +1483,7 @@ fn clear_session_history_loading_on_error(
     };
     state.session_history.update(|map| {
         if let Some(history) = map.get_mut(&agent_ref) {
-            history.loading = false;
+            history.pending_request = None;
         }
     });
 }
@@ -1517,10 +1550,258 @@ fn clear_session_history_loading_for_host(state: &AppState, host: &LocalHostId) 
     state.session_history.update(|map| {
         for (agent_ref, history) in map.iter_mut() {
             if agent_ref.local_host_id == *host {
-                history.loading = false;
+                history.pending_request = None;
             }
         }
     });
+}
+
+fn apply_context_compaction_notify(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: ContextCompactionNotifyPayload,
+) {
+    let Some(agent_ref) = resolve_agent_ref(state, host, stream) else {
+        log::warn!(
+            "ContextCompactionNotify referenced unknown agent host={} stream={} agent_id={}",
+            host,
+            stream,
+            payload.agent_id
+        );
+        return;
+    };
+    if agent_ref.agent_id != payload.agent_id {
+        log::error!(
+            "ContextCompactionNotify agent mismatch host={} stream={} expected={} got={}",
+            host,
+            stream,
+            agent_ref.agent_id,
+            payload.agent_id
+        );
+        return;
+    }
+    if !context_compaction_session_matches(
+        state,
+        &agent_ref,
+        &payload.logical_session_id,
+        "ContextCompactionNotify",
+    ) {
+        return;
+    }
+    reduce_context_compaction_notify(state, agent_ref, payload);
+}
+
+fn apply_context_compaction_capability(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: ContextCompactionCapabilityPayload,
+) {
+    let Some(agent_ref) = resolve_agent_ref(state, host, stream) else {
+        log::warn!(
+            "ContextCompactionCapability referenced unknown agent host={} stream={} agent_id={}",
+            host,
+            stream,
+            payload.agent_id
+        );
+        return;
+    };
+    if agent_ref.agent_id != payload.agent_id {
+        log::error!(
+            "ContextCompactionCapability agent mismatch host={} stream={} expected={} got={}",
+            host,
+            stream,
+            agent_ref.agent_id,
+            payload.agent_id
+        );
+        return;
+    }
+    if !context_compaction_session_matches(
+        state,
+        &agent_ref,
+        &payload.logical_session_id,
+        "ContextCompactionCapability",
+    ) {
+        return;
+    }
+    state
+        .context_compaction_capabilities
+        .update(|capabilities| {
+            capabilities.insert(agent_ref, payload);
+        });
+}
+
+fn context_compaction_session_matches(
+    state: &AppState,
+    agent_ref: &AgentRef,
+    logical_session_id: &protocol::SessionId,
+    frame: &str,
+) -> bool {
+    let mut matches = true;
+    state.agents.update(|agents| {
+        let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| {
+                agent.local_host_id == agent_ref.local_host_id
+                    && agent.agent_id == agent_ref.agent_id
+            })
+        else {
+            matches = false;
+            return;
+        };
+        match agent.session_id.as_ref() {
+            Some(bound_session) if bound_session != logical_session_id => {
+                log::warn!(
+                    "{} for agent {} names session {} but the mobile agent is bound to {}; dropping",
+                    frame,
+                    agent_ref.agent_id,
+                    logical_session_id.0,
+                    bound_session.0,
+                );
+                matches = false;
+            }
+            Some(_) => {}
+            None => {
+                agent.session_id = Some(logical_session_id.clone());
+            }
+        }
+    });
+    matches
+}
+
+fn apply_agent_start(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: AgentStartPayload,
+) {
+    log::info!(
+        "mobile_apply_agent_start host={} agent_id={} stream={}",
+        host,
+        payload.agent_id,
+        stream
+    );
+    state.agents.update(|agents| {
+        let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| agent.local_host_id == *host && agent.agent_id == payload.agent_id)
+        else {
+            log::warn!(
+                "ignoring AgentStart for unknown agent host={} agent_id={} stream={}",
+                host,
+                payload.agent_id,
+                stream
+            );
+            return;
+        };
+        if let (Some(bound_session), Some(announced_session)) =
+            (agent.session_id.as_ref(), payload.session_id.as_ref())
+            && bound_session != announced_session
+        {
+            log::error!(
+                "ignoring AgentStart with conflicting logical session host={} agent_id={} stream={} bound={} announced={}",
+                host,
+                payload.agent_id,
+                stream,
+                bound_session.0,
+                announced_session.0,
+            );
+            return;
+        }
+        agent.started = true;
+        if let Some(session_id) = payload.session_id {
+            agent.session_id = Some(session_id);
+        }
+    });
+}
+
+fn reduce_context_compaction_notify(
+    state: &AppState,
+    agent_ref: AgentRef,
+    payload: ContextCompactionNotifyPayload,
+) {
+    if payload.status.is_terminal() {
+        state.remember_terminal_context_compaction_operation(
+            &agent_ref,
+            payload.logical_session_id.clone(),
+            payload.operation_id.clone(),
+        );
+    } else if state.context_compaction_operation_is_terminal(
+        &agent_ref,
+        &payload.logical_session_id,
+        &payload.operation_id,
+    ) {
+        log::debug!(
+            "ignoring delayed context compaction progress host={} agent_id={} session={} operation={}",
+            agent_ref.local_host_id,
+            agent_ref.agent_id,
+            payload.logical_session_id.0,
+            payload.operation_id.0,
+        );
+        return;
+    }
+
+    state.context_compaction_operations.update(|operations| {
+        if payload.status.is_terminal() {
+            let is_current_operation = operations.get(&agent_ref).is_some_and(|current| {
+                current.logical_session_id == payload.logical_session_id
+                    && current.operation_id == payload.operation_id
+            });
+            if is_current_operation {
+                operations.remove(&agent_ref);
+            }
+        } else {
+            operations.insert(agent_ref, payload);
+        }
+    });
+}
+
+fn apply_team_context_compaction_notify(
+    state: &AppState,
+    host: &LocalHostId,
+    payload: TeamContextCompactionNotifyPayload,
+) {
+    for member in payload.members {
+        let Some((agent_ref, backend_kind)) = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.local_host_id == *host && agent.agent_id == member.agent_id)
+                .map(|agent| (agent.agent_ref(), agent.backend_kind))
+        }) else {
+            log::warn!(
+                "TeamContextCompactionNotify referenced unknown member host={} agent_id={}",
+                host,
+                member.agent_id,
+            );
+            continue;
+        };
+        if !context_compaction_session_matches(
+            state,
+            &agent_ref,
+            &member.logical_session_id,
+            "TeamContextCompactionNotify",
+        ) {
+            continue;
+        }
+        reduce_context_compaction_notify(
+            state,
+            agent_ref,
+            ContextCompactionNotifyPayload {
+                operation_id: member.operation_id,
+                agent_id: member.agent_id,
+                logical_session_id: member.logical_session_id,
+                backend_kind,
+                trigger: protocol::CompactionTrigger::TeamRequested,
+                method: member.method,
+                status: member.status,
+                provider_version: None,
+                metrics: Default::default(),
+                continuation: None,
+                message: member.message,
+            },
+        );
+    }
 }
 
 fn dispatch_chat_event(
@@ -1768,6 +2049,9 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 data.payload.kind()
             );
         }
+        ChatEvent::ContextCompaction(event) => {
+            state.push_context_compaction_marker(&agent_ref, event);
+        }
     }
 }
 
@@ -1781,11 +2065,39 @@ fn apply_session_history(
         local_host_id: host.clone(),
         agent_id: payload.agent_id.clone(),
     };
+    let expected = state
+        .session_history
+        .with_untracked(|map| map.get(&agent_ref).and_then(|history| history.pending_request.clone()));
+    let Some(expected) = expected else {
+        log::warn!(
+            "dropping unsolicited SessionHistory host={} agent_id={} request_id={}",
+            host,
+            payload.agent_id,
+            payload.request_id.0
+        );
+        return;
+    };
+    if expected.request_id != payload.request_id
+        || expected.before_seq != payload.request_before_seq
+    {
+        log::warn!(
+            "dropping stale SessionHistory host={} agent_id={} expected_request_id={} got_request_id={} expected_before_seq={:?} got_before_seq={:?}",
+            host,
+            payload.agent_id,
+            expected.request_id.0,
+            payload.request_id.0,
+            expected.before_seq,
+            payload.request_before_seq
+        );
+        return;
+    }
+
     let mut replay = MobileHistoryReplay::default();
     for event in payload.events {
         replay.apply(event, host, &agent_ref);
     }
 
+    let prepended_message_count = replay.rows.len();
     if !replay.rows.is_empty() {
         state.chat_messages.update(|map| {
             let current = map.remove(&agent_ref).unwrap_or_default();
@@ -1796,12 +2108,34 @@ fn apply_session_history(
         rebuild_chat_message_index(state, &agent_ref);
     }
 
+    let mut unseen_markers = Vec::new();
+    state.compaction_marker_ids.update(|indexes| {
+        let ids = indexes.entry(agent_ref.clone()).or_default();
+        for marker in replay.markers {
+            if ids.insert(marker.event.marker_id.clone()) {
+                unseen_markers.push(marker);
+            }
+        }
+    });
+    state.compaction_markers.update(|markers| {
+        let mut current = markers.remove(&agent_ref).unwrap_or_default();
+        for marker in &mut current {
+            marker.message_index = marker
+                .message_index
+                .saturating_add(prepended_message_count);
+        }
+        unseen_markers.extend(current);
+        if !unseen_markers.is_empty() {
+            markers.insert(agent_ref.clone(), unseen_markers);
+        }
+    });
+
     state.session_history.update(|map| {
         let mut remove = false;
         if let Some(history) = map.get_mut(&agent_ref) {
             history.oldest_seq = payload.oldest_seq;
             history.has_more_before = payload.has_more_before;
-            history.loading = false;
+            history.pending_request = None;
             history.message_count = 0;
             if !history.has_more_before {
                 remove = true;
@@ -1813,7 +2147,7 @@ fn apply_session_history(
                     message_count: 0,
                     oldest_seq: payload.oldest_seq,
                     has_more_before: payload.has_more_before,
-                    loading: false,
+                    pending_request: None,
                 },
             );
         }
@@ -1826,6 +2160,8 @@ fn apply_session_history(
 #[derive(Default)]
 struct MobileHistoryReplay {
     rows: Vec<ChatMessageEntry>,
+    markers: Vec<PositionedCompactionMarker>,
+    marker_ids: HashSet<protocol::CompactionObservationId>,
     message_index: HashMap<protocol::ChatMessageId, usize>,
     tool_index: HashMap<String, usize>,
 }
@@ -1907,6 +2243,14 @@ impl MobileHistoryReplay {
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
+            ChatEvent::ContextCompaction(event) => {
+                if self.marker_ids.insert(event.marker_id.clone()) {
+                    self.markers.push(PositionedCompactionMarker {
+                        message_index: self.rows.len(),
+                        event,
+                    });
+                }
+            }
         }
     }
 
@@ -2341,6 +2685,49 @@ fn apply_agent_bootstrap(
         agent_ref.agent_id,
         payload.events.len()
     );
+    let mut correlated_session_id = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| {
+                agent.local_host_id == *host && agent.agent_id == agent_ref.agent_id
+            })
+            .and_then(|agent| agent.session_id.clone())
+    });
+    let mut compaction_session_conflict = false;
+    for event in &payload.events {
+        let candidate = match event {
+            AgentBootstrapEvent::AgentStart(payload) => payload.session_id.as_ref(),
+            AgentBootstrapEvent::ContextCompaction(payload) => {
+                Some(&payload.logical_session_id)
+            }
+            AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+                Some(&payload.logical_session_id)
+            }
+            AgentBootstrapEvent::AgentError(_)
+            | AgentBootstrapEvent::SessionSettings(_)
+            | AgentBootstrapEvent::QueuedMessages(_)
+            | AgentBootstrapEvent::AgentActivityStats(_)
+            | AgentBootstrapEvent::ChatEvent(_)
+            | AgentBootstrapEvent::HasPriorHistory { .. } => None,
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if let Some(current) = correlated_session_id.as_ref()
+            && current != candidate
+        {
+            log::error!(
+                "agent bootstrap carried conflicting compaction sessions host={} stream={} first={} next={}",
+                host,
+                stream,
+                current.0,
+                candidate.0,
+            );
+            compaction_session_conflict = true;
+            break;
+        }
+        correlated_session_id = Some(candidate.clone());
+    }
     state.agent_load_requests.update(|m| {
         m.insert(agent_ref.clone());
     });
@@ -2357,6 +2744,12 @@ fn apply_agent_bootstrap(
         m.remove(&agent_ref);
     });
     state.chat_message_index.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.compaction_markers.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.compaction_marker_ids.update(|m| {
         m.remove(&agent_ref);
     });
     state.forget_session_history(&agent_ref);
@@ -2378,21 +2771,18 @@ fn apply_agent_bootstrap(
     state.agent_session_settings.update(|m| {
         m.remove(&agent_ref);
     });
+    state.context_compaction_operations.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.context_compaction_capabilities.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.forget_terminal_context_compaction_operations(&agent_ref);
 
     for event in payload.events {
         match event {
             AgentBootstrapEvent::AgentStart(inner) => {
-                state.agents.update(|agents| {
-                    if let Some(agent) = agents
-                        .iter_mut()
-                        .find(|a| a.local_host_id == *host && a.agent_id == agent_ref.agent_id)
-                    {
-                        agent.started = true;
-                        if let Some(session_id) = inner.session_id {
-                            agent.session_id = Some(session_id);
-                        }
-                    }
-                });
+                apply_agent_start(state, host, stream, inner);
             }
             AgentBootstrapEvent::AgentError(inner) => {
                 apply_agent_error(state, &agent_ref, &inner);
@@ -2419,7 +2809,7 @@ fn apply_agent_bootstrap(
                                 message_count,
                                 oldest_seq: Some(before_seq),
                                 has_more_before: true,
-                                loading: false,
+                                pending_request: None,
                             },
                         );
                     });
@@ -2427,6 +2817,56 @@ fn apply_agent_bootstrap(
             }
             AgentBootstrapEvent::ChatEvent(event) => {
                 apply_chat_event(state, &agent_ref, event);
+            }
+            AgentBootstrapEvent::ContextCompaction(payload) => {
+                if compaction_session_conflict {
+                    continue;
+                }
+                if payload.agent_id != agent_ref.agent_id {
+                    log::error!(
+                        "bootstrap ContextCompaction agent mismatch host={} stream={} expected={} got={}",
+                        host,
+                        stream,
+                        agent_ref.agent_id,
+                        payload.agent_id,
+                    );
+                    continue;
+                }
+                if context_compaction_session_matches(
+                    state,
+                    &agent_ref,
+                    &payload.logical_session_id,
+                    "bootstrap ContextCompaction",
+                ) {
+                    reduce_context_compaction_notify(state, agent_ref.clone(), payload);
+                }
+            }
+            AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+                if compaction_session_conflict {
+                    continue;
+                }
+                if payload.agent_id != agent_ref.agent_id {
+                    log::error!(
+                        "bootstrap ContextCompactionCapability agent mismatch host={} stream={} expected={} got={}",
+                        host,
+                        stream,
+                        agent_ref.agent_id,
+                        payload.agent_id,
+                    );
+                    continue;
+                }
+                if context_compaction_session_matches(
+                    state,
+                    &agent_ref,
+                    &payload.logical_session_id,
+                    "bootstrap ContextCompactionCapability",
+                ) {
+                    state
+                        .context_compaction_capabilities
+                        .update(|capabilities| {
+                            capabilities.insert(agent_ref.clone(), payload);
+                        });
+                }
             }
             // Mobile does not surface the agent-control activity stats line
             // (no await progress card UX), mirroring how it drops the
@@ -2575,6 +3015,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
         ChatEvent::Orchestration(_) => "Orchestration",
+        ChatEvent::ContextCompaction(_) => "ContextCompaction",
     }
 }
 
@@ -2606,6 +3047,19 @@ mod tests {
             local_host_id: host.clone(),
             agent_id,
         }
+    }
+
+    fn bind_agent_session(state: &AppState, agent_ref: &AgentRef, session_id: &str) {
+        state.agents.update(|agents| {
+            let agent = agents
+                .iter_mut()
+                .find(|agent| {
+                    agent.local_host_id == agent_ref.local_host_id
+                        && agent.agent_id == agent_ref.agent_id
+                })
+                .expect("seeded agent");
+            agent.session_id = Some(protocol::SessionId(session_id.to_owned()));
+        });
     }
 
     /// Put an agent in the exact shape a live turn leaves behind: an open
@@ -2645,6 +3099,641 @@ mod tests {
             message: message.to_owned(),
             fatal: true,
         }
+    }
+
+    fn compaction_marker(id: &str) -> protocol::ContextCompactionTimelineEvent {
+        protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId(id.to_owned()),
+            operation_id: None,
+            trigger: protocol::CompactionTrigger::BackendAutomatic,
+            method: protocol::CompactionMethod::BackendAutomatic,
+            backend_kind: protocol::BackendKind::Claude,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: protocol::CompactionMetrics {
+                before_tokens: Some(384_168),
+                after_tokens: Some(12_518),
+                ..Default::default()
+            },
+            continuation: None,
+            message: None,
+            timestamp: 10,
+        }
+    }
+
+    fn chat_message(content: &str) -> protocol::ChatMessage {
+        protocol::ChatMessage {
+            message_id: None,
+            timestamp: 0,
+            sender: protocol::MessageSender::User,
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn compaction_notify(
+        agent_id: &AgentId,
+        status: protocol::ContextCompactionStatus,
+    ) -> protocol::ContextCompactionNotifyPayload {
+        protocol::ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId("operation-1".to_owned()),
+            agent_id: agent_id.clone(),
+            logical_session_id: protocol::SessionId("logical-session".to_owned()),
+            backend_kind: protocol::BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: Some(protocol::CompactionMethod::NativeTextCommand),
+            status,
+            provider_version: Some("2.1.220".to_owned()),
+            metrics: Default::default(),
+            continuation: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn context_compaction_marker_is_positioned_and_deduplicated() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("marker-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "marker-agent");
+
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::MessageAdded(chat_message("before")),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::ContextCompaction(compaction_marker("boundary-1")),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::ContextCompaction(compaction_marker("boundary-1")),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::MessageAdded(chat_message("after")),
+            );
+
+            let markers = state
+                .compaction_markers
+                .with_untracked(|markers| markers.get(&agent_ref).cloned())
+                .expect("marker row");
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].message_index, 1);
+            assert_eq!(markers[0].event.marker_id.0, "boundary-1");
+        });
+    }
+
+    #[test]
+    fn stale_history_page_is_rejected_by_request_id_and_cursor() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("history-correlation-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "history-correlation-agent");
+            state.session_history.update(|history| {
+                history.insert(
+                    agent_ref.clone(),
+                    SessionHistoryState {
+                        message_count: 2,
+                        oldest_seq: Some(20),
+                        has_more_before: true,
+                        pending_request: Some(PendingSessionHistoryRequest {
+                            request_id: protocol::HistoryPageRequestId("current".to_owned()),
+                            before_seq: Some(20),
+                        }),
+                    },
+                );
+            });
+
+            apply_session_history(
+                &state,
+                &host,
+                &StreamPath("/agent/history-correlation-agent/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    request_id: protocol::HistoryPageRequestId("stale".to_owned()),
+                    request_before_seq: Some(20),
+                    events: vec![ChatEvent::MessageAdded(chat_message("stale"))],
+                    has_more_before: true,
+                    oldest_seq: Some(10),
+                },
+            );
+            assert!(
+                state
+                    .chat_messages
+                    .with_untracked(|messages| messages.get(&agent_ref).is_none())
+            );
+            assert_eq!(
+                state.session_history.with_untracked(|history| {
+                    history
+                        .get(&agent_ref)
+                        .and_then(|history| history.pending_request.as_ref())
+                        .map(|pending| pending.request_id.0.clone())
+                }),
+                Some("current".to_owned())
+            );
+
+            apply_session_history(
+                &state,
+                &host,
+                &StreamPath("/agent/history-correlation-agent/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    request_id: protocol::HistoryPageRequestId("current".to_owned()),
+                    request_before_seq: Some(19),
+                    events: vec![ChatEvent::MessageAdded(chat_message("wrong cursor"))],
+                    has_more_before: true,
+                    oldest_seq: Some(10),
+                },
+            );
+            assert!(
+                state
+                    .chat_messages
+                    .with_untracked(|messages| messages.get(&agent_ref).is_none())
+            );
+
+            apply_session_history(
+                &state,
+                &host,
+                &StreamPath("/agent/history-correlation-agent/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    request_id: protocol::HistoryPageRequestId("current".to_owned()),
+                    request_before_seq: Some(20),
+                    events: vec![
+                        ChatEvent::MessageAdded(chat_message("before marker")),
+                        ChatEvent::ContextCompaction(compaction_marker("history-boundary")),
+                        ChatEvent::MessageAdded(chat_message("after marker")),
+                    ],
+                    has_more_before: false,
+                    oldest_seq: Some(10),
+                },
+            );
+            let rows = state
+                .chat_messages
+                .with_untracked(|messages| messages.get(&agent_ref).cloned())
+                .expect("accepted page");
+            assert_eq!(rows.len(), 2);
+            let markers = state
+                .compaction_markers
+                .with_untracked(|markers| markers.get(&agent_ref).cloned())
+                .expect("history marker");
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].message_index, 1);
+        });
+    }
+
+    #[test]
+    fn compaction_bootstrap_restores_nonterminal_status_capability_and_marker() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("compaction-bootstrap-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "compaction-bootstrap-agent");
+            let stream = StreamPath("/agent/compaction-bootstrap-agent/inst".to_owned());
+            let notify = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Deferred {
+                    stage: protocol::CompactionStage::WaitingForIdle,
+                },
+            );
+            let capability = protocol::ContextCompactionCapabilityPayload {
+                agent_id: agent_ref.agent_id.clone(),
+                logical_session_id: protocol::SessionId("logical-session".to_owned()),
+                availability: protocol::RequestedCompactionAvailability::Available {
+                    route: protocol::RequestedCompactionRoute::NativePreferred,
+                },
+            };
+
+            apply_agent_bootstrap(
+                &state,
+                &host,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ContextCompaction(notify.clone()),
+                        AgentBootstrapEvent::ContextCompactionCapability(capability.clone()),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(
+                            compaction_marker("bootstrap-boundary"),
+                        )),
+                        AgentBootstrapEvent::AgentStart(AgentStartPayload {
+                            agent_id: agent_ref.agent_id.clone(),
+                            name: "Agent".to_owned(),
+                            origin: protocol::AgentOrigin::User,
+                            backend_kind: protocol::BackendKind::Codex,
+                            launch_profile_id: None,
+                            workspace_roots: Vec::new(),
+                            custom_agent_id: None,
+                            team_id: None,
+                            team_member_id: None,
+                            project_id: None,
+                            parent_agent_id: None,
+                            session_id: Some(protocol::SessionId(
+                                "logical-session".to_owned(),
+                            )),
+                            workflow: None,
+                            created_at_ms: 0,
+                        }),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert_eq!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| operations.get(&agent_ref).cloned()),
+                Some(notify)
+            );
+            assert_eq!(
+                state
+                    .context_compaction_capabilities
+                    .with_untracked(|capabilities| capabilities.get(&agent_ref).cloned()),
+                Some(capability)
+            );
+            assert_eq!(
+                state.compaction_markers.with_untracked(|markers| {
+                    markers.get(&agent_ref).map_or(0, Vec::len)
+                }),
+                1
+            );
+
+            apply_context_compaction_notify(
+                &state,
+                &host,
+                &stream,
+                compaction_notify(
+                    &agent_ref.agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+            );
+            assert!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| !operations.contains_key(&agent_ref)),
+                "terminal notify clears the mobile header operation state"
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_notifies_are_correlated_to_session_and_operation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("compaction-session-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "compaction-session-agent");
+            let stream = StreamPath("/agent/compaction-session-agent/inst".to_owned());
+            bind_agent_session(&state, &agent_ref, "logical-session");
+
+            let capability = protocol::ContextCompactionCapabilityPayload {
+                agent_id: agent_ref.agent_id.clone(),
+                logical_session_id: protocol::SessionId("logical-session".to_owned()),
+                availability: protocol::RequestedCompactionAvailability::Available {
+                    route: protocol::RequestedCompactionRoute::NativePreferred,
+                },
+            };
+            apply_context_compaction_capability(
+                &state,
+                &host,
+                &stream,
+                capability.clone(),
+            );
+            let mut stale_capability = capability.clone();
+            stale_capability.logical_session_id =
+                protocol::SessionId("prior-session".to_owned());
+            apply_context_compaction_capability(
+                &state,
+                &host,
+                &stream,
+                stale_capability,
+            );
+            assert_eq!(
+                state
+                    .context_compaction_capabilities
+                    .with_untracked(|capabilities| capabilities.get(&agent_ref).cloned()),
+                Some(capability),
+                "a prior-session capability cannot replace the current session snapshot"
+            );
+
+            let active = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Progress {
+                    stage: protocol::CompactionStage::Compacting,
+                },
+            );
+            apply_context_compaction_notify(&state, &host, &stream, active.clone());
+
+            let mut stale_session = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Completed,
+            );
+            stale_session.logical_session_id = protocol::SessionId("prior-session".to_owned());
+            apply_context_compaction_notify(&state, &host, &stream, stale_session);
+            assert_eq!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| operations.get(&agent_ref).cloned()),
+                Some(active.clone()),
+                "a prior-session terminal notify cannot clear the current operation"
+            );
+
+            let mut stale_operation = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Completed,
+            );
+            stale_operation.operation_id =
+                protocol::CompactionOperationId("prior-operation".to_owned());
+            apply_context_compaction_notify(&state, &host, &stream, stale_operation);
+            assert_eq!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| operations.get(&agent_ref).cloned()),
+                Some(active),
+                "a terminal notify for another operation cannot clear the current one"
+            );
+
+            apply_context_compaction_notify(
+                &state,
+                &host,
+                &stream,
+                compaction_notify(
+                    &agent_ref.agent_id,
+                    protocol::ContextCompactionStatus::Completed,
+                ),
+            );
+            assert!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| !operations.contains_key(&agent_ref)),
+                "the authoritative terminal notify clears its matching operation"
+            );
+
+            apply_context_compaction_notify(&state, &host, &stream, active);
+            assert!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| !operations.contains_key(&agent_ref)),
+                "delayed progress cannot resurrect a terminal operation"
+            );
+
+            for index in 0..40 {
+                let mut terminal = compaction_notify(
+                    &agent_ref.agent_id,
+                    protocol::ContextCompactionStatus::Failed {
+                        accepted: true,
+                        mutation: protocol::CompactionMutation::Completed,
+                    },
+                );
+                terminal.operation_id =
+                    protocol::CompactionOperationId(format!("terminal-{index}"));
+                reduce_context_compaction_notify(&state, agent_ref.clone(), terminal);
+            }
+            assert_eq!(
+                state.terminal_context_compaction_operation_count(&agent_ref),
+                32,
+                "terminal operation memory is bounded"
+            );
+        });
+    }
+
+    #[test]
+    fn agent_start_rejects_logical_session_rotation_without_clearing_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("agent-start-session-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "agent-start-session-agent");
+            let stream = StreamPath("/agent/agent-start-session-agent/inst".to_owned());
+            bind_agent_session(&state, &agent_ref, "logical-session");
+            state.agents.update(|agents| {
+                agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_ref() == agent_ref)
+                    .expect("seeded agent")
+                    .started = false;
+            });
+            let active = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Started {
+                    stage: protocol::CompactionStage::Compacting,
+                },
+            );
+            reduce_context_compaction_notify(&state, agent_ref.clone(), active.clone());
+
+            apply_agent_start(
+                &state,
+                &host,
+                &stream,
+                AgentStartPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    name: "Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
+                    workspace_roots: Vec::new(),
+                    custom_agent_id: None,
+                    team_id: None,
+                    team_member_id: None,
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: Some(protocol::SessionId("rotated-session".to_owned())),
+                    workflow: None,
+                    created_at_ms: 0,
+                },
+            );
+
+            let agent = state
+                .agents
+                .with_untracked(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.agent_ref() == agent_ref)
+                        .cloned()
+                })
+                .expect("seeded agent remains");
+            assert_eq!(
+                agent.session_id,
+                Some(protocol::SessionId("logical-session".to_owned()))
+            );
+            assert!(!agent.started, "the conflicting AgentStart is rejected");
+            assert_eq!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| operations.get(&agent_ref).cloned()),
+                Some(active),
+                "a conflicting AgentStart cannot clear the stable session's operation"
+            );
+
+            apply_agent_start(
+                &state,
+                &host,
+                &stream,
+                AgentStartPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    name: "Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
+                    workspace_roots: Vec::new(),
+                    custom_agent_id: None,
+                    team_id: None,
+                    team_member_id: None,
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                },
+            );
+            assert!(
+                state.agents.with_untracked(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.agent_ref() == agent_ref)
+                        .is_some_and(|agent| {
+                            agent.started
+                                && agent.session_id
+                                    == Some(protocol::SessionId(
+                                        "logical-session".to_owned(),
+                                    ))
+                        })
+                }),
+                "an incomplete AgentStart is tolerated without erasing known identity"
+            );
+        });
+    }
+
+    #[test]
+    fn conflicting_bootstrap_compaction_sessions_are_rejected() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("compaction-bootstrap-conflict-host".to_owned());
+            let agent_ref = seed_agent(
+                &state,
+                &host,
+                "compaction-bootstrap-conflict-agent",
+            );
+            let stream =
+                StreamPath("/agent/compaction-bootstrap-conflict-agent/inst".to_owned());
+            bind_agent_session(&state, &agent_ref, "logical-session");
+            let mut conflicting_capability =
+                protocol::ContextCompactionCapabilityPayload {
+                    agent_id: agent_ref.agent_id.clone(),
+                    logical_session_id: protocol::SessionId(
+                        "logical-session".to_owned(),
+                    ),
+                    availability:
+                        protocol::RequestedCompactionAvailability::Available {
+                            route:
+                                protocol::RequestedCompactionRoute::NativePreferred,
+                        },
+                };
+            conflicting_capability.logical_session_id =
+                protocol::SessionId("other-session".to_owned());
+
+            apply_agent_bootstrap(
+                &state,
+                &host,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ContextCompaction(compaction_notify(
+                            &agent_ref.agent_id,
+                            protocol::ContextCompactionStatus::Started {
+                                stage: protocol::CompactionStage::Compacting,
+                            },
+                        )),
+                        AgentBootstrapEvent::ContextCompactionCapability(
+                            conflicting_capability,
+                        ),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| !operations.contains_key(&agent_ref))
+            );
+            assert!(
+                state
+                    .context_compaction_capabilities
+                    .with_untracked(|capabilities| !capabilities.contains_key(&agent_ref))
+            );
+        });
+    }
+
+    #[test]
+    fn team_member_results_use_the_member_logical_session() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("team-compaction-session-host".to_owned());
+            let agent_ref = seed_agent(&state, &host, "team-compaction-member");
+            bind_agent_session(&state, &agent_ref, "current-session");
+
+            let mut active = compaction_notify(
+                &agent_ref.agent_id,
+                protocol::ContextCompactionStatus::Started {
+                    stage: protocol::CompactionStage::Compacting,
+                },
+            );
+            active.logical_session_id = protocol::SessionId("current-session".to_owned());
+            active.operation_id = protocol::CompactionOperationId("member-operation".to_owned());
+            reduce_context_compaction_notify(&state, agent_ref.clone(), active.clone());
+
+            let team_payload = |session_id: &str| TeamContextCompactionNotifyPayload {
+                team_operation_id: protocol::CompactionOperationId("team-operation".to_owned()),
+                team_id: protocol::TeamId("team".to_owned()),
+                status: protocol::TeamContextCompactionStatus::Completed,
+                members: vec![protocol::TeamMemberContextCompactionResult {
+                    agent_id: agent_ref.agent_id.clone(),
+                    logical_session_id: protocol::SessionId(session_id.to_owned()),
+                    operation_id: protocol::CompactionOperationId(
+                        "member-operation".to_owned(),
+                    ),
+                    method: Some(protocol::CompactionMethod::NativeTextCommand),
+                    status: protocol::ContextCompactionStatus::Completed,
+                    mutation: protocol::CompactionMutation::Completed,
+                    message: None,
+                }],
+                message: None,
+            };
+
+            apply_team_context_compaction_notify(&state, &host, team_payload("prior-session"));
+            assert_eq!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| operations.get(&agent_ref).cloned()),
+                Some(active),
+                "a team result for a member's prior session is ignored"
+            );
+
+            apply_team_context_compaction_notify(&state, &host, team_payload("current-session"));
+            assert!(
+                state
+                    .context_compaction_operations
+                    .with_untracked(|operations| !operations.contains_key(&agent_ref)),
+                "the matching per-member notify result is authoritative"
+            );
+        });
     }
 
     fn is_settled(state: &AppState, agent_ref: &AgentRef) -> bool {
@@ -3068,6 +4157,21 @@ mod tests {
                 local_host_id: host.clone(),
                 agent_id: payload_agent.clone(),
             };
+            let request_id = protocol::HistoryPageRequestId("history-page".to_owned());
+            state.session_history.update(|history| {
+                history.insert(
+                    agent_ref.clone(),
+                    SessionHistoryState {
+                        message_count: 2,
+                        oldest_seq: Some(10),
+                        has_more_before: true,
+                        pending_request: Some(PendingSessionHistoryRequest {
+                            request_id: request_id.clone(),
+                            before_seq: Some(10),
+                        }),
+                    },
+                );
+            });
             let message = |id: &str, content: &str| protocol::ChatMessage {
                 message_id: Some(protocol::ChatMessageId(id.to_owned())),
                 timestamp: 0,
@@ -3089,6 +4193,8 @@ mod tests {
                 &StreamPath("/agent/different-stream-owner/inst".to_owned()),
                 SessionHistoryPayload {
                     agent_id: payload_agent,
+                    request_id,
+                    request_before_seq: Some(10),
                     events: vec![
                         ChatEvent::MessageAdded(message("first", "first delivered")),
                         ChatEvent::MessageAdded(message("second", "second delivered")),
@@ -4318,7 +5424,10 @@ mod wasm_tests {
                     message_count: 3,
                     oldest_seq: Some(5),
                     has_more_before: true,
-                    loading: true,
+                    pending_request: Some(PendingSessionHistoryRequest {
+                        request_id: protocol::HistoryPageRequestId("history-request".to_owned()),
+                        before_seq: Some(5),
+                    }),
                 },
             );
         });
@@ -4342,13 +5451,12 @@ mod wasm_tests {
             ),
         );
 
-        let loading = state
+        let pending = state
             .session_history
-            .with_untracked(|m| m.get(&agent_ref).map(|h| h.loading));
+            .with_untracked(|m| m.get(&agent_ref).and_then(|h| h.pending_request.clone()));
         assert_eq!(
-            loading,
-            Some(false),
-            "FetchSessionHistory error must clear the history loading flag"
+            pending, None,
+            "FetchSessionHistory error must clear the pending history request"
         );
         assert!(
             state

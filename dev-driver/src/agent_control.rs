@@ -10,11 +10,12 @@ use protocol::{
     AgentBootstrapPayload, AgentControlLatestOutput, AgentControlReadDebugResult,
     AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload,
     AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent,
-    Envelope, FrameKind, HostBootstrapPayload, HostSettings, HostSettingsPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostSettings, HostSettingsPayload,
     LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
     MessageSender, NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
-    SpawnCostHint, StreamPath, cap_agent_control_events,
+    SessionId, SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, StreamPath, TeamContextCompactionNotifyPayload, cap_agent_control_events,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -41,6 +42,7 @@ struct AgentState {
     workspace_roots: Vec<String>,
     project_id: Option<ProjectId>,
     parent_agent_id: Option<AgentId>,
+    logical_session_id: Option<SessionId>,
     created_at_ms: u64,
     instance_stream: StreamPath,
     /// True between StreamStart and StreamEnd.
@@ -804,6 +806,7 @@ fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayloa
             workspace_roots: payload.workspace_roots,
             project_id: payload.project_id,
             parent_agent_id: payload.parent_agent_id,
+            logical_session_id: payload.session_id,
             created_at_ms: payload.created_at_ms,
             instance_stream: payload.instance_stream,
             is_thinking: false,
@@ -835,6 +838,18 @@ fn apply_agent_bootstrap_event(
         AgentBootstrapEvent::QueuedMessages(payload) => {
             Envelope::from_payload(stream.clone(), FrameKind::QueuedMessages, 0, &payload)
         }
+        AgentBootstrapEvent::ContextCompaction(payload) => Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ContextCompactionNotify,
+            0,
+            &payload,
+        ),
+        AgentBootstrapEvent::ContextCompactionCapability(payload) => Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ContextCompactionCapability,
+            0,
+            &payload,
+        ),
         AgentBootstrapEvent::ChatEvent(payload) => {
             Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, 0, &payload)
         }
@@ -843,6 +858,33 @@ fn apply_agent_bootstrap_event(
     }
     .expect("serialize AgentBootstrap event");
     apply_envelope(snapshot, &envelope);
+}
+
+fn correlate_compaction_session(
+    snapshot: &mut SnapshotState,
+    agent_id: &AgentId,
+    logical_session_id: &SessionId,
+    frame: &str,
+) {
+    let agent = snapshot.agents.get_mut(agent_id).unwrap_or_else(|| {
+        panic!(
+            "{frame} arrived for unknown agent {}",
+            agent_id.0,
+        )
+    });
+    match agent.logical_session_id.as_ref() {
+        Some(bound_session) => assert_eq!(
+            bound_session,
+            logical_session_id,
+            "{frame} logical session {} must match agent {} session {}",
+            logical_session_id.0,
+            agent_id.0,
+            bound_session.0,
+        ),
+        None => {
+            agent.logical_session_id = Some(logical_session_id.clone());
+        }
+    }
 }
 
 fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
@@ -918,9 +960,23 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 "agent_start payload agent_id {} must match stream {}",
                 payload.agent_id.0, envelope.stream.0
             );
-            if let Some(agent) = snapshot.agents.get_mut(&payload.agent_id) {
-                agent.activity_counter = agent.activity_counter.saturating_add(1);
+            let Some(agent) = snapshot.agents.get_mut(&payload.agent_id) else {
+                return;
+            };
+            if let Some(session_id) = payload.session_id.as_ref() {
+                match agent.logical_session_id.as_ref() {
+                    Some(bound_session) => assert_eq!(
+                        bound_session,
+                        session_id,
+                        "AgentStart logical session {} must match agent {} session {}",
+                        session_id.0,
+                        payload.agent_id.0,
+                        bound_session.0,
+                    ),
+                    None => agent.logical_session_id = Some(session_id.clone()),
+                }
             }
+            agent.activity_counter = agent.activity_counter.saturating_add(1);
         }
         FrameKind::ChatEvent => {
             let payload: ChatEvent = envelope
@@ -968,7 +1024,63 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 | ChatEvent::ToolExecutionCompleted(_)
                 | ChatEvent::TaskUpdate(_)
                 | ChatEvent::RetryAttempt(_)
-                | ChatEvent::Orchestration(_) => {}
+                | ChatEvent::Orchestration(_)
+                | ChatEvent::ContextCompaction(_) => {}
+            }
+        }
+        FrameKind::ContextCompactionNotify => {
+            let payload: ContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("validated ContextCompactionNotify payload should parse");
+            let stream_agent_id = parse_agent_id_from_stream(&envelope.stream);
+            assert_eq!(
+                stream_agent_id, payload.agent_id,
+                "context compaction payload agent_id {} must match stream {}",
+                payload.agent_id.0, envelope.stream.0,
+            );
+            correlate_compaction_session(
+                snapshot,
+                &payload.agent_id,
+                &payload.logical_session_id,
+                "ContextCompactionNotify",
+            );
+        }
+        FrameKind::ContextCompactionCapability => {
+            let payload: ContextCompactionCapabilityPayload = envelope
+                .parse_payload()
+                .expect("validated ContextCompactionCapability payload should parse");
+            let stream_agent_id = parse_agent_id_from_stream(&envelope.stream);
+            assert_eq!(
+                stream_agent_id, payload.agent_id,
+                "context compaction capability agent_id {} must match stream {}",
+                payload.agent_id.0, envelope.stream.0,
+            );
+            correlate_compaction_session(
+                snapshot,
+                &payload.agent_id,
+                &payload.logical_session_id,
+                "ContextCompactionCapability",
+            );
+        }
+        FrameKind::TeamContextCompactionNotify => {
+            let payload: TeamContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("validated TeamContextCompactionNotify payload should parse");
+            for member in payload.members {
+                if !snapshot.agents.contains_key(&member.agent_id) {
+                    tracing::warn!(
+                        agent_id = %member.agent_id,
+                        logical_session_id = %member.logical_session_id,
+                        "skipping unknown member in host-scoped team compaction notification"
+                    );
+                    continue;
+                }
+                correlate_compaction_session(
+                    snapshot,
+                    &member.agent_id,
+                    &member.logical_session_id,
+                    "TeamContextCompactionNotify",
+                );
             }
         }
         FrameKind::AgentRenamed => {
@@ -1946,7 +2058,17 @@ mod tests {
                     ChatEvent::OperationCancelled(data) => data.message.contains(expected_text),
                     ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
                     ChatEvent::StreamDelta(delta) => delta.text.contains(expected_text),
-                    _ => false,
+                    ChatEvent::MessageMetadataUpdated(_)
+                    | ChatEvent::TypingStatusChanged(_)
+                    | ChatEvent::StreamStart(_)
+                    | ChatEvent::StreamReasoningDelta(_)
+                    | ChatEvent::ToolRequest(_)
+                    | ChatEvent::ToolProgress(_)
+                    | ChatEvent::ToolExecutionCompleted(_)
+                    | ChatEvent::TaskUpdate(_)
+                    | ChatEvent::RetryAttempt(_)
+                    | ChatEvent::Orchestration(_)
+                    | ChatEvent::ContextCompaction(_) => false,
                 }
             }),
             "expected read output to contain {expected_text:?}, got {:?}",
@@ -1959,7 +2081,19 @@ mod tests {
         match event {
             ChatEvent::StreamEnd(data) => data.message.content.contains(expected_text),
             ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
-            _ => false,
+            ChatEvent::MessageMetadataUpdated(_)
+            | ChatEvent::TypingStatusChanged(_)
+            | ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::ToolRequest(_)
+            | ChatEvent::ToolProgress(_)
+            | ChatEvent::ToolExecutionCompleted(_)
+            | ChatEvent::TaskUpdate(_)
+            | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::Orchestration(_)
+            | ChatEvent::ContextCompaction(_) => false,
         }
     }
 
@@ -2014,6 +2148,8 @@ mod tests {
                                 .unwrap_or_else(|| parse_agent_id_from_stream(&env.stream));
                         }
                     }
+                    FrameKind::ContextCompactionNotify
+                    | FrameKind::ContextCompactionCapability => {}
                     _ => {}
                 }
             }
@@ -2042,7 +2178,21 @@ mod tests {
                 ChatEvent::StreamEnd(data) if data.message.content.contains(expected_text) => {
                     saw_stream_end = true;
                 }
-                _ => {}
+                ChatEvent::MessageAdded(_)
+                | ChatEvent::MessageMetadataUpdated(_)
+                | ChatEvent::TypingStatusChanged(_)
+                | ChatEvent::StreamStart(_)
+                | ChatEvent::StreamDelta(_)
+                | ChatEvent::StreamReasoningDelta(_)
+                | ChatEvent::StreamEnd(_)
+                | ChatEvent::ToolRequest(_)
+                | ChatEvent::ToolProgress(_)
+                | ChatEvent::ToolExecutionCompleted(_)
+                | ChatEvent::TaskUpdate(_)
+                | ChatEvent::OperationCancelled(_)
+                | ChatEvent::RetryAttempt(_)
+                | ChatEvent::Orchestration(_)
+                | ChatEvent::ContextCompaction(_) => {}
             }
         }
         assert!(
@@ -2178,6 +2328,7 @@ mod tests {
             workspace_roots: vec!["/tmp/test".to_owned()],
             project_id: None,
             parent_agent_id: None,
+            logical_session_id: Some(SessionId("logical-session".to_owned())),
             created_at_ms: 1,
             instance_stream: StreamPath(
                 "/agent/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440001"
@@ -2191,6 +2342,206 @@ mod tests {
             event_log: Vec::new(),
             latest_output: AgentControlLatestOutput::default(),
         }
+    }
+
+    fn context_compaction_notify(
+        agent_id: &AgentId,
+        session_id: &str,
+    ) -> ContextCompactionNotifyPayload {
+        ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId("operation".to_owned()),
+            agent_id: agent_id.clone(),
+            logical_session_id: SessionId(session_id.to_owned()),
+            backend_kind: BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: Some(protocol::CompactionMethod::NativeTextCommand),
+            status: protocol::ContextCompactionStatus::Started {
+                stage: protocol::CompactionStage::Compacting,
+            },
+            provider_version: None,
+            metrics: Default::default(),
+            continuation: None,
+            message: None,
+        }
+    }
+
+    fn agent_start_payload(agent_id: &AgentId, session_id: Option<&str>) -> AgentStartPayload {
+        AgentStartPayload {
+            agent_id: agent_id.clone(),
+            name: "worker".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            session_id: session_id.map(|session| SessionId(session.to_owned())),
+            workflow: None,
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn compaction_notify_can_establish_missing_agent_session() {
+        let agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let mut agent = test_agent_state(agent_id.clone());
+        agent.logical_session_id = None;
+        let mut snapshot = SnapshotState::default();
+        snapshot.agents.insert(agent_id.clone(), agent);
+        let envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                agent_id.0
+            )),
+            FrameKind::ContextCompactionNotify,
+            0,
+            &context_compaction_notify(&agent_id, "notify-session"),
+        )
+        .expect("context compaction envelope");
+
+        apply_envelope(&mut snapshot, &envelope);
+
+        assert_eq!(
+            snapshot.agents[&agent_id].logical_session_id,
+            Some(SessionId("notify-session".to_owned()))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TeamContextCompactionNotify logical session")]
+    fn team_compaction_member_must_match_agent_session() {
+        let agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot
+            .agents
+            .insert(agent_id.clone(), test_agent_state(agent_id.clone()));
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/test".to_owned()),
+            FrameKind::TeamContextCompactionNotify,
+            0,
+            &TeamContextCompactionNotifyPayload {
+                team_operation_id: protocol::CompactionOperationId("team-operation".to_owned()),
+                team_id: protocol::TeamId("team".to_owned()),
+                status: protocol::TeamContextCompactionStatus::Completed,
+                members: vec![protocol::TeamMemberContextCompactionResult {
+                    agent_id,
+                    logical_session_id: SessionId("other-session".to_owned()),
+                    operation_id: protocol::CompactionOperationId(
+                        "member-operation".to_owned(),
+                    ),
+                    method: Some(protocol::CompactionMethod::NativeTextCommand),
+                    status: protocol::ContextCompactionStatus::Completed,
+                    mutation: protocol::CompactionMutation::Completed,
+                    message: None,
+                }],
+                message: None,
+            },
+        )
+        .expect("team context compaction envelope");
+
+        apply_envelope(&mut snapshot, &envelope);
+    }
+
+    #[test]
+    fn team_compaction_skips_unknown_host_scoped_members() {
+        let unknown_agent_id =
+            AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
+        let mut snapshot = SnapshotState::default();
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/test".to_owned()),
+            FrameKind::TeamContextCompactionNotify,
+            0,
+            &TeamContextCompactionNotifyPayload {
+                team_operation_id:
+                    protocol::CompactionOperationId("team-operation".to_owned()),
+                team_id: protocol::TeamId("team".to_owned()),
+                status: protocol::TeamContextCompactionStatus::Completed,
+                members: vec![protocol::TeamMemberContextCompactionResult {
+                    agent_id: unknown_agent_id,
+                    logical_session_id: SessionId("logical-session".to_owned()),
+                    operation_id:
+                        protocol::CompactionOperationId("member-operation".to_owned()),
+                    method: Some(protocol::CompactionMethod::NativeTextCommand),
+                    status: protocol::ContextCompactionStatus::Completed,
+                    mutation: protocol::CompactionMutation::Completed,
+                    message: None,
+                }],
+                message: None,
+            },
+        )
+        .expect("team context compaction envelope");
+
+        apply_envelope(&mut snapshot, &envelope);
+
+        assert!(snapshot.agents.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "AgentStart logical session")]
+    fn agent_start_rejects_logical_session_rotation() {
+        let agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot
+            .agents
+            .insert(agent_id.clone(), test_agent_state(agent_id.clone()));
+        let envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                agent_id.0
+            )),
+            FrameKind::AgentStart,
+            0,
+            &agent_start_payload(&agent_id, Some("rotated-session")),
+        )
+        .expect("AgentStart envelope");
+
+        apply_envelope(&mut snapshot, &envelope);
+    }
+
+    #[test]
+    fn agent_start_retains_deliberate_tolerance() {
+        let known_agent_id =
+            AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let unknown_agent_id =
+            AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot.agents.insert(
+            known_agent_id.clone(),
+            test_agent_state(known_agent_id.clone()),
+        );
+        let known_envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                known_agent_id.0
+            )),
+            FrameKind::AgentStart,
+            0,
+            &agent_start_payload(&known_agent_id, None),
+        )
+        .expect("known AgentStart envelope");
+        let unknown_envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                unknown_agent_id.0
+            )),
+            FrameKind::AgentStart,
+            0,
+            &agent_start_payload(&unknown_agent_id, Some("logical-session")),
+        )
+        .expect("unknown AgentStart envelope");
+
+        apply_envelope(&mut snapshot, &known_envelope);
+        apply_envelope(&mut snapshot, &unknown_envelope);
+
+        assert_eq!(
+            snapshot.agents[&known_agent_id].logical_session_id,
+            Some(SessionId("logical-session".to_owned()))
+        );
+        assert_eq!(snapshot.agents[&known_agent_id].activity_counter, 1);
+        assert!(!snapshot.agents.contains_key(&unknown_agent_id));
     }
 
     fn assistant_output_envelope(agent_id: &AgentId, seq: u64, content: &str) -> Envelope {

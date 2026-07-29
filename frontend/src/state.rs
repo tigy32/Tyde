@@ -11,19 +11,21 @@ use protocol::{
     AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot, BackendKind,
     BackendSetupInfo, ByteRange, ChatMessage, ChatMessageId, CodeIntelDiagnostic,
     CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
-    CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent,
-    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
+    CompactionObservationId, CompactionOperationId, ContextCompactionNotifyPayload,
+    ContextCompactionStatus, ContextCompactionTimelineEvent, CustomAgent, CustomAgentId,
+    DiffContextMode, GitBranchName, HistoryPageRequestId, HostAbsPath, HostBrowseEntry,
     HostBrowseErrorPayload, HostPlatform, HostSettings, LaunchProfileCatalog, LaunchProfileId,
     McpServerConfig, McpServerId, MessageMetadataUpdateData, MobileAccessStatePayload,
     MobilePairingOfferPayload, Project, ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile,
     ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId,
-    ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
-    SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId,
-    StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    ProjectRootPath, ProjectSearchFileResult, QueuedMessageEntry, RequestedCompactionAvailability,
+    Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId,
+    SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId,
+    Steering, SteeringId, StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft,
+    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
+    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
     WorkflowSummary,
 };
@@ -2512,17 +2514,129 @@ fn next_chat_row_id() -> ChatRowId {
     })
 }
 
+thread_local! {
+    static NEXT_HISTORY_REQUEST_ID: Cell<u64> = const { Cell::new(0) };
+    /// Per-process entropy, mixed into every request id so ids are opaque
+    /// rather than a guessable sequence. Seeded lazily from the platform's
+    /// randomness — `Math.random` in the browser, the clock natively — because
+    /// the frontend has no RNG dependency and this is not a security boundary.
+    static HISTORY_REQUEST_SALT: Cell<u64> = const { Cell::new(0) };
+}
+
+fn history_request_salt() -> u64 {
+    HISTORY_REQUEST_SALT.with(|cell| {
+        let existing = cell.get();
+        if existing != 0 {
+            return existing;
+        }
+        let seed = platform_entropy();
+        // Never 0: that is the "unseeded" sentinel above.
+        let seed = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        cell.set(seed);
+        seed
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn platform_entropy() -> u64 {
+    (js_sys::Math::random() * (u64::MAX as f64)) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn platform_entropy() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
+/// An opaque, client-unique id for one `FetchSessionHistory`.
+///
+/// Compared only against the echo of this client's own request. It is opaque
+/// rather than a bare counter so ids cannot be predicted or accidentally
+/// collided across page loads, per the approved fresh-ID rule.
+pub fn new_history_request_id() -> String {
+    let salt = history_request_salt();
+    NEXT_HISTORY_REQUEST_ID.with(|cell| {
+        let seq = cell.get();
+        cell.set(seq + 1);
+        // SplitMix64 finalizer: cheap, dependency-free, and thoroughly mixes
+        // the low-entropy counter into the salt.
+        let mut z = salt.wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        format!("{z:016x}")
+    })
+}
+
+/// What a transcript row actually is.
+///
+/// The transcript used to be message-only, so every row could assume
+/// `.entry.message`. Compaction introduces a row that is deliberately *not*
+/// a message: it has no sender, no body, no copy control, and it must never
+/// acquire one — a raw provider summary that picks up a `MessageSender` is
+/// exactly the leak the compaction work exists to stop. Modelling it as a
+/// second row kind (rather than a synthetic `MessageSender::System`) is what
+/// makes that structural instead of a rendering convention.
+///
+/// The marker stays a *row* — not a card floated outside the windowed list —
+/// so it inherits the virtualizer's `ResizeObserver` measurement and row
+/// rhythm untouched, and so it survives history paging and scroll
+/// restoration like any other row.
+#[derive(Clone, Debug)]
+pub enum ChatRowContent {
+    Message(ArcRwSignal<ChatMessageEntry>),
+    /// Signal-backed for the same reason messages are: the windowed list keys
+    /// rows by `ChatRowId`, so a row whose content is refreshed in place —
+    /// a later, richer sighting of the same marker — would otherwise keep
+    /// rendering the value captured when it mounted.
+    ContextCompaction(ArcRwSignal<ContextCompactionTimelineEvent>),
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatRowHandle {
     pub id: ChatRowId,
-    pub entry: ArcRwSignal<ChatMessageEntry>,
+    pub content: ChatRowContent,
 }
 
 impl ChatRowHandle {
+    /// Build a message row. Named `new` so the existing call sites and test
+    /// fixtures keep reading naturally; `message` is the explicit alias.
     pub fn new(entry: ChatMessageEntry) -> Self {
+        Self::message(entry)
+    }
+
+    pub fn message(entry: ChatMessageEntry) -> Self {
         Self {
             id: next_chat_row_id(),
-            entry: ArcRwSignal::new(entry),
+            content: ChatRowContent::Message(ArcRwSignal::new(entry)),
+        }
+    }
+
+    pub fn context_compaction(event: ContextCompactionTimelineEvent) -> Self {
+        Self {
+            id: next_chat_row_id(),
+            content: ChatRowContent::ContextCompaction(ArcRwSignal::new(event)),
+        }
+    }
+
+    /// The row's message payload, or `None` for a non-message row.
+    ///
+    /// Every caller that walks the transcript looking for messages — tool-call
+    /// attachment, metadata patching, context-breakdown lookup — goes through
+    /// this and skips markers, rather than assuming every row has an entry.
+    pub fn message_entry(&self) -> Option<&ArcRwSignal<ChatMessageEntry>> {
+        match &self.content {
+            ChatRowContent::Message(entry) => Some(entry),
+            ChatRowContent::ContextCompaction(_) => None,
+        }
+    }
+
+    pub fn compaction_marker(&self) -> Option<&ArcRwSignal<ContextCompactionTimelineEvent>> {
+        match &self.content {
+            ChatRowContent::ContextCompaction(event) => Some(event),
+            ChatRowContent::Message(_) => None,
         }
     }
 }
@@ -2532,7 +2646,211 @@ pub struct SessionHistoryState {
     pub message_count: u32,
     pub oldest_seq: Option<u64>,
     pub has_more_before: bool,
-    pub loading: bool,
+    /// The page request this client is currently waiting for, if any.
+    ///
+    /// This replaces a bare `loading: bool`. A boolean only says "a fetch is
+    /// out"; it cannot say *which* fetch, so a page that arrives after the
+    /// client has moved on — the reconnect case, where bootstrap wipes the
+    /// transcript while a fetch from the previous connection is still in
+    /// flight — was prepended into a transcript it does not belong to.
+    /// Correlating on the echoed request id and cursor makes a stale page
+    /// droppable instead of duplicating rows.
+    pub pending_request: Option<PendingHistoryRequest>,
+}
+
+impl SessionHistoryState {
+    pub fn loading(&self) -> bool {
+        self.pending_request.is_some()
+    }
+}
+
+/// The outstanding `FetchSessionHistory` request: its id and the cursor it
+/// asked for. A `SessionHistory` frame applies only when both match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHistoryRequest {
+    pub request_id: HistoryPageRequestId,
+    pub before_seq: Option<u64>,
+}
+
+// ── Context compaction ──────────────────────────────────────────────────
+//
+// Three records, deliberately separate, because they have three lifetimes:
+//
+//   * `context_compactions`  — the transient operation. Lives from request to
+//     terminal, drives the banner and the busy pill, is reconstructed from
+//     bootstrap, and is *not* a transcript row.
+//   * `context_compaction_rows` — the durable marker index. One entry per
+//     marker id, permanent, so the same compaction arriving from live,
+//     bootstrap, a paged history window, and a legacy provider import
+//     materializes exactly one row.
+//   * `compaction_capability` — whether a request is even offerable, so the
+//     controls can be visible-but-disabled with a reason instead of silently
+//     vanishing.
+//
+// None of these is the old replacement machinery (`compaction_in_progress` and
+// friends), which stays untouched below for legacy replacement lineage.
+
+/// Where the client is in a compaction request, from the client's point of
+/// view.
+///
+/// `Requesting` exists only locally and only between the click and the first
+/// server frame. Without it, two controls (header button and agent card) can
+/// both submit before either sees an operation id, and the server admits two
+/// requests for one user intent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContextCompactionUiState {
+    /// Sent, no server frame yet. No operation id exists.
+    Requesting,
+    /// The server owns an operation. `payload.status` carries the detail.
+    ///
+    /// `live` is false for a banner reconstructed from `AgentBootstrap`. A
+    /// reconstructed banner must be *visible* but must not announce: inserting
+    /// a node into an `aria-live` region is itself an announcement, so
+    /// suppressing the explicit announce call is not enough to make a
+    /// reconnect silent. The first genuinely live update flips it.
+    Active {
+        payload: ContextCompactionNotifyPayload,
+        live: bool,
+    },
+    /// Terminal failure, retained so the agent card can explain it. Cleared
+    /// when the user asks again.
+    ///
+    /// Never renders as an alert: the one assertive announcement is made once,
+    /// at the moment of the live transition, through the shared live region.
+    /// Alert semantics on retained state would re-fire on every remount.
+    Failed(ContextCompactionNotifyPayload),
+}
+
+impl ContextCompactionUiState {
+    /// Is work outstanding? Drives the busy pill, the derived agent state, and
+    /// the duplicate-submit gate.
+    pub fn is_in_flight(&self) -> bool {
+        match self {
+            Self::Requesting => true,
+            Self::Active { payload, .. } => !payload.status.is_terminal(),
+            Self::Failed(_) => false,
+        }
+    }
+
+    /// Deferred means "the server has it and is waiting for a safe point" —
+    /// a distinct, user-meaningful state from actively compacting, and the one
+    /// most likely to be mistaken for a hang.
+    pub fn is_deferred(&self) -> bool {
+        matches!(
+            self,
+            Self::Active { payload, .. }
+                if matches!(payload.status, ContextCompactionStatus::Deferred { .. })
+        )
+    }
+
+    pub fn operation_id(&self) -> Option<&CompactionOperationId> {
+        match self {
+            Self::Requesting => None,
+            Self::Active { payload, .. } | Self::Failed(payload) => Some(&payload.operation_id),
+        }
+    }
+
+    /// May this banner's live region announce? False for a bootstrap-restored
+    /// banner until a live frame updates it.
+    pub fn announces(&self) -> bool {
+        match self {
+            Self::Requesting => true,
+            Self::Active { live, .. } => *live,
+            // Retained failure presentation is never a live region (see above).
+            Self::Failed(_) => false,
+        }
+    }
+}
+
+/// Fold a second sighting of the same marker into the one already rendered.
+///
+/// The same compaction reaches this client from live, bootstrap, a paged
+/// window, and a one-time provider import, and those copies are not equally
+/// rich — a live marker can race past metrics a later replay carries. The rule
+/// is monotone accumulation: a field the existing copy already knows is never
+/// unlearned, and a field it is missing is filled in. That makes the result
+/// independent of arrival order, which matters because the order genuinely
+/// varies between reconnect and page-back.
+///
+/// Identity fields (`marker_id`, `trigger`, `method`, `status`, `mutation`)
+/// describe one completed event and are expected to agree; the existing copy
+/// keeps them.
+pub fn merge_richer_marker(
+    existing: &mut ContextCompactionTimelineEvent,
+    incoming: ContextCompactionTimelineEvent,
+) {
+    let metrics = &mut existing.metrics;
+    let incoming_metrics = incoming.metrics;
+    metrics.before_tokens = metrics.before_tokens.or(incoming_metrics.before_tokens);
+    metrics.after_tokens = metrics.after_tokens.or(incoming_metrics.after_tokens);
+    metrics.before_messages = metrics.before_messages.or(incoming_metrics.before_messages);
+    metrics.after_messages = metrics.after_messages.or(incoming_metrics.after_messages);
+    metrics.messages_summarized = metrics
+        .messages_summarized
+        .or(incoming_metrics.messages_summarized);
+    metrics.cumulative_dropped_tokens = metrics
+        .cumulative_dropped_tokens
+        .or(incoming_metrics.cumulative_dropped_tokens);
+    metrics.duration_ms = metrics.duration_ms.or(incoming_metrics.duration_ms);
+    metrics.precomputed = metrics.precomputed.or(incoming_metrics.precomputed);
+
+    existing.operation_id = existing.operation_id.take().or(incoming.operation_id);
+    existing.provider_session_id = existing
+        .provider_session_id
+        .take()
+        .or(incoming.provider_session_id);
+    existing.continuation = existing.continuation.take().or(incoming.continuation);
+    existing.message = existing.message.take().or(incoming.message);
+    if existing.timestamp == 0 {
+        existing.timestamp = incoming.timestamp;
+    }
+}
+
+/// A capability snapshot, kept with the logical session it describes.
+///
+/// Capability is a property of a *logical session*, not of an agent id. Without
+/// the session, a snapshot from a previous session silently authorizes (or
+/// forbids) compaction in the current one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionCapabilitySnapshot {
+    pub logical_session_id: SessionId,
+    pub availability: RequestedCompactionAvailability,
+}
+
+/// How many terminal operation ids to remember per agent.
+///
+/// A late `Progress` frame for an operation that already finished must not
+/// resurrect the banner. Remembering the terminal ids is the only way to tell
+/// "stale frame for a finished operation" from "frame for an operation this
+/// client has not seen yet" (which happens legitimately after a reconnect).
+/// The set is bounded because it is unbounded otherwise: a long-lived agent
+/// compacts many times.
+const TERMINAL_COMPACTION_MEMORY: usize = 16;
+
+/// Bounded FIFO of operation ids known to have reached a terminal state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalOperationIds {
+    order: VecDeque<CompactionOperationId>,
+    seen: HashSet<CompactionOperationId>,
+}
+
+impl TerminalOperationIds {
+    pub fn insert(&mut self, id: CompactionOperationId) {
+        if self.seen.contains(&id) {
+            return;
+        }
+        self.seen.insert(id.clone());
+        self.order.push_back(id);
+        while self.order.len() > TERMINAL_COMPACTION_MEMORY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+    }
+
+    pub fn contains(&self, id: &CompactionOperationId) -> bool {
+        self.seen.contains(id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3831,6 +4149,43 @@ pub struct AppState {
     /// `Completed` retargets it. Drained at
     /// `finish_compaction_success` time.
     pub compaction_pending_close: RwSignal<HashSet<(String, AgentId)>>,
+    /// Transient context-compaction operation per agent — the banner, the busy
+    /// pill, and the duplicate-submit gate all read this.
+    ///
+    /// Distinct from `compaction_in_progress` above: that map tracks the
+    /// *legacy replacement* protocol, where compaction swaps the agent. A
+    /// context-compaction operation keeps the agent and logical session ids
+    /// stable and never produces a `NewAgent`, so it cannot use the same
+    /// state without inheriting a completion path that waits forever for a
+    /// replacement that is never coming.
+    pub context_compactions: RwSignal<HashMap<AgentId, ContextCompactionUiState>>,
+    /// Operation ids already known terminal, per agent. Guards against a
+    /// delayed progress frame or a duplicate terminal re-opening the banner.
+    pub terminal_compaction_operations: RwSignal<HashMap<AgentId, TerminalOperationIds>>,
+    /// Durable marker rows by marker id, per agent.
+    ///
+    /// The dedup key for the timeline marker. One compaction can reach this
+    /// client from four directions — live, bootstrap replay, a paged history
+    /// window, and a one-time legacy provider import — and every one of them
+    /// carries the same provider-derived `marker_id`. Indexing by it is what
+    /// makes "exactly one row per compaction" hold without content matching.
+    /// Cleared everywhere `chat_rows` is cleared.
+    pub context_compaction_rows:
+        RwSignal<HashMap<AgentId, HashMap<CompactionObservationId, ChatRowId>>>,
+    /// Latest typed team compaction result per `(host, team)`.
+    ///
+    /// Distinct from `team_compactions` on the legacy replacement path: this
+    /// one carries stable per-member agent ids and typed statuses, and the team
+    /// never swaps agents.
+    pub team_context_compactions:
+        RwSignal<HashMap<(String, TeamId), protocol::TeamContextCompactionNotifyPayload>>,
+    /// Server-declared availability of a requested compaction, per agent.
+    ///
+    /// Capability answers "is this route offerable at all", never "is the
+    /// agent free right now". A busy agent still accepts the request and the
+    /// server reports it deferred, so momentary activity must not disable the
+    /// control.
+    pub compaction_capability: RwSignal<HashMap<AgentId, CompactionCapabilitySnapshot>>,
     /// Latest server-pushed `MobileAccessState` snapshot per host. The
     /// payload carries broker status, the pairing-lifecycle phase
     /// (`Idle | Active | Consumed | Expired | Cancelled | Failed`), and
@@ -4092,6 +4447,11 @@ impl AppState {
             compaction_errors: RwSignal::new(HashMap::new()),
             compaction_pending_completion: RwSignal::new(HashMap::new()),
             compaction_pending_close: RwSignal::new(HashSet::new()),
+            context_compactions: RwSignal::new(HashMap::new()),
+            terminal_compaction_operations: RwSignal::new(HashMap::new()),
+            context_compaction_rows: RwSignal::new(HashMap::new()),
+            compaction_capability: RwSignal::new(HashMap::new()),
+            team_context_compactions: RwSignal::new(HashMap::new()),
             mobile_access_state: RwSignal::new(HashMap::new()),
             mobile_pairing_offer: RwSignal::new(HashMap::new()),
             mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
@@ -4334,6 +4694,212 @@ impl AppState {
         });
     }
 
+    // ── Context compaction ──────────────────────────────────────────────
+
+    /// Optimistic local start, between the click and the first server frame.
+    ///
+    /// Returns `false` if a request or operation is already outstanding, which
+    /// is how the header button, the agent card, the palette entry, and the
+    /// team control share one gate: whichever fires first wins and the rest
+    /// become no-ops. Without this, two controls both submit before either
+    /// sees an operation id.
+    pub fn begin_compaction_request(&self, agent_id: &AgentId) -> bool {
+        let already = self
+            .context_compactions
+            .with_untracked(|map| map.get(agent_id).is_some_and(|state| state.is_in_flight()));
+        if already {
+            return false;
+        }
+        self.context_compactions.update(|map| {
+            map.insert(agent_id.clone(), ContextCompactionUiState::Requesting);
+        });
+        true
+    }
+
+    /// Transport failed before the server ever saw the request: drop the
+    /// optimistic state so the control re-arms.
+    pub fn abandon_compaction_request(&self, agent_id: &AgentId, message: String) {
+        self.context_compactions.update(|map| {
+            if matches!(
+                map.get(agent_id),
+                Some(ContextCompactionUiState::Requesting)
+            ) {
+                map.remove(agent_id);
+            }
+        });
+        self.compaction_errors.update(|map| {
+            map.insert(agent_id.clone(), message);
+        });
+    }
+
+    /// Apply a server operation frame.
+    ///
+    /// Returns `true` when this frame is a *live terminal transition* the
+    /// caller should announce. Bootstrap passes terminal frames through this
+    /// too — they are filtered out server-side, but a client that trusts that
+    /// silently is one contract change away from announcing history.
+    pub fn apply_context_compaction_notify(
+        &self,
+        agent_id: &AgentId,
+        payload: ContextCompactionNotifyPayload,
+        live: bool,
+    ) -> bool {
+        let operation_id = payload.operation_id.clone();
+
+        // A frame for an operation this client already saw finish is stale:
+        // a delayed heartbeat, or a duplicate terminal. Either would otherwise
+        // reopen a banner for work that is over.
+        let already_terminal = self.terminal_compaction_operations.with_untracked(|map| {
+            map.get(agent_id)
+                .is_some_and(|seen| seen.contains(&operation_id))
+        });
+        if already_terminal {
+            log::debug!(
+                "context_compaction_notify ignored for terminal operation agent_id={agent_id} operation_id={}",
+                operation_id.0
+            );
+            return false;
+        }
+
+        let terminal = payload.status.is_terminal();
+        if terminal {
+            self.terminal_compaction_operations.update(|map| {
+                map.entry(agent_id.clone())
+                    .or_default()
+                    .insert(operation_id.clone());
+            });
+        }
+
+        match &payload.status {
+            ContextCompactionStatus::Failed { .. } => {
+                let message = payload
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Compaction failed.".to_owned());
+                self.compaction_errors.update(|map| {
+                    map.insert(agent_id.clone(), message);
+                });
+                self.context_compactions.update(|map| {
+                    map.insert(agent_id.clone(), ContextCompactionUiState::Failed(payload));
+                });
+            }
+            ContextCompactionStatus::Completed => {
+                // The durable marker is the record of success. Nothing is
+                // retained here, and — unlike the legacy replacement path —
+                // nothing waits for a `NewAgent` that is never coming.
+                self.compaction_errors.update(|map| {
+                    map.remove(agent_id);
+                });
+                self.context_compactions.update(|map| {
+                    map.remove(agent_id);
+                });
+            }
+            ContextCompactionStatus::Deferred { .. }
+            | ContextCompactionStatus::Started { .. }
+            | ContextCompactionStatus::Progress { .. } => {
+                self.compaction_errors.update(|map| {
+                    map.remove(agent_id);
+                });
+                self.context_compactions.update(|map| {
+                    map.insert(
+                        agent_id.clone(),
+                        ContextCompactionUiState::Active { payload, live },
+                    );
+                });
+            }
+        }
+
+        terminal
+    }
+
+    /// Drop everything compaction-related for one agent.
+    ///
+    /// Called wherever the transcript itself is dropped. The marker index is
+    /// listed here because it points at `ChatRowId`s: leaving it behind after
+    /// `chat_rows` is cleared makes the next sighting of a marker resolve to a
+    /// row that no longer exists, and the marker silently never renders.
+    pub fn forget_context_compaction(&self, agent_id: &AgentId) {
+        self.context_compactions.update(|map| {
+            map.remove(agent_id);
+        });
+        self.terminal_compaction_operations.update(|map| {
+            map.remove(agent_id);
+        });
+        self.context_compaction_rows.update(|map| {
+            map.remove(agent_id);
+        });
+        self.compaction_capability.update(|map| {
+            map.remove(agent_id);
+        });
+    }
+
+    /// Clear only the transcript-derived marker index.
+    pub fn forget_compaction_markers(&self, agent_id: &AgentId) {
+        self.context_compaction_rows.update(|map| {
+            map.remove(agent_id);
+        });
+    }
+
+    /// Reset every compaction read-model record for an agent ahead of an
+    /// authoritative `AgentBootstrap` replay.
+    ///
+    /// Bootstrap is a *replacement*, not a merge: whatever it omits is
+    /// authoritatively absent. Keeping local state across it lets a
+    /// pre-bootstrap `Requesting` persist forever (its operation frames went to
+    /// the dead connection), a terminal `Failed` banner outlive the server's
+    /// correct decision not to bootstrap terminal snapshots, and a capability
+    /// snapshot from a previous logical session keep gating the new one.
+    ///
+    /// The pending history request goes too — it belonged to the connection
+    /// that just went away, and leaving it outstanding would make the first
+    /// page of the new connection look stale.
+    pub fn reset_compaction_read_model(&self, agent_id: &AgentId) {
+        self.forget_context_compaction(agent_id);
+        self.session_history.update(|map| {
+            if let Some(history) = map.get_mut(agent_id) {
+                history.pending_request = None;
+            }
+        });
+    }
+
+    /// Store a capability snapshot, rejecting one that describes a different
+    /// logical session than the agent is currently bound to.
+    ///
+    /// Returns `false` when the snapshot was rejected. Fail-closed: a rejected
+    /// snapshot leaves capability *unknown*, which the control selector treats
+    /// as "still determining" and disables, rather than inheriting the previous
+    /// session's answer.
+    pub fn apply_compaction_capability(
+        &self,
+        agent_id: &AgentId,
+        snapshot: CompactionCapabilitySnapshot,
+    ) -> bool {
+        let bound_session = self.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.agent_id == *agent_id)
+                .and_then(|agent| agent.session_id.clone())
+        });
+        if let Some(bound_session) = bound_session
+            && bound_session != snapshot.logical_session_id
+        {
+            log::warn!(
+                "context_compaction_capability for agent {} names session {} but the agent is bound to {}; dropping",
+                agent_id.0,
+                snapshot.logical_session_id.0,
+                bound_session.0,
+            );
+            self.compaction_capability.update(|map| {
+                map.remove(agent_id);
+            });
+            return false;
+        }
+        self.compaction_capability.update(|map| {
+            map.insert(agent_id.clone(), snapshot);
+        });
+        true
+    }
+
     fn finalize_compaction_close(&self, host_id: &str, agent_id: &AgentId) {
         self.agents.update(|agents| {
             agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == *agent_id));
@@ -4342,6 +4908,7 @@ impl AppState {
             map.remove(agent_id);
         });
         self.forget_session_history(agent_id);
+        self.forget_context_compaction(agent_id);
         self.chat_tool_rows.update(|map| {
             map.remove(agent_id);
         });
@@ -4645,9 +5212,154 @@ impl AppState {
         !self.pending_agents_view_overlay.get().is_empty()
     }
 
+    /// Append a context-compaction marker row, or update the existing one.
+    ///
+    /// Returns `true` when a row was appended. The marker id is the dedup key:
+    /// the same compaction reaching this client from live, bootstrap, a paged
+    /// window, or a legacy import must produce one row, so a second sighting
+    /// refreshes the row in place instead of appending. Refreshing matters
+    /// because sightings are not equally rich — a paged historical marker can
+    /// carry metrics a live one raced past.
+    ///
+    /// Deliberately touches no message index, no tool index, no typing state,
+    /// and no turn state. A marker is not a message and not a turn boundary.
+    pub fn push_compaction_marker(
+        &self,
+        agent_id: AgentId,
+        event: ContextCompactionTimelineEvent,
+    ) -> bool {
+        let marker_id = event.marker_id.clone();
+        let existing = self.context_compaction_rows.with_untracked(|map| {
+            map.get(&agent_id)
+                .and_then(|index| index.get(&marker_id))
+                .copied()
+        });
+
+        if let Some(row_id) = existing {
+            // Write through the row's own signal so the mounted marker
+            // re-renders; replacing the enum value would leave the rendered
+            // view holding the sighting it mounted with.
+            let signal = self.chat_rows.with_untracked(|rows| {
+                rows.get(&agent_id)?
+                    .iter()
+                    .find(|row| row.id == row_id)
+                    .and_then(|row| row.compaction_marker().cloned())
+            });
+            if let Some(signal) = signal {
+                signal.update(|existing| merge_richer_marker(existing, event));
+            }
+            return false;
+        }
+
+        let handle = ChatRowHandle::context_compaction(event);
+        let row_id = handle.id;
+        self.chat_rows.update(|rows| {
+            rows.entry(agent_id.clone()).or_default().push(handle);
+        });
+        self.context_compaction_rows.update(|map| {
+            map.entry(agent_id).or_default().insert(marker_id, row_id);
+        });
+        true
+    }
+
+    /// Prepend a history page, funnelling its markers through the same
+    /// upsert/dedup rule as live and bootstrap.
+    ///
+    /// Two dedup axes, and the earlier version only handled one:
+    ///
+    /// * **Cross-source** — a marker already on screen is merged in place
+    ///   rather than prepended again. Merging (not dropping) matters because a
+    ///   paged copy can be *richer* than the live one that raced past it.
+    /// * **Within the page** — two copies of one marker id inside a single
+    ///   returned page both passed the old pre-prepend check, because the index
+    ///   was only written after the whole page was inserted. That left two rows
+    ///   visible with the index pointing at the second.
+    ///
+    /// Page order is preserved: the first occurrence keeps its position and
+    /// later occurrences merge into it.
+    pub fn prepend_history_page(&self, agent_id: &AgentId, rows: Vec<ChatRowHandle>) {
+        let mut deduped: Vec<ChatRowHandle> = Vec::with_capacity(rows.len());
+        // marker id -> index into `deduped`, for in-page collapsing.
+        let mut page_markers: HashMap<CompactionObservationId, usize> = HashMap::new();
+
+        for row in rows {
+            let Some(signal) = row.compaction_marker().cloned() else {
+                deduped.push(row);
+                continue;
+            };
+            let event = signal.get_untracked();
+            let marker_id = event.marker_id.clone();
+
+            // Already on screen from live/bootstrap/an earlier page: merge in
+            // place and drop the paged row.
+            if let Some(existing_row) = self
+                .context_compaction_rows
+                .with_untracked(|map| map.get(agent_id).and_then(|i| i.get(&marker_id)).copied())
+            {
+                let existing_signal = self.chat_rows.with_untracked(|map| {
+                    map.get(agent_id)?
+                        .iter()
+                        .find(|candidate| candidate.id == existing_row)
+                        .and_then(|candidate| candidate.compaction_marker().cloned())
+                });
+                if let Some(existing_signal) = existing_signal {
+                    existing_signal.update(|existing| merge_richer_marker(existing, event));
+                }
+                continue;
+            }
+
+            // Seen earlier in this same page: merge into that row.
+            if let Some(index) = page_markers.get(&marker_id).copied() {
+                if let Some(first) = deduped[index].compaction_marker() {
+                    first.update(|existing| merge_richer_marker(existing, event));
+                }
+                continue;
+            }
+
+            page_markers.insert(marker_id, deduped.len());
+            deduped.push(row);
+        }
+
+        self.prepend_chat_rows(agent_id, deduped);
+    }
+
+    /// Prepend already-materialized rows and register any markers among them.
+    pub fn prepend_chat_rows(&self, agent_id: &AgentId, rows: Vec<ChatRowHandle>) {
+        if rows.is_empty() {
+            return;
+        }
+        let markers: Vec<(CompactionObservationId, ChatRowId)> = rows
+            .iter()
+            .filter_map(|row| {
+                row.compaction_marker()
+                    .map(|event| (event.with_untracked(|e| e.marker_id.clone()), row.id))
+            })
+            .collect();
+
+        self.chat_rows.update(|map| {
+            let current = map.remove(agent_id).unwrap_or_default();
+            let mut combined = rows;
+            combined.extend(current);
+            map.insert(agent_id.clone(), combined);
+        });
+
+        if !markers.is_empty() {
+            self.context_compaction_rows.update(|map| {
+                let index = map.entry(agent_id.clone()).or_default();
+                for (marker_id, row_id) in markers {
+                    index.insert(marker_id, row_id);
+                }
+            });
+        }
+    }
+
     pub fn push_chat_entry(&self, agent_id: AgentId, entry: ChatMessageEntry) -> ChatRowHandle {
         let handle = ChatRowHandle::new(entry);
-        let (indexed_tool_call_ids, message_id) = handle.entry.with_untracked(|entry| {
+        let entry_signal = handle
+            .message_entry()
+            .expect("push_chat_entry builds a message row")
+            .clone();
+        let (indexed_tool_call_ids, message_id) = entry_signal.with_untracked(|entry| {
             (
                 entry
                     .tool_requests
@@ -4721,9 +5433,17 @@ impl AppState {
             );
             return;
         };
-        let row_message_id = handle
-            .entry
-            .with_untracked(|entry| entry.message.message_id.clone());
+        // A marker row can hold the id slot the index pointed at only if the
+        // index was corrupted; markers are never registered there. Skipping
+        // rather than panicking keeps a metadata update from taking the tab
+        // down.
+        let Some(entry_signal) = handle.message_entry().cloned() else {
+            log::warn!(
+                "chat_event message_metadata_updated targeted a non-message row agent_id={agent_id} row_id={row_id:?}"
+            );
+            return;
+        };
+        let row_message_id = entry_signal.with_untracked(|entry| entry.message.message_id.clone());
         if row_message_id.as_ref() != Some(&update.message_id) {
             log::warn!(
                 "chat_event message_metadata_updated stale row agent_id={} expected_message_id={} row_message_id={:?} row_id={:?}",
@@ -4734,7 +5454,7 @@ impl AppState {
             );
             return;
         }
-        handle.entry.update(|entry| {
+        entry_signal.update(|entry| {
             if let Some(model_info) = update.model_info {
                 entry.message.model_info = Some(model_info);
             }
@@ -4747,9 +5467,20 @@ impl AppState {
         });
     }
 
-    pub fn last_chat_row_untracked(&self, agent_id: &AgentId) -> Option<ChatRowHandle> {
-        self.chat_rows
-            .with_untracked(|rows| rows.get(agent_id).and_then(|rows| rows.last().cloned()))
+    /// The newest row that can actually hold a message or a tool card.
+    ///
+    /// Tool-card attachment falls back to "the last row" when no row claims
+    /// the call. Once markers exist, the last row may be a marker, which has
+    /// no message to attach to — the card would be silently dropped. This
+    /// skips past markers to the newest real message row.
+    pub fn last_chat_message_row_untracked(&self, agent_id: &AgentId) -> Option<ChatRowHandle> {
+        self.chat_rows.with_untracked(|rows| {
+            rows.get(agent_id)?
+                .iter()
+                .rev()
+                .find(|row| row.message_entry().is_some())
+                .cloned()
+        })
     }
 
     pub fn chat_row_by_id_untracked(
@@ -5847,6 +6578,29 @@ impl AppState {
             });
             self.session_history.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
+            });
+            // A host reset invalidates the transcript, so the marker index
+            // (which holds `ChatRowId`s into it) has to go with it. The live
+            // operation and capability snapshots go too: the authoritative
+            // versions arrive on the reconnect's `AgentBootstrap`, and a
+            // stale local copy would show a banner for an operation that may
+            // have finished while we were disconnected.
+            self.context_compaction_rows.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.context_compactions.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.terminal_compaction_operations.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.compaction_capability.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            // Team aggregates are host-keyed, so they go with the host rather
+            // than with the agent drop set.
+            self.team_context_compactions.update(|map| {
+                map.retain(|(host, _), _| host != host_id);
             });
             self.task_lists.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
@@ -10894,7 +11648,10 @@ mod tests {
                 .expect("agent rows");
             assert_eq!(rows.len(), 1, "metadata update must not append a row");
             assert_eq!(rows[0].id, original_row_id, "row identity preserved");
-            let entry = rows[0].entry.get_untracked();
+            let entry = rows[0]
+                .message_entry()
+                .expect("message row")
+                .get_untracked();
             assert_eq!(entry.message.content, "hello world", "content untouched");
             assert!(
                 entry
@@ -10938,7 +11695,10 @@ mod tests {
                     context_breakdown: Some(breakdown),
                 },
             );
-            let entry = rows[0].entry.get_untracked();
+            let entry = rows[0]
+                .message_entry()
+                .expect("message row")
+                .get_untracked();
             assert!(
                 entry
                     .message

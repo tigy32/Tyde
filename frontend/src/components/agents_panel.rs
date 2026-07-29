@@ -10,10 +10,11 @@ use protocol::{
     FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
 };
 
-use crate::send::{close_agent, compact_agent, send_frame};
+use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ConnectionStatus, ProjectInfo, StreamingState, TabContent, TransientEvent, sort_project_infos,
+    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, TransientEvent,
+    sort_project_infos,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -161,6 +162,10 @@ pub(crate) enum DerivedAgentState {
     /// `transient_events`, which the reducer drops on the next
     /// `TypingStatusChanged(true)`.
     Cancelled,
+    /// The server owns a compaction request but is waiting for a safe point.
+    /// Distinct from `Compacting`: "queued behind the current turn" is the
+    /// state most likely to be mistaken for a hang, so it gets its own label.
+    CompactionQueued,
     Compacting,
     Terminated,
 }
@@ -170,6 +175,7 @@ pub(crate) fn derive_agent_state(
     streaming: &HashMap<AgentId, StreamingState>,
     turn_active: &HashMap<AgentId, bool>,
     compaction: &HashMap<AgentId, CompactionOldInfo>,
+    context_compaction: &HashMap<AgentId, ContextCompactionUiState>,
     transient: &HashMap<AgentId, Vec<TransientEvent>>,
     interrupt_pending: &HashSet<AgentId>,
 ) -> DerivedAgentState {
@@ -179,8 +185,21 @@ pub(crate) fn derive_agent_state(
     if !agent.started {
         return DerivedAgentState::Initializing;
     }
+    // Legacy replacement compaction.
     if compaction.contains_key(&agent.agent_id) {
         return DerivedAgentState::Compacting;
+    }
+    // In-place context compaction. Reported ahead of thinking/streaming
+    // because a deferred operation coexists with a live turn by design — the
+    // turn is exactly what it is waiting for — and "Compaction queued" is the
+    // more informative of the two.
+    if let Some(operation) = context_compaction.get(&agent.agent_id) {
+        if operation.is_deferred() {
+            return DerivedAgentState::CompactionQueued;
+        }
+        if operation.is_in_flight() {
+            return DerivedAgentState::Compacting;
+        }
     }
     let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
     let streaming_open = streaming.contains_key(&agent.agent_id);
@@ -212,7 +231,8 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "Initializing",
         DerivedAgentState::Thinking => "Thinking",
         DerivedAgentState::Cancelling => "Cancelling",
-        DerivedAgentState::Compacting => "Compacting",
+        DerivedAgentState::CompactionQueued => "Compaction queued",
+        DerivedAgentState::Compacting => "Compacting context",
         DerivedAgentState::Idle => "Idle",
         DerivedAgentState::Cancelled => "Cancelled",
         DerivedAgentState::Terminated => "Terminated",
@@ -224,6 +244,7 @@ pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
         DerivedAgentState::Cancelling => "\u{25F7}",   // ◷ clock (CSS animates)
+        DerivedAgentState::CompactionQueued => "\u{27F2}", // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Idle => "\u{2713}",         // ✓
         DerivedAgentState::Cancelled => "\u{2298}",    // ⊘ circled division slash
@@ -236,6 +257,7 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "agent-card-status running",
         DerivedAgentState::Thinking => "agent-card-status running",
         DerivedAgentState::Cancelling => "agent-card-status running",
+        DerivedAgentState::CompactionQueued => "agent-card-status running",
         DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
         DerivedAgentState::Cancelled => "agent-card-status cancelled",
@@ -1577,22 +1599,26 @@ fn agent_card(
         let streaming = state.streaming_text;
         let turn_active = state.agent_turn_active;
         let compaction = state.compaction_in_progress;
+        let context_compaction = state.context_compactions;
         let transient = state.transient_events;
         let interrupt_pending = state.interrupt_pending;
         move || {
             compaction.with(|compaction| {
-                turn_active.with(|turn_active| {
-                    streaming.with(|streaming| {
-                        transient.with(|transient| {
-                            interrupt_pending.with(|interrupt_pending| {
-                                derive_agent_state(
-                                    &agent_for_derived,
-                                    streaming,
-                                    turn_active,
-                                    compaction,
-                                    transient,
-                                    interrupt_pending,
-                                )
+                context_compaction.with(|context_compaction| {
+                    turn_active.with(|turn_active| {
+                        streaming.with(|streaming| {
+                            transient.with(|transient| {
+                                interrupt_pending.with(|interrupt_pending| {
+                                    derive_agent_state(
+                                        &agent_for_derived,
+                                        streaming,
+                                        turn_active,
+                                        compaction,
+                                        context_compaction,
+                                        transient,
+                                        interrupt_pending,
+                                    )
+                                })
                             })
                         })
                     })
@@ -1621,69 +1647,63 @@ fn agent_card(
     // alone. A cancelled or cancelling turn is not: `⊘` is ambiguous, and
     // "your work was stopped" is exactly the outcome a user must not have to
     // hover or use a screen reader to discover.
+    // Compaction joins the visible-label set for the same reason cancellation
+    // is in it: `⟲` is not self-explanatory, and "your context is being
+    // rewritten for the next few minutes" is not an outcome a user should have
+    // to hover or use a screen reader to discover.
     let status_label_visible_sig = {
         let derived = derived.clone();
         move || {
             matches!(
                 derived(),
-                DerivedAgentState::Cancelled | DerivedAgentState::Cancelling
+                DerivedAgentState::Cancelled
+                    | DerivedAgentState::Cancelling
+                    | DerivedAgentState::CompactionQueued
+                    | DerivedAgentState::Compacting
             )
         }
     };
 
-    // Compact (Compact/Rotate) action — gated on the agent being idle on a
-    // connected host with at least one chat row, and not already mid-
-    // compaction. Hidden when gating fails so the button surface mirrors
-    // the existing hover-revealed Close (`agent-card-action`) UX.
-    let can_compact = {
+    // Compact action.
+    //
+    // Visible-but-disabled rather than hidden. The most common blocker used to
+    // be "the agent is not idle", which is transient and self-resolving — a
+    // control that silently vanishes teaches the user it does not exist. It is
+    // now not a blocker at all: the server accepts a request during a turn and
+    // reports it deferred, so the client no longer duplicates that decision.
+    //
+    // The old `chat_rows` non-empty gate is gone too: it was wrong, not just
+    // conservative. A restored session showing only the collapsed-history
+    // banner has zero loaded rows, so the button hid on exactly the long
+    // sessions that most need compacting.
+    let compaction_control = {
         let host_id = agent.host_id.clone();
         let agent_id = agent_id.clone();
-        let derived = derived.clone();
         let state = state.clone();
         move || {
-            if !matches!(
-                state.connection_status_for_host(&host_id),
-                ConnectionStatus::Connected
-            ) {
-                return false;
-            }
-            if state
-                .chat_rows
-                .with(|map| map.get(&agent_id).is_none_or(|rows| rows.is_empty()))
-            {
-                return false;
-            }
-            matches!(derived(), DerivedAgentState::Idle)
+            crate::actions::compaction_control_state(
+                &state,
+                &ActiveAgentRef {
+                    host_id: host_id.clone(),
+                    agent_id: agent_id.clone(),
+                },
+            )
         }
     };
     let compact_host_id = agent.host_id.clone();
     let compact_agent_id = agent_id.clone();
-    let compact_agent_stream = agent.instance_stream.clone();
     let compact_name = name.clone();
     let compact_state = state.clone();
     let on_compact = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
-        let host_id = compact_host_id.clone();
-        let aid = compact_agent_id.clone();
-        let agent_stream = compact_agent_stream.clone();
-        // The server marks the predecessor session non-resumable as
-        // part of the compaction protocol, so don't promise the user
-        // they can pick it back up. The summary remains visible in
-        // Sessions as a read-only record of what was kept.
-        let message = format!(
-            "Compact agent \"{}\"?\n\nThe agent will write a summary of context worth keeping and a fresh replacement will start from that summary. The original session is closed and kept in Sessions as a read-only record — you can view it, but it can't be resumed.",
-            compact_name
-        );
         let state = compact_state.clone();
+        let agent = ActiveAgentRef {
+            host_id: compact_host_id.clone(),
+            agent_id: compact_agent_id.clone(),
+        };
+        let name = compact_name.clone();
         spawn_local(async move {
-            if !crate::bridge::confirm_dialog("Compact agent", &message).await {
-                return;
-            }
-            state.mark_compaction_started(&host_id, aid.clone());
-            if let Err(e) = compact_agent(&host_id, agent_stream).await {
-                log::error!("failed to send AgentCompact: {e}");
-                state.finish_compaction_failure(aid, e);
-            }
+            crate::actions::request_context_compaction(state, agent, name).await;
         });
     };
 
@@ -1878,18 +1898,39 @@ fn agent_card(
                     >
                         "\u{270E}"
                     </button>
-                    {move || can_compact().then(|| view! {
-                        <button
-                            type="button"
-                            class="filter-toggle agent-card-compact agent-card-action"
-                            title="Compact agent"
-                            aria-label="Compact agent"
-                            on:click=on_compact.clone()
-                            on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                        >
-                            "\u{27F2}"
-                        </button>
-                    })}
+                    {move || {
+                        let control = compaction_control();
+                        let enabled = control.is_enabled();
+                        // The reason rides on both `title` and `aria-label` so
+                        // it reaches a pointer user and a screen-reader user
+                        // by the same route.
+                        let label = match control.reason() {
+                            None => "Compact context".to_owned(),
+                            Some(reason) => format!("Compact context — unavailable: {reason}"),
+                        };
+                        view! {
+                            <button
+                                type="button"
+                                class="filter-toggle agent-card-compact agent-card-action"
+                                title=label.clone()
+                                aria-label=label
+                                // `aria-disabled` rather than the native
+                                // `disabled` attribute. A natively-disabled
+                                // button is removed from the tab order, so the
+                                // reason on `title`/`aria-label` is reachable
+                                // only by pointer hover — no keyboard or
+                                // screen-reader user can ever discover why the
+                                // control is unavailable. The click handler
+                                // re-checks the gate, so it is inert either way.
+                                aria-disabled=move || if enabled { "false" } else { "true" }
+                                data-test="agent-card-compact"
+                                on:click=on_compact.clone()
+                                on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                            >
+                                "\u{27F2}"
+                            </button>
+                        }
+                    }}
                     <button
                         type="button"
                         class="filter-toggle agent-card-close agent-card-action"
@@ -2007,6 +2048,7 @@ mod tests {
             &streaming,
             &turn_active,
             &compaction,
+            &HashMap::new(),
             &transient,
             &HashSet::new(),
         );
@@ -2054,6 +2096,7 @@ mod tests {
                 &streaming,
                 &turn_active,
                 &compaction,
+                &HashMap::new(),
                 &transient,
                 &HashSet::new(),
             ),
@@ -2068,6 +2111,7 @@ mod tests {
                 &streaming,
                 &turn_active,
                 &compaction,
+                &HashMap::new(),
                 &HashMap::new(),
                 &HashSet::new(),
             ),
@@ -2097,6 +2141,7 @@ mod tests {
                 &streaming,
                 &turn_active,
                 &compaction,
+                &HashMap::new(),
                 &transient,
                 &pending,
             ),
@@ -2120,6 +2165,7 @@ mod tests {
                 &streaming,
                 &turn_active,
                 &compaction,
+                &HashMap::new(),
                 &transient,
                 &HashSet::new(),
             ),
@@ -2350,6 +2396,134 @@ mod tests {
     fn defaults_for_specific_project_shows_other_projects_false() {
         let ap = active("h", "p");
         assert!(!AgentsPanelFilters::defaults_for(Some(&ap)).show_other_projects);
+    }
+
+    /// A deferred operation is waiting for a safe point; an active one is
+    /// doing work. Collapsing them loses the distinction that tells the user
+    /// their request was accepted rather than ignored.
+    #[test]
+    fn context_compaction_derives_queued_and_compacting_separately() {
+        let agent = mk_agent("a", "h", None, None, true);
+        let (streaming, turn_active) = no_runtime();
+        let compaction = HashMap::new();
+        let transient = HashMap::new();
+
+        let payload = |status| protocol::ContextCompactionNotifyPayload {
+            operation_id: protocol::CompactionOperationId("op".to_owned()),
+            agent_id: agent.agent_id.clone(),
+            logical_session_id: protocol::SessionId("s".to_owned()),
+            backend_kind: protocol::BackendKind::Claude,
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: None,
+            status,
+            provider_version: None,
+            metrics: protocol::CompactionMetrics::default(),
+            continuation: None,
+            message: None,
+        };
+
+        let mut deferred = HashMap::new();
+        deferred.insert(
+            agent.agent_id.clone(),
+            ContextCompactionUiState::Active {
+                live: true,
+                payload: payload(protocol::ContextCompactionStatus::Deferred {
+                    stage: protocol::CompactionStage::WaitingForIdle,
+                }),
+            },
+        );
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &deferred,
+                &transient,
+                &HashSet::new(),
+            ),
+            DerivedAgentState::CompactionQueued,
+        );
+
+        let mut running = HashMap::new();
+        running.insert(
+            agent.agent_id.clone(),
+            ContextCompactionUiState::Active {
+                live: true,
+                payload: payload(protocol::ContextCompactionStatus::Progress {
+                    stage: protocol::CompactionStage::Compacting,
+                }),
+            },
+        );
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &running,
+                &transient,
+                &HashSet::new(),
+            ),
+            DerivedAgentState::Compacting,
+        );
+
+        // A terminal failure is not in flight: the control must re-arm.
+        let mut failed = HashMap::new();
+        failed.insert(
+            agent.agent_id.clone(),
+            ContextCompactionUiState::Failed(payload(protocol::ContextCompactionStatus::Failed {
+                accepted: true,
+                mutation: protocol::CompactionMutation::NotObserved,
+            })),
+        );
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &failed,
+                &transient,
+                &HashSet::new(),
+            ),
+            DerivedAgentState::Idle,
+            "a finished operation must not keep the agent looking busy"
+        );
+    }
+
+    /// `⟲` on its own does not say "your context is being rewritten for the
+    /// next few minutes". Compaction joins cancellation in the set of states
+    /// whose label is visible without hover.
+    #[test]
+    fn compaction_status_labels_are_visible_without_hover() {
+        for state in [
+            DerivedAgentState::CompactionQueued,
+            DerivedAgentState::Compacting,
+        ] {
+            assert!(
+                matches!(
+                    state,
+                    DerivedAgentState::Cancelled
+                        | DerivedAgentState::Cancelling
+                        | DerivedAgentState::CompactionQueued
+                        | DerivedAgentState::Compacting
+                ),
+                "{state:?} must be in the visible-label set"
+            );
+            assert!(
+                !status_label(&state).is_empty(),
+                "{state:?} needs a readable label, not just a glyph"
+            );
+        }
+        assert_eq!(
+            status_label(&DerivedAgentState::CompactionQueued),
+            "Compaction queued"
+        );
+        assert_eq!(
+            status_label(&DerivedAgentState::Compacting),
+            "Compacting context"
+        );
     }
 }
 

@@ -84,6 +84,7 @@ fn persist_expanded(expanded: bool) {
 enum ChildAgentStatus {
     Starting,
     Running,
+    Compacting,
     Idle,
     Failed(String),
 }
@@ -93,6 +94,7 @@ impl ChildAgentStatus {
         match self {
             Self::Starting => "Starting".to_owned(),
             Self::Running => "Running".to_owned(),
+            Self::Compacting => "Compacting context".to_owned(),
             Self::Idle => "Idle".to_owned(),
             Self::Failed(message) if message.trim().is_empty() => "Failed".to_owned(),
             Self::Failed(message) => format!("Failed: {}", truncate_inline(message, 72)),
@@ -101,7 +103,7 @@ impl ChildAgentStatus {
 
     fn class(&self) -> &'static str {
         match self {
-            Self::Starting | Self::Running => "tool-live-agent-status running",
+            Self::Starting | Self::Running | Self::Compacting => "tool-live-agent-status running",
             Self::Idle => "tool-live-agent-status idle",
             Self::Failed(_) => "tool-live-agent-status failed",
         }
@@ -121,18 +123,21 @@ fn backend_label(kind: BackendKind) -> &'static str {
 
 fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> ChildAgentStatus {
     let derived = state.compaction_in_progress.with(|compaction| {
-        state.agent_turn_active.with(|turn_active| {
-            state.streaming_text.with(|streaming| {
-                state.transient_events.with(|transient| {
-                    state.interrupt_pending.with(|interrupt_pending| {
-                        derive_agent_state(
-                            agent,
-                            streaming,
-                            turn_active,
-                            compaction,
-                            transient,
-                            interrupt_pending,
-                        )
+        state.context_compactions.with(|context_compaction| {
+            state.agent_turn_active.with(|turn_active| {
+                state.streaming_text.with(|streaming| {
+                    state.transient_events.with(|transient| {
+                        state.interrupt_pending.with(|interrupt_pending| {
+                            derive_agent_state(
+                                agent,
+                                streaming,
+                                turn_active,
+                                compaction,
+                                context_compaction,
+                                transient,
+                                interrupt_pending,
+                            )
+                        })
                     })
                 })
             })
@@ -140,9 +145,13 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
     });
     match derived {
         DerivedAgentState::Initializing => ChildAgentStatus::Starting,
-        DerivedAgentState::Thinking
-        | DerivedAgentState::Cancelling
-        | DerivedAgentState::Compacting => ChildAgentStatus::Running,
+        // A compacting child is running, but "Running" alone hides *why* it
+        // will produce no output for the next few minutes. The parent's own
+        // compaction never appears here — it has the dedicated banner.
+        DerivedAgentState::CompactionQueued | DerivedAgentState::Compacting => {
+            ChildAgentStatus::Compacting
+        }
+        DerivedAgentState::Thinking | DerivedAgentState::Cancelling => ChildAgentStatus::Running,
         // The tray tracks whether work is in flight, not how the last turn
         // ended; a cancelled child is idle for its purposes.
         DerivedAgentState::Idle | DerivedAgentState::Cancelled => ChildAgentStatus::Idle,
@@ -212,7 +221,9 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
             // Active-only: an idle or failed child leaves the tray
             // immediately. Its outcome stays on the transcript's cards.
             match derive_child_status(state, agent) {
-                ChildAgentStatus::Starting | ChildAgentStatus::Running => {
+                ChildAgentStatus::Starting
+                | ChildAgentStatus::Running
+                | ChildAgentStatus::Compacting => {
                     snapshot.counts.running += 1;
                     snapshot.children.push(agent.agent_id.clone());
                 }

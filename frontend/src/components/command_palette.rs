@@ -30,6 +30,7 @@ pub enum CommandId {
     GoToChat,
     ToggleSettings,
     SendFeedback,
+    CompactContext,
     FocusPrimaryPane,
     FocusSecondaryPane,
     CloseEditorPane,
@@ -282,6 +283,11 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         name: "Send Feedback",
         binding: None,
     },
+    CommandDescriptor {
+        id: CommandId::CompactContext,
+        name: "Compact Context",
+        binding: None,
+    },
 ];
 
 pub fn command_descriptor(id: CommandId) -> &'static CommandDescriptor {
@@ -370,6 +376,18 @@ pub fn command_availability(
         | CommandId::GoToChat
         | CommandId::ToggleSettings
         | CommandId::SendFeedback => CommandAvailability::Enabled,
+        // Shares the one capability + gate selector with the chat header, the
+        // agent card, and the team controls, so the palette can never offer a
+        // compaction the other surfaces refuse (or vice versa).
+        CommandId::CompactContext => match state.active_agent.get() {
+            None => CommandAvailability::Disabled("No active chat."),
+            Some(agent) => match crate::actions::compaction_control_state(state, &agent) {
+                crate::actions::CompactionControlState::Enabled => CommandAvailability::Enabled,
+                crate::actions::CompactionControlState::Disabled(reason) => {
+                    CommandAvailability::Disabled(reason)
+                }
+            },
+        },
     }
 }
 
@@ -592,6 +610,24 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         CommandId::ToggleSettings => {
             state.command_palette_open.set(false);
             state.settings_open.update(|open| *open = !*open);
+        }
+        CommandId::CompactContext => {
+            let Some(agent) = state.active_agent.get_untracked() else {
+                return;
+            };
+            let state = state.clone();
+            let name = state.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .find(|candidate| {
+                        candidate.host_id == agent.host_id && candidate.agent_id == agent.agent_id
+                    })
+                    .map(|candidate| candidate.name.clone())
+                    .unwrap_or_else(|| "this agent".to_owned())
+            });
+            wasm_bindgen_futures::spawn_local(async move {
+                crate::actions::request_context_compaction(state, agent, name).await;
+            });
         }
         CommandId::SendFeedback => {
             state.command_palette_open.set(false);

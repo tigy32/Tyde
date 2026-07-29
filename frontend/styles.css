@@ -2623,6 +2623,198 @@ kbd {
     line-height: 1.6;
 }
 
+
+/* --- Context compaction --- */
+
+/* The durable timeline marker. Deliberately quieter than any chat card: it
+   records that the model's working context was rewritten at this point, and it
+   is not a message. Rules + centred label, no bubble, no sender, no controls. */
+.context-compaction-marker {
+    padding: 2px 0;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+}
+
+/* The visible row is `aria-hidden`; a single visually-hidden sentence beside
+   it carries the same facts unabbreviated. Keeping the flex layout on this
+   inner element rather than the row means the hidden sentence does not become
+   a flex item and take up a column. */
+.context-compaction-visual {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.context-compaction-rule {
+    flex: 1 1 auto;
+    height: 1px;
+    background: var(--border);
+    opacity: 0.6;
+}
+
+.context-compaction-label {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex: 0 1 auto;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.context-compaction-icon {
+    font-size: 0.95em;
+    opacity: 0.8;
+}
+
+.context-compaction-title {
+    font-weight: 500;
+}
+
+/* Metrics are dimmer than the title: the title says what happened, the
+   figures are supporting detail. */
+.context-compaction-metric,
+.context-compaction-method {
+    opacity: 0.75;
+    font-variant-numeric: tabular-nums;
+}
+
+.context-compaction-method {
+    font-size: 0.92em;
+}
+
+.context-compaction-reason {
+    opacity: 0.85;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* Failure is carried by the word "failed" in the title as well as the colour,
+   so colour is never the only channel. */
+.context-compaction-marker-failed {
+    color: var(--warning);
+}
+
+.context-compaction-marker-failed .context-compaction-rule {
+    background: var(--warning);
+    opacity: 0.35;
+}
+
+/* Live operation banner. Sits outside the virtualized transcript so it stays
+   visible wherever the user has scrolled. */
+.chat-card-compacting {
+    background: rgba(122, 162, 247, 0.06);
+    border: 1px solid rgba(122, 162, 247, 0.22);
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+
+.compacting-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.compacting-card-icon {
+    display: inline-block;
+    animation: compacting-spin 2.4s linear infinite;
+}
+
+.compacting-card-title {
+    font-weight: 500;
+}
+
+.compacting-card-body {
+    margin-top: 4px;
+}
+
+.compacting-card-detail {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.9em;
+}
+
+/* The guarantee the user is most likely to doubt while watching a multi-minute
+   operation rewrite "their" conversation. */
+.compacting-card-note {
+    margin: 2px 0 0;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    opacity: 0.8;
+}
+
+.chat-card-compacting-failed {
+    background: rgba(232, 197, 106, 0.06);
+    border-color: rgba(232, 197, 106, 0.28);
+}
+
+.chat-card-compacting-failed .compacting-card-icon {
+    animation: none;
+}
+
+@keyframes compacting-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Header trigger, matching the neighbouring header controls. */
+.chat-header-compact {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 2px 6px;
+}
+
+/* The control uses `aria-disabled`, not the native attribute, so `:not(:disabled)`
+   matches an unavailable button and would brighten it on hover. Key the hover
+   affordance off the same predicate the dimmed state uses. */
+.chat-header-compact:hover:not([aria-disabled="true"]) {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+/* Unavailable controls use `aria-disabled`, not the native `disabled`
+   attribute, so they stay in the tab order and their reason is reachable by
+   keyboard and screen reader instead of hover-only. They still have to *look*
+   unavailable. */
+.chat-header-compact[aria-disabled="true"],
+.agent-card-compact[aria-disabled="true"],
+.team-member-icon-btn-compact[aria-disabled="true"],
+.team-card-compact[aria-disabled="true"] {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.compacting-card-elapsed {
+    margin-left: auto;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Aggregate outcome of the team's last compaction. Quiet by default; the
+   failure form carries the word "failed"/the provider reason as well as colour,
+   so colour is never the only channel. */
+.team-card-compaction-summary {
+    margin: 4px 0 0;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+}
+
+.team-card-compaction-summary-failed {
+    color: var(--warning);
+}
+
+/* The team button has room to show its blocker inline, so the reason is
+   visible rather than only announced. */
+.team-card-compact-reason {
+    margin-left: 6px;
+    opacity: 0.75;
+    font-size: 0.9em;
+}
+
 /* --- System / Warning / Error --- */
 .chat-card-system {
     background: transparent;
@@ -13557,5 +13749,11 @@ pre.tool-error-pre {
     /* Opacity reveal: the git panel's action group. */
     .gp-file-actions {
         transition: none;
+    }
+
+    /* The compaction banner's spinner runs for minutes at a time — by far the
+       longest-lived animation in the app, and the one most worth stopping. */
+    .compacting-card-icon {
+        animation: none;
     }
 }
