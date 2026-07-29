@@ -4,5 +4,23 @@
 # this is required for `cargo build -p mqtt-transport --target wasm32-unknown-unknown`.
 # Scoped to the wasm target only; native builds are unaffected. The cfg is inert
 # for any crate that is not getrandom 0.3.
+# wasm-ld defaults the shadow stack to 1 MiB, at the bottom of linear memory.
+# An unoptimized build's frames are large enough that booting the full app
+# overflows it: `__stack_pointer` walks off the start of memory and the next
+# load traps as "Out of bounds memory access" inside a wasm-bindgen closure,
+# roughly a second after `mount_to_body`. A trap poisons the instance, so the
+# app silently half-mounts and never connects to the host or answers UI-debug
+# ping — which is what made `tyde_dev_instance_start` time out with no
+# diagnostic. Release frames are small enough to fit, so this only ever bit
+# debug builds, and component-level wasm tests mount shallowly enough to miss
+# it.
+#
+# The stack lives in linear memory, so this raises the module's initial memory
+# rather than costing anything at runtime; pages are committed on demand.
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = [
+    '--cfg',
+    'getrandom_backend="wasm_js"',
+    '-C',
+    'link-arg=-zstack-size=16777216',
+]
