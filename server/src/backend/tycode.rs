@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,6 +29,11 @@ use super::{
     StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
     backend_fork_unsupported_message, render_combined_spawn_instructions,
     setup::{TYCODE_VERSION, ensure_tycode_command_compatible, resolve_tycode_binary_path},
+};
+use crate::agent::customization::SkillSelection;
+use crate::backend::skill_projection::{
+    DescriptionPolicy, ProjectedSkill, ProjectionPolicy, SkillRefusal, create_private_dir,
+    discard_wrapper, inspect_skill, write_wrapper,
 };
 use crate::backend::tycode_config;
 use crate::process_env;
@@ -570,6 +576,7 @@ enum TycodeStdinCommand {
     Cancel,
 }
 
+#[derive(Debug)]
 struct TempWorkspaceRoot {
     path: PathBuf,
 }
@@ -577,12 +584,10 @@ struct TempWorkspaceRoot {
 impl TempWorkspaceRoot {
     fn new(prefix: &str) -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).map_err(|err| {
-            format!(
-                "Failed to create temporary workspace {}: {err}",
-                path.display()
-            )
-        })?;
+        // Private, not merely fresh: this root holds the session's steering and
+        // the full text of every skill it projected, and a world-readable copy
+        // of a user's skill instructions is not something to create silently.
+        create_private_dir(&path)?;
         Ok(Self { path })
     }
 }
@@ -602,42 +607,197 @@ fn write_text_file(path: &PathBuf, body: &str) -> Result<(), String> {
     fs::write(path, body).map_err(|err| format!("Failed to write {}: {err}", path.display()))
 }
 
+/// How a selected skill is projected for Tycode.
+///
+/// `.tycode` is refused because the projection root *is* a workspace root: a
+/// skill shipping its own `.tycode` directory would land beside the one Tyde
+/// writes and could redirect the settings, steering, and skill tree Tyde owns.
+///
+/// A description is mandatory. Tycode's parser refuses a `SKILL.md` whose
+/// frontmatter has no non-empty `description` and only logs a warning, so
+/// without a synthesized fallback the skill would disappear from the catalog
+/// with nothing to tell the user why.
+const TYCODE_PROJECTION: ProjectionPolicy = ProjectionPolicy {
+    refused_resource_names: &[".tycode", ".claude"],
+    description: DescriptionPolicy::Required,
+};
+
+#[derive(Debug)]
+struct TycodeCustomization {
+    root: TempWorkspaceRoot,
+    /// Names a Default session started without. `None` when nothing was
+    /// dropped.
+    degraded_notice: Option<String>,
+}
+
+/// Materialize this session's steering and skills into a temporary workspace
+/// root that Tycode discovers for itself.
+///
+/// Tycode scans `<workspace root>/.tycode/skills/<name>/SKILL.md`, lists each
+/// skill's name and description in its system prompt, and loads a body only when
+/// the model calls `invoke_skill`. So skills are projected, never inlined: the
+/// session pays one catalog line per skill instead of every body up front.
+///
+/// **An explicit selection is fail-closed.** A custom agent naming its skills is
+/// making a statement about what the session is for, so any refusal aborts
+/// startup rather than quietly starting a differently equipped agent.
+///
+/// **The Default agent may degrade**, because it selects every installed skill
+/// and one broken skill anywhere in the store must not make Tycode unusable —
+/// but only with a user-visible notice naming every omitted skill and why.
 fn materialize_tycode_customization(
     config: &BackendSpawnConfig,
-) -> Result<Option<TempWorkspaceRoot>, String> {
-    let steering = render_combined_spawn_instructions(&config.resolved_spawn_config);
-    if steering.is_none() && config.resolved_spawn_config.skills.is_empty() {
+) -> Result<Option<TycodeCustomization>, String> {
+    let selected = &config.resolved_spawn_config.skills;
+    let selection = config.resolved_spawn_config.skill_selection;
+    let base_steering = render_combined_spawn_instructions(&config.resolved_spawn_config);
+    if base_steering.is_none() && selected.is_empty() {
         return Ok(None);
     }
     let root = TempWorkspaceRoot::new("tyde-tycode-customization")?;
+
+    // Inspect everything first, so a per-skill problem is a refusal the
+    // selection policy can weigh rather than a half-built root.
+    let mut refusals = Vec::new();
+    let mut inspected = Vec::new();
+    let mut claimed = BTreeSet::new();
+    for skill in selected {
+        match inspect_skill(skill, &mut claimed, TYCODE_PROJECTION) {
+            Ok(entry) => inspected.push(entry),
+            Err(reason) => refusals.push(SkillRefusal {
+                name: skill.name.clone(),
+                reason,
+            }),
+        }
+    }
+
+    let mut projected = Vec::new();
+    if !inspected.is_empty() {
+        let skills_dir = root.path.join(".tycode").join("skills");
+        create_private_dir(&skills_dir)?;
+        for entry in inspected {
+            match write_wrapper(&skills_dir, &entry) {
+                Ok(()) => projected.push(entry.projected),
+                Err(reason) => {
+                    discard_wrapper(&skills_dir, &entry.projected.name);
+                    refusals.push(SkillRefusal {
+                        name: entry.source_name,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    for refusal in &refusals {
+        tracing::warn!("Tycode skill projection: {}", refusal.describe());
+    }
+    if !refusals.is_empty() && selection == SkillSelection::Explicit {
+        return Err(format!(
+            "This agent explicitly selected {} skill(s), and Tyde could not expose all of them, \
+             so the session was not started:\n{}",
+            selected.len(),
+            refusals
+                .iter()
+                .map(|refusal| format!("- {}", refusal.describe()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    let steering = match tycode_skill_overlay(selection, &projected) {
+        Some(overlay) => Some(match base_steering {
+            Some(base) => format!("{base}\n\n{overlay}"),
+            None => overlay,
+        }),
+        None => base_steering,
+    };
     if let Some(steering) = steering {
         write_text_file(
             &root.path.join(".tycode").join("tyde_steering.md"),
             &steering,
         )?;
     }
-    for skill in &config.resolved_spawn_config.skills {
-        // Tycode has no skill discovery, so it is resolved with inline bodies.
-        // A skill without one means the resolver and this materializer
-        // disagree; write nothing rather than an empty SKILL.md that reads as
-        // "this skill has no instructions".
-        let body = skill.inline_body().ok_or_else(|| {
+
+    Ok(Some(TycodeCustomization {
+        degraded_notice: (!refusals.is_empty()).then(|| tycode_degraded_notice(&refusals)),
+        root,
+    }))
+}
+
+/// Name the projected skills without restating a single body.
+///
+/// `AllInstalled` says nothing: Tycode's own system prompt already lists every
+/// discovered skill with its description and mandates `invoke_skill`, so
+/// re-listing them would rebuild the duplication native discovery removes.
+/// `Explicit` enumerates, because a custom agent's selection is a deliberate
+/// statement of intent — and either way a skill whose store name could not be
+/// used verbatim is shown under both names, so the name the model must invoke is
+/// never a mystery.
+fn tycode_skill_overlay(selection: SkillSelection, projected: &[ProjectedSkill]) -> Option<String> {
+    let renamed = projected
+        .iter()
+        .filter(|skill| skill.name != skill.source_name)
+        .map(|skill| {
             format!(
-                "Tycode skill '{}' was resolved without an inline body",
-                skill.name
+                "- {} (installed in Tyde as '{}')",
+                skill.name, skill.source_name
             )
-        })?;
-        write_text_file(
-            &root
-                .path
-                .join(".tycode")
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md"),
-            body,
-        )?;
+        })
+        .collect::<Vec<_>>();
+    match selection {
+        SkillSelection::AllInstalled => (!renamed.is_empty()).then(|| {
+            format!(
+                "Skills installed in Tyde are available through `invoke_skill`. These are \
+                 listed under a different name than the one Tyde shows, and must be invoked by \
+                 the first name:\n{}",
+                renamed.join("\n")
+            )
+        }),
+        SkillSelection::Explicit => {
+            if projected.is_empty() {
+                return None;
+            }
+            let mut lines = vec![
+                "This agent selected these Tyde skills, available through `invoke_skill`:"
+                    .to_string(),
+            ];
+            for skill in projected {
+                let label = if skill.name == skill.source_name {
+                    skill.name.clone()
+                } else {
+                    format!(
+                        "{} (installed in Tyde as '{}')",
+                        skill.name, skill.source_name
+                    )
+                };
+                match skill.description.as_deref() {
+                    Some(description) if !description.is_empty() => {
+                        lines.push(format!("- {label} — {description}"));
+                    }
+                    _ => lines.push(format!("- {label}")),
+                }
+            }
+            Some(lines.join("\n"))
+        }
     }
-    Ok(Some(root))
+}
+
+/// User-visible notice for a Default session that started without some skills.
+fn tycode_degraded_notice(refusals: &[SkillRefusal]) -> String {
+    let mut lines = vec![format!(
+        "Tyde started this Tycode session without {} installed skill(s):",
+        refusals.len()
+    )];
+    for refusal in refusals {
+        lines.push(format!("- {}", refusal.describe()));
+    }
+    lines.push(
+        "The rest of the session's skills are available normally. Fix or remove the skills above \
+         to expose them."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
@@ -1754,8 +1914,15 @@ impl Backend for TycodeBackend {
                 }
             };
             let mut workspace_roots = workspace_roots;
-            if let Some(root) = materialized_customization.as_ref() {
-                workspace_roots.push(root.path.to_string_lossy().to_string());
+            if let Some(customization) = materialized_customization.as_ref() {
+                workspace_roots.push(customization.root.path.to_string_lossy().to_string());
+                // A Default session that dropped a skill says so. The channel is
+                // unbounded and its receiver was handed back before this task
+                // ran, so the notice arrives even though nothing is listening
+                // yet.
+                if let Some(notice) = customization.degraded_notice.as_deref() {
+                    let _ = events_tx.send(tycode_warning_chat_event(notice));
+                }
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let mut command = match tycode_session_command(
@@ -2046,8 +2213,15 @@ impl Backend for TycodeBackend {
                 }
             };
             let mut workspace_roots = workspace_roots;
-            if let Some(root) = materialized_customization.as_ref() {
-                workspace_roots.push(root.path.to_string_lossy().to_string());
+            if let Some(customization) = materialized_customization.as_ref() {
+                workspace_roots.push(customization.root.path.to_string_lossy().to_string());
+                // A Default session that dropped a skill says so. The channel is
+                // unbounded and its receiver was handed back before this task
+                // ran, so the notice arrives even though nothing is listening
+                // yet.
+                if let Some(notice) = customization.degraded_notice.as_deref() {
+                    let _ = events_tx.send(tycode_warning_chat_event(notice));
+                }
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let mut command = match tycode_session_command(
@@ -3018,6 +3192,24 @@ fn is_known_tycode_orchestration_payload_kind(kind: &str) -> bool {
             | "PlanSelected"
             | "ReviewRoundResolved"
     )
+}
+
+/// A non-fatal notice: the session is running, but not with everything the user
+/// configured. `Warning` rather than `Error` so it does not read as a failed
+/// start.
+fn tycode_warning_chat_event(message: impl Into<String>) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: unix_now_ms(),
+        sender: MessageSender::Warning,
+        content: message.into(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
 }
 
 fn tycode_error_chat_event(message: impl Into<String>) -> ChatEvent {
@@ -6607,6 +6799,175 @@ for raw_line in sys.stdin:
         assert_eq!(
             count, 4,
             "SessionStarted and ConversationCleared plus non-delta persisted events"
+        );
+    }
+    fn install_store_skill(
+        store: &Path,
+        name: &str,
+        body: &str,
+        description: Option<&str>,
+    ) -> crate::agent::customization::ResolvedSkill {
+        let dir = store.join(name);
+        fs::create_dir_all(&dir).expect("create store skill dir");
+        fs::write(dir.join("SKILL.md"), body).expect("write store SKILL.md");
+        crate::agent::customization::ResolvedSkill::path_only(
+            protocol::Skill {
+                id: protocol::SkillId(name.to_string()),
+                name: name.to_string(),
+                title: None,
+                description: description.map(str::to_string),
+            },
+            dir.clone(),
+            dir.join("SKILL.md"),
+        )
+    }
+
+    fn skill_spawn_config(
+        skills: Vec<crate::agent::customization::ResolvedSkill>,
+        selection: SkillSelection,
+    ) -> BackendSpawnConfig {
+        BackendSpawnConfig {
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                skills,
+                skill_selection: selection,
+                skill_delivery: crate::agent::customization::SkillDelivery::NativeDiscovery,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The regression this projection exists for: Tycode discovers skills for
+    /// itself, so a session must pay one catalog line per skill, not every body
+    /// up front. A body in the steering file means both paths fired and every
+    /// selected skill arrived pre-loaded.
+    #[test]
+    fn projected_skills_are_discoverable_and_no_body_reaches_the_prompt() {
+        const BODY: &str = "TYCODE_SKILL_BODY_SENTINEL";
+        let dir = TempDir::new().expect("tempdir");
+        let store = dir.path().join("store");
+        let skills = vec![
+            install_store_skill(
+                &store,
+                "eazy-ecs",
+                &format!("---\nname: eazy-ecs\ndescription: Deploy to ECS\n---\n{BODY}\n"),
+                None,
+            ),
+            // Uppercase: Tycode's parser rejects any name outside [a-z0-9-], so
+            // this skill is only discoverable at all because it is renamed.
+            install_store_skill(&store, "TycodeGames", &format!("{BODY}\n"), None),
+        ];
+        let scripts = store.join("TycodeGames").join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        fs::write(scripts.join("gen.py"), "print('art')\n").expect("write script");
+
+        let customization = materialize_tycode_customization(&skill_spawn_config(
+            skills,
+            SkillSelection::AllInstalled,
+        ))
+        .expect("materialize")
+        .expect("a skill-bearing session materializes a root");
+        assert_eq!(customization.degraded_notice, None);
+
+        let skills_dir = customization.root.path.join(".tycode").join("skills");
+        let ecs = fs::read_to_string(skills_dir.join("eazy-ecs").join("SKILL.md"))
+            .expect("projected eazy-ecs");
+        assert!(ecs.contains("name: eazy-ecs"), "{ecs}");
+        assert!(ecs.contains("description: Deploy to ECS"), "{ecs}");
+        assert!(ecs.contains(BODY), "the body must reach the wrapper: {ecs}");
+
+        let games = fs::read_to_string(skills_dir.join("tycodegames").join("SKILL.md"))
+            .expect("a store name outside the alphabet must be renamed, not dropped");
+        assert!(
+            games.contains("name: tycodegames"),
+            "Tycode keys on the frontmatter name: {games}"
+        );
+        assert!(
+            games.contains("description:"),
+            "Tycode refuses a skill with no description: {games}"
+        );
+        assert!(
+            skills_dir
+                .join("tycodegames")
+                .join("scripts")
+                .join("gen.py")
+                .is_file(),
+            "bundled scripts must resolve through the projection"
+        );
+
+        // The steering file is the eager path. It may name the rename, but no
+        // skill body may appear in it.
+        let steering = customization
+            .root
+            .path
+            .join(".tycode")
+            .join("tyde_steering.md");
+        let steering = fs::read_to_string(&steering).unwrap_or_default();
+        assert!(
+            !steering.contains(BODY),
+            "a skill body reached the prompt: {steering}"
+        );
+        assert!(
+            steering.contains("tycodegames") && steering.contains("TycodeGames"),
+            "a renamed skill must be signposted under both names: {steering}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_selection_fails_closed_when_a_skill_cannot_be_projected() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = dir.path().join("store");
+        let skills = vec![
+            install_store_skill(&store, "good", "---\nname: good\n---\nbody\n", None),
+            install_store_skill(&store, "broken", "---\nname: broken\nunterminated\n", None),
+        ];
+
+        let err =
+            materialize_tycode_customization(&skill_spawn_config(skills, SkillSelection::Explicit))
+                .expect_err("an explicitly selected skill that cannot be projected must not start");
+
+        assert!(
+            err.contains("broken"),
+            "the failure must name the skill: {err}"
+        );
+        assert!(err.contains("never closed"), "and say why: {err}");
+    }
+
+    #[test]
+    fn a_default_selection_degrades_with_a_notice_naming_every_dropped_skill() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = dir.path().join("store");
+        let skills = vec![
+            install_store_skill(&store, "good", "---\nname: good\n---\nbody\n", None),
+            install_store_skill(&store, "broken", "---\nname: broken\nunterminated\n", None),
+        ];
+
+        let customization = materialize_tycode_customization(&skill_spawn_config(
+            skills,
+            SkillSelection::AllInstalled,
+        ))
+        .expect("one broken skill must not make Tycode unusable")
+        .expect("materialized root");
+
+        let notice = customization
+            .degraded_notice
+            .expect("a dropped skill must be reported, never silent");
+        assert!(notice.contains("broken"), "{notice}");
+        assert!(notice.contains("never closed"), "{notice}");
+        assert!(
+            !notice.contains("'good'"),
+            "only the dropped skill: {notice}"
+        );
+        assert!(
+            customization
+                .root
+                .path
+                .join(".tycode")
+                .join("skills")
+                .join("good")
+                .join("SKILL.md")
+                .is_file(),
+            "the surviving skill is still projected"
         );
     }
 }

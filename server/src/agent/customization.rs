@@ -175,13 +175,17 @@ pub enum SkillDelivery {
 impl SkillDelivery {
     pub(crate) fn for_backend(backend_kind: BackendKind) -> Self {
         match backend_kind {
-            BackendKind::Claude | BackendKind::Codex => Self::NativeDiscovery,
+            // Tycode discovers `<workspace root>/.tycode/skills/<name>` itself,
+            // lists name and description in its system prompt, and loads a body
+            // only when the model calls `invoke_skill`. Inlining bodies here as
+            // well put every selected skill's full text in the prompt *and* in
+            // the catalog, which is the duplication native discovery exists to
+            // avoid.
+            BackendKind::Claude | BackendKind::Codex | BackendKind::Tycode => Self::NativeDiscovery,
             // Hermes replaces the shared skill block with its own name-only
             // catalog, so every body it was handed was read and thrown away.
             BackendKind::Hermes => Self::NamesOnly,
-            BackendKind::Tycode | BackendKind::Kiro | BackendKind::Antigravity => {
-                Self::InlineBodies
-            }
+            BackendKind::Kiro | BackendKind::Antigravity => Self::InlineBodies,
         }
     }
 
@@ -590,7 +594,7 @@ mod tests {
         fixture.install_skill("lint", &format!("{BODY_SENTINEL}\n{}", "x".repeat(20_000)));
         fixture.install_skill("qa", BODY_SENTINEL);
 
-        for backend_kind in [BackendKind::Claude, BackendKind::Codex] {
+        for backend_kind in [BackendKind::Claude, BackendKind::Codex, BackendKind::Tycode] {
             let resolved = fixture.resolve(backend_kind, None).unwrap_or_else(|err| {
                 panic!("{backend_kind:?} must resolve without a body: {err}")
             });
@@ -795,6 +799,36 @@ mod tests {
         );
         // The body is still reachable, but only through an explicit call.
         assert_eq!(skill.load_body().expect("lazy body"), BODY_SENTINEL);
+    }
+
+    /// Delivery is per-backend policy, and getting it wrong is invisible at
+    /// runtime: a backend that discovers skills for itself but is also handed
+    /// inline bodies just silently pays for every body twice — once in the
+    /// prompt, once in its own catalog — which is what Tycode did. Pin the whole
+    /// mapping so a new backend has to state which seam it has.
+    #[test]
+    fn every_backend_states_the_skill_seam_it_actually_has() {
+        for (backend_kind, expected) in [
+            (BackendKind::Claude, SkillDelivery::NativeDiscovery),
+            (BackendKind::Codex, SkillDelivery::NativeDiscovery),
+            // Tycode scans `<workspace root>/.tycode/skills` and gates bodies
+            // behind `invoke_skill`.
+            (BackendKind::Tycode, SkillDelivery::NativeDiscovery),
+            (BackendKind::Hermes, SkillDelivery::NamesOnly),
+            (BackendKind::Kiro, SkillDelivery::InlineBodies),
+            (BackendKind::Antigravity, SkillDelivery::InlineBodies),
+        ] {
+            assert_eq!(
+                SkillDelivery::for_backend(backend_kind),
+                expected,
+                "{backend_kind:?}"
+            );
+            assert_eq!(
+                SkillDelivery::for_backend(backend_kind).loads_bodies(),
+                expected == SkillDelivery::InlineBodies,
+                "{backend_kind:?} must read bodies only when it renders them"
+            );
+        }
     }
 
     #[test]
