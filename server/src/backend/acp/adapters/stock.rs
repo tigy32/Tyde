@@ -155,6 +155,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_stock_agent_lists_no_sessions_rather_than_kiros() {
+        // The generic backend used to read Kiro's session directory directly,
+        // so every ACP agent was offered Kiro's sessions as its own — resuming
+        // one would have handed a third-party agent a Kiro session id. Listing
+        // now goes through the adapter, and an agent with no session source
+        // correctly reports none.
+        let sessions = StockAdapter::new(spec("/opt/bin/gemini-cli"))
+            .list_sessions(None)
+            .await
+            .expect("listing must succeed even when the agent exposes no sessions");
+        assert!(
+            sessions.is_empty(),
+            "a stock agent must never inherit another agent's sessions, got {sessions:?}"
+        );
+    }
+
     #[test]
     fn display_name_comes_from_the_command_stem() {
         assert_eq!(

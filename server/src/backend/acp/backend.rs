@@ -953,40 +953,35 @@ impl KiroInner {
             }
         };
 
-        let raw_sessions = match &self.ssh_host {
-            Some(host) => load_remote_kiro_sessions(host).await?,
-            None => load_local_kiro_sessions().await?,
-        };
+        // Session storage is entirely agent-specific — Kiro keeps JSON files in
+        // its own directory, another agent may expose ACP `session/list` or
+        // nothing at all. Ask the adapter rather than reading Kiro's layout, or
+        // a stock agent would be handed Kiro's session list as if it were its
+        // own.
+        let listed = self.adapter.list_sessions(self.ssh_host.as_deref()).await?;
 
-        let mut sessions = Vec::new();
-        for (session_id, metadata) in &raw_sessions {
-            if excluded_session_id.as_deref() == Some(session_id.as_str()) {
-                continue;
-            }
-            let cwd = metadata
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if cwd.contains(KIRO_ADMIN_SESSION_SUBDIR)
-                || cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR)
-            {
-                continue;
-            }
-            let title = extract_session_title(metadata);
-            let last_modified = extract_session_timestamp(metadata);
-
-            sessions.push(json!({
-                "id": session_id,
-                "session_id": session_id,
-                "title": title,
-                "created_at": last_modified,
-                "last_modified": last_modified,
-                "last_message_preview": "",
-                "workspace_root": cwd,
-                "message_count": Value::Null,
-                "backend_kind": "kiro",
-            }));
-        }
+        let mut sessions = listed
+            .into_iter()
+            .filter(|session| excluded_session_id.as_deref() != Some(session.id.0.as_str()))
+            .map(|session| {
+                let last_modified = session.updated_at_ms.or(session.created_at_ms).unwrap_or(0);
+                json!({
+                    "id": session.id.0,
+                    "session_id": session.id.0,
+                    "title": session.title.unwrap_or_default(),
+                    "created_at": session.created_at_ms.unwrap_or(last_modified),
+                    "last_modified": last_modified,
+                    "last_message_preview": "",
+                    "workspace_root": session
+                        .workspace_roots
+                        .first()
+                        .cloned()
+                        .unwrap_or_default(),
+                    "message_count": Value::Null,
+                    "backend_kind": protocol::ACP_BACKEND,
+                })
+            })
+            .collect::<Vec<_>>();
 
         sessions.sort_by(|a, b| {
             let a_ts = a.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
@@ -4196,35 +4191,16 @@ impl Backend for KiroBackend {
         ))
     }
 
+    /// `Backend::list_sessions` is static, so there is no adapter instance to
+    /// ask and no way to know which configured agent the caller meant. It
+    /// therefore lists the built-in Kiro agent's sessions, which is what this
+    /// did when Kiro was the only ACP agent. Per-agent listing needs
+    /// `Backend::list_sessions` to carry the agent, which is a wider change to
+    /// the backend trait than this refactor makes; the instance-level
+    /// `list_sessions` above is already adapter-driven and is the path a
+    /// running session uses.
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        let raw_sessions = load_local_kiro_sessions().await?;
-        let mut sessions = Vec::new();
-        for (session_id, metadata) in raw_sessions {
-            let cwd = metadata
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if cwd.contains(KIRO_ADMIN_SESSION_SUBDIR)
-                || cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR)
-            {
-                continue;
-            }
-            sessions.push(BackendSession {
-                id: SessionId(session_id),
-                backend_kind: BackendKind::Acp,
-                workspace_roots: if cwd.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![cwd]
-                },
-                title: Some(extract_session_title(&metadata)),
-                token_count: None,
-                created_at_ms: Some(extract_session_timestamp(&metadata)),
-                updated_at_ms: Some(extract_session_timestamp(&metadata)),
-                resumable: true,
-            });
-        }
+        let mut sessions = kiro_adapter(None).list_sessions(None).await?;
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
         Ok(sessions)
     }
