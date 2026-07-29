@@ -4405,7 +4405,7 @@ pub(crate) fn spawn_agent_actor(
                                         "sent dequeued review-origin bundle to backend"
                                     );
                                 }
-                                if let Some(MessageOrigin::Review { review_id }) = queued.origin {
+                                if let Some(review_id) = review_origin {
                                     tracing::debug!(
                                         review_id = %review_id,
                                         agent_id = %current_start.agent_id,
@@ -5282,9 +5282,7 @@ pub(crate) fn spawn_agent_actor(
                                                     "sent immediate review-origin bundle to backend"
                                                 );
                                             }
-                                            if let Some(MessageOrigin::Review { review_id }) =
-                                                queued.origin
-                                            {
+                                            if let Some(review_id) = review_origin {
                                                 tracing::debug!(
                                                     review_id = %review_id,
                                                     agent_id = %current_start.agent_id,
