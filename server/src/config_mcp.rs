@@ -315,7 +315,7 @@ impl TydeConfigMcpServer {
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let payload = setup::collect_backend_setup().await;
+        let payload = setup::collect_backend_setup(&[]).await;
         let backends: Vec<_> = payload
             .backends
             .iter()

@@ -70,7 +70,15 @@ impl Drop for PreparedBackendSetupCommand {
     }
 }
 
-pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
+/// Probes every backend.
+///
+/// `acp_agents` carries the user's configured ACP agents (label + command) so
+/// the ACP row reflects the agents that are actually configured rather than
+/// only the built-in Kiro CLI. Pass an empty slice when settings are not
+/// available; the built-in agent is still probed.
+pub(crate) async fn collect_backend_setup(
+    acp_agents: &[ConfiguredAcpAgent],
+) -> BackendSetupPayload {
     let platform = host_platform();
     // Probe every backend concurrently. Each probe spawns a real `<cli>
     // --version` subprocess capped at a 2s timeout, so running them
@@ -85,10 +93,17 @@ pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
             BackendKind::Hermes,
         ]
         .into_iter()
-        .map(|kind| probe_backend(kind, platform)),
+        .map(|kind| probe_backend(kind, platform, acp_agents)),
     )
     .await;
     BackendSetupPayload { backends }
+}
+
+/// One configured ACP agent, as the setup probe sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredAcpAgent {
+    pub label: String,
+    pub command: String,
 }
 
 /// Backend setup with no real CLI probing — used by test fixtures (and any
@@ -133,7 +148,7 @@ pub(crate) async fn prepare_runnable_command(
     action: BackendSetupAction,
 ) -> Result<Option<PreparedBackendSetupCommand>, String> {
     let platform = host_platform();
-    let payload = collect_backend_setup().await;
+    let payload = collect_backend_setup(&[]).await;
     let info = payload
         .backends
         .into_iter()
@@ -248,10 +263,14 @@ fn resolve_tycode_binary_path_for_home(home: &Path) -> Option<String> {
         .then(|| path.to_string_lossy().to_string())
 }
 
-async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
+async fn probe_backend(
+    kind: BackendKind,
+    platform: HostPlatform,
+    acp_agents: &[ConfiguredAcpAgent],
+) -> BackendSetupInfo {
     let probe = match kind {
         BackendKind::Tycode => probe_installed_tycode().await,
-        BackendKind::Acp => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
+        BackendKind::Acp => probe_acp_agents(acp_agents).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
         BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
@@ -357,6 +376,52 @@ async fn probe_resolved_tycode(command: Option<String>) -> ProbeResult {
             ProbeResult::unavailable(diagnostic)
         }
     }
+}
+
+/// ACP is the one backend whose "is it installed?" answer depends on user
+/// configuration: the built-in Kiro agent plus any agent the user pointed at
+/// their own binary.
+///
+/// The row reports installed when *any* configured agent resolves, because ACP
+/// is usable at that point. When some resolve and others do not, the working
+/// status is kept but the diagnostic names the broken ones — a user who
+/// mistyped one command should not have the whole backend read as fine with no
+/// hint, nor as broken when their other agents work.
+async fn probe_acp_agents(agents: &[ConfiguredAcpAgent]) -> ProbeResult {
+    let mut missing = Vec::new();
+    let mut resolved: Option<ProbeResult> = None;
+    for agent in agents {
+        let candidates = command_candidates(&[agent.command.as_str()]);
+        let probe = probe_candidates(&candidates).await;
+        if matches!(probe.status, BackendSetupStatus::Installed) {
+            if resolved.is_none() {
+                resolved = Some(probe);
+            }
+        } else {
+            missing.push(agent.label.clone());
+        }
+    }
+
+    // Fall back to the built-in Kiro CLI when nothing was configured, so a
+    // fresh install still reports Kiro correctly.
+    let mut result = match resolved {
+        Some(probe) => probe,
+        None if agents.is_empty() => {
+            probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await
+        }
+        None => ProbeResult::not_installed(),
+    };
+
+    if !missing.is_empty() {
+        result.diagnostic = Some(BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandNotFound,
+            message: format!(
+                "No runnable command for ACP agent(s): {}",
+                missing.join(", ")
+            ),
+        });
+    }
+    result
 }
 
 async fn probe_candidates(candidates: &[String]) -> ProbeResult {
@@ -1838,6 +1903,54 @@ mod tests {
         assert!(
             !path.exists(),
             "dropping the prepared command must clean up"
+        );
+    }
+
+    fn agent(label: &str, command: &str) -> ConfiguredAcpAgent {
+        ConfiguredAcpAgent {
+            label: label.to_owned(),
+            command: command.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_reports_installed_when_any_configured_agent_resolves() {
+        // `/bin/sh` always exists; the other command cannot. ACP is usable via
+        // the working agent, so the row must not read as not-installed — but it
+        // must still name the broken one rather than hiding it.
+        let probe = probe_acp_agents(&[
+            agent("Working Agent", "/bin/sh"),
+            agent("Broken Agent", "/definitely/not/a/real/acp/binary"),
+        ])
+        .await;
+
+        assert_eq!(probe.status, BackendSetupStatus::Installed);
+        let diagnostic = probe
+            .diagnostic
+            .expect("a misconfigured agent must be reported, not silently ignored");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandNotFound);
+        assert!(
+            diagnostic.message.contains("Broken Agent"),
+            "the diagnostic must name the agent that failed, got {:?}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("Working Agent"),
+            "an agent that resolved must not be reported as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_reports_not_installed_when_every_configured_agent_is_missing() {
+        let probe =
+            probe_acp_agents(&[agent("Only Agent", "/definitely/not/a/real/acp/binary")]).await;
+
+        assert_eq!(probe.status, BackendSetupStatus::NotInstalled);
+        assert!(
+            probe
+                .diagnostic
+                .is_some_and(|diagnostic| diagnostic.message.contains("Only Agent")),
+            "the one configured agent must be named"
         );
     }
 }

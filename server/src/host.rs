@@ -8413,12 +8413,22 @@ impl HostHandle {
     /// instead of spawning real `<cli> --version` subprocesses and a codex
     /// model-discovery network RPC on every host spawn.
     async fn collect_backend_setup_respecting_probe(&self) -> BackendSetupPayload {
-        let skip = self.state.lock().await.skip_real_backend_probe;
+        let (skip, settings_store) = {
+            let state = self.state.lock().await;
+            (
+                state.skip_real_backend_probe,
+                Arc::clone(&state.settings_store),
+            )
+        };
         if skip {
-            setup::stub_backend_setup()
-        } else {
-            setup::collect_backend_setup().await
+            return setup::stub_backend_setup();
         }
+        let settings = settings_store.lock().await.get().ok();
+        let acp_agents = settings
+            .as_ref()
+            .map(configured_acp_setup_agents)
+            .unwrap_or_default();
+        setup::collect_backend_setup(&acp_agents).await
     }
 
     fn schedule_session_schema_refresh(&self) {
@@ -20102,6 +20112,33 @@ fn acp_schema_state<'a>(
         .cloned()
         .unwrap_or(LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()));
     schemas.get(&key).unwrap_or(PENDING)
+}
+
+/// The configured ACP agents as the setup probe wants them: one per launch
+/// profile, labelled the way the user sees it in Settings.
+pub(crate) fn configured_acp_setup_agents(
+    settings: &protocol::HostSettings,
+) -> Vec<crate::backend::setup::ConfiguredAcpAgent> {
+    configured_acp_profile_ids(settings)
+        .into_iter()
+        .filter_map(|id| {
+            let agent = acp_agent_for_profile(settings, &id)?;
+            let label = if id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
+                builtin_kiro_launch_profile().label
+            } else {
+                settings
+                    .launch_profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map(|profile| profile.label.clone())
+                    .unwrap_or_else(|| id.0.clone())
+            };
+            Some(crate::backend::setup::ConfiguredAcpAgent {
+                label,
+                command: agent.command,
+            })
+        })
+        .collect()
 }
 
 pub(crate) const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
