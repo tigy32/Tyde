@@ -2445,6 +2445,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::agent::customization::ResolvedSpawnConfig;
+    use crate::backend::BackendContinuationContext;
 
     #[tokio::test]
     async fn mock_backend_records_read_only_access_mode() {
@@ -2550,7 +2551,7 @@ mod tests {
             trigger: CompactionTrigger::UserRequested,
             focus: focus.map(str::to_owned),
             transcript_authoritative: true,
-            continuation: super::BackendContinuationContext {
+            continuation: BackendContinuationContext {
                 required: Vec::new(),
                 advisory: Vec::new(),
             },

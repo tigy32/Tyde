@@ -18,13 +18,11 @@ use protocol::{
     ContextCompactionTimelineStatus, ContinuationInstallSummary, Envelope, FrameKind,
     MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
     ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
-    QueuedMessagesPayload, ReasoningData, RequestedCompactionAvailability,
-    RequestedCompactionRoute, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
-    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
-    ToolRequestType,
+    QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload, SpawnCostHint,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -403,7 +401,7 @@ pub(crate) struct SessionHistoryWindow {
     pub oldest_seq: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SequencedQueuedMessage {
     sequence: u64,
     entry: QueuedMessageEntry,
@@ -2512,7 +2510,7 @@ fn activity_summary_attempted_tool_labels(
 }
 
 /// Type-erased backend handle for agent input and acknowledged settings edits.
-trait BackendSender: Send + 'static {
+trait BackendSender: Send + Sync + 'static {
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability;
     fn begin_compaction<'a>(
         &'a self,
@@ -11659,16 +11657,16 @@ mod tests {
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
         AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-        CompactionOperationId, CompactionTrigger, ContextCompactionNotifyPayload,
-        ContextCompactionTimelineEvent, Envelope, FrameKind, MessageMetadataUpdateData,
-        MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
-        ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
-        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
-        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType, ToolUseData,
+        CompactionMetrics, CompactionOperationId, CompactionStage, CompactionTrigger,
+        ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
+        Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
+        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+        QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
+        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
+        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
+        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -11693,9 +11691,9 @@ mod tests {
         replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
         session_history_entries_from_log, session_history_window, spawn_agent_actor,
         spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
-        upsert_activity_stats_snapshot,
+        upsert_activity_stats_snapshot, upsert_context_compaction_snapshot,
     };
-    use crate::agent::backend_turn_visibly_busy;
+    use crate::agent::{backend_turn_visibly_busy, supervisor};
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
     use crate::backend::{

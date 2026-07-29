@@ -2399,7 +2399,7 @@ impl ClaudeInner {
                 let diagnostic = value
                     .get("message")
                     .and_then(extract_text_from_message)
-                    .and_then(normalize_nonempty);
+                    .and_then(|diagnostic| normalize_nonempty(&diagnostic));
                 if let Some(diagnostic) = diagnostic {
                     let mut state = self.state.lock().await;
                     if let Some(pending) = state.pending_compaction.as_mut()

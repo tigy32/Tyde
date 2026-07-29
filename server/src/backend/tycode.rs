@@ -4490,6 +4490,7 @@ mod tests {
                 ChatEvent::OperationCancelled(_) => "OperationCancelled",
                 ChatEvent::RetryAttempt(_) => "RetryAttempt",
                 ChatEvent::Orchestration(_) => "Orchestration",
+                ChatEvent::ContextCompaction(_) => "ContextCompaction",
             })
             .collect()
     }
