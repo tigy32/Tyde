@@ -8,7 +8,7 @@ use protocol::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionCapability {
+pub struct BackendCompactionCapability {
     pub coordinator: BackendCompactionCoordinator,
     pub availability: BackendCompactionAvailability,
     pub provider_version: Option<String>,
@@ -85,13 +85,13 @@ impl Default for BackendCompactionCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionCoordinator {
+pub enum BackendCompactionCoordinator {
     LegacyReplacement,
     ContextOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionAvailability {
+pub enum BackendCompactionAvailability {
     Native {
         mechanism: BackendCompactionMechanism,
     },
@@ -107,19 +107,19 @@ pub(crate) enum BackendCompactionAvailability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionMechanism {
+pub enum BackendCompactionMechanism {
     InterceptedTextCommand,
     JsonRpcRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionProtocolConfidence {
+pub enum BackendCompactionProtocolConfidence {
     Verified,
     Compatible,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendContextReseatSupport {
+pub enum BackendContextReseatSupport {
     PreservedByNative,
     InjectAfterNative,
     IncludeInNativeRequest,
@@ -127,7 +127,7 @@ pub(crate) enum BackendContextReseatSupport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionUnavailableReason {
+pub enum BackendCompactionUnavailableReason {
     ManualTriggerAbsent,
     AdapterHasNoManualTransport,
     VersionTooOld { required: String },
@@ -137,7 +137,7 @@ pub(crate) enum BackendCompactionUnavailableReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionUnknownReason {
+pub enum BackendCompactionUnknownReason {
     ProcessNotInitialized,
     VersionUnavailable,
     VersionUnparseable,
@@ -146,7 +146,7 @@ pub(crate) enum BackendCompactionUnknownReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionCapabilityEvidence {
+pub enum BackendCompactionCapabilityEvidence {
     ClaudeInitializeCommand { name: String },
     CodexInitializeUserAgent { user_agent: String },
     HermesLocalGatewayProbe { version: String },
@@ -155,13 +155,13 @@ pub(crate) enum BackendCompactionCapabilityEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BackendContinuationContext {
+pub struct BackendContinuationContext {
     pub required: Vec<BackendContinuationItem>,
     pub advisory: Vec<BackendContinuationItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BackendContinuationItem {
+pub struct BackendContinuationItem {
     pub kind: String,
     pub payload: Value,
 }
@@ -334,7 +334,7 @@ impl std::fmt::Display for BackendBindingPrepareError {
 impl std::error::Error for BackendBindingPrepareError {}
 
 #[derive(Debug, Clone)]
-pub(crate) struct BackendCompactionRequest {
+pub struct BackendCompactionRequest {
     pub operation_id: CompactionOperationId,
     pub trigger: CompactionTrigger,
     pub focus: Option<String>,
@@ -343,7 +343,7 @@ pub(crate) struct BackendCompactionRequest {
 }
 
 #[derive(Debug)]
-pub(crate) enum BackendCompactionStart {
+pub enum BackendCompactionStart {
     Accepted(BackendAcceptedCompaction),
     Deferred {
         reason: BackendCompactionDeferredReason,
@@ -356,13 +356,13 @@ pub(crate) enum BackendCompactionStart {
 }
 
 #[derive(Debug)]
-pub(crate) struct BackendAcceptedCompaction {
+pub struct BackendAcceptedCompaction {
     pub operation_id: CompactionOperationId,
     pub terminal: oneshot::Receiver<BackendCompactionResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionDeferredReason {
+pub enum BackendCompactionDeferredReason {
     ActiveTurn,
     ToolLifecycleActive,
     ApprovalPending,
@@ -372,7 +372,7 @@ pub(crate) enum BackendCompactionDeferredReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionNotDispatchedReason {
+pub enum BackendCompactionNotDispatchedReason {
     NativeUnavailable(BackendCompactionUnavailableReason),
     CapabilityUnknown(BackendCompactionUnknownReason),
     BackendClosed,
@@ -381,26 +381,26 @@ pub(crate) enum BackendCompactionNotDispatchedReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionDispatchState {
+pub enum BackendCompactionDispatchState {
     Accepted,
     MayHaveReachedProvider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionMutationState {
+pub enum BackendCompactionMutationState {
     NotObserved,
     Completed,
     MayHaveMutated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum PostCompactionTokenCount {
+pub enum PostCompactionTokenCount {
     Trusted(u64),
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionResult {
+pub struct BackendCompactionResult {
     pub operation_id: CompactionOperationId,
     pub dispatch: BackendCompactionDispatchState,
     pub mutation: BackendCompactionMutationState,
@@ -412,18 +412,18 @@ pub(crate) struct BackendCompactionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionSuccess {
+pub struct BackendCompactionSuccess {
     pub mechanism: CompactionMethod,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionFailure {
+pub struct BackendCompactionFailure {
     pub kind: BackendCompactionFailureKind,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionFailureKind {
+pub enum BackendCompactionFailureKind {
     ProviderRejected,
     ProviderFailed,
     Interrupted,
@@ -433,7 +433,7 @@ pub(crate) enum BackendCompactionFailureKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionTerminalEvidence {
+pub enum BackendCompactionTerminalEvidence {
     Claude {
         session_id: Option<String>,
         boundary_uuid: Option<String>,
@@ -511,7 +511,7 @@ pub(crate) enum BackendCompactionUserFocusProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ContinuationInstallStatus {
+pub enum ContinuationInstallStatus {
     NotRequired,
     PreservedByNative,
     Installed,
@@ -520,7 +520,7 @@ pub(crate) enum ContinuationInstallStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendContextReseatResult {
+pub struct BackendContextReseatResult {
     pub required: ContinuationInstallStatus,
     pub advisory: ContinuationInstallStatus,
 }

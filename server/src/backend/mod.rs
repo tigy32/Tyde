@@ -4,6 +4,8 @@ pub mod antigravity;
 pub mod claude;
 pub mod claude_skills;
 pub mod codex;
+// Trait-facing compaction types are nominally public inside this crate-private
+// module so the public Backend trait does not export the internal contract.
 pub(crate) mod compaction;
 pub mod hermes;
 pub mod hermes_config;

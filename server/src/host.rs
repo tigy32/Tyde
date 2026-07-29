@@ -29116,13 +29116,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 "updated_at_ms": 1
             }))
             .expect("session record");
-        let context = crate::agent::supervisor::SupervisionContextSnapshot {
-            auto_compaction_blocked_until_real_user: true,
-            supervision_verdict_dormant_until_real_user: true,
-            compaction_user_message_count: Some(1),
-            user_message_count: 1,
-            ..Default::default()
-        };
+        let mut context = crate::agent::supervisor::SupervisionContextSnapshot::default();
+        context.auto_compaction_blocked_until_real_user = true;
+        context.supervision_verdict_dormant_until_real_user = true;
+        context.compaction_user_message_count = Some(1);
+        context.user_message_count = 1;
         assert!(!supervision_record_allows_action(
             Some(&record),
             &context,
@@ -29133,12 +29131,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &context,
             SupervisionAction::Verdict,
         ));
-        let released = crate::agent::supervisor::SupervisionContextSnapshot {
-            auto_compaction_blocked_until_real_user: false,
-            supervision_verdict_dormant_until_real_user: false,
-            user_message_count: 2,
-            ..context
-        };
+        let mut released = context;
+        released.auto_compaction_blocked_until_real_user = false;
+        released.supervision_verdict_dormant_until_real_user = false;
+        released.user_message_count = 2;
         assert!(supervision_record_allows_action(
             Some(&record),
             &released,
@@ -29245,13 +29241,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
             record.compacted_from_session_id.is_none() && record.compacted_to_session_id.is_none(),
             "context-operation dormancy must not rely on legacy lineage"
         );
-        let dormant = crate::agent::supervisor::SupervisionContextSnapshot {
-            auto_compaction_blocked_until_real_user: true,
-            supervision_verdict_dormant_until_real_user: true,
-            compaction_user_message_count: Some(1),
-            user_message_count: 1,
-            ..Default::default()
-        };
+        let mut dormant = crate::agent::supervisor::SupervisionContextSnapshot::default();
+        dormant.auto_compaction_blocked_until_real_user = true;
+        dormant.supervision_verdict_dormant_until_real_user = true;
+        dormant.compaction_user_message_count = Some(1);
+        dormant.user_message_count = 1;
         assert!(!supervision_verdict_launch_allows_action(
             Some(&record),
             &dormant,
@@ -29275,12 +29269,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
         );
 
-        let released = crate::agent::supervisor::SupervisionContextSnapshot {
-            auto_compaction_blocked_until_real_user: false,
-            supervision_verdict_dormant_until_real_user: false,
-            user_message_count: 2,
-            ..dormant
-        };
+        let mut released = dormant;
+        released.auto_compaction_blocked_until_real_user = false;
+        released.supervision_verdict_dormant_until_real_user = false;
+        released.user_message_count = 2;
         assert!(supervision_verdict_launch_allows_action(
             Some(&record),
             &released,
@@ -29329,10 +29321,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .get(&session_id)
             .expect("legacy session record");
-        let dormant = crate::agent::supervisor::SupervisionContextSnapshot {
-            user_message_count: 1,
-            ..Default::default()
-        };
+        let mut dormant = crate::agent::supervisor::SupervisionContextSnapshot::default();
+        dormant.user_message_count = 1;
         assert!(!supervision_verdict_launch_allows_action(
             Some(&record),
             &dormant,
@@ -29356,10 +29346,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
         );
 
-        let released = crate::agent::supervisor::SupervisionContextSnapshot {
-            user_message_count: 2,
-            ..dormant
-        };
+        let mut released = dormant;
+        released.user_message_count = 2;
         assert!(supervision_verdict_launch_allows_action(
             Some(&record),
             &released,
