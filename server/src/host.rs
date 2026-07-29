@@ -20136,6 +20136,7 @@ pub(crate) fn configured_acp_setup_agents(
             Some(crate::backend::setup::ConfiguredAcpAgent {
                 label,
                 command: agent.command,
+                adapter: agent.adapter,
             })
         })
         .collect()
@@ -30322,6 +30323,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         ];
 
         let ids = configured_acp_profile_ids(&settings);
+        let agents = configured_acp_setup_agents(&settings);
 
         assert_eq!(
             ids,
@@ -30331,6 +30333,13 @@ Rules: Record only what remains true and useful for future work; drop transient 
             ],
             "probing must cover the built-in agent plus every configured ACP agent, and nothing else"
         );
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].label, "Kiro (ACP)");
+        assert_eq!(agents[0].command, "");
+        assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
+        assert_eq!(agents[1].label, "acp:my-agent");
+        assert_eq!(agents[1].command, "/usr/local/bin/my-agent");
+        assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
     }
 
     #[test]

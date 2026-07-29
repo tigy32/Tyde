@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use command_group::AsyncCommandGroup;
 use protocol::{
-    BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic,
+    AcpAdapterId, BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic,
     BackendSetupDiagnosticCode, BackendSetupInfo, BackendSetupPayload, BackendSetupStatus,
     HostPlatform,
 };
@@ -34,6 +34,12 @@ const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
+const ACP_AGGREGATE_MAX_FAILURES: usize = 4;
+const ACP_AGGREGATE_LABEL_MAX_BYTES: usize = 96;
+const ACP_AGGREGATE_DETAIL_MAX_BYTES: usize = 256;
+const ACP_AGGREGATE_MESSAGE_MAX_BYTES: usize = 1536;
+const ACP_COMMAND_DIAGNOSTIC_MAX_BYTES: usize = 512;
+const ACP_DIAGNOSTIC_TRUNCATION_MARKER: &str = "… [truncated]";
 
 pub(crate) struct PreparedBackendSetupCommand {
     program: String,
@@ -104,6 +110,7 @@ pub(crate) async fn collect_backend_setup(
 pub(crate) struct ConfiguredAcpAgent {
     pub label: String,
     pub command: String,
+    pub adapter: AcpAdapterId,
 }
 
 /// Backend setup with no real CLI probing — used by test fixtures (and any
@@ -388,40 +395,208 @@ async fn probe_resolved_tycode(command: Option<String>) -> ProbeResult {
 /// mistyped one command should not have the whole backend read as fine with no
 /// hint, nor as broken when their other agents work.
 async fn probe_acp_agents(agents: &[ConfiguredAcpAgent]) -> ProbeResult {
-    let mut missing = Vec::new();
-    let mut resolved: Option<ProbeResult> = None;
-    for agent in agents {
-        let candidates = command_candidates(&[agent.command.as_str()]);
-        let probe = probe_candidates(&candidates).await;
-        if matches!(probe.status, BackendSetupStatus::Installed) {
-            if resolved.is_none() {
-                resolved = Some(probe);
-            }
-        } else {
-            missing.push(agent.label.clone());
-        }
+    if agents.is_empty() {
+        let fallback = ConfiguredAcpAgent {
+            label: "Kiro (ACP)".to_owned(),
+            command: String::new(),
+            adapter: AcpAdapterId::Kiro,
+        };
+        let probe = probe_acp_agent(&fallback).await;
+        return aggregate_acp_agent_probes(vec![AcpAgentProbe {
+            label: fallback.label,
+            probe,
+        }]);
     }
 
-    // Fall back to the built-in Kiro CLI when nothing was configured, so a
-    // fresh install still reports Kiro correctly.
-    let mut result = match resolved {
-        Some(probe) => probe,
-        None if agents.is_empty() => {
-            probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await
-        }
-        None => ProbeResult::not_installed(),
-    };
-
-    if !missing.is_empty() {
-        result.diagnostic = Some(BackendSetupDiagnostic {
-            code: BackendSetupDiagnosticCode::CommandNotFound,
-            message: format!(
-                "No runnable command for ACP agent(s): {}",
-                missing.join(", ")
-            ),
+    let mut probes = Vec::with_capacity(agents.len());
+    for agent in agents {
+        probes.push(AcpAgentProbe {
+            label: agent.label.clone(),
+            probe: probe_acp_agent(agent).await,
         });
     }
+    aggregate_acp_agent_probes(probes)
+}
+
+struct AcpAgentProbe {
+    label: String,
+    probe: ProbeResult,
+}
+
+fn acp_agent_command_candidates(agent: &ConfiguredAcpAgent) -> Vec<String> {
+    let command = agent.command.trim();
+    if !command.is_empty() {
+        return vec![command.to_owned()];
+    }
+    match agent.adapter {
+        AcpAdapterId::Kiro => KIRO_CLI_CANDIDATES
+            .iter()
+            .map(|candidate| (*candidate).to_owned())
+            .collect(),
+        AcpAdapterId::Stock => Vec::new(),
+    }
+}
+
+async fn probe_acp_agent(agent: &ConfiguredAcpAgent) -> ProbeResult {
+    let candidates = acp_agent_command_candidates(agent);
+    if candidates.is_empty() {
+        return ProbeResult::not_installed_with_diagnostic(BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandNotFound,
+            message: "no ACP command is configured".to_owned(),
+        });
+    }
+    probe_acp_candidates(&candidates).await
+}
+
+async fn probe_acp_candidates(candidates: &[String]) -> ProbeResult {
+    for candidate in candidates {
+        let command = match classify_acp_candidate(candidate) {
+            AcpCandidateClassification::Missing => continue,
+            AcpCandidateClassification::Runnable(command) => command,
+            AcpCandidateClassification::Unavailable(diagnostic) => {
+                return ProbeResult::unavailable(diagnostic);
+            }
+        };
+
+        return match probe_command(&command).await {
+            Ok(version) => ProbeResult::installed(version),
+            Err(failure) => ProbeResult::unavailable(version_command_failure(&command, failure)),
+        };
+    }
+
+    ProbeResult::not_installed_with_diagnostic(BackendSetupDiagnostic {
+        code: BackendSetupDiagnosticCode::CommandNotFound,
+        message: if candidates.len() == 1 {
+            format!("command {} was not found", candidates[0])
+        } else {
+            format!("none of the commands {} were found", candidates.join(", "))
+        },
+    })
+}
+
+enum AcpCandidateClassification {
+    Missing,
+    Runnable(String),
+    Unavailable(BackendSetupDiagnostic),
+}
+
+fn classify_acp_candidate(candidate: &str) -> AcpCandidateClassification {
+    let path = Path::new(candidate);
+    if path.components().count() == 1 {
+        return process_env::find_executable_in_path(candidate)
+            .map_or(AcpCandidateClassification::Missing, |path| {
+                AcpCandidateClassification::Runnable(path.to_string_lossy().into_owned())
+            });
+    }
+    classify_explicit_acp_candidate_with(candidate, |path| std::fs::metadata(path))
+}
+
+fn classify_explicit_acp_candidate_with(
+    candidate: &str,
+    metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> AcpCandidateClassification {
+    match metadata(Path::new(candidate)) {
+        Ok(_) => AcpCandidateClassification::Runnable(candidate.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            AcpCandidateClassification::Missing
+        }
+        Err(error) => {
+            let candidate = bounded_acp_text(candidate, ACP_AGGREGATE_DETAIL_MAX_BYTES);
+            let message = bounded_acp_text(
+                &format!("could not inspect ACP command {candidate}: {error}"),
+                ACP_COMMAND_DIAGNOSTIC_MAX_BYTES,
+            );
+            AcpCandidateClassification::Unavailable(BackendSetupDiagnostic {
+                code: BackendSetupDiagnosticCode::CommandFailed,
+                message,
+            })
+        }
+    }
+}
+
+fn aggregate_acp_agent_probes(probes: Vec<AcpAgentProbe>) -> ProbeResult {
+    let installed_version = probes
+        .iter()
+        .find(|result| result.probe.status == BackendSetupStatus::Installed)
+        .and_then(|result| result.probe.version.clone());
+    let has_installed = probes
+        .iter()
+        .any(|result| result.probe.status == BackendSetupStatus::Installed);
+    let failures = probes
+        .iter()
+        .filter(|result| result.probe.status != BackendSetupStatus::Installed)
+        .collect::<Vec<_>>();
+
+    let mut result = if has_installed {
+        ProbeResult::installed(installed_version)
+    } else if failures
+        .iter()
+        .any(|result| result.probe.status == BackendSetupStatus::Unavailable)
+    {
+        ProbeResult::unavailable(aggregate_acp_diagnostic(&failures))
+    } else if failures.is_empty() {
+        ProbeResult::not_installed()
+    } else {
+        ProbeResult::not_installed_with_diagnostic(aggregate_acp_diagnostic(&failures))
+    };
+
+    if has_installed && !failures.is_empty() {
+        result.diagnostic = Some(aggregate_acp_diagnostic(&failures));
+    }
     result
+}
+
+fn aggregate_acp_diagnostic(failures: &[&AcpAgentProbe]) -> BackendSetupDiagnostic {
+    let code = failures
+        .iter()
+        .find(|result| result.probe.status == BackendSetupStatus::Unavailable)
+        .and_then(|result| result.probe.diagnostic.as_ref())
+        .or_else(|| {
+            failures
+                .iter()
+                .find_map(|result| result.probe.diagnostic.as_ref())
+        })
+        .map(|diagnostic| diagnostic.code)
+        .unwrap_or(BackendSetupDiagnosticCode::CommandNotFound);
+    let omitted = failures.len().saturating_sub(ACP_AGGREGATE_MAX_FAILURES);
+    let mut clauses = failures
+        .iter()
+        .take(ACP_AGGREGATE_MAX_FAILURES)
+        .map(|result| {
+            let detail = result
+                .probe
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("ACP command is unavailable");
+            let label = bounded_acp_text(&result.label, ACP_AGGREGATE_LABEL_MAX_BYTES);
+            let detail = bounded_acp_text(detail, ACP_AGGREGATE_DETAIL_MAX_BYTES);
+            format!("{label}: {detail}")
+        })
+        .collect::<Vec<_>>();
+    if omitted > 0 {
+        clauses.push(format!("[truncated] {omitted} additional ACP profile(s)"));
+    }
+    let message = bounded_acp_text(&clauses.join("; "), ACP_AGGREGATE_MESSAGE_MAX_BYTES);
+    BackendSetupDiagnostic { code, message }
+}
+
+fn bounded_acp_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes <= ACP_DIAGNOSTIC_TRUNCATION_MARKER.len() {
+        let mut end = max_bytes;
+        while !ACP_DIAGNOSTIC_TRUNCATION_MARKER.is_char_boundary(end) {
+            end -= 1;
+        }
+        return ACP_DIAGNOSTIC_TRUNCATION_MARKER[..end].to_owned();
+    }
+    let mut end = max_bytes - ACP_DIAGNOSTIC_TRUNCATION_MARKER.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], ACP_DIAGNOSTIC_TRUNCATION_MARKER)
 }
 
 async fn probe_candidates(candidates: &[String]) -> ProbeResult {
@@ -1990,6 +2165,38 @@ mod tests {
         ConfiguredAcpAgent {
             label: label.to_owned(),
             command: command.to_owned(),
+            adapter: AcpAdapterId::Stock,
+        }
+    }
+
+    fn kiro_agent(label: &str, command: &str) -> ConfiguredAcpAgent {
+        ConfiguredAcpAgent {
+            label: label.to_owned(),
+            command: command.to_owned(),
+            adapter: AcpAdapterId::Kiro,
+        }
+    }
+
+    fn acp_failure(
+        label: &str,
+        status: BackendSetupStatus,
+        code: BackendSetupDiagnosticCode,
+        message: &str,
+    ) -> AcpAgentProbe {
+        let diagnostic = BackendSetupDiagnostic {
+            code,
+            message: message.to_owned(),
+        };
+        let probe = match status {
+            BackendSetupStatus::Unavailable => ProbeResult::unavailable(diagnostic),
+            BackendSetupStatus::NotInstalled => {
+                ProbeResult::not_installed_with_diagnostic(diagnostic)
+            }
+            other => panic!("unsupported synthetic failure status: {other:?}"),
+        };
+        AcpAgentProbe {
+            label: label.to_owned(),
+            probe,
         }
     }
 
@@ -2016,7 +2223,7 @@ mod tests {
         );
         assert!(
             !diagnostic.message.contains("Working Agent"),
-            "an agent that resolved must not be reported as missing"
+            "an agent that resolved must not be reported as broken"
         );
     }
 
@@ -2026,11 +2233,294 @@ mod tests {
             probe_acp_agents(&[agent("Only Agent", "/definitely/not/a/real/acp/binary")]).await;
 
         assert_eq!(probe.status, BackendSetupStatus::NotInstalled);
+        let diagnostic = probe.diagnostic.expect("missing diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandNotFound);
         assert!(
-            probe
-                .diagnostic
-                .is_some_and(|diagnostic| diagnostic.message.contains("Only Agent")),
-            "the one configured agent must be named"
+            diagnostic.message.contains("Only Agent")
+                && diagnostic
+                    .message
+                    .contains("/definitely/not/a/real/acp/binary"),
+            "the missing absolute path and its agent must be named: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_classifies_missing_path_commands_as_not_installed() {
+        let relative = "./tyde-acp-relative-command-that-does-not-exist";
+        assert!(!Path::new(relative).exists());
+        let probe = probe_acp_agents(&[
+            agent("PATH Agent", "tyde-acp-path-command-that-does-not-exist"),
+            agent("Relative Agent", relative),
+            agent("Absolute Agent", "/definitely/not/an/acp-command"),
+        ])
+        .await;
+
+        assert_eq!(probe.status, BackendSetupStatus::NotInstalled);
+        let diagnostic = probe.diagnostic.expect("missing diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandNotFound);
+        assert!(
+            diagnostic.message.contains("PATH Agent")
+                && diagnostic.message.contains("Relative Agent")
+                && diagnostic.message.contains("Absolute Agent"),
+            "every missing command shape must retain its label: {}",
+            diagnostic.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_classifies_existing_unstartable_file_as_unavailable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("not-executable");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").expect("write non-executable fixture");
+        let mut permissions = std::fs::metadata(&command)
+            .expect("stat non-executable fixture")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&command, permissions)
+            .expect("make fixture explicitly non-executable");
+
+        let probe = probe_acp_agents(&[agent("Blocked Agent", &command.to_string_lossy())]).await;
+
+        assert_eq!(probe.status, BackendSetupStatus::Unavailable);
+        let diagnostic = probe.diagnostic.expect("start failure diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic.message.contains("Blocked Agent")
+                && diagnostic.message.contains("could not run"),
+            "an existing unstartable command must retain its start failure: {}",
+            diagnostic.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_preserves_nonzero_version_failure() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("broken-acp");
+        write_executable(
+            &command,
+            "#!/bin/sh\nprintf 'ACP policy denied startup\\n' >&2\nexit 7\n",
+        );
+
+        let probe = probe_acp_agents(&[agent("Broken Agent", &command.to_string_lossy())]).await;
+
+        assert_eq!(probe.status, BackendSetupStatus::Unavailable);
+        let diagnostic = probe.diagnostic.expect("nonzero diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic.message.contains("Broken Agent")
+                && diagnostic.message.contains("ACP policy denied startup")
+                && diagnostic.message.contains('7'),
+            "the nonzero exit must survive ACP aggregation: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn acp_preserves_timeout_and_mixed_failure_precedence() {
+        let probe = aggregate_acp_agent_probes(vec![
+            acp_failure(
+                "Missing Agent",
+                BackendSetupStatus::NotInstalled,
+                BackendSetupDiagnosticCode::CommandNotFound,
+                "command missing-acp was not found",
+            ),
+            acp_failure(
+                "Slow Agent",
+                BackendSetupStatus::Unavailable,
+                BackendSetupDiagnosticCode::CommandTimedOut,
+                "version check did not finish within 2 seconds",
+            ),
+            acp_failure(
+                "Failed Agent",
+                BackendSetupStatus::Unavailable,
+                BackendSetupDiagnosticCode::CommandFailed,
+                "version check exited with 9",
+            ),
+        ]);
+
+        assert_eq!(probe.status, BackendSetupStatus::Unavailable);
+        let diagnostic = probe.diagnostic.expect("aggregate diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::CommandTimedOut,
+            "the first real unavailable failure must set the structural code"
+        );
+        let missing = diagnostic
+            .message
+            .find("Missing Agent")
+            .expect("missing label");
+        let slow = diagnostic.message.find("Slow Agent").expect("slow label");
+        let failed = diagnostic
+            .message
+            .find("Failed Agent")
+            .expect("failed label");
+        assert!(
+            missing < slow && slow < failed,
+            "aggregate details must retain stable profile order: {}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("within 2 seconds")
+                && diagnostic.message.contains("exited with 9"),
+            "heterogeneous failure details must not be collapsed: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn acp_candidate_selection_is_adapter_aware() {
+        let blank_stock = agent("Blank Stock", " \t");
+        assert!(acp_agent_command_candidates(&blank_stock).is_empty());
+
+        let blank_kiro = kiro_agent("Kiro", "");
+        assert_eq!(
+            acp_agent_command_candidates(&blank_kiro),
+            vec!["kiro-cli".to_owned(), "kiro-cli-chat".to_owned()]
+        );
+
+        let explicit_kiro = kiro_agent("Kiro Override", "/custom/kiro");
+        assert_eq!(
+            acp_agent_command_candidates(&explicit_kiro),
+            vec!["/custom/kiro".to_owned()],
+            "an explicit Kiro command must be authoritative"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_trims_explicit_command_before_probing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("trimmed-acp");
+        write_executable(&command, "#!/bin/sh\nprintf 'trimmed-acp 1.0\\n'\n");
+        let command = command.to_string_lossy().into_owned();
+        let padded = format!(" \t{command}\n");
+        let configured = agent("Trimmed Agent", &padded);
+
+        assert_eq!(
+            acp_agent_command_candidates(&configured),
+            vec![command.clone()],
+            "setup must normalize explicit commands the same way as ACP launch"
+        );
+        let probe = probe_acp_agents(&[configured]).await;
+
+        assert_eq!(probe.status, BackendSetupStatus::Installed);
+        assert_eq!(probe.version.as_deref(), Some("trimmed-acp 1.0"));
+    }
+
+    #[test]
+    fn acp_metadata_failure_is_bounded_and_unavailable() {
+        let candidate = format!("/unreadable/{}/agent", "x".repeat(600));
+        let classification = classify_explicit_acp_candidate_with(&candidate, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "metadata access denied",
+            ))
+        });
+
+        let AcpCandidateClassification::Unavailable(diagnostic) = classification else {
+            panic!("metadata failures must not be classified as missing");
+        };
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(diagnostic.message.contains("could not inspect ACP command"));
+        assert!(
+            diagnostic
+                .message
+                .contains(ACP_DIAGNOSTIC_TRUNCATION_MARKER)
+        );
+        assert!(diagnostic.message.len() <= ACP_COMMAND_DIAGNOSTIC_MAX_BYTES);
+    }
+
+    #[test]
+    fn acp_aggregate_diagnostic_bounds_profiles_and_details() {
+        let boundary = aggregate_acp_agent_probes(
+            (0..ACP_AGGREGATE_MAX_FAILURES)
+                .map(|index| {
+                    acp_failure(
+                        &format!("Boundary Agent {index}"),
+                        BackendSetupStatus::NotInstalled,
+                        BackendSetupDiagnosticCode::CommandNotFound,
+                        "command was not found",
+                    )
+                })
+                .collect(),
+        )
+        .diagnostic
+        .expect("boundary diagnostic");
+        assert!(!boundary.message.contains("additional ACP profile"));
+
+        let probe = aggregate_acp_agent_probes(
+            (0..ACP_AGGREGATE_MAX_FAILURES + 2)
+                .map(|index| {
+                    acp_failure(
+                        &format!("Agent {index} {}", "l".repeat(200)),
+                        BackendSetupStatus::Unavailable,
+                        BackendSetupDiagnosticCode::CommandFailed,
+                        &format!("failure {index} {}", "d".repeat(600)),
+                    )
+                })
+                .collect(),
+        );
+
+        let diagnostic = probe.diagnostic.expect("bounded diagnostic");
+        assert!(diagnostic.message.len() <= ACP_AGGREGATE_MESSAGE_MAX_BYTES);
+        assert!(
+            diagnostic
+                .message
+                .contains(ACP_DIAGNOSTIC_TRUNCATION_MARKER),
+            "long labels/details must carry a truncation marker: {}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("[truncated] 2 additional ACP profile(s)"),
+            "omitted profiles must be counted deterministically: {}",
+            diagnostic.message
+        );
+        assert!(diagnostic.message.contains("Agent 3"));
+        assert!(!diagnostic.message.contains("Agent 4"));
+    }
+
+    #[tokio::test]
+    async fn blank_stock_command_is_labeled_without_spawning() {
+        let probe = probe_acp_agents(&[agent("Blank Stock", " \t")]).await;
+
+        assert_eq!(probe.status, BackendSetupStatus::NotInstalled);
+        let diagnostic = probe.diagnostic.expect("blank command diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandNotFound);
+        assert!(
+            diagnostic.message.contains("Blank Stock")
+                && diagnostic.message.contains("no ACP command is configured"),
+            "blank Stock must be classified before process launch: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn installed_acp_retains_unavailable_diagnostic() {
+        let probe = aggregate_acp_agent_probes(vec![
+            AcpAgentProbe {
+                label: "Working Agent".to_owned(),
+                probe: ProbeResult::installed(Some("1.2.3".to_owned())),
+            },
+            acp_failure(
+                "Broken Agent",
+                BackendSetupStatus::Unavailable,
+                BackendSetupDiagnosticCode::CommandFailed,
+                "version check exited with 7",
+            ),
+        ]);
+
+        assert_eq!(probe.status, BackendSetupStatus::Installed);
+        assert_eq!(probe.version.as_deref(), Some("1.2.3"));
+        let diagnostic = probe.diagnostic.expect("broken peer diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic.message.contains("Broken Agent")
+                && !diagnostic.message.contains("Working Agent")
         );
     }
 }
