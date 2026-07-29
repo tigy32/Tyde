@@ -195,6 +195,8 @@ fn safe_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use protocol::{
         BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation,
         CompactionObservationId, CompactionTrigger, ContextCompactionTimelineEvent,
