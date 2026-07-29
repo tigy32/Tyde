@@ -25297,12 +25297,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let records = transcript_store
             .load(&old_session_id)
             .expect("old transcript before compaction");
+        assert!(
+            transcript_store.is_authoritative(&old_session_id),
+            "precondition: the legacy target transcript is authoritative"
+        );
         let saw_visible_context = records.iter().any(|record| {
             record.visibility == TranscriptVisibility::Visible
                 && matches!(
                     &record.event,
-                    ChatEvent::StreamEnd(end)
-                        if end.message.content.contains("legacy transcript remains visible")
+                    ChatEvent::MessageAdded(message)
+                        if matches!(&message.sender, MessageSender::Assistant { .. })
+                            && message.content.contains("legacy transcript remains visible")
                 )
         });
         let visible_before = records
