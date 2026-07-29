@@ -2347,9 +2347,9 @@ impl ClaudeInner {
                                 session_id.as_deref(),
                             ) {
                                 self.emitter
-                                    .compaction_event(&BackendCompactionEvent::Observed(
-                                        Box::new(observation),
-                                    ));
+                                    .compaction_event(&BackendCompactionEvent::Observed(Box::new(
+                                        observation,
+                                    )));
                             }
                             return;
                         }
@@ -11590,14 +11590,13 @@ use protocol::{
 
 use super::{
     Backend, BackendCompactionCapability, BackendCompactionCapabilityEvidence,
-    BackendCompactionDeferredReason,
-    BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
-    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
-    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
-    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
-    BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
+    BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
+    BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
+    BackendCompactionObservationSource, BackendCompactionProgress,
+    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
     BackendContinuationContext, BackendContinuationItem, BackendEvent, BackendObservedCompaction,
     BackendSession, BackendSpawnConfig, BackendStartupError, ContinuationInstallStatus,

@@ -6016,8 +6016,8 @@ impl CodexInner {
                             .unwrap_or("unknown-item");
                         let thread_id = self.state.lock().await.thread_id.clone();
                         self.emitter
-                            .compaction_event(&BackendCompactionEvent::Observed(
-                                Box::new(BackendObservedCompaction {
+                            .compaction_event(&BackendCompactionEvent::Observed(Box::new(
+                                BackendObservedCompaction {
                                     observation_id: super::compaction::stable_observation_id(
                                         "codex",
                                         &thread_id,
@@ -6033,8 +6033,8 @@ impl CodexInner {
                                         item_id: item_id.to_string(),
                                     },
                                     user_focus: None,
-                                }),
-                            ));
+                                },
+                            )));
                     }
                     "userMessage" => {
                         let text = extract_codex_item_text(item);
@@ -13713,10 +13713,9 @@ use protocol::{
 
 use super::{
     Backend, BackendCompactionCapability, BackendCompactionCapabilityEvidence,
-    BackendCompactionDeferredReason,
-    BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
-    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionObservationSource, BackendCompactionProgress,
+    BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
+    BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
+    BackendCompactionMutationState, BackendCompactionObservationSource, BackendCompactionProgress,
     BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
     BackendCompactionUnknownReason, BackendContextReseatSupport, BackendEvent,

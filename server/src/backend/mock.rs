@@ -1277,8 +1277,8 @@ fn emit_mock_compaction_observation(
 ) -> bool {
     let event_id = format!("prompt-{prompt_index}-compact");
     events_tx
-        .send_compaction(BackendCompactionEvent::Observed(
-            Box::new(BackendObservedCompaction {
+        .send_compaction(BackendCompactionEvent::Observed(Box::new(
+            BackendObservedCompaction {
                 observation_id: super::compaction::stable_observation_id(
                     "mock",
                     &session_id.0,
@@ -1294,8 +1294,8 @@ fn emit_mock_compaction_observation(
                 },
                 source: BackendCompactionObservationSource::MockEvent { event_id },
                 user_focus: None,
-            }),
-        ))
+            },
+        )))
         .is_ok()
 }
 
