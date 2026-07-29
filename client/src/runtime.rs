@@ -1345,7 +1345,7 @@ fn bootstrap_agent_session_id(payload: &AgentBootstrapPayload) -> Option<protoco
         if let Some(current) = logical_session_id.as_ref()
             && current != candidate
         {
-            log::error!(
+            tracing::error!(
                 "agent bootstrap carried conflicting logical sessions {} and {}",
                 current.0,
                 candidate.0,

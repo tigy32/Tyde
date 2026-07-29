@@ -2166,7 +2166,7 @@ pub fn compaction_control_state(
     // determining", which is both true and self-resolving.
     let availability = state.compaction_capability.with_untracked(|map| {
         map.get(&agent.agent_id)
-            .map(|snapshot| snapshot.availability)
+            .map(|snapshot| snapshot.availability.clone())
     });
     match availability {
         Some(RequestedCompactionAvailability::Available { .. }) => CompactionControlState::Enabled,
