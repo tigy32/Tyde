@@ -165,10 +165,7 @@ impl Backend for AntigravityBackend {
         antigravity_compaction_capability(self.provider_version.clone())
     }
 
-    async fn begin_compaction(
-        &self,
-        _request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, _request: BackendCompactionRequest) -> BackendCompactionStart {
         BackendCompactionStart::NotDispatched {
             reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                 BackendCompactionUnavailableReason::ManualTriggerAbsent,
@@ -2906,13 +2903,10 @@ mod tests {
             ..BackendSpawnConfig::default()
         };
 
-        let (backend, _events) = <AntigravityBackend as Backend>::resume(
-            vec!["/tmp".to_owned()],
-            config,
-            session_id,
-        )
-        .await
-        .expect("resume from configured conversation directory");
+        let (backend, _events) =
+            <AntigravityBackend as Backend>::resume(vec!["/tmp".to_owned()], config, session_id)
+                .await
+                .expect("resume from configured conversation directory");
 
         assert_eq!(
             backend.inner.state.lock().await.conversations_dir,

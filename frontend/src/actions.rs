@@ -2164,9 +2164,10 @@ pub fn compaction_control_state(
     // capability is how a client sends a request the backend cannot serve and
     // then has to explain the refusal after the fact. Unknown reads as "still
     // determining", which is both true and self-resolving.
-    let availability = state
-        .compaction_capability
-        .with_untracked(|map| map.get(&agent.agent_id).map(|snapshot| snapshot.availability));
+    let availability = state.compaction_capability.with_untracked(|map| {
+        map.get(&agent.agent_id)
+            .map(|snapshot| snapshot.availability)
+    });
     match availability {
         Some(RequestedCompactionAvailability::Available { .. }) => CompactionControlState::Enabled,
         None => CompactionControlState::Disabled(availability_reason_text(

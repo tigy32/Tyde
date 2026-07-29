@@ -2531,7 +2531,11 @@ fn history_request_salt() -> u64 {
         }
         let seed = platform_entropy();
         // Never 0: that is the "unseeded" sentinel above.
-        let seed = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        let seed = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
         cell.set(seed);
         seed
     })

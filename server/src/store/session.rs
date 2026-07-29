@@ -634,8 +634,7 @@ impl SessionStore {
                     record_reconciled = true;
                 }
                 if record_reconciled {
-                    record.compaction_epoch =
-                        record.compaction_epoch.saturating_add(1);
+                    record.compaction_epoch = record.compaction_epoch.saturating_add(1);
                     record.updated_at_ms = now_ms();
                 }
             }
@@ -1325,39 +1324,37 @@ mod tests {
         let session_id = SessionId("session".to_owned());
         let operation_id = CompactionOperationId("operation".to_owned());
         let mut record = test_record(BackendKind::Claude, session_id.clone(), true);
-        record.compaction_operations.push(CompactionOperationRecord {
-            operation_id: operation_id.clone(),
-            logical_session_id: session_id.clone(),
-            trigger: CompactionTrigger::UserRequested,
-            state: StoredCompactionState::NativeDispatchPossible,
-            method: Some(CompactionMethod::NativeTextCommand),
-            accepted: false,
-            mutation: CompactionMutation::NotObserved,
-            binding_generation_before: 0,
-            binding_generation_after: None,
-            transcript_high_water: 9,
-            metrics: CompactionMetrics::default(),
-            continuation: None,
-            message: None,
-            started_at_ms: 1,
-            finished_at_ms: None,
-        });
+        record
+            .compaction_operations
+            .push(CompactionOperationRecord {
+                operation_id: operation_id.clone(),
+                logical_session_id: session_id.clone(),
+                trigger: CompactionTrigger::UserRequested,
+                state: StoredCompactionState::NativeDispatchPossible,
+                method: Some(CompactionMethod::NativeTextCommand),
+                accepted: false,
+                mutation: CompactionMutation::NotObserved,
+                binding_generation_before: 0,
+                binding_generation_after: None,
+                transcript_high_water: 9,
+                metrics: CompactionMetrics::default(),
+                continuation: None,
+                message: None,
+                started_at_ms: 1,
+                finished_at_ms: None,
+            });
         SessionStore::save(
             &path,
             &[(session_id.0.clone(), record)].into_iter().collect(),
         )
         .expect("write session store");
 
-        let (store, _) =
-            SessionStore::load_with_migration(path).expect("reconcile store");
+        let (store, _) = SessionStore::load_with_migration(path).expect("reconcile store");
         let operation = store
             .compaction_operation(&session_id, &operation_id)
             .expect("operation remains durable");
         assert_eq!(operation.state, StoredCompactionState::Failed);
         assert!(operation.accepted);
-        assert_eq!(
-            operation.mutation,
-            CompactionMutation::MayHaveMutated
-        );
+        assert_eq!(operation.mutation, CompactionMutation::MayHaveMutated);
     }
 }

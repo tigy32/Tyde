@@ -1338,29 +1338,24 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
     fn compaction_marker_changes_only_token_and_guard_fold_fields() {
         let initial = envelope(0, ChatEvent::MessageAdded(user_message("ship it")));
         let before = supervision_context_snapshot(std::slice::from_ref(&initial));
-        let marker = ChatEvent::ContextCompaction(
-            protocol::ContextCompactionTimelineEvent {
-                marker_id: protocol::CompactionObservationId("marker".to_owned()),
-                operation_id: Some(protocol::CompactionOperationId(
-                    "operation".to_owned(),
-                )),
-                trigger: protocol::CompactionTrigger::UserRequested,
-                method: protocol::CompactionMethod::NativeTextCommand,
-                backend_kind: BackendKind::Claude,
-                provider_session_id: None,
-                status: protocol::ContextCompactionTimelineStatus::Completed,
-                mutation: protocol::CompactionMutation::Completed,
-                metrics: protocol::CompactionMetrics {
-                    after_tokens: Some(25),
-                    ..protocol::CompactionMetrics::default()
-                },
-                continuation: None,
-                message: None,
-                timestamp: 1,
+        let marker = ChatEvent::ContextCompaction(protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("marker".to_owned()),
+            operation_id: Some(protocol::CompactionOperationId("operation".to_owned())),
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: protocol::CompactionMethod::NativeTextCommand,
+            backend_kind: BackendKind::Claude,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: protocol::CompactionMetrics {
+                after_tokens: Some(25),
+                ..protocol::CompactionMetrics::default()
             },
-        );
-        let after =
-            supervision_context_snapshot(&[initial, envelope(1, marker)]);
+            continuation: None,
+            message: None,
+            timestamp: 1,
+        });
+        let after = supervision_context_snapshot(&[initial, envelope(1, marker)]);
 
         assert_eq!(after.user_message_count, before.user_message_count);
         assert_eq!(after.last_user_message, before.last_user_message);
@@ -1368,10 +1363,7 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             after.kicks_since_user_message,
             before.kicks_since_user_message
         );
-        assert_eq!(
-            after.last_assistant_message,
-            before.last_assistant_message
-        );
+        assert_eq!(after.last_assistant_message, before.last_assistant_message);
         assert!(after.auto_compaction_blocked_until_real_user);
         assert!(after.supervision_verdict_dormant_until_real_user);
         assert_eq!(after.compaction_user_message_count, Some(1));
@@ -1415,26 +1407,23 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             context_breakdown: None,
             images: None,
         });
-        let marker = ChatEvent::ContextCompaction(
-            protocol::ContextCompactionTimelineEvent {
-                marker_id: protocol::CompactionObservationId("failed-marker".to_owned()),
-                operation_id: Some(protocol::CompactionOperationId(
-                    "failed-operation".to_owned(),
-                )),
-                trigger: protocol::CompactionTrigger::UserRequested,
-                method: protocol::CompactionMethod::NativeRpc,
-                backend_kind: BackendKind::Codex,
-                provider_session_id: None,
-                status: protocol::ContextCompactionTimelineStatus::Failed,
-                mutation: protocol::CompactionMutation::NotObserved,
-                metrics: protocol::CompactionMetrics::default(),
-                continuation: None,
-                message: Some("not dispatched".to_owned()),
-                timestamp: 2,
-            },
-        );
-        let snapshot =
-            supervision_context_snapshot(&[envelope(0, assistant), envelope(1, marker)]);
+        let marker = ChatEvent::ContextCompaction(protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("failed-marker".to_owned()),
+            operation_id: Some(protocol::CompactionOperationId(
+                "failed-operation".to_owned(),
+            )),
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: protocol::CompactionMethod::NativeRpc,
+            backend_kind: BackendKind::Codex,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Failed,
+            mutation: protocol::CompactionMutation::NotObserved,
+            metrics: protocol::CompactionMetrics::default(),
+            continuation: None,
+            message: Some("not dispatched".to_owned()),
+            timestamp: 2,
+        });
+        let snapshot = supervision_context_snapshot(&[envelope(0, assistant), envelope(1, marker)]);
         assert_eq!(snapshot.current_context_input_tokens, Some(800));
         assert!(!snapshot.auto_compaction_blocked_until_real_user);
         assert!(snapshot.supervision_verdict_dormant_until_real_user);
@@ -1442,24 +1431,20 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
 
     #[test]
     fn real_user_message_releases_both_compaction_guards() {
-        let marker = ChatEvent::ContextCompaction(
-            protocol::ContextCompactionTimelineEvent {
-                marker_id: protocol::CompactionObservationId("marker".to_owned()),
-                operation_id: Some(protocol::CompactionOperationId(
-                    "operation".to_owned(),
-                )),
-                trigger: protocol::CompactionTrigger::UserRequested,
-                method: protocol::CompactionMethod::NativeRpc,
-                backend_kind: BackendKind::Codex,
-                provider_session_id: None,
-                status: protocol::ContextCompactionTimelineStatus::Completed,
-                mutation: protocol::CompactionMutation::Completed,
-                metrics: protocol::CompactionMetrics::default(),
-                continuation: None,
-                message: None,
-                timestamp: 1,
-            },
-        );
+        let marker = ChatEvent::ContextCompaction(protocol::ContextCompactionTimelineEvent {
+            marker_id: protocol::CompactionObservationId("marker".to_owned()),
+            operation_id: Some(protocol::CompactionOperationId("operation".to_owned())),
+            trigger: protocol::CompactionTrigger::UserRequested,
+            method: protocol::CompactionMethod::NativeRpc,
+            backend_kind: BackendKind::Codex,
+            provider_session_id: None,
+            status: protocol::ContextCompactionTimelineStatus::Completed,
+            mutation: protocol::CompactionMutation::Completed,
+            metrics: protocol::CompactionMetrics::default(),
+            continuation: None,
+            message: None,
+            timestamp: 1,
+        });
         let snapshot = supervision_context_snapshot(&[
             envelope(0, ChatEvent::MessageAdded(user_message("first"))),
             envelope(1, marker),

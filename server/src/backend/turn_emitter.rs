@@ -559,10 +559,7 @@ impl TurnEmitter {
         }));
     }
 
-    pub(crate) fn compaction_event(
-        &self,
-        event: &super::compaction::BackendCompactionEvent,
-    ) {
+    pub(crate) fn compaction_event(&self, event: &super::compaction::BackendCompactionEvent) {
         let data = serde_json::to_value(event).expect("backend compaction event must serialize");
         self.lock().send(json!({
             "kind": "BackendCompaction",

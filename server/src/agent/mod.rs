@@ -20,10 +20,11 @@ use protocol::{
     ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
     QueuedMessagesPayload, ReasoningData, RequestedCompactionAvailability,
     RequestedCompactionRoute, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
+    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
+    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -47,9 +48,7 @@ use crate::host::{
     HostSessionSummaryCountUpdate, HostSubAgentEmitter,
 };
 use crate::review::ReviewRegistryHandle;
-use crate::store::session::{
-    CompactionOperationRecord, SessionStore, StoredCompactionState,
-};
+use crate::store::session::{CompactionOperationRecord, SessionStore, StoredCompactionState};
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
 
@@ -249,8 +248,11 @@ enum AgentCommand {
         trigger: CompactionTrigger,
         focus: Option<String>,
         barrier_timeout: Duration,
-        inactivity_gate:
-            Option<(u64, u64, watch::Receiver<crate::host::SupervisorSettingsSignal>)>,
+        inactivity_gate: Option<(
+            u64,
+            u64,
+            watch::Receiver<crate::host::SupervisorSettingsSignal>,
+        )>,
         reply: oneshot::Sender<Result<CompactionOperationId, String>>,
     },
     ContextCompactionTerminal {
@@ -2093,7 +2095,9 @@ async fn prepare_context_fallback(
         || binding.ready.unsafe_activity_observed
     {
         binding.backend.shutdown().await;
-        return Err("prepared backend binding did not provide complete readiness evidence".to_owned());
+        return Err(
+            "prepared backend binding did not provide complete readiness evidence".to_owned(),
+        );
     }
     let (continuation, warning) =
         summarize_continuation_result(&binding.continuation, "fallback bootstrap");
@@ -2160,9 +2164,7 @@ async fn generate_fallback_compaction_summary(
     antigravity_conversations_dir: PathBuf,
 ) -> Result<String, String> {
     #[cfg(test)]
-    if requested_focus
-        .is_some_and(|focus| focus.contains("__test_fail_fallback_summary__"))
-    {
+    if requested_focus.is_some_and(|focus| focus.contains("__test_fail_fallback_summary__")) {
         return Err("test-forced fallback summary failure".to_owned());
     }
     if use_mock_backend {
@@ -2188,8 +2190,9 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
         origin: None,
         tool_response: None,
     };
-    let isolated_workspace = tempfile::tempdir()
-        .map_err(|error| format!("failed to create isolated compaction summary workspace: {error}"))?;
+    let isolated_workspace = tempfile::tempdir().map_err(|error| {
+        format!("failed to create isolated compaction summary workspace: {error}")
+    })?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
     let summary_agent_id = AgentId(Uuid::new_v4().to_string());
@@ -2212,11 +2215,7 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
         while let Some(event) = events.recv().await {
             match event {
                 ChatEvent::StreamDelta(delta) => {
-                    push_summary_capped(
-                        &mut summary,
-                        &delta.text,
-                        MAX_COMPACTION_SUMMARY_BYTES,
-                    );
+                    push_summary_capped(&mut summary, &delta.text, MAX_COMPACTION_SUMMARY_BYTES);
                 }
                 ChatEvent::StreamEnd(end) if summary.trim().is_empty() => {
                     push_summary_capped(
@@ -2258,12 +2257,13 @@ fn summarize_continuation_result(
 ) -> (ContinuationInstallSummary, Option<String>) {
     use crate::backend::ContinuationInstallStatus;
 
-    let failure = [&result.required, &result.advisory]
-        .into_iter()
-        .find_map(|status| match status {
-            ContinuationInstallStatus::Failed { message } => Some(message.clone()),
-            _ => None,
-        });
+    let failure =
+        [&result.required, &result.advisory]
+            .into_iter()
+            .find_map(|status| match status {
+                ContinuationInstallStatus::Failed { message } => Some(message.clone()),
+                _ => None,
+            });
     if let Some(message) = failure {
         return (
             ContinuationInstallSummary::Failed {
@@ -2517,7 +2517,9 @@ trait BackendSender: Send + 'static {
     fn begin_compaction<'a>(
         &'a self,
         request: crate::backend::BackendCompactionRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>>;
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
+    >;
     fn install_continuation_context<'a>(
         &'a self,
         context: crate::backend::BackendContinuationContext,
@@ -2548,8 +2550,9 @@ impl<B: Backend> BackendSender for B {
     fn begin_compaction<'a>(
         &'a self,
         request: crate::backend::BackendCompactionRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
+    > {
         Box::pin(Backend::begin_compaction(self, request))
     }
 
@@ -3003,9 +3006,7 @@ pub(crate) fn spawn_agent_actor(
                 startup_mcp_servers: Vec::new(),
                 session_settings: initial_session_settings,
                 provider_version: spawn_config.provider_version.clone(),
-                antigravity_conversations_dir: spawn_config
-                    .antigravity_conversations_dir
-                    .clone(),
+                antigravity_conversations_dir: spawn_config.antigravity_conversations_dir.clone(),
                 backend_config,
                 resolved_spawn_config,
             },
@@ -3265,9 +3266,8 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(Err(error));
                         }
                         AgentCommand::ReadCompactionCapability { reply } => {
-                            let _ = reply.send(
-                                crate::backend::BackendCompactionCapability::default(),
-                            );
+                            let _ =
+                                reply.send(crate::backend::BackendCompactionCapability::default());
                         }
                         AgentCommand::RequestContextCompaction { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
@@ -7950,10 +7950,8 @@ async fn enter_terminal_failure(
     if let Some(compaction) = context.compaction.as_mut()
         && let Some(flight) = compaction.flight.take()
     {
-        let accepted = matches!(
-            flight.state,
-            StoredCompactionState::NativeAccepted
-        ) || flight.terminal_taken;
+        let accepted =
+            matches!(flight.state, StoredCompactionState::NativeAccepted) || flight.terminal_taken;
         let mutation = if accepted {
             CompactionMutation::MayHaveMutated
         } else {
@@ -8105,14 +8103,8 @@ async fn park_terminal_agent(
                     }
                     None => None,
                 };
-                let window = authoritative.unwrap_or_else(|| {
-                        session_history_window(
-                            event_log,
-                            before_seq,
-                            limit,
-                            None,
-                        )
-                    });
+                let window = authoritative
+                    .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -8291,20 +8283,9 @@ async fn park_relay_terminal_agent(
                 limit,
                 reply,
             } => {
-                let window = authoritative_session_history_window(
-                    session_id,
-                    before_seq,
-                    limit,
-                )
-                .await
-                .unwrap_or_else(|| {
-                    session_history_window(
-                        event_log,
-                        before_seq,
-                        limit,
-                        None,
-                    )
-                });
+                let window = authoritative_session_history_window(session_id, before_seq, limit)
+                    .await
+                    .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -8369,7 +8350,7 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::RequestContextCompaction { reply, .. } => {
                 let _ = reply.send(Err(
-                    "backend-native relay agents cannot be compacted".to_owned(),
+                    "backend-native relay agents cannot be compacted".to_owned()
                 ));
             }
             AgentCommand::ContextCompactionFallbackPrepared { result, .. } => {
@@ -8853,11 +8834,9 @@ async fn append_chat_event(
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
 }
 
-fn transcript_session_registry(
-) -> &'static std::sync::Mutex<HashMap<String, SessionId>> {
-    static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, SessionId>>,
-    > = std::sync::OnceLock::new();
+fn transcript_session_registry() -> &'static std::sync::Mutex<HashMap<String, SessionId>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, SessionId>>> =
+        std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -8868,11 +8847,7 @@ fn register_transcript_session(canonical_stream: &str, session_id: &SessionId) {
         .insert(canonical_stream.to_owned(), session_id.clone());
 }
 
-async fn journal_new_replay_records(
-    canonical_stream: &str,
-    event_log: &[Envelope],
-    start: usize,
-) {
+async fn journal_new_replay_records(canonical_stream: &str, event_log: &[Envelope], start: usize) {
     if !actor_transcript_io_enabled() {
         return;
     }
@@ -8950,8 +8925,7 @@ async fn mark_transcript_authoritative(session_id: &SessionId) {
         let session_id = session_id.clone();
         move || {
             let root = crate::store::transcript::TranscriptStore::default_root()?;
-            crate::store::transcript::TranscriptStore::new(root)
-                .mark_authoritative(&session_id)
+            crate::store::transcript::TranscriptStore::new(root).mark_authoritative(&session_id)
         }
     })
     .await;
@@ -9080,8 +9054,7 @@ async fn send_initial_follow_up_or_park(
                     "backend busy with a self-started turn; initial follow-up queued at front"
                 );
                 let sequence = *context.next_queue_sequence;
-                *context.next_queue_sequence =
-                    (*context.next_queue_sequence).saturating_add(1);
+                *context.next_queue_sequence = (*context.next_queue_sequence).saturating_add(1);
                 context.queue.push_front(SequencedQueuedMessage {
                     sequence,
                     entry: queued_entry_from_send_payload(payload),
@@ -10335,10 +10308,7 @@ async fn record_context_compaction_terminal(
 
     let marker_method = resolved_method.unwrap_or(CompactionMethod::NativeRpc);
     let marker = ContextCompactionTimelineEvent {
-        marker_id: CompactionObservationId(format!(
-            "operation:{}",
-            flight.operation_id.0
-        )),
+        marker_id: CompactionObservationId(format!("operation:{}", flight.operation_id.0)),
         operation_id: Some(flight.operation_id.clone()),
         trigger: flight.trigger,
         method: marker_method,
@@ -10412,9 +10382,7 @@ async fn release_context_compaction_barrier(
     *in_turn = true;
     *idle_transition_armed = false;
     match backend
-        .send_with_outcome(AgentInput::SendMessage(
-            queued.clone().into_send_payload(),
-        ))
+        .send_with_outcome(AgentInput::SendMessage(queued.clone().into_send_payload()))
         .await
     {
         SendOutcome::Accepted => {}
@@ -10432,8 +10400,8 @@ async fn release_context_compaction_barrier(
                 &AgentErrorPayload {
                     agent_id: agent_id.clone(),
                     code: AgentErrorCode::Internal,
-                    message:
-                        "agent backend closed while releasing the compaction barrier".to_owned(),
+                    message: "agent backend closed while releasing the compaction barrier"
+                        .to_owned(),
                     fatal: true,
                 },
             )
@@ -10497,9 +10465,7 @@ async fn try_dispatch_context_compaction(
                 .actor_tx
                 .send(AgentCommand::ContextCompactionTerminal {
                     operation_id: active.operation_id.clone(),
-                    result: Err(format!(
-                        "failed to read native dispatch frontier: {error}"
-                    )),
+                    result: Err(format!("failed to read native dispatch frontier: {error}")),
                 });
             return;
         }
@@ -10575,22 +10541,19 @@ async fn try_dispatch_context_compaction(
             active.terminal_taken = true;
             let session_id = context.session_id.clone();
             let operation_id = active.operation_id.clone();
-            let accepted_persisted = run_session_store_io(
-                context.session_store,
-                move |store| {
-                    let mut record = store
-                        .compaction_operation(&session_id, &operation_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "missing compaction operation {} after native acceptance",
-                                operation_id.0
-                            )
-                        })?;
-                    record.state = StoredCompactionState::NativeAccepted;
-                    record.accepted = true;
-                    store.put_compaction_operation(&session_id, record)
-                },
-            )
+            let accepted_persisted = run_session_store_io(context.session_store, move |store| {
+                let mut record = store
+                    .compaction_operation(&session_id, &operation_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing compaction operation {} after native acceptance",
+                            operation_id.0
+                        )
+                    })?;
+                record.state = StoredCompactionState::NativeAccepted;
+                record.accepted = true;
+                store.put_compaction_operation(&session_id, record)
+            })
             .await;
             if let Err(error) = accepted_persisted {
                 let _ = context
@@ -10606,10 +10569,9 @@ async fn try_dispatch_context_compaction(
             let operation_id = accepted.operation_id;
             let tx = context.actor_tx.clone();
             tokio::spawn(async move {
-                let result = accepted
-                    .terminal
-                    .await
-                    .map_err(|_| "accepted backend compaction ended without a terminal result".to_owned());
+                let result = accepted.terminal.await.map_err(|_| {
+                    "accepted backend compaction ended without a terminal result".to_owned()
+                });
                 let _ = tx.send(AgentCommand::ContextCompactionTerminal {
                     operation_id,
                     result,
@@ -10680,23 +10642,20 @@ async fn try_dispatch_context_compaction(
             let transcript_high_water = active
                 .fallback_transcript_high_water
                 .expect("fallback high-water was just installed");
-            let fallback_persisted = run_session_store_io(
-                context.session_store,
-                move |store| {
-                    let mut record = store
-                        .compaction_operation(&session_id, &operation_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "missing compaction operation {} before fallback",
-                                operation_id.0
-                            )
-                        })?;
-                    record.state = StoredCompactionState::FallbackPreparing;
-                    record.method = Some(CompactionMethod::InlineFallback);
-                    record.transcript_high_water = transcript_high_water;
-                    store.put_compaction_operation(&session_id, record)
-                },
-            )
+            let fallback_persisted = run_session_store_io(context.session_store, move |store| {
+                let mut record = store
+                    .compaction_operation(&session_id, &operation_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing compaction operation {} before fallback",
+                            operation_id.0
+                        )
+                    })?;
+                record.state = StoredCompactionState::FallbackPreparing;
+                record.method = Some(CompactionMethod::InlineFallback);
+                record.transcript_high_water = transcript_high_water;
+                store.put_compaction_operation(&session_id, record)
+            })
             .await;
             if let Err(error) = fallback_persisted {
                 let _ = context
@@ -10743,8 +10702,7 @@ async fn try_dispatch_context_compaction(
                 spawn_config: context.spawn_config.clone(),
                 use_mock_backend: context.use_mock_backend,
                 capacity_tx: context.capacity_tx.clone(),
-                antigravity_conversations_dir:
-                    context.antigravity_conversations_dir.clone(),
+                antigravity_conversations_dir: context.antigravity_conversations_dir.clone(),
             };
             let operation_id = active.operation_id.clone();
             let tx = context.actor_tx.clone();
@@ -10795,12 +10753,7 @@ async fn upsert_context_compaction_snapshot(
             payload: value,
         });
     }
-    broadcast_live_event(
-        subscribers,
-        FrameKind::ContextCompactionNotify,
-        &payload,
-    )
-    .await;
+    broadcast_live_event(subscribers, FrameKind::ContextCompactionNotify, &payload).await;
 }
 
 async fn upsert_context_compaction_capability(
@@ -10824,12 +10777,7 @@ async fn upsert_context_compaction_capability(
             payload: value,
         });
     }
-    broadcast_live_event(
-        subscribers,
-        FrameKind::ContextCompactionCapability,
-        payload,
-    )
-    .await;
+    broadcast_live_event(subscribers, FrameKind::ContextCompactionCapability, payload).await;
 }
 
 async fn append_compaction_marker_once(
@@ -10881,13 +10829,16 @@ async fn persist_compaction_marker(
         sequence,
         event_id: marker.marker_id.0.clone(),
         visibility: crate::store::transcript::TranscriptVisibility::TimelineMarker,
-        provider_identity: marker.provider_session_id.as_ref().map(|provider_session_id| {
-            crate::store::transcript::ProviderEventIdentity {
-                backend: format!("{:?}", marker.backend_kind).to_ascii_lowercase(),
-                provider_session_id: provider_session_id.0.clone(),
-                event_id: marker.marker_id.0.clone(),
-            }
-        }),
+        provider_identity: marker
+            .provider_session_id
+            .as_ref()
+            .map(
+                |provider_session_id| crate::store::transcript::ProviderEventIdentity {
+                    backend: format!("{:?}", marker.backend_kind).to_ascii_lowercase(),
+                    provider_session_id: provider_session_id.0.clone(),
+                    event_id: marker.marker_id.0.clone(),
+                },
+            ),
         event: ChatEvent::ContextCompaction(marker.clone()),
         timestamp_ms: marker.timestamp,
     };
@@ -11445,12 +11396,10 @@ fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEve
             serde_json::from_value(envelope.payload.clone())
                 .expect("failed to parse ContextCompactionNotify from replay log"),
         ),
-        FrameKind::ContextCompactionCapability => {
-            AgentBootstrapEvent::ContextCompactionCapability(
-                serde_json::from_value(envelope.payload.clone())
-                    .expect("failed to parse ContextCompactionCapability from replay log"),
-            )
-        }
+        FrameKind::ContextCompactionCapability => AgentBootstrapEvent::ContextCompactionCapability(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse ContextCompactionCapability from replay log"),
+        ),
         FrameKind::ChatEvent => AgentBootstrapEvent::ChatEvent(
             serde_json::from_value(envelope.payload.clone())
                 .expect("failed to parse ChatEvent from replay log"),
@@ -11709,16 +11658,17 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
-        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionOperationId,
-        CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionTimelineEvent,
-        Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-        QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
-        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
-        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
-        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
-        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
+        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
+        CompactionOperationId, CompactionTrigger, ContextCompactionNotifyPayload,
+        ContextCompactionTimelineEvent, Envelope, FrameKind, MessageMetadataUpdateData,
+        MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
+        ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
+        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -11726,22 +11676,21 @@ mod tests {
     use super::{
         AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
         AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
-        AgentReplayState, AgentStartupFailure, AgentStartupTestGate, CompactionFlight,
-        AppendSupervisorWarningOutcome, CLOSE_TURN_GRACE, DELIVERY_REJECTED_CLOSING,
-        GenerateAgentActivitySummaryRequest, InterruptOutcome, RelayEventReceivers,
-        ResolvedSpawnRequest, SequencedQueuedMessage, SupervisorStallInterruptOutcome,
-        SupervisorVerdictStart, SupervisorVerdictStartRejection, TokenUsageSource,
-        activity_history_snapshot, agent_name_generation_spawn_config,
-        agent_usage_snapshot_from_log, append_chat_event, append_event,
-        apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
-        attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
-        collect_agent_name_events, context_compaction_dispatch_is_safe,
-        context_compaction_fallback_allowed, current_latest_output,
-        generate_fallback_compaction_summary, generate_mock_name, ingest_gated_replay_event,
-        internal_compaction_input, known_turn_usage, mark_agent_turn_active, output_events_since,
-        project_legacy_native_collaboration_event, publish_resumed_agent_idle,
-        record_agent_started, record_chat_event_for_replay, replay_envelope,
-        resolve_backend_session_settings, sanitize_generated_agent_name,
+        AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
+        AppendSupervisorWarningOutcome, CLOSE_TURN_GRACE, CompactionFlight,
+        DELIVERY_REJECTED_CLOSING, GenerateAgentActivitySummaryRequest, InterruptOutcome,
+        RelayEventReceivers, ResolvedSpawnRequest, SequencedQueuedMessage,
+        SupervisorStallInterruptOutcome, SupervisorVerdictStart, SupervisorVerdictStartRejection,
+        TokenUsageSource, activity_history_snapshot, agent_name_generation_spawn_config,
+        agent_usage_snapshot_from_log, append_chat_event, append_event, apply_generated_agent_name,
+        apply_runtime_session_updates, attach_subscriber, attach_subscriber_with_latest_output,
+        collect_agent_activity_summary_events, collect_agent_name_events,
+        context_compaction_dispatch_is_safe, context_compaction_fallback_allowed,
+        current_latest_output, generate_fallback_compaction_summary, generate_mock_name,
+        ingest_gated_replay_event, internal_compaction_input, known_turn_usage,
+        mark_agent_turn_active, output_events_since, project_legacy_native_collaboration_event,
+        publish_resumed_agent_idle, record_agent_started, record_chat_event_for_replay,
+        replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
         session_history_entries_from_log, session_history_window, spawn_agent_actor,
         spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
         upsert_activity_stats_snapshot,
@@ -12979,9 +12928,7 @@ mod tests {
                         let _ = reply.send(Err(error));
                     }
                     AgentCommand::ReadCompactionCapability { reply } => {
-                        let _ = reply.send(
-                            crate::backend::BackendCompactionCapability::default(),
-                        );
+                        let _ = reply.send(crate::backend::BackendCompactionCapability::default());
                     }
                     AgentCommand::RequestContextCompaction { reply, .. } => {
                         let _ = reply.send(Err("agent is not running".to_owned()));
@@ -18223,12 +18170,10 @@ mod tests {
             (0..=7)
                 .map(super::context_compaction_retry_delay)
                 .collect::<Vec<_>>(),
-            [
-                100_u64, 200, 400, 800, 1_600, 3_200, 5_000, 5_000,
-            ]
-            .into_iter()
-            .map(Duration::from_millis)
-            .collect::<Vec<_>>(),
+            [100_u64, 200, 400, 800, 1_600, 3_200, 5_000, 5_000,]
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect::<Vec<_>>(),
             "retry delay must exponentially back off and remain capped"
         );
     }
@@ -18278,7 +18223,10 @@ mod tests {
             crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         );
         let flight_method = super::compaction_method_for_capability(&claude_native);
-        assert_eq!(flight_method, Some(protocol::CompactionMethod::NativeTextCommand));
+        assert_eq!(
+            flight_method,
+            Some(protocol::CompactionMethod::NativeTextCommand)
+        );
         assert_eq!(
             super::resolved_compaction_terminal_method(None, flight_method),
             Some(protocol::CompactionMethod::NativeTextCommand),
@@ -18306,16 +18254,12 @@ mod tests {
         }];
         let replacement = serde_json::json!({"operation_id": "new"});
         log.iter_mut()
-            .find(|event| {
-                event.kind == FrameKind::ContextCompactionNotify
-            })
+            .find(|event| event.kind == FrameKind::ContextCompactionNotify)
             .expect("snapshot")
             .payload = replacement;
         assert_eq!(
             log.iter()
-                .filter(|event| {
-                    event.kind == FrameKind::ContextCompactionNotify
-                })
+                .filter(|event| { event.kind == FrameKind::ContextCompactionNotify })
                 .count(),
             1
         );
@@ -18340,9 +18284,7 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match self.previous.take() {
-                    Some(previous) => {
-                        std::env::set_var("TYDE_TRANSCRIPT_STORE_DIR", previous)
-                    }
+                    Some(previous) => std::env::set_var("TYDE_TRANSCRIPT_STORE_DIR", previous),
                     None => std::env::remove_var("TYDE_TRANSCRIPT_STORE_DIR"),
                 }
             }
@@ -18512,8 +18454,7 @@ mod tests {
 
         for path in rows {
             let name = format!("compaction-terminal-{path:?}");
-            let (_dir, start, request, runtime, status_handle) =
-                startup_actor_fixture(&name, None);
+            let (_dir, start, request, runtime, status_handle) = startup_actor_fixture(&name, None);
             let session_store = Arc::clone(&runtime.session_store);
             let (handle, startup_rx) =
                 spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
@@ -18528,9 +18469,9 @@ mod tests {
 
             let focus = match path {
                 TerminalPath::NativeSuccess => None,
-                TerminalPath::NativeProviderFailure => Some(
-                    crate::backend::mock::MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL.to_owned(),
-                ),
+                TerminalPath::NativeProviderFailure => {
+                    Some(crate::backend::mock::MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL.to_owned())
+                }
                 TerminalPath::NativeTimeoutOrEof
                 | TerminalPath::Interrupt
                 | TerminalPath::ActorClose => {
@@ -18551,9 +18492,9 @@ mod tests {
                     "{} __test_fail_fallback_revalidation__",
                     crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL
                 )),
-                TerminalPath::FallbackCommitSuccess => Some(
-                    crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL.to_owned(),
-                ),
+                TerminalPath::FallbackCommitSuccess => {
+                    Some(crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL.to_owned())
+                }
             };
             let operation_id = handle
                 .request_context_compaction(
@@ -18588,7 +18529,10 @@ mod tests {
                 .await
                 .compaction_operation(&session_id, &operation_id)
                 .expect("durable compaction operation");
-            assert!(stored.is_terminal(), "{path:?} must persist a terminal record");
+            assert!(
+                stored.is_terminal(),
+                "{path:?} must persist a terminal record"
+            );
             let transcript = crate::store::transcript::TranscriptStore::new(
                 crate::store::transcript::TranscriptStore::default_root()
                     .expect("test transcript root"),
@@ -18735,13 +18679,11 @@ mod tests {
             after_seed, before,
             "prepared replacement seeding changed the supervisor fold"
         );
-        let continuation_input =
-            internal_compaction_input("continuation_injection".to_owned());
+        let continuation_input = internal_compaction_input("continuation_injection".to_owned());
         assert_ne!(continuation_input.origin, Some(MessageOrigin::User));
         let result = match prepared.backend {
             crate::backend::PreparedBackendHandle::Mock { backend, .. } => {
-                let result =
-                    Backend::install_continuation_context(&*backend, continuation).await;
+                let result = Backend::install_continuation_context(&*backend, continuation).await;
                 Backend::shutdown(*backend).await;
                 result
             }
@@ -18773,10 +18715,7 @@ mod tests {
             after.cancelled_since_user_message,
             before.cancelled_since_user_message
         );
-        assert_eq!(
-            after.last_assistant_message,
-            before.last_assistant_message
-        );
+        assert_eq!(after.last_assistant_message, before.last_assistant_message);
         assert_eq!(
             after.auto_compaction_blocked_until_real_user,
             before.auto_compaction_blocked_until_real_user
@@ -18799,12 +18738,8 @@ mod tests {
             log.len() as u64,
             FrameKind::ChatEvent,
             &ChatEvent::ContextCompaction(ContextCompactionTimelineEvent {
-                marker_id: protocol::CompactionObservationId(
-                    "o5-terminal-marker".to_owned(),
-                ),
-                operation_id: Some(CompactionOperationId(
-                    "o5-terminal-operation".to_owned(),
-                )),
+                marker_id: protocol::CompactionObservationId("o5-terminal-marker".to_owned()),
+                operation_id: Some(CompactionOperationId("o5-terminal-operation".to_owned())),
                 trigger: CompactionTrigger::UserRequested,
                 method: protocol::CompactionMethod::InlineFallback,
                 backend_kind: BackendKind::Claude,

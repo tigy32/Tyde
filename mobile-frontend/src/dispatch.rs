@@ -12,8 +12,8 @@ use protocol::{
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
     BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
-    ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
     Envelope, FrameKind, HeartbeatPayload, HostBootstrapPayload, HostBrowseEntriesPayload,
     HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
     LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
@@ -23,17 +23,17 @@ use protocol::{
     ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
     StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
-    TeamContextCompactionNotifyPayload,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload,
 };
 
 use crate::bridge;
 use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
-    HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo,
-    PendingSessionHistoryRequest, PositionedCompactionMarker, ReviewRef, SessionHistoryState,
+    HostBrowseSession, LocalHostId, PendingSessionHistoryRequest, PositionedCompactionMarker,
+    ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo, ReviewRef, SessionHistoryState,
     SessionInfo, SessionListLoadState, StreamingState, ToolRequestEntry, TransientEvent,
     reduce_project_diff_response, sort_project_infos,
 };
@@ -570,7 +570,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         FrameKind::ChatEvent => dispatch_chat_event(state, host, &envelope.stream, &envelope),
         FrameKind::ContextCompactionNotify => {
             match envelope.parse_payload::<ContextCompactionNotifyPayload>() {
-                Ok(payload) => apply_context_compaction_notify(state, host, &envelope.stream, payload),
+                Ok(payload) => {
+                    apply_context_compaction_notify(state, host, &envelope.stream, payload)
+                }
                 Err(error) => log::error!(
                     "failed to parse ContextCompactionNotify host={} stream={} seq={}: {}",
                     host,
@@ -2065,9 +2067,10 @@ fn apply_session_history(
         local_host_id: host.clone(),
         agent_id: payload.agent_id.clone(),
     };
-    let expected = state
-        .session_history
-        .with_untracked(|map| map.get(&agent_ref).and_then(|history| history.pending_request.clone()));
+    let expected = state.session_history.with_untracked(|map| {
+        map.get(&agent_ref)
+            .and_then(|history| history.pending_request.clone())
+    });
     let Some(expected) = expected else {
         log::warn!(
             "dropping unsolicited SessionHistory host={} agent_id={} request_id={}",
@@ -2120,9 +2123,7 @@ fn apply_session_history(
     state.compaction_markers.update(|markers| {
         let mut current = markers.remove(&agent_ref).unwrap_or_default();
         for marker in &mut current {
-            marker.message_index = marker
-                .message_index
-                .saturating_add(prepended_message_count);
+            marker.message_index = marker.message_index.saturating_add(prepended_message_count);
         }
         unseen_markers.extend(current);
         if !unseen_markers.is_empty() {
@@ -2688,18 +2689,14 @@ fn apply_agent_bootstrap(
     let mut correlated_session_id = state.agents.with_untracked(|agents| {
         agents
             .iter()
-            .find(|agent| {
-                agent.local_host_id == *host && agent.agent_id == agent_ref.agent_id
-            })
+            .find(|agent| agent.local_host_id == *host && agent.agent_id == agent_ref.agent_id)
             .and_then(|agent| agent.session_id.clone())
     });
     let mut compaction_session_conflict = false;
     for event in &payload.events {
         let candidate = match event {
             AgentBootstrapEvent::AgentStart(payload) => payload.session_id.as_ref(),
-            AgentBootstrapEvent::ContextCompaction(payload) => {
-                Some(&payload.logical_session_id)
-            }
+            AgentBootstrapEvent::ContextCompaction(payload) => Some(&payload.logical_session_id),
             AgentBootstrapEvent::ContextCompactionCapability(payload) => {
                 Some(&payload.logical_session_id)
             }
@@ -3340,9 +3337,7 @@ mod tests {
                             team_member_id: None,
                             project_id: None,
                             parent_agent_id: None,
-                            session_id: Some(protocol::SessionId(
-                                "logical-session".to_owned(),
-                            )),
+                            session_id: Some(protocol::SessionId("logical-session".to_owned())),
                             workflow: None,
                             created_at_ms: 0,
                         }),
@@ -3365,9 +3360,9 @@ mod tests {
                 Some(capability)
             );
             assert_eq!(
-                state.compaction_markers.with_untracked(|markers| {
-                    markers.get(&agent_ref).map_or(0, Vec::len)
-                }),
+                state
+                    .compaction_markers
+                    .with_untracked(|markers| { markers.get(&agent_ref).map_or(0, Vec::len) }),
                 1
             );
 
@@ -3406,21 +3401,10 @@ mod tests {
                     route: protocol::RequestedCompactionRoute::NativePreferred,
                 },
             };
-            apply_context_compaction_capability(
-                &state,
-                &host,
-                &stream,
-                capability.clone(),
-            );
+            apply_context_compaction_capability(&state, &host, &stream, capability.clone());
             let mut stale_capability = capability.clone();
-            stale_capability.logical_session_id =
-                protocol::SessionId("prior-session".to_owned());
-            apply_context_compaction_capability(
-                &state,
-                &host,
-                &stream,
-                stale_capability,
-            );
+            stale_capability.logical_session_id = protocol::SessionId("prior-session".to_owned());
+            apply_context_compaction_capability(&state, &host, &stream, stale_capability);
             assert_eq!(
                 state
                     .context_compaction_capabilities
@@ -3607,9 +3591,7 @@ mod tests {
                         .is_some_and(|agent| {
                             agent.started
                                 && agent.session_id
-                                    == Some(protocol::SessionId(
-                                        "logical-session".to_owned(),
-                                    ))
+                                    == Some(protocol::SessionId("logical-session".to_owned()))
                         })
                 }),
                 "an incomplete AgentStart is tolerated without erasing known identity"
@@ -3623,26 +3605,16 @@ mod tests {
         owner.with(|| {
             let state = AppState::new();
             let host = LocalHostId("compaction-bootstrap-conflict-host".to_owned());
-            let agent_ref = seed_agent(
-                &state,
-                &host,
-                "compaction-bootstrap-conflict-agent",
-            );
-            let stream =
-                StreamPath("/agent/compaction-bootstrap-conflict-agent/inst".to_owned());
+            let agent_ref = seed_agent(&state, &host, "compaction-bootstrap-conflict-agent");
+            let stream = StreamPath("/agent/compaction-bootstrap-conflict-agent/inst".to_owned());
             bind_agent_session(&state, &agent_ref, "logical-session");
-            let mut conflicting_capability =
-                protocol::ContextCompactionCapabilityPayload {
-                    agent_id: agent_ref.agent_id.clone(),
-                    logical_session_id: protocol::SessionId(
-                        "logical-session".to_owned(),
-                    ),
-                    availability:
-                        protocol::RequestedCompactionAvailability::Available {
-                            route:
-                                protocol::RequestedCompactionRoute::NativePreferred,
-                        },
-                };
+            let mut conflicting_capability = protocol::ContextCompactionCapabilityPayload {
+                agent_id: agent_ref.agent_id.clone(),
+                logical_session_id: protocol::SessionId("logical-session".to_owned()),
+                availability: protocol::RequestedCompactionAvailability::Available {
+                    route: protocol::RequestedCompactionRoute::NativePreferred,
+                },
+            };
             conflicting_capability.logical_session_id =
                 protocol::SessionId("other-session".to_owned());
 
@@ -3658,9 +3630,7 @@ mod tests {
                                 stage: protocol::CompactionStage::Compacting,
                             },
                         )),
-                        AgentBootstrapEvent::ContextCompactionCapability(
-                            conflicting_capability,
-                        ),
+                        AgentBootstrapEvent::ContextCompactionCapability(conflicting_capability),
                     ],
                     latest_output: Default::default(),
                     turn_active: false,
@@ -3706,9 +3676,7 @@ mod tests {
                 members: vec![protocol::TeamMemberContextCompactionResult {
                     agent_id: agent_ref.agent_id.clone(),
                     logical_session_id: protocol::SessionId(session_id.to_owned()),
-                    operation_id: protocol::CompactionOperationId(
-                        "member-operation".to_owned(),
-                    ),
+                    operation_id: protocol::CompactionOperationId("member-operation".to_owned()),
                     method: Some(protocol::CompactionMethod::NativeTextCommand),
                     status: protocol::ContextCompactionStatus::Completed,
                     mutation: protocol::CompactionMutation::Completed,

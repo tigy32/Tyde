@@ -26,46 +26,45 @@ use protocol::{
     BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot,
     BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapListing,
     BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
-    CompactionAvailabilityReason, CompactionMethod, CompactionMutation,
-    ContextCompactionNotifyPayload, ContextCompactionStatus,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
-    CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
-    FrameKind, GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial,
-    HostBrowseListPayload, HostBrowseStartPayload, HostFilterId, HostLaunchProfileConfig,
-    HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog,
-    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
-    ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MessageOrigin,
-    MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
-    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
-    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload,
-    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
-    SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload, SessionId,
-    SessionListCursor, SessionListGeneration, SessionListPageInfo, SessionListPageStatus,
-    SessionListPayload, SessionListScope, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SessionSummary, SessionSummaryCountUpdatedPayload,
-    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
-    TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
-    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TeamCreatePayload,
-    TeamContextCompactionNotifyPayload, TeamContextCompactionStatus,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
-    TeamMemberContextCompactionResult,
-    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
+    CodeIntelUnsubscribeFilePayload, CompactionAvailabilityReason, CompactionMethod,
+    CompactionMutation, ContextCompactionNotifyPayload, ContextCompactionStatus, CustomAgent,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT, FrameKind, GitBranchName, HostAbsPath,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
+    HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
+    LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT,
+    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    McpServerUpsertPayload, McpTransportConfig, MessageOrigin, MessageSender,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
+    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, RequestedCompactionAvailability, RequestedCompactionRoute,
+    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
+    RunBackendSetupPayload, SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload,
+    SessionId, SessionListCursor, SessionListGeneration, SessionListPageInfo,
+    SessionListPageStatus, SessionListPayload, SessionListScope, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
+    SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageAmount,
+    TaskTokenUsageEntry, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
+    TaskTokenUsageUnavailableReason, TeamContextCompactionNotifyPayload,
+    TeamContextCompactionStatus, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
+    TeamMemberContextCompactionResult, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
     TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
@@ -483,8 +482,7 @@ pub(crate) fn requested_compaction_availability(
         Availability::Native { .. } => RequestedCompactionAvailability::Available {
             route: RequestedCompactionRoute::NativePreferred,
         },
-        Availability::AutomaticOnly { .. }
-        | Availability::Unavailable { .. }
+        Availability::AutomaticOnly { .. } | Availability::Unavailable { .. }
             if !transcript_authoritative =>
         {
             RequestedCompactionAvailability::Unavailable {
@@ -3751,11 +3749,9 @@ impl HostHandle {
         targets: Vec<(TeamCompactTarget, AgentHandle)>,
         stream: Stream,
     ) -> AppResult<()> {
-        let team_operation_id =
-            protocol::CompactionOperationId(Uuid::new_v4().to_string());
-        let stall_timeout = enabled_supervisor_stall_timeout(
-            self.supervisor_settings_signal().await.settings,
-        );
+        let team_operation_id = protocol::CompactionOperationId(Uuid::new_v4().to_string());
+        let stall_timeout =
+            enabled_supervisor_stall_timeout(self.supervisor_settings_signal().await.settings);
         let mut targets_with_sessions = Vec::with_capacity(targets.len());
         for (target, handle) in targets {
             let logical_session_id = handle.snapshot().session_id.ok_or_else(|| {
@@ -3783,10 +3779,7 @@ impl HostHandle {
         for (target, handle, logical_session_id) in targets_with_sessions {
             let (tx, rx) = mpsc::unbounded_channel();
             let agent_stream = Stream::new(
-                StreamPath(format!(
-                    "/agent/{}/team-context-compact",
-                    target.agent_id
-                )),
+                StreamPath(format!("/agent/{}/team-context-compact", target.agent_id)),
                 tx,
             );
             if !handle.attach(agent_stream).await {
@@ -3813,60 +3806,48 @@ impl HostHandle {
                     members.push(TeamMemberContextCompactionResult {
                         agent_id: target.agent_id,
                         logical_session_id,
-                        operation_id: protocol::CompactionOperationId(
-                            "not-admitted".to_owned(),
-                        ),
+                        operation_id: protocol::CompactionOperationId("not-admitted".to_owned()),
                         method: None,
                         status: ContextCompactionStatus::Failed {
                             accepted: false,
                             mutation: CompactionMutation::NotObserved,
                         },
                         mutation: CompactionMutation::NotObserved,
-                        message: Some(
-                            "team member compaction was not admitted".to_owned(),
-                        ),
+                        message: Some("team member compaction was not admitted".to_owned()),
                     });
                     continue;
                 };
-                let terminal = tokio::time::timeout(
-                    SUPERVISION_COMPACTION_OBSERVE_TIMEOUT,
-                    async {
+                let terminal =
+                    tokio::time::timeout(SUPERVISION_COMPACTION_OBSERVE_TIMEOUT, async {
                         while let Some(envelope) = rx.recv().await {
-                            if envelope.kind
-                                != FrameKind::ContextCompactionNotify
-                            {
+                            if envelope.kind != FrameKind::ContextCompactionNotify {
                                 continue;
                             }
-                            let Ok(notify) = envelope
-                                .parse_payload::<ContextCompactionNotifyPayload>()
+                            let Ok(notify) =
+                                envelope.parse_payload::<ContextCompactionNotifyPayload>()
                             else {
                                 continue;
                             };
-                            if notify.operation_id == operation_id
-                                && notify.status.is_terminal()
-                            {
+                            if notify.operation_id == operation_id && notify.status.is_terminal() {
                                 return Some(notify);
                             }
                         }
                         None
-                    },
-                )
-                .await
-                .ok()
-                .flatten();
+                    })
+                    .await
+                    .ok()
+                    .flatten();
                 match terminal {
-                    Some(notify) => members.push(
-                        team_member_context_compaction_result_from_terminal(
+                    Some(notify) => {
+                        members.push(team_member_context_compaction_result_from_terminal(
                             target.agent_id,
                             operation_id,
                             notify,
-                        ),
-                    ),
+                        ))
+                    }
                     None => {
-                        let logical_session_id = handle
-                            .snapshot()
-                            .session_id
-                            .unwrap_or(initial_session_id);
+                        let logical_session_id =
+                            handle.snapshot().session_id.unwrap_or(initial_session_id);
                         members.push(TeamMemberContextCompactionResult {
                             agent_id: target.agent_id,
                             logical_session_id,
@@ -3878,19 +3859,16 @@ impl HostHandle {
                             },
                             mutation: CompactionMutation::MayHaveMutated,
                             message: Some(
-                                "team member compaction terminal was not observed"
-                                    .to_owned(),
+                                "team member compaction terminal was not observed".to_owned(),
                             ),
                         });
                     }
                 }
             }
-            let failed = members.iter().filter(|member| {
-                !matches!(
-                    member.status,
-                    ContextCompactionStatus::Completed
-                )
-            }).count();
+            let failed = members
+                .iter()
+                .filter(|member| !matches!(member.status, ContextCompactionStatus::Completed))
+                .count();
             send_team_context_compaction_notify(
                 &stream,
                 TeamContextCompactionNotifyPayload {
@@ -3902,9 +3880,8 @@ impl HostHandle {
                         TeamContextCompactionStatus::Failed
                     },
                     members,
-                    message: (failed != 0).then(|| {
-                        format!("{failed} team member compactions failed")
-                    }),
+                    message: (failed != 0)
+                        .then(|| format!("{failed} team member compactions failed")),
                 },
             );
         });
@@ -14541,17 +14518,14 @@ async fn observe_supervised_agents(
         let activity_changed = entry.last_activity_counter != status.activity_counter;
         if activity_changed {
             if let SupervisorPhase::PostCompactionDormant {
-                user_message_count,
-                ..
+                user_message_count, ..
             } = &entry.phase
             {
                 let current_user_message_count = observation
                     .handle
                     .read_supervision_context()
                     .await
-                    .map_or(*user_message_count, |context| {
-                        context.user_message_count
-                    });
+                    .map_or(*user_message_count, |context| context.user_message_count);
                 if current_user_message_count <= *user_message_count {
                     entry.last_activity_counter = status.activity_counter;
                     continue;
@@ -15514,16 +15488,10 @@ fn supervision_record_allows_action(
     if record.compacted_to_session_id.is_some() {
         return false;
     }
-    if !record.compaction_operations.is_empty()
-        || context.compaction_user_message_count.is_some()
-    {
+    if !record.compaction_operations.is_empty() || context.compaction_user_message_count.is_some() {
         return match action {
-            SupervisionAction::Verdict => {
-                !context.supervision_verdict_dormant_until_real_user
-            }
-            SupervisionAction::AutoCompaction => {
-                !context.auto_compaction_blocked_until_real_user
-            }
+            SupervisionAction::Verdict => !context.supervision_verdict_dormant_until_real_user,
+            SupervisionAction::AutoCompaction => !context.auto_compaction_blocked_until_real_user,
         };
     }
     !(record.compacted_from_session_id.is_some() && context.user_message_count <= 1)
@@ -15720,9 +15688,7 @@ async fn supervisor_auto_compact(
     let observe = async {
         while let Some(envelope) = rx.recv().await {
             if envelope.kind == FrameKind::ContextCompactionNotify {
-                let Ok(payload) =
-                    envelope.parse_payload::<ContextCompactionNotifyPayload>()
-                else {
+                let Ok(payload) = envelope.parse_payload::<ContextCompactionNotifyPayload>() else {
                     continue;
                 };
                 if payload.status.is_terminal() {
@@ -20348,10 +20314,7 @@ mod tests {
             installed_backend_version(&setup, BackendKind::Antigravity).as_deref(),
             Some("antigravity-local-build")
         );
-        assert_eq!(
-            installed_backend_version(&setup, BackendKind::Codex),
-            None
-        );
+        assert_eq!(installed_backend_version(&setup, BackendKind::Codex), None);
     }
 
     #[test]
@@ -20374,10 +20337,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            result.logical_session_id.0,
-            "session-after-mid-run-change"
-        );
+        assert_eq!(result.logical_session_id.0, "session-after-mid-run-change");
         assert_eq!(result.mutation, CompactionMutation::Completed);
     }
 
@@ -29098,15 +29058,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[test]
     fn backend_compaction_mutation_and_method_conversions_are_exhaustive() {
         assert_eq!(
-            CompactionMutation::from(
-                crate::backend::BackendCompactionMutationState::NotObserved
-            ),
+            CompactionMutation::from(crate::backend::BackendCompactionMutationState::NotObserved),
             CompactionMutation::NotObserved
         );
         assert_eq!(
-            CompactionMutation::from(
-                crate::backend::BackendCompactionMutationState::Completed
-            ),
+            CompactionMutation::from(crate::backend::BackendCompactionMutationState::Completed),
             CompactionMutation::Completed
         );
         assert_eq!(
@@ -29122,9 +29078,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             CompactionMethod::NativeTextCommand
         );
         assert_eq!(
-            CompactionMethod::from(
-                crate::backend::BackendCompactionMechanism::JsonRpcRequest
-            ),
+            CompactionMethod::from(crate::backend::BackendCompactionMechanism::JsonRpcRequest),
             CompactionMethod::NativeRpc
         );
     }
@@ -29132,18 +29086,16 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[test]
     fn capability_conversion_includes_policy_and_transcript_authority() {
         let policy = CompactionRoutingPolicy::default();
-        let guarded =
-            crate::backend::BackendCompactionCapability::context_unavailable(
-                crate::backend::BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
-            );
+        let guarded = crate::backend::BackendCompactionCapability::context_unavailable(
+            crate::backend::BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+        );
         assert!(matches!(
             requested_compaction_availability(&guarded, &policy, false),
             RequestedCompactionAvailability::Unavailable { .. }
         ));
-        let unavailable =
-            crate::backend::BackendCompactionCapability::context_unavailable(
-                crate::backend::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-            );
+        let unavailable = crate::backend::BackendCompactionCapability::context_unavailable(
+            crate::backend::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        );
         assert_eq!(
             requested_compaction_availability(&unavailable, &policy, true),
             RequestedCompactionAvailability::Available {
@@ -29242,13 +29194,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             "Finished must not schedule another verdict or zero-threshold compaction"
         );
         assert!(
-            !finish_supervisor_compaction(
-                &mut entries,
-                &agent_id,
-                10,
-                3,
-                Instant::now(),
-            ),
+            !finish_supervisor_compaction(&mut entries, &agent_id, 10, 3, Instant::now(),),
             "a duplicate or stale Finished event must not re-arm the entry"
         );
     }
@@ -29263,9 +29209,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .activity_summary_observation(&agent_id)
             .await
             .expect("live observation");
-        let session_store = {
-            fixture.host.state.lock().await.session_store.clone()
-        };
+        let session_store = { fixture.host.state.lock().await.session_store.clone() };
         session_store
             .lock()
             .await
@@ -29298,8 +29242,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .get(&session_id)
             .expect("typed session record");
         assert!(
-            record.compacted_from_session_id.is_none()
-                && record.compacted_to_session_id.is_none(),
+            record.compacted_from_session_id.is_none() && record.compacted_to_session_id.is_none(),
             "context-operation dormancy must not rely on legacy lineage"
         );
         let dormant = crate::agent::supervisor::SupervisionContextSnapshot {
@@ -29372,15 +29315,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .activity_summary_observation(&agent_id)
             .await
             .expect("live observation");
-        let session_store = {
-            fixture.host.state.lock().await.session_store.clone()
-        };
+        let session_store = { fixture.host.state.lock().await.session_store.clone() };
         session_store
             .lock()
             .await
             .update(&session_id, |record| {
-                record.compacted_from_session_id =
-                    Some(SessionId("legacy-parent".to_owned()));
+                record.compacted_from_session_id = Some(SessionId("legacy-parent".to_owned()));
                 record.compaction_operations.clear();
             })
             .expect("persist legacy lineage fixture");
@@ -29446,10 +29386,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[test]
     fn compaction_barrier_deadline_extends_long_stall_timeout() {
-        assert_eq!(
-            compaction_barrier_timeout(None),
-            Duration::from_secs(600)
-        );
+        assert_eq!(compaction_barrier_timeout(None), Duration::from_secs(600));
         assert_eq!(
             compaction_barrier_timeout(Some(Duration::from_secs(900))),
             Duration::from_secs(930)

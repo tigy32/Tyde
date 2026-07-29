@@ -51,9 +51,7 @@ impl TranscriptStore {
                 return Ok(PathBuf::from(trimmed));
             }
         }
-        Ok(crate::paths::home_dir()?
-            .join(".tyde")
-            .join("transcripts"))
+        Ok(crate::paths::home_dir()?.join(".tyde").join("transcripts"))
     }
 
     pub(crate) fn is_authoritative(&self, session_id: &SessionId) -> bool {
@@ -206,10 +204,9 @@ mod tests {
     use super::*;
 
     fn store() -> TranscriptStore {
-        TranscriptStore::new(std::env::temp_dir().join(format!(
-            "tyde-transcript-test-{}",
-            Uuid::new_v4()
-        )))
+        TranscriptStore::new(
+            std::env::temp_dir().join(format!("tyde-transcript-test-{}", Uuid::new_v4())),
+        )
     }
 
     fn marker(session_id: &SessionId, sequence: u64) -> TranscriptRecord {
@@ -260,14 +257,18 @@ mod tests {
             provider_session_id: "provider".to_owned(),
             event_id: "boundary".to_owned(),
         });
-        assert!(store
-            .append_import_if_missing(&record)
-            .expect("first import"));
+        assert!(
+            store
+                .append_import_if_missing(&record)
+                .expect("first import")
+        );
         let mut duplicate = record.clone();
         duplicate.event_id = "different-local-id".to_owned();
-        assert!(!store
-            .append_import_if_missing(&duplicate)
-            .expect("duplicate import"));
+        assert!(
+            !store
+                .append_import_if_missing(&duplicate)
+                .expect("duplicate import")
+        );
     }
 
     #[test]

@@ -24,9 +24,7 @@ fn full_token_count(tokens: u64) -> String {
     formatted
 }
 
-fn compaction_outcome_text(
-    event: &protocol::ContextCompactionTimelineEvent,
-) -> &'static str {
+fn compaction_outcome_text(event: &protocol::ContextCompactionTimelineEvent) -> &'static str {
     use protocol::{CompactionMutation, ContextCompactionTimelineStatus};
 
     match (event.status, event.mutation) {
@@ -53,8 +51,7 @@ pub fn ContextCompactionMarkerView(
     event: protocol::ContextCompactionTimelineEvent,
 ) -> impl IntoView {
     let outcome = compaction_outcome_text(&event);
-    let suppress_metrics = event.status
-        == protocol::ContextCompactionTimelineStatus::Failed
+    let suppress_metrics = event.status == protocol::ContextCompactionTimelineStatus::Failed
         && event.mutation == protocol::CompactionMutation::NotObserved;
     let metrics = if suppress_metrics {
         None
@@ -65,12 +62,8 @@ pub fn ContextCompactionMarkerView(
                 compact_token_count(before),
                 compact_token_count(after)
             )),
-            (Some(before), None) => {
-                Some(format!("from {} tokens", compact_token_count(before)))
-            }
-            (None, Some(after)) => {
-                Some(format!("to {} tokens", compact_token_count(after)))
-            }
+            (Some(before), None) => Some(format!("from {} tokens", compact_token_count(before))),
+            (None, Some(after)) => Some(format!("to {} tokens", compact_token_count(after))),
             (None, None) => None,
         }
     };
@@ -727,7 +720,10 @@ mod wasm_tests {
             .query_selector_all("[data-mobile-test='chat-compaction-marker']")
             .unwrap();
         let partial_text = rows.item(0).unwrap().text_content().unwrap_or_default();
-        assert!(partial_text.contains("from 384.2k tokens"), "{partial_text}");
+        assert!(
+            partial_text.contains("from 384.2k tokens"),
+            "{partial_text}"
+        );
         assert!(
             partial_text.contains("from 384,168 tokens"),
             "accessible text preserves the known full count: {partial_text}"

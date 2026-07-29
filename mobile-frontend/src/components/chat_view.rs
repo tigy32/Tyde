@@ -2353,9 +2353,12 @@ mod wasm_tests {
         assert!(!state.push_context_compaction_marker(&agent_ref, marker));
         state.push_chat_message_entry(
             &agent_ref,
-            make_message(MessageSender::Assistant {
-                agent: "Coder".to_owned(),
-            }, "after compaction"),
+            make_message(
+                MessageSender::Assistant {
+                    agent: "Coder".to_owned(),
+                },
+                "after compaction",
+            ),
         );
         next_tick().await;
 

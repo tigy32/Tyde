@@ -11,26 +11,26 @@ use protocol::{
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
-    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
-    HostBootstrapPayload, HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload,
-    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAccessedPayload,
-    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    SendMessagePayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SessionSummaryCountUpdatedPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
-    StreamPath, TaskTokenUsagePayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamContextCompactionNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload, read_envelope, write_envelope,
+    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind, HostBootstrapPayload,
+    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
+    NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionHistoryPayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SessionSummaryCountUpdatedPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
+    TaskTokenUsagePayload, TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
+    TerminalStartPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope,
+    write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -1307,9 +1307,7 @@ fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
     match event {
         AgentEvent::Start(payload) => payload.session_id.clone(),
         AgentEvent::Bootstrap(payload) => bootstrap_agent_session_id(payload),
-        AgentEvent::ContextCompactionNotify(payload) => {
-            Some(payload.logical_session_id.clone())
-        }
+        AgentEvent::ContextCompactionNotify(payload) => Some(payload.logical_session_id.clone()),
         AgentEvent::ContextCompactionCapability(payload) => {
             Some(payload.logical_session_id.clone())
         }
@@ -1323,9 +1321,7 @@ fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
     }
 }
 
-fn bootstrap_agent_session_id(
-    payload: &AgentBootstrapPayload,
-) -> Option<protocol::SessionId> {
+fn bootstrap_agent_session_id(payload: &AgentBootstrapPayload) -> Option<protocol::SessionId> {
     let mut logical_session_id = None;
     for event in &payload.events {
         let candidate = match event {
@@ -1397,9 +1393,7 @@ mod compaction_session_tests {
     fn compaction_events_resolve_pending_agent_session_identity() {
         let session_id = protocol::SessionId("logical-session".to_owned());
         assert_eq!(
-            agent_event_session_id(&AgentEvent::ContextCompactionNotify(notify(
-                &session_id.0
-            ))),
+            agent_event_session_id(&AgentEvent::ContextCompactionNotify(notify(&session_id.0))),
             Some(session_id.clone())
         );
         assert_eq!(

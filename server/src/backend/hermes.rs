@@ -9,13 +9,13 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
-    ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
-    CompactionMethod, CompactionMetrics, CompactionStage, RetryAttemptData, SelectOption,
-    SendMessageToolResponse, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData,
-    ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
+    CompactionMethod, CompactionMetrics, CompactionStage, ContextBreakdown, MessageSender,
+    MessageTokenUsage, ModelInfo, OperationCancelledData, RetryAttemptData, SelectOption,
+    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
+    ToolRequest, ToolRequestType, ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -498,10 +498,7 @@ fn classify_hermes_compaction_response(
                     optional_string_any(info, &["resumed", "session_key", "stored_session_id"])
                 })
                 .or_else(|| {
-                    optional_string_any(
-                        &value,
-                        &["resumed", "session_key", "stored_session_id"],
-                    )
+                    optional_string_any(&value, &["resumed", "session_key", "stored_session_id"])
                 })
                 .map(SessionId)
                 .unwrap_or_else(|| stored_before.clone());
@@ -825,9 +822,9 @@ impl Backend for HermesBackend {
         }
 
         let stored_session_id = Arc::new(std::sync::Mutex::new(ids.stored_session_id));
-        let compaction_capability = Arc::new(std::sync::Mutex::new(
-            hermes_compaction_capability(gateway.provider_version.as_deref()),
-        ));
+        let compaction_capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(
+            gateway.provider_version.as_deref(),
+        )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
@@ -917,9 +914,9 @@ impl Backend for HermesBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (resume_replay_complete_tx, resume_replay_complete_rx) = oneshot::channel();
         let stored_session_id = Arc::new(std::sync::Mutex::new(SessionId(resumed)));
-        let compaction_capability = Arc::new(std::sync::Mutex::new(
-            hermes_compaction_capability(gateway.provider_version.as_deref()),
-        ));
+        let compaction_capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(
+            gateway.provider_version.as_deref(),
+        )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
@@ -1002,10 +999,7 @@ impl Backend for HermesBackend {
             .clone()
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         let capability = self
             .compaction_capability
             .lock()
@@ -1037,10 +1031,12 @@ impl Backend for HermesBackend {
                 fallback_safe: false,
             };
         }
-        reply_rx.await.unwrap_or(BackendCompactionStart::NotDispatched {
-            reason: BackendCompactionNotDispatchedReason::BackendClosed,
-            fallback_safe: false,
-        })
+        reply_rx
+            .await
+            .unwrap_or(BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                fallback_safe: false,
+            })
     }
 
     async fn install_continuation_context(
@@ -1894,13 +1890,13 @@ impl HermesSessionActor {
                     message: "Hermes response channel closed during session.compress".to_string(),
                 })
             });
-            let _ = events_tx.send(BackendEvent::Compaction(
-                BackendCompactionEvent::Progress(BackendCompactionProgress {
+            let _ = events_tx.send(BackendEvent::Compaction(BackendCompactionEvent::Progress(
+                BackendCompactionProgress {
                     operation_id: terminal_operation_id.clone(),
                     stage: CompactionStage::Finalizing,
                     elapsed_ms: None,
-                }),
-            ));
+                },
+            )));
             let result = classify_hermes_compaction_response(
                 terminal_operation_id,
                 live_session_id,
@@ -1925,13 +1921,15 @@ impl HermesSessionActor {
         operation_id: &protocol::CompactionOperationId,
         stage: CompactionStage,
     ) {
-        let _ = self.events_tx.send(BackendEvent::Compaction(
-            BackendCompactionEvent::Progress(BackendCompactionProgress {
-                operation_id: operation_id.clone(),
-                stage,
-                elapsed_ms: None,
-            }),
-        ));
+        let _ = self
+            .events_tx
+            .send(BackendEvent::Compaction(BackendCompactionEvent::Progress(
+                BackendCompactionProgress {
+                    operation_id: operation_id.clone(),
+                    stage,
+                    elapsed_ms: None,
+                },
+            )));
     }
 
     async fn run(
@@ -2755,11 +2753,7 @@ impl HermesGatewayHandle {
             .map_err(|error| error.to_string())
     }
 
-    async fn request_typed(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, HermesRpcError> {
+    async fn request_typed(&self, method: &str, params: Value) -> Result<Value, HermesRpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HermesGatewayCommand::Request {
@@ -10753,11 +10747,10 @@ for line in sys.stdin:
                 fallback_safe: false,
             })
         ));
-        assert!(hermes_compaction_pre_dispatch(
-            &hermes_compaction_capability(Some("0.17.0")),
-            true,
-        )
-        .is_none());
+        assert!(
+            hermes_compaction_pre_dispatch(&hermes_compaction_capability(Some("0.17.0")), true,)
+                .is_none()
+        );
     }
 
     #[test]
@@ -10784,9 +10777,9 @@ for line in sys.stdin:
     #[test]
     fn attempted_provider_failures_never_look_fallback_safe() {
         let stored = Arc::new(std::sync::Mutex::new(SessionId("stored".to_string())));
-        let capability = Arc::new(std::sync::Mutex::new(
-            hermes_compaction_capability(Some("0.17.0")),
-        ));
+        let capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(Some(
+            "0.17.0",
+        ))));
         let busy = classify_hermes_compaction_response(
             protocol::CompactionOperationId("busy".to_string()),
             "live".to_string(),

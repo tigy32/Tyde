@@ -1895,10 +1895,7 @@ impl Backend for TycodeBackend {
         )
     }
 
-    async fn begin_compaction(
-        &self,
-        _request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, _request: BackendCompactionRequest) -> BackendCompactionStart {
         BackendCompactionStart::NotDispatched {
             reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                 BackendCompactionUnavailableReason::AdapterHasNoManualTransport,

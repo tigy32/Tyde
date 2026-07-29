@@ -218,10 +218,7 @@ impl ClaudeCommandHandle {
             })
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         ClaudeInner::begin_compaction(Arc::clone(&self.inner), request).await
     }
 }
@@ -585,8 +582,7 @@ impl ClaudeSession {
     }
 
     async fn seed_installed_provider_version(&self, provider_version: Option<String>) {
-        let provider_version =
-            provider_version.and_then(|version| normalize_nonempty(&version));
+        let provider_version = provider_version.and_then(|version| normalize_nonempty(&version));
         let mut state = self.inner.state.lock().await;
         state.installed_provider_version = provider_version.clone();
         state.provider_version = provider_version;
@@ -1262,9 +1258,7 @@ fn claude_live_compaction_observation(
         },
         provider_session_id: Some(SessionId(session_id)),
         metrics: claude_compaction_metrics(metadata),
-        source: BackendCompactionObservationSource::ClaudeBoundary {
-            boundary_uuid,
-        },
+        source: BackendCompactionObservationSource::ClaudeBoundary { boundary_uuid },
         user_focus: metadata
             .and_then(|metadata| metadata.get("user_context"))
             .and_then(Value::as_str)
@@ -1910,7 +1904,9 @@ impl ClaudeInner {
                     true,
                 )
                 .await
-                .unwrap_or_else(|| dispatch_uncertain_claude_result(request.operation_id.clone(), error));
+                .unwrap_or_else(|| {
+                    dispatch_uncertain_claude_result(request.operation_id.clone(), error)
+                });
             return BackendCompactionStart::DispatchUncertain(result);
         }
         {
@@ -2322,9 +2318,7 @@ impl ClaudeInner {
                             progress = Some(BackendCompactionProgress {
                                 operation_id: pending.request.operation_id.clone(),
                                 stage: CompactionStage::Compacting,
-                                elapsed_ms: Some(
-                                    pending.dispatched_at.elapsed().as_millis() as u64,
-                                ),
+                                elapsed_ms: Some(pending.dispatched_at.elapsed().as_millis() as u64),
                             });
                         }
                         if let Some(compact_result) = system.compact_result {
@@ -2354,22 +2348,16 @@ impl ClaudeInner {
                                 &system,
                                 session_id.as_deref(),
                             ) {
-                                self.emitter.compaction_event(
-                                    &BackendCompactionEvent::Observed(observation),
-                                );
+                                self.emitter
+                                    .compaction_event(&BackendCompactionEvent::Observed(
+                                        observation,
+                                    ));
                             }
                             return;
                         }
-                        let Some(uuid) = system
-                            .uuid
-                            .clone()
-                            .or_else(|| {
-                                value
-                                    .get("uuid")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                            })
-                        else {
+                        let Some(uuid) = system.uuid.clone().or_else(|| {
+                            value.get("uuid").and_then(Value::as_str).map(str::to_owned)
+                        }) else {
                             return;
                         };
                         let mut state = self.state.lock().await;
@@ -2393,9 +2381,7 @@ impl ClaudeInner {
                         }
                         pending.boundary = Some(ClaudeCompactionBoundary {
                             uuid,
-                            metrics: claude_compaction_metrics(
-                                system.compact_metadata.as_ref(),
-                            ),
+                            metrics: claude_compaction_metrics(system.compact_metadata.as_ref()),
                         });
                     }
                     ClaudeSystemEvent::Init
@@ -2453,8 +2439,7 @@ impl ClaudeInner {
         let (result, terminal_tx, timeout_cancel_tx, waiters) = {
             let mut state = self.state.lock().await;
             let active_matches = state.active_turn.as_ref().is_some_and(|active| {
-                active.id == turn_id
-                    && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+                active.id == turn_id && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
             });
             if !active_matches {
                 return None;
@@ -2473,26 +2458,30 @@ impl ClaudeInner {
             let semantic_failure = forced_failure
                 .or_else(|| interrupted.then(|| "Claude compaction was interrupted".to_string()))
                 .or_else(|| pending.compact_error.clone())
-                .or_else(|| pending.result_is_error.then(|| {
-                    pending
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "Claude returned an error result".to_string())
-                }))
-                .or_else(|| typed_failed.then(|| {
-                    pending
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "Claude reported compaction failure".to_string())
-                }))
+                .or_else(|| {
+                    pending.result_is_error.then(|| {
+                        pending
+                            .diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "Claude returned an error result".to_string())
+                    })
+                })
+                .or_else(|| {
+                    typed_failed.then(|| {
+                        pending
+                            .diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "Claude reported compaction failure".to_string())
+                    })
+                })
                 .or_else(|| {
                     (!pending.terminal_result_seen)
                         .then(|| "Claude compaction did not reach a terminal result".to_string())
                 })
                 .or_else(|| {
-                    boundary
-                        .is_none()
-                        .then(|| "Claude returned a result without a manual compact boundary".to_string())
+                    boundary.is_none().then(|| {
+                        "Claude returned a result without a manual compact boundary".to_string()
+                    })
                 });
             let dispatch = if dispatch_uncertain {
                 BackendCompactionDispatchState::MayHaveReachedProvider
@@ -3319,8 +3308,7 @@ impl ClaudeInner {
     async fn active_turn_pending_outcome_id(&self) -> Option<u64> {
         let state = self.state.lock().await;
         state.active_turn.as_ref().and_then(|active| {
-            if active.outcome_tx.is_some()
-                || matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+            if active.outcome_tx.is_some() || matches!(active.owner, ClaudeTurnOwner::Compaction(_))
             {
                 Some(active.id)
             } else {
@@ -7766,9 +7754,11 @@ fn consume_claude_stream_value_with_interrupt(
                 ClaudeSystemEvent::Status => {}
                 ClaudeSystemEvent::CompactBoundary => {
                     summary.control_event = Some(ClaudeControlEvent::ConversationCompacted);
-                    if let Some(observation) =
-                        claude_live_compaction_observation(value, &system, summary.session_id.as_deref())
-                    {
+                    if let Some(observation) = claude_live_compaction_observation(
+                        value,
+                        &system,
+                        summary.session_id.as_deref(),
+                    ) {
                         inner
                             .emitter
                             .compaction_event(&BackendCompactionEvent::Observed(observation));
@@ -10854,9 +10844,7 @@ fn claude_replay_compaction_observation(value: &Value) -> Option<BackendObserved
         },
         provider_session_id: Some(SessionId(session_id)),
         metrics,
-        source: BackendCompactionObservationSource::ClaudeBoundary {
-            boundary_uuid,
-        },
+        source: BackendCompactionObservationSource::ClaudeBoundary { boundary_uuid },
         user_focus,
     })
 }
@@ -10873,10 +10861,7 @@ fn claude_compaction_metrics(metadata: Option<&Value>) -> CompactionMetrics {
         before_messages: get_u64("beforeMessages", "before_messages"),
         after_messages: get_u64("afterMessages", "after_messages"),
         messages_summarized: get_u64("messagesSummarized", "messages_summarized"),
-        cumulative_dropped_tokens: get_u64(
-            "cumulativeDroppedTokens",
-            "cumulative_dropped_tokens",
-        ),
+        cumulative_dropped_tokens: get_u64("cumulativeDroppedTokens", "cumulative_dropped_tokens"),
         duration_ms: get_u64("durationMs", "duration_ms"),
         precomputed: metadata
             .and_then(|metadata| {
@@ -11613,11 +11598,10 @@ use super::{
     BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
     BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
     BackendCompactionUnknownReason, BackendCompactionUserFocus,
-    BackendCompactionUserFocusProvenance, BackendContextReseatResult,
-    BackendContextReseatSupport, BackendContinuationContext, BackendContinuationItem,
-    BackendEvent, BackendObservedCompaction, BackendSession, BackendSpawnConfig,
-    BackendStartupError, ContinuationInstallStatus, EventStream, PostCompactionTokenCount,
-    protocol_images_to_attachments,
+    BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
+    BackendContinuationContext, BackendContinuationItem, BackendEvent, BackendObservedCompaction,
+    BackendSession, BackendSpawnConfig, BackendStartupError, ContinuationInstallStatus,
+    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
@@ -12297,9 +12281,7 @@ fn sanitize_claude_compaction_focus(value: &str) -> Result<String, ()> {
     Ok(sanitized)
 }
 
-fn claude_compaction_focus(
-    request: &BackendCompactionRequest,
-) -> Result<Option<String>, ()> {
+fn claude_compaction_focus(request: &BackendCompactionRequest) -> Result<Option<String>, ()> {
     let mut parts = Vec::new();
     if let Some(focus) = request.focus.as_deref() {
         let focus = sanitize_claude_compaction_focus(focus)?;
@@ -13059,10 +13041,7 @@ impl Backend for ClaudeBackend {
             })
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         let handle = self
             .command_handle
             .lock()
@@ -17158,8 +17137,7 @@ for raw_line in sys.stdin:
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
-        let BackendEvent::Chat(event) =
-            events_rx.recv().await.expect("adapted terminal StreamEnd")
+        let BackendEvent::Chat(event) = events_rx.recv().await.expect("adapted terminal StreamEnd")
         else {
             panic!("expected adapted terminal chat event");
         };
@@ -28035,7 +28013,8 @@ for line in sys.stdin:
             Err("Failed to start Claude CLI: No such file or directory".to_string())
         );
 
-        let BackendEvent::Chat(event) = events_rx.recv().await.expect("forwarded chat event") else {
+        let BackendEvent::Chat(event) = events_rx.recv().await.expect("forwarded chat event")
+        else {
             panic!("expected forwarded chat event");
         };
         match event {

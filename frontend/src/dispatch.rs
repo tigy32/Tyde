@@ -4238,7 +4238,10 @@ fn apply_team_context_compaction_notify(
     }
 
     state.team_context_compactions.update(|map| {
-        map.insert((host_id.to_owned(), payload.team_id.clone()), payload.clone());
+        map.insert(
+            (host_id.to_owned(), payload.team_id.clone()),
+            payload.clone(),
+        );
     });
 
     // The team run's single announcement authority. Members reduce above but
@@ -5722,23 +5725,22 @@ pub(crate) fn compaction_marker_announcement(
     use protocol::{CompactionMutation, ContextCompactionTimelineStatus};
 
     let mut sentence = match event.status {
-        ContextCompactionTimelineStatus::Completed => match (
-            event.metrics.before_tokens,
-            event.metrics.after_tokens,
-        ) {
-            (Some(before), Some(after)) => format!(
-                "Context compacted. {} tokens reduced to {}.",
-                group_digits(before),
-                group_digits(after)
-            ),
-            (Some(before), None) => {
-                format!("Context compacted from {} tokens.", group_digits(before))
+        ContextCompactionTimelineStatus::Completed => {
+            match (event.metrics.before_tokens, event.metrics.after_tokens) {
+                (Some(before), Some(after)) => format!(
+                    "Context compacted. {} tokens reduced to {}.",
+                    group_digits(before),
+                    group_digits(after)
+                ),
+                (Some(before), None) => {
+                    format!("Context compacted from {} tokens.", group_digits(before))
+                }
+                (None, Some(after)) => {
+                    format!("Context compacted to {} tokens.", group_digits(after))
+                }
+                (None, None) => "Context compacted.".to_owned(),
             }
-            (None, Some(after)) => {
-                format!("Context compacted to {} tokens.", group_digits(after))
-            }
-            (None, None) => "Context compacted.".to_owned(),
-        },
+        }
         ContextCompactionTimelineStatus::Failed => {
             let mut sentence = match event.mutation {
                 CompactionMutation::NotObserved => {
@@ -10469,9 +10471,9 @@ mod tests {
                 "a completed member releases its gate"
             );
             assert!(
-                state.context_compactions.with_untracked(|map| map
-                    .get(&member_b)
-                    .is_some_and(|op| !op.is_in_flight())),
+                state
+                    .context_compactions
+                    .with_untracked(|map| map.get(&member_b).is_some_and(|op| !op.is_in_flight())),
                 "a failed member is terminal, so its control re-arms"
             );
             assert!(
@@ -10782,8 +10784,7 @@ mod tests {
                 ChatEventSource::Live,
             );
             assert!(
-                crate::components::center_zone::current_alert()
-                    .contains("summarizer timed out"),
+                crate::components::center_zone::current_alert().contains("summarizer timed out"),
                 "the terminal notify makes the single announcement, assertively"
             );
             assert!(

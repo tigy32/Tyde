@@ -1505,9 +1505,7 @@ fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
         // where an `on_cleanup` registered inside an effect body attaches.
         clear_ticker();
         elapsed.set(0);
-        let running = operation_key
-            .get()
-            .is_some_and(|(_, in_flight)| in_flight);
+        let running = operation_key.get().is_some_and(|(_, in_flight)| in_flight);
         if !running {
             return;
         }
@@ -2946,21 +2944,24 @@ mod wasm_tests {
             state.context_compactions.update(|map| {
                 map.insert(
                     agent_id_mount.clone(),
-                    ContextCompactionUiState::Active { live: true, payload: protocol::ContextCompactionNotifyPayload {
-                        operation_id: protocol::CompactionOperationId("op-1".to_owned()),
-                        agent_id: agent_id_mount.clone(),
-                        logical_session_id: protocol::SessionId("s".to_owned()),
-                        backend_kind: BackendKind::Claude,
-                        trigger: CompactionTrigger::UserRequested,
-                        method: Some(CompactionMethod::NativeTextCommand),
-                        status: ContextCompactionStatus::Progress {
-                            stage: CompactionStage::Compacting,
+                    ContextCompactionUiState::Active {
+                        live: true,
+                        payload: protocol::ContextCompactionNotifyPayload {
+                            operation_id: protocol::CompactionOperationId("op-1".to_owned()),
+                            agent_id: agent_id_mount.clone(),
+                            logical_session_id: protocol::SessionId("s".to_owned()),
+                            backend_kind: BackendKind::Claude,
+                            trigger: CompactionTrigger::UserRequested,
+                            method: Some(CompactionMethod::NativeTextCommand),
+                            status: ContextCompactionStatus::Progress {
+                                stage: CompactionStage::Compacting,
+                            },
+                            provider_version: None,
+                            metrics: protocol::CompactionMetrics::default(),
+                            continuation: None,
+                            message: None,
                         },
-                        provider_version: None,
-                        metrics: protocol::CompactionMetrics::default(),
-                        continuation: None,
-                        message: None,
-                    } },
+                    },
                 );
             });
             provide_context(state);
@@ -3147,21 +3148,24 @@ mod wasm_tests {
             state.context_compactions.update(|map| {
                 map.insert(
                     agent_id_mount.clone(),
-                    ContextCompactionUiState::Active { live: true, payload: protocol::ContextCompactionNotifyPayload {
-                        operation_id: protocol::CompactionOperationId("op-2".to_owned()),
-                        agent_id: agent_id_mount.clone(),
-                        logical_session_id: protocol::SessionId("s".to_owned()),
-                        backend_kind: BackendKind::Claude,
-                        trigger: CompactionTrigger::UserRequested,
-                        method: None,
-                        status: ContextCompactionStatus::Deferred {
-                            stage: CompactionStage::WaitingForIdle,
+                    ContextCompactionUiState::Active {
+                        live: true,
+                        payload: protocol::ContextCompactionNotifyPayload {
+                            operation_id: protocol::CompactionOperationId("op-2".to_owned()),
+                            agent_id: agent_id_mount.clone(),
+                            logical_session_id: protocol::SessionId("s".to_owned()),
+                            backend_kind: BackendKind::Claude,
+                            trigger: CompactionTrigger::UserRequested,
+                            method: None,
+                            status: ContextCompactionStatus::Deferred {
+                                stage: CompactionStage::WaitingForIdle,
+                            },
+                            provider_version: None,
+                            metrics: protocol::CompactionMetrics::default(),
+                            continuation: None,
+                            message: None,
                         },
-                        provider_version: None,
-                        metrics: protocol::CompactionMetrics::default(),
-                        continuation: None,
-                        message: None,
-                    } },
+                    },
                 );
             });
             provide_context(state);

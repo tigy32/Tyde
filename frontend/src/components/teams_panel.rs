@@ -4,8 +4,8 @@ use wasm_bindgen_futures::spawn_local;
 use protocol::{
     AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint, Team,
     TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload,
-    TeamMemberCreateSpec, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
+    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberCreateSpec,
+    TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
     TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId,
     TeamTemplateId,
 };
@@ -468,7 +468,9 @@ fn TeamCard(
             };
             if !all_claimed || claimed.is_empty() {
                 release_all(&claimed, "another compaction started first");
-                log::info!("team compact: could not claim every member; rolled back and not sending");
+                log::info!(
+                    "team compact: could not claim every member; rolled back and not sending"
+                );
                 return;
             }
 
@@ -499,9 +501,7 @@ fn TeamCard(
         let failed: Vec<&protocol::TeamMemberContextCompactionResult> = payload
             .members
             .iter()
-            .filter(|member| {
-                !matches!(member.status, protocol::ContextCompactionStatus::Completed)
-            })
+            .filter(|member| !matches!(member.status, protocol::ContextCompactionStatus::Completed))
             .collect();
         match payload.status {
             protocol::TeamContextCompactionStatus::Started => {
@@ -517,8 +517,11 @@ fn TeamCard(
                     .clone()
                     .unwrap_or_else(|| "Some members could not be compacted.".to_owned());
                 for member in failed {
-                    if let Some(reason) =
-                        member.message.as_deref().map(str::trim).filter(|r| !r.is_empty())
+                    if let Some(reason) = member
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|r| !r.is_empty())
                     {
                         text.push_str(&format!(" {}: {reason}", member.agent_id.0));
                     }
@@ -3138,11 +3141,9 @@ mod wasm_tests {
             "default AgentCompactPayload omits optional fields"
         );
         assert!(
-            state
-                .context_compactions
-                .with_untracked(|map| map
-                    .get(&bound_agent_id)
-                    .is_some_and(|operation| operation.is_in_flight())),
+            state.context_compactions.with_untracked(|map| map
+                .get(&bound_agent_id)
+                .is_some_and(|operation| operation.is_in_flight())),
             "bound agent should be marked in-flight while the server processes"
         );
 
@@ -5556,10 +5557,8 @@ mod wasm_tests {
         push_agent(&rep_agent_id, "/agent/a-rep/inst");
         state.team_member_bindings.update(|m| {
             let entry = m.entry(host_id.to_owned()).or_default();
-            for (member_id, agent_id) in [
-                (&manager_id, &mgr_agent_id),
-                (&report_id, &rep_agent_id),
-            ] {
+            for (member_id, agent_id) in [(&manager_id, &mgr_agent_id), (&report_id, &rep_agent_id)]
+            {
                 entry.insert(
                     member_id.clone(),
                     TeamMemberBindingPayload {

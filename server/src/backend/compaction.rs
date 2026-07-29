@@ -235,7 +235,9 @@ pub(crate) struct BackendBindingReadyEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BackendBindingPrepareError {
-    InvalidSeed { message: String },
+    InvalidSeed {
+        message: String,
+    },
     SpawnFailed {
         backend_kind: BackendKind,
         message: String,
@@ -245,7 +247,9 @@ pub(crate) enum BackendBindingPrepareError {
         provider_session_id: SessionId,
         message: String,
     },
-    ProviderIdentityMissing { backend_kind: BackendKind },
+    ProviderIdentityMissing {
+        backend_kind: BackendKind,
+    },
     ProviderIdentityChanged {
         backend_kind: BackendKind,
         before: SessionId,
@@ -259,8 +263,12 @@ pub(crate) enum BackendBindingPrepareError {
         backend_kind: BackendKind,
         activity: String,
     },
-    BootstrapStreamClosed { backend_kind: BackendKind },
-    BootstrapTimedOut { backend_kind: BackendKind },
+    BootstrapStreamClosed {
+        backend_kind: BackendKind,
+    },
+    BootstrapTimedOut {
+        backend_kind: BackendKind,
+    },
 }
 
 impl std::fmt::Display for BackendBindingPrepareError {
@@ -284,7 +292,10 @@ impl std::fmt::Display for BackendBindingPrepareError {
                 provider_session_id.0
             ),
             Self::ProviderIdentityMissing { backend_kind } => {
-                write!(formatter, "prepared {backend_kind:?} binding had no provider identity")
+                write!(
+                    formatter,
+                    "prepared {backend_kind:?} binding had no provider identity"
+                )
             }
             Self::ProviderIdentityChanged {
                 backend_kind,
@@ -471,14 +482,20 @@ pub(crate) struct BackendObservedCompaction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BackendCompactionObservationSource {
-    ClaudeBoundary { boundary_uuid: String },
+    ClaudeBoundary {
+        boundary_uuid: String,
+    },
     CodexItem {
         thread_id: String,
         turn_id: String,
         item_id: String,
     },
-    HermesEvent { event_id: String },
-    MockEvent { event_id: String },
+    HermesEvent {
+        event_id: String,
+    },
+    MockEvent {
+        event_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

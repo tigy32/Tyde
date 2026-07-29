@@ -123,10 +123,8 @@ mod compaction_contract_tests {
             }]
         });
 
-        let error = serde_json::from_value::<TeamContextCompactionNotifyPayload>(
-            missing_session,
-        )
-        .expect_err("member logical_session_id is a required wire field");
+        let error = serde_json::from_value::<TeamContextCompactionNotifyPayload>(missing_session)
+            .expect_err("member logical_session_id is a required wire field");
         assert!(error.to_string().contains("logical_session_id"));
     }
 
@@ -147,10 +145,9 @@ mod compaction_contract_tests {
             timestamp: 42,
         };
         let event = ChatEvent::ContextCompaction(marker.clone());
-        let decoded: ChatEvent = serde_json::from_value(
-            serde_json::to_value(&event).expect("serialize marker"),
-        )
-        .expect("deserialize marker");
+        let decoded: ChatEvent =
+            serde_json::from_value(serde_json::to_value(&event).expect("serialize marker"))
+                .expect("deserialize marker");
         assert!(matches!(
             decoded,
             ChatEvent::ContextCompaction(decoded_marker)
@@ -168,10 +165,9 @@ mod compaction_contract_tests {
             has_more_before: false,
             oldest_seq: None,
         };
-        let decoded: SessionHistoryPayload = serde_json::from_value(
-            serde_json::to_value(&payload).expect("serialize history"),
-        )
-        .expect("deserialize history");
+        let decoded: SessionHistoryPayload =
+            serde_json::from_value(serde_json::to_value(&payload).expect("serialize history"))
+                .expect("deserialize history");
         assert_eq!(decoded.request_id, payload.request_id);
         assert_eq!(decoded.request_before_seq, Some(19));
     }
@@ -1504,9 +1500,7 @@ impl fmt::Display for FrameKind {
             Self::AgentRenamed => f.write_str("agent_renamed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
             Self::ContextCompactionNotify => f.write_str("context_compaction_notify"),
-            Self::ContextCompactionCapability => {
-                f.write_str("context_compaction_capability")
-            }
+            Self::ContextCompactionCapability => f.write_str("context_compaction_capability"),
             Self::AgentClosed => f.write_str("agent_closed"),
             Self::ChatEvent => f.write_str("chat_event"),
             Self::SessionHistory => f.write_str("session_history"),
@@ -1523,9 +1517,7 @@ impl fmt::Display for FrameKind {
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
             Self::TeamCompactNotify => f.write_str("team_compact_notify"),
-            Self::TeamContextCompactionNotify => {
-                f.write_str("team_context_compaction_notify")
-            }
+            Self::TeamContextCompactionNotify => f.write_str("team_context_compaction_notify"),
             Self::TeamPresetCatalogNotify => f.write_str("team_preset_catalog_notify"),
             Self::TeamDraftNotify => f.write_str("team_draft_notify"),
             Self::TeamMemberShuffleSuggestionNotify => {
@@ -3850,9 +3842,15 @@ pub enum ContinuationInstallSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContextCompactionStatus {
-    Deferred { stage: CompactionStage },
-    Started { stage: CompactionStage },
-    Progress { stage: CompactionStage },
+    Deferred {
+        stage: CompactionStage,
+    },
+    Started {
+        stage: CompactionStage,
+    },
+    Progress {
+        stage: CompactionStage,
+    },
     Completed,
     Failed {
         accepted: bool,

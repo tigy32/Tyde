@@ -10,10 +10,10 @@ pub use mobile_shell_types::{
 pub use protocol::MobileServiceAuthState;
 use protocol::types::AgentCompactNotifyPayload;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
+    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId,
     CompactionObservationId, CompactionOperationId, ContextCompactionCapabilityPayload,
-    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent,
-    CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, CustomAgent, CustomAgentId,
+    DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
     MobileAccessErrorCode, Project, ProjectDiffScope, ProjectFileContentsPayload,
     ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
@@ -929,8 +929,7 @@ pub struct AppState {
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
     pub compaction_markers: RwSignal<HashMap<AgentRef, Vec<PositionedCompactionMarker>>>,
-    pub compaction_marker_ids:
-        RwSignal<HashMap<AgentRef, HashSet<CompactionObservationId>>>,
+    pub compaction_marker_ids: RwSignal<HashMap<AgentRef, HashSet<CompactionObservationId>>>,
     /// Server-owned prior-history availability for each agent. The server
     /// sends only this indicator in `AgentBootstrap`; actual prior transcript
     /// rows are fetched explicitly with `FetchSessionHistory` and prepended
@@ -980,8 +979,7 @@ pub struct AppState {
     pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
     pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
     pub agent_compactions: RwSignal<HashMap<AgentRef, AgentCompactNotifyPayload>>,
-    pub context_compaction_operations:
-        RwSignal<HashMap<AgentRef, ContextCompactionNotifyPayload>>,
+    pub context_compaction_operations: RwSignal<HashMap<AgentRef, ContextCompactionNotifyPayload>>,
     pub context_compaction_capabilities:
         RwSignal<HashMap<AgentRef, ContextCompactionCapabilityPayload>>,
     context_compaction_terminal_operations:
@@ -1149,8 +1147,7 @@ impl AppState {
 
     pub fn next_history_page_request_id(&self) -> protocol::HistoryPageRequestId {
         let next = self.next_history_request_id.get_untracked();
-        self.next_history_request_id
-            .set(next.wrapping_add(1));
+        self.next_history_request_id.set(next.wrapping_add(1));
         protocol::HistoryPageRequestId(format!("mobile-history-{next}"))
     }
 
@@ -1193,20 +1190,14 @@ impl AppState {
             });
     }
 
-    pub(crate) fn forget_terminal_context_compaction_operations(
-        &self,
-        agent_ref: &AgentRef,
-    ) {
+    pub(crate) fn forget_terminal_context_compaction_operations(&self, agent_ref: &AgentRef) {
         self.context_compaction_terminal_operations
             .update(|operations| {
                 operations.remove(agent_ref);
             });
     }
 
-    pub(crate) fn forget_host_terminal_context_compaction_operations(
-        &self,
-        host: &LocalHostId,
-    ) {
+    pub(crate) fn forget_host_terminal_context_compaction_operations(&self, host: &LocalHostId) {
         self.context_compaction_terminal_operations
             .update(|operations| {
                 operations.retain(|agent_ref, _| agent_ref.local_host_id != *host);

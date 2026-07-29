@@ -11,10 +11,10 @@ use protocol::{
     AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload,
     AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostSettings, HostSettingsPayload,
-    LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
-    MessageSender, NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry,
-    SessionId, SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
+    HostBootstrapPayload, HostSettings, HostSettingsPayload, LaunchProfileCatalog,
+    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, MessageSender,
+    NewAgentPayload, ProjectId, SendMessagePayload, SessionId, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
     SpawnCostHint, StreamPath, TeamContextCompactionNotifyPayload, cap_agent_control_events,
 };
 use serde::{Deserialize, Serialize};
@@ -866,20 +866,15 @@ fn correlate_compaction_session(
     logical_session_id: &SessionId,
     frame: &str,
 ) {
-    let agent = snapshot.agents.get_mut(agent_id).unwrap_or_else(|| {
-        panic!(
-            "{frame} arrived for unknown agent {}",
-            agent_id.0,
-        )
-    });
+    let agent = snapshot
+        .agents
+        .get_mut(agent_id)
+        .unwrap_or_else(|| panic!("{frame} arrived for unknown agent {}", agent_id.0,));
     match agent.logical_session_id.as_ref() {
         Some(bound_session) => assert_eq!(
-            bound_session,
-            logical_session_id,
+            bound_session, logical_session_id,
             "{frame} logical session {} must match agent {} session {}",
-            logical_session_id.0,
-            agent_id.0,
-            bound_session.0,
+            logical_session_id.0, agent_id.0, bound_session.0,
         ),
         None => {
             agent.logical_session_id = Some(logical_session_id.clone());
@@ -966,12 +961,9 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             if let Some(session_id) = payload.session_id.as_ref() {
                 match agent.logical_session_id.as_ref() {
                     Some(bound_session) => assert_eq!(
-                        bound_session,
-                        session_id,
+                        bound_session, session_id,
                         "AgentStart logical session {} must match agent {} session {}",
-                        session_id.0,
-                        payload.agent_id.0,
-                        bound_session.0,
+                        session_id.0, payload.agent_id.0, bound_session.0,
                     ),
                     None => agent.logical_session_id = Some(session_id.clone()),
                 }
@@ -2148,8 +2140,8 @@ mod tests {
                                 .unwrap_or_else(|| parse_agent_id_from_stream(&env.stream));
                         }
                     }
-                    FrameKind::ContextCompactionNotify
-                    | FrameKind::ContextCompactionCapability => {}
+                    FrameKind::ContextCompactionNotify | FrameKind::ContextCompactionCapability => {
+                    }
                     _ => {}
                 }
             }
@@ -2429,9 +2421,7 @@ mod tests {
                 members: vec![protocol::TeamMemberContextCompactionResult {
                     agent_id,
                     logical_session_id: SessionId("other-session".to_owned()),
-                    operation_id: protocol::CompactionOperationId(
-                        "member-operation".to_owned(),
-                    ),
+                    operation_id: protocol::CompactionOperationId("member-operation".to_owned()),
                     method: Some(protocol::CompactionMethod::NativeTextCommand),
                     status: protocol::ContextCompactionStatus::Completed,
                     mutation: protocol::CompactionMutation::Completed,
@@ -2447,23 +2437,20 @@ mod tests {
 
     #[test]
     fn team_compaction_skips_unknown_host_scoped_members() {
-        let unknown_agent_id =
-            AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
+        let unknown_agent_id = AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
         let mut snapshot = SnapshotState::default();
         let envelope = Envelope::from_payload(
             StreamPath("/host/test".to_owned()),
             FrameKind::TeamContextCompactionNotify,
             0,
             &TeamContextCompactionNotifyPayload {
-                team_operation_id:
-                    protocol::CompactionOperationId("team-operation".to_owned()),
+                team_operation_id: protocol::CompactionOperationId("team-operation".to_owned()),
                 team_id: protocol::TeamId("team".to_owned()),
                 status: protocol::TeamContextCompactionStatus::Completed,
                 members: vec![protocol::TeamMemberContextCompactionResult {
                     agent_id: unknown_agent_id,
                     logical_session_id: SessionId("logical-session".to_owned()),
-                    operation_id:
-                        protocol::CompactionOperationId("member-operation".to_owned()),
+                    operation_id: protocol::CompactionOperationId("member-operation".to_owned()),
                     method: Some(protocol::CompactionMethod::NativeTextCommand),
                     status: protocol::ContextCompactionStatus::Completed,
                     mutation: protocol::CompactionMutation::Completed,
@@ -2503,10 +2490,8 @@ mod tests {
 
     #[test]
     fn agent_start_retains_deliberate_tolerance() {
-        let known_agent_id =
-            AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
-        let unknown_agent_id =
-            AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
+        let known_agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let unknown_agent_id = AgentId("550e8400-e29b-41d4-a716-446655440099".to_owned());
         let mut snapshot = SnapshotState::default();
         snapshot.agents.insert(
             known_agent_id.clone(),

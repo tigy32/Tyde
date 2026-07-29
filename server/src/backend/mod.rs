@@ -32,20 +32,19 @@ use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
 
 pub(crate) use compaction::{
-    BackendAcceptedCompaction, BackendCompactionAvailability, BackendCompactionCapability,
-    BackendBindingPrepareError, BackendBindingReadyEvidence, BackendCompactionCapabilityEvidence,
-    BackendCompactionCoordinator,
+    BackendAcceptedCompaction, BackendBindingPrepareError, BackendBindingReadyEvidence,
+    BackendCompactionAvailability, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
     BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
     BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
     BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
     BackendCompactionObservationSource, BackendCompactionProgress,
     BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
-    BackendCompactionUserFocus, BackendCompactionUserFocusProvenance,
-    BackendContextReseatResult, BackendContextReseatSupport, BackendContextSeed,
-    BackendContinuationContext, BackendContinuationItem, BackendObservedCompaction,
-    ContinuationInstallStatus, PostCompactionTokenCount,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
+    BackendContextSeed, BackendContinuationContext, BackendContinuationItem,
+    BackendObservedCompaction, ContinuationInstallStatus, PostCompactionTokenCount,
 };
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
@@ -458,10 +457,7 @@ pub trait Backend: Send + Sync + 'static {
             } else {
                 ContinuationInstallStatus::Unsupported
             };
-            BackendContextReseatResult {
-                required,
-                advisory,
-            }
+            BackendContextReseatResult { required, advisory }
         }
     }
 
@@ -592,11 +588,10 @@ pub(crate) async fn prepare_compacted_backend_binding(
             })
         }
         BackendKind::Antigravity => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<antigravity::AntigravityBackend>(
-                    kind, spawn, seed,
-                )
-                .await?;
+            let (backend, events, provider_session_id, ready) = prepare_concrete_backend_binding::<
+                antigravity::AntigravityBackend,
+            >(kind, spawn, seed)
+            .await?;
             Ok(PreparedBackendBinding {
                 backend: PreparedBackendHandle::Antigravity(Box::new(backend)),
                 events,
@@ -659,17 +654,15 @@ async fn prepare_concrete_backend_binding<B: Backend>(
     };
     let (bootstrap_backend, mut bootstrap_events) =
         B::spawn(workspace_roots.clone(), bootstrap_spawn, initial_input)
-        .await
-        .map_err(|message| BackendBindingPrepareError::SpawnFailed {
-            backend_kind: kind,
-            message,
-        })?;
+            .await
+            .map_err(|message| BackendBindingPrepareError::SpawnFailed {
+                backend_kind: kind,
+                message,
+            })?;
     let identity_before = bootstrap_backend.session_id();
     if identity_before.0.trim().is_empty() {
         bootstrap_backend.shutdown().await;
-        return Err(BackendBindingPrepareError::ProviderIdentityMissing {
-            backend_kind: kind,
-        });
+        return Err(BackendBindingPrepareError::ProviderIdentityMissing { backend_kind: kind });
     }
     let mut ready = match drain_prepared_binding_bootstrap(
         kind,
@@ -695,17 +688,13 @@ async fn prepare_concrete_backend_binding<B: Backend>(
     }
     bootstrap_backend.shutdown().await;
 
-    let (backend, mut events) = B::resume(
-        workspace_roots,
-        spawn,
-        identity_after.clone(),
-    )
-    .await
-    .map_err(|message| BackendBindingPrepareError::ResumeFailed {
-        backend_kind: kind,
-        provider_session_id: identity_after.clone(),
-        message,
-    })?;
+    let (backend, mut events) = B::resume(workspace_roots, spawn, identity_after.clone())
+        .await
+        .map_err(|message| BackendBindingPrepareError::ResumeFailed {
+            backend_kind: kind,
+            provider_session_id: identity_after.clone(),
+            message,
+        })?;
     if let Some(replay_ready) = events.take_resume_replay_complete() {
         match tokio::time::timeout(std::time::Duration::from_secs(300), replay_ready).await {
             Ok(Ok(())) => {}
@@ -717,9 +706,7 @@ async fn prepare_concrete_backend_binding<B: Backend>(
             }
             Err(_) => {
                 backend.shutdown().await;
-                return Err(BackendBindingPrepareError::BootstrapTimedOut {
-                    backend_kind: kind,
-                });
+                return Err(BackendBindingPrepareError::BootstrapTimedOut { backend_kind: kind });
             }
         }
     }
@@ -817,15 +804,11 @@ async fn drain_prepared_binding_bootstrap(
                 | BackendEvent::Compaction(_) => {}
             }
         }
-        Err(BackendBindingPrepareError::BootstrapStreamClosed {
-            backend_kind: kind,
-        })
+        Err(BackendBindingPrepareError::BootstrapStreamClosed { backend_kind: kind })
     };
     tokio::time::timeout(std::time::Duration::from_secs(300), drain)
         .await
-        .map_err(|_| BackendBindingPrepareError::BootstrapTimedOut {
-            backend_kind: kind,
-        })?
+        .map_err(|_| BackendBindingPrepareError::BootstrapTimedOut { backend_kind: kind })?
 }
 
 fn drain_prepared_binding_replay(

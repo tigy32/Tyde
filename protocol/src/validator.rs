@@ -555,9 +555,7 @@ impl ProtocolValidator {
                         self.violation(
                             envelope,
                             None,
-                            format!(
-                                "failed to parse TeamContextCompactionNotify payload: {error}"
-                            ),
+                            format!("failed to parse TeamContextCompactionNotify payload: {error}"),
                         )
                     })?;
                 if let Some(member) = payload
@@ -824,9 +822,7 @@ impl ProtocolValidator {
                             &recent_frames,
                             envelope,
                             Some(state.backend_kind),
-                            format!(
-                                "failed to parse ContextCompactionCapability payload: {error}"
-                            ),
+                            format!("failed to parse ContextCompactionCapability payload: {error}"),
                         )
                     })?;
                 if payload.agent_id != state.agent_id {

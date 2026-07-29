@@ -4,12 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentId, AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-    CompactionMethod, CompactionMetrics, CompactionOperationId, CompactionStage,
-    CompactionTrigger, ContextBreakdown, MessageMetadataUpdateData, MessageSender,
-    MessageTokenUsage, ModelInfo, OperationCancelledData, OrchestrationAgentOrigin,
-    OrchestrationAgentType, OrchestrationEvent, OrchestrationId, OrchestrationPayload, SessionId,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
+    CompactionMethod, CompactionMetrics, CompactionOperationId, CompactionStage, CompactionTrigger,
+    ContextBreakdown, MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo,
+    OperationCancelledData, OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent,
+    OrchestrationId, OrchestrationPayload, SessionId, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,17 +21,16 @@ use uuid::Uuid;
 use super::agent_control_progress::{await_progress_data_for_tool, tyde_tool_result};
 use super::empty_session_settings_schema;
 use super::{
-    Backend, BackendAcceptedCompaction, BackendCompactionAvailability,
-    BackendCompactionCapability, BackendCompactionCapabilityEvidence,
-    BackendCompactionCoordinator, BackendCompactionDeferredReason, BackendCompactionDispatchState,
-    BackendCompactionEvent, BackendCompactionFailure, BackendCompactionFailureKind,
-    BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
-    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
-    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendContextReseatSupport, BackendEvent, BackendSession,
-    BackendObservedCompaction, BackendSpawnConfig, BackendStartupError, EventStream,
-    PostCompactionTokenCount,
+    Backend, BackendAcceptedCompaction, BackendCompactionAvailability, BackendCompactionCapability,
+    BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
+    BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
+    BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
+    BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
+    BackendCompactionObservationSource, BackendCompactionProgress,
+    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendContextReseatSupport, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
     StartupMcpServer, StartupMcpTransport,
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
@@ -52,12 +51,9 @@ const MOCK_CANCEL_TURN_SENTINEL: &str = "__mock_cancel__";
 const MOCK_COMPACT_SENTINEL: &str = "/compact";
 pub(crate) const MOCK_NATIVE_COMPACT_SENTINEL: &str = "__mock_native_compact__";
 pub(crate) const MOCK_COMPACT_AUTO_SENTINEL: &str = "__mock_compact_auto__";
-pub(crate) const MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL: &str =
-    "__mock_compact_fail_pre__";
-pub(crate) const MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL: &str =
-    "__mock_compact_fail_post__";
-pub(crate) const MOCK_COMPACT_NO_BOUNDARY_SENTINEL: &str =
-    "__mock_compact_no_boundary__";
+pub(crate) const MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL: &str = "__mock_compact_fail_pre__";
+pub(crate) const MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL: &str = "__mock_compact_fail_post__";
+pub(crate) const MOCK_COMPACT_NO_BOUNDARY_SENTINEL: &str = "__mock_compact_no_boundary__";
 pub(crate) const MOCK_COMPACT_HANG_SENTINEL: &str = "__mock_compact_hang__";
 pub(crate) const MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL: &str =
     "__mock_compact_capability_unknown__";
@@ -230,10 +226,7 @@ struct MockEventSender {
 }
 
 impl MockEventSender {
-    fn send(
-        &self,
-        event: ChatEvent,
-    ) -> Result<(), mpsc::error::SendError<ChatEvent>> {
+    fn send(&self, event: ChatEvent) -> Result<(), mpsc::error::SendError<ChatEvent>> {
         match event {
             ChatEvent::TypingStatusChanged(active) => {
                 self.active_turn
@@ -242,8 +235,9 @@ impl MockEventSender {
                     .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(active)))
                     .map_err(|error| match error.0 {
                         BackendEvent::Chat(event) => mpsc::error::SendError(event),
-                        BackendEvent::ModelRequestTokenUsage(_)
-                        | BackendEvent::Compaction(_) => unreachable!(),
+                        BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {
+                            unreachable!()
+                        }
                     })
             }
             event => self
@@ -251,8 +245,9 @@ impl MockEventSender {
                 .send(BackendEvent::Chat(event))
                 .map_err(|error| match error.0 {
                     BackendEvent::Chat(event) => mpsc::error::SendError(event),
-                    BackendEvent::ModelRequestTokenUsage(_)
-                    | BackendEvent::Compaction(_) => unreachable!(),
+                    BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {
+                        unreachable!()
+                    }
                 }),
         }
     }
@@ -334,7 +329,10 @@ impl Backend for MockBackend {
         let compaction_capability = mock_compaction_capability_for_control(&format!(
             "{}\n{}",
             initial_message,
-            resolved_spawn_config.instructions.as_deref().unwrap_or_default()
+            resolved_spawn_config
+                .instructions
+                .as_deref()
+                .unwrap_or_default()
         ));
         let slow_initial_turn = resolved_spawn_config
             .instructions
@@ -648,10 +646,7 @@ impl Backend for MockBackend {
         self.compaction_capability.clone()
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         if let Some(start) =
             super::compaction::not_dispatched_for_capability(&self.compaction_capability)
         {
@@ -715,9 +710,10 @@ impl Backend for MockBackend {
         if !hangs {
             let active_compaction = Arc::clone(&self.active_compaction);
             let session_id = self.session_id.clone();
-            let fail_after_dispatch = request.focus.as_deref().is_some_and(|focus| {
-                focus.contains(MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL)
-            });
+            let fail_after_dispatch = request
+                .focus
+                .as_deref()
+                .is_some_and(|focus| focus.contains(MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL));
             let omit_boundary = request
                 .focus
                 .as_deref()

@@ -353,10 +353,7 @@ impl CodexCommandHandle {
             .clone()
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         self.inner.begin_compaction(request).await
     }
 
@@ -1083,28 +1080,28 @@ async fn codex_list_skills(rpc: &CodexRpc, cwd: &str) -> Result<CodexSkillCatalo
 }
 
 async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
-    let response = rpc.request(
-        "initialize",
-        json!({
-            "clientInfo": {
-                "name": "tyde",
-                "title": Value::Null,
-                "version": "0.1"
-            },
-            "capabilities": {
-                "experimentalApi": true
-            }
-        }),
-    )
-    .await?;
+    let response = rpc
+        .request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "tyde",
+                    "title": Value::Null,
+                    "version": "0.1"
+                },
+                "capabilities": {
+                    "experimentalApi": true
+                }
+            }),
+        )
+        .await?;
     let user_agent = response
         .get("userAgent")
         .or_else(|| response.get("user_agent"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let capability = codex_compaction_capability(user_agent.as_deref());
-    *rpc
-        .compaction_capability
+    *rpc.compaction_capability
         .lock()
         .expect("Codex compaction capability mutex poisoned") = capability;
     Ok(())
@@ -1122,23 +1119,20 @@ fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCap
         .split(|character: char| !(character.is_ascii_digit() || character == '.'))
         .find(|part| {
             let mut components = part.split('.');
-            components.next().is_some_and(|value| !value.is_empty())
-                && components.next().is_some()
+            components.next().is_some_and(|value| !value.is_empty()) && components.next().is_some()
         })
         .map(str::to_owned);
     let evidence = BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
         user_agent: user_agent.to_string(),
     };
     match provider_version.as_deref() {
-        Some("0.144.3") if !user_agent.contains("0.144.3-") => {
-            BackendCompactionCapability::native(
+        Some("0.144.3") if !user_agent.contains("0.144.3-") => BackendCompactionCapability::native(
             BackendCompactionMechanism::JsonRpcRequest,
             provider_version,
             BackendCompactionProtocolConfidence::Verified,
             BackendContextReseatSupport::InjectAfterNative,
             evidence,
-            )
-        }
+        ),
         Some(version) => BackendCompactionCapability::unknown(
             BackendCompactionUnknownReason::ProtocolNotAllowlisted,
             Some(version.to_string()),
@@ -3474,11 +3468,13 @@ impl CodexInner {
         };
 
         self.emitter
-            .compaction_event(&BackendCompactionEvent::Progress(BackendCompactionProgress {
-                operation_id: request.operation_id.clone(),
-                stage: CompactionStage::Dispatching,
-                elapsed_ms: None,
-            }));
+            .compaction_event(&BackendCompactionEvent::Progress(
+                BackendCompactionProgress {
+                    operation_id: request.operation_id.clone(),
+                    stage: CompactionStage::Dispatching,
+                    elapsed_ms: None,
+                },
+            ));
 
         let response = self
             .rpc
@@ -3658,7 +3654,7 @@ impl CodexInner {
             Ok(Err(_)) => Err("Codex continuation terminal channel closed".to_string()),
             Err(_) => {
                 self.finish_codex_continuation(Err(
-                    "Codex continuation installation timed out".to_string(),
+                    "Codex continuation installation timed out".to_string()
                 ))
                 .await;
                 Err("Codex continuation installation timed out".to_string())
@@ -3698,11 +3694,7 @@ impl CodexInner {
         }
     }
 
-    async fn finish_compaction_failure(
-        &self,
-        kind: BackendCompactionFailureKind,
-        message: String,
-    ) {
+    async fn finish_compaction_failure(&self, kind: BackendCompactionFailureKind, message: String) {
         let Some(mut pending) = self.state.lock().await.pending_compaction.take() else {
             return;
         };
@@ -3721,9 +3713,7 @@ impl CodexInner {
             dispatch,
             mutation,
             outcome: Err(BackendCompactionFailure { kind, message }),
-            provider_session_id: Some(SessionId(
-                self.state.lock().await.thread_id.clone(),
-            )),
+            provider_session_id: Some(SessionId(self.state.lock().await.thread_id.clone())),
             metrics: CompactionMetrics::default(),
             post_context_tokens: PostCompactionTokenCount::Unknown,
             evidence: BackendCompactionTerminalEvidence::Codex {
@@ -6025,25 +6015,26 @@ impl CodexInner {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown-item");
                         let thread_id = self.state.lock().await.thread_id.clone();
-                        self.emitter.compaction_event(&BackendCompactionEvent::Observed(
-                            BackendObservedCompaction {
-                                observation_id: super::compaction::stable_observation_id(
-                                    "codex",
-                                    &thread_id,
-                                    &format!("{turn_id}:{item_id}"),
-                                ),
-                                trigger: CompactionTrigger::BackendAutomatic,
-                                method: CompactionMethod::BackendAutomatic,
-                                provider_session_id: Some(SessionId(thread_id.clone())),
-                                metrics: CompactionMetrics::default(),
-                                source: BackendCompactionObservationSource::CodexItem {
-                                    thread_id,
-                                    turn_id: turn_id.to_string(),
-                                    item_id: item_id.to_string(),
+                        self.emitter
+                            .compaction_event(&BackendCompactionEvent::Observed(
+                                BackendObservedCompaction {
+                                    observation_id: super::compaction::stable_observation_id(
+                                        "codex",
+                                        &thread_id,
+                                        &format!("{turn_id}:{item_id}"),
+                                    ),
+                                    trigger: CompactionTrigger::BackendAutomatic,
+                                    method: CompactionMethod::BackendAutomatic,
+                                    provider_session_id: Some(SessionId(thread_id.clone())),
+                                    metrics: CompactionMetrics::default(),
+                                    source: BackendCompactionObservationSource::CodexItem {
+                                        thread_id,
+                                        turn_id: turn_id.to_string(),
+                                        item_id: item_id.to_string(),
+                                    },
+                                    user_focus: None,
                                 },
-                                user_focus: None,
-                            },
-                        ));
+                            ));
                     }
                     "userMessage" => {
                         let text = extract_codex_item_text(item);
@@ -13725,11 +13716,10 @@ use super::{
     BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionObservationSource,
-    BackendCompactionProgress, BackendCompactionProtocolConfidence, BackendCompactionRequest,
-    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendCompactionUnknownReason,
-    BackendContextReseatSupport, BackendEvent,
+    BackendCompactionObservationSource, BackendCompactionProgress,
+    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnknownReason, BackendContextReseatSupport, BackendEvent,
     BackendObservedCompaction, BackendSession, BackendSpawnConfig, EventStream,
     PostCompactionTokenCount, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
@@ -13794,8 +13784,7 @@ impl CodexBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
         let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
-        let compaction_handle =
-            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
         tokio::spawn(async move {
@@ -14818,8 +14807,7 @@ impl Backend for CodexBackend {
             tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
-        let compaction_handle =
-            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
         let session_id = session_id.0;
@@ -15044,8 +15032,7 @@ impl Backend for CodexBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
-        let compaction_handle =
-            Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
+        let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
@@ -15295,10 +15282,7 @@ impl Backend for CodexBackend {
             })
     }
 
-    async fn begin_compaction(
-        &self,
-        request: BackendCompactionRequest,
-    ) -> BackendCompactionStart {
+    async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         let handle = self
             .compaction_handle
             .lock()
