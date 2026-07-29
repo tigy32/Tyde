@@ -1518,7 +1518,7 @@ fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
         .ok();
         ticker.set_value(handle);
     });
-    on_cleanup(move || clear_ticker());
+    on_cleanup(clear_ticker);
 
     view! {
         {move || {

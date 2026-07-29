@@ -185,12 +185,14 @@ pub fn alert(message: impl Into<String>) {
 /// Exists so tests can assert on what assistive technology would actually be
 /// told — including that a replay path said *nothing* — rather than inferring
 /// it from which code path ran.
-pub fn current_announcement() -> String {
+#[cfg(test)]
+pub(crate) fn current_announcement() -> String {
     ANNOUNCEMENT.with(|announcement| announcement.get_untracked())
 }
 
 /// The assertive live region's current text.
-pub fn current_alert() -> String {
+#[cfg(test)]
+pub(crate) fn current_alert() -> String {
     ALERT.with(|alert| alert.get_untracked())
 }
 

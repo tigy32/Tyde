@@ -4837,13 +4837,6 @@ impl AppState {
         });
     }
 
-    /// Clear only the transcript-derived marker index.
-    pub fn forget_compaction_markers(&self, agent_id: &AgentId) {
-        self.context_compaction_rows.update(|map| {
-            map.remove(agent_id);
-        });
-    }
-
     /// Reset every compaction read-model record for an agent ahead of an
     /// authoritative `AgentBootstrap` replay.
     ///
