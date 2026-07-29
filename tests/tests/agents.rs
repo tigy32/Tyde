@@ -182,7 +182,7 @@ fn pop_front_pending_agent_event(stream: &StreamPath) -> Option<Envelope> {
 }
 
 fn push_pending_agent_event(env: Envelope) {
-    if !env.stream.0.starts_with("/agent/") {
+    if !env.stream.0.starts_with("/agent/") && env.kind != FrameKind::NewAgent {
         return;
     }
     pending_agent_events()
@@ -3602,7 +3602,11 @@ async fn close_agent_recursively_closes_descendants_first() {
 /// A held turn keeps emitting on the parent's stream, so a spawn's `NewAgent`
 /// is not necessarily the next frame on the connection.
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
+    let host_stream = single_host_stream(client);
     loop {
+        if let Some(env) = pop_pending_agent_event(&host_stream, FrameKind::NewAgent) {
+            return env.parse_payload().expect("parse pending NewAgent");
+        }
         let env = expect_next_event(client, context).await;
         if env.kind == FrameKind::NewAgent {
             return env.parse_payload().expect("parse NewAgent");

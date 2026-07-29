@@ -13719,8 +13719,8 @@ use super::{
     BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
     BackendCompactionUnknownReason, BackendContextReseatSupport, BackendEvent,
-    BackendObservedCompaction, BackendSession, BackendSpawnConfig, EventStream,
-    PostCompactionTokenCount, protocol_images_to_attachments,
+    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendTranscriptEventMetadata,
+    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
@@ -14089,6 +14089,7 @@ impl CodexBackend {
         };
         startup_cancel_guard.disarm();
         let backend_session_id = Arc::new(std::sync::Mutex::new(Some(session_id)));
+        let transcript_session_id = Arc::clone(&backend_session_id);
 
         Ok((
             Self {
@@ -14099,7 +14100,9 @@ impl CodexBackend {
                 subagent_emitter_tx,
                 compaction_handle,
             },
-            EventStream::new_backend(events_rx),
+            EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
+                codex_transcript_event_metadata(&transcript_session_id, event)
+            }),
         ))
     }
 }
@@ -14452,6 +14455,78 @@ fn model_request_token_usage_from_raw(value: &Value) -> Option<ModelRequestToken
         return None;
     }
     serde_json::from_value(value.get("data")?.clone()).ok()
+}
+
+fn codex_transcript_event_metadata(
+    provider_session_id: &Arc<std::sync::Mutex<Option<SessionId>>>,
+    event: &ChatEvent,
+) -> BackendTranscriptEventMetadata {
+    let Some(provider_event_id) = codex_transcript_provider_event_id(event) else {
+        return BackendTranscriptEventMetadata {
+            provider_session_id: None,
+            provider_event_id: None,
+        };
+    };
+    let Some(provider_session_id) = provider_session_id
+        .lock()
+        .expect("Codex session id mutex poisoned")
+        .clone()
+    else {
+        return BackendTranscriptEventMetadata {
+            provider_session_id: None,
+            provider_event_id: None,
+        };
+    };
+    BackendTranscriptEventMetadata::visible_provider_event(provider_session_id, provider_event_id)
+}
+
+fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
+    fn provider_id(id: &str) -> Option<&str> {
+        (!id.trim().is_empty() && !id.starts_with("server-generated:")).then_some(id)
+    }
+
+    let (role, id) = match event {
+        ChatEvent::MessageAdded(message) => (
+            "message",
+            provider_id(message.message_id.as_ref()?.0.as_str())?,
+        ),
+        ChatEvent::MessageMetadataUpdated(update) => {
+            ("message-metadata", provider_id(update.message_id.0.as_str())?)
+        }
+        ChatEvent::StreamStart(start) => (
+            "stream-start",
+            provider_id(start.message_id.as_deref()?)?,
+        ),
+        ChatEvent::StreamDelta(delta) => {
+            ("stream-text", provider_id(delta.message_id.as_deref()?)?)
+        }
+        ChatEvent::StreamReasoningDelta(delta) => (
+            "stream-reasoning",
+            provider_id(delta.message_id.as_deref()?)?,
+        ),
+        ChatEvent::StreamEnd(end) => (
+            "stream-end",
+            provider_id(end.message.message_id.as_ref()?.0.as_str())?,
+        ),
+        ChatEvent::ToolRequest(request) => {
+            ("tool-request", provider_id(request.tool_call_id.as_str())?)
+        }
+        ChatEvent::ToolProgress(progress) => (
+            "tool-progress",
+            provider_id(progress.tool_call_id.as_str())?,
+        ),
+        ChatEvent::ToolExecutionCompleted(completion) => (
+            "tool-completion",
+            provider_id(completion.tool_call_id.as_str())?,
+        ),
+        ChatEvent::TypingStatusChanged(_)
+        | ChatEvent::TaskUpdate(_)
+        | ChatEvent::OperationCancelled(_)
+        | ChatEvent::RetryAttempt(_)
+        | ChatEvent::Orchestration(_)
+        | ChatEvent::ContextCompaction(_) => return None,
+    };
+    Some(format!("{role}:{id}"))
 }
 
 struct CodexForwardedBackendEvent {
@@ -14812,6 +14887,7 @@ impl Backend for CodexBackend {
         let session_id = session_id.0;
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
+        let transcript_session_id = Arc::clone(&backend_session_id);
 
         tokio::spawn(async move {
             let mut resume_replay_complete_tx = Some(resume_replay_complete_tx);
@@ -15002,9 +15078,12 @@ impl Backend for CodexBackend {
                 subagent_emitter_tx,
                 compaction_handle,
             },
-            EventStream::new_backend_with_resume_replay_barrier(
+            EventStream::new_backend_with_resume_replay_barrier_and_transcript_metadata(
                 events_rx,
                 resume_replay_complete_rx,
+                move |event| {
+                    codex_transcript_event_metadata(&transcript_session_id, event)
+                },
             ),
         ))
     }
@@ -15248,6 +15327,7 @@ impl Backend for CodexBackend {
         };
         startup_cancel_guard.disarm();
         let backend_session_id = Arc::new(std::sync::Mutex::new(Some(child_session_id)));
+        let transcript_session_id = Arc::clone(&backend_session_id);
 
         Ok((
             Self {
@@ -15258,7 +15338,9 @@ impl Backend for CodexBackend {
                 subagent_emitter_tx,
                 compaction_handle,
             },
-            EventStream::new_backend(events_rx),
+            EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
+                codex_transcript_event_metadata(&transcript_session_id, event)
+            }),
         ))
     }
 
@@ -15381,6 +15463,47 @@ mod tests {
     use tokio::time::timeout;
 
     static CODEX_FAKE_APP_SERVER_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn transcript_metadata_attests_provider_identity_without_guessing_generated_ids() {
+        let provider_session_id = Arc::new(std::sync::Mutex::new(Some(SessionId(
+            "provider-thread".to_owned(),
+        ))));
+        let provider_event = ChatEvent::StreamStart(protocol::StreamStartData {
+            message_id: Some("provider-item".to_owned()),
+            agent: "codex".to_owned(),
+            model: Some("codex-model".to_owned()),
+        });
+        assert_eq!(
+            codex_transcript_event_metadata(&provider_session_id, &provider_event),
+            BackendTranscriptEventMetadata::visible_provider_event(
+                SessionId("provider-thread".to_owned()),
+                "stream-start:provider-item".to_owned(),
+            )
+        );
+
+        let generated_event = ChatEvent::StreamStart(protocol::StreamStartData {
+            message_id: Some(
+                protocol::ServerGeneratedChatMessageIdentity {
+                    origin:
+                        protocol::ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
+                    stream_epoch: 7,
+                    item_ordinal: 3,
+                }
+                .message_id()
+                .0,
+            ),
+            agent: "codex".to_owned(),
+            model: Some("codex-model".to_owned()),
+        });
+        assert_eq!(
+            codex_transcript_event_metadata(&provider_session_id, &generated_event),
+            BackendTranscriptEventMetadata {
+                provider_session_id: None,
+                provider_event_id: None,
+            }
+        );
+    }
 
     struct CodexFakeAppServer {
         _dir: tempfile::TempDir,

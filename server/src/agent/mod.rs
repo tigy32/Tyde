@@ -4157,11 +4157,13 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                     }
-                    append_chat_event(
+                    append_backend_chat_event(
                         &canonical_stream,
                         &mut event_log,
                         &mut subscribers,
                         &mut replay_state,
+                        backend_kind,
+                        &events,
                         &event,
                     )
                     .await;
@@ -6666,6 +6668,7 @@ pub(crate) fn spawn_agent_actor(
                                     .expect("live agent must have session_id"),
                                 before_seq,
                                 limit,
+                                replay_state.active_completed_stream_history_filter(),
                             )
                             .await
                             .unwrap_or_else(|| {
@@ -7616,6 +7619,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &session_id,
                                 before_seq,
                                 limit,
+                                replay_state.active_completed_stream_history_filter(),
                             )
                             .await
                             .unwrap_or_else(|| {
@@ -8127,7 +8131,13 @@ async fn park_terminal_agent(
             } => {
                 let authoritative = match session_id {
                     Some(session_id) => {
-                        authoritative_session_history_window(session_id, before_seq, limit).await
+                        authoritative_session_history_window(
+                            session_id,
+                            before_seq,
+                            limit,
+                            None,
+                        )
+                        .await
                     }
                     None => None,
                 };
@@ -8311,9 +8321,12 @@ async fn park_relay_terminal_agent(
                 limit,
                 reply,
             } => {
-                let window = authoritative_session_history_window(session_id, before_seq, limit)
-                    .await
-                    .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
+                let window =
+                    authoritative_session_history_window(session_id, before_seq, limit, None)
+                        .await
+                        .unwrap_or_else(|| {
+                            session_history_window(event_log, before_seq, limit, None)
+                        });
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -8847,19 +8860,107 @@ async fn append_chat_event(
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
 ) {
+    append_chat_event_with_transcript_metadata(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        None,
+        event,
+    )
+    .await;
+}
+
+async fn append_backend_chat_event(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    backend_kind: BackendKind,
+    events: &EventStream,
+    event: &ChatEvent,
+) {
+    append_chat_event_with_transcript_metadata(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        Some((backend_kind, events)),
+        event,
+    )
+    .await;
+}
+
+async fn append_chat_event_with_transcript_metadata(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    transcript_metadata: Option<(BackendKind, &EventStream)>,
+    event: &ChatEvent,
+) {
     let replay_len_before = event_log.len();
     if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
         let error = stream_identity_violation_event(violation);
         record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
             .expect("identity violation error is a non-stream event");
-        journal_new_replay_records(canonical_stream, event_log, replay_len_before).await;
+        journal_new_replay_records(
+            canonical_stream,
+            event_log,
+            replay_len_before,
+            HashMap::new(),
+        )
+        .await;
         broadcast_live_event(subscribers, FrameKind::ChatEvent, &error).await;
         return;
     }
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event)
         .expect("preflighted replay event remains valid");
-    journal_new_replay_records(canonical_stream, event_log, replay_len_before).await;
+    let provider_identities = transcript_provider_identities(
+        event_log,
+        replay_len_before,
+        transcript_metadata,
+    );
+    journal_new_replay_records(
+        canonical_stream,
+        event_log,
+        replay_len_before,
+        provider_identities,
+    )
+    .await;
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
+}
+
+fn transcript_provider_identities(
+    event_log: &[Envelope],
+    start: usize,
+    transcript_metadata: Option<(BackendKind, &EventStream)>,
+) -> HashMap<u64, crate::store::transcript::ProviderEventIdentity> {
+    let Some((backend_kind, events)) = transcript_metadata else {
+        return HashMap::new();
+    };
+    event_log[start..]
+        .iter()
+        .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+        .filter_map(|envelope| {
+            let event = envelope.parse_payload::<ChatEvent>().ok()?;
+            let metadata = events.transcript_metadata(&event);
+            match (
+                metadata.provider_session_id,
+                metadata.provider_event_id,
+            ) {
+                (Some(provider_session_id), Some(event_id)) => Some((
+                    envelope.seq,
+                    crate::store::transcript::ProviderEventIdentity {
+                        backend: format!("{backend_kind:?}").to_ascii_lowercase(),
+                        provider_session_id: provider_session_id.0,
+                        event_id,
+                    },
+                )),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn transcript_session_registry() -> &'static std::sync::Mutex<HashMap<String, SessionId>> {
@@ -8875,7 +8976,12 @@ fn register_transcript_session(canonical_stream: &str, session_id: &SessionId) {
         .insert(canonical_stream.to_owned(), session_id.clone());
 }
 
-async fn journal_new_replay_records(canonical_stream: &str, event_log: &[Envelope], start: usize) {
+async fn journal_new_replay_records(
+    canonical_stream: &str,
+    event_log: &[Envelope],
+    start: usize,
+    provider_identities: HashMap<u64, crate::store::transcript::ProviderEventIdentity>,
+) {
     if !actor_transcript_io_enabled() {
         return;
     }
@@ -8907,7 +9013,7 @@ async fn journal_new_replay_records(canonical_stream: &str, event_log: &[Envelop
                 sequence: envelope.seq,
                 event_id,
                 visibility,
-                provider_identity: None,
+                provider_identity: provider_identities.get(&envelope.seq).cloned(),
                 event,
                 timestamp_ms: now_ms(),
             })
@@ -11126,6 +11232,7 @@ async fn authoritative_session_history_window(
     session_id: &SessionId,
     before_seq: Option<u64>,
     limit: usize,
+    completed_stream_filter: Option<CompletedStreamHistoryFilter>,
 ) -> Option<SessionHistoryWindow> {
     if !actor_transcript_io_enabled() {
         return None;
@@ -11151,7 +11258,14 @@ async fn authoritative_session_history_window(
             })
             .map(|record| (record.sequence, record.event))
             .collect::<Vec<_>>();
-        let entries = project_session_history_entries(entries);
+        let entries = project_session_history_entries(entries)
+            .into_iter()
+            .filter(|(_, event)| {
+                completed_stream_filter
+                    .as_ref()
+                    .is_none_or(|filter| !filter.matches(event))
+            })
+            .collect::<Vec<_>>();
         let end = entries.len();
         let start = history_start_for_message_limit(&entries, end, limit.max(1));
         let selected = &entries[start..end];
@@ -11728,14 +11842,15 @@ mod tests {
         RelayEventReceivers, ResolvedSpawnRequest, SequencedQueuedMessage,
         SupervisorStallInterruptOutcome, SupervisorVerdictStart, SupervisorVerdictStartRejection,
         TokenUsageSource, activity_history_snapshot, agent_name_generation_spawn_config,
-        agent_usage_snapshot_from_log, append_chat_event, append_event, apply_generated_agent_name,
-        apply_runtime_session_updates, attach_subscriber, attach_subscriber_with_latest_output,
-        collect_agent_activity_summary_events, collect_agent_name_events,
-        context_compaction_dispatch_is_safe, context_compaction_fallback_allowed,
-        current_latest_output, generate_fallback_compaction_summary, generate_mock_name,
-        ingest_gated_replay_event, internal_compaction_input, known_turn_usage,
-        mark_agent_turn_active, output_events_since, project_legacy_native_collaboration_event,
-        publish_resumed_agent_idle, record_agent_started, record_chat_event_for_replay,
+        agent_usage_snapshot_from_log, append_backend_chat_event, append_chat_event, append_event,
+        apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
+        attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
+        collect_agent_name_events, context_compaction_dispatch_is_safe,
+        context_compaction_fallback_allowed, current_latest_output,
+        generate_fallback_compaction_summary, generate_mock_name, ingest_gated_replay_event,
+        internal_compaction_input, known_turn_usage, mark_agent_turn_active, output_events_since,
+        project_legacy_native_collaboration_event, publish_resumed_agent_idle,
+        record_agent_started, record_chat_event_for_replay, register_transcript_session,
         replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
         session_history_entries_from_log, session_history_window, spawn_agent_actor,
         spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
@@ -11746,7 +11861,7 @@ mod tests {
     use crate::agent::{backend_turn_visibly_busy, supervisor};
     use crate::backend::{
         Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
-        EventStream,
+        BackendTranscriptEventMetadata, EventStream,
     };
     use crate::review::ReviewRegistry;
     use crate::store::project::ProjectStore;
@@ -18344,6 +18459,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn backend_transcript_metadata_reaches_authoritative_record() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let transcript_dir = tempfile::tempdir().expect("transcript tempdir");
+        let _transcript_env = TranscriptEnvGuard::install(transcript_dir.path());
+        let session_id = SessionId("logical-provider-metadata".to_owned());
+        let canonical_stream = "/agent/provider-metadata";
+        register_transcript_session(canonical_stream, &session_id);
+
+        let (_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let events = EventStream::new_backend_with_transcript_metadata(events_rx, |event| {
+            match event {
+                ChatEvent::MessageAdded(message)
+                    if message.message_id.as_ref().is_some_and(|id| id.0 == "provider-item") =>
+                {
+                    BackendTranscriptEventMetadata::visible_provider_event(
+                        SessionId("provider-thread".to_owned()),
+                        "message:provider-item".to_owned(),
+                    )
+                }
+                _ => BackendTranscriptEventMetadata {
+                    provider_session_id: None,
+                    provider_event_id: None,
+                },
+            }
+        });
+        let event = ChatEvent::MessageAdded(ChatMessage {
+            timestamp: 1,
+            content: "provider response".to_owned(),
+            sender: MessageSender::Assistant {
+                agent: "codex".to_owned(),
+            },
+            message_id: Some(ChatMessageId("provider-item".to_owned())),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        });
+        let mut event_log = Vec::new();
+        let mut subscribers = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        append_backend_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            BackendKind::Codex,
+            &events,
+            &event,
+        )
+        .await;
+
+        let records = crate::store::transcript::TranscriptStore::new(
+            crate::store::transcript::TranscriptStore::default_root()
+                .expect("test transcript root"),
+        )
+        .load(&session_id)
+        .expect("authoritative transcript records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].provider_identity.as_ref(),
+            Some(&crate::store::transcript::ProviderEventIdentity {
+                backend: "codex".to_owned(),
+                provider_session_id: "provider-thread".to_owned(),
+                event_id: "message:provider-item".to_owned(),
+            })
+        );
+    }
+
     async fn wait_for_idle_actor(status: &AgentStatusHandle) {
         timeout(Duration::from_secs(5), async {
             loop {
@@ -18515,7 +18701,17 @@ mod tests {
 
         for path in rows {
             let name = format!("compaction-terminal-{path:?}");
-            let (_dir, start, request, runtime, status_handle) = startup_actor_fixture(&name, None);
+            let (_dir, start, mut request, runtime, status_handle) =
+                startup_actor_fixture(&name, None);
+            let starts_held = matches!(
+                path,
+                TerminalPath::DeferredDeadline | TerminalPath::Interrupt
+            );
+            if starts_held {
+                request.initial_input = Some(delivery_payload(
+                    "__mock_hold_until_interrupt__ hold compaction safe point",
+                ));
+            }
             let session_store = Arc::clone(&runtime.session_store);
             let (handle, startup_rx) =
                 spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
@@ -18523,7 +18719,17 @@ mod tests {
                 .await
                 .expect("actor startup reply")
                 .expect("mock actor startup");
-            wait_for_idle_actor(&status_handle).await;
+            if starts_held {
+                timeout(Duration::from_secs(5), async {
+                    while !status_handle.snapshot().await.is_active() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("initial held turn becomes active before deferred compaction");
+            } else {
+                wait_for_idle_actor(&status_handle).await;
+            }
             let (tx, mut rx) = mpsc::unbounded_channel();
             assert!(handle.attach(replay_stream(tx)).await);
             let _ = recv_agent_bootstrap_events(&mut rx, "compaction terminal bootstrap").await;
@@ -18556,26 +18762,6 @@ mod tests {
                     Some(crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL.to_owned())
                 }
             };
-            if matches!(
-                path,
-                TerminalPath::DeferredDeadline | TerminalPath::Interrupt
-            ) {
-                assert_eq!(
-                    handle
-                        .deliver_message(delivery_payload(
-                            "__mock_hold_until_interrupt__ hold compaction safe point",
-                        ))
-                        .await,
-                    Ok(())
-                );
-                timeout(Duration::from_secs(5), async {
-                    while !status_handle.snapshot().await.is_active() {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("held turn becomes active before deferred compaction");
-            }
             let barrier_timeout = if matches!(path, TerminalPath::DeferredDeadline) {
                 Duration::from_millis(50)
             } else {

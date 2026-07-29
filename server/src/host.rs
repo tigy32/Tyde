@@ -5513,6 +5513,9 @@ impl HostHandle {
                         ));
                     }
                     Some(_) => {}
+                    None
+                        if request.fork_from_session_id.is_some()
+                            && parent_session_lookup_failure.is_some() => {}
                     None => {
                         return Err(AppError::conflict(
                             "spawn_agent",
@@ -25044,6 +25047,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("start deterministic active turn");
         wait_for_agent_active(&fixture.host, &old_agent_id).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
+        assert!(
+            handle
+                .attach(Stream::new(agent_path.clone(), tx.clone()))
+                .await
+        );
         let host_path = StreamPath(format!("/host/compact-route-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
@@ -25053,7 +25062,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .await
                 .is_empty()
         );
-        let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
         let compact = protocol::Envelope::from_payload(
             agent_path,
             FrameKind::AgentCompact,

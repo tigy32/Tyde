@@ -1031,7 +1031,23 @@ fn start_mock_command_loop(
                     if emit_user_bubbles && payload.message.trim() != MOCK_COMPACT_SENTINEL {
                         emit_mock_user_bubble(&events_tx, &payload.message);
                     }
-                    if let Some((agent_id, message)) =
+                    if payload.message.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL)
+                        || payload.message.contains(MOCK_IGNORE_INTERRUPT_SENTINEL)
+                    {
+                        if !emit_held_turn(&events_tx, &session_id_for_task, &payload.message).await
+                        {
+                            return;
+                        }
+                        maybe_spawn_live_native_child(
+                            &payload.message,
+                            &mut subagent_emitter_rx,
+                            &mut active_subagents,
+                        )
+                        .await;
+                        ignore_interrupts =
+                            payload.message.contains(MOCK_IGNORE_INTERRUPT_SENTINEL);
+                        holding_until_interrupt = true;
+                    } else if let Some((agent_id, message)) =
                         parse_mock_agent_control_send_message(&payload.message)
                     {
                         if !emit_mock_agent_control_send_message(&events_tx, agent_id, message) {
@@ -1173,7 +1189,10 @@ fn start_mock_command_loop(
                         holding_until_interrupt = false;
                         continue;
                     }
-                    break;
+                    // The loop processes a normal turn synchronously, so an
+                    // interrupt queued while that turn was active can arrive
+                    // only after its idle event. It is stale, not a shutdown.
+                    continue;
                 }
             }
         }
@@ -2535,6 +2554,90 @@ mod tests {
                 .expect("terminating mock event stream reaches EOF")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn later_message_can_open_and_interrupt_a_held_turn() {
+        let (backend, mut events) = spawn_idle_mock().await;
+        assert!(
+            backend
+                .send(AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: format!("{MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL} later held turn"),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }))
+                .await
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match events.recv_backend().await {
+                    Some(BackendEvent::Chat(ChatEvent::StreamEnd(end)))
+                        if end.message.content.contains("later held turn") =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("later held mock turn closed its event stream"),
+                }
+            }
+        })
+        .await
+        .expect("later held mock turn reaches its interruptible safe point");
+
+        assert!(backend.interrupt().await);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut cancelled = false;
+            loop {
+                match events.recv_backend().await {
+                    Some(BackendEvent::Chat(ChatEvent::OperationCancelled(_))) => {
+                        cancelled = true;
+                    }
+                    Some(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)))
+                        if cancelled =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("interrupted held mock turn closed its event stream"),
+                }
+            }
+        })
+        .await
+        .expect("later held mock turn reaches idle after interrupt");
+    }
+
+    #[tokio::test]
+    async fn stale_idle_interrupt_does_not_terminate_mock_backend() {
+        let (backend, mut events) = spawn_idle_mock().await;
+        assert!(backend.interrupt().await);
+        tokio::task::yield_now().await;
+        assert!(
+            backend
+                .send(AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "ordinary turn after stale interrupt".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }))
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match events.recv_backend().await {
+                    Some(BackendEvent::Chat(ChatEvent::StreamEnd(end)))
+                        if end.message.content.contains("ordinary turn after stale interrupt") =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("stale idle interrupt terminated mock backend"),
+                }
+            }
+        })
+        .await
+        .expect("mock accepts an ordinary turn after stale idle interrupt");
     }
 
     #[tokio::test]

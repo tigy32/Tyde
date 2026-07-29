@@ -2668,7 +2668,7 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
             }
         };
 
-        let start = expect_fixture_agent_start(
+        let (start, bootstrap_chat_events) = expect_fixture_agent_start_with_chat_events(
             &mut fixture.client,
             &new_agent.instance_stream,
             "empty-root AgentStart",
@@ -2685,16 +2685,13 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
             .unwrap_or_else(|| panic!("{backend_kind:?} empty-root AgentStart missing session_id"));
         session_ids.push((backend_kind, session_id));
 
-        loop {
-            let env = expect_fixture_event(&mut fixture.client, "empty-root ChatEvent").await;
-            if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
-                continue;
-            }
-            let event: ChatEvent = env.parse_payload().expect("parse empty-root ChatEvent");
-            if matches!(event, ChatEvent::StreamEnd(_)) {
-                break;
-            }
-        }
+        expect_fixture_initial_stream_end(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            bootstrap_chat_events,
+            "empty-root ChatEvent",
+        )
+        .await;
     }
 
     fixture
@@ -3785,18 +3782,19 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
     };
     let agent_stream = new_agent.instance_stream.clone();
 
-    expect_fixture_agent_start(&mut fixture.client, &agent_stream, "Kiro AgentStart").await;
-
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "Kiro StreamEnd").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse Kiro ChatEvent");
-        if matches!(event, ChatEvent::StreamEnd(_)) {
-            break;
-        }
-    }
+    let (_, bootstrap_chat_events) = expect_fixture_agent_start_with_chat_events(
+        &mut fixture.client,
+        &agent_stream,
+        "Kiro AgentStart",
+    )
+    .await;
+    expect_fixture_initial_stream_end(
+        &mut fixture.client,
+        &agent_stream,
+        bootstrap_chat_events,
+        "Kiro StreamEnd",
+    )
+    .await;
 }
 
 #[tokio::test]

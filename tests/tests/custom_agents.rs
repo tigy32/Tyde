@@ -86,6 +86,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::AgentActivityStats
+                | FrameKind::SessionSummaryCountUpdated
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList

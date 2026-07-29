@@ -8,11 +8,14 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HostSettingErrorTarget, HostSettingValue,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, BackendKind, ChatEvent,
+    CommandErrorPayload, CompactionMethod, CompactionTrigger,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, ContextCompactionStatus,
+    Envelope, FetchSessionHistoryPayload, FrameKind, HostSettingErrorTarget, HostSettingValue,
     HostSettingsPayload, ListSessionsPayload, MessageSender, NewAgentPayload,
-    SUPERVISOR_MESSAGE_PREFIX, SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    RequestedCompactionAvailability, RequestedCompactionRoute, SUPERVISOR_MESSAGE_PREFIX,
+    SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -94,6 +97,75 @@ fn chat_event_on(env: &Envelope, stream: &StreamPath) -> Option<ChatEvent> {
     env.parse_payload::<ChatEvent>().ok()
 }
 
+fn context_compaction_on(
+    env: &Envelope,
+    agent: &NewAgentPayload,
+) -> Option<ContextCompactionNotifyPayload> {
+    if env.kind != FrameKind::ContextCompactionNotify || env.stream != agent.instance_stream {
+        return None;
+    }
+    env.parse_payload::<ContextCompactionNotifyPayload>()
+        .ok()
+        .filter(|payload| payload.agent_id == agent.agent_id)
+}
+
+fn is_compaction_lifecycle_on(env: &Envelope, agent: &NewAgentPayload) -> bool {
+    context_compaction_on(env, agent).is_some()
+        || env.kind == FrameKind::NewAgent
+        || (env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == agent.agent_id))
+}
+
+async fn wait_for_native_supervisor_compaction(
+    client: &mut client::Connection,
+    agent: &NewAgentPayload,
+    timeout: Duration,
+    context: &str,
+) -> ContextCompactionNotifyPayload {
+    let session_id = agent
+        .session_id
+        .as_ref()
+        .expect("supervised agent has a logical session id");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out waiting for {context}");
+        }
+        let env = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        assert_ne!(
+            env.kind,
+            FrameKind::NewAgent,
+            "native supervisor compaction must not replace the live agent"
+        );
+        assert!(
+            env.kind != FrameKind::AgentClosed
+                || !env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|payload| payload.agent_id == agent.agent_id),
+            "native supervisor compaction must not close the live agent"
+        );
+        let Some(payload) = context_compaction_on(&env, agent) else {
+            continue;
+        };
+        if !payload.status.is_terminal() {
+            continue;
+        }
+        assert_eq!(payload.status, ContextCompactionStatus::Completed);
+        assert_eq!(&payload.logical_session_id, session_id);
+        assert_eq!(payload.trigger, CompactionTrigger::SupervisorRequested);
+        assert_eq!(payload.method, Some(CompactionMethod::NativeRpc));
+        return payload;
+    }
+}
+
 fn is_supervisor_kick(env: &Envelope, stream: &StreamPath) -> bool {
     matches!(
         chat_event_on(env, stream),
@@ -133,17 +205,34 @@ fn stall_interrupt_notice(env: &Envelope, stream: &StreamPath) -> Option<String>
 }
 
 fn is_assistant_message_containing(env: &Envelope, stream: &StreamPath, needle: &str) -> bool {
-    match chat_event_on(env, stream) {
-        Some(ChatEvent::MessageAdded(message)) => {
+    chat_event_on(env, stream).is_some_and(|event| assistant_message_contains(&event, needle))
+}
+
+fn assistant_message_contains(event: &ChatEvent, needle: &str) -> bool {
+    match event {
+        ChatEvent::MessageAdded(message) => {
             matches!(message.sender, MessageSender::Assistant { .. })
                 && message.content.contains(needle)
         }
-        Some(ChatEvent::StreamEnd(data)) => {
+        ChatEvent::StreamEnd(data) => {
             matches!(data.message.sender, MessageSender::Assistant { .. })
                 && data.message.content.contains(needle)
         }
         _ => false,
     }
+}
+
+fn native_capability_matches(
+    payload: &ContextCompactionCapabilityPayload,
+    agent: &NewAgentPayload,
+) -> bool {
+    payload.agent_id == agent.agent_id
+        && matches!(
+            &payload.availability,
+            RequestedCompactionAvailability::Available {
+                route: RequestedCompactionRoute::NativePreferred
+            }
+        )
 }
 
 async fn apply_supervisor_setting(fixture: &mut Fixture, setting: HostSettingValue) {
@@ -210,17 +299,70 @@ async fn spawn_supervised_agent_with_verdict(
         |env| env.kind == FrameKind::NewAgent,
     )
     .await;
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let mut new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
     let agent_stream = new_agent.instance_stream.clone();
 
-    let stream = agent_stream.clone();
+    let mut saw_native_capability = false;
+    let mut saw_initial_response = false;
+    let mut logical_session_id = None;
     wait_for_envelope(
         &mut fixture.client,
         Duration::from_secs(5),
-        "initial mock turn",
-        |env| is_assistant_message_containing(env, &stream, "mock backend response to: hello"),
+        "initial mock turn and native compaction capability",
+        |env| {
+            if env.stream != agent_stream {
+                return false;
+            }
+            match env.kind {
+                FrameKind::AgentBootstrap => {
+                    let bootstrap: AgentBootstrapPayload =
+                        env.parse_payload().expect("parse AgentBootstrap");
+                    for event in bootstrap.events {
+                        match event {
+                            AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+                                if native_capability_matches(&payload, &new_agent) {
+                                    saw_native_capability = true;
+                                    logical_session_id =
+                                        Some(payload.logical_session_id);
+                                }
+                            }
+                            AgentBootstrapEvent::ChatEvent(event) => {
+                                saw_initial_response |= assistant_message_contains(
+                                    &event,
+                                    "mock backend response to: hello",
+                                );
+                            }
+                            AgentBootstrapEvent::AgentStart(_)
+                            | AgentBootstrapEvent::AgentError(_)
+                            | AgentBootstrapEvent::SessionSettings(_)
+                            | AgentBootstrapEvent::QueuedMessages(_)
+                            | AgentBootstrapEvent::AgentActivityStats(_)
+                            | AgentBootstrapEvent::ContextCompaction(_)
+                            | AgentBootstrapEvent::HasPriorHistory { .. } => {}
+                        }
+                    }
+                }
+                FrameKind::ContextCompactionCapability => {
+                    let payload: ContextCompactionCapabilityPayload = env
+                        .parse_payload()
+                        .expect("parse ContextCompactionCapability");
+                    if native_capability_matches(&payload, &new_agent) {
+                        saw_native_capability = true;
+                        logical_session_id = Some(payload.logical_session_id);
+                    }
+                }
+                FrameKind::ChatEvent => {
+                    let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                    saw_initial_response |=
+                        assistant_message_contains(&event, "mock backend response to: hello");
+                }
+                _ => {}
+            }
+            saw_native_capability && saw_initial_response
+        },
     )
     .await;
+    new_agent.session_id = logical_session_id;
     new_agent
 }
 
@@ -771,41 +913,24 @@ async fn supervisor_auto_compaction_runs_above_threshold_once() {
 
     let original = spawn_supervised_agent(&mut fixture, "supervised-done-agent", true).await;
 
-    // 250,000 > 200,000, so a Done verdict compacts the original.
-    let env = wait_for_envelope(
+    // The failing run reached the eligible 250,000 > 200,000 threshold but
+    // timed out only on the stale replacement NewAgent. The mock advertises
+    // native JSON RPC, so the same-session typed terminal is completion.
+    wait_for_native_supervisor_compaction(
         &mut fixture.client,
+        &original,
         SUPERVISION_WAIT,
-        "replacement NewAgent from supervisor auto-compaction",
-        |env| env.kind == FrameKind::NewAgent,
+        "terminal native supervisor auto-compaction",
     )
     .await;
-    let replacement: NewAgentPayload = env.parse_payload().expect("parse replacement NewAgent");
-    assert_eq!(
-        replacement.name, "supervised-done-agent",
-        "the compacted replacement keeps the original agent name"
-    );
-    let env = wait_for_envelope(
-        &mut fixture.client,
-        SUPERVISION_WAIT,
-        "AgentClosed for the compacted original agent",
-        |env| {
-            env.kind == FrameKind::AgentClosed
-                && env
-                    .parse_payload::<AgentClosedPayload>()
-                    .is_ok_and(|payload| payload.agent_id == original.agent_id)
-        },
-    )
-    .await;
-    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
-    assert_eq!(closed.agent_id, original.agent_id);
 
-    // The replacement idles after digesting its bootstrap summary. The
-    // post-compaction guard must keep the supervisor from compacting again.
+    // The in-place operation becomes dormant after completion. No further
+    // compaction lifecycle or destructive legacy replacement may start.
     assert_no_envelope(
         &mut fixture.client,
         QUIET_WAIT,
-        "second auto-compaction of the replacement agent",
-        |env| env.kind == FrameKind::NewAgent,
+        "second auto-compaction of the live agent",
+        |env| is_compaction_lifecycle_on(env, &original),
     )
     .await;
 }
@@ -839,15 +964,17 @@ async fn accepted_user_activity_invalidates_the_old_compaction_interval() {
     assert_no_envelope(
         &mut fixture.client,
         Duration::from_secs(4),
-        "replacement from the stale first inactivity interval",
-        |env| env.kind == FrameKind::NewAgent,
+        "compaction from the stale first inactivity interval",
+        |env| is_compaction_lifecycle_on(env, &original),
     )
     .await;
-    wait_for_envelope(
+    // The failing run preserved this quiet window and timed out only when the
+    // next eligible interval still required a replacement NewAgent.
+    wait_for_native_supervisor_compaction(
         &mut fixture.client,
+        &original,
         SUPERVISION_WAIT,
-        "replacement after the next full inactivity interval",
-        |env| env.kind == FrameKind::NewAgent,
+        "native compaction after the next full inactivity interval",
     )
     .await;
 }
@@ -871,7 +998,7 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
         HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 300_000 },
     )
     .await;
-    spawn_supervised_agent(&mut fixture, "live-settings-agent", true).await;
+    let agent = spawn_supervised_agent(&mut fixture, "live-settings-agent", true).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     apply_supervisor_setting(
@@ -883,7 +1010,7 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
         &mut fixture.client,
         Duration::from_secs(1),
         "compaction while live context is below the live threshold",
-        |env| env.kind == FrameKind::NewAgent,
+        |env| is_compaction_lifecycle_on(env, &agent),
     )
     .await;
     apply_supervisor_setting(
@@ -891,11 +1018,13 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
         HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
     )
     .await;
-    wait_for_envelope(
+    // The failing run honored the live 300,000-token threshold and timed out
+    // only because the newly eligible native operation was expected to spawn.
+    wait_for_native_supervisor_compaction(
         &mut fixture.client,
+        &agent,
         SUPERVISION_WAIT,
-        "compaction after the live threshold becomes eligible",
-        |env| env.kind == FrameKind::NewAgent,
+        "native compaction after the live threshold becomes eligible",
     )
     .await;
 }

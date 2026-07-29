@@ -18,7 +18,7 @@ pub mod turn_emitter;
 pub mod tycode;
 pub mod tycode_config;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
@@ -197,6 +197,37 @@ pub(crate) enum BackendEvent {
     Compaction(BackendCompactionEvent),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendTranscriptEventMetadata {
+    /// Both fields are set only when the adapter can attest an event to an
+    /// exact provider item. Provider-internal artifacts must be filtered
+    /// before they enter EventStream rather than labeled as public history.
+    pub provider_session_id: Option<SessionId>,
+    pub provider_event_id: Option<String>,
+}
+
+impl BackendTranscriptEventMetadata {
+    fn visible_without_provider_identity() -> Self {
+        Self {
+            provider_session_id: None,
+            provider_event_id: None,
+        }
+    }
+
+    pub(crate) fn visible_provider_event(
+        provider_session_id: SessionId,
+        provider_event_id: String,
+    ) -> Self {
+        Self {
+            provider_session_id: Some(provider_session_id),
+            provider_event_id: Some(provider_event_id),
+        }
+    }
+}
+
+type BackendTranscriptMetadataProjector =
+    Arc<dyn Fn(&ChatEvent) -> BackendTranscriptEventMetadata + Send + Sync>;
+
 enum EventStreamReceiver {
     Chat(mpsc::UnboundedReceiver<ChatEvent>),
     Backend(mpsc::UnboundedReceiver<BackendEvent>),
@@ -205,6 +236,7 @@ enum EventStreamReceiver {
 pub struct EventStream {
     rx: EventStreamReceiver,
     resume_replay_complete: Option<oneshot::Receiver<()>>,
+    transcript_metadata_projector: Option<BackendTranscriptMetadataProjector>,
 }
 
 impl EventStream {
@@ -212,6 +244,7 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Chat(rx),
             resume_replay_complete: None,
+            transcript_metadata_projector: None,
         }
     }
 
@@ -219,6 +252,18 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             resume_replay_complete: None,
+            transcript_metadata_projector: None,
+        }
+    }
+
+    pub(crate) fn new_backend_with_transcript_metadata(
+        rx: mpsc::UnboundedReceiver<BackendEvent>,
+        projector: impl Fn(&ChatEvent) -> BackendTranscriptEventMetadata + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            rx: EventStreamReceiver::Backend(rx),
+            resume_replay_complete: None,
+            transcript_metadata_projector: Some(Arc::new(projector)),
         }
     }
 
@@ -229,6 +274,7 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Chat(rx),
             resume_replay_complete: Some(resume_replay_complete),
+            transcript_metadata_projector: None,
         }
     }
 
@@ -239,6 +285,19 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             resume_replay_complete: Some(resume_replay_complete),
+            transcript_metadata_projector: None,
+        }
+    }
+
+    pub(crate) fn new_backend_with_resume_replay_barrier_and_transcript_metadata(
+        rx: mpsc::UnboundedReceiver<BackendEvent>,
+        resume_replay_complete: oneshot::Receiver<()>,
+        projector: impl Fn(&ChatEvent) -> BackendTranscriptEventMetadata + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            rx: EventStreamReceiver::Backend(rx),
+            resume_replay_complete: Some(resume_replay_complete),
+            transcript_metadata_projector: Some(Arc::new(projector)),
         }
     }
 
@@ -276,6 +335,25 @@ impl EventStream {
             EventStreamReceiver::Chat(rx) => rx.try_recv().map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.try_recv(),
         }
+    }
+
+    pub(crate) fn transcript_metadata(
+        &self,
+        event: &ChatEvent,
+    ) -> BackendTranscriptEventMetadata {
+        let metadata = self
+            .transcript_metadata_projector
+            .as_ref()
+            .map_or_else(
+                BackendTranscriptEventMetadata::visible_without_provider_identity,
+                |f| f(event),
+            );
+        debug_assert_eq!(
+            metadata.provider_session_id.is_some(),
+            metadata.provider_event_id.is_some(),
+            "backend transcript provider identity must be complete"
+        );
+        metadata
     }
 
     pub fn take_resume_replay_complete(&mut self) -> Option<oneshot::Receiver<()>> {
