@@ -903,8 +903,9 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
         panic!("missing Kiro executable should make its schema unavailable: {kiro_schema:?}");
     };
     assert!(
-        message.contains("Kiro schema probe stage 'acp_spawn'"),
-        "missing Kiro executable should fail during acp_spawn: {message}"
+        message.starts_with("ACP schema probe stage 'acp_spawn' failed:")
+            && message.contains("Failed to start Kiro executable"),
+        "shared stage context must be neutral while nested adapter detail remains specific: {message}"
     );
     assert!(
         message.contains(missing_kiro.to_string_lossy().as_ref()),

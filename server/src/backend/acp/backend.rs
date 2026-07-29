@@ -94,12 +94,12 @@ async fn await_kiro_stage<T>(
     future: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     if let Some(deadline) = deadline {
-        tracing::debug!(stage = stage.label(), "Kiro schema probe stage started");
+        tracing::debug!(stage = stage.label(), "ACP schema probe stage started");
         let result = tokio::time::timeout_at(deadline, future)
             .await
-            .map_err(|_| format!("Kiro schema probe stage '{}' timed out", stage.label()))?
-            .map_err(|err| format!("Kiro schema probe stage '{}' failed: {err}", stage.label()))?;
-        tracing::debug!(stage = stage.label(), "Kiro schema probe stage completed");
+            .map_err(|_| format!("ACP schema probe stage '{}' timed out", stage.label()))?
+            .map_err(|err| format!("ACP schema probe stage '{}' failed: {err}", stage.label()))?;
+        tracing::debug!(stage = stage.label(), "ACP schema probe stage completed");
         Ok(result)
     } else {
         future
@@ -451,7 +451,7 @@ impl KiroSession {
                         .and_then(|v| v.get("sessionId"))
                         .and_then(Value::as_str)
                 })
-                .ok_or("Kiro session/new response missing sessionId")?
+                .ok_or_else(|| format!("{agent_label} session/new response missing sessionId"))?
                 .to_string();
 
             Ok((session_id, session_started))
@@ -3377,7 +3377,7 @@ fn session_settings_schema_from_known_models(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("Kiro model entry missing id: {model}"))?;
+            .ok_or_else(|| "ACP agent model entry missing id".to_string())?;
         let label = model
             .get("displayName")
             .or_else(|| model.get("name"))
@@ -3400,7 +3400,7 @@ fn session_settings_schema_from_known_models(
     }
 
     if options.is_empty() {
-        return Err("Kiro reported no selectable models".to_string());
+        return Err("ACP agent reported no selectable models".to_string());
     }
 
     Ok(protocol::SessionSettingsSchema {
@@ -3446,7 +3446,7 @@ pub(crate) async fn probe_session_settings_schema(
             let raw = raw_events
                 .recv()
                 .await
-                .ok_or_else(|| "Kiro admin probe ended before ModelsList".to_string())?;
+                .ok_or_else(|| "ACP schema probe ended before ModelsList".to_string())?;
             if raw.get("kind").and_then(Value::as_str) != Some("ModelsList") {
                 continue;
             }
@@ -3454,7 +3454,9 @@ pub(crate) async fn probe_session_settings_schema(
                 .get("data")
                 .and_then(|data| data.get("models"))
                 .and_then(Value::as_array)
-                .ok_or_else(|| format!("Kiro ModelsList missing data.models array: {raw}"))?;
+                .ok_or_else(|| {
+                    "ACP schema probe ModelsList response missing data.models array".to_string()
+                })?;
             return session_settings_schema_from_known_models(known_models);
         }
     })
@@ -3462,21 +3464,21 @@ pub(crate) async fn probe_session_settings_schema(
 
     tracing::debug!(
         stage = KiroSchemaProbeStage::Shutdown.label(),
-        "Kiro schema probe stage started"
+        "ACP schema probe stage started"
     );
     let shutdown_result =
         tokio::time::timeout(KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT, session.shutdown())
             .await
             .map_err(|_| {
                 format!(
-                    "Kiro schema probe stage '{}' timed out",
+                    "ACP schema probe stage '{}' timed out",
                     KiroSchemaProbeStage::Shutdown.label()
                 )
             });
     if shutdown_result.is_ok() {
         tracing::debug!(
             stage = KiroSchemaProbeStage::Shutdown.label(),
-            "Kiro schema probe stage completed"
+            "ACP schema probe stage completed"
         );
     }
 
@@ -3487,7 +3489,7 @@ pub(crate) async fn probe_session_settings_schema(
         (Err(probe_error), Err(shutdown_error)) => {
             tracing::warn!(
                 error = %shutdown_error,
-                "Kiro schema probe cleanup failed after an earlier probe failure"
+                "ACP schema probe cleanup failed after an earlier probe failure"
             );
             Err(probe_error)
         }
@@ -4478,6 +4480,31 @@ mod tests {
         assert_eq!(models[1]["id"], Value::String("claude-sonnet".to_string()));
     }
 
+    #[test]
+    fn stock_models_list_rejects_malformed_entry_without_echoing_it() {
+        let error = session_settings_schema_from_known_models(&[json!({
+            "displayName": "sentinel-private-model",
+            "providerMetadata": {
+                "credential": "sentinel-secret"
+            }
+        })])
+        .expect_err("a Stock ModelsList entry without id must be rejected");
+
+        assert_eq!(error, "ACP agent model entry missing id");
+        assert!(!error.contains("Kiro"));
+        assert!(!error.contains("sentinel-private-model"));
+        assert!(!error.contains("sentinel-secret"));
+    }
+
+    #[test]
+    fn stock_models_list_rejects_empty_models_without_kiro_identity() {
+        let error = session_settings_schema_from_known_models(&[])
+            .expect_err("an empty Stock ModelsList must not produce a schema");
+
+        assert_eq!(error, "ACP agent reported no selectable models");
+        assert!(!error.contains("Kiro"));
+    }
+
     // Real Kiro ACP events captured from a live session.
 
     #[tokio::test]
@@ -4574,7 +4601,91 @@ mod tests {
 
         assert_eq!(
             result.expect_err("expired workspace setup deadline should time out"),
-            "Kiro schema probe stage 'workspace_setup' timed out"
+            "ACP schema probe stage 'workspace_setup' timed out"
+        );
+    }
+
+    fn write_stock_schema_probe_without_session_id() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-stock-schema-probe-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake stock schema-probe tempdir");
+        let path = dir.join("fake-stock-schema-agent");
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+"#;
+        std::fs::write(&path, script).expect("write fake stock schema-probe program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake stock schema-probe program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake stock schema-probe program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn stock_schema_probe_failure_never_claims_kiro_identity() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-stock-schema-probe-ws-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create schema-probe workspace");
+        let program = write_stock_schema_probe_without_session_id();
+        let agent = protocol::AcpAgentSpec {
+            command: program.to_string_lossy().to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            adapter: protocol::AcpAdapterId::Stock,
+        };
+
+        let error = probe_session_settings_schema(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            Some(&agent),
+        )
+        .await
+        .expect_err("missing sessionId must fail the stock schema probe");
+
+        assert_eq!(
+            error, "fake-stock-schema-agent session/new response missing sessionId",
+            "post-response validation must preserve the actual Stock agent identity"
+        );
+        assert!(
+            !error.contains("Kiro"),
+            "shared schema-probe control flow must not claim Kiro identity: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_schema_probe_keeps_only_adapter_specific_kiro_identity() {
+        let missing_program = std::env::temp_dir().join(format!(
+            "missing-kiro-schema-agent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let error = probe_session_settings_schema(
+            &[],
+            Some(missing_program.to_string_lossy().to_string()),
+            None,
+        )
+        .await
+        .expect_err("missing Kiro executable must fail the schema probe");
+
+        assert!(
+            error.starts_with("ACP schema probe stage 'acp_spawn' failed:"),
+            "shared probe stage must remain backend-neutral: {error}"
+        );
+        assert!(
+            error.contains("Failed to start Kiro executable"),
+            "the adapter-specific executable identity may truthfully name Kiro: {error}"
         );
     }
 

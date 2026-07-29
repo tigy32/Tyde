@@ -572,7 +572,7 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Session Settings (Codex)",
             BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Hermes => "Session Settings (Hermes)",
-            BackendKind::Acp => "Session Settings (Kiro)",
+            BackendKind::Acp => "Session Settings (ACP)",
             BackendKind::Tycode => "Session Settings",
         }
     }
@@ -1017,8 +1017,9 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         AgentActivitySummaryPayload, AgentActivitySummaryState, AgentId, AgentOrigin, Envelope,
-        FrameKind, SelectOption, SelectOptionsBySetting, SelectOptionsForValue,
-        SessionSettingField, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageEntry,
+        FrameKind, LaunchProfile, LaunchProfileId, LaunchProfileKind, SelectOption,
+        SelectOptionsBySetting, SelectOptionsForValue, SessionSettingField, StreamPath,
+        TaskTokenUsageAggregate, TaskTokenUsageEntry,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1708,6 +1709,15 @@ mod wasm_tests {
     }
 
     fn make_state(host_id: &str, agent_id: &str, with_settings_fields: bool) -> AppState {
+        make_state_for_backend(host_id, agent_id, with_settings_fields, BackendKind::Claude)
+    }
+
+    fn make_state_for_backend(
+        host_id: &str,
+        agent_id: &str,
+        with_settings_fields: bool,
+        backend_kind: BackendKind,
+    ) -> AppState {
         let state = AppState::new();
         state.selected_host_id.set(Some(host_id.to_owned()));
         state.host_streams.update(|map| {
@@ -1726,7 +1736,7 @@ mod wasm_tests {
                 agent_id: AgentId(agent_id.to_owned()),
                 name: "Root".to_owned(),
                 origin: AgentOrigin::User,
-                backend_kind: BackendKind::Claude,
+                backend_kind,
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
@@ -1754,10 +1764,10 @@ mod wasm_tests {
         };
         state.session_schemas.update(|map| {
             map.entry(host_id.to_owned()).or_default().insert(
-                BackendKind::Claude,
+                backend_kind,
                 SessionSchemaEntry::Ready {
                     schema: SessionSettingsSchema {
-                        backend_kind: BackendKind::Claude,
+                        backend_kind,
                         fields,
                     },
                 },
@@ -1789,6 +1799,83 @@ mod wasm_tests {
             provide_context(state);
             view! { <SessionSettingsBar agent_ref=agent_ref composer=composer /> }
         })
+    }
+
+    #[wasm_bindgen_test]
+    async fn custom_acp_draft_and_active_agent_use_acp_settings_identity() {
+        let draft_container = make_container();
+        let draft_state = AppState::new();
+        let host_id = "h-acp-draft";
+        draft_state.selected_host_id.set(Some(host_id.to_owned()));
+        crate::dispatch::prime_host_for_tests(&draft_state, host_id);
+        draft_state.session_schemas.update(|map| {
+            map.entry(host_id.to_owned()).or_default().insert(
+                BackendKind::Acp,
+                SessionSchemaEntry::Ready {
+                    schema: SessionSettingsSchema {
+                        backend_kind: BackendKind::Acp,
+                        fields: vec![SessionSettingField {
+                            key: "model".to_owned(),
+                            label: "Model".to_owned(),
+                            description: None,
+                            field_type: SessionSettingFieldType::Toggle { default: false },
+                            use_slider: false,
+                            select_options_by_setting: None,
+                        }],
+                    },
+                },
+            );
+        });
+        draft_state.schemas_loaded_for_host.update(|map| {
+            map.insert(host_id.to_owned(), true);
+        });
+        crate::actions::begin_new_chat_with_profile(
+            &draft_state,
+            LaunchProfile {
+                id: LaunchProfileId("qa-acp".to_owned()),
+                kind: LaunchProfileKind::Custom,
+                label: "QA ACP".to_owned(),
+                description: None,
+                backend_kind: BackendKind::Acp,
+                session_settings: SessionSettingsValues::default(),
+            },
+            None,
+        );
+        let _draft_handle = mount_bar(&draft_container, draft_state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let draft_toggle = query(&draft_container, ".session-settings-toggle")
+            .expect("custom ACP draft settings toggle");
+        let draft_text = draft_toggle.text_content().unwrap_or_default();
+        assert!(
+            draft_text.contains("Session Settings (ACP)") && !draft_text.contains("Kiro"),
+            "custom ACP draft must use backend identity, got: {draft_text}"
+        );
+        assert_eq!(
+            draft_state
+                .composer_untracked()
+                .launch_profile_id
+                .get_untracked(),
+            Some(LaunchProfileId("qa-acp".to_owned())),
+            "rendering the footer must not rewrite the selected launch profile"
+        );
+
+        let active_container = make_container();
+        let active_state = make_state_for_backend("h-acp-active", "root", true, BackendKind::Acp);
+        let _active_handle = mount_bar(&active_container, active_state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let active_toggle = query(&active_container, ".session-settings-toggle")
+            .expect("active ACP agent settings toggle");
+        let active_text = active_toggle.text_content().unwrap_or_default();
+        assert!(
+            active_text.contains("Session Settings (ACP)") && !active_text.contains("Kiro"),
+            "active ACP agent must retain backend identity, got: {active_text}"
+        );
     }
 
     fn known_amount(input: u64, output: u64) -> TaskTokenUsageAmount {
