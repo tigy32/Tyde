@@ -13381,13 +13381,12 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
-    let transcript_root = if std::env::var("TYDE_TRANSCRIPT_STORE_DIR")
-        .is_ok_and(|path| !path.trim().is_empty())
-    {
-        TranscriptStore::default_root()?
-    } else {
-        paths.session.with_file_name("transcripts")
-    };
+    let transcript_root =
+        if std::env::var("TYDE_TRANSCRIPT_STORE_DIR").is_ok_and(|path| !path.trim().is_empty()) {
+            TranscriptStore::default_root()?
+        } else {
+            paths.session.with_file_name("transcripts")
+        };
     let transcript_store = TranscriptStore::new(transcript_root);
     let antigravity_conversations_dir =
         crate::backend::antigravity::resolve_antigravity_conversations_dir(

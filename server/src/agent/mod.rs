@@ -7785,8 +7785,8 @@ async fn transcript_is_authoritative(store: &TranscriptStore, session_id: &Sessi
     let session_id = session_id.clone();
     let store = store.clone();
     tokio::task::spawn_blocking(move || store.is_authoritative(&session_id))
-    .await
-    .unwrap_or(false)
+        .await
+        .unwrap_or(false)
 }
 
 fn actor_transcript_io_enabled() -> bool {
@@ -8353,18 +8353,15 @@ async fn park_relay_terminal_agent(
                 limit,
                 reply,
             } => {
-                let window =
-                    authoritative_session_history_window(
-                        transcript_store,
-                        session_id,
-                        before_seq,
-                        limit,
-                        None,
-                    )
-                        .await
-                        .unwrap_or_else(|| {
-                            session_history_window(event_log, before_seq, limit, None)
-                        });
+                let window = authoritative_session_history_window(
+                    transcript_store,
+                    session_id,
+                    before_seq,
+                    limit,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -9001,8 +8998,7 @@ struct RegisteredTranscriptSession {
     store: TranscriptStore,
 }
 
-type TranscriptSessionRegistry =
-    std::sync::Mutex<HashMap<String, RegisteredTranscriptSession>>;
+type TranscriptSessionRegistry = std::sync::Mutex<HashMap<String, RegisteredTranscriptSession>>;
 
 fn transcript_session_registry() -> &'static TranscriptSessionRegistry {
     static REGISTRY: std::sync::OnceLock<TranscriptSessionRegistry> = std::sync::OnceLock::new();
@@ -11048,11 +11044,9 @@ async fn persist_compaction_marker(
     };
     let session_id = session_id.clone();
     let marker_id = marker.marker_id.0.clone();
-    let persisted = tokio::task::spawn_blocking(move || {
-        store.append_import_if_missing(&record)
-            .map(|_| ())
-    })
-    .await;
+    let persisted =
+        tokio::task::spawn_blocking(move || store.append_import_if_missing(&record).map(|_| ()))
+            .await;
     match persisted {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
