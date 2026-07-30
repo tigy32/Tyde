@@ -640,13 +640,13 @@ struct TycodeCustomization {
 /// the model calls `invoke_skill`. So skills are projected, never inlined: the
 /// session pays one catalog line per skill instead of every body up front.
 ///
-/// **An explicit selection is fail-closed.** A custom agent naming its skills is
-/// making a statement about what the session is for, so any refusal aborts
-/// startup rather than quietly starting a differently equipped agent.
-///
-/// **The Default agent may degrade**, because it selects every installed skill
-/// and one broken skill anywhere in the store must not make Tycode unusable —
-/// but only with a user-visible notice naming every omitted skill and why.
+/// **A skill that cannot be projected never stops the session.** It costs the
+/// session that one capability; refusing to start would cost it every other
+/// skill and the workspace too. This holds for an explicit selection as much as
+/// for the Default agent — but it is never silent: the notice names every
+/// omitted skill and why, and the overlay is built solely from what was
+/// actually projected, so the model is never told about a skill that is not
+/// there.
 fn materialize_tycode_customization(
     config: &BackendSpawnConfig,
 ) -> Result<Option<TycodeCustomization>, String> {
@@ -693,18 +693,6 @@ fn materialize_tycode_customization(
 
     for refusal in &refusals {
         tracing::warn!("Tycode skill projection: {}", refusal.describe());
-    }
-    if !refusals.is_empty() && selection == SkillSelection::Explicit {
-        return Err(format!(
-            "This agent explicitly selected {} skill(s), and Tyde could not expose all of them, \
-             so the session was not started:\n{}",
-            selected.len(),
-            refusals
-                .iter()
-                .map(|refusal| format!("- {}", refusal.describe()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
     }
 
     let steering = match tycode_skill_overlay(selection, &projected) {
@@ -788,7 +776,7 @@ fn tycode_skill_overlay(selection: SkillSelection, projected: &[ProjectedSkill])
 /// User-visible notice for a Default session that started without some skills.
 fn tycode_degraded_notice(refusals: &[SkillRefusal]) -> String {
     let mut lines = vec![format!(
-        "Tyde started this Tycode session without {} installed skill(s):",
+        "Tyde started this Tycode session without {} of its selected skill(s):",
         refusals.len()
     )];
     for refusal in refusals {
@@ -6931,8 +6919,12 @@ for raw_line in sys.stdin:
         );
     }
 
+    /// An explicit selection degrades like any other: the session keeps the
+    /// skills that projected, is told which one did not and why, and the overlay
+    /// names only what is actually there. Refusing to start would have cost this
+    /// session `good` as well as `broken`.
     #[test]
-    fn an_explicit_selection_fails_closed_when_a_skill_cannot_be_projected() {
+    fn an_explicit_selection_degrades_when_a_skill_cannot_be_projected() {
         let dir = TempDir::new().expect("tempdir");
         let store = dir.path().join("store");
         let skills = vec![
@@ -6940,15 +6932,42 @@ for raw_line in sys.stdin:
             install_store_skill(&store, "broken", "---\nname: broken\nunterminated\n", None),
         ];
 
-        let err =
+        let customization =
             materialize_tycode_customization(&skill_spawn_config(skills, SkillSelection::Explicit))
-                .expect_err("an explicitly selected skill that cannot be projected must not start");
+                .expect("one unprojectable skill must not stop the session")
+                .expect("materialized root");
 
+        let notice = customization
+            .degraded_notice
+            .as_deref()
+            .expect("a dropped skill must be reported, never silent");
         assert!(
-            err.contains("broken"),
-            "the failure must name the skill: {err}"
+            notice.contains("broken"),
+            "the notice must name the skill: {notice}"
         );
-        assert!(err.contains("never closed"), "and say why: {err}");
+        assert!(notice.contains("never closed"), "and say why: {notice}");
+        assert!(
+            !notice.contains("'good'"),
+            "a skill that projected must not be reported as dropped: {notice}"
+        );
+
+        let skills_dir = customization.root.path.join(".tycode").join("skills");
+        assert!(skills_dir.join("good").join("SKILL.md").is_file());
+        assert!(!skills_dir.join("broken").exists());
+
+        let steering = fs::read_to_string(
+            customization
+                .root
+                .path
+                .join(".tycode")
+                .join("tyde_steering.md"),
+        )
+        .unwrap_or_default();
+        assert!(steering.contains("good"), "{steering}");
+        assert!(
+            !steering.contains("broken"),
+            "the model must not be told about a skill that is not there: {steering}"
+        );
     }
 
     #[test]

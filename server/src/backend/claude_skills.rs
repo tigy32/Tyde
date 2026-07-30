@@ -312,16 +312,16 @@ pub(crate) fn help_text_supports_plugin_dir(help: &str) -> bool {
     help.contains(CLAUDE_PLUGIN_DIR_FLAG)
 }
 
-/// Error for a CLI that cannot sideload a plugin. Names the flag rather than a
+/// Notice for a CLI that cannot sideload a plugin. Names the flag rather than a
 /// version: one installed CLI cannot establish a floor version, and a wrong
-/// version number in an error message is worse than none.
-pub(crate) fn unsupported_plugin_dir_error() -> String {
+/// version number in a message is worse than none.
+pub(crate) fn unsupported_plugin_dir_notice() -> String {
     format!(
-        "This Claude CLI does not support `{CLAUDE_PLUGIN_DIR_FLAG}`, so Tyde cannot expose \
-         installed skills to it. Skills are discovered natively from a session-scoped \
-         `{TYDE_SKILLS_PLUGIN_NAME}` plugin; Tyde will not fall back to pasting skill bodies \
-         into the prompt. Upgrade the Claude CLI, or remove Tyde skills from this agent to \
-         start without them."
+        "Tyde started this Claude session without its installed skills: this Claude CLI does not \
+         support `{CLAUDE_PLUGIN_DIR_FLAG}`, which is how Tyde exposes them. Skills are \
+         discovered natively from a session-scoped `{TYDE_SKILLS_PLUGIN_NAME}` plugin; Tyde will \
+         not fall back to pasting skill bodies into the prompt. Upgrade the Claude CLI to get \
+         them back. The session works normally otherwise."
     )
 }
 
@@ -436,18 +436,50 @@ pub(crate) fn verify_plugin_inventory(output: &str, expected_root: &Path) -> Res
 }
 
 /// Result of checking a CLI `init` frame against what Tyde materialized.
+///
+/// There is deliberately no fatal variant. A session whose skills did not all
+/// arrive is a *worse* session, not an unusable one, and killing it takes away
+/// every other skill and the whole conversation to punish one name. So the gap
+/// is reported and the session runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InitFrameVerdict {
     Verified,
-    Failed(String),
+    /// At least one materialized skill is not reachable under the id Tyde told
+    /// the model to use. Carries the user-visible notice naming each one, what
+    /// happened to it, and — when Claude kept its own copy — the id that does
+    /// work.
+    Degraded(String),
 }
 
-/// Verify that every materialized skill was loaded, exactly once.
+/// The id an expected skill is actually reachable under, if any.
+///
+/// Claude drops a plugin skill whose bare name collides with one the user
+/// already has, keeping its own copy and logging the skip only at debug level.
+/// The capability is therefore still present, just under a different id — which
+/// is the difference between "degraded" and "gone", and the reason this looks
+/// past the namespace before calling anything missing.
+fn user_owned_alternative<'a>(expected_id: &str, reported: &[&'a str]) -> Option<&'a str> {
+    let bare = expected_id
+        .rsplit_once(':')
+        .map_or(expected_id, |(_, name)| name);
+    reported
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != expected_id)
+        .find(|candidate| {
+            let candidate_bare = candidate
+                .rsplit_once(':')
+                .map_or(*candidate, |(_, name)| name);
+            candidate_bare == bare
+        })
+}
+
+/// Check that every materialized skill was loaded, exactly once.
 ///
 /// `reported` is the `init` frame's `skills` array; `None` means the frame did
-/// not carry the field. Both a missing field and a missing skill are failures:
-/// starting a turn believing a skill is available when it is not is the failure
-/// mode this whole design exists to prevent.
+/// not carry the field. Anything short of a clean match produces a notice rather
+/// than a refusal: the session still has whatever else it materialized, and the
+/// user is told exactly what it does not have.
 pub(crate) fn verify_init_frame(
     expected: &[String],
     reported: Option<&[String]>,
@@ -456,9 +488,10 @@ pub(crate) fn verify_init_frame(
         return InitFrameVerdict::Verified;
     }
     let Some(reported) = reported else {
-        return InitFrameVerdict::Failed(
-            "Claude's init frame did not report a 'skills' field, so Tyde cannot confirm the \
-             session's skills were loaded"
+        return InitFrameVerdict::Degraded(
+            "Claude's init frame did not report a 'skills' field, so Tyde cannot confirm this \
+             session's skills were loaded. The session continues; if a skill turns out to be \
+             missing, ask for it by name and Claude will report that it is unavailable."
                 .to_string(),
         );
     };
@@ -467,6 +500,9 @@ pub(crate) fn verify_init_frame(
     for name in reported {
         *counts.entry(name.as_str()).or_default() += 1;
     }
+    let reported_names: Vec<&str> = reported.iter().map(String::as_str).collect();
+
+    let mut notices: Vec<String> = Vec::new();
 
     let duplicated: Vec<&str> = expected
         .iter()
@@ -474,27 +510,48 @@ pub(crate) fn verify_init_frame(
         .filter(|name| counts.get(name).copied().unwrap_or(0) > 1)
         .collect();
     if !duplicated.is_empty() {
-        return InitFrameVerdict::Failed(format!(
+        notices.push(format!(
             "Claude reported {} more than once, so the '{TYDE_SKILLS_PLUGIN_NAME}' namespace \
-             collides with another loaded skill",
+             collides with another loaded skill and Tyde cannot tell which body will run.",
             duplicated.join(", ")
         ));
     }
 
-    let missing: Vec<&str> = expected
-        .iter()
-        .map(String::as_str)
-        .filter(|name| !counts.contains_key(name))
-        .collect();
-    if !missing.is_empty() {
-        return InitFrameVerdict::Failed(format!(
-            "Claude did not load {}. The most likely cause is a name collision with a skill \
-             already installed in Claude, which Claude resolves in favour of its own copy. \
-             Rename the Tyde skill, or remove it from this agent.",
-            missing.join(", ")
+    let mut superseded: Vec<String> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for name in expected.iter().map(String::as_str) {
+        if counts.contains_key(name) {
+            continue;
+        }
+        match user_owned_alternative(name, &reported_names) {
+            Some(alternative) => superseded.push(format!("{name} (loaded as '{alternative}')")),
+            None => missing.push(name),
+        }
+    }
+
+    if !superseded.is_empty() {
+        notices.push(format!(
+            "Claude already had a skill of the same name for {}, and resolves that collision in \
+             favour of its own copy. The skill is still available — invoke it under the name in \
+             brackets rather than the '{TYDE_SKILLS_PLUGIN_NAME}:' one. Rename the Tyde skill if \
+             you want this session to use Tyde's copy instead.",
+            superseded.join(", ")
         ));
     }
-    InitFrameVerdict::Verified
+    if !missing.is_empty() {
+        notices.push(format!(
+            "Claude did not load {}, so this session does not have {}. Everything else the \
+             session selected is available normally.",
+            missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" }
+        ));
+    }
+
+    if notices.is_empty() {
+        InitFrameVerdict::Verified
+    } else {
+        InitFrameVerdict::Degraded(notices.join(" "))
+    }
 }
 
 /// The steering overlay describing how to reach Tyde skills.
@@ -515,7 +572,9 @@ pub(crate) fn native_skill_overlay(
              `{TYDE_SKILLS_PLUGIN_NAME}` plugin and are addressed as \
              `{TYDE_SKILLS_PLUGIN_NAME}:<name>`. Their names and descriptions \
              are already listed among your available skills; read a skill only \
-             when you invoke it."
+             when you invoke it. If one of those ids does not resolve, a skill \
+             of the same name was already installed here and won the name — try \
+             the bare `<name>` before reporting the skill as unavailable."
         ),
         SkillSelection::Explicit => {
             let mut lines = vec![format!(
@@ -537,15 +596,25 @@ pub(crate) fn native_skill_overlay(
                     _ => lines.push(format!("- {label}")),
                 }
             }
+            lines.push(
+                "If one of those ids does not resolve, a skill of the same name was already \
+                 installed here and won the name — try the bare `<name>` before reporting the \
+                 skill as unavailable."
+                    .to_string(),
+            );
             lines.join("\n")
         }
     }
 }
 
-/// User-visible notice for a Default session that started without some skills.
+/// User-visible notice for a session that started without some of its skills.
+///
+/// Used for every selection, including a custom agent's explicit one: a skill
+/// Tyde could not materialize costs that session a capability, and refusing to
+/// start costs it the capability *and* every other one it asked for.
 pub(crate) fn degraded_default_notice(refusals: &[SkillRefusal]) -> String {
     let mut lines = vec![format!(
-        "Tyde started this Claude session without {} installed skill(s):",
+        "Tyde started this Claude session without {} of its selected skill(s):",
         refusals.len()
     )];
     for refusal in refusals {
@@ -1586,13 +1655,13 @@ mod tests {
             Some(&["tyde-skills:a".to_string(), "other".to_string()]),
         );
         assert!(
-            matches!(missing, InitFrameVerdict::Failed(ref m) if m.contains("tyde-skills:b")),
+            matches!(missing, InitFrameVerdict::Degraded(ref m) if m.contains("tyde-skills:b")),
             "{missing:?}"
         );
 
         let absent = verify_init_frame(&expected, None);
         assert!(
-            matches!(absent, InitFrameVerdict::Failed(ref m) if m.contains("'skills' field")),
+            matches!(absent, InitFrameVerdict::Degraded(ref m) if m.contains("'skills' field")),
             "{absent:?}"
         );
 
@@ -1605,8 +1674,42 @@ mod tests {
             ]),
         );
         assert!(
-            matches!(collided, InitFrameVerdict::Failed(ref m) if m.contains("collides")),
+            matches!(collided, InitFrameVerdict::Degraded(ref m) if m.contains("collides")),
             "{collided:?}"
+        );
+
+        // Claude kept its own same-named skill and dropped the plugin copy. The
+        // capability is still reachable, so the verdict must say which id works
+        // rather than report the skill as gone.
+        let superseded = verify_init_frame(
+            &expected,
+            Some(&["a".to_string(), "tyde-skills:b".to_string()]),
+        );
+        let message = match superseded {
+            InitFrameVerdict::Degraded(ref message) => message,
+            InitFrameVerdict::Verified => {
+                panic!("a superseded skill is still a gap: {superseded:?}")
+            }
+        };
+        assert!(message.contains("tyde-skills:a"), "{message}");
+        assert!(
+            message.contains("loaded as 'a'"),
+            "the verdict must name the id that resolves: {message}"
+        );
+        assert!(
+            !message.contains("did not load"),
+            "a skill Claude kept under its own name is not missing: {message}"
+        );
+
+        // A same-named skill from a *different* plugin counts too: the name is
+        // what Claude deduplicates on, and `other:a` is the id that survived.
+        let other_namespace = verify_init_frame(
+            &expected,
+            Some(&["other:a".to_string(), "tyde-skills:b".to_string()]),
+        );
+        assert!(
+            matches!(other_namespace, InitFrameVerdict::Degraded(ref m) if m.contains("loaded as 'other:a'")),
+            "{other_namespace:?}"
         );
 
         assert_eq!(verify_init_frame(&[], None), InitFrameVerdict::Verified);
@@ -1619,7 +1722,7 @@ mod tests {
             "  --plugin-dir <path>   Load a plugin"
         ));
         assert!(!help_text_supports_plugin_dir("  --add-dir <path>"));
-        assert!(unsupported_plugin_dir_error().contains("--plugin-dir"));
+        assert!(unsupported_plugin_dir_notice().contains("--plugin-dir"));
     }
 
     #[test]
@@ -1671,7 +1774,10 @@ mod tests {
             },
         ]);
 
-        assert!(notice.contains("without 2 installed skill(s)"), "{notice}");
+        assert!(
+            notice.contains("without 2 of its selected skill(s)"),
+            "{notice}"
+        );
         assert!(
             notice.contains("skill 'a' was not exposed: bad frontmatter"),
             "{notice}"

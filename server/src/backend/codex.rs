@@ -1286,16 +1286,18 @@ fn prepare_codex_skills_blocking(
                 skill: selected,
                 visibility,
             }),
-            Err(err) if selection == SkillSelection::Explicit => {
-                discard_codex_skill_wrapper(&projection_root, ordinal)?;
-                return Err(err);
-            }
+            // The selection type does not decide this. An explicitly selected
+            // skill Tyde cannot project is one capability the session does not
+            // get; refusing to start would cost it all the others too. It does
+            // decide how loudly to say it: a skill a custom agent named by hand
+            // going missing is worth more than one of everything-installed.
             Err(err) => {
                 discard_codex_skill_wrapper(&projection_root, ordinal)?;
-                tracing::warn!("Default Codex skill selection degraded: {err}");
+                tracing::warn!("Codex skill selection degraded: {err}");
                 diagnostics.push(format!(
-                    "Default Codex session omitted Tyde skill '{}': {err}",
-                    selected.name
+                    "Codex session omitted Tyde skill '{}' ({}): {err}",
+                    selected.name,
+                    codex_selection_label(selection)
                 ));
             }
         }
@@ -1306,25 +1308,49 @@ fn prepare_codex_skills_blocking(
     })
 }
 
+/// How to describe a dropped skill: the selection type is no longer a policy
+/// input, but it is still what tells the user whether their agent asked for this
+/// skill by name or simply had everything installed.
+fn codex_selection_label(selection: SkillSelection) -> &'static str {
+    match selection {
+        SkillSelection::Explicit => "explicitly selected",
+        SkillSelection::AllInstalled => "installed",
+    }
+}
+
+/// What the post-`extraRoots` catalog says about one selected skill.
+///
+/// The distinction that matters is *reachable* versus *not there*. Codex, like
+/// Claude, resolves a name collision in favour of a skill the user already had;
+/// the selection is then still satisfied — by someone else's body — and dropping
+/// it would take away a capability the session does have. Only `Unresolved`
+/// means the model would find nothing under that name.
+enum CodexSkillVerdict {
+    Verified,
+    Superseded(String),
+    Unresolved(String),
+}
+
 fn verify_codex_prepared_skills_blocking(
     prepared: &[CodexPreparedSkill],
     catalog: &CodexSkillCatalog,
-) -> Vec<(usize, String)> {
+) -> Vec<(usize, CodexSkillVerdict)> {
     prepared
         .iter()
         .enumerate()
-        .filter_map(|(index, prepared)| {
-            verify_codex_prepared_skill(prepared, catalog)
-                .err()
-                .map(|err| (index, err))
-        })
+        .filter_map(
+            |(index, prepared)| match verify_codex_prepared_skill(prepared, catalog) {
+                CodexSkillVerdict::Verified => None,
+                verdict => Some((index, verdict)),
+            },
+        )
         .collect()
 }
 
 fn verify_codex_prepared_skill(
     prepared: &CodexPreparedSkill,
     catalog: &CodexSkillCatalog,
-) -> Result<(), String> {
+) -> CodexSkillVerdict {
     let selected = &prepared.skill;
     let expected_skill_md = prepared.visibility.skill_md();
     let related_errors = catalog
@@ -1334,7 +1360,7 @@ fn verify_codex_prepared_skill(
         .map(CodexSkillCatalogError::display)
         .collect::<Vec<_>>();
     if !related_errors.is_empty() {
-        return Err(format!(
+        return CodexSkillVerdict::Unresolved(format!(
             "Selected Codex skill '{}' is ambiguous because final discovery reported related errors: {}",
             selected.name,
             related_errors.join("; ")
@@ -1346,7 +1372,7 @@ fn verify_codex_prepared_skill(
         .filter(|skill| skill.name == selected.name)
         .collect::<Vec<_>>();
     if same_name.iter().any(|skill| skill.enabled.is_none()) {
-        return Err(format!(
+        return CodexSkillVerdict::Unresolved(format!(
             "Selected Codex skill '{}' is ambiguous because a same-name catalog entry has an unknown enabled state",
             selected.name
         ));
@@ -1356,8 +1382,8 @@ fn verify_codex_prepared_skill(
         .copied()
         .filter(|skill| skill.enabled == Some(true))
         .collect::<Vec<_>>();
-    if enabled.len() != 1 {
-        let matches = same_name
+    let describe_matches = || {
+        same_name
             .iter()
             .map(|skill| {
                 format!(
@@ -1370,30 +1396,53 @@ fn verify_codex_prepared_skill(
                     }
                 )
             })
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "Selected Codex skill '{}' must resolve to exactly one enabled entry after skills/extraRoots/set; found {} [{}]",
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if enabled.is_empty() {
+        return CodexSkillVerdict::Unresolved(format!(
+            "Selected Codex skill '{}' must resolve to exactly one enabled entry after \
+             skills/extraRoots/set; found 0 [{}]",
             selected.name,
-            enabled.len(),
-            matches.join(", ")
+            describe_matches()
         ));
     }
-    let visible_skill_md = codex_listed_filesystem_skill_md(enabled[0])?.ok_or_else(|| {
-        format!(
-            "Selected Codex skill '{}' resolved to non-filesystem locator {}",
+    if enabled.len() > 1 {
+        // More than one enabled entry under the name: the skill resolves, but
+        // not necessarily to Tyde's copy. Reachable, so it stays; ambiguous, so
+        // it is reported.
+        return CodexSkillVerdict::Superseded(format!(
+            "Selected Codex skill '{}' must resolve to exactly one enabled entry after \
+             skills/extraRoots/set; found {} [{}], so Codex — not Tyde — decides which body runs. \
+             Rename the Tyde skill to give this session its own copy.",
             selected.name,
-            enabled[0].locator.as_deref().unwrap_or("<opaque>")
-        )
-    })?;
+            enabled.len(),
+            describe_matches()
+        ));
+    }
+    let visible_skill_md = match codex_listed_filesystem_skill_md(enabled[0]) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return CodexSkillVerdict::Superseded(format!(
+                "Selected Codex skill '{}' resolved to non-filesystem locator {}, which is not the \
+                 copy Tyde projected",
+                selected.name,
+                enabled[0].locator.as_deref().unwrap_or("<opaque>")
+            ));
+        }
+        Err(err) => return CodexSkillVerdict::Unresolved(err),
+    };
     if visible_skill_md != expected_skill_md {
-        return Err(format!(
-            "Selected Tyde skill '{}' resolved to unexpected Codex skill path {} instead of {}",
+        return CodexSkillVerdict::Superseded(format!(
+            "Selected Codex skill '{}' resolved to {} instead of the copy Tyde projected at {}, so \
+             a skill of the same name that was already installed won the name. The skill is \
+             available; rename the Tyde skill to use Tyde's copy instead.",
             selected.name,
             visible_skill_md.display(),
             expected_skill_md.display()
         ));
     }
-    Ok(())
+    CodexSkillVerdict::Verified
 }
 
 async fn set_codex_skill_extra_roots(
@@ -1442,10 +1491,10 @@ async fn configure_codex_native_skills(
     diagnostics.extend(preparation.diagnostics);
     let mut prepared = preparation.prepared;
 
-    if prepared.is_empty() && selection == SkillSelection::AllInstalled {
-        tracing::debug!(
-            "Codex Default selection exposed no Tyde skills; skipping skills/extraRoots/set"
-        );
+    if prepared.is_empty() {
+        // Nothing was projected, whatever the selection asked for. There is no
+        // root worth registering, and the diagnostics above already say why.
+        tracing::debug!("Codex selection exposed no Tyde skills; skipping skills/extraRoots/set");
         return Ok(CodexSkillSetup {
             exposed_names: Vec::new(),
             diagnostics,
@@ -1463,7 +1512,7 @@ async fn configure_codex_native_skills(
         }
         let prepared_for_verification = prepared.clone();
         let catalog_for_verification = final_catalog.clone();
-        let failures = tokio::task::spawn_blocking(move || {
+        let verdicts = tokio::task::spawn_blocking(move || {
             verify_codex_prepared_skills_blocking(
                 &prepared_for_verification,
                 &catalog_for_verification,
@@ -1471,28 +1520,51 @@ async fn configure_codex_native_skills(
         })
         .await
         .map_err(|err| format!("Codex skill verification task failed: {err}"))?;
+
+        // A superseded skill still resolves, so it is kept and reported. Only
+        // an unresolved one is dropped and re-verified — retrying a supersession
+        // would loop until the retry budget ran out and then drop a skill the
+        // session actually has.
+        let mut failures = Vec::new();
+        for (index, verdict) in verdicts {
+            match verdict {
+                CodexSkillVerdict::Verified => {}
+                CodexSkillVerdict::Superseded(note) => {
+                    if !diagnostics.contains(&note) {
+                        tracing::warn!("{note}");
+                        diagnostics.push(note);
+                    }
+                }
+                CodexSkillVerdict::Unresolved(reason) => failures.push((index, reason)),
+            }
+        }
         if failures.is_empty() {
             break;
         }
-        if selection == SkillSelection::Explicit {
-            return Err(failures[0].1.clone());
-        }
-        if verification + 1 == maximum_verifications {
-            return Err(format!(
-                "Codex skill verification did not converge after {maximum_verifications} catalog checks"
-            ));
-        }
 
+        // The selection type does not change the outcome. A custom agent that
+        // named its skills is still that agent with one fewer, and refusing to
+        // start would cost it every skill that *did* resolve.
+        let last_pass = verification + 1 == maximum_verifications;
         let failed_indices = failures
             .iter()
             .map(|(index, _)| *index)
             .collect::<HashSet<_>>();
         for (index, err) in &failures {
             let selected = &prepared[*index].skill;
-            let diagnostic = format!(
-                "Default Codex session omitted Tyde skill '{}': {err}",
-                selected.name
-            );
+            let label = codex_selection_label(selection);
+            let diagnostic = if last_pass {
+                format!(
+                    "Codex session omitted Tyde skill '{}' ({label}) after \
+                     {maximum_verifications} catalog checks did not converge: {err}",
+                    selected.name
+                )
+            } else {
+                format!(
+                    "Codex session omitted Tyde skill '{}' ({label}): {err}",
+                    selected.name
+                )
+            };
             tracing::warn!("{diagnostic}");
             diagnostics.push(diagnostic);
         }
@@ -1537,6 +1609,29 @@ async fn configure_codex_native_skills(
     })
 }
 
+/// Turn a failure to configure skills into a session that starts without them.
+///
+/// Every way skill configuration can fail — an app-server that rejects
+/// `skills/extraRoots/set`, a catalog Tyde cannot read, a projection it cannot
+/// write — costs the session its Tyde skills and nothing else. The session
+/// starts, and this is the notice that says what it is missing.
+fn codex_skills_unavailable(selected_skills: &[ResolvedSkill], reason: &str) -> CodexSkillSetup {
+    let names = selected_skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let diagnostic = format!(
+        "Tyde started this Codex session without its {} selected skill(s) [{names}]: {reason}",
+        selected_skills.len()
+    );
+    tracing::warn!("{diagnostic}");
+    CodexSkillSetup {
+        exposed_names: Vec::new(),
+        diagnostics: vec![diagnostic],
+    }
+}
+
 fn codex_skill_catalog_diagnostics(phase: &str, errors: &[CodexSkillCatalogError]) -> Vec<String> {
     errors
         .iter()
@@ -1574,17 +1669,18 @@ fn codex_skills_extra_roots_unsupported_message() -> String {
         .to_owned()
 }
 
-fn codex_selected_skills_ssh_error(
+fn codex_selected_skills_ssh_notice(
     ssh_host: Option<&str>,
     selected_skills: &[ResolvedSkill],
 ) -> Option<String> {
     let host = ssh_host.filter(|_| !selected_skills.is_empty())?;
     Some(format!(
-        "Codex native selected skills are not supported for SSH host '{host}': Tyde will not send local skill paths to a remote app-server"
+        "Tyde started this Codex session without its {} selected skill(s): Tyde will not send local skill paths to the app-server on SSH host '{host}', which cannot read this machine's disk",
+        selected_skills.len()
     ))
 }
 
-fn codex_selected_skills_remote_workspace_error(
+fn codex_selected_skills_remote_workspace_notice(
     workspace_roots: &[String],
     selected_skills: &[ResolvedSkill],
 ) -> Option<String> {
@@ -1593,8 +1689,21 @@ fn codex_selected_skills_remote_workspace_error(
     }
     let detail = codex_ssh_workspace_detail(workspace_roots)?;
     Some(format!(
-        "Codex native selected skills are not supported {detail}: Tyde will not send local skill paths to a remote app-server"
+        "Tyde started this Codex session without its {} selected skill(s): Tyde will not send local skill paths to a remote app-server {detail}",
+        selected_skills.len()
     ))
+}
+
+/// The one reason a Codex session cannot have Tyde's skills that is known before
+/// the app-server starts: it is running somewhere that cannot read this
+/// machine's disk. The skills are dropped, not the session.
+fn codex_remote_skill_notice(
+    ssh_host: Option<&str>,
+    workspace_roots: &[String],
+    selected_skills: &[ResolvedSkill],
+) -> Option<String> {
+    codex_selected_skills_ssh_notice(ssh_host, selected_skills)
+        .or_else(|| codex_selected_skills_remote_workspace_notice(workspace_roots, selected_skills))
 }
 
 fn codex_ssh_workspace_detail(workspace_roots: &[String]) -> Option<String> {
@@ -1751,15 +1860,27 @@ impl CodexSession {
             selected_skills,
             skill_selection,
         } = options;
-        if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
-            return Err(err);
-        }
-        if let Some(err) =
-            codex_selected_skills_remote_workspace_error(workspace_roots, selected_skills)
+        // A session that cannot reach Tyde's skills runs without them. Dropping
+        // the selection here — rather than refusing the spawn — is what keeps a
+        // remote workspace usable to a skill-bearing agent.
+        let mut skill_notices: Vec<String> = Vec::new();
+        let mut selected_skills = selected_skills;
+        if let Some(notice) =
+            codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
         {
-            return Err(err);
+            tracing::warn!("{notice}");
+            skill_notices.push(notice);
+            selected_skills = &[];
         }
-        let mut skill_projection = CodexSkillProjection::new(selected_skills)?;
+        let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
+            Ok(projection) => projection,
+            Err(err) => {
+                let unavailable = codex_skills_unavailable(selected_skills, &err);
+                skill_notices.extend(unavailable.diagnostics);
+                selected_skills = &[];
+                None
+            }
+        };
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
                 Some(write_codex_session_steering_tempfile(content)?)
@@ -1835,15 +1956,22 @@ impl CodexSession {
             .await
             {
                 Ok(setup) => setup,
+                // Configuring skills never fails the spawn. Whatever went wrong
+                // — a rejected `skills/extraRoots/set`, an unreadable catalog —
+                // costs this session its Tyde skills and nothing else, and the
+                // notice says which ones and why.
                 Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
+                    remove_codex_skill_projection(&mut skill_projection);
+                    codex_skills_unavailable(selected_skills, &err)
                 }
             }
         } else {
             CodexSkillSetup::default()
         };
+        // Notices decided before the app-server started ride along with the
+        // ones it produced, so the user sees every reason in one place.
+        let mut skill_setup = skill_setup;
+        skill_setup.diagnostics.splice(0..0, skill_notices);
 
         let mut thread_start_params = json!({
             "cwd": cwd,
@@ -1934,15 +2062,27 @@ impl CodexSession {
             selection: skill_selection,
             installed_provider_version,
         } = selected_skill_context;
-        if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
-            return Err(err);
-        }
-        if let Some(err) =
-            codex_selected_skills_remote_workspace_error(workspace_roots, selected_skills)
+        // A session that cannot reach Tyde's skills runs without them. Dropping
+        // the selection here — rather than refusing the spawn — is what keeps a
+        // remote workspace usable to a skill-bearing agent.
+        let mut skill_notices: Vec<String> = Vec::new();
+        let mut selected_skills = selected_skills;
+        if let Some(notice) =
+            codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
         {
-            return Err(err);
+            tracing::warn!("{notice}");
+            skill_notices.push(notice);
+            selected_skills = &[];
         }
-        let mut skill_projection = CodexSkillProjection::new(selected_skills)?;
+        let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
+            Ok(projection) => projection,
+            Err(err) => {
+                let unavailable = codex_skills_unavailable(selected_skills, &err);
+                skill_notices.extend(unavailable.diagnostics);
+                selected_skills = &[];
+                None
+            }
+        };
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
                 Some(write_codex_session_steering_tempfile(content)?)
@@ -2010,15 +2150,22 @@ impl CodexSession {
             .await
             {
                 Ok(setup) => setup,
+                // Configuring skills never fails the spawn. Whatever went wrong
+                // — a rejected `skills/extraRoots/set`, an unreadable catalog —
+                // costs this session its Tyde skills and nothing else, and the
+                // notice says which ones and why.
                 Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
+                    remove_codex_skill_projection(&mut skill_projection);
+                    codex_skills_unavailable(selected_skills, &err)
                 }
             }
         } else {
             CodexSkillSetup::default()
         };
+        // Notices decided before the app-server started ride along with the
+        // ones it produced, so the user sees every reason in one place.
+        let mut skill_setup = skill_setup;
+        skill_setup.diagnostics.splice(0..0, skill_notices);
 
         let mut fork_params = json!({
             "threadId": from_thread_id,
@@ -13874,14 +14021,9 @@ impl CodexBackend {
         initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
         let inference_only = config.execution_mode == BackendExecutionMode::InferenceOnly;
-        if !inference_only
-            && let Some(err) = codex_selected_skills_remote_workspace_error(
-                &workspace_roots,
-                &config.resolved_spawn_config.skills,
-            )
-        {
-            return Err(err);
-        }
+        // No remote-skill guard here: a remote session drops its skills with a
+        // notice when it starts (`codex_remote_skill_notice`), rather than
+        // refusing to start at all.
         let initial_emitter = (!inference_only).then_some(initial_emitter).flatten();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
@@ -14978,12 +15120,6 @@ impl Backend for CodexBackend {
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
-        if let Some(err) = codex_selected_skills_remote_workspace_error(
-            &workspace_roots,
-            &config.resolved_spawn_config.skills,
-        ) {
-            return Err(err);
-        }
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
@@ -15204,12 +15340,6 @@ impl Backend for CodexBackend {
         from_session_id: protocol::SessionId,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
-        if let Some(error) = codex_selected_skills_remote_workspace_error(
-            &workspace_roots,
-            &config.resolved_spawn_config.skills,
-        ) {
-            return Err(BackendStartupError::unsupported(error));
-        }
         if let Some(error) = codex_ssh_fork_unsupported_error(&workspace_roots) {
             return Err(error);
         }
@@ -17165,18 +17295,19 @@ for line in sys.stdin:
             codex_native_skill_spawn_options(&selected),
         )
         .await;
-        let err = match result {
-            Ok((session, _)) => {
-                session.shutdown().await;
-                panic!("plugin namespace collision must remain visible")
-            }
-            Err(err) => err,
-        };
+        let (session, mut raw_events) = result.expect(
+                "fail-open: plugin namespace collision must not remain visible, it degrades with a notice",
+            );
+        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.shutdown().await;
         assert!(
-            err.contains(
+            diagnostics.contains(
                 "Selected Codex skill 'plugin-bearing' must resolve to exactly one enabled entry"
             ),
-            "unexpected collision error: {err}"
+            "unexpected collision error: {diagnostics}"
         );
         let methods = fake
             .requests()
@@ -17188,6 +17319,10 @@ for line in sys.stdin:
                     .map(str::to_owned)
             })
             .collect::<Vec<_>>();
+        // The collision is reported and the skill dropped, then the remaining
+        // (empty) selection is re-registered and re-verified before the session
+        // starts its thread. What must never appear is a session that kept the
+        // ambiguous skill.
         assert_eq!(
             methods,
             vec![
@@ -17195,6 +17330,9 @@ for line in sys.stdin:
                 "skills/list",
                 "skills/extraRoots/set",
                 "skills/list",
+                "skills/extraRoots/set",
+                "skills/list",
+                "thread/start",
             ]
         );
     }
@@ -17535,14 +17673,15 @@ for line in sys.stdin:
                 codex_native_skill_spawn_options(&selected),
             )
             .await;
-            let err = match result {
-                Ok((session, _)) => {
-                    session.shutdown().await;
-                    panic!("Explicit must refuse malformed source frontmatter")
-                }
-                Err(err) => err,
-            };
-            assert!(err.contains("frontmatter block that is never closed"));
+            let (session, mut raw_events) = result.expect(
+                "fail-open: Explicit must not refuse malformed source frontmatter, it degrades with a notice",
+            );
+            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("\n");
+            session.shutdown().await;
+            assert!(diagnostics.contains("frontmatter block that is never closed"));
             assert!(!fake.requests().iter().any(|request| {
                 request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
             }));
@@ -17654,17 +17793,27 @@ for line in sys.stdin:
                     codex_native_skill_spawn_options(&selected),
                 )
                 .await;
-                let err = match result {
-                    Ok((session, _)) => {
-                        session.shutdown().await;
-                        panic!("Explicit must fail final verification in mode {mode}")
-                    }
-                    Err(err) => err,
-                };
-                assert!(err.contains(expected), "{mode}: {err}");
-                assert!(!fake.requests().iter().any(|request| {
-                    request.get("method").and_then(Value::as_str) == Some("thread/start")
-                }));
+                let (session, mut raw_events) = result.expect(
+                "fail-open: Explicit must not fail final verification in mode {mode}, it degrades with a notice",
+            );
+                let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                    .filter_map(|event| {
+                        event.get("data").and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                session.shutdown().await;
+                assert!(diagnostics.contains(expected), "{mode}: {diagnostics}");
+                assert!(
+                    diagnostics.contains("explicitly selected"),
+                    "{mode}: an explicitly selected skill must be named as such: {diagnostics}"
+                );
+                assert!(
+                    fake.requests().iter().any(|request| {
+                        request.get("method").and_then(Value::as_str) == Some("thread/start")
+                    }),
+                    "{mode}: the session must still start"
+                );
             }
         }
     }
@@ -17716,14 +17865,20 @@ for line in sys.stdin:
                     session.shutdown().await;
                 }
                 SkillSelection::Explicit => {
-                    let err = match result {
-                        Ok((session, _)) => {
-                            session.shutdown().await;
-                            panic!("Explicit must fail unknown-enabled collision")
-                        }
-                        Err(err) => err,
-                    };
-                    assert!(err.contains("discovery errors") || err.contains("enabled state"));
+                    let (session, mut raw_events) = result.expect(
+                "fail-open: Explicit must not fail unknown-enabled collision, it degrades with a notice",
+            );
+                    let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                        .filter_map(|event| {
+                            event.get("data").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    session.shutdown().await;
+                    assert!(
+                        diagnostics.contains("discovery errors")
+                            || diagnostics.contains("enabled state")
+                    );
                     assert!(!fake.requests().iter().any(|request| {
                         request.get("method").and_then(Value::as_str)
                             == Some("skills/extraRoots/set")
@@ -17929,22 +18084,26 @@ for line in sys.stdin:
             codex_native_skill_spawn_options(&selected),
         )
         .await;
-        let err = match result {
-            Ok((session, _)) => {
-                session.shutdown().await;
-                panic!("divergent same-name skills must fail")
-            }
-            Err(err) => err,
-        };
-        assert!(err.contains("conflicts with a different enabled Codex skill"));
-        assert!(err.contains(&native.source_dir.display().to_string()));
-        assert!(err.contains(&selected[0].source_dir.display().to_string()));
+        let (session, mut raw_events) = result.expect(
+            "fail-open: divergent same-name skills must not fail, it degrades with a notice",
+        );
+        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.shutdown().await;
+        assert!(diagnostics.contains("conflicts with a different enabled Codex skill"));
+        assert!(diagnostics.contains(&native.source_dir.display().to_string()));
+        assert!(diagnostics.contains(&selected[0].source_dir.display().to_string()));
         assert_eq!(
             fake.requests()
                 .iter()
                 .filter_map(|request| request.get("method").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
-            vec!["initialize", "skills/list"]
+            // No `skills/extraRoots/set`: the collision is caught before any root
+            // is registered, so nothing of Tyde's is ever exposed under a name
+            // that resolves elsewhere. The session starts regardless.
+            vec!["initialize", "skills/list", "thread/start"]
         );
         assert_eq!(fake.skill_projection_dirs(), before);
         assert!(native.skill_md_path.exists());
@@ -17989,7 +18148,7 @@ for line in sys.stdin:
             .get("data")
             .and_then(Value::as_str)
             .expect("diagnostic text");
-        assert!(diagnostic.contains("Default Codex session omitted Tyde skill 'collision'"));
+        assert!(diagnostic.contains("Codex session omitted Tyde skill 'collision'"));
         assert!(diagnostic.contains(&native.source_dir.display().to_string()));
         assert!(!diagnostic.contains("omitted Tyde skill 'available'"));
 
@@ -18096,14 +18255,15 @@ for line in sys.stdin:
                 ),
             )
             .await;
-            let err = match result {
-                Ok((session, _)) => {
-                    session.shutdown().await;
-                    panic!("Explicit must fail when a native collision tree changes")
-                }
-                Err(err) => err,
-            };
-            assert!(err.contains("not a regular file"));
+            let (session, mut raw_events) = result.expect(
+                "fail-open: Explicit must not fail when a native collision tree changes, it degrades with a notice",
+            );
+            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("\n");
+            session.shutdown().await;
+            assert!(diagnostics.contains("not a regular file"));
             assert!(!fake.requests().iter().any(|request| {
                 request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
             }));
@@ -18208,14 +18368,15 @@ for line in sys.stdin:
                 ),
             )
             .await;
-            let err = match result {
-                Ok((session, _)) => {
-                    session.shutdown().await;
-                    panic!("Explicit must fail when a selected wrapper cannot materialize")
-                }
-                Err(err) => err,
-            };
-            assert!(err.contains("injected resource-link failure"));
+            let (session, mut raw_events) = result.expect(
+                "fail-open: Explicit must not fail when a selected wrapper cannot materialize, it degrades with a notice",
+            );
+            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("\n");
+            session.shutdown().await;
+            assert!(diagnostics.contains("injected resource-link failure"));
             assert!(!fake.requests().iter().any(|request| {
                 request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
             }));
@@ -18247,27 +18408,36 @@ for line in sys.stdin:
             codex_native_skill_spawn_options(&selected),
         )
         .await;
-        let err = match result {
-            Ok((session, _)) => {
-                session.shutdown().await;
-                panic!("unsupported skills method must fail")
-            }
-            Err(err) => err,
-        };
-        assert!(err.contains("skills/extraRoots/set"));
-        assert!(err.contains("Update Codex CLI"));
+        let (session, mut raw_events) = result.expect(
+            "fail-open: unsupported skills method must not fail, it degrades with a notice",
+        );
+        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.shutdown().await;
+        assert!(diagnostics.contains("skills/extraRoots/set"));
+        assert!(diagnostics.contains("Update Codex CLI"));
         let requests = fake.requests();
         assert_eq!(
             requests
                 .iter()
                 .filter_map(|request| request.get("method").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
-            vec!["initialize", "skills/list", "skills/extraRoots/set"]
+            vec![
+                "initialize",
+                "skills/list",
+                "skills/extraRoots/set",
+                "thread/start",
+            ]
         );
+        // The point of "without fallback": Tyde never writes the skill into the
+        // user's Codex config to work around the missing method. The session
+        // starts without the skill instead.
         assert!(!requests.iter().any(|request| {
             matches!(
                 request.get("method").and_then(Value::as_str),
-                Some("thread/start" | "skills/config/write")
+                Some("skills/config/write")
             )
         }));
         let projection = codex_extra_root(&requests).expect("attempted projection root");
@@ -18326,19 +18496,24 @@ for line in sys.stdin:
         let ChatEvent::MessageAdded(message) = event else {
             panic!("resume setup failure must be a visible message");
         };
-        assert!(matches!(message.sender, MessageSender::Error));
+        // A warning, not an error: the resume succeeds, it just has no Tyde
+        // skills. An error card here would say the session did not come back.
+        assert!(matches!(message.sender, MessageSender::Warning));
         assert!(message.content.contains("skills/extraRoots/set"));
         assert!(message.content.contains("Update Codex CLI"));
         tokio::time::timeout(Duration::from_secs(5), replay_complete)
             .await
-            .expect("resume error completes replay barrier")
+            .expect("resume warning completes replay barrier")
             .expect("resume worker retains replay barrier");
-        assert!(!fake.requests().iter().any(|request| {
-            matches!(
-                request.get("method").and_then(Value::as_str),
-                Some("thread/start" | "thread/resume" | "turn/start")
-            )
-        }));
+        assert!(
+            fake.requests().iter().any(|request| {
+                matches!(
+                    request.get("method").and_then(Value::as_str),
+                    Some("thread/start" | "thread/resume")
+                )
+            }),
+            "the session must still resume without its skills"
+        );
         backend.shutdown().await;
     }
 
@@ -18382,7 +18557,7 @@ for line in sys.stdin:
         let ChatEvent::MessageAdded(message) = event else {
             panic!("resume collision must be a visible message");
         };
-        assert!(matches!(message.sender, MessageSender::Error));
+        assert!(matches!(message.sender, MessageSender::Warning));
         assert!(
             message
                 .content
@@ -18392,23 +18567,51 @@ for line in sys.stdin:
             .await
             .expect("resume collision completes replay barrier")
             .expect("resume worker retains replay barrier");
+        // The colliding skill was dropped before any root was registered, so
+        // nothing of Tyde's is exposed — but the session itself comes back.
         assert!(!fake.requests().iter().any(|request| {
             matches!(
                 request.get("method").and_then(Value::as_str),
-                Some("skills/extraRoots/set" | "thread/resume" | "turn/start")
+                Some("skills/extraRoots/set")
+            )
+        }));
+        assert!(fake.requests().iter().any(|request| {
+            matches!(
+                request.get("method").and_then(Value::as_str),
+                Some("thread/start" | "thread/resume")
             )
         }));
         backend.shutdown().await;
     }
 
+    /// Whether a startup mode is fatal, or merely costs the session its skills.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CodexStartupOutcome {
+        /// Nothing to do with skills: without this step there is no session.
+        Fails,
+        /// A skill could not be exposed. The session starts without it.
+        DegradesWithoutSkills,
+    }
+
+    /// Whatever the outcome, the session's own skill root is cleaned up and the
+    /// user's skill store is untouched.
     #[tokio::test]
     async fn codex_native_skill_startup_failures_clean_owned_roots() {
-        for mode in [
-            "skills_initialize_error",
-            "skills_set_error",
-            "skills_final_missing",
-            "skills_final_disabled",
-            "skills_thread_start_error",
+        for (mode, outcome) in [
+            ("skills_initialize_error", CodexStartupOutcome::Fails),
+            (
+                "skills_set_error",
+                CodexStartupOutcome::DegradesWithoutSkills,
+            ),
+            (
+                "skills_final_missing",
+                CodexStartupOutcome::DegradesWithoutSkills,
+            ),
+            (
+                "skills_final_disabled",
+                CodexStartupOutcome::DegradesWithoutSkills,
+            ),
+            ("skills_thread_start_error", CodexStartupOutcome::Fails),
         ] {
             let fake = CodexFakeAppServer::new(mode, "unused");
             let native_home = tempfile::tempdir().expect("native Codex home");
@@ -18429,12 +18632,20 @@ for line in sys.stdin:
                 codex_native_skill_spawn_options(&selected),
             )
             .await;
-            match result {
-                Ok((session, _)) => {
+            match (outcome, result) {
+                (CodexStartupOutcome::Fails, Ok((session, _))) => {
                     session.shutdown().await;
                     panic!("{mode} must fail startup")
                 }
-                Err(err) => assert!(!err.is_empty(), "{mode} must report a visible error"),
+                (CodexStartupOutcome::Fails, Err(err)) => {
+                    assert!(!err.is_empty(), "{mode} must report a visible error")
+                }
+                (CodexStartupOutcome::DegradesWithoutSkills, Ok((session, _))) => {
+                    session.shutdown().await
+                }
+                (CodexStartupOutcome::DegradesWithoutSkills, Err(err)) => {
+                    panic!("{mode} costs the session its skills, not the session: {err}")
+                }
             }
             assert_eq!(
                 fake.skill_projection_dirs(),
@@ -18690,15 +18901,15 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_ssh_rejects_only_nonempty_native_skill_selections() {
+    fn codex_ssh_drops_only_nonempty_native_skill_selections() {
         let store = tempfile::tempdir().expect("Tyde skill store");
         let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-        assert!(codex_selected_skills_ssh_error(Some("example.com"), &[]).is_none());
-        let err = codex_selected_skills_ssh_error(Some("example.com"), &selected)
-            .expect("selected SSH skills must be rejected");
-        assert!(err.contains("example.com"));
-        assert!(err.contains("will not send local skill paths"));
-        assert!(codex_selected_skills_ssh_error(None, &selected).is_none());
+        assert!(codex_selected_skills_ssh_notice(Some("example.com"), &[]).is_none());
+        let notice = codex_selected_skills_ssh_notice(Some("example.com"), &selected)
+            .expect("selected SSH skills must be dropped with a notice");
+        assert!(notice.contains("example.com"));
+        assert!(notice.contains("will not send local skill paths"));
+        assert!(codex_selected_skills_ssh_notice(None, &selected).is_none());
     }
 
     #[test]
@@ -18707,94 +18918,54 @@ for line in sys.stdin:
         let selected = vec![write_codex_skill(store.path(), "selected", "body")];
         let malformed = ["ssh://missing-remote-path".to_owned()];
 
-        let selected_error = codex_selected_skills_remote_workspace_error(&malformed, &selected)
-            .expect("selected skills must reject malformed SSH roots");
+        let selected_notice = codex_selected_skills_remote_workspace_notice(&malformed, &selected)
+            .expect("selected skills must be dropped for malformed SSH roots");
         let fork_error = codex_ssh_fork_unsupported_error(&malformed)
-            .expect("fork must reject the same malformed SSH roots");
+            .expect("fork must still reject the same malformed SSH roots");
 
-        assert!(selected_error.contains("malformed SSH workspace roots"));
+        assert!(selected_notice.contains("malformed SSH workspace roots"));
         assert!(fork_error.message.contains("malformed SSH workspace roots"));
         assert!(
-            codex_selected_skills_remote_workspace_error(&malformed, &[]).is_none(),
+            codex_selected_skills_remote_workspace_notice(&malformed, &[]).is_none(),
             "no-skill SSH behavior remains unchanged"
         );
     }
 
-    #[tokio::test]
-    async fn codex_backend_remote_roots_reject_selected_skills_before_local_startup() {
+    /// The contract this used to enforce by refusing the spawn: **no local skill
+    /// path is ever handed to a remote app-server**, and nothing is materialized
+    /// for a selection that cannot travel. That still holds — the session now
+    /// starts without the skills instead of not starting at all, so the
+    /// assertion moved from "the spawn fails" to "the selection is dropped and
+    /// nothing local is written".
+    #[test]
+    fn codex_remote_roots_drop_selected_skills_before_local_startup() {
         let fake = CodexFakeAppServer::new("ok", "unused");
         let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
         let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = write_codex_skill(store.path(), "selected", "body");
-        let config = BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                skills: vec![selected],
-                skill_delivery: crate::agent::customization::SkillDelivery::NativeDiscovery,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
         let remote_roots = vec!["ssh://devbox.example.com/workspace".to_owned()];
+
+        let notice = codex_remote_skill_notice(None, &remote_roots, &selected)
+            .expect("remote roots must drop a non-empty selection");
+        assert!(notice.contains("devbox.example.com"), "{notice}");
         assert!(
-            codex_selected_skills_remote_workspace_error(&remote_roots, &[]).is_none(),
+            notice.contains("will not send local skill paths"),
+            "{notice}"
+        );
+        assert!(
+            codex_remote_skill_notice(None, &remote_roots, &[]).is_none(),
             "no-skill SSH sessions retain their existing routing"
         );
-        let initial_input = || protocol::SendMessagePayload {
-            message: "must not start".to_owned(),
-            images: None,
-            origin: None,
-            tool_response: None,
-        };
 
-        let spawn_err = match <CodexBackend as Backend>::spawn(
-            remote_roots.clone(),
-            config.clone(),
-            initial_input(),
-        )
-        .await
-        {
-            Ok((backend, _)) => {
-                backend.shutdown().await;
-                panic!("remote selected-skill spawn must fail")
-            }
-            Err(err) => err,
-        };
-        assert!(spawn_err.contains("devbox.example.com"));
-        assert!(spawn_err.contains("will not send local skill paths"));
-
-        let resume_err = match <CodexBackend as Backend>::resume(
-            remote_roots.clone(),
-            config.clone(),
-            SessionId("remote-resume".to_owned()),
-        )
-        .await
-        {
-            Ok((backend, _)) => {
-                backend.shutdown().await;
-                panic!("remote selected-skill resume must fail")
-            }
-            Err(err) => err,
-        };
-        assert!(resume_err.contains("will not send local skill paths"));
-
-        let fork_err = match <CodexBackend as Backend>::fork(
-            remote_roots,
-            config,
-            SessionId("remote-parent".to_owned()),
-            initial_input(),
-        )
-        .await
-        {
-            Ok((backend, _)) => {
-                backend.shutdown().await;
-                panic!("remote selected-skill fork must fail")
-            }
-            Err(err) => err,
-        };
-        assert_eq!(fork_err.code, AgentErrorCode::Unsupported);
-        assert!(fork_err.message.contains("will not send local skill paths"));
-        assert!(fake.requests().is_empty());
+        // The dropped selection is what reaches projection, so nothing local is
+        // materialized and no path exists to send anywhere.
+        assert!(
+            CodexSkillProjection::new(&[])
+                .expect("an empty selection needs no projection")
+                .is_none()
+        );
         assert!(fake.skill_projection_dirs().is_empty());
+        assert!(fake.requests().is_empty());
     }
 
     #[test]
@@ -20403,6 +20574,8 @@ for line in sys.stdin:
         )
         .await;
 
+        // Not a skill failure: without an app-server there is no session at all,
+        // so this one still fails.
         let err = match result {
             Ok((session, _)) => {
                 session.shutdown().await;

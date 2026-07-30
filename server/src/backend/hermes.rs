@@ -295,6 +295,13 @@ struct HermesGatewayHandle {
     request_timeout: Duration,
     system_overlay_installed: bool,
     provider_version: Option<String>,
+    /// The instructions this gateway was started with. Rendered inside `spawn`,
+    /// because whether the skills can be named depends on whether registering
+    /// the store actually took — and that is only known there.
+    spawn_instructions: Option<String>,
+    /// Why this session has no Tyde skills, when it was supposed to. Surfaced to
+    /// the user by the caller; a session is never refused over it.
+    skill_notice: Option<String>,
 }
 
 enum HermesGatewayCommand {
@@ -752,20 +759,22 @@ impl Backend for HermesBackend {
         let remote_host =
             crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
         let dropped_skills_notice =
-            hermes_remote_skill_gate(&config.resolved_spawn_config, remote_host.as_deref())?;
+            hermes_remote_skill_notice(&config.resolved_spawn_config, remote_host.as_deref());
         let expose_skills =
             remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
-        let spawn_instructions =
-            render_hermes_spawn_instructions(&config.resolved_spawn_config, expose_skills);
         let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
-            spawn_instructions.as_deref(),
+            &config.resolved_spawn_config,
             expose_skills,
         )
         .await?;
+        let spawn_instructions = gateway.spawn_instructions.clone();
+        // Either the store could not travel, or registering it did not take.
+        // Both are notices; neither stops the session.
+        let dropped_skills_notice = dropped_skills_notice.or_else(|| gateway.skill_notice.clone());
         let history_instructions = (!gateway.system_overlay_installed)
             .then_some(spawn_instructions.as_deref())
             .flatten();
@@ -843,22 +852,23 @@ impl Backend for HermesBackend {
         let remote_host =
             crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
         // Resume refuses any session whose instructions cannot be installed
-        // remotely (below), so the gate's notice has nowhere to go and only its
-        // refusal matters here.
-        hermes_remote_skill_gate(&config.resolved_spawn_config, remote_host.as_deref())?;
+        // remotely (below), which is a different question from whether the
+        // skills came along; the notice for those is surfaced with the rest.
+        let dropped_skills_notice =
+            hermes_remote_skill_notice(&config.resolved_spawn_config, remote_host.as_deref());
         let expose_skills =
             remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
-        let spawn_instructions =
-            render_hermes_spawn_instructions(&config.resolved_spawn_config, expose_skills);
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
-            spawn_instructions.as_deref(),
+            &config.resolved_spawn_config,
             expose_skills,
         )
         .await?;
+        let spawn_instructions = gateway.spawn_instructions.clone();
+        let dropped_skills_notice = dropped_skills_notice.or_else(|| gateway.skill_notice.clone());
         if spawn_instructions.is_some() && !gateway.system_overlay_installed {
             gateway.shutdown().await;
             return Err(
@@ -891,6 +901,14 @@ impl Backend for HermesBackend {
         let replay_events = hermes_history_to_chat_events(&history)?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        // A resumed session that came back without its skills says so, exactly
+        // as a fresh one does. The channel is unbounded and its receiver is
+        // returned below, so this survives until the client attaches.
+        if let Some(notice) = dropped_skills_notice {
+            let _ = events_tx.send(BackendEvent::Chat(ChatEvent::MessageAdded(
+                warning_message(notice),
+            )));
+        }
         let (resume_replay_complete_tx, resume_replay_complete_rx) = oneshot::channel();
         let stored_session_id = Arc::new(std::sync::Mutex::new(SessionId(resumed)));
         let compaction_capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(
@@ -952,7 +970,7 @@ impl Backend for HermesBackend {
             &[],
             &protocol::ToolPolicy::Unrestricted,
             &profile,
-            None,
+            &ResolvedSpawnConfig::default(),
             false,
         )
         .await?;
@@ -1176,7 +1194,7 @@ pub(crate) async fn probe_profile_surfaces(
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
-        None,
+        &ResolvedSpawnConfig::default(),
         false,
     )
     .await;
@@ -1569,7 +1587,7 @@ async fn run_credential_actions_for_profile(
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
-        None,
+        &ResolvedSpawnConfig::default(),
         false,
     )
     .await?;
@@ -2598,7 +2616,7 @@ impl HermesGatewayHandle {
         startup_mcp_servers: &[StartupMcpServer],
         tool_policy: &protocol::ToolPolicy,
         profile: &HermesProfileRef,
-        spawn_instructions: Option<&str>,
+        resolved: &ResolvedSpawnConfig,
         expose_skills: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
@@ -2620,16 +2638,28 @@ impl HermesGatewayHandle {
                 profile.home_dir.to_string_lossy().to_string(),
             );
         }
-        // Before the gateway starts, so a store Hermes cannot see is a clean
-        // startup error rather than a session that reports every selected skill
-        // as missing. Remote targets never get here: the caller drops or refuses
+        // Before the gateway starts, and before the instructions are rendered:
+        // whether this session may *name* its skills is exactly whether
+        // registering the store took. A registration that fails costs the
+        // session its skills — never the session itself — and the prompt is then
+        // rendered without them, because naming a skill Hermes cannot load is
+        // worse than silence. Remote targets never get here: the caller drops
         // their skills, because this edits a config file on *this* machine.
-        if expose_skills && target.remote_host.is_none() {
-            let skills_root = crate::store::skills::SkillStore::default_root_dir()?;
-            register_hermes_skill_dir(&target, &skills_root).await?;
+        let registration = if expose_skills && target.remote_host.is_none() {
+            Some(match crate::store::skills::SkillStore::default_root_dir() {
+                Ok(skills_root) => register_hermes_skill_dir(&target, &skills_root).await,
+                Err(err) => Err(err),
+            })
+        } else {
+            None
+        };
+        let (spawn_instructions, skill_notice) = hermes_skill_exposure(resolved, registration);
+        if let Some(notice) = skill_notice.as_deref() {
+            tracing::warn!("{notice}");
         }
         let system_overlay_installed = target.remote_host.is_none();
-        if system_overlay_installed && let Some(spawn_instructions) = spawn_instructions {
+        if system_overlay_installed && let Some(spawn_instructions) = spawn_instructions.as_deref()
+        {
             target.env.insert(
                 TYDE_HERMES_SYSTEM_PROMPT_ENV.to_string(),
                 spawn_instructions.to_string(),
@@ -2686,6 +2716,8 @@ impl HermesGatewayHandle {
             request_timeout,
             system_overlay_installed,
             provider_version: target.provider_version.clone(),
+            spawn_instructions,
+            skill_notice,
         };
 
         match tokio::time::timeout(startup_timeout, ready_rx).await {
@@ -4936,38 +4968,62 @@ fn render_hermes_spawn_instructions(
     }
 }
 
-/// Decide what a session does about skills it may not be able to expose.
+/// Decide what this session may name and what it must report, from the outcome
+/// of registering Tyde's store with the Hermes install it will run against.
 ///
-/// Mirrors the policy every other backend uses. An explicit selection is
-/// fail-closed, because a custom agent naming its skills is stating what the
-/// session is for. The Default agent degrades, because it selects every
-/// installed skill and running remotely must not become impossible just because
-/// the store cannot travel — but it says so.
-fn hermes_remote_skill_gate(
+/// `registration` is `None` when registration was never attempted — a remote
+/// gateway, or a session with no skills. Pure on purpose: the ordering it
+/// encodes is load-bearing and would otherwise only be testable through a live
+/// gateway. A registration that failed must render instructions that name *no*
+/// skills, because a name with nothing behind it makes the model report every
+/// selected skill as missing, which is the failure this whole path exists to
+/// avoid. The notice is how the user finds out instead.
+fn hermes_skill_exposure(
+    resolved: &ResolvedSpawnConfig,
+    registration: Option<Result<(), String>>,
+) -> (Option<String>, Option<String>) {
+    let (discoverable, notice) = match registration {
+        None => (false, None),
+        Some(Ok(())) => (true, None),
+        Some(Err(err)) => (
+            false,
+            Some(format!(
+                "Tyde started this Hermes session without its {} selected skill(s): {err}. The \
+                 session works normally otherwise.",
+                resolved.skills.len()
+            )),
+        ),
+    };
+    (
+        render_hermes_spawn_instructions(resolved, discoverable),
+        notice,
+    )
+}
+
+/// Decide what a session does about skills it cannot expose remotely.
+///
+/// Mirrors the policy every other backend uses: the skills are dropped, never
+/// the session, whatever the selection asked for. An explicitly selected skill
+/// is worth naming more loudly than one of everything-installed, but refusing to
+/// start would cost the agent every other skill and the workspace with it.
+fn hermes_remote_skill_notice(
     resolved: &ResolvedSpawnConfig,
     remote_host: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(host) = remote_host else {
-        return Ok(None);
-    };
+) -> Option<String> {
+    let host = remote_host?;
     if resolved.skills.is_empty() {
-        return Ok(None);
+        return None;
     }
-    if resolved.skill_selection == SkillSelection::Explicit {
-        return Err(format!(
-            "Hermes skills are not available over SSH. This session selected {} skill(s), but \
-             Tyde exposes them by registering its skill store with the Hermes install on the \
-             machine it runs on, which the gateway on '{host}' cannot read. Remove the skills \
-             from this agent to run it remotely.",
-            resolved.skills.len()
-        ));
-    }
-    Ok(Some(format!(
-        "Tyde started this Hermes session without its {} installed skill(s): the gateway runs on \
-         '{host}' over SSH, and Tyde's skill store is on this machine. The session works \
+    let selection = match resolved.skill_selection {
+        SkillSelection::Explicit => "explicitly selected",
+        SkillSelection::AllInstalled => "installed",
+    };
+    Some(format!(
+        "Tyde started this Hermes session without its {} {selection} skill(s): the gateway runs \
+         on '{host}' over SSH, and Tyde's skill store is on this machine. The session works \
          normally otherwise, and any skills installed on '{host}' are still available.",
         resolved.skills.len()
-    )))
+    ))
 }
 
 pub(crate) fn session_is_resumable_for_workspace_roots(
@@ -10579,30 +10635,87 @@ for line in sys.stdin:
         );
     }
 
+    /// A registration Hermes did not take is the exact case that used to stop
+    /// the spawn. It now costs the session its skills — and, critically, the
+    /// instructions stop naming them, so the model is never told about a skill
+    /// `skills_list` cannot see.
     #[test]
-    fn remote_hermes_refuses_an_explicit_selection_and_reports_a_degraded_default() {
-        let explicit = skill_resolved_config(SkillSelection::Explicit);
-        let err = hermes_remote_skill_gate(&explicit, Some("builder.example"))
-            .expect_err("an explicit selection must fail closed rather than start without it");
-        assert!(err.contains("not available over SSH"), "{err}");
-        assert!(err.contains("builder.example"), "{err}");
-        assert!(err.contains("2 skill(s)"), "{err}");
+    fn a_failed_registration_drops_the_skills_from_the_prompt_not_the_session() {
+        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
 
-        let notice = hermes_remote_skill_gate(
+        let (instructions, notice) = hermes_skill_exposure(&resolved, Some(Ok(())));
+        assert!(
+            instructions
+                .as_deref()
+                .is_some_and(|text| text.contains("axdb-ops")),
+            "a registered store may be named: {instructions:?}"
+        );
+        assert_eq!(notice, None);
+
+        let (instructions, notice) = hermes_skill_exposure(
+            &resolved,
+            Some(Err(
+                "Hermes did not register the Tyde skills directory".to_string()
+            )),
+        );
+        assert!(
+            !instructions
+                .as_deref()
+                .unwrap_or_default()
+                .contains("axdb-ops"),
+            "a store Hermes did not register must not be named: {instructions:?}"
+        );
+        let notice = notice.expect("a failed registration must be reported");
+        assert!(notice.contains("2 selected skill(s)"), "{notice}");
+        assert!(notice.contains("did not register"), "{notice}");
+        assert!(
+            notice.contains("works normally otherwise"),
+            "the session survives, and the notice says so: {notice}"
+        );
+
+        // Never attempted (remote, or nothing selected): no notice from here,
+        // and nothing named.
+        let (instructions, notice) = hermes_skill_exposure(&resolved, None);
+        assert!(
+            !instructions
+                .as_deref()
+                .unwrap_or_default()
+                .contains("axdb-ops")
+        );
+        assert_eq!(notice, None);
+    }
+
+    /// A remote session keeps its workspace and loses its skills, whichever way
+    /// they were selected. The selection type only changes how the loss is
+    /// described — an explicitly named skill going missing is worth saying so.
+    #[test]
+    fn remote_hermes_drops_skills_with_a_notice_for_every_selection() {
+        let explicit = skill_resolved_config(SkillSelection::Explicit);
+        let explicit_notice = hermes_remote_skill_notice(&explicit, Some("builder.example"))
+            .expect("an explicit selection is dropped with a notice, not refused");
+        assert!(
+            explicit_notice.contains("2 explicitly selected skill(s)"),
+            "{explicit_notice}"
+        );
+        assert!(
+            explicit_notice.contains("builder.example"),
+            "{explicit_notice}"
+        );
+
+        let notice = hermes_remote_skill_notice(
             &skill_resolved_config(SkillSelection::AllInstalled),
             Some("builder.example"),
         )
-        .expect("the Default agent still starts remotely")
-        .expect("but never silently");
+        .expect("a Default agent starts remotely, but never silently");
         assert!(notice.contains("2 installed skill(s)"), "{notice}");
         assert!(notice.contains("builder.example"), "{notice}");
 
         // Local sessions are unaffected, and a skill-less remote session has
         // nothing to report either way.
-        assert_eq!(hermes_remote_skill_gate(&explicit, None), Ok(None));
+        assert_eq!(hermes_remote_skill_notice(&explicit, None), None);
         assert_eq!(
-            hermes_remote_skill_gate(&ResolvedSpawnConfig::default(), Some("builder.example")),
-            Ok(None)
+            hermes_remote_skill_notice(&ResolvedSpawnConfig::default(), Some("builder.example")),
+            None
         );
     }
 

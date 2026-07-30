@@ -29,7 +29,7 @@ use crate::agent::customization::SkillSelection;
 use crate::backend::claude_skills::{
     CLAUDE_PLUGIN_DIR_FLAG, ClaudeSkillPlugin, InitFrameVerdict, PreparedSkill,
     degraded_default_notice, help_text_supports_plugin_dir, native_skill_overlay,
-    unsupported_plugin_dir_error, verify_init_frame, verify_plugin_inventory,
+    unsupported_plugin_dir_notice, verify_init_frame, verify_plugin_inventory,
 };
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -267,15 +267,18 @@ struct ClaudeSkillExposure {
 /// Decide how a Claude session exposes its selected skills, and materialize the
 /// session plugin when it is a local session.
 ///
-/// **An explicit selection is fail-closed.** A custom agent naming its skills is
-/// making a statement about what the session is for, so any refusal, unreadable
-/// body, or name collision aborts startup rather than quietly starting a
-/// different agent than the one that was configured.
+/// **Nothing about a skill stops a session from starting.** A skill that cannot
+/// be exposed — a refusal, an unreadable body, a name collision, a CLI too old
+/// for `--plugin-dir`, an SSH target that cannot see this machine's disk — costs
+/// the session that one capability. Refusing to start costs it that capability
+/// *and* every other skill, the agent, and the conversation, which is a strictly
+/// worse answer to the same problem. This holds for an explicit selection too:
+/// a custom agent short one skill is still the agent the user asked for.
 ///
-/// **The Default agent may degrade**, because it selects every installed skill
-/// and one broken skill anywhere in the store must not make Claude unusable —
-/// but only with a user-visible notice naming every omitted skill and why, and
-/// the overlay is then built solely from the skills that actually materialized.
+/// **What is never allowed is silence.** Every omission produces a user-visible
+/// notice naming the skill and the reason, and the overlay is built solely from
+/// the skills that actually materialized, so the model is never told about a
+/// skill this session does not have.
 ///
 /// There is deliberately no fallback to pasting bodies into a local prompt: that
 /// is the behaviour this work removes, and doing it silently on a capability
@@ -284,12 +287,26 @@ async fn claude_prepare_skills(
     config: &BackendSpawnConfig,
     ssh_host: Option<&str>,
     workspace_root: &str,
-) -> Result<(ClaudeSkillExposure, ClaudeSkillSteering), String> {
+) -> (ClaudeSkillExposure, ClaudeSkillSteering) {
     let selected = &config.resolved_spawn_config.skills;
     let selection = config.resolved_spawn_config.skill_selection;
     if selected.is_empty() {
-        return Ok((ClaudeSkillExposure::default(), ClaudeSkillSteering::None));
+        return (ClaudeSkillExposure::default(), ClaudeSkillSteering::None);
     }
+
+    // Every exit below that gives up on skills routes through this, so no path
+    // can drop one without telling the user which and why.
+    let without_skills = |notice: String| {
+        tracing::warn!("{notice}");
+        (
+            ClaudeSkillExposure {
+                plugin: None,
+                expected: Vec::new(),
+                degraded_notice: Some(notice),
+            },
+            ClaudeSkillSteering::None,
+        )
+    };
 
     // Keyed on the host actually handed to the low-level spawn, not on the shape
     // of the workspace roots: a root list that merely mentions `ssh://` does not
@@ -299,61 +316,67 @@ async fn claude_prepare_skills(
     // machine is invisible to a CLI running somewhere else, and Tyde has no
     // remote materialization path. Earlier revisions inlined bodies here
     // instead; that branch was unreachable from any production entry point, so
-    // it documented a fallback that did not exist. A skill-bearing remote
-    // session now fails visibly.
+    // it documented a fallback that did not exist. The session runs remotely
+    // without them, and says so.
     if let Some(host) = ssh_host {
-        return Err(format!(
-            "Claude skills are not available over SSH. This session selected {} skill(s), but \
-             Tyde materializes them into a directory on the machine it runs on, which the CLI \
-             on '{host}' cannot read. Remove the skills from this agent to run it remotely.",
+        return without_skills(format!(
+            "Tyde started this Claude session without its {} selected skill(s): Tyde \
+             materializes them into a directory on the machine it runs on, which the CLI on \
+             '{host}' cannot read. The session works normally otherwise, and any skills \
+             installed on '{host}' are still available.",
             selected.len()
         ));
     }
 
     if !claude_supports_plugin_dir().await {
-        return Err(unsupported_plugin_dir_error());
+        return without_skills(unsupported_plugin_dir_notice());
     }
 
-    let outcome = ClaudeSkillPlugin::prepare(None, selected)?;
+    let outcome = match ClaudeSkillPlugin::prepare(None, selected) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return without_skills(format!(
+                "Tyde started this Claude session without its {} selected skill(s): {err}",
+                selected.len()
+            ));
+        }
+    };
     for refusal in &outcome.refusals {
         tracing::warn!("Claude skill materialization: {}", refusal.describe());
-    }
-
-    if !outcome.refusals.is_empty() && selection == SkillSelection::Explicit {
-        return Err(format!(
-            "This agent explicitly selected {} skill(s), and Tyde could not expose all of \
-             them, so the session was not started:\n{}",
-            selected.len(),
-            outcome
-                .refusals
-                .iter()
-                .map(|refusal| format!("- {}", refusal.describe()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
     }
 
     let degraded_notice =
         (!outcome.refusals.is_empty()).then(|| degraded_default_notice(&outcome.refusals));
 
     let Some(plugin) = outcome.plugin else {
-        // Every installed skill was refused. A Default session still starts, but
-        // never silently: the notice above names each one.
-        return Ok((
+        // Every selected skill was refused. The session still starts, but never
+        // silently: the notice above names each one.
+        return (
             ClaudeSkillExposure {
                 plugin: None,
                 expected: Vec::new(),
                 degraded_notice,
             },
             ClaudeSkillSteering::None,
-        ));
+        );
     };
 
-    // Zero-provider, pre-start, machine-readable: prove the CLI actually loaded
-    // this root before the session process exists. Catches every *global*
-    // failure — a rejected flag, an unreadable manifest, a disabled plugin —
-    // while it is still a clean startup error rather than a mid-turn surprise.
-    claude_verify_plugin_loaded(plugin.root(), workspace_root).await?;
+    // Zero-provider, pre-start, machine-readable: find out whether the CLI
+    // actually loaded this root before the session process exists. Catches every
+    // *global* failure — a rejected flag, an unreadable manifest, a disabled
+    // plugin — early enough to tell the user in one notice instead of letting
+    // each skill turn up missing mid-turn.
+    if let Err(err) = claude_verify_plugin_loaded(plugin.root(), workspace_root).await {
+        let mut notice = format!(
+            "Tyde started this Claude session without its {} selected skill(s): {err}.",
+            selected.len()
+        );
+        if let Some(refused) = degraded_notice.as_deref() {
+            notice.push_str("\n\n");
+            notice.push_str(refused);
+        }
+        return without_skills(notice);
+    }
 
     let expected = plugin.exposed().to_vec();
     tracing::debug!(
@@ -362,14 +385,14 @@ async fn claude_prepare_skills(
         plugin.root().display(),
         expected.join(", ")
     );
-    Ok((
+    (
         ClaudeSkillExposure {
             plugin: Some(Arc::new(plugin)),
             expected,
             degraded_notice,
         },
         ClaudeSkillSteering::Native(selection, outcome.prepared),
-    ))
+    )
 }
 
 impl ClaudeSession {
@@ -872,8 +895,10 @@ enum ClaudeSkillReadiness {
     Pending,
     /// Every materialized skill was reported loaded.
     Ready,
-    /// Verification failed. Startup fails with this message.
-    Failed(String),
+    /// The session is short at least one skill, or could not be confirmed to
+    /// have them. It keeps running — this message is the notice the user gets,
+    /// not a startup error.
+    Degraded(String),
 }
 
 struct ClaudeProcessRuntime {
@@ -1165,19 +1190,40 @@ impl ClaudeSystemFrame {
 ///
 /// Used only while skill verification is still pending: a turn that reaches its
 /// `result` without ever emitting an `init` frame is never going to emit one, so
-/// the session must fail rather than hold its output indefinitely.
+/// the reader stops holding its output and says the skills were unconfirmed.
 fn claude_frame_is_turn_terminal(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("result")
+}
+
+/// Put held-back frames back at the front of the queue, in arrival order.
+///
+/// `after` is the frame that ended the hold; it is requeued *behind* the frames
+/// it followed so the replay preserves true arrival order. Every exit from the
+/// hold goes through here — held frames are model output, and there is no
+/// outcome, skill gap included, that makes discarding them right.
+fn release_held_frames(
+    held_back: &mut Vec<Value>,
+    held_back_bytes: &mut usize,
+    queue: &mut std::collections::VecDeque<Value>,
+    after: Option<Value>,
+) {
+    if let Some(value) = after {
+        queue.push_front(value);
+    }
+    for held in held_back.drain(..).rev() {
+        queue.push_front(held);
+    }
+    *held_back_bytes = 0;
 }
 
 /// Skills reported by a `system`/`init` frame.
 ///
 /// `None` means this is not an `init` frame. `Some(Ok(None))` means the frame
 /// carried no `skills` field at all, and `Some(Err(_))` means it carried one
-/// Tyde cannot read — both are verification failures, not reasons to proceed.
-/// Parsed straight from the JSON rather than through `ClaudeSystemFrame` so a
-/// malformed `skills` field cannot make the whole frame unparseable and thus
-/// invisible to the gate.
+/// Tyde cannot read — both mean the session's skills are unconfirmed, which is
+/// reported rather than assumed either way. Parsed straight from the JSON rather
+/// than through `ClaudeSystemFrame` so a malformed `skills` field cannot make
+/// the whole frame unparseable and thus invisible to the check.
 fn claude_init_frame_skills(value: &Value) -> Option<Result<Option<Vec<String>>, String>> {
     if value.get("type").and_then(Value::as_str) != Some("system")
         || value.get("subtype").and_then(Value::as_str) != Some("init")
@@ -1568,9 +1614,11 @@ struct SkillFailureTarget {
     turn_id: Option<u64>,
 }
 
-/// What a committed skill failure hands back for the caller to finish.
+/// What a committed skill gap hands back for the caller to finish.
+///
+/// Only the watchdog: the gap does not touch the turn's outcome sender, because
+/// a turn is not failed by a skill the session could not expose.
 struct CommittedSkillFailure {
-    outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
     watchdog: Option<JoinHandle<()>>,
 }
 
@@ -3334,17 +3382,7 @@ impl ClaudeInner {
         }
     }
 
-    /// Terminate the session because the CLI did not load the skills Tyde
-    /// materialized.
-    ///
-    /// The `init` frame arrives at the head of the CLI's response to the first
-    /// user message, so by the time this runs the first provider request is
-    /// already in flight — that race is unavoidable without a pre-start skill
-    /// inventory the CLI does not expose (see `verify_plugin_inventory`). What
-    /// is avoidable is *acting* on a session whose skills are wrong, so this
-    /// suppresses everything the model says, fails the turn, and kills the
-    /// process rather than letting a half-equipped agent continue.
-    /// The identity to decide a skill failure against, taken now.
+    /// The identity to decide a skill gap against, taken now.
     async fn current_skill_failure_target(&self) -> SkillFailureTarget {
         let state = self.state.lock().await;
         SkillFailureTarget {
@@ -3353,19 +3391,19 @@ impl ClaudeInner {
         }
     }
 
-    /// Commit a skill failure, or decline it.
+    /// Commit a skill gap, or decline it.
     ///
     /// Every check and every mutation happens in one critical section under the
     /// state lock — the same lock a cancel takes. That makes the two linearize:
     /// whichever acquires it first wins, and the loser's revalidation fails
-    /// rather than half-applying. A failure declines when the process has moved
-    /// on, when verification is no longer pending, when a cancel already marked
-    /// abandonment, when the active turn is not the exact one the failure was
+    /// rather than half-applying. A gap declines when the process has moved on,
+    /// when verification is no longer pending, when a cancel already marked
+    /// abandonment, when the active turn is not the exact one the gap was
     /// decided for, or when that turn has been interrupted.
     ///
-    /// Declining emits nothing and takes nothing: a cancelled turn must not be
-    /// reported as a skill failure, and a turn this failure was not about must
-    /// not have its sender taken.
+    /// Declining emits nothing: a cancelled turn must not be reported as a
+    /// missing skill, and a gap decided against a turn that is no longer running
+    /// would name the wrong one.
     async fn commit_skill_failure(
         &self,
         target: &SkillFailureTarget,
@@ -3411,75 +3449,62 @@ impl ClaudeInner {
             return None;
         }
 
-        // Committed. Transition, disown the watchdog, and take *this* turn's
-        // sender — never whichever turn happens to be current.
+        // Committed. Transition and disown the watchdog. The turn's outcome
+        // sender is deliberately left alone: the turn is still the user's turn
+        // and still completes on its own terms. A skill Tyde could not expose
+        // does not make the model's answer void.
         self.skill_readiness
-            .send_replace(ClaudeSkillReadiness::Failed(reason.to_string()));
+            .send_replace(ClaudeSkillReadiness::Degraded(reason.to_string()));
         let watchdog = state.skill_watchdog.take();
-        let outcome_tx = state
-            .active_turn
-            .as_mut()
-            .and_then(|active| active.outcome_tx.take());
-        Some(CommittedSkillFailure {
-            outcome_tx,
-            watchdog,
-        })
+        Some(CommittedSkillFailure { watchdog })
     }
 
-    /// Terminate the session for a skill failure decided against `target`.
+    /// Report a skill gap decided against `target`, and let the session run on.
+    ///
+    /// The `init` frame arrives at the head of the CLI's response to the first
+    /// user message, so by the time this runs the first provider request is
+    /// already in flight — that race is unavoidable without a pre-start skill
+    /// inventory the CLI does not expose (see `verify_plugin_inventory`). An
+    /// earlier revision resolved it by suppressing the model's output, failing
+    /// the turn and killing the process. That traded one missing skill for the
+    /// whole session, and did it most often for the most harmless cause: Claude
+    /// dropping a plugin skill whose name collided with one the user already
+    /// had, where the capability is in fact still there under its own name.
+    ///
+    /// So the gap is now a notice. It is emitted once, it names the skill, and
+    /// the session keeps every other skill, its turn, and its process.
     ///
     /// `abort_watchdog` is false when the caller *is* the watchdog: aborting its
     /// own handle would cancel it at the next await, which is how an earlier
     /// revision lost the settle.
-    async fn terminate_for_skill_mismatch(
+    async fn report_skill_gap(
         &self,
         target: &SkillFailureTarget,
         message: &str,
         abort_watchdog: bool,
     ) {
-        let full = format!(
-            "{message} Tyde stopped this Claude session before using its response, because a \
-             session missing a skill it was configured with will silently do the wrong thing."
-        );
-        let Some(committed) = self.commit_skill_failure(target, &full).await else {
+        let Some(committed) = self.commit_skill_failure(target, message).await else {
             return;
         };
-        tracing::error!("{full}");
-        self.emit_error(&full);
-        if let Some(sender) = committed.outcome_tx {
-            let _ = sender.send(TurnOutcome::Failed {
-                summary: ClaudeStdoutSummary::default(),
-                error: full,
-            });
-        }
+        tracing::warn!("{message}");
+        // A notice, not a `backend_error`: an error card reads as "this turn
+        // failed", and this turn did not.
+        self.emitter.subprocess_stderr(message);
         if let Some(handle) = committed.watchdog
             && abort_watchdog
         {
             handle.abort();
         }
-        self.shutdown_process().await;
-    }
-
-    /// Has this session been terminated for a skill mismatch?
-    ///
-    /// Read by the stdout reader before forwarding anything, so no model output
-    /// from a mis-equipped session reaches the user even if frames were already
-    /// buffered when the mismatch was detected.
-    fn skills_mismatched(&self) -> bool {
-        matches!(
-            *self.skill_readiness.borrow(),
-            ClaudeSkillReadiness::Failed(_)
-        )
     }
 
     /// Record the CLI's `init` frame against what Tyde materialized.
     ///
     /// The frame is produced locally before any provider request, so this costs
-    /// nothing and can gate the first prompt. A missing skill means the CLI
-    /// dropped it — most likely a collision with a user-owned skill of the same
-    /// name, which the CLI resolves in the user's favour and logs only at debug
-    /// level. That is a startup failure, not a notice: a session that believes
-    /// it has a skill it does not have will silently do the wrong thing.
+    /// nothing. A missing skill means the CLI dropped it — most likely a
+    /// collision with a user-owned skill of the same name, which the CLI
+    /// resolves in the user's favour and logs only at debug level. Tyde says so
+    /// out loud, because the alternative is a session that believes it has a
+    /// skill it does not have.
     async fn record_skill_init_frame(&self, reported: Result<Option<Vec<String>>, String>) {
         let expected = {
             let state = self.state.lock().await;
@@ -3494,7 +3519,7 @@ impl ClaudeInner {
         }
         let verdict = match reported {
             Ok(reported) => verify_init_frame(&expected, reported.as_deref()),
-            Err(message) => InitFrameVerdict::Failed(message),
+            Err(message) => InitFrameVerdict::Degraded(message),
         };
         match verdict {
             InitFrameVerdict::Verified => {
@@ -3506,34 +3531,30 @@ impl ClaudeInner {
                     .send_replace(ClaudeSkillReadiness::Ready);
                 self.cancel_skill_watchdog().await;
             }
-            InitFrameVerdict::Failed(message) => {
+            InitFrameVerdict::Degraded(message) => {
                 // The transition is left to `commit_skill_failure`. Setting it
                 // here would both pre-empt the atomic check and guarantee the
                 // commit declines, since it requires readiness to still be
                 // `Pending` — the very condition a cancel races it for.
                 let target = self.current_skill_failure_target().await;
-                self.terminate_for_skill_mismatch(&target, &message, true)
-                    .await;
+                self.report_skill_gap(&target, &message, true).await;
             }
         }
     }
 
-    /// Current verification state. There is deliberately no *blocking* variant:
-    /// the `init` frame only arrives in response to a user message, so waiting
-    /// for it before sending one would deadlock.
-    fn skill_readiness_snapshot(&self) -> ClaudeSkillReadiness {
-        self.skill_readiness.borrow().clone()
-    }
-
+    /// Current verification state. Nothing in production branches on this any
+    /// more — the reader only needs to know whether the hold is over, which
+    /// `skills_awaiting_verification` answers — but tests assert on which of the
+    /// settled states a session reached.
     #[cfg(test)]
     fn skill_readiness_state(&self) -> ClaudeSkillReadiness {
-        self.skill_readiness_snapshot()
+        self.skill_readiness.borrow().clone()
     }
 
     /// Is this session still waiting to learn whether it has its skills?
     ///
-    /// While true, the stdout reader holds model output back rather than
-    /// rendering something it may have to retract.
+    /// While true, the stdout reader holds model output back so the notice for
+    /// a skill that did not arrive lands ahead of the output it is about.
     fn skills_awaiting_verification(&self) -> bool {
         if !matches!(
             *self.skill_readiness.borrow(),
@@ -3581,7 +3602,7 @@ impl ClaudeInner {
             // `abort_watchdog: false` — this task owns the handle it would be
             // aborting, and cancelling itself would drop the settle.
             inner
-                .terminate_for_skill_mismatch(
+                .report_skill_gap(
                     &target,
                     "Claude did not report which skills it loaded within the startup timeout.",
                     false,
@@ -4953,10 +4974,12 @@ async fn read_claude_stdout_persistent(
     // Frames held back while skill verification is still Pending. The `init`
     // frame arrives at the head of the CLI's response to the first user
     // message, so anything the model says can reach this reader *before* Tyde
-    // knows whether the session has the skills it was configured with.
-    // Rendering that and retracting it later is worse than showing it a beat
-    // late, so it waits here and is replayed in order once the frame confirms
-    // the session — or dropped entirely if it does not.
+    // knows whether the session has the skills it was configured with. Holding
+    // them a beat keeps the skill notice ahead of the output it is about.
+    //
+    // Every exit from the hold releases these frames, including the ones that
+    // report a gap: the output is the model's answer either way, and a skill
+    // Tyde could not expose is not a reason to make the user's turn vanish.
     let mut held_back: Vec<Value> = Vec::new();
     // Held-back frames are bounded in both count and size. A CLI that streams a
     // long answer and never reports would otherwise grow this without limit,
@@ -4972,24 +4995,34 @@ async fn read_claude_stdout_persistent(
             Some(value) => value,
             None => {
                 let Ok(Some(line)) = lines.next_line().await else {
-                    // EOF. A session that never confirmed its skills must not
-                    // look like a clean end-of-stream — unless the user
-                    // cancelled, in which case this is the cancel taking effect
-                    // and blaming the skills would be wrong.
+                    // EOF. A session that never confirmed its skills says so —
+                    // unless the user cancelled, in which case this is the
+                    // cancel taking effect and blaming the skills would be
+                    // wrong.
                     if inner.skills_awaiting_verification() {
                         if inner.active_turn_is_interrupted().await {
                             inner.abandon_skill_verification_for_cancelled_turn().await;
                         } else {
                             inner
-                                .terminate_for_skill_mismatch(
+                                .report_skill_gap(
                                     &inner.current_skill_failure_target().await,
-                                    "Claude exited before reporting which skills it loaded.",
+                                    "Claude exited before reporting which skills it loaded, so \
+                                     Tyde could not confirm this session had them.",
                                     true,
                                 )
                                 .await;
                         }
                     }
-                    held_back.clear();
+                    // Release anything still held: it is output the user has
+                    // not seen yet, and this is the last chance to show it. The
+                    // next pass finds the buffer empty and leaves.
+                    if !held_back.is_empty() {
+                        for held in held_back.drain(..).rev() {
+                            queue.push_front(held);
+                        }
+                        held_back_bytes = 0;
+                        continue;
+                    }
                     break;
                 };
                 let trimmed = line.trim();
@@ -5020,17 +5053,27 @@ async fn read_claude_stdout_persistent(
         // and the terminal frames that follow a cancel must report cancellation.
         if inner.skills_awaiting_verification() && inner.active_turn_is_interrupted().await {
             inner.abandon_skill_verification_for_cancelled_turn().await;
-            held_back.clear();
-            held_back_bytes = 0;
+            // Requeued behind the frames it followed, and only once the hold is
+            // actually over — re-queuing a frame that would take this branch
+            // again is a spin, not a replay.
+            if !inner.skills_awaiting_verification() {
+                release_held_frames(
+                    &mut held_back,
+                    &mut held_back_bytes,
+                    &mut queue,
+                    Some(value),
+                );
+                continue;
+            }
         }
 
         // Inbound control *requests* — permission prompts, ExitPlanMode,
-        // AskUserQuestion — are turn-time actions. The real protocol does not
-        // send them before the `init` frame, and acting on one would be taking
-        // an action on behalf of a session whose skills are still unverified.
-        // Fail fast rather than buffer: these carry a request id the CLI is
-        // blocking on, so holding one is a hang, and answering one is exactly
-        // the bypass this check exists to prevent.
+        // AskUserQuestion — are turn-time actions that carry a request id the
+        // CLI is blocking on, so they can never be buffered: holding one is a
+        // hang. The real protocol does not send them before the `init` frame,
+        // so one arriving here means the frame is not coming. Settle
+        // verification with a notice and answer the request, rather than
+        // leaving the CLI blocked on a reply that will never come.
         if inner.skills_awaiting_verification()
             && value.get("type").and_then(Value::as_str) == Some("control_request")
         {
@@ -5039,18 +5082,29 @@ async fn read_claude_stdout_persistent(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             inner
-                .terminate_for_skill_mismatch(
+                .report_skill_gap(
                     &inner.current_skill_failure_target().await,
                     &format!(
                         "Claude asked Tyde to act on a '{subtype}' control request before \
-                         reporting which skills it loaded."
+                         reporting which skills it loaded, so Tyde could not confirm this \
+                         session had them."
                     ),
                     true,
                 )
                 .await;
-            held_back.clear();
-            held_back_bytes = 0;
-            continue;
+            if !inner.skills_awaiting_verification() {
+                release_held_frames(
+                    &mut held_back,
+                    &mut held_back_bytes,
+                    &mut queue,
+                    Some(value),
+                );
+                continue;
+            }
+            // The settle was declined — a cancel or a newer process won the
+            // race. Fall through and answer the request regardless: the CLI is
+            // blocked on a reply, and leaving it blocked is the one outcome
+            // worse than answering under an unconfirmed skill set.
         }
 
         if handle_exit_plan_mode_control_request(&value, &inner, &mut turn_state, &stdin).await {
@@ -5067,64 +5121,80 @@ async fn read_claude_stdout_persistent(
         // `continue`d: the frame still flows to the per-turn reducer.
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
-            match inner.skill_readiness_snapshot() {
-                ClaudeSkillReadiness::Ready if !held_back.is_empty() => {
-                    // Confirmed: everything held back is genuine output. It
-                    // arrived *before* this frame, so it goes in front of it and
-                    // this frame is requeued behind — replaying in true arrival
-                    // order rather than letting the confirming frame overtake
-                    // the output it confirmed. Guarded on a non-empty buffer so
-                    // the requeued frame cannot loop through here forever.
-                    queue.push_front(value);
-                    for held in held_back.drain(..).rev() {
-                        queue.push_front(held);
-                    }
-                    held_back_bytes = 0;
-                    continue;
-                }
-                ClaudeSkillReadiness::Failed(_) => {
-                    held_back.clear();
-                    held_back_bytes = 0;
-                }
-                _ => {}
+            // Settled — whether every skill arrived or some did not. Everything
+            // held back is genuine output either way, and it arrived *before*
+            // this frame, so it goes in front of it and this frame is requeued
+            // behind: true arrival order rather than letting the settling frame
+            // overtake the output it settled. Guarded on a non-empty buffer so
+            // the requeued frame cannot loop through here forever.
+            if !held_back.is_empty() && !inner.skills_awaiting_verification() {
+                release_held_frames(
+                    &mut held_back,
+                    &mut held_back_bytes,
+                    &mut queue,
+                    Some(value),
+                );
+                continue;
             }
-        }
-        // Once a mismatch is known, nothing this process says is trustworthy.
-        if inner.skills_mismatched() {
-            continue;
         }
         if inner.skills_awaiting_verification() {
             // A terminal frame while still unverified means the confirmation is
-            // never coming.
+            // never coming. Say so, then let the frame through: this is the end
+            // of the user's turn, and swallowing it would strand the turn.
             if claude_frame_is_turn_terminal(&value) {
                 inner
-                    .terminate_for_skill_mismatch(
+                    .report_skill_gap(
                         &inner.current_skill_failure_target().await,
-                        "Claude finished its turn without reporting which skills it loaded.",
+                        "Claude finished its turn without reporting which skills it loaded, so \
+                         Tyde could not confirm this session had them.",
                         true,
                     )
                     .await;
-                held_back.clear();
-                held_back_bytes = 0;
+                if !inner.skills_awaiting_verification() {
+                    release_held_frames(
+                        &mut held_back,
+                        &mut held_back_bytes,
+                        &mut queue,
+                        Some(value),
+                    );
+                    continue;
+                }
+                // Settle declined by a racing cancel or a newer process. Hold
+                // this frame with the rest rather than re-queueing it into the
+                // same branch; EOF releases the buffer.
+                held_back_bytes += value.to_string().len();
+                held_back.push(value);
                 continue;
             }
             let frame_bytes = value.to_string().len();
             if held_back.len() + 1 > CLAUDE_HELD_BACK_FRAME_LIMIT
                 || held_back_bytes + frame_bytes > CLAUDE_HELD_BACK_BYTE_LIMIT
             {
+                // The buffer is a courtesy — it keeps the notice ahead of the
+                // output it describes — and it is not worth unbounded memory or
+                // a stalled stream. Stop holding, say why, and let the output
+                // flow from here on.
                 inner
-                    .terminate_for_skill_mismatch(
+                    .report_skill_gap(
                         &inner.current_skill_failure_target().await,
                         &format!(
                             "Claude produced more than {} frames or {} bytes of output without \
-                             reporting which skills it loaded.",
+                             reporting which skills it loaded, so Tyde could not confirm this \
+                             session had them.",
                             CLAUDE_HELD_BACK_FRAME_LIMIT, CLAUDE_HELD_BACK_BYTE_LIMIT
                         ),
                         true,
                     )
                     .await;
-                held_back.clear();
-                held_back_bytes = 0;
+                // Released unconditionally: the bound has to hold whether or not
+                // the settle took, and an empty buffer means the requeued frame
+                // is under the limit next time round rather than back here.
+                release_held_frames(
+                    &mut held_back,
+                    &mut held_back_bytes,
+                    &mut queue,
+                    Some(value),
+                );
                 continue;
             }
             held_back_bytes += frame_bytes;
@@ -11711,20 +11781,14 @@ impl ClaudeBackend {
                     return;
                 }
             };
-            // Materialize before the process starts: a capability miss or a
-            // failed materialization must fail the spawn, not start a session
-            // that silently has no skills.
+            // Materialize before the process starts, so a capability miss or a
+            // failed materialization is one notice at startup rather than a
+            // skill that turns up missing mid-turn. It never fails the spawn:
+            // see `claude_prepare_skills`.
             // `ClaudeBackend` spawns the CLI locally; the low-level session is
             // the only layer that takes an ssh host, and it is given none here.
             let (skills, skill_steering) =
-                match claude_prepare_skills(&config, None, &probe_workspace_root).await {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        tracing::error!("Failed to prepare Claude skills: {err}");
-                        let _ = ready_tx.send(Err(err));
-                        return;
-                    }
-                };
+                claude_prepare_skills(&config, None, &probe_workspace_root).await;
             let steering = match claude_steering_content(&config, skill_steering) {
                 Ok(steering) => steering,
                 Err(err) => {
@@ -12780,7 +12844,7 @@ impl Backend for ClaudeBackend {
         // was unlinked when it shut down.
         let probe_workspace_root = pick_workspace_root(&workspace_roots)?;
         let (skills, skill_steering) =
-            claude_prepare_skills(&config, None, &probe_workspace_root).await?;
+            claude_prepare_skills(&config, None, &probe_workspace_root).await;
         let steering = claude_steering_content(&config, skill_steering)?;
         let steering_content = steering;
         let agent_identity = claude_agent_identity(&config);
@@ -14275,9 +14339,7 @@ sys.exit(1)
         );
         let config = spawn_config_with_skills(vec![incident], SkillSelection::Explicit);
 
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect("valid full frontmatter must reach plugin preflight");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
         assert_eq!(exposure.expected, ["tyde-skills:axdb-ops"]);
         assert!(exposure.degraded_notice.is_none());
@@ -14297,9 +14359,13 @@ sys.exit(1)
         }
     }
 
+    /// An explicit selection degrades like every other one. A custom agent short
+    /// a skill is still the agent the user asked for, and refusing to start
+    /// takes away the whole session over one unreadable file — so the skill is
+    /// dropped, named, and the reason kept.
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_explicit_selection_fails_closed_on_malformed_frontmatter() {
+    async fn an_explicit_selection_degrades_visibly_rather_than_refusing_to_start() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -14310,12 +14376,23 @@ sys.exit(1)
         );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
 
-        let err = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect_err("an explicit selection must fail closed");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
-        assert!(err.contains("explicitly selected"), "{err}");
-        assert!(err.contains("not valid YAML"), "{err}");
+        assert!(exposure.plugin.is_none());
+        assert!(exposure.expected.is_empty());
+        let notice = exposure
+            .degraded_notice
+            .as_deref()
+            .expect("dropping an explicitly selected skill must be user-visible");
+        assert!(notice.contains("broken"), "{notice}");
+        assert!(
+            notice.contains("not valid YAML"),
+            "the notice must keep the reason, not just the name: {notice}"
+        );
+        assert!(
+            matches!(steering, ClaudeSkillSteering::None),
+            "a skill that was not materialized must not be named to the model: {steering:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -14328,9 +14405,7 @@ sys.exit(1)
         let broken = skill_fixture(tmp.path(), "broken", "---\njust a scalar\n---\nbody\n");
         let config = spawn_config_with_skills(vec![good, broken], SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect("Default must not be blocked by one broken skill");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
         assert_eq!(exposure.expected, ["tyde-skills:good"]);
         let notice = exposure
@@ -14372,9 +14447,7 @@ sys.exit(1)
         );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect("Default still starts");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
         assert!(exposure.plugin.is_none());
         assert!(exposure.expected.is_empty());
@@ -14398,27 +14471,31 @@ sys.exit(1)
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_cli_without_plugin_dir_fails_the_spawn_rather_than_inlining() {
+    async fn a_cli_without_plugin_dir_starts_without_skills_rather_than_inlining() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(false, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
         let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
 
-        let err = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect_err("an incapable CLI must fail visibly");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
-        assert!(err.contains("--plugin-dir"), "{err}");
+        assert!(exposure.expected.is_empty());
+        assert!(matches!(steering, ClaudeSkillSteering::None));
+        let notice = exposure
+            .degraded_notice
+            .as_deref()
+            .expect("an incapable CLI must be reported, not silently tolerated");
+        assert!(notice.contains("--plugin-dir"), "{notice}");
         assert!(
-            err.contains("will not fall back"),
-            "the error must say there is no body-inlining fallback: {err}"
+            notice.contains("will not fall back"),
+            "the notice must say there is no body-inlining fallback: {notice}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_preflight_that_does_not_report_our_root_fails_the_spawn() {
+    async fn a_preflight_that_does_not_report_our_root_starts_without_skills() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         // The CLI claims to have loaded the plugin from somewhere else.
         let cli = FakeClaudeCli::install(
@@ -14431,19 +14508,22 @@ sys.exit(1)
         let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
         let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
 
-        let err = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect_err("a plugin loaded from elsewhere is not this session's");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
+        // A plugin loaded from elsewhere is not this session's, so the session
+        // must not claim these skills — but it still starts, and says why.
+        assert!(exposure.expected.is_empty());
+        assert!(matches!(steering, ClaudeSkillSteering::None));
+        let notice = exposure.degraded_notice.as_deref().expect("a notice");
         assert!(
-            err.contains("could not resolve") || err.contains("not from this session's root"),
-            "{err}"
+            notice.contains("could not resolve") || notice.contains("not from this session's root"),
+            "{notice}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_preflight_reporting_plugin_errors_fails_the_spawn() {
+    async fn a_preflight_reporting_plugin_errors_starts_without_skills() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(
             true,
@@ -14455,12 +14535,19 @@ sys.exit(1)
         let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
         let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
 
-        let err = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect_err("reported problems must fail the spawn");
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
-        assert!(err.contains("problem(s) loading"), "{err}");
-        assert!(err.contains("skill alpha is invalid"), "{err}");
+        assert!(exposure.expected.is_empty());
+        assert!(matches!(steering, ClaudeSkillSteering::None));
+        let notice = exposure
+            .degraded_notice
+            .as_deref()
+            .expect("reported problems must reach the user");
+        assert!(notice.contains("problem(s) loading"), "{notice}");
+        assert!(
+            notice.contains("skill alpha is invalid"),
+            "the CLI's own complaint must survive into the notice: {notice}"
+        );
     }
 
     #[cfg(unix)]
@@ -14479,9 +14566,7 @@ sys.exit(1)
         // Remoteness is the ssh host the low-level spawn was given, not the
         // shape of the workspace roots. `None` here means local, and a local
         // session gets native discovery whatever the roots look like.
-        let (_, steering) = claude_prepare_skills(&config, None, cli.workspace())
-            .await
-            .expect("local preparation");
+        let (_, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
 
         assert!(
             matches!(steering, ClaudeSkillSteering::Native(..)),
@@ -14492,9 +14577,10 @@ sys.exit(1)
     /// Remote Claude sessions cannot have native skills, and Tyde no longer
     /// pretends otherwise: there is no inline-body fallback, because the branch
     /// that claimed to provide one was unreachable from every production entry
-    /// point. A skill-bearing remote session fails visibly instead.
+    /// point. The session runs on the remote host without them and says so,
+    /// rather than making a remote workspace unusable to a skill-bearing agent.
     #[tokio::test]
-    async fn a_remote_skill_bearing_session_fails_visibly() {
+    async fn a_remote_skill_bearing_session_starts_without_skills_and_says_so() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills = vec![skill_fixture(
             tmp.path(),
@@ -14503,16 +14589,20 @@ sys.exit(1)
         )];
         let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
 
-        // No fake CLI needed: this fails before any local command runs.
-        let err = claude_prepare_skills(&config, Some("build-host"), "/tmp")
-            .await
-            .expect_err("remote native skills are not supported");
+        // No fake CLI needed: this decides before any local command runs.
+        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp").await;
 
-        assert!(err.contains("not available over SSH"), "{err}");
-        assert!(err.contains("build-host"), "{err}");
+        assert!(exposure.plugin.is_none());
+        assert!(exposure.expected.is_empty());
         assert!(
-            !err.contains("Skill: "),
-            "no inline-body fallback is offered: {err}"
+            matches!(steering, ClaudeSkillSteering::None),
+            "the model must not be told about skills the remote CLI cannot read: {steering:?}"
+        );
+        let notice = exposure.degraded_notice.as_deref().expect("a notice");
+        assert!(notice.contains("build-host"), "{notice}");
+        assert!(
+            !notice.contains("Skill: "),
+            "no inline-body fallback is offered: {notice}"
         );
     }
 
@@ -14520,9 +14610,7 @@ sys.exit(1)
     async fn a_remote_session_without_skills_is_unaffected() {
         let config = spawn_config_with_skills(Vec::new(), SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp")
-            .await
-            .expect("a remote session with no skills is fine");
+        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp").await;
 
         assert!(exposure.plugin.is_none());
         assert!(matches!(steering, ClaudeSkillSteering::None));
@@ -14590,9 +14678,31 @@ sys.exit(1)
         (inner, rx)
     }
 
+    /// Drain the emitter and return the text of every user-visible notice.
+    fn drained_notices(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        let mut notices = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            assert_ne!(
+                event_kind(&event),
+                Some("Error"),
+                "a skill gap is a notice, not a failed turn: {event}"
+            );
+            if event_kind(&event) == Some("SubprocessStderr") {
+                notices.push(
+                    event
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        notices
+    }
+
     #[tokio::test]
     async fn a_confirmed_init_frame_leaves_the_session_running() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
 
         inner
             .record_skill_init_frame(Ok(Some(vec![
@@ -14604,16 +14714,18 @@ sys.exit(1)
 
         assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
         assert!(
-            !inner.skills_mismatched(),
-            "a confirmed session must keep rendering model output"
+            drained_notices(&mut rx).is_empty(),
+            "a session that got everything it asked for must say nothing"
         );
     }
 
-    /// Each of these is a mismatch, and every one must terminate the session
-    /// rather than warn: a session that believes it has a skill it does not have
-    /// will silently do the wrong thing.
+    /// Every one of these leaves the session short of what Tyde materialized,
+    /// and every one is a notice rather than a dead session: the user keeps the
+    /// turn, the process, and every skill that did arrive, and is told exactly
+    /// which one did not. Killing the session instead — the previous behaviour —
+    /// spent the whole conversation to report one name.
     #[tokio::test]
-    async fn every_init_frame_mismatch_terminates_the_session() {
+    async fn every_init_frame_gap_is_reported_and_the_session_survives() {
         for (label, reported, expected_fragment) in [
             (
                 "a dropped skill",
@@ -14644,33 +14756,63 @@ sys.exit(1)
             inner.record_skill_init_frame(reported).await;
 
             match inner.skill_readiness_state() {
-                ClaudeSkillReadiness::Failed(message) => assert!(
+                ClaudeSkillReadiness::Degraded(message) => assert!(
                     message.contains(expected_fragment),
                     "{label}: {message:?} lacks {expected_fragment:?}"
                 ),
-                other => panic!("{label}: expected Failed, got {other:?}"),
+                other => panic!("{label}: expected Degraded, got {other:?}"),
             }
+            let notices = drained_notices(&mut rx);
             assert!(
-                inner.skills_mismatched(),
-                "{label}: subsequent model output must be suppressed"
-            );
-            let mut saw_error = false;
-            while let Ok(event) = rx.try_recv() {
-                if event_kind(&event) == Some("Error") {
-                    saw_error = true;
-                }
-            }
-            assert!(
-                saw_error,
-                "{label}: the user must be told, not just the log"
+                notices
+                    .iter()
+                    .any(|notice| notice.contains(expected_fragment)),
+                "{label}: the user must be told, not just the log: {notices:?}"
             );
         }
     }
 
+    /// The reported case: Claude keeps its own same-named skill and silently
+    /// drops the plugin copy. The capability is still there under Claude's id,
+    /// so the notice says which id works instead of pretending the skill is gone.
     #[tokio::test]
-    async fn a_mismatch_fails_the_turn_in_flight() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:a"]).await;
-        let (outcome_tx, outcome_rx) = oneshot::channel();
+    async fn a_skill_superseded_by_claudes_own_copy_names_the_id_that_works() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:axdb-ops"]).await;
+
+        inner
+            .record_skill_init_frame(Ok(Some(vec![
+                "axdb-ops".to_string(),
+                "code-review".to_string(),
+            ])))
+            .await;
+
+        let message = match inner.skill_readiness_state() {
+            ClaudeSkillReadiness::Degraded(message) => message,
+            other => panic!("a superseded skill is a notice, got {other:?}"),
+        };
+        assert!(message.contains("tyde-skills:axdb-ops"), "{message}");
+        assert!(
+            message.contains("loaded as 'axdb-ops'"),
+            "the notice must name the id that resolves: {message}"
+        );
+        assert!(
+            !message.contains("did not load"),
+            "a skill Claude kept under its own name is not missing: {message}"
+        );
+        assert!(
+            drained_notices(&mut rx)
+                .iter()
+                .any(|notice| notice.contains("axdb-ops")),
+            "the collision must reach the user"
+        );
+    }
+
+    /// A skill gap says nothing about the model's answer, so the turn it lands
+    /// in keeps its outcome sender and completes on its own terms.
+    #[tokio::test]
+    async fn a_skill_gap_leaves_the_turn_in_flight_alone() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a"]).await;
+        let (outcome_tx, mut outcome_rx) = oneshot::channel();
         {
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
@@ -14686,27 +14828,36 @@ sys.exit(1)
 
         inner.record_skill_init_frame(Ok(Some(Vec::new()))).await;
 
-        // Bounded purely as a diagnostic: an unsettled sender used to hang this
-        // test until nextest's global timeout, taking 987 unrelated tests with
-        // it. The assertions below are unchanged — this only turns "wedge the
-        // suite" into "report which contract broke".
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), outcome_rx)
-            .await
-            .expect("a skill mismatch must settle the in-flight turn, not leave it pending")
-            .expect("the turn must be resolved");
-        match outcome {
-            TurnOutcome::Failed { error, .. } => {
-                assert!(error.contains("tyde-skills:a"), "{error}");
-                assert!(error.contains("stopped this Claude session"), "{error}");
-            }
-            TurnOutcome::Completed { .. } => panic!("a mismatched session must not complete"),
-            TurnOutcome::Cancelled { .. } => panic!("a mismatch is a failure, not a cancellation"),
-        }
+        assert!(
+            inner
+                .state
+                .lock()
+                .await
+                .active_turn
+                .as_ref()
+                .expect("the turn is still active")
+                .outcome_tx
+                .is_some(),
+            "the turn's outcome must still be the turn's to settle"
+        );
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a skill gap must not resolve the turn"
+        );
+        assert!(
+            drained_notices(&mut rx)
+                .iter()
+                .any(|notice| notice.contains("tyde-skills:a")),
+            "the missing skill must still be named to the user"
+        );
     }
 
     #[tokio::test]
     async fn a_session_without_skills_ignores_init_frames_entirely() {
-        let (inner, _rx) = make_test_inner();
+        let (inner, mut rx) = make_test_inner();
         let inner = Arc::new(inner);
 
         inner.record_skill_init_frame(Ok(None)).await;
@@ -14715,7 +14866,7 @@ sys.exit(1)
             inner.skill_readiness_state(),
             ClaudeSkillReadiness::NotRequired
         );
-        assert!(!inner.skills_mismatched());
+        assert!(drained_notices(&mut rx).is_empty());
     }
 
     #[tokio::test]
@@ -14878,28 +15029,41 @@ sys.exit(1)
             }
         }
 
-        /// The terminal outcome this behaviour must deliver, as a class plus a
-        /// fragment of its reason. Asserting the class is what stops a dropped
-        /// sender from passing as delivery: `Ok(Err(RecvError))` is a drop, and
-        /// a drop carries no outcome at all.
+        /// The terminal outcome this behaviour must deliver. Asserting the class
+        /// is what stops a dropped sender from passing as delivery:
+        /// `Ok(Err(RecvError))` is a drop, and a drop carries no outcome at all.
+        ///
+        /// Every behaviour that ends its turn now *completes* it. A skill Tyde
+        /// could not confirm never fails a turn — the previous contract turned
+        /// each of these into a synthesised failure, which is what made one
+        /// dropped skill cost the whole session.
         fn expected_terminal(self) -> ExpectedTerminal {
-            let confirmed = self.reported_skills().contains("tyde-skills:alpha");
             match self {
-                // A confirmed session runs to its own `result`.
-                Self::Reports(_) | Self::AssistantBeforeInit(_) if confirmed => {
-                    ExpectedTerminal::Completed
+                Self::Reports(_) | Self::AssistantBeforeInit(_) => ExpectedTerminal::Completed,
+                Self::OmitsInit | Self::ResultBeforeInit => ExpectedTerminal::Completed,
+                // These three never end their turn: the fake stops talking
+                // without a `result`. Nothing may synthesise a terminal outcome
+                // on their behalf — the session stays open, exactly as it would
+                // with a real CLI that is still thinking.
+                Self::ControlRequestBeforeInit | Self::FloodsWithoutInit | Self::SaysNothing => {
+                    ExpectedTerminal::StaysOpen
                 }
-                // An unconfirmed one is failed by the init-frame verdict.
-                Self::Reports(_) | Self::AssistantBeforeInit(_) => {
-                    ExpectedTerminal::Failed("did not load")
-                }
-                Self::OmitsInit | Self::ResultBeforeInit => {
-                    ExpectedTerminal::Failed("without reporting")
-                }
-                Self::ControlRequestBeforeInit => ExpectedTerminal::Failed("control request"),
-                Self::FloodsWithoutInit => ExpectedTerminal::Failed("bytes of output"),
-                Self::SaysNothing => ExpectedTerminal::Failed("startup timeout"),
             }
+        }
+
+        /// The fragment the user-visible skill notice must contain, or `None`
+        /// when this behaviour gave Tyde everything it expected.
+        fn expected_notice(self) -> Option<&'static str> {
+            if self.reported_skills().contains("tyde-skills:alpha") {
+                return None;
+            }
+            Some(match self {
+                Self::Reports(_) | Self::AssistantBeforeInit(_) => "did not load",
+                Self::OmitsInit | Self::ResultBeforeInit => "without reporting",
+                Self::ControlRequestBeforeInit => "control request",
+                Self::FloodsWithoutInit => "bytes of output",
+                Self::SaysNothing => "startup timeout",
+            })
         }
 
         /// The last log entry this behaviour is expected to write, or `None`
@@ -14920,8 +15084,9 @@ sys.exit(1)
     #[derive(Clone, Copy, Debug)]
     enum ExpectedTerminal {
         Completed,
-        /// Failed, with this fragment in its reason.
-        Failed(&'static str),
+        /// The turn stays open because the CLI never ended it. Tyde must not
+        /// invent an outcome for it.
+        StaysOpen,
     }
 
     /// Turn id the fake harness registers. Named so the clear-up at the end of
@@ -15017,7 +15182,12 @@ for raw_line in sys.stdin:
             print(init_frame, flush=True); note("INIT_FRAME")
             print(result, flush=True); note("RESULT")
         elif behaviour == "omits_init":
+            # Two ids, for the same reason `assistant_before_init` uses two: a
+            # lone assistant frame accumulates into the turn summary, and only a
+            # following phase makes the first one's text an emitted event. The
+            # test asserts the user *sees* the output, so it has to be emitted.
             print(assistant, flush=True); note("MODEL_OUTPUT")
+            print(assistant_next, flush=True)
             print(result, flush=True); note("RESULT")
         elif behaviour == "result_before_init":
             print(result, flush=True); note("RESULT")
@@ -15031,6 +15201,10 @@ for raw_line in sys.stdin:
         elif behaviour == "floods_without_init":
             for n in range(40):
                 print(assistant, flush=True)
+            # A second id closes the flood's phase, so the output released at
+            # the buffer bound is observable as an event rather than sitting in
+            # a turn summary that never arrives.
+            print(assistant_next, flush=True)
             note("FLOOD_DONE")
         # "says_nothing" falls through: no frames at all.
 "#,
@@ -15135,39 +15309,58 @@ for raw_line in sys.stdin:
         // it resolved by being *sent*. `Ok(Err(RecvError))` is a dropped
         // sender — the turn died without an outcome — and treating that as
         // delivery is exactly how a lost settle would go unnoticed.
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(20), outcome_rx)
-            .await
-            .unwrap_or_else(|_| {
-                panic!("{behaviour:?}: the turn must reach a terminal outcome, not hang")
-            })
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{behaviour:?}: the turn's outcome sender was dropped; a drop is not a \
-                     delivery"
+        let mut outcome_rx = outcome_rx;
+        match behaviour.expected_terminal() {
+            ExpectedTerminal::Completed => {
+                let delivered = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    outcome_rx,
                 )
-            });
-        match (behaviour.expected_terminal(), delivered) {
-            (ExpectedTerminal::Completed, TurnOutcome::Completed { .. }) => {}
-            (ExpectedTerminal::Failed(fragment), TurnOutcome::Failed { error, .. }) => {
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{behaviour:?}: the turn must reach a terminal outcome, not hang")
+                })
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{behaviour:?}: the turn's outcome sender was dropped; a drop is not \
+                             a delivery"
+                    )
+                });
+                match delivered {
+                    TurnOutcome::Completed { .. } => {}
+                    TurnOutcome::Failed { error, .. } => panic!(
+                        "{behaviour:?}: an unconfirmed skill must not fail the turn, got {error:?}"
+                    ),
+                    TurnOutcome::Cancelled { .. } => {
+                        panic!("{behaviour:?}: nobody cancelled this turn")
+                    }
+                }
+            }
+            ExpectedTerminal::StaysOpen => {
                 assert!(
-                    error.contains(fragment),
-                    "{behaviour:?}: expected a failure mentioning {fragment:?}, got {error:?}"
+                    matches!(
+                        outcome_rx.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ),
+                    "{behaviour:?}: the CLI never ended this turn, so Tyde must not either"
                 );
-            }
-            (expected, TurnOutcome::Completed { .. }) => {
-                panic!("{behaviour:?}: expected {expected:?}, got a completed turn")
-            }
-            (expected, TurnOutcome::Failed { error, .. }) => {
-                panic!("{behaviour:?}: expected {expected:?}, got a failure {error:?}")
-            }
-            (expected, TurnOutcome::Cancelled { .. }) => {
-                panic!("{behaviour:?}: expected {expected:?}, got a cancelled turn")
             }
         }
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
+        }
+        if let Some(fragment) = behaviour.expected_notice() {
+            let notices: Vec<&str> = events
+                .iter()
+                .filter(|event| event_kind(event) == Some("SubprocessStderr"))
+                .filter_map(|event| event.get("data").and_then(Value::as_str))
+                .collect();
+            assert!(
+                notices.iter().any(|notice| notice.contains(fragment)),
+                "{behaviour:?}: the user must be told about {fragment:?}, got {notices:?}"
+            );
         }
         let state = inner.skill_readiness_state();
 
@@ -15301,9 +15494,14 @@ for raw_line in sys.stdin:
         );
     }
 
+    /// The hold-back buffer exists to order the notice against the output, not
+    /// to decide whether the output is real. Output the model produced is the
+    /// model's answer whether or not every skill arrived, so a gap replays it
+    /// exactly like a clean verification does — the alternative silently ate a
+    /// turn the user had already paid for.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn output_held_back_before_a_mismatch_is_discarded_not_replayed() {
+    async fn output_held_back_before_a_gap_is_replayed_not_discarded() {
         let (log, events, _state) =
             run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(r#"["other"]"#)).await;
 
@@ -15313,60 +15511,74 @@ for raw_line in sys.stdin:
         );
         let rendered = serde_json::to_string(&events).expect("events");
         assert!(
-            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "output held back before a mismatch must be discarded: {rendered}"
+            rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "output held back before a gap must still reach the user: {rendered}"
         );
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
         assert!(
-            kinds.contains(&Some("Error")),
-            "the user must be told: {kinds:?}"
+            !kinds.contains(&Some("Error")),
+            "a missing skill is a notice, not a failed turn: {kinds:?}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_cli_that_never_reports_skills_fails_rather_than_rendering() {
+    async fn a_cli_that_never_reports_skills_still_renders_and_says_so() {
         let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::OmitsInit).await;
 
         assert!(log.contains("MODEL_OUTPUT"), "the fake did speak: {log:?}");
         assert!(!log.contains("INIT_FRAME"), "but never reported: {log:?}");
         let rendered = serde_json::to_string(&events).expect("events");
         assert!(
-            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "unverified output must never reach the user: {rendered}"
+            rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "unconfirmed is not the same as untrustworthy; the answer still shows: {rendered}"
         );
+        // The notice itself is asserted by the harness via `expected_notice`.
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(kinds.contains(&Some("Error")), "{kinds:?}");
+        assert!(!kinds.contains(&Some("Error")), "{kinds:?}");
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_turn_that_ends_without_an_init_frame_fails_the_session() {
-        let (log, events, _state) =
+    async fn a_turn_that_ends_without_an_init_frame_completes_with_a_notice() {
+        let (log, events, state) =
             run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
 
         assert!(log.contains("RESULT"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
+        match state {
+            ClaudeSkillReadiness::Degraded(message) => {
+                assert!(message.contains("without reporting"), "{message}")
+            }
+            other => panic!("an unreported turn must settle as Degraded, got {other:?}"),
+        }
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
         assert!(
-            kinds.contains(&Some("Error")),
-            "a turn that ends unverified must fail, not look complete: {kinds:?}"
+            !kinds.contains(&Some("Error")),
+            "a turn that ends unverified still ended: {kinds:?}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_silent_cli_is_failed_by_the_verification_watchdog() {
+    async fn a_silent_cli_is_reported_by_the_verification_watchdog() {
         // Nothing at all comes back after the prompt: no init frame, no output,
         // no result. Only the timeout can resolve this.
-        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
+        let (log, events, state) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
 
         assert!(log.contains("PROMPT"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
+        match state {
+            ClaudeSkillReadiness::Degraded(message) => assert!(
+                message.contains("within the startup timeout"),
+                "a silent CLI must not leave the session waiting forever: {message}"
+            ),
+            other => panic!("the watchdog must settle verification, got {other:?}"),
+        }
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
         assert!(
-            kinds.contains(&Some("Error")),
-            "a silent CLI must not leave the session waiting forever: {kinds:?}"
+            !kinds.contains(&Some("Error")),
+            "a CLI that has not reported yet has not failed: {kinds:?}"
         );
     }
 
@@ -15396,7 +15608,7 @@ for raw_line in sys.stdin:
             let (_log, _events, state) = run_fake_with_behaviour(behaviour).await;
 
             match state {
-                ClaudeSkillReadiness::Failed(message) => assert!(
+                ClaudeSkillReadiness::Degraded(message) => assert!(
                     message.contains(fragment),
                     "{label}: {message:?} lacks {fragment:?}"
                 ),
@@ -15405,47 +15617,53 @@ for raw_line in sys.stdin:
         }
     }
 
-    /// An inbound control request before the init frame would have Tyde act on
-    /// behalf of a session whose skills are unverified. It carries a request id
-    /// the CLI blocks on, so buffering it is a hang and answering it is the
-    /// bypass; failing fast is the only honest option.
+    /// An inbound control request before the init frame carries a request id the
+    /// CLI is blocking on, so it can never be buffered — holding one is a hang.
+    /// It also means the init frame is not coming, so verification settles with
+    /// a notice and the request is answered. Killing the session instead left
+    /// the user with neither an answer nor their turn.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_control_request_before_the_init_frame_fails_the_session() {
+    async fn a_control_request_before_the_init_frame_is_answered_with_a_notice() {
         let (log, events, state) =
             run_fake_with_behaviour(FakeInitBehaviour::ControlRequestBeforeInit).await;
 
         assert!(log.contains("CONTROL_REQUEST"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
         match state {
-            ClaudeSkillReadiness::Failed(message) => {
+            ClaudeSkillReadiness::Degraded(message) => {
                 assert!(message.contains("control request"), "{message}");
                 assert!(message.contains("can_use_tool"), "{message}");
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected Degraded, got {other:?}"),
         }
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(kinds.contains(&Some("Error")), "{kinds:?}");
+        assert!(
+            !kinds.contains(&Some("Error")),
+            "an unconfirmed session is not a failed one: {kinds:?}"
+        );
     }
 
+    /// The bound is about memory, not trust: past it, Tyde stops holding output
+    /// and lets it through, rather than deleting what the model already said.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn unbounded_output_without_an_init_frame_fails_rather_than_growing() {
+    async fn unbounded_output_without_an_init_frame_stops_holding_and_renders() {
         let (log, events, state) =
             run_fake_with_behaviour(FakeInitBehaviour::FloodsWithoutInit).await;
 
         assert!(log.contains("FLOOD_DONE"), "{log:?}");
         match state {
-            ClaudeSkillReadiness::Failed(message) => assert!(
+            ClaudeSkillReadiness::Degraded(message) => assert!(
                 message.contains("frames or") && message.contains("bytes of output"),
                 "{message}"
             ),
-            other => panic!("expected Failed once the buffer bound was hit, got {other:?}"),
+            other => panic!("expected Degraded once the buffer bound was hit, got {other:?}"),
         }
         let rendered = serde_json::to_string(&events).expect("events");
         assert!(
-            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "nothing unverified may be rendered, even on overflow: {rendered}"
+            rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "output past the bound must be released, not dropped: {rendered}"
         );
     }
 
@@ -15553,7 +15771,7 @@ for raw_line in sys.stdin:
         assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
 
         inner
-            .terminate_for_skill_mismatch(&target, "stale decision", true)
+            .report_skill_gap(&target, "stale decision", true)
             .await;
 
         assert_eq!(
@@ -15578,34 +15796,32 @@ for raw_line in sys.stdin:
         );
     }
 
-    /// The other interleaving: the failure commits first, so the cancel finds
-    /// nothing left to abandon.
+    /// The other interleaving: the gap commits first, so the cancel finds
+    /// nothing left to abandon. The gap still does not touch the turn — it
+    /// settles verification and nothing else.
     #[tokio::test]
-    async fn a_skill_failure_that_wins_the_race_blocks_the_cancel() {
+    async fn a_skill_gap_that_wins_the_race_blocks_the_cancel() {
         let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let outcome_rx = install_live_turn(&inner, 32).await;
+        let mut outcome_rx = install_live_turn(&inner, 32).await;
         let target = inner.current_skill_failure_target().await;
 
         inner
-            .terminate_for_skill_mismatch(&target, "the CLI dropped a skill", true)
+            .report_skill_gap(&target, "the CLI dropped a skill", true)
             .await;
 
         match inner.skill_readiness_state() {
-            ClaudeSkillReadiness::Failed(message) => {
+            ClaudeSkillReadiness::Degraded(message) => {
                 assert!(message.contains("the CLI dropped a skill"), "{message}")
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected Degraded, got {other:?}"),
         }
-        match outcome_rx
-            .await
-            .expect("the winning failure settles the turn")
-        {
-            TurnOutcome::Failed { error, .. } => {
-                assert!(error.contains("the CLI dropped a skill"), "{error}")
-            }
-            TurnOutcome::Completed { .. } => panic!("a skill failure is not a completion"),
-            TurnOutcome::Cancelled { .. } => panic!("a skill failure is not a cancellation"),
-        }
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a skill gap settles verification, never the turn"
+        );
 
         // The cancel arrives second and finds verification already settled.
         inner
@@ -15636,7 +15852,7 @@ for raw_line in sys.stdin:
         let mut new_turn = install_live_turn(&inner, 42).await;
 
         inner
-            .terminate_for_skill_mismatch(&stale, "decided for the previous process", true)
+            .report_skill_gap(&stale, "decided for the previous process", true)
             .await;
 
         assert_eq!(
@@ -15666,7 +15882,7 @@ for raw_line in sys.stdin:
             turn_id: Some(41),
         };
         inner
-            .terminate_for_skill_mismatch(&same_generation_wrong_turn, "wrong turn", true)
+            .report_skill_gap(&same_generation_wrong_turn, "wrong turn", true)
             .await;
         assert!(
             matches!(
@@ -15716,12 +15932,13 @@ for raw_line in sys.stdin:
         assert!(inner.skills_awaiting_verification());
     }
 
-    /// A watchdog that wins must run termination to completion — including
-    /// settling the turn — rather than aborting itself partway through.
+    /// A watchdog that wins must run its report to completion — settling
+    /// verification and disowning its own handle — rather than aborting itself
+    /// partway through. What it must *not* do is settle the turn.
     #[tokio::test]
-    async fn a_watchdog_termination_settles_the_turn_it_kills() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let (outcome_tx, outcome_rx) = oneshot::channel();
+    async fn a_watchdog_reports_without_settling_the_turn() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let (outcome_tx, mut outcome_rx) = oneshot::channel();
         {
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
@@ -15736,18 +15953,33 @@ for raw_line in sys.stdin:
         }
         inner.watch_for_skill_verification().await;
 
-        let outcome = tokio::time::timeout(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 8, outcome_rx)
-            .await
-            .expect("the watchdog must settle the turn, not abort itself mid-termination")
-            .expect("the sender must be sent, not dropped");
-
-        match outcome {
-            TurnOutcome::Failed { error, .. } => {
-                assert!(error.contains("within the startup timeout"), "{error}");
-            }
-            TurnOutcome::Completed { .. } => panic!("a watchdog kill is not a completion"),
-            TurnOutcome::Cancelled { .. } => panic!("a watchdog kill is not a cancellation"),
+        // Settled by the timer, not by a frame: poll the state it owns rather
+        // than a turn outcome it must never send.
+        let deadline = std::time::Instant::now() + CLAUDE_SKILL_VERIFICATION_TIMEOUT * 8;
+        while std::time::Instant::now() < deadline && inner.skills_awaiting_verification() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+
+        match inner.skill_readiness_state() {
+            ClaudeSkillReadiness::Degraded(message) => assert!(
+                message.contains("within the startup timeout"),
+                "the watchdog must record why it fired: {message}"
+            ),
+            other => panic!("the watchdog must settle verification, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a CLI that has not reported its skills has not failed the turn"
+        );
+        assert!(
+            drained_notices(&mut rx)
+                .iter()
+                .any(|notice| notice.contains("within the startup timeout")),
+            "the timeout must reach the user, not just the log"
+        );
         assert!(
             inner.state.lock().await.skill_watchdog.is_none(),
             "the watchdog must have disowned its own handle"
@@ -15864,21 +16096,30 @@ for raw_line in sys.stdin:
         );
     }
 
+    /// The end-to-end shape of the reported bug: the CLI reports a skill set
+    /// that does not include Tyde's, and the session carries on. The gap reaches
+    /// the user as a notice naming the skill — the harness asserts that — and
+    /// the turn is neither failed nor emptied.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_mismatch_detected_after_the_prompt_terminates_the_session() {
-        let (log, events, _state) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
+    async fn a_gap_detected_after_the_prompt_is_reported_without_killing_the_session() {
+        let (log, events, state) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
 
         assert!(log.contains("INIT_FRAME"), "{log:?}");
+        assert!(
+            log.contains("RESULT"),
+            "the session must be allowed to finish its turn: {log:?}"
+        );
+        match state {
+            ClaudeSkillReadiness::Degraded(message) => {
+                assert!(message.contains("tyde-skills:alpha"), "{message}")
+            }
+            other => panic!("a dropped skill must settle as Degraded, got {other:?}"),
+        }
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
         assert!(
-            kinds.contains(&Some("Error")),
-            "the mismatch must reach the user: {kinds:?}"
-        );
-        let rendered = serde_json::to_string(&events).expect("events");
-        assert!(
-            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "output from a mis-equipped session must be suppressed: {rendered}"
+            !kinds.contains(&Some("Error")),
+            "a dropped skill is not a failed turn: {kinds:?}"
         );
     }
     #[tokio::test]
