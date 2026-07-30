@@ -13,7 +13,6 @@ pub struct BackendCompactionCapability {
     pub availability: BackendCompactionAvailability,
     pub provider_version: Option<String>,
     pub protocol_version: Option<String>,
-    pub confidence: Option<BackendCompactionProtocolConfidence>,
     pub reseat: BackendContextReseatSupport,
     pub evidence: BackendCompactionCapabilityEvidence,
 }
@@ -25,7 +24,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unavailable { reason },
             provider_version: None,
             protocol_version: None,
-            confidence: None,
             reseat: BackendContextReseatSupport::Unsupported,
             evidence: BackendCompactionCapabilityEvidence::AdapterContract,
         }
@@ -49,7 +47,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unavailable { reason },
             provider_version,
             protocol_version: None,
-            confidence: None,
             reseat: BackendContextReseatSupport::Unsupported,
             evidence,
         }
@@ -58,7 +55,6 @@ impl BackendCompactionCapability {
     pub(crate) fn native(
         mechanism: BackendCompactionMechanism,
         provider_version: Option<String>,
-        confidence: BackendCompactionProtocolConfidence,
         reseat: BackendContextReseatSupport,
         evidence: BackendCompactionCapabilityEvidence,
     ) -> Self {
@@ -67,7 +63,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Native { mechanism },
             provider_version,
             protocol_version: None,
-            confidence: Some(confidence),
             reseat,
             evidence,
         }
@@ -83,7 +78,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unknown { reason },
             provider_version,
             protocol_version: None,
-            confidence: None,
             reseat: BackendContextReseatSupport::Unsupported,
             evidence,
         }
@@ -125,12 +119,6 @@ pub enum BackendCompactionMechanism {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BackendCompactionProtocolConfidence {
-    Verified,
-    Compatible,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendContextReseatSupport {
     PreservedByNative,
     InjectAfterNative,
@@ -142,8 +130,6 @@ pub enum BackendContextReseatSupport {
 pub enum BackendCompactionUnavailableReason {
     ManualTriggerAbsent,
     AdapterHasNoManualTransport,
-    VersionTooOld { required: String },
-    VersionNotAllowlisted { tested: String },
     TranscriptNotAuthoritative,
     ProviderDisabledCommand,
 }
@@ -151,27 +137,14 @@ pub enum BackendCompactionUnavailableReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionUnknownReason {
     ProcessNotInitialized,
-    VersionUnavailable,
-    VersionUnparseable,
     CapabilityProbeFailed(String),
-    ProtocolNotAllowlisted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionCapabilityEvidence {
-    ClaudeInitializeCommand {
-        name: String,
-    },
-    CodexInitializeUserAgent {
-        user_agent: String,
-    },
-    CodexInstalledVersionFallback {
-        user_agent: Option<String>,
-        installed_version: String,
-    },
-    HermesLocalGatewayProbe {
-        version: String,
-    },
+    ClaudeInitializeCommand { name: String },
+    CodexMethodProbe,
+    HermesMethodProbe,
     AdapterContract,
     None,
 }
@@ -583,30 +556,22 @@ pub(crate) fn stable_observation_id(
 mod tests {
     use super::*;
 
-    const UNKNOWN_REASON_COUNT: usize = 5;
-    const UNAVAILABLE_REASON_COUNT: usize = 6;
+    const UNKNOWN_REASON_COUNT: usize = 2;
+    const UNAVAILABLE_REASON_COUNT: usize = 4;
 
     #[test]
     fn every_unknown_reason_stays_fail_closed() {
         fn reason_name(reason: &BackendCompactionUnknownReason) -> &'static str {
             match reason {
                 BackendCompactionUnknownReason::ProcessNotInitialized => "process_not_initialized",
-                BackendCompactionUnknownReason::VersionUnavailable => "version_unavailable",
-                BackendCompactionUnknownReason::VersionUnparseable => "version_unparseable",
                 BackendCompactionUnknownReason::CapabilityProbeFailed(_) => {
                     "capability_probe_failed"
-                }
-                BackendCompactionUnknownReason::ProtocolNotAllowlisted => {
-                    "protocol_not_allowlisted"
                 }
             }
         }
         let reasons: [BackendCompactionUnknownReason; UNKNOWN_REASON_COUNT] = [
             BackendCompactionUnknownReason::ProcessNotInitialized,
-            BackendCompactionUnknownReason::VersionUnavailable,
-            BackendCompactionUnknownReason::VersionUnparseable,
             BackendCompactionUnknownReason::CapabilityProbeFailed("probe".to_owned()),
-            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
         ];
         for reason in reasons {
             assert!(!reason_name(&reason).is_empty());
@@ -633,10 +598,6 @@ mod tests {
                 BackendCompactionUnavailableReason::AdapterHasNoManualTransport => {
                     "adapter_has_no_manual_transport"
                 }
-                BackendCompactionUnavailableReason::VersionTooOld { .. } => "version_too_old",
-                BackendCompactionUnavailableReason::VersionNotAllowlisted { .. } => {
-                    "version_not_allowlisted"
-                }
                 BackendCompactionUnavailableReason::TranscriptNotAuthoritative => {
                     "transcript_not_authoritative"
                 }
@@ -648,12 +609,6 @@ mod tests {
         let reasons: [BackendCompactionUnavailableReason; UNAVAILABLE_REASON_COUNT] = [
             BackendCompactionUnavailableReason::ManualTriggerAbsent,
             BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-            BackendCompactionUnavailableReason::VersionTooOld {
-                required: "1.0.0".to_owned(),
-            },
-            BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                tested: "1.0.0".to_owned(),
-            },
             BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
             BackendCompactionUnavailableReason::ProviderDisabledCommand,
         ];

@@ -30225,7 +30225,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
 
         let unknown = crate::backend::BackendCompactionCapability::unknown(
-            crate::backend::BackendCompactionUnknownReason::VersionUnparseable,
+            crate::backend::BackendCompactionUnknownReason::CapabilityProbeFailed(
+                "development probe failed".to_owned(),
+            ),
             Some("development".to_owned()),
             crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         );
@@ -30247,7 +30249,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
             },
             provider_version: None,
             protocol_version: None,
-            confidence: None,
             reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         };

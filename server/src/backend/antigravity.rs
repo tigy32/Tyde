@@ -265,7 +265,6 @@ fn antigravity_compaction_capability(
         },
         provider_version,
         protocol_version: None,
-        confidence: None,
         reseat: BackendContextReseatSupport::Unsupported,
         evidence: BackendCompactionCapabilityEvidence::AdapterContract,
     }

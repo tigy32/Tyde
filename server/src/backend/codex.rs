@@ -1114,7 +1114,6 @@ async fn initialize_codex_rpc(
 }
 
 const CODEX_APP_SERVER_CLIENT_NAME: &str = "tyde";
-const CODEX_TESTED_COMPACTION_VERSIONS: &str = "0.144.3, 0.146.0";
 
 fn codex_version_from_user_agent(user_agent: &str) -> Result<Option<&str>, ()> {
     let prefix = format!("{CODEX_APP_SERVER_CLIENT_NAME}/");
@@ -1130,31 +1129,9 @@ fn codex_version_from_user_agent(user_agent: &str) -> Result<Option<&str>, ()> {
     Ok(Some(version))
 }
 
-fn is_stable_three_part_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let valid_part = |part: Option<&str>| {
-        part.is_some_and(|part| {
-            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
-        })
-    };
-    valid_part(parts.next())
-        && valid_part(parts.next())
-        && valid_part(parts.next())
-        && parts.next().is_none()
-}
-
 #[cfg(test)]
 fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCapability {
     codex_compaction_capability_with_installed_version(user_agent, None)
-}
-
-fn codex_version_from_installed_provider(version_line: &str) -> Option<&str> {
-    let mut candidates = version_line.split_whitespace().filter_map(|part| {
-        let version = part.strip_prefix('v').unwrap_or(part);
-        is_stable_three_part_version(version).then_some(version)
-    });
-    let version = candidates.next()?;
-    candidates.next().is_none().then_some(version)
 }
 
 fn codex_compaction_capability_with_installed_version(
@@ -1165,93 +1142,16 @@ fn codex_compaction_capability_with_installed_version(
     let installed_provider_version = installed_provider_version
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let parsed_user_agent_version = match user_agent {
-        Some(user_agent) => codex_version_from_user_agent(user_agent),
-        None => Ok(None),
-    };
-    let (provider_version, evidence) = match parsed_user_agent_version {
-        Ok(Some(version)) => (
-            Some(version.to_owned()),
-            BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-                user_agent: user_agent.expect("parsed Codex user agent").to_owned(),
-            },
-        ),
-        Ok(None) => {
-            let Some((installed_version_line, version)) =
-                installed_provider_version.and_then(|line| {
-                    codex_version_from_installed_provider(line).map(|version| (line, version))
-                })
-            else {
-                let reason = if user_agent.is_none() && installed_provider_version.is_none() {
-                    BackendCompactionUnknownReason::VersionUnavailable
-                } else {
-                    BackendCompactionUnknownReason::VersionUnparseable
-                };
-                return BackendCompactionCapability::unknown(
-                    reason,
-                    installed_provider_version.map(str::to_owned),
-                    user_agent.map_or(BackendCompactionCapabilityEvidence::None, |user_agent| {
-                        BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-                            user_agent: user_agent.to_owned(),
-                        }
-                    }),
-                );
-            };
-            (
-                Some(version.to_owned()),
-                BackendCompactionCapabilityEvidence::CodexInstalledVersionFallback {
-                    user_agent: user_agent.map(str::to_owned),
-                    installed_version: installed_version_line.to_owned(),
-                },
-            )
-        }
-        Err(()) => {
-            return BackendCompactionCapability::unknown(
-                BackendCompactionUnknownReason::VersionUnparseable,
-                None,
-                BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-                    user_agent: user_agent.expect("malformed Codex user agent").to_owned(),
-                },
-            );
-        }
-    };
-    match provider_version.as_deref() {
-        // Verified describes the tested 0.144.3 compaction contract. On legacy
-        // user-agent shapes, the setup probe supplies only the binary identity.
-        Some("0.144.3") => BackendCompactionCapability::native(
-            BackendCompactionMechanism::JsonRpcRequest,
-            provider_version,
-            BackendCompactionProtocolConfidence::Verified,
-            BackendContextReseatSupport::InjectAfterNative,
-            evidence,
-        ),
-        Some("0.146.0") => BackendCompactionCapability::native(
-            BackendCompactionMechanism::JsonRpcRequest,
-            provider_version,
-            BackendCompactionProtocolConfidence::Compatible,
-            BackendContextReseatSupport::InjectAfterNative,
-            evidence,
-        ),
-        Some(version) if is_stable_three_part_version(version) => {
-            BackendCompactionCapability::context_unavailable_with_metadata(
-                BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                    tested: CODEX_TESTED_COMPACTION_VERSIONS.to_owned(),
-                },
-                Some(version.to_owned()),
-                evidence,
-            )
-        }
-        Some(version) => BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
-            Some(version.to_string()),
-            evidence,
-        ),
-        None => BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnparseable,
-            None,
-            evidence,
-        ),
-    }
+    let provider_version = user_agent
+        .and_then(|value| codex_version_from_user_agent(value).ok().flatten())
+        .map(str::to_owned)
+        .or_else(|| installed_provider_version.map(str::to_owned));
+    BackendCompactionCapability::native(
+        BackendCompactionMechanism::JsonRpcRequest,
+        provider_version,
+        BackendContextReseatSupport::InjectAfterNative,
+        BackendCompactionCapabilityEvidence::CodexMethodProbe,
+    )
 }
 
 #[derive(Default)]
@@ -1670,7 +1570,7 @@ fn is_codex_skills_extra_roots_unsupported_error(error: &str) -> bool {
 }
 
 fn codex_skills_extra_roots_unsupported_message() -> String {
-    "Installed Codex CLI does not support native selected skills (app-server method `skills/extraRoots/set`). Update Codex CLI to 0.136.0 or newer and try again."
+    "Installed Codex CLI does not expose native selected skills (app-server method `skills/extraRoots/set`). Update Codex CLI and try again."
         .to_owned()
 }
 
@@ -13924,8 +13824,8 @@ use super::{
     BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
     BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
     BackendCompactionMutationState, BackendCompactionObservationSource, BackendCompactionProgress,
-    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
-    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionRequest, BackendCompactionResult, BackendCompactionStart,
+    BackendCompactionSuccess, BackendCompactionTerminalEvidence,
     BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
     BackendContextReseatSupport, BackendEvent, BackendObservedCompaction, BackendSession,
     BackendSpawnConfig, BackendTranscriptEventMetadata, EventStream, PostCompactionTokenCount,
@@ -14473,16 +14373,17 @@ fn backend_warning_message(content: String) -> ChatEvent {
 
 fn is_codex_thread_fork_unsupported_error(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
-    normalized.contains("-32601")
-        || (normalized.contains("thread/fork")
-            && (normalized.contains("method not found")
-                || normalized.contains("unknown method")
-                || normalized.contains("unknown request")
-                || normalized.contains("unsupported method")))
+    normalized.contains("thread/fork")
+        && (normalized.contains("-32601")
+            || normalized.contains("method not found")
+            || normalized.contains("unknown method")
+            || normalized.contains("unknown request")
+            || normalized.contains("unsupported method")
+            || normalized.contains("unknown variant"))
 }
 
 fn codex_thread_fork_unsupported_message() -> String {
-    "Installed Codex CLI does not support session fork (app-server method `thread/fork`). Update Codex CLI to 0.136.0 or newer and try again."
+    "Installed Codex CLI does not expose session fork (app-server method `thread/fork`). Update Codex CLI and try again."
         .to_string()
 }
 
@@ -15656,7 +15557,7 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendCompactionAvailability, BackendCompactionNotDispatchedReason};
+    use crate::backend::BackendCompactionAvailability;
     use crate::sub_agent::SubAgentHandle;
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentControlProgressKind, AgentErrorCode,
@@ -18354,7 +18255,7 @@ for line in sys.stdin:
             Err(err) => err,
         };
         assert!(err.contains("skills/extraRoots/set"));
-        assert!(err.contains("0.136.0 or newer"));
+        assert!(err.contains("Update Codex CLI"));
         let requests = fake.requests();
         assert_eq!(
             requests
@@ -18427,7 +18328,7 @@ for line in sys.stdin:
         };
         assert!(matches!(message.sender, MessageSender::Error));
         assert!(message.content.contains("skills/extraRoots/set"));
-        assert!(message.content.contains("0.136.0 or newer"));
+        assert!(message.content.contains("Update Codex CLI"));
         tokio::time::timeout(Duration::from_secs(5), replay_complete)
             .await
             .expect("resume error completes replay barrier")
@@ -20806,11 +20707,8 @@ for line in sys.stdin:
                 BackendCompactionCapability::native(
                     BackendCompactionMechanism::JsonRpcRequest,
                     Some("0.144.3".to_string()),
-                    BackendCompactionProtocolConfidence::Verified,
                     BackendContextReseatSupport::InjectAfterNative,
-                    BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-                        user_agent: "codex-cli 0.144.3".to_string(),
-                    },
+                    BackendCompactionCapabilityEvidence::CodexMethodProbe,
                 ),
             )),
         };
@@ -31347,175 +31245,86 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn beta_46_user_agent_is_compatible_across_environment_fields() {
-        let verified = codex_compaction_capability(Some(
-            "tyde/0.144.3 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
-        ));
-        assert!(matches!(
-            verified.availability,
-            BackendCompactionAvailability::Native {
-                mechanism: BackendCompactionMechanism::JsonRpcRequest
-            }
-        ));
-        assert_eq!(
-            verified.confidence,
-            Some(BackendCompactionProtocolConfidence::Verified)
-        );
-
-        for terminal in ["unknown", "dumb", "xterm-256color"] {
-            let user_agent =
-                format!("tyde/0.146.0 (Other OS 99.88.77; x86_64) {terminal} (tyde; 0.1)");
-            let compatible = codex_compaction_capability(Some(&user_agent));
+    fn compaction_capability_never_gates_on_provider_version() {
+        for user_agent in [
+            None,
+            Some("tyde/999.0.0 (Future OS 99.88.77; x86_64)"),
+            Some("tyde/999.0.0-nightly.1 (Future OS)"),
+            Some("tyde/development (Future OS)"),
+            Some("Future OS without-a-tyde-product-token"),
+            Some("tyde/one tyde/two"),
+        ] {
+            let capability = codex_compaction_capability(user_agent);
             assert!(matches!(
-                &compatible.availability,
+                capability.availability,
                 BackendCompactionAvailability::Native {
                     mechanism: BackendCompactionMechanism::JsonRpcRequest
                 }
             ));
-            assert_eq!(
-                compatible.confidence,
-                Some(BackendCompactionProtocolConfidence::Compatible)
-            );
-            assert_eq!(compatible.provider_version.as_deref(), Some("0.146.0"));
             assert!(
-                crate::backend::compaction::not_dispatched_for_capability(&compatible).is_none(),
-                "beta 46's 0.146.0 CapabilityUnknown regression must stay fixed"
+                crate::backend::compaction::not_dispatched_for_capability(&capability).is_none()
             );
             assert_eq!(
-                compatible.evidence,
-                BackendCompactionCapabilityEvidence::CodexInitializeUserAgent { user_agent }
+                capability.evidence,
+                BackendCompactionCapabilityEvidence::CodexMethodProbe
             );
         }
-
-        let reordered = codex_compaction_capability(Some(
-            "Mac OS 15.6.0 tyde/0.147.0 xterm-256color (tyde; 0.1)",
-        ));
-        assert_eq!(reordered.provider_version.as_deref(), Some("0.147.0"));
-        assert!(!matches!(
-            reordered.provider_version.as_deref(),
-            Some("15.6.0")
-        ));
     }
 
     #[test]
-    fn future_stable_version_routes_to_fallback_but_unknown_shapes_fail_closed() {
-        let user_agent = "tyde/0.147.0 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)";
-        let unreviewed = codex_compaction_capability(Some(user_agent));
-        assert!(matches!(
-            &unreviewed.availability,
-            BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                    tested
-                }
-            } if tested == CODEX_TESTED_COMPACTION_VERSIONS
-        ));
-        assert_eq!(unreviewed.provider_version.as_deref(), Some("0.147.0"));
-        assert!(matches!(
-            crate::backend::compaction::not_dispatched_for_capability(&unreviewed),
-            Some(BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
-                    BackendCompactionUnavailableReason::VersionNotAllowlisted { .. }
-                ),
-                fallback_safe: true,
-            })
-        ));
-        assert_eq!(
-            unreviewed.evidence,
-            BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-                user_agent: user_agent.to_owned()
-            }
-        );
-
-        let prerelease = codex_compaction_capability(Some(
-            "tyde/0.146.0-beta.1 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
-        ));
-        assert!(matches!(
-            prerelease.availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::ProtocolNotAllowlisted
-            }
-        ));
-        assert!(matches!(
-            codex_compaction_capability(Some("Mac OS 15.6.0 without-a-tyde-product-token"))
-                .availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
-            }
-        ));
-        assert!(matches!(
-            codex_compaction_capability(None).availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnavailable
-            }
-        ));
-    }
-
-    #[test]
-    fn installed_version_preserves_legacy_user_agent_support_without_guessing() {
+    fn installed_version_is_diagnostic_only_for_legacy_user_agents() {
         let legacy_user_agent = "codex-app-server (Mac OS 15.6.0; arm64)";
-        let installed_line = "codex-cli 0.144.3";
-        let verified = codex_compaction_capability_with_installed_version(
-            Some(legacy_user_agent),
-            Some(installed_line),
-        );
-        assert!(matches!(
-            verified.availability,
-            BackendCompactionAvailability::Native {
-                mechanism: BackendCompactionMechanism::JsonRpcRequest
-            }
-        ));
-        assert_eq!(
-            verified.confidence,
-            Some(BackendCompactionProtocolConfidence::Verified)
-        );
-        assert_eq!(verified.provider_version.as_deref(), Some("0.144.3"));
-        assert_eq!(
-            verified.evidence,
-            BackendCompactionCapabilityEvidence::CodexInstalledVersionFallback {
-                user_agent: Some(legacy_user_agent.to_owned()),
-                installed_version: installed_line.to_owned(),
-            }
-        );
-
-        let anchored = codex_compaction_capability_with_installed_version(
-            Some("tyde/0.146.0 (Mac OS 15.6.0; arm64)"),
-            Some(installed_line),
-        );
-        assert_eq!(anchored.provider_version.as_deref(), Some("0.146.0"));
-        assert_eq!(
-            anchored.confidence,
-            Some(BackendCompactionProtocolConfidence::Compatible)
-        );
-
-        for malformed in ["codex-cli development", "codex-cli 0.144.3 mirror 0.146.0"] {
+        for installed_line in [
+            "codex-cli 999.0.0",
+            "codex-cli 999.0.0-nightly.1",
+            "codex-cli development",
+            "malformed version output",
+        ] {
             let capability = codex_compaction_capability_with_installed_version(
                 Some(legacy_user_agent),
-                Some(malformed),
+                Some(installed_line),
             );
             assert!(matches!(
                 capability.availability,
-                BackendCompactionAvailability::Unknown {
-                    reason: BackendCompactionUnknownReason::VersionUnparseable
+                BackendCompactionAvailability::Native {
+                    mechanism: BackendCompactionMechanism::JsonRpcRequest
                 }
             ));
+            assert_eq!(capability.provider_version.as_deref(), Some(installed_line));
         }
 
-        let ambiguous_user_agent = codex_compaction_capability_with_installed_version(
-            Some("tyde/0.144.3 tyde/0.146.0"),
-            Some(installed_line),
+        let anchored = codex_compaction_capability_with_installed_version(
+            Some("tyde/999.0.0-nightly.1 (Future OS)"),
+            Some("installed fallback"),
         );
-        assert!(matches!(
-            ambiguous_user_agent.availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
-            }
-        ));
+        assert_eq!(
+            anchored.provider_version.as_deref(),
+            Some("999.0.0-nightly.1")
+        );
     }
 
     #[test]
-    fn real_codex_method_absence_signal_caches_safe_future_fallback() {
+    fn thread_fork_unsupported_requires_method_specific_evidence() {
+        assert!(is_codex_thread_fork_unsupported_error(
+            "Codex thread/fork failed: Codex JSON-RPC error -32601: method not found"
+        ));
+        assert!(is_codex_thread_fork_unsupported_error(
+            "thread/fork failed: unknown variant `thread/fork`"
+        ));
+        assert!(!is_codex_thread_fork_unsupported_error(
+            "skills/list failed: Codex JSON-RPC error -32601: method not found"
+        ));
+        assert!(!is_codex_thread_fork_unsupported_error(
+            "thread/fork failed: provider disconnected"
+        ));
+        assert!(!codex_thread_fork_unsupported_message().contains("or newer"));
+        assert!(!codex_skills_extra_roots_unsupported_message().contains("or newer"));
+    }
+
+    #[test]
+    fn real_codex_method_absence_signal_is_cached_for_safe_fallback() {
         let previous = codex_compaction_capability(Some(
-            "tyde/0.146.0 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
+            "tyde/999.0.0-nightly.1 (Future OS; arm64) dumb (tyde; 0.1)",
         ));
         let stored = std::sync::Mutex::new(previous.clone());
         let routed_missing = codex_rpc_error(&json!({

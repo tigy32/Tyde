@@ -992,6 +992,26 @@ so either rejects stale automatic compaction. A conditional compact accepted
 first legitimately crosses the gate. Rotation and post-compaction bootstrap
 guards still apply.
 
+Native context-compaction availability is capability-based, never inferred
+from an external backend version. Claude advertises its `compact` command
+during initialization. Codex and Hermes probe their namespaced methods on
+request and cache a structured method-absence response for later routing.
+Provider version strings remain diagnostic metadata only; missing, future,
+prerelease, development, or malformed identities cannot disable a native
+probe. Claude preserves the trimmed raw provider version line, including any
+product suffix, rather than treating an extracted semver as capability
+evidence.
+
+Inline fallback is authorized before dispatch when a backend explicitly
+reports a fallback-safe non-dispatch, or after a native attempt only for the
+conclusive structured outcome `Rejected + NotObserved`. Both routes require an
+authoritative transcript because fallback reconstructs context from that
+transcript. The second route keeps the original operation ID, persists
+`FallbackPreparing` with method `InlineFallback` and native acceptance cleared
+before launching one fallback, and retains the input barrier throughout.
+Accepted, ambiguous, possibly mutated, or malformed native outcomes fail closed
+and never start another compaction.
+
 The implementation guarantees only that compaction **starts no earlier than**
 the configured inactivity delay. This repository defines no provider cache
 TTL, and the 300-second default cannot guarantee that compaction starts or

@@ -34,10 +34,9 @@ use crate::backend::{
     BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionNotDispatchedReason, BackendCompactionProgress,
-    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
-    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
+    BackendCompactionNotDispatchedReason, BackendCompactionProgress, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
     BackendContextReseatSupport, BackendEvent, BackendSession, BackendSpawnConfig,
     BackendStartupError, EventStream, PostCompactionTokenCount, StartupMcpServer,
     StartupMcpTransport, backend_fork_unsupported_message, render_combined_spawn_instructions,
@@ -404,76 +403,16 @@ struct HermesVersionOutput {
     stderr: String,
 }
 
-fn is_stable_hermes_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let valid_part = |part: Option<&str>| {
-        part.is_some_and(|part| {
-            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
-        })
-    };
-    valid_part(parts.next())
-        && valid_part(parts.next())
-        && valid_part(parts.next())
-        && parts.next().is_none()
-}
-
-fn hermes_version_from_probe_line(version_line: &str) -> Option<String> {
-    let prefixed = version_line
-        .split_whitespace()
-        .filter_map(|part| part.strip_prefix('v'))
-        .filter(|part| is_stable_hermes_version(part))
-        .collect::<Vec<_>>();
-    if let [version] = prefixed.as_slice() {
-        return Some((*version).to_owned());
-    }
-    if !prefixed.is_empty() {
-        return None;
-    }
-
-    let unprefixed = version_line
-        .split_whitespace()
-        .filter(|part| is_stable_hermes_version(part))
-        .collect::<Vec<_>>();
-    if let [version] = unprefixed.as_slice() {
-        Some((*version).to_owned())
-    } else {
-        None
-    }
-}
-
 fn hermes_compaction_capability(version: Option<&str>) -> BackendCompactionCapability {
-    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
-        return BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnavailable,
-            None,
-            BackendCompactionCapabilityEvidence::None,
-        );
-    };
-    let evidence = BackendCompactionCapabilityEvidence::HermesLocalGatewayProbe {
-        version: version.to_string(),
-    };
-    let normalized = hermes_version_from_probe_line(version);
-    match normalized.as_deref() {
-        Some("0.17.0") => BackendCompactionCapability::native(
-            BackendCompactionMechanism::JsonRpcRequest,
-            normalized,
-            BackendCompactionProtocolConfidence::Verified,
-            BackendContextReseatSupport::PreservedByNative,
-            evidence,
-        ),
-        Some(observed) => BackendCompactionCapability::context_unavailable_with_metadata(
-            BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                tested: "0.17.0".to_owned(),
-            },
-            Some(observed.to_owned()),
-            evidence,
-        ),
-        None => BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnparseable,
-            Some(version.to_owned()),
-            evidence,
-        ),
-    }
+    BackendCompactionCapability::native(
+        BackendCompactionMechanism::JsonRpcRequest,
+        version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        BackendContextReseatSupport::PreservedByNative,
+        BackendCompactionCapabilityEvidence::HermesMethodProbe,
+    )
 }
 
 fn hermes_compaction_pre_dispatch(
@@ -1844,8 +1783,8 @@ impl HermesSessionActor {
         &mut self,
         request: BackendCompactionRequest,
     ) -> BackendCompactionStart {
-        // Transcript authority is the first guard by contract: an exact
-        // provider version must not bypass an unsafe replay source.
+        // Transcript authority is the first guard by contract: an advertised
+        // native method must not bypass an unsafe replay source.
         if !request.transcript_authoritative {
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
@@ -10747,69 +10686,36 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn untested_stable_version_routes_to_fallback_not_unknown() {
-        let verified = hermes_compaction_capability(Some(
-            "Hermes Agent v0.17.0 (2026.6.19) · upstream 729bbb7a",
-        ));
-        assert!(matches!(
-            verified.availability,
-            crate::backend::BackendCompactionAvailability::Native {
-                mechanism: BackendCompactionMechanism::JsonRpcRequest
-            }
-        ));
-        assert_eq!(
-            verified.confidence,
-            Some(BackendCompactionProtocolConfidence::Verified)
-        );
-        let verified_with_trailing_date =
-            hermes_compaction_capability(Some("Hermes Agent v0.17.0 upstream 2026.6.19"));
-        assert_eq!(
-            verified_with_trailing_date.provider_version.as_deref(),
-            Some("0.17.0")
-        );
-
-        let unreviewed = hermes_compaction_capability(Some(
-            "Hermes Agent v0.17.1 (2026.6.19) · upstream 729bbb7a",
-        ));
-        assert!(matches!(
-            &unreviewed.availability,
-            crate::backend::BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                    tested
+    fn compaction_capability_never_gates_on_provider_version() {
+        for version in [
+            None,
+            Some("Hermes Agent v999.0.0"),
+            Some("Hermes Agent v999.0.0-nightly.1"),
+            Some("Hermes Agent development"),
+            Some("malformed version output"),
+        ] {
+            let capability = hermes_compaction_capability(version);
+            assert!(matches!(
+                capability.availability,
+                crate::backend::BackendCompactionAvailability::Native {
+                    mechanism: BackendCompactionMechanism::JsonRpcRequest
                 }
-            } if tested == "0.17.0"
-        ));
-        assert_eq!(unreviewed.provider_version.as_deref(), Some("0.17.1"));
-        assert!(matches!(
-            crate::backend::compaction::not_dispatched_for_capability(&unreviewed),
-            Some(BackendCompactionStart::NotDispatched {
-                fallback_safe: true,
-                ..
-            })
-        ));
-
-        let unparseable = hermes_compaction_capability(Some("Hermes Agent development"));
-        assert!(matches!(
-            unparseable.availability,
-            crate::backend::BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
-            }
-        ));
-        let ambiguous =
-            hermes_compaction_capability(Some("Hermes Agent 0.17.0 upstream 2026.6.19"));
-        assert!(matches!(
-            ambiguous.availability,
-            crate::backend::BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
-            }
-        ));
+            ));
+            assert_eq!(
+                capability.provider_version.as_deref(),
+                version.map(str::trim)
+            );
+            assert!(
+                crate::backend::compaction::not_dispatched_for_capability(&capability).is_none()
+            );
+        }
     }
 
     #[test]
-    fn transcript_guard_precedes_unknown_version() {
-        let unknown = hermes_compaction_capability(None);
+    fn transcript_guard_precedes_method_probe() {
+        let capability = hermes_compaction_capability(None);
         assert!(matches!(
-            hermes_compaction_pre_dispatch(&unknown, false),
+            hermes_compaction_pre_dispatch(&capability, false),
             Some(BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                     BackendCompactionUnavailableReason::TranscriptNotAuthoritative
@@ -10817,16 +10723,12 @@ for line in sys.stdin:
                 fallback_safe: true,
             })
         ));
-        assert!(matches!(
-            hermes_compaction_pre_dispatch(&unknown, true),
-            Some(BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(_),
-                fallback_safe: false,
-            })
-        ));
         assert!(
-            hermes_compaction_pre_dispatch(&hermes_compaction_capability(Some("0.17.0")), true,)
-                .is_none()
+            hermes_compaction_pre_dispatch(
+                &hermes_compaction_capability(Some("malformed version output")),
+                true,
+            )
+            .is_none()
         );
     }
 
@@ -10852,10 +10754,10 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn attempted_provider_failures_never_look_fallback_safe() {
+    fn method_absence_is_cached_while_accepted_or_ambiguous_failures_stay_unsafe() {
         let stored = Arc::new(std::sync::Mutex::new(SessionId("stored".to_string())));
         let capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(Some(
-            "0.17.0",
+            "Hermes Agent v999.0.0-nightly.1",
         ))));
         let busy = classify_hermes_compaction_response(
             protocol::CompactionOperationId("busy".to_string()),
@@ -10901,7 +10803,10 @@ for line in sys.stdin:
                 reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
             }
         ));
-        assert_eq!(cached.provider_version.as_deref(), Some("0.17.0"));
+        assert_eq!(
+            cached.provider_version.as_deref(),
+            Some("Hermes Agent v999.0.0-nightly.1")
+        );
         assert!(matches!(
             crate::backend::compaction::not_dispatched_for_capability(&cached),
             Some(BackendCompactionStart::NotDispatched {

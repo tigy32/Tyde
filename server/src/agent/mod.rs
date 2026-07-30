@@ -510,6 +510,52 @@ fn context_compaction_fallback_allowed(
         )
 }
 
+fn backend_compaction_result_allows_inline_fallback(
+    operation_id: &CompactionOperationId,
+    result: &crate::backend::BackendCompactionResult,
+) -> bool {
+    result.operation_id == *operation_id
+        && result.dispatch == crate::backend::BackendCompactionDispatchState::Rejected
+        && result.mutation == crate::backend::BackendCompactionMutationState::NotObserved
+        && result.outcome.is_err()
+}
+
+fn compaction_flight_can_enter_rejected_fallback(flight: &CompactionFlight) -> bool {
+    flight.state == StoredCompactionState::NativeAccepted
+        && flight.terminal_taken
+        && flight.method != Some(CompactionMethod::InlineFallback)
+        && flight.fallback_task.is_none()
+}
+
+fn inline_fallback_owns_structured_native_terminal(
+    flight: &CompactionFlight,
+    operation_id: &CompactionOperationId,
+    result: &Result<crate::backend::BackendCompactionResult, String>,
+) -> bool {
+    matches!(
+        flight.state,
+        StoredCompactionState::FallbackPreparing | StoredCompactionState::FallbackCommitPending
+    ) && flight.method == Some(CompactionMethod::InlineFallback)
+        && matches!(
+            result,
+            Ok(result) if result.operation_id == *operation_id
+        )
+}
+
+fn mark_inline_context_fallback_preparing(
+    flight: &mut CompactionFlight,
+    transcript_high_water: u64,
+    activity_counter: u64,
+    settings: SessionSettingsValues,
+) {
+    flight.state = StoredCompactionState::FallbackPreparing;
+    flight.method = Some(CompactionMethod::InlineFallback);
+    flight.terminal_taken = false;
+    flight.fallback_transcript_high_water = Some(transcript_high_water);
+    flight.fallback_activity_counter = Some(activity_counter);
+    flight.fallback_settings = Some(settings);
+}
+
 fn arm_context_compaction_retry(
     flight: &mut CompactionFlight,
     actor_tx: &mpsc::UnboundedSender<AgentCommand>,
@@ -2066,6 +2112,7 @@ pub(crate) async fn generate_agent_activity_summary(
 async fn prepare_context_fallback(
     request: PrepareContextFallbackRequest,
 ) -> Result<PreparedContextFallback, String> {
+    wait_for_context_fallback_test_gate(&request.logical_session_id).await;
     let rendered_transcript = load_authoritative_compaction_transcript(
         &request.transcript_store,
         &request.logical_session_id,
@@ -3799,6 +3846,15 @@ pub(crate) fn spawn_agent_actor(
                                 let flight = context_compaction
                                     .as_ref()
                                     .expect("matching compaction flight disappeared");
+                                if flight.method == Some(CompactionMethod::InlineFallback)
+                                    && matches!(
+                                        flight.state,
+                                        StoredCompactionState::FallbackPreparing
+                                            | StoredCompactionState::FallbackCommitPending
+                                    )
+                                {
+                                    continue;
+                                }
                                 upsert_context_compaction_snapshot(
                                     &canonical_stream,
                                     &mut event_log,
@@ -6325,7 +6381,7 @@ pub(crate) fn spawn_agent_actor(
                             operation_id,
                             result,
                         } => {
-                            let Some(flight) = context_compaction.take() else {
+                            let Some(mut flight) = context_compaction.take() else {
                                 continue;
                             };
                             if flight.operation_id != operation_id {
@@ -6335,6 +6391,119 @@ pub(crate) fn spawn_agent_actor(
                             let session_id = current_session_id
                                 .as_ref()
                                 .expect("live agent must have session_id");
+                            if inline_fallback_owns_structured_native_terminal(
+                                &flight,
+                                &operation_id,
+                                &result,
+                            ) {
+                                context_compaction = Some(flight);
+                                continue;
+                            }
+                            let rejected_without_mutation = result
+                                .as_ref()
+                                .ok()
+                                .is_some_and(|result| {
+                                    backend_compaction_result_allows_inline_fallback(
+                                        &operation_id,
+                                        result,
+                                    )
+                                });
+                            if rejected_without_mutation
+                                && compaction_flight_can_enter_rejected_fallback(&flight)
+                            {
+                                let rejection_message = result
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|result| result.outcome.as_ref().err())
+                                    .map(|failure| failure.message.clone())
+                                    .unwrap_or_else(|| {
+                                        "native compaction was rejected before mutation".to_owned()
+                                    });
+                                let capability = backend
+                                    .as_ref()
+                                    .expect("backend must exist while starting fallback")
+                                    .compaction_capability();
+                                let mut fallback_context = ContextCompactionDispatchContext {
+                                    actor_tx: &actor_tx,
+                                    backend: backend
+                                        .as_ref()
+                                        .expect("backend must exist while starting fallback")
+                                        .as_ref(),
+                                    session_store: &session_store,
+                                    transcript_store: &transcript_store,
+                                    session_id,
+                                    start: &current_start,
+                                    status_handle: &status_handle,
+                                    current_session_settings: &current_session_settings,
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                    spawn_config: &compaction_spawn_config,
+                                    use_mock_backend,
+                                    capacity_tx: &compaction_capacity_tx,
+                                    antigravity_conversations_dir:
+                                        &compaction_antigravity_conversations_dir,
+                                };
+                                let fallback_result = begin_inline_context_fallback(
+                                    &mut fallback_context,
+                                    &mut flight,
+                                    &capability,
+                                    format!(
+                                        "native compaction was rejected before mutation ({rejection_message}); preparing inline fallback"
+                                    ),
+                                )
+                                .await;
+                                in_turn = false;
+                                idle_transition_armed = false;
+                                match fallback_result {
+                                    Ok(()) => {
+                                        context_compaction = Some(flight);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let terminal = ContextCompactionTerminalRecord {
+                                            accepted: false,
+                                            mutation: CompactionMutation::NotObserved,
+                                            method: flight.method,
+                                            metrics: CompactionMetrics::default(),
+                                            provider_session_id: None,
+                                            status: ContextCompactionTimelineStatus::Failed,
+                                            continuation: None,
+                                            message: Some(error),
+                                            trusted_post_context_tokens: None,
+                                        };
+                                        record_context_compaction_terminal(
+                                            flight,
+                                            terminal,
+                                            &session_store,
+                                            session_id,
+                                            &current_start,
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut replay_state,
+                                            &mut subscribers,
+                                            &mut activity_stats,
+                                        )
+                                        .await;
+                                        if matches!(lifecycle, ActorLifecycle::Running) {
+                                            release_context_compaction_barrier(
+                                                backend.as_ref().expect(
+                                                    "backend must exist while releasing compaction",
+                                                ),
+                                                &mut queue,
+                                                &mut in_turn,
+                                                &mut idle_transition_armed,
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &current_start.agent_id,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             let accepted_before_terminal = matches!(
                                 flight.state,
                                 StoredCompactionState::NativeAccepted
@@ -7039,6 +7208,17 @@ static COMPACT_IF_INACTIVE_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGa
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+struct ContextFallbackTestGate {
+    session_id: SessionId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CONTEXT_FALLBACK_TEST_GATE: std::sync::Mutex<Option<ContextFallbackTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 fn begin_supervisor_verdict_test_gates()
 -> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
     static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>> =
@@ -7157,6 +7337,51 @@ async fn wait_for_compact_if_inactive_test_gate(agent_id: &AgentId) {
 
 #[cfg(not(test))]
 async fn wait_for_compact_if_inactive_test_gate(_agent_id: &AgentId) {}
+
+#[cfg(test)]
+fn install_context_fallback_test_gate(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = CONTEXT_FALLBACK_TEST_GATE
+        .lock()
+        .expect("context fallback test gate mutex poisoned")
+        .replace(ContextFallbackTestGate {
+            session_id,
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(
+        replaced.is_none(),
+        "context fallback test gate already installed"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_for_context_fallback_test_gate(session_id: &SessionId) {
+    let gate = {
+        let mut gate = CONTEXT_FALLBACK_TEST_GATE
+            .lock()
+            .expect("context fallback test gate mutex poisoned");
+        if gate
+            .as_ref()
+            .is_some_and(|gate| &gate.session_id == session_id)
+        {
+            gate.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_for_context_fallback_test_gate(_session_id: &SessionId) {}
 
 #[cfg(test)]
 async fn wait_for_agent_startup_test_gate(agent_id: &AgentId) {
@@ -10670,8 +10895,106 @@ async fn release_context_compaction_barrier(
     }
 }
 
+async fn begin_inline_context_fallback(
+    context: &mut ContextCompactionDispatchContext<'_>,
+    active: &mut CompactionFlight,
+    capability: &crate::backend::BackendCompactionCapability,
+    message: String,
+) -> Result<(), String> {
+    if active.fallback_task.is_some()
+        || matches!(
+            active.state,
+            StoredCompactionState::FallbackPreparing | StoredCompactionState::FallbackCommitPending
+        )
+    {
+        return Err("inline fallback is already in progress".to_owned());
+    }
+    if !context_compaction_fallback_allowed(active.trigger, capability) {
+        return Err("supervisor fallback is disabled for an automatic-only backend".to_owned());
+    }
+    if !transcript_is_authoritative(context.transcript_store, context.session_id).await {
+        return Err("inline fallback requires an authoritative transcript".to_owned());
+    }
+
+    let transcript_high_water = context.event_log.len() as u64;
+    let activity_counter = context.status_handle.snapshot().await.activity_counter;
+    let fallback_settings = context.current_session_settings.clone();
+    let session_id = context.session_id.clone();
+    let operation_id = active.operation_id.clone();
+    run_session_store_io(context.session_store, move |store| {
+        let mut record = store
+            .compaction_operation(&session_id, &operation_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing compaction operation {} before fallback",
+                    operation_id.0
+                )
+            })?;
+        record.state = StoredCompactionState::FallbackPreparing;
+        record.method = Some(CompactionMethod::InlineFallback);
+        record.accepted = false;
+        record.mutation = CompactionMutation::NotObserved;
+        record.transcript_high_water = transcript_high_water;
+        store.put_compaction_operation(&session_id, record)
+    })
+    .await
+    .map_err(|error| format!("failed to persist fallback preparation frontier: {error}"))?;
+
+    mark_inline_context_fallback_preparing(
+        active,
+        transcript_high_water,
+        activity_counter,
+        fallback_settings,
+    );
+    upsert_context_compaction_snapshot(
+        context.canonical_stream,
+        context.event_log,
+        context.subscribers,
+        context.session_id,
+        &ContextCompactionNotifyPayload {
+            operation_id: active.operation_id.clone(),
+            agent_id: context.start.agent_id.clone(),
+            logical_session_id: context.session_id.clone(),
+            backend_kind: context.start.backend_kind,
+            trigger: active.trigger,
+            method: Some(CompactionMethod::InlineFallback),
+            status: ContextCompactionStatus::Started {
+                stage: CompactionStage::Finalizing,
+            },
+            provider_version: active.provider_version.clone(),
+            metrics: CompactionMetrics::default(),
+            continuation: None,
+            message: Some(message),
+        },
+    )
+    .await;
+    let request = PrepareContextFallbackRequest {
+        backend_kind: context.start.backend_kind,
+        workspace_roots: context.start.workspace_roots.clone(),
+        logical_session_id: context.session_id.clone(),
+        transcript_store: context.transcript_store.clone(),
+        transcript_high_water,
+        requested_focus: active.focus.clone(),
+        continuation: active.continuation.clone(),
+        spawn_config: context.spawn_config.clone(),
+        use_mock_backend: context.use_mock_backend,
+        capacity_tx: context.capacity_tx.clone(),
+        antigravity_conversations_dir: context.antigravity_conversations_dir.clone(),
+    };
+    let operation_id = active.operation_id.clone();
+    let tx = context.actor_tx.clone();
+    active.fallback_task = Some(tokio::spawn(async move {
+        let result = prepare_context_fallback(request).await;
+        let _ = tx.send(AgentCommand::ContextCompactionFallbackPrepared {
+            operation_id,
+            result,
+        });
+    }));
+    Ok(())
+}
+
 async fn try_dispatch_context_compaction(
-    context: ContextCompactionDispatchContext<'_>,
+    mut context: ContextCompactionDispatchContext<'_>,
     flight: &mut Option<CompactionFlight>,
     readiness: ContextCompactionDispatchReadiness<'_>,
 ) {
@@ -10878,101 +11201,23 @@ async fn try_dispatch_context_compaction(
                     });
                 return;
             }
-            if !context_compaction_fallback_allowed(active.trigger, &capability) {
-                let _ = context
-                    .actor_tx
-                    .send(AgentCommand::ContextCompactionTerminal {
-                        operation_id: active.operation_id.clone(),
-                        result: Err(
-                            "supervisor fallback is disabled for an automatic-only backend"
-                                .to_owned(),
-                        ),
-                    });
-                return;
-            }
-            active.state = StoredCompactionState::FallbackPreparing;
-            active.method = Some(CompactionMethod::InlineFallback);
-            active.fallback_transcript_high_water = Some(context.event_log.len() as u64);
-            active.fallback_activity_counter =
-                Some(context.status_handle.snapshot().await.activity_counter);
-            active.fallback_settings = Some(context.current_session_settings.clone());
-            let session_id = context.session_id.clone();
-            let operation_id = active.operation_id.clone();
-            let transcript_high_water = active
-                .fallback_transcript_high_water
-                .expect("fallback high-water was just installed");
-            let fallback_persisted = run_session_store_io(context.session_store, move |store| {
-                let mut record = store
-                    .compaction_operation(&session_id, &operation_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "missing compaction operation {} before fallback",
-                            operation_id.0
-                        )
-                    })?;
-                record.state = StoredCompactionState::FallbackPreparing;
-                record.method = Some(CompactionMethod::InlineFallback);
-                record.transcript_high_water = transcript_high_water;
-                store.put_compaction_operation(&session_id, record)
-            })
-            .await;
-            if let Err(error) = fallback_persisted {
-                let _ = context
-                    .actor_tx
-                    .send(AgentCommand::ContextCompactionTerminal {
-                        operation_id: active.operation_id.clone(),
-                        result: Err(format!(
-                            "failed to persist fallback preparation frontier: {error}"
-                        )),
-                    });
-                return;
-            }
-            upsert_context_compaction_snapshot(
-                context.canonical_stream,
-                context.event_log,
-                context.subscribers,
-                context.session_id,
-                &ContextCompactionNotifyPayload {
-                    operation_id: active.operation_id.clone(),
-                    agent_id: context.start.agent_id.clone(),
-                    logical_session_id: context.session_id.clone(),
-                    backend_kind: context.start.backend_kind,
-                    trigger: active.trigger,
-                    method: Some(CompactionMethod::InlineFallback),
-                    status: ContextCompactionStatus::Started {
-                        stage: CompactionStage::Finalizing,
-                    },
-                    provider_version: active.provider_version.clone(),
-                    metrics: CompactionMetrics::default(),
-                    continuation: None,
-                    message: Some(format!(
-                        "native compaction was not dispatched ({reason:?}); preparing inline fallback"
-                    )),
-                },
+            if let Err(error) = begin_inline_context_fallback(
+                &mut context,
+                active,
+                &capability,
+                format!(
+                    "native compaction was not dispatched ({reason:?}); preparing inline fallback"
+                ),
             )
-            .await;
-            let request = PrepareContextFallbackRequest {
-                backend_kind: context.start.backend_kind,
-                workspace_roots: context.start.workspace_roots.clone(),
-                logical_session_id: context.session_id.clone(),
-                transcript_store: context.transcript_store.clone(),
-                transcript_high_water,
-                requested_focus: active.focus.clone(),
-                continuation: active.continuation.clone(),
-                spawn_config: context.spawn_config.clone(),
-                use_mock_backend: context.use_mock_backend,
-                capacity_tx: context.capacity_tx.clone(),
-                antigravity_conversations_dir: context.antigravity_conversations_dir.clone(),
-            };
-            let operation_id = active.operation_id.clone();
-            let tx = context.actor_tx.clone();
-            active.fallback_task = Some(tokio::spawn(async move {
-                let result = prepare_context_fallback(request).await;
-                let _ = tx.send(AgentCommand::ContextCompactionFallbackPrepared {
-                    operation_id,
-                    result,
-                });
-            }));
+            .await
+            {
+                let _ = context
+                    .actor_tx
+                    .send(AgentCommand::ContextCompactionTerminal {
+                        operation_id: active.operation_id.clone(),
+                        result: Err(error),
+                    });
+            }
         }
         crate::backend::BackendCompactionStart::DispatchUncertain(result) => {
             active.state = StoredCompactionState::NativeAccepted;
@@ -11944,16 +12189,17 @@ mod tests {
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
         AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
-        CompactionMetrics, CompactionOperationId, CompactionStage, CompactionTrigger,
-        ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
-        Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-        QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
-        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
-        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
-        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
-        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
+        CompactionMetrics, CompactionMutation, CompactionOperationId, CompactionStage,
+        CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionStatus,
+        ContextCompactionTimelineEvent, ContextCompactionTimelineStatus, Envelope, FrameKind,
+        MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
+        ModelRequestId, ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
+        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -11970,17 +12216,19 @@ mod tests {
         agent_name_generation_spawn_config, agent_usage_snapshot_from_log,
         append_backend_chat_event, append_chat_event, append_event, apply_generated_agent_name,
         apply_runtime_session_updates, attach_subscriber, attach_subscriber_with_latest_output,
-        collect_agent_activity_summary_events, collect_agent_name_events,
+        backend_compaction_result_allows_inline_fallback, collect_agent_activity_summary_events,
+        collect_agent_name_events, compaction_flight_can_enter_rejected_fallback,
         context_compaction_dispatch_is_safe, context_compaction_fallback_allowed,
         current_latest_output, generate_fallback_compaction_summary, generate_mock_name,
-        ingest_gated_replay_event, internal_compaction_input, known_turn_usage,
-        mark_agent_turn_active, output_events_since, project_legacy_native_collaboration_event,
-        publish_resumed_agent_idle, record_agent_started, record_chat_event_for_replay,
-        register_transcript_session, replay_envelope, resolve_backend_session_settings,
-        sanitize_generated_agent_name, session_history_entries_from_log, session_history_window,
-        spawn_agent_actor, spawn_relay_agent_actor, summarize_continuation_result,
-        terminal_input_rejected_payload, upsert_activity_stats_snapshot,
-        upsert_context_compaction_snapshot,
+        ingest_gated_replay_event, inline_fallback_owns_structured_native_terminal,
+        install_context_fallback_test_gate, internal_compaction_input, known_turn_usage,
+        mark_agent_turn_active, mark_inline_context_fallback_preparing, output_events_since,
+        project_legacy_native_collaboration_event, publish_resumed_agent_idle,
+        record_agent_started, record_chat_event_for_replay, register_transcript_session,
+        replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
+        session_history_entries_from_log, session_history_window, spawn_agent_actor,
+        spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
+        upsert_activity_stats_snapshot, upsert_context_compaction_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
@@ -18326,6 +18574,123 @@ mod tests {
     }
 
     #[test]
+    fn inline_fallback_requires_exact_rejected_not_observed_terminal() {
+        let operation_id = CompactionOperationId("operation".to_owned());
+        let result = |operation_id: &str,
+                      dispatch,
+                      mutation,
+                      failed|
+         -> crate::backend::BackendCompactionResult {
+            crate::backend::BackendCompactionResult {
+                operation_id: CompactionOperationId(operation_id.to_owned()),
+                dispatch,
+                mutation,
+                outcome: if failed {
+                    Err(crate::backend::BackendCompactionFailure {
+                        kind: crate::backend::BackendCompactionFailureKind::ProviderRejected,
+                        message: "method absent".to_owned(),
+                    })
+                } else {
+                    Ok(crate::backend::BackendCompactionSuccess {
+                        mechanism: CompactionMethod::NativeRpc,
+                    })
+                },
+                provider_session_id: None,
+                metrics: CompactionMetrics::default(),
+                post_context_tokens: crate::backend::PostCompactionTokenCount::Unknown,
+                evidence: crate::backend::BackendCompactionTerminalEvidence::None,
+            }
+        };
+        use crate::backend::BackendCompactionDispatchState::{
+            Accepted, MayHaveReachedProvider, Rejected,
+        };
+        use crate::backend::BackendCompactionMutationState::{MayHaveMutated, NotObserved};
+
+        assert!(backend_compaction_result_allows_inline_fallback(
+            &operation_id,
+            &result("operation", Rejected, NotObserved, true),
+        ));
+        for disallowed in [
+            result("operation", Accepted, NotObserved, true),
+            result("operation", Accepted, MayHaveMutated, true),
+            result("operation", MayHaveReachedProvider, NotObserved, true),
+            result("operation", Rejected, MayHaveMutated, true),
+            result("operation", Rejected, NotObserved, false),
+            result("different-operation", Rejected, NotObserved, true),
+        ] {
+            assert!(
+                !backend_compaction_result_allows_inline_fallback(&operation_id, &disallowed,),
+                "accepted, ambiguous, successful, or mismatched terminals must not fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_terminal_fallback_clears_native_acceptance_before_spawn() {
+        let rejected_terminal = crate::backend::BackendCompactionResult {
+            operation_id: CompactionOperationId("operation".to_owned()),
+            dispatch: crate::backend::BackendCompactionDispatchState::Rejected,
+            mutation: crate::backend::BackendCompactionMutationState::NotObserved,
+            outcome: Err(crate::backend::BackendCompactionFailure {
+                kind: crate::backend::BackendCompactionFailureKind::ProviderRejected,
+                message: "method absent".to_owned(),
+            }),
+            provider_session_id: None,
+            metrics: CompactionMetrics::default(),
+            post_context_tokens: crate::backend::PostCompactionTokenCount::Unknown,
+            evidence: crate::backend::BackendCompactionTerminalEvidence::None,
+        };
+        let mut flight = CompactionFlight {
+            operation_id: CompactionOperationId("operation".to_owned()),
+            trigger: CompactionTrigger::UserRequested,
+            focus: None,
+            continuation: crate::backend::BackendContinuationContext {
+                required: Vec::new(),
+                advisory: Vec::new(),
+            },
+            queue_watermark: 0,
+            state: StoredCompactionState::NativeAccepted,
+            binding_generation_before: 0,
+            fallback_transcript_high_water: None,
+            fallback_activity_counter: None,
+            fallback_settings: None,
+            fallback_task: None,
+            retry_armed: false,
+            retry_attempt: 0,
+            method: Some(CompactionMethod::NativeRpc),
+            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
+            provider_version: Some("arbitrary diagnostic".to_owned()),
+            terminal_taken: true,
+        };
+        assert!(compaction_flight_can_enter_rejected_fallback(&flight));
+
+        mark_inline_context_fallback_preparing(
+            &mut flight,
+            17,
+            23,
+            SessionSettingsValues::default(),
+        );
+
+        assert_eq!(flight.state, StoredCompactionState::FallbackPreparing);
+        assert_eq!(flight.method, Some(CompactionMethod::InlineFallback));
+        assert!(!flight.terminal_taken);
+        assert_eq!(flight.fallback_transcript_high_water, Some(17));
+        assert_eq!(flight.fallback_activity_counter, Some(23));
+        assert!(
+            !compaction_flight_can_enter_rejected_fallback(&flight),
+            "a duplicate native terminal cannot start a second fallback"
+        );
+        assert!(
+            inline_fallback_owns_structured_native_terminal(
+                &flight,
+                &CompactionOperationId("operation".to_owned()),
+                &Ok(rejected_terminal),
+            ),
+            "the active inline fallback must absorb a duplicate native terminal"
+        );
+    }
+
+    #[test]
     fn background_task_must_reach_terminal_progress_before_compaction_dispatch() {
         let flight = CompactionFlight {
             operation_id: CompactionOperationId("operation".to_owned()),
@@ -18501,7 +18866,6 @@ mod tests {
             },
             provider_version: Some("antigravity-test".to_owned()),
             protocol_version: None,
-            confidence: None,
             reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         };
@@ -18532,7 +18896,6 @@ mod tests {
         let claude_native = crate::backend::BackendCompactionCapability::native(
             crate::backend::BackendCompactionMechanism::InterceptedTextCommand,
             Some("claude-test".to_owned()),
-            crate::backend::BackendCompactionProtocolConfidence::Verified,
             crate::backend::BackendContextReseatSupport::InjectAfterNative,
             crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         );
@@ -18815,42 +19178,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_version_falls_back_while_unknown_is_rejected_before_admission() {
+    async fn rejected_not_observed_falls_back_once_in_the_same_operation() {
         let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
         let transcript_dir = tempfile::tempdir().expect("transcript tempdir");
         let _transcript_env = TranscriptEnvGuard::install(transcript_dir.path());
 
         let (_dir, start, mut request, runtime, status_handle) =
-            startup_actor_fixture("future-version-fallback", None);
-        request.initial_input = Some(delivery_payload(&format!(
-            "{} establish authoritative transcript",
-            crate::backend::mock::MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL
-        )));
+            startup_actor_fixture("rejected-terminal-fallback", None);
+        request.initial_input = Some(delivery_payload("establish authoritative transcript"));
         let session_store = Arc::clone(&runtime.session_store);
         let (handle, startup_rx) =
             spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
         let session_id = startup_rx
             .await
-            .expect("future-version actor startup reply")
-            .expect("future-version actor startup");
+            .expect("rejected-terminal actor startup reply")
+            .expect("rejected-terminal actor startup");
         wait_for_idle_actor(&status_handle).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         assert!(handle.attach(replay_stream(tx)).await);
-        let _ = recv_agent_bootstrap_events(&mut rx, "future-version bootstrap").await;
+        let _ = recv_agent_bootstrap_events(&mut rx, "rejected-terminal bootstrap").await;
         assert_eq!(
             handle
                 .requested_compaction_route(CompactionTrigger::UserRequested)
                 .await,
-            Ok(protocol::RequestedCompactionRoute::InlineFallbackOnly)
+            Ok(protocol::RequestedCompactionRoute::NativePreferred)
         );
         let operation_id = handle
             .request_context_compaction(
                 CompactionTrigger::UserRequested,
-                None,
+                Some(crate::backend::mock::MOCK_COMPACT_REJECTED_SENTINEL.to_owned()),
                 Duration::from_secs(30),
             )
             .await
-            .expect("future version admits safe fallback");
+            .expect("native compaction request is admitted");
         let (terminal, terminal_count) = recv_context_terminal(&mut rx).await;
         assert_eq!(terminal_count, 1);
         assert_eq!(terminal.operation_id, operation_id);
@@ -18860,12 +19220,28 @@ mod tests {
             .lock()
             .await
             .compaction_operation(&session_id, &operation_id)
-            .expect("future-version fallback operation");
+            .expect("same-operation fallback record");
         assert_eq!(stored.method, Some(CompactionMethod::InlineFallback));
+        assert!(!stored.accepted);
+        assert_eq!(stored.mutation, CompactionMutation::Completed);
+        assert_follow_up_reaches_backend(
+            &handle,
+            &mut rx,
+            "RejectedNotObservedFallback",
+            terminal_count,
+            false,
+        )
+        .await;
         assert!(handle.close().await);
+    }
 
+    #[tokio::test]
+    async fn unknown_capability_is_rejected_before_admission() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let transcript_dir = tempfile::tempdir().expect("transcript tempdir");
+        let _transcript_env = TranscriptEnvGuard::install(transcript_dir.path());
         let (_dir, start, mut request, runtime, status_handle) =
-            startup_actor_fixture("unknown-version-rejected", None);
+            startup_actor_fixture("unknown-capability-rejected", None);
         request.initial_input = Some(delivery_payload(&format!(
             "{} establish authoritative transcript",
             crate::backend::mock::MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL
@@ -18875,8 +19251,8 @@ mod tests {
             spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
         let session_id = startup_rx
             .await
-            .expect("unknown-version actor startup reply")
-            .expect("unknown-version actor startup");
+            .expect("unknown-capability actor startup reply")
+            .expect("unknown-capability actor startup");
         wait_for_idle_actor(&status_handle).await;
         assert!(
             handle
@@ -18900,7 +19276,7 @@ mod tests {
                 .lock()
                 .await
                 .get(&session_id)
-                .expect("unknown-version session")
+                .expect("unknown-capability session")
                 .compaction_operations
                 .is_empty(),
             "rejected unknown capability must not persist a compaction operation"
@@ -18914,6 +19290,7 @@ mod tests {
         enum TerminalPath {
             NativeSuccess,
             NativeProviderFailure,
+            RejectedFallbackInterrupt,
             DeferredDeadline,
             ContinuationInjectionFailure,
             FallbackSummaryFailure,
@@ -18926,6 +19303,7 @@ mod tests {
         let rows = [
             TerminalPath::NativeSuccess,
             TerminalPath::NativeProviderFailure,
+            TerminalPath::RejectedFallbackInterrupt,
             TerminalPath::DeferredDeadline,
             TerminalPath::ContinuationInjectionFailure,
             TerminalPath::FallbackSummaryFailure,
@@ -18974,11 +19352,29 @@ mod tests {
             let (tx, mut rx) = mpsc::unbounded_channel();
             assert!(handle.attach(replay_stream(tx)).await);
             let _ = recv_agent_bootstrap_events(&mut rx, "compaction terminal bootstrap").await;
+            let preserved_token_count = 42_424;
+            let (fallback_gate_entered, fallback_gate_release) =
+                if matches!(path, TerminalPath::RejectedFallbackInterrupt) {
+                    session_store
+                        .lock()
+                        .await
+                        .update(&session_id, |record| {
+                            record.token_count = Some(preserved_token_count)
+                        })
+                        .expect("seed token count before rejected fallback interrupt");
+                    let (entered, release) = install_context_fallback_test_gate(session_id.clone());
+                    (Some(entered), Some(release))
+                } else {
+                    (None, None)
+                };
 
             let focus = match path {
                 TerminalPath::NativeSuccess => None,
                 TerminalPath::NativeProviderFailure => {
                     Some(crate::backend::mock::MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL.to_owned())
+                }
+                TerminalPath::RejectedFallbackInterrupt => {
+                    Some(crate::backend::mock::MOCK_COMPACT_REJECTED_SENTINEL.to_owned())
                 }
                 TerminalPath::ActorClose => {
                     Some(crate::backend::mock::MOCK_COMPACT_HANG_SENTINEL.to_owned())
@@ -19020,6 +19416,16 @@ mod tests {
                 TerminalPath::Interrupt => {
                     assert_eq!(handle.interrupt().await, InterruptOutcome::Interrupted);
                 }
+                TerminalPath::RejectedFallbackInterrupt => {
+                    timeout(
+                        Duration::from_secs(5),
+                        fallback_gate_entered.expect("rejected fallback interrupt gate"),
+                    )
+                    .await
+                    .expect("rejected fallback reaches production preparation task")
+                    .expect("rejected fallback preparation gate stays open");
+                    assert_eq!(handle.interrupt().await, InterruptOutcome::Interrupted);
+                }
                 TerminalPath::ActorClose => {
                     assert!(handle.close().await);
                 }
@@ -19036,6 +19442,45 @@ mod tests {
                 stored.is_terminal(),
                 "{path:?} must persist a terminal record"
             );
+            if matches!(path, TerminalPath::NativeProviderFailure) {
+                assert_eq!(
+                    terminal.status,
+                    ContextCompactionStatus::Failed {
+                        accepted: true,
+                        mutation: CompactionMutation::MayHaveMutated,
+                    }
+                );
+                assert!(stored.accepted);
+                assert_eq!(stored.mutation, CompactionMutation::MayHaveMutated);
+                assert_ne!(
+                    stored.method,
+                    Some(CompactionMethod::InlineFallback),
+                    "an accepted ambiguous native failure must never fallback"
+                );
+            }
+            if matches!(path, TerminalPath::RejectedFallbackInterrupt) {
+                assert_eq!(
+                    terminal.status,
+                    ContextCompactionStatus::Failed {
+                        accepted: false,
+                        mutation: CompactionMutation::NotObserved,
+                    }
+                );
+                assert!(!stored.accepted);
+                assert_eq!(stored.mutation, CompactionMutation::NotObserved);
+                assert_eq!(stored.method, Some(CompactionMethod::InlineFallback));
+                assert_eq!(
+                    session_store
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .expect("rejected fallback interrupt session")
+                        .token_count,
+                    Some(preserved_token_count),
+                    "a rejected native attempt must not clear trusted token usage"
+                );
+            }
+            drop(fallback_gate_release);
             let transcript = transcript_store
                 .load(&session_id)
                 .expect("canonical transcript records");
@@ -19053,6 +19498,22 @@ mod tests {
                 1,
                 "{path:?} must persist exactly one terminal timeline marker before notify"
             );
+            if matches!(path, TerminalPath::RejectedFallbackInterrupt) {
+                let marker = transcript
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        ChatEvent::ContextCompaction(marker)
+                            if marker.operation_id.as_ref() == Some(&operation_id) =>
+                        {
+                            Some(marker)
+                        }
+                        _ => None,
+                    })
+                    .expect("rejected fallback interrupt timeline marker");
+                assert_eq!(marker.method, CompactionMethod::InlineFallback);
+                assert_eq!(marker.mutation, CompactionMutation::NotObserved);
+                assert_eq!(marker.status, ContextCompactionTimelineStatus::Failed);
+            }
 
             if matches!(path, TerminalPath::ActorClose) {
                 assert_eq!(

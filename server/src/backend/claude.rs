@@ -11593,10 +11593,10 @@ use super::{
     BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
     BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
     BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
-    BackendCompactionObservationSource, BackendCompactionProgress,
-    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
-    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
+    BackendCompactionUnknownReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
     BackendContinuationContext, BackendContinuationItem, BackendEvent, BackendObservedCompaction,
     BackendSession, BackendSpawnConfig, BackendStartupError, ContinuationInstallStatus,
@@ -12205,89 +12205,32 @@ fn claude_capacity_access_from_initialize(response: &Value) -> ClaudeCapacityAcc
     }
 }
 
-fn stable_claude_version(version_line: &str) -> Option<(&str, u64)> {
-    let version = version_line.split_whitespace().next()?;
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let valid_part = |part: Option<&str>| {
-        part.is_some_and(|part| {
-            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
-        })
-    };
-    (valid_part(parts.next()) && valid_part(parts.next()) && parts.next().is_none())
-        .then_some((version, major))
-}
-
 fn claude_compaction_capability(
     compact_command_advertised: Option<bool>,
     provider_version: Option<&str>,
 ) -> BackendCompactionCapability {
+    let provider_version = provider_version.and_then(normalize_nonempty);
+    let evidence = BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+        name: "compact".to_owned(),
+    };
     match compact_command_advertised {
-        None => {
-            return BackendCompactionCapability::unknown(
-                BackendCompactionUnknownReason::ProcessNotInitialized,
-                provider_version.map(str::to_owned),
-                BackendCompactionCapabilityEvidence::None,
-            );
-        }
-        Some(false) => {
-            let mut capability = BackendCompactionCapability::context_unavailable(
-                BackendCompactionUnavailableReason::ProviderDisabledCommand,
-            );
-            capability.provider_version = provider_version.map(str::to_owned);
-            capability.evidence = BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
-                name: "compact".to_string(),
-            };
-            return capability;
-        }
-        Some(true) => {}
-    }
-
-    let Some(version_line) = provider_version.and_then(normalize_nonempty) else {
-        return BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnavailable,
-            None,
-            BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
-                name: "compact".to_string(),
-            },
-        );
-    };
-    let Some((version, major)) = stable_claude_version(&version_line) else {
-        return BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnparseable,
-            Some(version_line),
-            BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
-                name: "compact".to_string(),
-            },
-        );
-    };
-    let version = version.to_owned();
-    if major != 2 {
-        let evidence = BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
-            name: "compact".to_string(),
-        };
-        return BackendCompactionCapability::context_unavailable_with_metadata(
-            BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                tested: "2.x stable".to_owned(),
-            },
-            Some(version),
+        None => BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::ProcessNotInitialized,
+            provider_version,
+            BackendCompactionCapabilityEvidence::None,
+        ),
+        Some(false) => BackendCompactionCapability::context_unavailable_with_metadata(
+            BackendCompactionUnavailableReason::ProviderDisabledCommand,
+            provider_version,
             evidence,
-        );
+        ),
+        Some(true) => BackendCompactionCapability::native(
+            BackendCompactionMechanism::InterceptedTextCommand,
+            provider_version,
+            BackendContextReseatSupport::IncludeInNativeRequest,
+            evidence,
+        ),
     }
-    let confidence = if version == "2.1.220" {
-        BackendCompactionProtocolConfidence::Verified
-    } else {
-        BackendCompactionProtocolConfidence::Compatible
-    };
-    BackendCompactionCapability::native(
-        BackendCompactionMechanism::InterceptedTextCommand,
-        Some(version),
-        confidence,
-        BackendContextReseatSupport::IncludeInNativeRequest,
-        BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
-            name: "compact".to_string(),
-        },
-    )
 }
 
 fn sanitize_claude_compaction_focus(value: &str) -> Result<String, ()> {
@@ -25954,43 +25897,37 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn compaction_capability_requires_catalog_and_supported_major() {
-        let verified = claude_compaction_capability(Some(true), Some("2.1.220 (Claude Code)"));
-        assert_eq!(
-            verified.confidence,
-            Some(BackendCompactionProtocolConfidence::Verified)
-        );
-        assert_eq!(verified.provider_version.as_deref(), Some("2.1.220"));
-        let compatible = claude_compaction_capability(Some(true), Some("2.2.0"));
-        assert_eq!(
-            compatible.confidence,
-            Some(BackendCompactionProtocolConfidence::Compatible)
-        );
-        let next_major = claude_compaction_capability(Some(true), Some("3.0.0"));
-        assert!(matches!(
-            next_major.availability,
-            BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                    ref tested
+    fn compaction_capability_uses_advertised_command_not_version() {
+        for version in [
+            None,
+            Some("999.0.0"),
+            Some("999.0.0-nightly.1"),
+            Some("development"),
+            Some("malformed version output"),
+        ] {
+            let capability = claude_compaction_capability(Some(true), version);
+            assert!(matches!(
+                capability.availability,
+                BackendCompactionAvailability::Native {
+                    mechanism: BackendCompactionMechanism::InterceptedTextCommand
                 }
-            } if tested == "2.x stable"
-        ));
-        assert_eq!(next_major.provider_version.as_deref(), Some("3.0.0"));
+            ));
+            assert_eq!(
+                capability.provider_version.as_deref(),
+                version.map(str::trim)
+            );
+        }
         assert!(matches!(
-            claude_compaction_capability(Some(true), Some("development")).availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
+            claude_compaction_capability(Some(false), Some("999.0.0")).availability,
+            BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::ProviderDisabledCommand
             }
         ));
         assert!(matches!(
-            claude_compaction_capability(Some(true), Some("2.2.0-beta.1")).availability,
+            claude_compaction_capability(None, Some("999.0.0")).availability,
             BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::VersionUnparseable
+                reason: BackendCompactionUnknownReason::ProcessNotInitialized
             }
-        ));
-        assert!(matches!(
-            claude_compaction_capability(Some(false), Some("2.1.220")).availability,
-            BackendCompactionAvailability::Unavailable { .. }
         ));
     }
 
@@ -26017,10 +25954,9 @@ for line in sys.stdin:
             BackendCompactionAvailability::Native { .. }
         ));
         assert_eq!(
-            capability.confidence,
-            Some(BackendCompactionProtocolConfidence::Verified)
+            capability.provider_version.as_deref(),
+            Some("2.1.220 (Claude Code)")
         );
-        assert_eq!(capability.provider_version.as_deref(), Some("2.1.220"));
     }
 
     #[tokio::test]

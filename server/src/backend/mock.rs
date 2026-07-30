@@ -26,12 +26,11 @@ use super::{
     BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
     BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
     BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
-    BackendCompactionObservationSource, BackendCompactionProgress,
-    BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
-    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendContextReseatSupport, BackendEvent, BackendObservedCompaction, BackendSession,
-    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
-    StartupMcpServer, StartupMcpTransport,
+    BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionRequest,
+    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
+    BackendCompactionTerminalEvidence, BackendContextReseatSupport, BackendEvent,
+    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendStartupError,
+    EventStream, PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport,
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
@@ -53,6 +52,7 @@ const MOCK_COMPACT_SENTINEL: &str = "/compact";
 pub(crate) const MOCK_NATIVE_COMPACT_SENTINEL: &str = "__mock_native_compact__";
 pub(crate) const MOCK_COMPACT_AUTO_SENTINEL: &str = "__mock_compact_auto__";
 pub(crate) const MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL: &str = "__mock_compact_fail_pre__";
+pub(crate) const MOCK_COMPACT_REJECTED_SENTINEL: &str = "__mock_compact_rejected__";
 pub(crate) const MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL: &str = "__mock_compact_fail_post__";
 pub(crate) const MOCK_COMPACT_NO_BOUNDARY_SENTINEL: &str = "__mock_compact_no_boundary__";
 pub(crate) const MOCK_COMPACT_HANG_SENTINEL: &str = "__mock_compact_hang__";
@@ -305,7 +305,6 @@ fn native_mock_compaction_capability() -> BackendCompactionCapability {
         },
         provider_version: Some("mock-native-compaction-v1".to_owned()),
         protocol_version: Some("mock-native-compaction-v1".to_owned()),
-        confidence: Some(BackendCompactionProtocolConfidence::Verified),
         reseat: BackendContextReseatSupport::PreservedByNative,
         evidence: BackendCompactionCapabilityEvidence::AdapterContract,
     }
@@ -319,16 +318,16 @@ fn mock_compaction_capability_for_control(control: &str) -> BackendCompactionCap
     }
     if control.contains(MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL) {
         return BackendCompactionCapability::unknown(
-            super::BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+            super::BackendCompactionUnknownReason::CapabilityProbeFailed(
+                "mock capability probe failed".to_owned(),
+            ),
             Some("mock-unknown".to_owned()),
             BackendCompactionCapabilityEvidence::AdapterContract,
         );
     }
     if control.contains(MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL) {
         return BackendCompactionCapability::context_unavailable_with_metadata(
-            super::BackendCompactionUnavailableReason::VersionNotAllowlisted {
-                tested: "mock-native-compaction-v1".to_owned(),
-            },
+            super::BackendCompactionUnavailableReason::ManualTriggerAbsent,
             Some("mock-future-compaction-v2".to_owned()),
             BackendCompactionCapabilityEvidence::AdapterContract,
         );
@@ -754,6 +753,10 @@ impl Backend for MockBackend {
                 .focus
                 .as_deref()
                 .is_some_and(|focus| focus.contains(MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL));
+            let rejected_before_mutation = request
+                .focus
+                .as_deref()
+                .is_some_and(|focus| focus.contains(MOCK_COMPACT_REJECTED_SENTINEL));
             let omit_boundary = request
                 .focus
                 .as_deref()
@@ -779,11 +782,17 @@ impl Backend for MockBackend {
                     }
                     flight.terminal_tx.take()
                 };
-                let failure = fail_after_dispatch || omit_boundary;
+                let failure = rejected_before_mutation || fail_after_dispatch || omit_boundary;
                 let result = BackendCompactionResult {
                     operation_id: operation_id.clone(),
-                    dispatch: BackendCompactionDispatchState::Accepted,
-                    mutation: if fail_after_dispatch {
+                    dispatch: if rejected_before_mutation {
+                        BackendCompactionDispatchState::Rejected
+                    } else {
+                        BackendCompactionDispatchState::Accepted
+                    },
+                    mutation: if rejected_before_mutation {
+                        BackendCompactionMutationState::NotObserved
+                    } else if fail_after_dispatch {
                         BackendCompactionMutationState::MayHaveMutated
                     } else if omit_boundary {
                         BackendCompactionMutationState::NotObserved
@@ -792,12 +801,16 @@ impl Backend for MockBackend {
                     },
                     outcome: if failure {
                         Err(BackendCompactionFailure {
-                            kind: if fail_after_dispatch {
+                            kind: if rejected_before_mutation {
+                                BackendCompactionFailureKind::ProviderRejected
+                            } else if fail_after_dispatch {
                                 BackendCompactionFailureKind::ProviderFailed
                             } else {
                                 BackendCompactionFailureKind::ProtocolViolation
                             },
-                            message: if fail_after_dispatch {
+                            message: if rejected_before_mutation {
+                                "mock compaction was rejected before mutation".to_owned()
+                            } else if fail_after_dispatch {
                                 "mock compaction failed after dispatch".to_owned()
                             } else {
                                 "mock compaction completed without a boundary".to_owned()
@@ -2869,6 +2882,31 @@ mod tests {
         assert!(matches!(
             events.try_recv_backend(),
             Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_method_absence_is_rejected_without_observed_mutation() {
+        let (backend, _events) = spawn_idle_mock().await;
+        let accepted = match backend
+            .begin_compaction(mock_compaction_request(
+                "mock-method-absent",
+                Some(MOCK_COMPACT_REJECTED_SENTINEL),
+            ))
+            .await
+        {
+            BackendCompactionStart::Accepted(accepted) => accepted,
+            start => panic!("expected accepted mock compaction, got {start:?}"),
+        };
+        let result = accepted.terminal.await.expect("mock compaction terminal");
+        assert_eq!(result.dispatch, BackendCompactionDispatchState::Rejected);
+        assert_eq!(result.mutation, BackendCompactionMutationState::NotObserved);
+        assert!(matches!(
+            result.outcome,
+            Err(BackendCompactionFailure {
+                kind: BackendCompactionFailureKind::ProviderRejected,
+                ..
+            })
         ));
     }
 
