@@ -313,6 +313,7 @@ mod tests {
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: Vec::new(),
                 }],
             }],

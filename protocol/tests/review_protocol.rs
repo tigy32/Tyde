@@ -143,6 +143,7 @@ fn diff_payload() -> ProjectGitDiffPayload {
         files: vec![ProjectGitDiffFile {
             relative_path: "src/lib.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![ProjectGitDiffHunk {
                 hunk_id: "src/lib.rs:1".to_owned(),
                 old_start: 1,
@@ -490,6 +491,7 @@ fn project_git_diff_file_binary_flag_round_trips() {
     let file = ProjectGitDiffFile {
         relative_path: "assets/logo.png".to_owned(),
         is_binary: true,
+        unmerged: false,
         hunks: Vec::new(),
     };
 

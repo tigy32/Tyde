@@ -1689,11 +1689,10 @@ fn DiffContent(
 /// for now; fix is to make this mode-aware (run `pair_lines_side_by_side`
 /// per hunk to count) and recompute when view_mode toggles.
 fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMode) -> usize {
-    // Binary / no-hunk files render the file header (1 row) plus a single
-    // "Binary file changed" placeholder row instead of hunks — see
-    // `DiffFileView`'s `show_placeholder` branch. Counting it keeps the
-    // per-file virtual-scroll offsets aligned in multi-file diffs.
-    if file.is_binary || file.hunks.is_empty() {
+    // Unmerged, binary, and no-hunk files render the file header plus a
+    // single placeholder row instead of hunks. Counting it keeps the per-file
+    // virtual-scroll offsets aligned in multi-file diffs.
+    if file.unmerged || file.is_binary || file.hunks.is_empty() {
         return 2;
     }
     let mut total = 1; // file header
@@ -1753,12 +1752,20 @@ fn DiffFileView(
     // the hunk renderer entirely. The file header still carries the
     // file-level comment affordance + thread region, so the user can leave
     // a file-scoped comment on a binary change.
+    let is_unmerged = file.unmerged;
     let is_binary = file.is_binary;
-    let show_placeholder = is_binary || file.hunks.is_empty();
-    let placeholder_text = if is_binary {
+    let show_placeholder = is_unmerged || is_binary || file.hunks.is_empty();
+    let placeholder_text = if is_unmerged {
+        "Unmerged file — resolve conflicts in the file, then stage it"
+    } else if is_binary {
         "Binary file changed"
     } else {
         "No textual changes"
+    };
+    let placeholder_test = if is_unmerged {
+        "diff-unmerged-placeholder"
+    } else {
+        "diff-binary-placeholder"
     };
 
     // `data-diff-path` lets a pointer hit-test resolve which file a row belongs
@@ -1779,7 +1786,7 @@ fn DiffFileView(
             })}
             {if show_placeholder {
                 view! {
-                    <div class="diff-binary-placeholder" data-test="diff-binary-placeholder">
+                    <div class="diff-binary-placeholder" data-test=placeholder_test>
                         {placeholder_text}
                     </div>
                 }.into_any()
@@ -4275,6 +4282,7 @@ mod tests {
         let binary = ProjectGitDiffFile {
             relative_path: "img.png".to_owned(),
             is_binary: true,
+            unmerged: false,
             hunks: vec![],
         };
         assert_eq!(rendered_rows_for_file(&binary, DiffContextMode::Hunks), 2);
@@ -4286,14 +4294,28 @@ mod tests {
         let no_hunks = ProjectGitDiffFile {
             relative_path: "x.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![],
         };
         assert_eq!(rendered_rows_for_file(&no_hunks, DiffContextMode::Hunks), 2);
+
+        let unmerged = ProjectGitDiffFile {
+            relative_path: "conflicted.rs".to_owned(),
+            is_binary: false,
+            unmerged: true,
+            hunks: vec![],
+        };
+        assert_eq!(rendered_rows_for_file(&unmerged, DiffContextMode::Hunks), 2);
+        assert_eq!(
+            rendered_rows_for_file(&unmerged, DiffContextMode::FullFile),
+            2
+        );
 
         // header + hunk-header + 1 line = 3 (Hunks); header + 1 line = 2 (FullFile).
         let normal = ProjectGitDiffFile {
             relative_path: "x.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![ProjectGitDiffHunk {
                 hunk_id: "h".to_owned(),
                 old_start: 1,
@@ -4582,6 +4604,7 @@ mod wasm_tests {
         let file = ProjectGitDiffFile {
             relative_path: "big.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![hunk],
         };
         DiffViewState {
@@ -4756,6 +4779,7 @@ mod wasm_tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: relative_path.to_owned(),
                 is_binary: false,
+                unmerged: false,
                 hunks: vec![hunk],
             }],
         }
@@ -5775,6 +5799,7 @@ mod wasm_tests {
         let file = ProjectGitDiffFile {
             relative_path: path.clone(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![mk_hunk(431, 431, "h1"), mk_hunk(459, 458, "h2")],
         };
         let diff = DiffViewState {
@@ -5904,6 +5929,7 @@ mod wasm_tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/foo.rs".to_owned(),
                 is_binary: false,
+                unmerged: false,
                 hunks: vec![hunk],
             }],
         }
@@ -5919,6 +5945,23 @@ mod wasm_tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: path.to_owned(),
                 is_binary: true,
+                unmerged: false,
+                hunks: vec![],
+            }],
+        }
+    }
+
+    fn unmerged_diff(path: &str) -> DiffViewState {
+        DiffViewState {
+            root: review_root(),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some(path.to_owned()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: path.to_owned(),
+                is_binary: false,
+                unmerged: true,
                 hunks: vec![],
             }],
         }
@@ -5928,6 +5971,7 @@ mod wasm_tests {
         ProjectGitDiffFile {
             relative_path: path.to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![ProjectGitDiffHunk {
                 old_start: 1,
                 old_count: 1,
@@ -6711,6 +6755,43 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "expected a file-level comment affordance on the binary file header"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn unmerged_file_renders_conflict_placeholder_without_hunk_actions() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _mounted =
+            mount_reviewable(container.clone(), unmerged_diff("src/conflicted.rs"), None);
+        next_tick().await;
+        next_tick().await;
+
+        let placeholder = container
+            .query_selector("[data-test=\"diff-unmerged-placeholder\"]")
+            .unwrap()
+            .expect("expected an unmerged-file placeholder");
+        assert_eq!(
+            placeholder.text_content().unwrap_or_default(),
+            "Unmerged file — resolve conflicts in the file, then stage it"
+        );
+        assert!(
+            container
+                .query_selector("[data-test=\"diff-binary-placeholder\"]")
+                .unwrap()
+                .is_none(),
+            "unmerged state must take precedence over the no-hunk placeholder"
+        );
+        assert_eq!(
+            container.query_selector_all(".diff-line").unwrap().length(),
+            0
+        );
+        assert!(
+            container
+                .query_selector(".diff-hunk-stage-btn")
+                .unwrap()
+                .is_none(),
+            "unmerged files must not expose ordinary hunk staging"
         );
     }
 

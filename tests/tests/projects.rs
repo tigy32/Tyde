@@ -404,6 +404,20 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn git_expect_failure(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run git {:?}: {}", args, err));
+    assert!(
+        !output.status.success(),
+        "git {:?} unexpectedly succeeded",
+        args
+    );
+}
+
 fn write_file(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|err| {
@@ -1275,6 +1289,63 @@ async fn project_read_diff_returns_unstaged_diff() {
             .lines
             .iter()
             .any(|line| line.text.contains("println!(\"hello\")"))
+    );
+}
+
+#[tokio::test]
+async fn project_read_diff_returns_typed_unmerged_file() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("read-diff-unmerged", &[("src/lib.rs", "base\n")]);
+
+    git(repo.path(), &["checkout", "-b", "other"]);
+    write_file(&repo.path().join("src/lib.rs"), "theirs\n");
+    git(repo.path(), &["add", "src/lib.rs"]);
+    git(repo.path(), &["commit", "-m", "Change on other"]);
+    git(repo.path(), &["checkout", "-"]);
+    write_file(&repo.path().join("src/lib.rs"), "ours\n");
+    git(repo.path(), &["add", "src/lib.rs"]);
+    git(repo.path(), &["commit", "-m", "Change on current"]);
+    git_expect_failure(repo.path(), &["merge", "other"]);
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Unmerged",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let root = protocol::ProjectRootPath(project_root(&project, 0));
+    let request = ProjectReadDiffPayload {
+        root: root.clone(),
+        scope: ProjectDiffScope::Unstaged,
+        path: Some("src/lib.rs".to_owned()),
+        context_mode: DiffContextMode::Hunks,
+    };
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        request.clone(),
+        "typed unmerged project git diff",
+    )
+    .await;
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].relative_path, "src/lib.rs");
+    assert!(diff.files[0].unmerged);
+    assert!(diff.files[0].hunks.is_empty());
+
+    write_file(&repo.path().join("src/lib.rs"), "resolved\n");
+    git(repo.path(), &["add", "src/lib.rs"]);
+
+    let resolved = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        request,
+        "resolved project git diff",
+    )
+    .await;
+    assert!(
+        resolved.files.iter().all(|file| !file.unmerged),
+        "resolved and staged files must leave the typed unmerged state"
     );
 }
 

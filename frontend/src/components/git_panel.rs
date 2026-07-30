@@ -260,33 +260,55 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
 
 #[component]
 fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
+    let conflicts: Vec<_> = root
+        .files
+        .iter()
+        .filter(|f| {
+            f.staged == Some(ProjectGitChangeKind::Unmerged)
+                || f.unstaged == Some(ProjectGitChangeKind::Unmerged)
+        })
+        .cloned()
+        .collect();
     let staged: Vec<_> = root
         .files
         .iter()
-        .filter(|f| f.staged.is_some())
+        .filter(|f| {
+            f.staged.is_some()
+                && f.staged != Some(ProjectGitChangeKind::Unmerged)
+                && f.unstaged != Some(ProjectGitChangeKind::Unmerged)
+        })
         .cloned()
         .collect();
     let unstaged: Vec<_> = root
         .files
         .iter()
-        .filter(|f| f.unstaged.is_some() && !f.untracked)
+        .filter(|f| {
+            f.unstaged.is_some()
+                && f.unstaged != Some(ProjectGitChangeKind::Unmerged)
+                && f.staged != Some(ProjectGitChangeKind::Unmerged)
+                && !f.untracked
+        })
         .cloned()
         .collect();
     let untracked: Vec<_> = root.files.iter().filter(|f| f.untracked).cloned().collect();
 
     let root_path = root.root.clone();
+    let conflicts_expanded = RwSignal::new(true);
     let staged_expanded = RwSignal::new(true);
     let unstaged_expanded = RwSignal::new(true);
     let untracked_expanded = RwSignal::new(true);
 
+    let conflicts_count = conflicts.len();
     let staged_count = staged.len();
     let unstaged_count = unstaged.len();
     let untracked_count = untracked.len();
 
+    let has_conflicts = conflicts_count != 0;
     let has_staged = staged_count != 0;
     let has_unstaged = unstaged_count != 0;
     let has_untracked = untracked_count != 0;
 
+    let root_for_conflicts = root_path.clone();
     let root_for_staged = root_path.clone();
     let root_for_unstaged = root_path.clone();
     let root_for_untracked = root_path.clone();
@@ -362,6 +384,20 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     <span class="gp-root-ahead-behind">{ab}</span>
                 })}
             </div>
+            <Show when=move || has_conflicts>
+                <GitFileSection
+                    title="Conflicts"
+                    count=conflicts_count
+                    files=conflicts.clone()
+                    expanded=conflicts_expanded
+                    scope=ProjectDiffScope::Unstaged
+                    root_path=root_for_conflicts.clone()
+                    show_stage_btn=true
+                    show_unstage_btn=false
+                    show_discard_btn=false
+                    file_counts=file_counts
+                />
+            </Show>
             <Show when=move || has_staged>
                 <div class="gp-commit-area">
                     <textarea
@@ -674,6 +710,7 @@ fn change_kind_icon(kind: Option<ProjectGitChangeKind>) -> &'static str {
         Some(ProjectGitChangeKind::Renamed) => "R",
         Some(ProjectGitChangeKind::Copied) => "C",
         Some(ProjectGitChangeKind::TypeChanged) => "T",
+        Some(ProjectGitChangeKind::Unmerged) => "U",
         None => " ",
     }
 }
@@ -686,6 +723,7 @@ fn change_kind_class(kind: Option<ProjectGitChangeKind>) -> &'static str {
         Some(ProjectGitChangeKind::Renamed) => "gp-status-icon renamed",
         Some(ProjectGitChangeKind::Copied) => "gp-status-icon renamed",
         Some(ProjectGitChangeKind::TypeChanged) => "gp-status-icon modified",
+        Some(ProjectGitChangeKind::Unmerged) => "gp-status-icon unmerged",
         None => "gp-status-icon",
     }
 }
@@ -924,6 +962,22 @@ mod wasm_tests {
         }
     }
 
+    fn conflicted_root() -> ProjectRootGitStatus {
+        ProjectRootGitStatus {
+            root: ProjectRootPath("/repo".to_owned()),
+            branch: Some("main".to_owned()),
+            ahead: 0,
+            behind: 0,
+            clean: false,
+            files: vec![ProjectGitFileStatus {
+                relative_path: "src/conflicted.rs".to_owned(),
+                staged: Some(ProjectGitChangeKind::Unmerged),
+                unstaged: Some(ProjectGitChangeKind::Unmerged),
+                untracked: false,
+            }],
+        }
+    }
+
     /// The single active workspace draft summary the server emits per project.
     fn draft_summary() -> ReviewSummary {
         ReviewSummary {
@@ -980,6 +1034,14 @@ mod wasm_tests {
         container: HtmlElement,
         with_draft: bool,
     ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
+        mount_git_panel_with_root(container, with_draft, changed_root())
+    }
+
+    fn mount_git_panel_with_root(
+        container: HtmlElement,
+        with_draft: bool,
+        root: ProjectRootGitStatus,
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
         let handle = mount_to(container, move || {
@@ -989,7 +1051,7 @@ mod wasm_tests {
                 project_id: ProjectId("proj-1".to_owned()),
             }));
             state.git_status.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![changed_root()]);
+                m.insert(ProjectId("proj-1".to_owned()), vec![root]);
             });
             if with_draft {
                 state.review_summaries.update(|m| {
@@ -1101,6 +1163,71 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "no side-open context menu opens from a git diff row"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn unmerged_file_renders_once_in_conflicts_with_safe_actions() {
+        let container = make_container();
+        stub_recording_bridge();
+        let mounted = mount_git_panel_with_root(container.clone(), false, conflicted_root());
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("Conflicts"));
+        assert!(!text.contains("Changes"));
+        assert!(!text.contains("Staged"));
+        assert_eq!(
+            container
+                .query_selector_all(".gp-file-name")
+                .unwrap()
+                .length(),
+            1,
+            "the conflicted path must not be duplicated into staged or changes"
+        );
+        assert_eq!(
+            container
+                .query_selector(".gp-status-icon.unmerged")
+                .unwrap()
+                .expect("unmerged status icon")
+                .text_content()
+                .as_deref(),
+            Some("U")
+        );
+        assert!(
+            container.query_selector(".gp-stage-btn").unwrap().is_some(),
+            "whole-file staging remains available after conflict resolution"
+        );
+        assert!(
+            container
+                .query_selector(".gp-unstage-btn")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .query_selector(".gp-discard-btn")
+                .unwrap()
+                .is_none()
+        );
+
+        row_button(&container).click();
+        next_tick().await;
+
+        let state = mounted.borrow().clone().unwrap();
+        let key = DiffKey::new(
+            "h1",
+            ProjectId("proj-1".to_owned()),
+            ProjectRootPath("/repo".to_owned()),
+            ProjectDiffScope::Unstaged,
+            "src/conflicted.rs",
+        );
+        assert_eq!(diff_occurrences(&state, &key).len(), 1);
+        assert!(
+            state
+                .diff_contents
+                .with_untracked(|diffs| diffs.contains_key(&key)),
+            "the conflict row must request the typed unstaged diff"
         );
     }
 

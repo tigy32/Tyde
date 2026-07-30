@@ -1931,6 +1931,7 @@ mod tests {
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/lib.rs::0".to_owned(),
                         old_start: 1,
@@ -2035,6 +2036,7 @@ mod tests {
         review.diffs[0].files = vec![ProjectGitDiffFile {
             relative_path: "assets/logo.png".to_owned(),
             is_binary: true,
+            unmerged: false,
             hunks: Vec::new(),
         }];
 
@@ -2070,6 +2072,7 @@ mod tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: "assets/logo.png".to_owned(),
                 is_binary: true,
+                unmerged: false,
                 hunks: Vec::new(),
             }],
         }];
@@ -2087,6 +2090,7 @@ mod tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: "scripts/run.sh".to_owned(),
                 is_binary: false,
+                unmerged: false,
                 hunks: Vec::new(),
             }],
         }];

@@ -8351,6 +8351,7 @@ mod tests {
                 .map(|p| ProjectGitDiffFile {
                     relative_path: p.to_string(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: vec![],
                 })
                 .collect(),
@@ -8368,6 +8369,7 @@ mod tests {
                 .map(|p| ProjectGitDiffFile {
                     relative_path: p.to_string(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: vec![],
                 })
                 .collect(),

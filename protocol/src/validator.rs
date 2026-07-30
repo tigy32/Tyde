@@ -3804,7 +3804,10 @@ mod tests {
 
         let mut validator = ProtocolValidator::new();
         validator
-            .validate_envelope(&host_bootstrap_with_session_list(page(Some(64), complete())))
+            .validate_envelope(&host_bootstrap_with_session_list(page(
+                Some(64),
+                complete(),
+            )))
             .expect("bootstrap host stream");
         let violation = validator
             .validate_envelope(&session_list_envelope(descriptor))
@@ -3848,7 +3851,10 @@ mod tests {
 
             let mut validator = ProtocolValidator::new();
             validator
-                .validate_envelope(&host_bootstrap_with_session_list(page(Some(64), complete())))
+                .validate_envelope(&host_bootstrap_with_session_list(page(
+                    Some(64),
+                    complete(),
+                )))
                 .expect("bootstrap host stream");
             let violation = validator
                 .validate_envelope(&session_list_envelope(descriptor))

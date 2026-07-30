@@ -2236,6 +2236,7 @@ mod wasm_tests {
                 ProjectGitDiffFile {
                     relative_path: "src/foo.rs".to_owned(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/foo.rs:1".to_owned(),
                         old_start: 1,
@@ -2279,6 +2280,7 @@ mod wasm_tests {
                 ProjectGitDiffFile {
                     relative_path: "src/bar.rs".to_owned(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/bar.rs:1".to_owned(),
                         old_start: 1,
@@ -3439,6 +3441,7 @@ mod wasm_tests {
         let files = vec![protocol::ProjectGitDiffFile {
             relative_path: "src/foo.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![protocol::ProjectGitDiffHunk {
                 hunk_id: "h1".to_owned(),
                 old_start: 1,
@@ -3490,6 +3493,7 @@ mod wasm_tests {
         let files = vec![protocol::ProjectGitDiffFile {
             relative_path: "src/foo.rs".to_owned(),
             is_binary: false,
+            unmerged: false,
             hunks: vec![protocol::ProjectGitDiffHunk {
                 hunk_id: "h1".to_owned(),
                 old_start: 1,

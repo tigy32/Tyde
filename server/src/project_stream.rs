@@ -1768,6 +1768,12 @@ where
                 continue;
             }
 
+            if line.starts_with("u ") {
+                let file = parse_unmerged_status_line(line)?;
+                files.insert(file.relative_path.clone(), file);
+                continue;
+            }
+
             if line.starts_with("1 ") || line.starts_with("2 ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 assert!(parts.len() >= 9, "invalid porcelain status line '{}'", line);
@@ -1804,6 +1810,32 @@ where
     }
 
     Ok(ProjectGitStatusPayload { roots })
+}
+
+fn parse_unmerged_status_line(line: &str) -> Result<ProjectGitFileStatus, String> {
+    let parts = line.splitn(11, ' ').collect::<Vec<_>>();
+    let &[record, xy, sub, m1, m2, m3, mw, h1, h2, h3, path] = parts.as_slice() else {
+        return Err(format!("invalid unmerged porcelain status line '{}'", line));
+    };
+    if record != "u"
+        || [sub, m1, m2, m3, mw, h1, h2, h3]
+            .into_iter()
+            .any(|field| field.is_empty())
+    {
+        return Err(format!("invalid unmerged porcelain status line '{}'", line));
+    }
+    if xy.len() != 2 {
+        return Err(format!("invalid unmerged XY status '{}' in '{}'", xy, line));
+    }
+    if path.is_empty() {
+        return Err(format!("missing path in unmerged status line '{}'", line));
+    }
+    Ok(ProjectGitFileStatus {
+        relative_path: path.to_owned(),
+        staged: Some(ProjectGitChangeKind::Unmerged),
+        unstaged: Some(ProjectGitChangeKind::Unmerged),
+        untracked: false,
+    })
 }
 
 pub(crate) fn read_file(
@@ -2241,6 +2273,7 @@ fn build_untracked_diff_file(
             return Ok(ProjectGitDiffFile {
                 relative_path: relative_path.to_owned(),
                 is_binary: true,
+                unmerged: false,
                 hunks: Vec::new(),
             });
         }
@@ -2272,6 +2305,7 @@ fn build_untracked_diff_file(
     Ok(ProjectGitDiffFile {
         relative_path: relative_path.to_owned(),
         is_binary: false,
+        unmerged: false,
         hunks,
     })
 }
@@ -2715,6 +2749,7 @@ fn parse_change_kind(status: char) -> Option<ProjectGitChangeKind> {
 struct ParsedGitDiffFile {
     relative_path: String,
     header_lines: Vec<String>,
+    unmerged: bool,
     hunks: Vec<ParsedGitDiffHunk>,
 }
 
@@ -2736,6 +2771,7 @@ fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
             Ok(ProjectGitDiffFile {
                 relative_path: relative_path.clone(),
                 is_binary: parsed_git_diff_file_is_binary(&file),
+                unmerged: file.unmerged,
                 hunks: file
                     .hunks
                     .into_iter()
@@ -2773,16 +2809,35 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
     let mut current_hunk: Option<ParsedGitDiffHunk> = None;
 
     for line in raw.lines() {
+        if let Some(relative_path) = line
+            .strip_prefix("diff --cc ")
+            .or_else(|| line.strip_prefix("diff --combined "))
+        {
+            finish_parsed_git_diff_file(
+                &mut files,
+                &mut current_file,
+                &mut current_hunk,
+                "hunk appeared before file in git diff",
+            )?;
+            if relative_path.is_empty() {
+                return Err(format!("invalid combined diff header '{}'", line));
+            }
+            current_file = Some(ParsedGitDiffFile {
+                relative_path: relative_path.to_owned(),
+                header_lines: vec![line.to_owned()],
+                unmerged: true,
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+
         if let Some(diff_line) = line.strip_prefix("diff --git ") {
-            if let Some(hunk) = current_hunk.take() {
-                let file = current_file
-                    .as_mut()
-                    .ok_or_else(|| "hunk appeared before file in git diff".to_owned())?;
-                file.hunks.push(hunk);
-            }
-            if let Some(file) = current_file.take() {
-                files.push(file);
-            }
+            finish_parsed_git_diff_file(
+                &mut files,
+                &mut current_file,
+                &mut current_hunk,
+                "hunk appeared before file in git diff",
+            )?;
 
             let parts: Vec<&str> = diff_line.split_whitespace().collect();
             if parts.len() != 2 {
@@ -2791,8 +2846,18 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
             current_file = Some(ParsedGitDiffFile {
                 relative_path: parse_diff_path(parts[0], parts[1]),
                 header_lines: vec![line.to_owned()],
+                unmerged: false,
                 hunks: Vec::new(),
             });
+            continue;
+        }
+
+        if current_file.as_ref().is_some_and(|file| file.unmerged) {
+            current_file
+                .as_mut()
+                .expect("unmerged file checked above")
+                .header_lines
+                .push(line.to_owned());
             continue;
         }
 
@@ -2825,17 +2890,32 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
         }
     }
 
+    finish_parsed_git_diff_file(
+        &mut files,
+        &mut current_file,
+        &mut current_hunk,
+        "trailing hunk appeared before file in git diff",
+    )?;
+
+    Ok(files)
+}
+
+fn finish_parsed_git_diff_file(
+    files: &mut Vec<ParsedGitDiffFile>,
+    current_file: &mut Option<ParsedGitDiffFile>,
+    current_hunk: &mut Option<ParsedGitDiffHunk>,
+    hunk_before_file_error: &'static str,
+) -> Result<(), String> {
     if let Some(hunk) = current_hunk.take() {
         let file = current_file
             .as_mut()
-            .ok_or_else(|| "trailing hunk appeared before file in git diff".to_owned())?;
+            .ok_or_else(|| hunk_before_file_error.to_owned())?;
         file.hunks.push(hunk);
     }
     if let Some(file) = current_file.take() {
         files.push(file);
     }
-
-    Ok(files)
+    Ok(())
 }
 
 fn parse_diff_path(a_path: &str, b_path: &str) -> String {
@@ -2906,6 +2986,9 @@ fn project_git_diff_lines_for_hunk(hunk: &ParsedGitDiffHunk) -> Vec<ProjectGitDi
 }
 
 fn parse_hunk_header(header: &str) -> Result<(u32, u32, u32, u32), String> {
+    if header.starts_with("@@@") {
+        return Err(format!("unsupported combined diff hunk '{}'", header));
+    }
     let ranges = header
         .strip_prefix("@@ ")
         .and_then(|rest| rest.split_once(" @@"))
@@ -3063,6 +3146,32 @@ mod tests {
         assert_eq!(status.roots.len(), 1);
         assert_eq!(status.roots[0].branch.as_deref(), Some("main"));
         assert!(status.roots[0].clean);
+    }
+
+    #[test]
+    fn build_git_status_retains_porcelain_v2_unmerged_records() {
+        let project = test_project("/repo");
+        let output = "\
+# branch.oid abc123\n\
+# branch.head main\n\
+u UU N... 100644 100644 100644 100644 1111111 2222222 3333333 src/both modified.rs\n\
+u AA N... 000000 100644 100644 100644 0000000 4444444 5555555 src/both-added.rs\n\
+u DU N... 100644 000000 100644 100644 6666666 0000000 7777777 src/delete-modify.rs\n";
+
+        let status = build_git_status_with_runner(&project, |_root, _args, _access_mode| {
+            Ok(output.to_owned())
+        })
+        .expect("unmerged porcelain records should parse");
+
+        let root = &status.roots[0];
+        assert!(!root.clean);
+        assert_eq!(root.files.len(), 3);
+        assert_eq!(root.files[0].relative_path, "src/both modified.rs");
+        for file in &root.files {
+            assert_eq!(file.staged, Some(ProjectGitChangeKind::Unmerged));
+            assert_eq!(file.unstaged, Some(ProjectGitChangeKind::Unmerged));
+            assert!(!file.untracked);
+        }
     }
 
     #[test]
@@ -3265,6 +3374,42 @@ mod tests {
         assert_eq!(diff.root.0, "/repo");
         assert_eq!(diff.path.as_deref(), Some("src/lib.rs"));
         assert_eq!(diff.context_mode, DiffContextMode::Hunks);
+    }
+
+    #[test]
+    fn read_diff_returns_combined_sections_as_unmerged_files() {
+        let project = test_project("/repo");
+        let raw = "\
+diff --cc server/src/code_intel/lsp_provider.rs\n\
+index 1111111,2222222..3333333\n\
+--- a/server/src/code_intel/lsp_provider.rs\n\
++++ b/server/src/code_intel/lsp_provider.rs\n\
+@@@ -378,15 -348,13 +385,25 @@@ async fn run\n\
+++        merged_line();\n";
+
+        let diff = read_diff_with_runner(
+            &project,
+            ProjectReadDiffPayload {
+                root: ProjectRootPath("/repo".to_owned()),
+                scope: ProjectDiffScope::Unstaged,
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+            },
+            |_root, args, _access_mode| match args {
+                ["diff", "--relative", "-U3"] => Ok(raw.to_owned()),
+                ["ls-files", "--others", "--exclude-standard"] => Ok(String::new()),
+                other => panic!("unexpected git args: {other:?}"),
+            },
+        )
+        .expect("combined diff should produce a typed unmerged file");
+
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(
+            diff.files[0].relative_path,
+            "server/src/code_intel/lsp_provider.rs"
+        );
+        assert!(diff.files[0].unmerged);
+        assert!(diff.files[0].hunks.is_empty());
     }
 
     #[test]
@@ -3488,6 +3633,62 @@ index 83db48f..f735c2b 100644\n\
         assert_eq!(hunk.lines[4].text, "line3");
         assert_eq!(hunk.lines[4].old_line_number, Some(3));
         assert_eq!(hunk.lines[4].new_line_number, Some(4));
+    }
+
+    #[test]
+    fn parse_git_diff_keeps_combined_sections_typed_and_separate() {
+        let raw = "\
+diff --git a/src/before.rs b/src/before.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/before.rs\n\
++++ b/src/before.rs\n\
+@@ -1 +1 @@\n\
+-before\n\
++after\n\
+diff --cc src/conflicted.rs\n\
+index 3333333,4444444..5555555\n\
+--- a/src/conflicted.rs\n\
++++ b/src/conflicted.rs\n\
+@@@ -378,15 -348,13 +385,25 @@@ async fn run\n\
+++combined result\n\
+diff --combined src/also-conflicted.rs\n\
+index 6666666,7777777..8888888\n\
+--- a/src/also-conflicted.rs\n\
++++ b/src/also-conflicted.rs\n\
+@@@ -1,2 -1,2 +1,3 @@@\n\
+++combined result\n\
+diff --git a/src/after.rs b/src/after.rs\n\
+index 9999999..aaaaaaa 100644\n\
+--- a/src/after.rs\n\
++++ b/src/after.rs\n\
+@@ -4 +4,2 @@\n\
+ line4\n\
++line5\n";
+
+        let files = parse_git_diff(raw).expect("mixed ordinary and combined diff should parse");
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].relative_path, "src/before.rs");
+        assert!(!files[0].unmerged);
+        assert_eq!(files[0].hunks[0].old_start, 1);
+        assert_eq!(files[0].hunks[0].new_start, 1);
+        assert_eq!(files[1].relative_path, "src/conflicted.rs");
+        assert!(files[1].unmerged);
+        assert!(files[1].hunks.is_empty());
+        assert_eq!(files[2].relative_path, "src/also-conflicted.rs");
+        assert!(files[2].unmerged);
+        assert!(files[2].hunks.is_empty());
+        assert_eq!(files[3].relative_path, "src/after.rs");
+        assert!(!files[3].unmerged);
+        assert_eq!(files[3].hunks[0].old_start, 4);
+        assert_eq!(files[3].hunks[0].new_start, 4);
+        assert_eq!(files[3].hunks[0].lines[1].new_line_number, Some(5));
+    }
+
+    #[test]
+    fn parse_hunk_header_identifies_stray_combined_headers() {
+        let error = parse_hunk_header("@@@ -378,15 -348,13 +385,25 @@@ async fn run")
+            .expect_err("combined header must not enter the ordinary parser");
+        assert!(error.starts_with("unsupported combined diff hunk"));
     }
 
     #[test]

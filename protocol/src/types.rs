@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -5573,6 +5573,7 @@ pub enum ProjectGitChangeKind {
     Renamed,
     Copied,
     TypeChanged,
+    Unmerged,
 }
 
 /// Monotonic per-file version counter, owned by the project-stream actor. Each
@@ -6134,6 +6135,8 @@ pub struct ProjectGitDiffFile {
     pub relative_path: String,
     #[serde(default)]
     pub is_binary: bool,
+    #[serde(default)]
+    pub unmerged: bool,
     pub hunks: Vec<ProjectGitDiffHunk>,
 }
 
@@ -8195,8 +8198,44 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_two() {
-        assert_eq!(PROTOCOL_VERSION, 42);
+    fn protocol_version_is_forty_three() {
+        assert_eq!(PROTOCOL_VERSION, 43);
+    }
+
+    #[test]
+    fn project_git_unmerged_state_round_trips_and_defaults() {
+        let legacy: ProjectGitDiffFile = serde_json::from_value(serde_json::json!({
+            "relative_path": "src/lib.rs",
+            "is_binary": false,
+            "hunks": []
+        }))
+        .expect("deserialize legacy project diff file");
+        assert!(!legacy.unmerged);
+
+        let unmerged = ProjectGitDiffFile {
+            relative_path: "src/lib.rs".to_owned(),
+            is_binary: false,
+            unmerged: true,
+            hunks: Vec::new(),
+        };
+        let encoded =
+            serde_json::to_value(&unmerged).expect("serialize unmerged project diff file");
+        assert_eq!(encoded["unmerged"], true);
+        assert_eq!(
+            serde_json::from_value::<ProjectGitDiffFile>(encoded)
+                .expect("deserialize unmerged project diff file"),
+            unmerged
+        );
+        assert_eq!(
+            serde_json::to_value(ProjectGitChangeKind::Unmerged)
+                .expect("serialize unmerged project change kind"),
+            serde_json::json!("unmerged")
+        );
+        assert_eq!(
+            serde_json::from_value::<ProjectGitChangeKind>(serde_json::json!("unmerged"))
+                .expect("deserialize unmerged project change kind"),
+            ProjectGitChangeKind::Unmerged
+        );
     }
 
     #[test]

@@ -517,7 +517,10 @@ async fn desktop_bootstrap_page_limit_survives_being_echoed_back() {
         "an unbounded replay must advertise no page size rather than its own count"
     );
     assert!(
-        matches!(bootstrap.session_list.status, SessionListPageStatus::Complete),
+        matches!(
+            bootstrap.session_list.status,
+            SessionListPageStatus::Complete
+        ),
         "an unbounded page has nothing left to continue with"
     );
 

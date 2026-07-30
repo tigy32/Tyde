@@ -450,15 +450,23 @@ fn DiffFileBlock(
     let root_for_btn = root.clone();
     let root_for_thread = root.clone();
 
-    // Binary / no-hunk files have no lines to anchor line comments to —
-    // render a clear placeholder and skip the hunk list. The file-level
-    // comment affordance + thread region above still work.
+    // Unmerged, binary, and no-hunk files have no lines to anchor line
+    // comments to, so render a clear placeholder and skip the hunk list. The
+    // file-level comment affordance + thread region above still work.
+    let is_unmerged = file.unmerged;
     let is_binary = file.is_binary;
-    let show_placeholder = is_binary || file.hunks.is_empty();
-    let placeholder_text = if is_binary {
+    let show_placeholder = is_unmerged || is_binary || file.hunks.is_empty();
+    let placeholder_text = if is_unmerged {
+        "Unmerged file — resolve conflicts in the file, then stage it"
+    } else if is_binary {
         "Binary file changed"
     } else {
         "No textual changes"
+    };
+    let placeholder_test = if is_unmerged {
+        "diff-unmerged-placeholder"
+    } else {
+        "diff-binary-placeholder"
     };
 
     // File-level comment affordance + thread region, only with a review.
@@ -528,7 +536,7 @@ fn DiffFileBlock(
                 view! {
                     <div
                         class="project-diff-binary-placeholder"
-                        data-mobile-test="diff-binary-placeholder"
+                        data-mobile-test=placeholder_test
                     >
                         {placeholder_text}
                     </div>
@@ -1460,6 +1468,7 @@ mod wasm_tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/main.rs".to_owned(),
                 is_binary: false,
+                unmerged: false,
                 hunks: vec![ProjectGitDiffHunk {
                     hunk_id: "h-1".to_owned(),
                     old_start: 1,
@@ -1904,6 +1913,23 @@ mod wasm_tests {
             files: vec![ProjectGitDiffFile {
                 relative_path: "assets/logo.png".to_owned(),
                 is_binary: true,
+                unmerged: false,
+                hunks: vec![],
+            }],
+        }
+    }
+
+    fn fixture_unmerged_diff_state() -> ProjectDiffState {
+        ProjectDiffState {
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "src/conflicted.rs".to_owned(),
+                is_binary: false,
+                unmerged: true,
                 hunks: vec![],
             }],
         }
@@ -1982,6 +2008,60 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "binary file must still expose a file-level comment affordance"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn diff_viewer_unmerged_file_shows_conflict_placeholder() {
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        };
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(key.clone(), fixture_unmerged_diff_state());
+            });
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Unstaged
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let placeholder = container
+            .query_selector("[data-mobile-test='diff-unmerged-placeholder']")
+            .unwrap()
+            .expect("unmerged file must render a conflict placeholder");
+        assert_eq!(
+            placeholder.text_content().unwrap_or_default(),
+            "Unmerged file — resolve conflicts in the file, then stage it"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-binary-placeholder']")
+                .unwrap()
+                .is_none(),
+            "unmerged state must take precedence over no-hunk state"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[data-mobile-test='diff-line-added']")
+                .unwrap()
+                .length(),
+            0
         );
     }
 

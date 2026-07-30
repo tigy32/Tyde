@@ -6796,6 +6796,7 @@ kbd {
 .gp-status-icon.deleted { color: var(--error); }
 .gp-status-icon.renamed { color: var(--info); }
 .gp-status-icon.untracked { color: var(--text-tertiary); }
+.gp-status-icon.unmerged { color: var(--error); }
 
 .gp-file-path {
     display: flex;

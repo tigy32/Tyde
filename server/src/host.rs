@@ -27389,6 +27389,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
                     is_binary: false,
+                    unmerged: false,
                     hunks: Vec::new(),
                 }],
             }],
