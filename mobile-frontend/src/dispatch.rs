@@ -2440,7 +2440,11 @@ pub fn load_next_session_page(state: &AppState, host: &LocalHostId) {
         let payload = ListSessionsPayload {
             scope: Some(page.scope),
             cursor: Some(next_cursor),
-            limit: Some(page.limit),
+            // Echoed exactly as the server stated it. A page advertising a
+            // continuation always carries a limit, so this is `Some` here in
+            // practice; passing it through rather than re-wrapping keeps the
+            // request faithful to the descriptor.
+            limit: page.limit,
         };
         if let Err(error) =
             crate::send::send_frame(&host, stream, FrameKind::ListSessions, &payload).await
@@ -4420,7 +4424,7 @@ mod wasm_tests {
                         generation: protocol::SessionListGeneration(1),
                         offset: 0,
                     },
-                    limit: 64,
+                    limit: Some(64),
                     total_count: 100,
                     status: protocol::SessionListPageStatus::More {
                         next_cursor: protocol::SessionListCursor {
@@ -4481,7 +4485,7 @@ mod wasm_tests {
                         generation: protocol::SessionListGeneration(1),
                         offset: 0,
                     },
-                    limit: 64,
+                    limit: Some(64),
                     total_count: 100,
                     status: protocol::SessionListPageStatus::More {
                         next_cursor: protocol::SessionListCursor {
@@ -5040,7 +5044,7 @@ mod wasm_tests {
                     generation: protocol::SessionListGeneration(1),
                     offset: 0,
                 },
-                limit: 1,
+                limit: Some(1),
                 total_count: 1,
                 status: protocol::SessionListPageStatus::Complete,
             },

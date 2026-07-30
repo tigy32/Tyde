@@ -594,7 +594,7 @@ mod wasm_tests {
                                 generation: protocol::SessionListGeneration(1),
                                 offset: 0,
                             },
-                            limit: 2,
+                            limit: Some(2),
                             total_count: 5,
                             status: protocol::SessionListPageStatus::More {
                                 next_cursor: protocol::SessionListCursor {
@@ -640,6 +640,10 @@ mod wasm_tests {
         );
     }
 
+    /// Takes a plain `u32` deliberately: every page this builds advertises a
+    /// continuation, and a continuation without a page limit is a state the
+    /// protocol validator rejects. Widening the parameter would let a fixture
+    /// express it.
     fn more_page(limit: u32, total: u32, next_offset: u32) -> protocol::SessionListPageInfo {
         protocol::SessionListPageInfo {
             scope: protocol::SessionListScope::RootSessions,
@@ -647,7 +651,7 @@ mod wasm_tests {
                 generation: protocol::SessionListGeneration(1),
                 offset: 0,
             },
-            limit,
+            limit: Some(limit),
             total_count: total,
             status: protocol::SessionListPageStatus::More {
                 next_cursor: protocol::SessionListCursor {
@@ -835,7 +839,7 @@ mod wasm_tests {
                                 generation: protocol::SessionListGeneration(1),
                                 offset: 0,
                             },
-                            limit: 20,
+                            limit: Some(20),
                             total_count: 1,
                             status: protocol::SessionListPageStatus::Complete,
                         },
@@ -898,7 +902,7 @@ mod wasm_tests {
                                 generation: protocol::SessionListGeneration(1),
                                 offset: 0,
                             },
-                            limit: 20,
+                            limit: Some(20),
                             total_count: 1,
                             status: protocol::SessionListPageStatus::Complete,
                         },

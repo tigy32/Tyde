@@ -207,6 +207,7 @@ impl ProtocolValidator {
                         format!("failed to parse HostBootstrap payload: {error}"),
                     )
                 })?;
+                validate_session_list_page(self, envelope, "HostBootstrap", &payload.session_list)?;
                 for agent in payload.agents {
                     self.register_agent_stream_from_new_agent(envelope, agent)?;
                 }
@@ -331,7 +332,14 @@ impl ProtocolValidator {
                 self, envelope, "LaunchProfileCatalogNotify"
             ),
             FrameKind::SessionList => {
-                parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
+                let payload: SessionListPayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse SessionList payload: {error}"),
+                    )
+                })?;
+                validate_session_list_page(self, envelope, "SessionList", &payload.page)
             }
             FrameKind::SessionSummaryCountUpdated => parse_host_payload::<
                 SessionSummaryCountUpdatedPayload,
@@ -1276,6 +1284,43 @@ fn validate_spawn_agent_payload(payload: &SpawnAgentPayload) -> Result<(), Strin
     }
 
     Ok(())
+}
+
+/// Session page descriptors are echoed back by clients as request limits, so a
+/// descriptor the emitting host would itself reject is a wire defect, not a
+/// client bug. Enforce the three shapes that break that contract.
+///
+/// Accepted, deliberately: `Complete` with no limit (a full-replay subscriber
+/// returned everything in scope), `Complete` with a limit, and `More` with a
+/// limit.
+fn validate_session_list_page(
+    validator: &ProtocolValidator,
+    envelope: &Envelope,
+    label: &str,
+    page: &crate::SessionListPageInfo,
+) -> Result<(), ProtocolViolation> {
+    let max = crate::MAX_SESSION_LIST_PAGE_LIMIT;
+    match (page.status, page.limit) {
+        // An unbounded page returned every session in scope, so there is
+        // nothing left to continue with. Advertising a continuation anyway
+        // would hand "Load more" a cursor with no limit to pair it with.
+        (crate::SessionListPageStatus::More { .. }, None) => Err(validator.violation(
+            envelope,
+            None,
+            format!("{label} advertises more session pages without a page limit"),
+        )),
+        (_, Some(0)) => Err(validator.violation(
+            envelope,
+            None,
+            format!("{label} session page limit must be greater than zero"),
+        )),
+        (_, Some(limit)) if limit > max => Err(validator.violation(
+            envelope,
+            None,
+            format!("{label} session page limit {limit} exceeds maximum {max}"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn parse_host_payload<T: serde::de::DeserializeOwned>(
@@ -3660,5 +3705,159 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(7, &tool_completed("call-2")))
             .unwrap();
+    }
+
+    // ── Session list page descriptors ──────────────────────────────────
+    //
+    // Clients re-request a view by echoing the descriptor the host gave them,
+    // so a descriptor the host would itself reject is a wire defect. These
+    // shapes all deserialize cleanly, which is exactly why they need checking
+    // here rather than only inside the host's own paging helpers.
+
+    fn page(
+        limit: Option<u32>,
+        status: crate::SessionListPageStatus,
+    ) -> crate::SessionListPageInfo {
+        crate::SessionListPageInfo {
+            scope: crate::SessionListScope::AllSessions,
+            cursor: crate::SessionListCursor {
+                generation: crate::SessionListGeneration(1),
+                offset: 0,
+            },
+            limit,
+            total_count: 300,
+            status,
+        }
+    }
+
+    fn complete() -> crate::SessionListPageStatus {
+        crate::SessionListPageStatus::Complete
+    }
+
+    fn more() -> crate::SessionListPageStatus {
+        crate::SessionListPageStatus::More {
+            next_cursor: crate::SessionListCursor {
+                generation: crate::SessionListGeneration(1),
+                offset: 64,
+            },
+        }
+    }
+
+    fn host_bootstrap_with_session_list(session_list: crate::SessionListPageInfo) -> Envelope {
+        let mut payload: HostBootstrapPayload = host_bootstrap_with_agents(Vec::new())
+            .parse_payload()
+            .expect("parse HostBootstrap fixture");
+        payload.session_list = session_list;
+        Envelope::from_payload(host_stream(), FrameKind::HostBootstrap, 0, &payload)
+            .expect("serialize HostBootstrap")
+    }
+
+    fn session_list_envelope(page: crate::SessionListPageInfo) -> Envelope {
+        Envelope::from_payload(
+            host_stream(),
+            FrameKind::SessionList,
+            1,
+            &SessionListPayload {
+                sessions: vec![],
+                page,
+            },
+        )
+        .expect("serialize SessionList")
+    }
+
+    /// A full-replay (desktop) subscriber returns everything in scope and
+    /// advertises no limit. That is the shape this whole change exists to
+    /// make legal.
+    #[test]
+    fn accepts_unbounded_and_bounded_session_pages() {
+        for descriptor in [
+            page(None, complete()),
+            page(Some(64), complete()),
+            page(Some(20), more()),
+            page(Some(crate::MAX_SESSION_LIST_PAGE_LIMIT), more()),
+        ] {
+            let mut validator = ProtocolValidator::new();
+            validator
+                .validate_envelope(&host_bootstrap_with_session_list(descriptor))
+                .expect("valid bootstrap page");
+            validator
+                .validate_envelope(&session_list_envelope(descriptor))
+                .expect("valid session list page");
+        }
+    }
+
+    #[test]
+    fn rejects_session_page_advertising_more_without_a_limit() {
+        let descriptor = page(None, more());
+
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&host_bootstrap_with_session_list(descriptor))
+            .expect_err("a continuation with no limit must be rejected");
+        assert!(
+            violation
+                .message
+                .contains("HostBootstrap advertises more session pages without a page limit"),
+            "unexpected violation: {}",
+            violation.message
+        );
+
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_session_list(page(Some(64), complete())))
+            .expect("bootstrap host stream");
+        let violation = validator
+            .validate_envelope(&session_list_envelope(descriptor))
+            .expect_err("a continuation with no limit must be rejected");
+        assert!(
+            violation
+                .message
+                .contains("SessionList advertises more session pages without a page limit"),
+            "unexpected violation: {}",
+            violation.message
+        );
+    }
+
+    /// The reported failure: the host advertised `4014` — its own session
+    /// count — and then rejected the client that echoed it back.
+    #[test]
+    fn rejects_session_page_limits_outside_the_advertised_bound() {
+        for (descriptor, expected) in [
+            (
+                page(Some(0), complete()),
+                "session page limit must be greater than zero",
+            ),
+            (
+                page(Some(crate::MAX_SESSION_LIST_PAGE_LIMIT + 1), complete()),
+                "session page limit 129 exceeds maximum 128",
+            ),
+            (
+                page(Some(4014), complete()),
+                "session page limit 4014 exceeds maximum 128",
+            ),
+        ] {
+            let mut validator = ProtocolValidator::new();
+            let violation = validator
+                .validate_envelope(&host_bootstrap_with_session_list(descriptor))
+                .expect_err("out-of-bound bootstrap page limit must be rejected");
+            assert!(
+                violation.message.contains(expected),
+                "unexpected violation: {}",
+                violation.message
+            );
+
+            let mut validator = ProtocolValidator::new();
+            validator
+                .validate_envelope(&host_bootstrap_with_session_list(page(Some(64), complete())))
+                .expect("bootstrap host stream");
+            let violation = validator
+                .validate_envelope(&session_list_envelope(descriptor))
+                .expect_err("out-of-bound session list page limit must be rejected");
+            assert!(
+                violation.message.contains(expected),
+                "unexpected violation: {}",
+                violation.message
+            );
+        }
     }
 }

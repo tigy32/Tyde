@@ -17791,7 +17791,6 @@ impl SessionPageRequest {
         generation: SessionListGeneration,
         scope: SessionListScope,
         mode: SessionListReplayMode,
-        total_count: usize,
         limit: Option<u32>,
         operation: &'static str,
     ) -> AppResult<Self> {
@@ -17801,7 +17800,7 @@ impl SessionPageRequest {
                 generation,
                 offset: 0,
             },
-            limit: session_page_limit(limit, mode, total_count, operation)?,
+            limit: session_page_limit(limit, mode, operation)?,
         })
     }
 
@@ -17810,38 +17809,56 @@ impl SessionPageRequest {
         scope: SessionListScope,
         limit: Option<u32>,
         mode: SessionListReplayMode,
-        total_count: usize,
         operation: &'static str,
     ) -> AppResult<Self> {
         Ok(Self {
             scope,
             cursor,
-            limit: session_page_limit(limit, mode, total_count, operation)?,
+            limit: session_page_limit(limit, mode, operation)?,
         })
     }
 }
 
+/// Resolve the page size for one session-list request, then bound the resolved
+/// value.
+///
+/// `None` in, for a full-replay subscriber, stays `None` out: that subscriber
+/// returns everything in scope and has no bound to report. It used to resolve
+/// to the subscriber's own session count, which the client then echoed back as
+/// an explicit limit — and this same function rejected it, so every desktop
+/// host with more than `MAX_SESSION_LIST_PAGE_LIMIT` sessions failed its own
+/// refresh with `session list limit 4014 exceeds maximum 128`.
+///
+/// The bound is applied to the *resolved* limit rather than only to a
+/// client-supplied one, so a replay-mode default can never again advertise a
+/// page size that requests are refused for.
 fn session_page_limit(
     limit: Option<u32>,
     mode: SessionListReplayMode,
-    total_count: usize,
     operation: &'static str,
 ) -> AppResult<Option<u32>> {
-    match limit {
-        Some(0) => Err(AppError::invalid(
-            operation,
-            "session list limit must be greater than zero",
-        )),
-        Some(limit) if limit > MAX_SESSION_LIST_PAGE_LIMIT => Err(AppError::invalid(
-            operation,
-            format!("session list limit {limit} exceeds maximum {MAX_SESSION_LIST_PAGE_LIMIT}"),
-        )),
-        Some(limit) => Ok(Some(limit)),
+    let resolved = match limit {
+        Some(0) => {
+            return Err(AppError::invalid(
+                operation,
+                "session list limit must be greater than zero",
+            ));
+        }
+        Some(limit) => Some(limit),
         None => match mode {
-            SessionListReplayMode::Full => Ok(u32::try_from(total_count).ok()),
-            SessionListReplayMode::Paged { limit } => Ok(Some(limit)),
+            SessionListReplayMode::Full => None,
+            SessionListReplayMode::Paged { limit } => Some(limit),
         },
+    };
+    if let Some(resolved) = resolved
+        && resolved > MAX_SESSION_LIST_PAGE_LIMIT
+    {
+        return Err(AppError::invalid(
+            operation,
+            format!("session list limit {resolved} exceeds maximum {MAX_SESSION_LIST_PAGE_LIMIT}"),
+        ));
     }
+    Ok(resolved)
 }
 
 fn replace_session_list_snapshot(
@@ -17861,7 +17878,6 @@ fn replace_session_list_snapshot(
         generation,
         scope,
         subscriber.session_list_replay,
-        sessions.len(),
         limit,
         operation,
     )?;
@@ -17920,7 +17936,6 @@ fn page_existing_session_list_snapshot(
         snapshot.scope,
         limit,
         subscriber.session_list_replay,
-        snapshot.sessions.len(),
         operation,
     )?;
     page_session_summaries(&snapshot.sessions, request).map_err(|message| {
@@ -17947,6 +17962,10 @@ fn page_session_summaries(
     }
 
     let remaining = sessions.len().saturating_sub(start);
+    // Slice arithmetic only. An absent limit takes every remaining row, but
+    // that count is *not* what the response advertises — the descriptor below
+    // reports the resolved `request.limit`, so an unbounded page says so
+    // instead of naming a number the client would be refused for echoing.
     let requested_limit = match request.limit {
         Some(limit) => limit,
         None => u32::try_from(remaining)
@@ -17973,7 +17992,7 @@ fn page_session_summaries(
         SessionListPageInfo {
             scope: request.scope,
             cursor: request.cursor,
-            limit: requested_limit,
+            limit: request.limit,
             total_count,
             status,
         },
@@ -22752,6 +22771,128 @@ Rules: Record only what remains true and useful for future work; drop transient 
             compacted_at_ms: None,
             compaction_summary_preview: None,
         }
+    }
+
+    /// Enough sessions to cross `MAX_SESSION_LIST_PAGE_LIMIT`, which is the
+    /// only threshold that matters here — the reported host had 4014, but the
+    /// defect reproduces identically at 129 for a fraction of the fixtures.
+    fn session_summaries_over_the_page_maximum() -> Vec<SessionSummary> {
+        (0..MAX_SESSION_LIST_PAGE_LIMIT + 1)
+            .map(|index| {
+                test_session_summary(
+                    BackendKind::Hermes,
+                    SessionId(format!("session-{index}")),
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    /// The whole class of defect in one assertion: a client re-requests a view
+    /// by echoing the descriptor it was handed, so whatever the host stamps,
+    /// the host must accept back — and accept back *unchanged*.
+    ///
+    /// Before the fix a full-replay page advertised its own session count, and
+    /// this round trip failed with
+    /// `session list limit 129 exceeds maximum 128`.
+    #[test]
+    fn a_full_replay_page_limit_is_accepted_when_echoed_back() {
+        let sessions = session_summaries_over_the_page_maximum();
+        let request = SessionPageRequest::initial(
+            SessionListGeneration(1),
+            SessionListScope::AllSessions,
+            SessionListReplayMode::Full,
+            None,
+            "test",
+        )
+        .expect("build initial full-replay page request");
+        let (_, page) =
+            page_session_summaries(&sessions, request).expect("page a full-replay snapshot");
+
+        let echoed = session_page_limit(page.limit, SessionListReplayMode::Full, "test")
+            .expect("the host must accept the page limit it advertised");
+        assert_eq!(
+            echoed, page.limit,
+            "echoing an advertised limit must resolve to that same limit"
+        );
+    }
+
+    #[test]
+    fn full_replay_reports_no_limit_rather_than_the_session_count() {
+        let full = SessionListReplayMode::Full;
+        assert_eq!(
+            session_page_limit(None, full, "test").expect("full replay resolves"),
+            None,
+            "full replay is unbounded; naming a count here produced the 4014"
+        );
+
+        let sessions = session_summaries_over_the_page_maximum();
+        let expected = sessions.len() as u32;
+        let request = SessionPageRequest::initial(
+            SessionListGeneration(1),
+            SessionListScope::AllSessions,
+            SessionListReplayMode::Full,
+            None,
+            "test",
+        )
+        .expect("build initial full-replay page request");
+        let (page_sessions, page) =
+            page_session_summaries(&sessions, request).expect("page a full-replay snapshot");
+
+        assert_eq!(page.limit, None);
+        assert_eq!(page.total_count, expected);
+        assert_eq!(
+            page_sessions.len(),
+            expected as usize,
+            "an unbounded page still returns every session in scope"
+        );
+        assert!(
+            matches!(page.status, SessionListPageStatus::Complete),
+            "an unbounded page has nothing left to continue with"
+        );
+    }
+
+    #[test]
+    fn session_page_limit_bounds_resolved_limits_not_just_requested_ones() {
+        let full = SessionListReplayMode::Full;
+        let max = MAX_SESSION_LIST_PAGE_LIMIT;
+
+        assert!(
+            session_page_limit(Some(0), full, "test").is_err(),
+            "a zero page would never terminate"
+        );
+        assert_eq!(
+            session_page_limit(Some(max), full, "test").expect("the maximum is requestable"),
+            Some(max)
+        );
+
+        let error = session_page_limit(Some(max + 1), full, "test")
+            .expect_err("an oversized explicit limit must be rejected");
+        assert!(
+            error.message.contains("exceeds maximum 128"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        // A replay-mode default is resolved before it is bounded, so a paged
+        // subscriber can no longer advertise a page size that requests for it
+        // would be refused.
+        let oversized = SessionListReplayMode::Paged { limit: max + 1 };
+        let error = session_page_limit(None, oversized, "test")
+            .expect_err("an oversized resolved default must be rejected");
+        assert!(
+            error.message.contains("exceeds maximum 128"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        let mobile = SessionListReplayMode::Paged {
+            limit: DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
+        };
+        assert_eq!(
+            session_page_limit(None, mobile, "test").expect("the mobile default resolves"),
+            Some(DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT)
+        );
     }
 
     #[test]

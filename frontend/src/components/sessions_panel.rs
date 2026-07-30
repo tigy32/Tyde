@@ -282,6 +282,10 @@ pub fn SessionsPanel() -> impl IntoView {
                     return None;
                 }
                 // Ask for the scope/limit this host's view is actually using.
+                // The limit is echoed exactly as the server stated it — an
+                // unbounded page re-asks for an unbounded one. Wrapping it in
+                // `Some` used to turn the server's own session count into an
+                // explicit request the same server then refused.
                 let payload = state.session_list_pages.with_untracked(|pages| {
                     pages
                         .iter()
@@ -289,7 +293,7 @@ pub fn SessionsPanel() -> impl IntoView {
                         .map(|((_, _), page)| ListSessionsPayload {
                             scope: Some(page.scope),
                             cursor: None,
-                            limit: Some(page.limit),
+                            limit: page.limit,
                         })
                         .unwrap_or_default()
                 });
@@ -525,7 +529,7 @@ fn load_more_buttons(state: AppState, hosts: Memo<Vec<String>>) -> impl IntoView
                             &ListSessionsPayload {
                                 scope: Some(scope),
                                 cursor: Some(cursor),
-                                limit: Some(limit),
+                                limit,
                             },
                         )
                         .await
@@ -1090,6 +1094,34 @@ mod wasm_tests {
         serde_json::from_str(&raw).expect("probe returns [host, stream] pairs")
     }
 
+    /// The `limit` each outgoing `list_sessions` actually carried, in order.
+    /// `None` is reported for a frame that omitted the field — which is what a
+    /// request re-asking for an unbounded view must look like. Read off the
+    /// serialized envelope rather than from what the UI intended, so a
+    /// synthesized count is visible as one.
+    fn list_sessions_limits() -> Vec<Option<u32>> {
+        let raw = js_sys::eval(
+            r#"
+            (function() {
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const parsed = JSON.parse(args);
+                    const env = JSON.parse(parsed.line);
+                    if (env.kind !== "list_sessions") continue;
+                    const limit = env.payload.limit;
+                    out.push(limit === undefined ? null : limit);
+                }
+                return JSON.stringify(out);
+            })()
+            "#,
+        )
+        .expect("probe list_sessions limits")
+        .as_string()
+        .unwrap_or_else(|| "[]".to_owned());
+        serde_json::from_str(&raw).expect("probe returns limits")
+    }
+
     /// What the transport reported for each `list_sessions` attempt, in order:
     /// `"ok"` or `"err"`. Attempts and outcomes are separate probes because a
     /// retry is only correct if the first attempt genuinely failed.
@@ -1427,6 +1459,127 @@ mod wasm_tests {
             list_sessions_outcomes(),
             vec!["ok".to_owned(), "ok".to_owned()],
             "and both reached the host"
+        );
+    }
+
+    /// The reported failure, from the client side. A full-replay host answers
+    /// with a page that applied no bound; the panel re-asks for that same view
+    /// by echoing the descriptor. Turning "no bound" into a number — the
+    /// host's own session count — is what made the server reject its own
+    /// advertised limit with `session list limit 4014 exceeds maximum 128`.
+    ///
+    /// Both the automatic per-connection request and the explicit Refresh go
+    /// through the same construction, so both are checked: a fix that only
+    /// covered the button would still fail on every startup.
+    #[wasm_bindgen_test]
+    async fn refreshing_an_unbounded_view_asks_for_an_unbounded_one() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+        // What a desktop host's bootstrap leaves behind: everything in scope
+        // was returned, so there is no page size to report and no
+        // continuation. `More` with no limit is not a state the server can
+        // produce, and the protocol validator rejects it.
+        state.session_list_pages.update(|pages| {
+            pages.insert(
+                (
+                    "host-a".to_owned(),
+                    crate::state::session_list_scope_key(protocol::SessionListScope::AllSessions),
+                ),
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::AllSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: None,
+                    total_count: 4014,
+                    status: protocol::SessionListPageStatus::Complete,
+                },
+            );
+        });
+
+        let (container, _handle) = mount_panel(state.clone());
+        settle().await;
+        connect(&state, "host-a", "/host-1");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_limits(),
+            vec![None],
+            "the automatic per-connection request must carry the descriptor's \
+             own limit, not a count derived from it"
+        );
+
+        let refresh = container
+            .query_selector("[data-test=\"sessions-refresh\"]")
+            .unwrap()
+            .expect("the Refresh button is rendered")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        refresh.click();
+        settle().await;
+
+        assert_eq!(
+            list_sessions_limits(),
+            vec![None, None],
+            "and so must the explicit Refresh"
+        );
+        assert_eq!(
+            list_sessions_outcomes(),
+            vec!["ok".to_owned(), "ok".to_owned()],
+            "both requests reached the host"
+        );
+    }
+
+    /// A bounded view is echoed just as faithfully — this fix must not turn
+    /// every desktop request into an unbounded one.
+    #[wasm_bindgen_test]
+    async fn refreshing_a_bounded_view_asks_for_the_same_bound() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+        state.session_list_pages.update(|pages| {
+            pages.insert(
+                (
+                    "host-a".to_owned(),
+                    crate::state::session_list_scope_key(protocol::SessionListScope::RootSessions),
+                ),
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::RootSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: Some(20),
+                    total_count: 300,
+                    status: protocol::SessionListPageStatus::More {
+                        next_cursor: protocol::SessionListCursor {
+                            generation: protocol::SessionListGeneration(1),
+                            offset: 20,
+                        },
+                    },
+                },
+            );
+        });
+
+        let (_container, _handle) = mount_panel(state.clone());
+        settle().await;
+        connect(&state, "host-a", "/host-1");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_limits(),
+            vec![Some(20)],
+            "a bounded view re-asks for its own bound"
         );
     }
 }

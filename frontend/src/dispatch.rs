@@ -501,6 +501,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     errors.insert(host_id.to_string(), message);
                 });
                 clear_session_history_loading_on_error(state, host_id, &payload);
+                clear_session_list_refresh_on_error(state, host_id, &payload);
                 // The route below correlates on the typed `setting_target`, never
                 // on "a SetSetting failed while something was in flight" — a
                 // heuristic there would report an unrelated command's failure
@@ -4856,6 +4857,43 @@ fn clear_session_history_loading_on_error(
     });
 }
 
+/// Reopen a host's automatic session-list refresh gate after the server
+/// rejected the request that claimed it.
+///
+/// The gate is released by an *arriving first page*, so a rejected request
+/// leaves it claimed and the host's non-forced refreshes wedged until some
+/// unrelated server-initiated fan-out happens to arrive. Mobile already does
+/// this (`mobile-frontend/src/dispatch.rs`, `clear_session_list_loading`);
+/// desktop did not.
+///
+/// What this restores is the *non-forced* claimants — chiefly the
+/// activity-driven first-page refresh in `request_first_session_page`, which
+/// returns early while the host is claimed. The explicit Refresh button was
+/// never blocked by this gate: it calls `request_authoritative_pages` with
+/// `force = true`, which sends whether or not the claim succeeded.
+///
+/// It also deliberately does **not** re-arm the Sessions panel's
+/// per-connection one-shot, which is keyed by `(host_id, StreamPath)`: a
+/// reconnect is a new stream and gets its own automatic request, and asking
+/// the same dead connection twice is what that one-shot exists to prevent.
+///
+/// Correlated on the typed `request_kind`, never on the operation string and
+/// never on "something was in flight" — the same rule the setting-save route
+/// below the call site follows. Only the failing host is released; other
+/// hosts' claims are untouched.
+fn clear_session_list_refresh_on_error(
+    state: &AppState,
+    host_id: &str,
+    payload: &CommandErrorPayload,
+) {
+    if !matches!(payload.request_kind, FrameKind::ListSessions) {
+        return;
+    }
+    state.session_list_refresh_in_flight.update(|hosts| {
+        hosts.remove(host_id);
+    });
+}
+
 fn clear_session_history_loading_for_host(state: &AppState, host_id: &str) {
     let agent_ids = state.agents.with_untracked(|agents| {
         agents
@@ -6179,7 +6217,8 @@ fn request_first_session_page(state: &AppState, host_id: &str) {
         Some((scope, limit)) => protocol::ListSessionsPayload {
             scope: Some(scope),
             cursor: None,
-            limit: Some(limit),
+            // Echoed exactly as the server stated it, including "no limit".
+            limit,
         },
         None => protocol::ListSessionsPayload::default(),
     };
@@ -11293,7 +11332,7 @@ mod wasm_tests {
                 page: protocol::SessionListPageInfo {
                     scope: Default::default(),
                     cursor: protocol::SessionListCursor { generation, offset },
-                    limit: 2,
+                    limit: Some(2),
                     total_count: total,
                     status: match more_at {
                         Some(offset) => protocol::SessionListPageStatus::More {
@@ -11825,7 +11864,7 @@ mod wasm_tests {
                         generation: protocol::SessionListGeneration(1),
                         offset: 0,
                     },
-                    limit: 1,
+                    limit: Some(1),
                     total_count: 1,
                     status: protocol::SessionListPageStatus::Complete,
                 },
@@ -11839,7 +11878,7 @@ mod wasm_tests {
                         generation: protocol::SessionListGeneration(1),
                         offset: 0,
                     },
-                    limit: 1,
+                    limit: Some(1),
                     total_count: 4,
                     status: protocol::SessionListPageStatus::More {
                         next_cursor: protocol::SessionListCursor {
@@ -11950,7 +11989,7 @@ mod wasm_tests {
                             generation: protocol::SessionListGeneration(1),
                             offset: 0,
                         },
-                        limit: 1,
+                        limit: Some(1),
                         total_count: 4,
                         status: protocol::SessionListPageStatus::More {
                             next_cursor: protocol::SessionListCursor {
@@ -12157,7 +12196,7 @@ mod wasm_tests {
                 generation: protocol::SessionListGeneration(1),
                 offset: 0,
             },
-            limit: 1,
+            limit: Some(1),
             total_count: 3,
             status: protocol::SessionListPageStatus::More {
                 next_cursor: protocol::SessionListCursor {
@@ -12194,7 +12233,7 @@ mod wasm_tests {
                 generation: protocol::SessionListGeneration(9),
                 offset: 0,
             },
-            limit: 1,
+            limit: Some(1),
             total_count: 1,
             status: protocol::SessionListPageStatus::Complete,
         };
@@ -12669,6 +12708,87 @@ mod wasm_tests {
         assert_eq!(prompt.project_name, "Dirty workbench");
         assert!(prompt.message.contains("?? implementation.md"));
         assert!(state.pending_workbench_removes.get_untracked().is_empty());
+    }
+
+    /// The refresh gate is released by an arriving first page. A rejected
+    /// `list_sessions` produces no page, so before this fix the claim survived
+    /// the failure and the host's non-forced refreshes stayed wedged behind a
+    /// request that was already dead.
+    ///
+    /// Only the failing host may be released: the gate is per host, and a
+    /// rejection on one says nothing about a request in flight on another.
+    #[wasm_bindgen_test]
+    fn a_rejected_list_sessions_reopens_only_that_hosts_refresh_gate() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+        state.session_list_refresh_in_flight.update(|hosts| {
+            hosts.insert("host-a".to_owned());
+            hosts.insert("host-b".to_owned());
+        });
+
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/local".to_owned()),
+            FrameKind::CommandError,
+            0,
+            &CommandErrorPayload {
+                stream: StreamPath("/host/local".to_owned()),
+                request_kind: FrameKind::ListSessions,
+                setting_target: None,
+                operation: "list_sessions".to_owned(),
+                code: protocol::CommandErrorCode::InvalidInput,
+                message: "session list limit 4014 exceeds maximum 128".to_owned(),
+                fatal: false,
+            },
+        )
+        .expect("command error envelope");
+        dispatch_envelope(&state, "host-a", envelope);
+
+        let in_flight = state.session_list_refresh_in_flight.get_untracked();
+        assert!(
+            !in_flight.contains("host-a"),
+            "a rejected list request must reopen the gate it claimed"
+        );
+        assert!(
+            in_flight.contains("host-b"),
+            "another host's in-flight refresh must survive"
+        );
+    }
+
+    /// An error for a different command must not be mistaken for this one.
+    /// The correlation is the typed `request_kind`, never "a command failed
+    /// while a refresh happened to be outstanding".
+    #[wasm_bindgen_test]
+    fn an_unrelated_command_error_leaves_the_refresh_gate_claimed() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+        state.session_list_refresh_in_flight.update(|hosts| {
+            hosts.insert("host-a".to_owned());
+        });
+
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/local".to_owned()),
+            FrameKind::CommandError,
+            0,
+            &CommandErrorPayload {
+                stream: StreamPath("/host/local".to_owned()),
+                request_kind: FrameKind::DeleteSession,
+                setting_target: None,
+                operation: "delete_session".to_owned(),
+                code: protocol::CommandErrorCode::NotFound,
+                message: "unknown session".to_owned(),
+                fatal: false,
+            },
+        )
+        .expect("command error envelope");
+        dispatch_envelope(&state, "host-a", envelope);
+
+        assert!(
+            state
+                .session_list_refresh_in_flight
+                .get_untracked()
+                .contains("host-a"),
+            "an unrelated failure must not release a live refresh claim"
+        );
     }
 
     #[wasm_bindgen_test]

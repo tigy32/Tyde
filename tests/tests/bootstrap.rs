@@ -452,6 +452,162 @@ async fn mobile_bootstrap_pages_large_session_store() {
     ));
 }
 
+/// Read until a `SessionList` arrives, failing *immediately* on a rejected
+/// `list_sessions` rather than looping past it.
+///
+/// `next_kind` would silently drop the `CommandError` this regression is about
+/// and then time out, reporting nothing about why. Here the rejection is the
+/// diagnostic.
+async fn next_session_list(client: &mut client::Connection, context: &str) -> SessionListPayload {
+    for _ in 0..16 {
+        let env = next_env(client, context).await;
+        match env.kind {
+            FrameKind::SessionList => {
+                return env.parse_payload().expect("parse SessionList");
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+                if error.request_kind == FrameKind::ListSessions {
+                    panic!(
+                        "{context} was rejected: {} failed with {:?}: {}",
+                        error.operation, error.code, error.message
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("no SessionList arrived before {context} ran out of frames");
+}
+
+/// The reported failure. A desktop host replays its whole session list, so its
+/// bootstrap page applied no bound. The client re-requests that view by
+/// echoing the page descriptor it was given, and the host must accept it.
+///
+/// Before the fix the descriptor carried the host's own session count in place
+/// of "no bound", and the echo came back as
+/// `session list limit 129 exceeds maximum 128` — on every desktop host with
+/// more than `MAX_SESSION_LIST_PAGE_LIMIT` sessions, with no user action
+/// needed.
+#[tokio::test]
+async fn desktop_bootstrap_page_limit_survives_being_echoed_back() {
+    let session_count = protocol::MAX_SESSION_LIST_PAGE_LIMIT + 1;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store(&session_path, session_count);
+    let host = server::spawn_host_with_mock_backend(
+        session_path,
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let env = next_env(&mut client, "desktop host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.session_list.scope,
+        protocol::SessionListScope::AllSessions
+    );
+    assert_eq!(bootstrap.session_list.total_count, session_count);
+    assert_eq!(bootstrap.sessions.len(), session_count as usize);
+    assert_eq!(
+        bootstrap.session_list.limit, None,
+        "an unbounded replay must advertise no page size rather than its own count"
+    );
+    assert!(
+        matches!(bootstrap.session_list.status, SessionListPageStatus::Complete),
+        "an unbounded page has nothing left to continue with"
+    );
+
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(bootstrap.session_list.scope),
+            cursor: None,
+            limit: bootstrap.session_list.limit,
+        })
+        .await
+        .expect("re-request the advertised view");
+
+    let page = next_session_list(&mut client, "echoed desktop session list").await;
+    assert_eq!(page.page.limit, None);
+    assert_eq!(page.page.total_count, session_count);
+    assert_eq!(page.sessions.len(), session_count as usize);
+    assert!(matches!(page.page.status, SessionListPageStatus::Complete));
+}
+
+/// Mobile is paged, and stays paged. Its descriptor names a real bound, that
+/// bound round-trips, and omitting it falls back to the same subscriber
+/// default rather than to "unbounded" — the request field means "use my
+/// default", not "no limit".
+#[tokio::test]
+async fn mobile_session_page_limit_round_trips_and_defaults_when_omitted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store(&session_path, 300);
+    let host = server::spawn_host_with_mock_backend(
+        session_path,
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_mobile_raw(host).await;
+
+    let env = next_env(&mut client, "mobile host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.session_list.limit,
+        Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT)
+    );
+    let next_cursor = match bootstrap.session_list.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("a 300-session mobile bootstrap must be paged"),
+    };
+
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(bootstrap.session_list.scope),
+            cursor: Some(next_cursor),
+            limit: bootstrap.session_list.limit,
+        })
+        .await
+        .expect("echo the advertised mobile limit");
+    let page = next_session_list(&mut client, "echoed mobile session page").await;
+    assert_eq!(
+        page.page.limit,
+        Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT)
+    );
+    assert_eq!(
+        page.sessions.len(),
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
+    );
+
+    let next_cursor = match page.page.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("300 sessions must leave more pages"),
+    };
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(bootstrap.session_list.scope),
+            cursor: Some(next_cursor),
+            limit: None,
+        })
+        .await
+        .expect("request a page without naming a limit");
+    let page = next_session_list(&mut client, "defaulted mobile session page").await;
+    assert_eq!(
+        page.page.limit,
+        Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT),
+        "an omitted request limit resolves to the subscriber default, never to unbounded"
+    );
+    assert_eq!(
+        page.sessions.len(),
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
+    );
+}
+
 #[tokio::test]
 async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
     let dir = tempfile::tempdir().expect("tempdir");

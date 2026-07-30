@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -4074,7 +4074,27 @@ pub struct SessionListPageInfo {
     #[serde(default)]
     pub scope: SessionListScope,
     pub cursor: SessionListCursor,
-    pub limit: u32,
+    /// The page size the server applied to **this response**. `None` means the
+    /// server applied no bound and returned every session in scope.
+    ///
+    /// Distinct from [`ListSessionsPayload::limit`], where `None` means "no
+    /// client-chosen limit — use this subscriber's replay-mode default", which
+    /// resolves to unbounded only for a full-replay subscriber and to the
+    /// mobile page size for a paged one.
+    ///
+    /// Clients echo this field verbatim when re-requesting the same view.
+    /// Encoding "unbounded" as `total_count` made the server emit a value its
+    /// own request validation rejects (`session list limit N exceeds maximum
+    /// 128`), so a desktop host with more than
+    /// [`MAX_SESSION_LIST_PAGE_LIMIT`] sessions failed every refresh.
+    ///
+    /// Invariant: [`SessionListPageStatus::More`] implies `Some(_)`. A page
+    /// with no bound returned everything, so there is nothing left to continue
+    /// with. Upheld by the host's own page construction; `ProtocolValidator`
+    /// asserts it over observed frames in protocol and backend tests, so a
+    /// regression fails a test rather than being rejected at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
     pub total_count: u32,
     pub status: SessionListPageStatus,
 }
@@ -4084,7 +4104,7 @@ impl Default for SessionListPageInfo {
         Self {
             scope: SessionListScope::AllSessions,
             cursor: SessionListCursor::default(),
-            limit: DEFAULT_SESSION_LIST_PAGE_LIMIT,
+            limit: Some(DEFAULT_SESSION_LIST_PAGE_LIMIT),
             total_count: 0,
             status: SessionListPageStatus::Complete,
         }
@@ -4106,6 +4126,15 @@ pub struct ListSessionsPayload {
     pub scope: Option<SessionListScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<SessionListCursor>,
+    /// `None` means "no client-chosen limit — use this subscriber's
+    /// replay-mode default". That is *not* the same as `None` on
+    /// [`SessionListPageInfo::limit`], which describes a response that was
+    /// actually unbounded. A full-replay subscriber resolves `None` to
+    /// unbounded; a paged one resolves it to its own page size.
+    ///
+    /// Clients re-request a view by echoing the descriptor they were given, so
+    /// the contract this field must uphold is that a subscriber accepts the
+    /// limit it emitted — not that `None` means unbounded everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -8166,8 +8195,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_one() {
-        assert_eq!(PROTOCOL_VERSION, 41);
+    fn protocol_version_is_forty_two() {
+        assert_eq!(PROTOCOL_VERSION, 42);
     }
 
     #[test]
@@ -8218,6 +8247,47 @@ mod search_serde_tests {
         let page: SessionListPageInfo =
             serde_json::from_value(legacy_page).expect("deserialize SessionListPageInfo");
         assert_eq!(page.scope, SessionListScope::AllSessions);
+        // A numeric limit is a bounded page and stays one. `Option<u32>`
+        // decodes the present number on its own; `#[serde(default)]` is what
+        // the omitted key below needs.
+        assert_eq!(page.limit, Some(64));
+    }
+
+    /// A page's `limit` is a *response descriptor*: `None` says the server
+    /// applied no bound. Encoding that as `total_count` is what made the host
+    /// advertise `4014` and then reject the client that echoed it back.
+    ///
+    /// The omitted-key and omitted-on-serialize cases are the ones that make
+    /// this a breaking wire change: a pre-42 client's `u32` field cannot
+    /// decode a missing `limit`, which is why `PROTOCOL_VERSION` moves with it.
+    #[test]
+    fn session_list_page_limit_encodes_unbounded_as_an_absent_field() {
+        let unbounded = serde_json::json!({
+            "cursor": { "generation": 1, "offset": 0 },
+            "total_count": 4014,
+            "status": { "kind": "complete" },
+        });
+        let page: SessionListPageInfo =
+            serde_json::from_value(unbounded).expect("deserialize unbounded SessionListPageInfo");
+        assert_eq!(page.limit, None);
+        assert_eq!(page.total_count, 4014);
+
+        let encoded = serde_json::to_value(page).expect("serialize unbounded page");
+        assert!(
+            encoded.get("limit").is_none(),
+            "an unbounded page must omit the key rather than emit a count"
+        );
+
+        let bounded = SessionListPageInfo {
+            limit: Some(64),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(bounded).expect("serialize bounded page");
+        assert_eq!(
+            encoded["limit"],
+            serde_json::json!(64),
+            "a bounded page keeps the pre-42 numeric wire shape"
+        );
     }
 
     #[test]
