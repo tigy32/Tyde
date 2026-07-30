@@ -251,6 +251,10 @@ enum AgentCommand {
     ReadCompactionCapability {
         reply: oneshot::Sender<crate::backend::BackendCompactionCapability>,
     },
+    ReadRequestedCompactionRoute {
+        trigger: CompactionTrigger,
+        reply: oneshot::Sender<Result<protocol::RequestedCompactionRoute, String>>,
+    },
     RequestContextCompaction {
         trigger: CompactionTrigger,
         focus: Option<String>,
@@ -1517,6 +1521,19 @@ impl AgentHandle {
             .send(AgentCommand::ReadCompactionCapability { reply })
             .ok()?;
         received.await.ok()
+    }
+
+    pub(crate) async fn requested_compaction_route(
+        &self,
+        trigger: CompactionTrigger,
+    ) -> Result<protocol::RequestedCompactionRoute, String> {
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::ReadRequestedCompactionRoute { trigger, reply })
+            .map_err(|_| "agent stopped before compaction route was read".to_owned())?;
+        received
+            .await
+            .map_err(|_| "agent stopped before compaction route was read".to_owned())?
     }
 
     pub(crate) async fn request_context_compaction(
@@ -3285,6 +3302,9 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::ReadCompactionCapability { reply } => {
                             let _ =
                                 reply.send(crate::backend::BackendCompactionCapability::default());
+                        }
+                        AgentCommand::ReadRequestedCompactionRoute { reply, .. } => {
+                            let _ = reply.send(Err("agent backend is starting".to_owned()));
                         }
                         AgentCommand::RequestContextCompaction { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
@@ -5685,6 +5705,29 @@ pub(crate) fn spawn_agent_actor(
                                 .compaction_capability();
                             let _ = reply.send(capability);
                         }
+                        AgentCommand::ReadRequestedCompactionRoute { trigger, reply } => {
+                            let result = match current_session_id.as_ref() {
+                                Some(session_id) => {
+                                    let capability = backend
+                                        .as_ref()
+                                        .expect("backend must exist while actor is running")
+                                        .compaction_capability();
+                                    crate::host::requested_context_compaction_route(
+                                        &capability,
+                                        trigger,
+                                        transcript_is_authoritative(
+                                            &transcript_store,
+                                            session_id,
+                                        )
+                                        .await,
+                                    )
+                                }
+                                None => Err(
+                                    "agent has no logical session to compact".to_owned(),
+                                ),
+                            };
+                            let _ = reply.send(result);
+                        }
                         AgentCommand::RequestContextCompaction {
                             trigger,
                             focus,
@@ -5757,12 +5800,16 @@ pub(crate) fn spawn_agent_actor(
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
                                 .compaction_capability();
-                            if capability.coordinator
-                                != crate::backend::BackendCompactionCoordinator::ContextOperation
-                            {
-                                let _ = reply.send(Err(
-                                    "backend is still assigned to legacy compaction".to_owned(),
-                                ));
+                            if let Err(error) = crate::host::requested_context_compaction_route(
+                                &capability,
+                                trigger,
+                                transcript_is_authoritative(
+                                    &transcript_store,
+                                    session_id,
+                                )
+                                .await,
+                            ) {
+                                let _ = reply.send(Err(error));
                                 continue;
                             }
                             let operation_id =
@@ -7561,6 +7608,11 @@ pub(crate) fn spawn_relay_agent_actor(
                                 crate::backend::BackendCompactionCapability::default(),
                             );
                         }
+                        AgentCommand::ReadRequestedCompactionRoute { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "backend-native relay agents cannot be compacted".to_owned(),
+                            ));
+                        }
                         AgentCommand::RequestContextCompaction { reply, .. } => {
                             let _ = reply.send(Err(
                                 "backend-native relay agents cannot be compacted".to_owned(),
@@ -8245,6 +8297,9 @@ async fn park_terminal_agent(
             AgentCommand::ReadCompactionCapability { reply } => {
                 let _ = reply.send(crate::backend::BackendCompactionCapability::default());
             }
+            AgentCommand::ReadRequestedCompactionRoute { reply, .. } => {
+                let _ = reply.send(Err("agent is not running".to_owned()));
+            }
             AgentCommand::RequestContextCompaction { reply, .. } => {
                 let _ = reply.send(Err("agent is not running".to_owned()));
             }
@@ -8432,6 +8487,11 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::ReadCompactionCapability { reply } => {
                 let _ = reply.send(crate::backend::BackendCompactionCapability::default());
+            }
+            AgentCommand::ReadRequestedCompactionRoute { reply, .. } => {
+                let _ = reply.send(Err(
+                    "backend-native relay agents cannot be compacted".to_owned()
+                ));
             }
             AgentCommand::RequestContextCompaction { reply, .. } => {
                 let _ = reply.send(Err(
@@ -11883,17 +11943,17 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
-        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMetrics,
-        CompactionOperationId, CompactionStage, CompactionTrigger, ContextCompactionNotifyPayload,
-        ContextCompactionStatus, ContextCompactionTimelineEvent, Envelope, FrameKind,
-        MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
-        ModelRequestId, ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
-        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
-        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType, ToolUseData,
+        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
+        CompactionMetrics, CompactionOperationId, CompactionStage, CompactionTrigger,
+        ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
+        Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
+        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+        QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
+        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
+        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
+        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -13168,6 +13228,9 @@ mod tests {
                     }
                     AgentCommand::ReadCompactionCapability { reply } => {
                         let _ = reply.send(crate::backend::BackendCompactionCapability::default());
+                    }
+                    AgentCommand::ReadRequestedCompactionRoute { reply, .. } => {
+                        let _ = reply.send(Err("agent is not running".to_owned()));
                     }
                     AgentCommand::RequestContextCompaction { reply, .. } => {
                         let _ = reply.send(Err("agent is not running".to_owned()));
@@ -18749,6 +18812,100 @@ mod tests {
             terminal_count, 1,
             "{path} must broadcast exactly one terminal compaction notify"
         );
+    }
+
+    #[tokio::test]
+    async fn future_version_falls_back_while_unknown_is_rejected_before_admission() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let transcript_dir = tempfile::tempdir().expect("transcript tempdir");
+        let _transcript_env = TranscriptEnvGuard::install(transcript_dir.path());
+
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("future-version-fallback", None);
+        request.initial_input = Some(delivery_payload(&format!(
+            "{} establish authoritative transcript",
+            crate::backend::mock::MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL
+        )));
+        let session_store = Arc::clone(&runtime.session_store);
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        let session_id = startup_rx
+            .await
+            .expect("future-version actor startup reply")
+            .expect("future-version actor startup");
+        wait_for_idle_actor(&status_handle).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "future-version bootstrap").await;
+        assert_eq!(
+            handle
+                .requested_compaction_route(CompactionTrigger::UserRequested)
+                .await,
+            Ok(protocol::RequestedCompactionRoute::InlineFallbackOnly)
+        );
+        let operation_id = handle
+            .request_context_compaction(
+                CompactionTrigger::UserRequested,
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("future version admits safe fallback");
+        let (terminal, terminal_count) = recv_context_terminal(&mut rx).await;
+        assert_eq!(terminal_count, 1);
+        assert_eq!(terminal.operation_id, operation_id);
+        assert_eq!(terminal.status, ContextCompactionStatus::Completed);
+        assert_eq!(terminal.method, Some(CompactionMethod::InlineFallback));
+        let stored = session_store
+            .lock()
+            .await
+            .compaction_operation(&session_id, &operation_id)
+            .expect("future-version fallback operation");
+        assert_eq!(stored.method, Some(CompactionMethod::InlineFallback));
+        assert!(handle.close().await);
+
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("unknown-version-rejected", None);
+        request.initial_input = Some(delivery_payload(&format!(
+            "{} establish authoritative transcript",
+            crate::backend::mock::MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL
+        )));
+        let session_store = Arc::clone(&runtime.session_store);
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        let session_id = startup_rx
+            .await
+            .expect("unknown-version actor startup reply")
+            .expect("unknown-version actor startup");
+        wait_for_idle_actor(&status_handle).await;
+        assert!(
+            handle
+                .requested_compaction_route(CompactionTrigger::UserRequested)
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .request_context_compaction(
+                    CompactionTrigger::UserRequested,
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+                .is_err(),
+            "genuinely unknown capability must fail before durable admission"
+        );
+        assert!(
+            session_store
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("unknown-version session")
+                .compaction_operations
+                .is_empty(),
+            "rejected unknown capability must not persist a compaction operation"
+        );
+        assert!(handle.close().await);
     }
 
     #[tokio::test]

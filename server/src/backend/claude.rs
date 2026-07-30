@@ -12205,6 +12205,19 @@ fn claude_capacity_access_from_initialize(response: &Value) -> ClaudeCapacityAcc
     }
 }
 
+fn stable_claude_version(version_line: &str) -> Option<(&str, u64)> {
+    let version = version_line.split_whitespace().next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let valid_part = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+    };
+    (valid_part(parts.next()) && valid_part(parts.next()) && parts.next().is_none())
+        .then_some((version, major))
+}
+
 fn claude_compaction_capability(
     compact_command_advertised: Option<bool>,
     provider_version: Option<&str>,
@@ -12230,7 +12243,7 @@ fn claude_compaction_capability(
         Some(true) => {}
     }
 
-    let Some(version) = provider_version.and_then(normalize_nonempty) else {
+    let Some(version_line) = provider_version.and_then(normalize_nonempty) else {
         return BackendCompactionCapability::unknown(
             BackendCompactionUnknownReason::VersionUnavailable,
             None,
@@ -12239,21 +12252,26 @@ fn claude_compaction_capability(
             },
         );
     };
-    let major = version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u64>().ok());
-    if major != Some(2) {
+    let Some((version, major)) = stable_claude_version(&version_line) else {
         return BackendCompactionCapability::unknown(
-            if major.is_some() {
-                BackendCompactionUnknownReason::ProtocolNotAllowlisted
-            } else {
-                BackendCompactionUnknownReason::VersionUnparseable
-            },
-            Some(version),
+            BackendCompactionUnknownReason::VersionUnparseable,
+            Some(version_line),
             BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
                 name: "compact".to_string(),
             },
+        );
+    };
+    let version = version.to_owned();
+    if major != 2 {
+        let evidence = BackendCompactionCapabilityEvidence::ClaudeInitializeCommand {
+            name: "compact".to_string(),
+        };
+        return BackendCompactionCapability::context_unavailable_with_metadata(
+            BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                tested: "2.x stable".to_owned(),
+            },
+            Some(version),
+            evidence,
         );
     }
     let confidence = if version == "2.1.220" {
@@ -25937,19 +25955,38 @@ for line in sys.stdin:
 
     #[test]
     fn compaction_capability_requires_catalog_and_supported_major() {
-        let verified = claude_compaction_capability(Some(true), Some("2.1.220"));
+        let verified = claude_compaction_capability(Some(true), Some("2.1.220 (Claude Code)"));
         assert_eq!(
             verified.confidence,
             Some(BackendCompactionProtocolConfidence::Verified)
         );
+        assert_eq!(verified.provider_version.as_deref(), Some("2.1.220"));
         let compatible = claude_compaction_capability(Some(true), Some("2.2.0"));
         assert_eq!(
             compatible.confidence,
             Some(BackendCompactionProtocolConfidence::Compatible)
         );
+        let next_major = claude_compaction_capability(Some(true), Some("3.0.0"));
         assert!(matches!(
-            claude_compaction_capability(Some(true), Some("3.0.0")).availability,
-            BackendCompactionAvailability::Unknown { .. }
+            next_major.availability,
+            BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                    ref tested
+                }
+            } if tested == "2.x stable"
+        ));
+        assert_eq!(next_major.provider_version.as_deref(), Some("3.0.0"));
+        assert!(matches!(
+            claude_compaction_capability(Some(true), Some("development")).availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnparseable
+            }
+        ));
+        assert!(matches!(
+            claude_compaction_capability(Some(true), Some("2.2.0-beta.1")).availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnparseable
+            }
         ));
         assert!(matches!(
             claude_compaction_capability(Some(false), Some("2.1.220")).availability,
@@ -25964,7 +26001,7 @@ for line in sys.stdin:
             inner: Arc::new(inner),
         };
         session
-            .seed_installed_provider_version(Some("2.1.220".to_owned()))
+            .seed_installed_provider_version(Some("2.1.220 (Claude Code)".to_owned()))
             .await;
         session
             .inner

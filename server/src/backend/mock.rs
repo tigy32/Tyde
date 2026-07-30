@@ -325,8 +325,12 @@ fn mock_compaction_capability_for_control(control: &str) -> BackendCompactionCap
         );
     }
     if control.contains(MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL) {
-        return BackendCompactionCapability::context_unavailable(
-            super::BackendCompactionUnavailableReason::ProviderDisabledCommand,
+        return BackendCompactionCapability::context_unavailable_with_metadata(
+            super::BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                tested: "mock-native-compaction-v1".to_owned(),
+            },
+            Some("mock-future-compaction-v2".to_owned()),
+            BackendCompactionCapabilityEvidence::AdapterContract,
         );
     }
     native_mock_compaction_capability()

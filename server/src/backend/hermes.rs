@@ -404,6 +404,43 @@ struct HermesVersionOutput {
     stderr: String,
 }
 
+fn is_stable_hermes_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let valid_part = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+    };
+    valid_part(parts.next())
+        && valid_part(parts.next())
+        && valid_part(parts.next())
+        && parts.next().is_none()
+}
+
+fn hermes_version_from_probe_line(version_line: &str) -> Option<String> {
+    let prefixed = version_line
+        .split_whitespace()
+        .filter_map(|part| part.strip_prefix('v'))
+        .filter(|part| is_stable_hermes_version(part))
+        .collect::<Vec<_>>();
+    if let [version] = prefixed.as_slice() {
+        return Some((*version).to_owned());
+    }
+    if !prefixed.is_empty() {
+        return None;
+    }
+
+    let unprefixed = version_line
+        .split_whitespace()
+        .filter(|part| is_stable_hermes_version(part))
+        .collect::<Vec<_>>();
+    if let [version] = unprefixed.as_slice() {
+        Some((*version).to_owned())
+    } else {
+        None
+    }
+}
+
 fn hermes_compaction_capability(version: Option<&str>) -> BackendCompactionCapability {
     let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
         return BackendCompactionCapability::unknown(
@@ -415,28 +452,27 @@ fn hermes_compaction_capability(version: Option<&str>) -> BackendCompactionCapab
     let evidence = BackendCompactionCapabilityEvidence::HermesLocalGatewayProbe {
         version: version.to_string(),
     };
-    let normalized = version.split_whitespace().rev().find_map(|part| {
-        let part = part.trim_start_matches('v');
-        (part.split('.').count() >= 3
-            && part
-                .chars()
-                .all(|character| character.is_ascii_digit() || character == '.'))
-        .then(|| part.to_string())
-    });
-    if normalized.as_deref() == Some("0.17.0") {
-        BackendCompactionCapability::native(
+    let normalized = hermes_version_from_probe_line(version);
+    match normalized.as_deref() {
+        Some("0.17.0") => BackendCompactionCapability::native(
             BackendCompactionMechanism::JsonRpcRequest,
             normalized,
             BackendCompactionProtocolConfidence::Verified,
             BackendContextReseatSupport::PreservedByNative,
             evidence,
-        )
-    } else {
-        BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
-            normalized.or_else(|| Some(version.to_string())),
+        ),
+        Some(observed) => BackendCompactionCapability::context_unavailable_with_metadata(
+            BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                tested: "0.17.0".to_owned(),
+            },
+            Some(observed.to_owned()),
             evidence,
-        )
+        ),
+        None => BackendCompactionCapability::unknown(
+            BackendCompactionUnknownReason::VersionUnparseable,
+            Some(version.to_owned()),
+            evidence,
+        ),
     }
 }
 
@@ -569,15 +605,17 @@ fn classify_hermes_compaction_response(
                 *compaction_capability
                     .lock()
                     .expect("Hermes compaction capability mutex poisoned") =
-                    BackendCompactionCapability::unknown(
-                        BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+                    BackendCompactionCapability::context_unavailable_with_metadata(
+                        BackendCompactionUnavailableReason::ManualTriggerAbsent,
                         previous.provider_version,
                         previous.evidence,
                     );
             }
             BackendCompactionResult {
                 operation_id,
-                dispatch: if error.code.is_some() {
+                dispatch: if error.code == Some(-32601) {
+                    BackendCompactionDispatchState::Rejected
+                } else if error.code.is_some() {
                     BackendCompactionDispatchState::Accepted
                 } else {
                     BackendCompactionDispatchState::MayHaveReachedProvider
@@ -10709,8 +10747,10 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn compaction_capability_requires_exact_fixture_version() {
-        let verified = hermes_compaction_capability(Some("Hermes Agent v0.17.0"));
+    fn untested_stable_version_routes_to_fallback_not_unknown() {
+        let verified = hermes_compaction_capability(Some(
+            "Hermes Agent v0.17.0 (2026.6.19) · upstream 729bbb7a",
+        ));
         assert!(matches!(
             verified.availability,
             crate::backend::BackendCompactionAvailability::Native {
@@ -10721,12 +10761,46 @@ for line in sys.stdin:
             verified.confidence,
             Some(BackendCompactionProtocolConfidence::Verified)
         );
+        let verified_with_trailing_date =
+            hermes_compaction_capability(Some("Hermes Agent v0.17.0 upstream 2026.6.19"));
+        assert_eq!(
+            verified_with_trailing_date.provider_version.as_deref(),
+            Some("0.17.0")
+        );
 
-        let unreviewed = hermes_compaction_capability(Some("0.17.1"));
+        let unreviewed = hermes_compaction_capability(Some(
+            "Hermes Agent v0.17.1 (2026.6.19) · upstream 729bbb7a",
+        ));
         assert!(matches!(
-            unreviewed.availability,
+            &unreviewed.availability,
+            crate::backend::BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                    tested
+                }
+            } if tested == "0.17.0"
+        ));
+        assert_eq!(unreviewed.provider_version.as_deref(), Some("0.17.1"));
+        assert!(matches!(
+            crate::backend::compaction::not_dispatched_for_capability(&unreviewed),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            })
+        ));
+
+        let unparseable = hermes_compaction_capability(Some("Hermes Agent development"));
+        assert!(matches!(
+            unparseable.availability,
             crate::backend::BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::ProtocolNotAllowlisted
+                reason: BackendCompactionUnknownReason::VersionUnparseable
+            }
+        ));
+        let ambiguous =
+            hermes_compaction_capability(Some("Hermes Agent 0.17.0 upstream 2026.6.19"));
+        assert!(matches!(
+            ambiguous.availability,
+            crate::backend::BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnparseable
             }
         ));
     }
@@ -10797,6 +10871,44 @@ for line in sys.stdin:
         assert_eq!(busy.dispatch, BackendCompactionDispatchState::Accepted);
         assert_eq!(busy.mutation, BackendCompactionMutationState::NotObserved);
         assert!(busy.outcome.is_err());
+
+        let method_missing = classify_hermes_compaction_response(
+            protocol::CompactionOperationId("method-missing".to_string()),
+            "live".to_string(),
+            SessionId("stored".to_string()),
+            Err(HermesRpcError {
+                code: Some(-32601),
+                message: "Method not found".to_string(),
+            }),
+            &stored,
+            &capability,
+        );
+        assert_eq!(
+            method_missing.dispatch,
+            BackendCompactionDispatchState::Rejected
+        );
+        assert_eq!(
+            method_missing.mutation,
+            BackendCompactionMutationState::NotObserved
+        );
+        let cached = capability
+            .lock()
+            .expect("Hermes compaction capability")
+            .clone();
+        assert!(matches!(
+            &cached.availability,
+            crate::backend::BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
+            }
+        ));
+        assert_eq!(cached.provider_version.as_deref(), Some("0.17.0"));
+        assert!(matches!(
+            crate::backend::compaction::not_dispatched_for_capability(&cached),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            })
+        ));
 
         let unknown = classify_hermes_compaction_response(
             protocol::CompactionOperationId("unknown".to_string()),

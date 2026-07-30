@@ -1079,13 +1079,16 @@ async fn codex_list_skills(rpc: &CodexRpc, cwd: &str) -> Result<CodexSkillCatalo
     parse_codex_skill_catalog(&response)
 }
 
-async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
+async fn initialize_codex_rpc(
+    rpc: &CodexRpc,
+    installed_provider_version: Option<&str>,
+) -> Result<(), String> {
     let response = rpc
         .request(
             "initialize",
             json!({
                 "clientInfo": {
-                    "name": "tyde",
+                    "name": CODEX_APP_SERVER_CLIENT_NAME,
                     "title": Value::Null,
                     "version": "0.1"
                 },
@@ -1100,39 +1103,144 @@ async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
         .or_else(|| response.get("user_agent"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let capability = codex_compaction_capability(user_agent.as_deref());
+    let capability = codex_compaction_capability_with_installed_version(
+        user_agent.as_deref(),
+        installed_provider_version,
+    );
     *rpc.compaction_capability
         .lock()
         .expect("Codex compaction capability mutex poisoned") = capability;
     Ok(())
 }
 
-fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCapability {
-    let Some(user_agent) = user_agent.map(str::trim).filter(|value| !value.is_empty()) else {
-        return BackendCompactionCapability::unknown(
-            BackendCompactionUnknownReason::VersionUnavailable,
-            None,
-            BackendCompactionCapabilityEvidence::None,
-        );
+const CODEX_APP_SERVER_CLIENT_NAME: &str = "tyde";
+const CODEX_TESTED_COMPACTION_VERSIONS: &str = "0.144.3, 0.146.0";
+
+fn codex_version_from_user_agent(user_agent: &str) -> Result<Option<&str>, ()> {
+    let prefix = format!("{CODEX_APP_SERVER_CLIENT_NAME}/");
+    let mut matches = user_agent
+        .split_whitespace()
+        .filter_map(|part| part.strip_prefix(prefix.as_str()));
+    let Some(version) = matches.next() else {
+        return Ok(None);
     };
-    let provider_version = user_agent
-        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .find(|part| {
-            let mut components = part.split('.');
-            components.next().is_some_and(|value| !value.is_empty()) && components.next().is_some()
+    if version.is_empty() || matches.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(version))
+}
+
+fn is_stable_three_part_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let valid_part = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
         })
-        .map(str::to_owned);
-    let evidence = BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
-        user_agent: user_agent.to_string(),
+    };
+    valid_part(parts.next())
+        && valid_part(parts.next())
+        && valid_part(parts.next())
+        && parts.next().is_none()
+}
+
+#[cfg(test)]
+fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCapability {
+    codex_compaction_capability_with_installed_version(user_agent, None)
+}
+
+fn codex_version_from_installed_provider(version_line: &str) -> Option<&str> {
+    let mut candidates = version_line.split_whitespace().filter_map(|part| {
+        let version = part.strip_prefix('v').unwrap_or(part);
+        is_stable_three_part_version(version).then_some(version)
+    });
+    let version = candidates.next()?;
+    candidates.next().is_none().then_some(version)
+}
+
+fn codex_compaction_capability_with_installed_version(
+    user_agent: Option<&str>,
+    installed_provider_version: Option<&str>,
+) -> BackendCompactionCapability {
+    let user_agent = user_agent.map(str::trim).filter(|value| !value.is_empty());
+    let installed_provider_version = installed_provider_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let parsed_user_agent_version = match user_agent {
+        Some(user_agent) => codex_version_from_user_agent(user_agent),
+        None => Ok(None),
+    };
+    let (provider_version, evidence) = match parsed_user_agent_version {
+        Ok(Some(version)) => (
+            Some(version.to_owned()),
+            BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+                user_agent: user_agent.expect("parsed Codex user agent").to_owned(),
+            },
+        ),
+        Ok(None) => {
+            let Some((installed_version_line, version)) =
+                installed_provider_version.and_then(|line| {
+                    codex_version_from_installed_provider(line).map(|version| (line, version))
+                })
+            else {
+                let reason = if user_agent.is_none() && installed_provider_version.is_none() {
+                    BackendCompactionUnknownReason::VersionUnavailable
+                } else {
+                    BackendCompactionUnknownReason::VersionUnparseable
+                };
+                return BackendCompactionCapability::unknown(
+                    reason,
+                    installed_provider_version.map(str::to_owned),
+                    user_agent.map_or(BackendCompactionCapabilityEvidence::None, |user_agent| {
+                        BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+                            user_agent: user_agent.to_owned(),
+                        }
+                    }),
+                );
+            };
+            (
+                Some(version.to_owned()),
+                BackendCompactionCapabilityEvidence::CodexInstalledVersionFallback {
+                    user_agent: user_agent.map(str::to_owned),
+                    installed_version: installed_version_line.to_owned(),
+                },
+            )
+        }
+        Err(()) => {
+            return BackendCompactionCapability::unknown(
+                BackendCompactionUnknownReason::VersionUnparseable,
+                None,
+                BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+                    user_agent: user_agent.expect("malformed Codex user agent").to_owned(),
+                },
+            );
+        }
     };
     match provider_version.as_deref() {
-        Some("0.144.3") if !user_agent.contains("0.144.3-") => BackendCompactionCapability::native(
+        // Verified describes the tested 0.144.3 compaction contract. On legacy
+        // user-agent shapes, the setup probe supplies only the binary identity.
+        Some("0.144.3") => BackendCompactionCapability::native(
             BackendCompactionMechanism::JsonRpcRequest,
             provider_version,
             BackendCompactionProtocolConfidence::Verified,
             BackendContextReseatSupport::InjectAfterNative,
             evidence,
         ),
+        Some("0.146.0") => BackendCompactionCapability::native(
+            BackendCompactionMechanism::JsonRpcRequest,
+            provider_version,
+            BackendCompactionProtocolConfidence::Compatible,
+            BackendContextReseatSupport::InjectAfterNative,
+            evidence,
+        ),
+        Some(version) if is_stable_three_part_version(version) => {
+            BackendCompactionCapability::context_unavailable_with_metadata(
+                BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                    tested: CODEX_TESTED_COMPACTION_VERSIONS.to_owned(),
+                },
+                Some(version.to_owned()),
+                evidence,
+            )
+        }
         Some(version) => BackendCompactionCapability::unknown(
             BackendCompactionUnknownReason::ProtocolNotAllowlisted,
             Some(version.to_string()),
@@ -1622,6 +1730,7 @@ struct CodexThreadResponseConfig<'a> {
 struct CodexSelectedSkillContext<'a> {
     skills: &'a [ResolvedSkill],
     selection: SkillSelection,
+    installed_provider_version: Option<&'a str>,
 }
 
 impl CodexSelectedSkillContext<'_> {
@@ -1629,6 +1738,7 @@ impl CodexSelectedSkillContext<'_> {
         Self {
             skills: &[],
             selection: SkillSelection::Explicit,
+            installed_provider_version: None,
         }
     }
 }
@@ -1644,6 +1754,7 @@ struct CodexSessionSpawnOptions<'a> {
     access_mode: BackendAccessMode,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     execution_mode: BackendExecutionMode,
+    installed_provider_version: Option<&'a str>,
     selected_skills: &'a [ResolvedSkill],
     skill_selection: SkillSelection,
 }
@@ -1666,6 +1777,7 @@ impl CodexSession {
                 access_mode,
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
+                installed_provider_version: None,
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1690,6 +1802,7 @@ impl CodexSession {
                 access_mode,
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
+                installed_provider_version: None,
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1714,6 +1827,7 @@ impl CodexSession {
                 access_mode,
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
+                installed_provider_version: None,
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1733,6 +1847,7 @@ impl CodexSession {
             access_mode,
             subagent_emitter,
             execution_mode,
+            installed_provider_version,
             selected_skills,
             skill_selection,
         } = options;
@@ -1768,7 +1883,7 @@ impl CodexSession {
             }
         };
 
-        if let Err(err) = initialize_codex_rpc(&rpc).await {
+        if let Err(err) = initialize_codex_rpc(&rpc, installed_provider_version).await {
             cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
             return Err(err);
         }
@@ -1917,6 +2032,7 @@ impl CodexSession {
         let CodexSelectedSkillContext {
             skills: selected_skills,
             selection: skill_selection,
+            installed_provider_version,
         } = selected_skill_context;
         if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
             return Err(err);
@@ -1950,7 +2066,7 @@ impl CodexSession {
             }
         };
 
-        if let Err(err) = initialize_codex_rpc(&rpc).await {
+        if let Err(err) = initialize_codex_rpc(&rpc, installed_provider_version).await {
             cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
             return Err(err);
         }
@@ -3478,7 +3594,7 @@ impl CodexInner {
 
         let response = self
             .rpc
-            .request(
+            .request_typed(
                 "thread/compact/start",
                 json!({
                     "threadId": thread_id
@@ -3498,27 +3614,25 @@ impl CodexInner {
                 )
                 .await;
             }
-            Err(message) => {
-                if message.starts_with("Codex JSON-RPC error")
+            Err(error) => {
+                let rejected_before_dispatch =
+                    error.rejected_before_dispatch("thread/compact/start");
+                if error.code.is_some()
+                    && !rejected_before_dispatch
                     && let Some(pending) = self.state.lock().await.pending_compaction.as_mut()
                 {
                     pending.accepted = true;
                 }
-                if message.contains("-32601") {
-                    *self
-                        .rpc
-                        .compaction_capability
-                        .lock()
-                        .expect("Codex compaction capability mutex poisoned") =
-                        BackendCompactionCapability::unknown(
-                            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
-                            capability.provider_version.clone(),
-                            capability.evidence.clone(),
-                        );
-                }
-                self.finish_compaction_failure(
+                cache_codex_manual_trigger_absent(
+                    &self.rpc.compaction_capability,
+                    &capability,
+                    "thread/compact/start",
+                    &error,
+                );
+                self.finish_compaction_failure_with_dispatch(
                     BackendCompactionFailureKind::ProviderRejected,
-                    message,
+                    error.to_string(),
+                    rejected_before_dispatch.then_some(BackendCompactionDispatchState::Rejected),
                 )
                 .await;
             }
@@ -3695,7 +3809,21 @@ impl CodexInner {
     }
 
     async fn finish_compaction_failure(&self, kind: BackendCompactionFailureKind, message: String) {
-        let Some(mut pending) = self.state.lock().await.pending_compaction.take() else {
+        self.finish_compaction_failure_with_dispatch(kind, message, None)
+            .await;
+    }
+
+    async fn finish_compaction_failure_with_dispatch(
+        &self,
+        kind: BackendCompactionFailureKind,
+        message: String,
+        dispatch_override: Option<BackendCompactionDispatchState>,
+    ) {
+        let (pending, thread_id) = {
+            let mut state = self.state.lock().await;
+            (state.pending_compaction.take(), state.thread_id.clone())
+        };
+        let Some(mut pending) = pending else {
             return;
         };
         let mutation = if pending.item_started || pending.item_completed {
@@ -3703,21 +3831,21 @@ impl CodexInner {
         } else {
             BackendCompactionMutationState::NotObserved
         };
-        let dispatch = if pending.accepted {
+        let dispatch = dispatch_override.unwrap_or(if pending.accepted {
             BackendCompactionDispatchState::Accepted
         } else {
             BackendCompactionDispatchState::MayHaveReachedProvider
-        };
+        });
         let result = BackendCompactionResult {
             operation_id: pending.request.operation_id.clone(),
             dispatch,
             mutation,
             outcome: Err(BackendCompactionFailure { kind, message }),
-            provider_session_id: Some(SessionId(self.state.lock().await.thread_id.clone())),
+            provider_session_id: Some(SessionId(thread_id.clone())),
             metrics: CompactionMetrics::default(),
             post_context_tokens: PostCompactionTokenCount::Unknown,
             evidence: BackendCompactionTerminalEvidence::Codex {
-                thread_id: self.state.lock().await.thread_id.clone(),
+                thread_id,
                 turn_id: pending.turn_id,
                 item_id: pending.item_id,
                 deprecated_notification_seen: pending.deprecated_notification_seen,
@@ -13285,19 +13413,84 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
     overrides
 }
 
-type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
 
-fn codex_rpc_error_message(err_obj: &Value) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRpcError {
+    code: Option<i64>,
+    message: String,
+}
+
+impl CodexRpcError {
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    fn method_unavailable(&self, method: &str) -> bool {
+        if self.code == Some(-32601) {
+            return true;
+        }
+        if self.code != Some(-32600) {
+            return false;
+        }
+        [
+            format!("unknown variant `{method}`"),
+            format!("unknown variant '{method}'"),
+            format!("unknown variant \"{method}\""),
+        ]
+        .iter()
+        .any(|quoted| self.message.contains(quoted))
+    }
+
+    fn rejected_before_dispatch(&self, method: &str) -> bool {
+        self.method_unavailable(method)
+            || (self.code == Some(-32600)
+                && self.message.trim_start().starts_with("Invalid request:"))
+    }
+}
+
+impl std::fmt::Display for CodexRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(formatter, "Codex JSON-RPC error {code}: {}", self.message),
+            None => formatter.write_str(&self.message),
+        }
+    }
+}
+
+fn codex_rpc_error(err_obj: &Value) -> CodexRpcError {
     let message = err_obj
         .get("message")
         .and_then(Value::as_str)
-        .map(str::to_string);
-    match (err_obj.get("code").and_then(Value::as_i64), message) {
-        (Some(code), Some(message)) => format!("Codex JSON-RPC error {code}: {message}"),
-        (Some(code), None) => format!("Codex JSON-RPC error {code}: {err_obj}"),
-        (None, Some(message)) => message,
-        (None, None) => format!("Codex JSON-RPC error: {err_obj}"),
+        .map(str::to_owned)
+        .unwrap_or_else(|| err_obj.to_string());
+    CodexRpcError {
+        code: err_obj.get("code").and_then(Value::as_i64),
+        message,
     }
+}
+
+fn cache_codex_manual_trigger_absent(
+    stored: &std::sync::Mutex<BackendCompactionCapability>,
+    previous: &BackendCompactionCapability,
+    method: &str,
+    error: &CodexRpcError,
+) -> bool {
+    if !error.method_unavailable(method) {
+        return false;
+    }
+    *stored
+        .lock()
+        .expect("Codex compaction capability mutex poisoned") =
+        BackendCompactionCapability::context_unavailable_with_metadata(
+            BackendCompactionUnavailableReason::ManualTriggerAbsent,
+            previous.provider_version.clone(),
+            previous.evidence.clone(),
+        );
+    true
 }
 
 struct CodexRpc {
@@ -13427,7 +13620,7 @@ impl CodexRpc {
                             Ok(result.clone())
                         } else {
                             let err_obj = parsed.get("error").cloned().unwrap_or(Value::Null);
-                            Err(codex_rpc_error_message(&err_obj))
+                            Err(codex_rpc_error(&err_obj))
                         };
                         if let Some(tx) = stdout_pending.lock().await.remove(&id) {
                             let _ = tx.send(response);
@@ -13464,7 +13657,9 @@ impl CodexRpc {
 
             let mut pending = stdout_pending.lock().await;
             for (_, tx) in pending.drain() {
-                let _ = tx.send(Err("Codex app-server exited before response".to_string()));
+                let _ = tx.send(Err(CodexRpcError::transport(
+                    "Codex app-server exited before response",
+                )));
             }
             drop(pending);
 
@@ -13500,6 +13695,12 @@ impl CodexRpc {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_typed(method, params)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_typed(&self, method: &str, params: Value) -> Result<Value, CodexRpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -13513,16 +13714,18 @@ impl CodexRpc {
 
         if let Err(err) = self.send_json(&payload).await {
             let _ = self.pending.lock().await.remove(&id);
-            return Err(err);
+            return Err(CodexRpcError::transport(err));
         }
         observe_codex_request_sent(method);
 
         match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("Codex response channel closed".to_string()),
+            Ok(Err(_)) => Err(CodexRpcError::transport("Codex response channel closed")),
             Err(_) => {
                 let _ = self.pending.lock().await.remove(&id);
-                Err(format!("Codex request timed out for method '{method}'"))
+                Err(CodexRpcError::transport(format!(
+                    "Codex request timed out for method '{method}'"
+                )))
             }
         }
     }
@@ -13560,16 +13763,18 @@ impl CodexRpc {
             observe_codex_request_sent(method);
             let result = match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err("Codex response channel closed".to_string()),
+                Ok(Err(_)) => Err(CodexRpcError::transport("Codex response channel closed")),
                 Err(_) => {
                     pending.lock().await.remove(&id);
-                    Err(format!("Codex request timed out for method '{method}'"))
+                    Err(CodexRpcError::transport(format!(
+                        "Codex request timed out for method '{method}'"
+                    )))
                 }
             };
             if let Err(error) = result {
                 tracing::warn!(
                     codex_method = method,
-                    error,
+                    error = %error,
                     "Detached Codex request failed"
                 );
             }
@@ -13721,10 +13926,11 @@ use super::{
     BackendCompactionMutationState, BackendCompactionObservationSource, BackendCompactionProgress,
     BackendCompactionProtocolConfidence, BackendCompactionRequest, BackendCompactionResult,
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnknownReason, BackendContextReseatSupport, BackendEvent,
-    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendTranscriptEventMetadata,
-    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
+    BackendContextReseatSupport, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendTranscriptEventMetadata, EventStream, PostCompactionTokenCount,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 pub struct CodexBackend {
@@ -13813,6 +14019,7 @@ impl CodexBackend {
                     access_mode: config.resolved_spawn_config.access_mode,
                     subagent_emitter: initial_emitter,
                     execution_mode: config.execution_mode,
+                    installed_provider_version: config.provider_version.as_deref(),
                     selected_skills,
                     skill_selection: if inference_only {
                         SkillSelection::Explicit
@@ -14906,6 +15113,7 @@ impl Backend for CodexBackend {
                     access_mode: config.resolved_spawn_config.access_mode,
                     subagent_emitter: None,
                     execution_mode: BackendExecutionMode::Agent,
+                    installed_provider_version: config.provider_version.as_deref(),
                     selected_skills: &config.resolved_spawn_config.skills,
                     skill_selection: config.resolved_spawn_config.skill_selection,
                 },
@@ -15132,6 +15340,7 @@ impl Backend for CodexBackend {
                 CodexSelectedSkillContext {
                     skills: &config.resolved_spawn_config.skills,
                     selection: config.resolved_spawn_config.skill_selection,
+                    installed_provider_version: config.provider_version.as_deref(),
                 },
             )
             .await
@@ -15447,7 +15656,7 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BackendCompactionAvailability;
+    use crate::backend::{BackendCompactionAvailability, BackendCompactionNotDispatchedReason};
     use crate::sub_agent::SubAgentHandle;
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentControlProgressKind, AgentErrorCode,
@@ -16664,6 +16873,7 @@ for line in sys.stdin:
             access_mode: BackendAccessMode::Unrestricted,
             subagent_emitter: None,
             execution_mode: BackendExecutionMode::Agent,
+            installed_provider_version: None,
             selected_skills,
             skill_selection,
         }
@@ -18522,6 +18732,7 @@ for line in sys.stdin:
             CodexSelectedSkillContext {
                 skills: &selected,
                 selection: SkillSelection::Explicit,
+                installed_provider_version: None,
             },
         )
         .await
@@ -31136,8 +31347,10 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn compaction_capability_requires_exact_fixture_version() {
-        let verified = codex_compaction_capability(Some("codex-cli 0.144.3"));
+    fn beta_46_user_agent_is_compatible_across_environment_fields() {
+        let verified = codex_compaction_capability(Some(
+            "tyde/0.144.3 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
+        ));
         assert!(matches!(
             verified.availability,
             BackendCompactionAvailability::Native {
@@ -31149,13 +31362,241 @@ Do not describe the tool, and do not skip the tool call."#;
             Some(BackendCompactionProtocolConfidence::Verified)
         );
 
-        let unreviewed = codex_compaction_capability(Some("codex-cli 0.145.0"));
+        for terminal in ["unknown", "dumb", "xterm-256color"] {
+            let user_agent =
+                format!("tyde/0.146.0 (Other OS 99.88.77; x86_64) {terminal} (tyde; 0.1)");
+            let compatible = codex_compaction_capability(Some(&user_agent));
+            assert!(matches!(
+                &compatible.availability,
+                BackendCompactionAvailability::Native {
+                    mechanism: BackendCompactionMechanism::JsonRpcRequest
+                }
+            ));
+            assert_eq!(
+                compatible.confidence,
+                Some(BackendCompactionProtocolConfidence::Compatible)
+            );
+            assert_eq!(compatible.provider_version.as_deref(), Some("0.146.0"));
+            assert!(
+                crate::backend::compaction::not_dispatched_for_capability(&compatible).is_none(),
+                "beta 46's 0.146.0 CapabilityUnknown regression must stay fixed"
+            );
+            assert_eq!(
+                compatible.evidence,
+                BackendCompactionCapabilityEvidence::CodexInitializeUserAgent { user_agent }
+            );
+        }
+
+        let reordered = codex_compaction_capability(Some(
+            "Mac OS 15.6.0 tyde/0.147.0 xterm-256color (tyde; 0.1)",
+        ));
+        assert_eq!(reordered.provider_version.as_deref(), Some("0.147.0"));
+        assert!(!matches!(
+            reordered.provider_version.as_deref(),
+            Some("15.6.0")
+        ));
+    }
+
+    #[test]
+    fn future_stable_version_routes_to_fallback_but_unknown_shapes_fail_closed() {
+        let user_agent = "tyde/0.147.0 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)";
+        let unreviewed = codex_compaction_capability(Some(user_agent));
         assert!(matches!(
-            unreviewed.availability,
+            &unreviewed.availability,
+            BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                    tested
+                }
+            } if tested == CODEX_TESTED_COMPACTION_VERSIONS
+        ));
+        assert_eq!(unreviewed.provider_version.as_deref(), Some("0.147.0"));
+        assert!(matches!(
+            crate::backend::compaction::not_dispatched_for_capability(&unreviewed),
+            Some(BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::VersionNotAllowlisted { .. }
+                ),
+                fallback_safe: true,
+            })
+        ));
+        assert_eq!(
+            unreviewed.evidence,
+            BackendCompactionCapabilityEvidence::CodexInitializeUserAgent {
+                user_agent: user_agent.to_owned()
+            }
+        );
+
+        let prerelease = codex_compaction_capability(Some(
+            "tyde/0.146.0-beta.1 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
+        ));
+        assert!(matches!(
+            prerelease.availability,
             BackendCompactionAvailability::Unknown {
                 reason: BackendCompactionUnknownReason::ProtocolNotAllowlisted
             }
         ));
+        assert!(matches!(
+            codex_compaction_capability(Some("Mac OS 15.6.0 without-a-tyde-product-token"))
+                .availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnparseable
+            }
+        ));
+        assert!(matches!(
+            codex_compaction_capability(None).availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnavailable
+            }
+        ));
+    }
+
+    #[test]
+    fn installed_version_preserves_legacy_user_agent_support_without_guessing() {
+        let legacy_user_agent = "codex-app-server (Mac OS 15.6.0; arm64)";
+        let installed_line = "codex-cli 0.144.3";
+        let verified = codex_compaction_capability_with_installed_version(
+            Some(legacy_user_agent),
+            Some(installed_line),
+        );
+        assert!(matches!(
+            verified.availability,
+            BackendCompactionAvailability::Native {
+                mechanism: BackendCompactionMechanism::JsonRpcRequest
+            }
+        ));
+        assert_eq!(
+            verified.confidence,
+            Some(BackendCompactionProtocolConfidence::Verified)
+        );
+        assert_eq!(verified.provider_version.as_deref(), Some("0.144.3"));
+        assert_eq!(
+            verified.evidence,
+            BackendCompactionCapabilityEvidence::CodexInstalledVersionFallback {
+                user_agent: Some(legacy_user_agent.to_owned()),
+                installed_version: installed_line.to_owned(),
+            }
+        );
+
+        let anchored = codex_compaction_capability_with_installed_version(
+            Some("tyde/0.146.0 (Mac OS 15.6.0; arm64)"),
+            Some(installed_line),
+        );
+        assert_eq!(anchored.provider_version.as_deref(), Some("0.146.0"));
+        assert_eq!(
+            anchored.confidence,
+            Some(BackendCompactionProtocolConfidence::Compatible)
+        );
+
+        for malformed in ["codex-cli development", "codex-cli 0.144.3 mirror 0.146.0"] {
+            let capability = codex_compaction_capability_with_installed_version(
+                Some(legacy_user_agent),
+                Some(malformed),
+            );
+            assert!(matches!(
+                capability.availability,
+                BackendCompactionAvailability::Unknown {
+                    reason: BackendCompactionUnknownReason::VersionUnparseable
+                }
+            ));
+        }
+
+        let ambiguous_user_agent = codex_compaction_capability_with_installed_version(
+            Some("tyde/0.144.3 tyde/0.146.0"),
+            Some(installed_line),
+        );
+        assert!(matches!(
+            ambiguous_user_agent.availability,
+            BackendCompactionAvailability::Unknown {
+                reason: BackendCompactionUnknownReason::VersionUnparseable
+            }
+        ));
+    }
+
+    #[test]
+    fn real_codex_method_absence_signal_caches_safe_future_fallback() {
+        let previous = codex_compaction_capability(Some(
+            "tyde/0.146.0 (Mac OS 15.6.0; arm64) dumb (tyde; 0.1)",
+        ));
+        let stored = std::sync::Mutex::new(previous.clone());
+        let routed_missing = codex_rpc_error(&json!({
+            "code": -32600,
+            "message": concat!(
+                "Invalid request: unknown variant `thread/compact/start`, ",
+                "expected one of `initialize`, `thread/start`",
+            )
+        }));
+        assert!(cache_codex_manual_trigger_absent(
+            &stored,
+            &previous,
+            "thread/compact/start",
+            &routed_missing,
+        ));
+        assert!(routed_missing.rejected_before_dispatch("thread/compact/start"));
+        let cached = stored.lock().expect("cached capability").clone();
+        assert!(matches!(
+            &cached.availability,
+            BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
+            }
+        ));
+        assert_eq!(cached.provider_version, previous.provider_version);
+        assert_eq!(cached.evidence, previous.evidence);
+        assert!(matches!(
+            crate::backend::compaction::not_dispatched_for_capability(&cached),
+            Some(BackendCompactionStart::NotDispatched {
+                fallback_safe: true,
+                ..
+            })
+        ));
+
+        let thread_missing = codex_rpc_error(&json!({
+            "code": -32600,
+            "message": "thread not found: 00000000-0000-0000-0000-000000000000"
+        }));
+        assert!(!thread_missing.method_unavailable("thread/compact/start"));
+        assert!(!thread_missing.rejected_before_dispatch("thread/compact/start"));
+        assert!(
+            codex_rpc_error(&json!({"code": -32601, "message": "Method not found"}))
+                .method_unavailable("thread/compact/start")
+        );
+    }
+
+    #[tokio::test]
+    async fn deserializer_rejection_is_not_reported_as_provider_acceptance() {
+        let (inner, _events) = test_codex_inner();
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        inner.state.lock().await.pending_compaction = Some(PendingCodexCompaction {
+            request: BackendCompactionRequest {
+                operation_id: protocol::CompactionOperationId("deserializer-rejection".to_owned()),
+                trigger: CompactionTrigger::UserRequested,
+                focus: None,
+                transcript_authoritative: true,
+                continuation: crate::backend::BackendContinuationContext {
+                    required: Vec::new(),
+                    advisory: Vec::new(),
+                },
+            },
+            terminal_tx: Some(terminal_tx),
+            accepted: false,
+            turn_id: None,
+            item_id: None,
+            item_started: false,
+            item_completed: false,
+            turn_status: None,
+            deprecated_notification_seen: false,
+        });
+
+        inner
+            .finish_compaction_failure_with_dispatch(
+                BackendCompactionFailureKind::ProviderRejected,
+                "Codex JSON-RPC error -32600: Invalid request".to_owned(),
+                Some(BackendCompactionDispatchState::Rejected),
+            )
+            .await;
+        let result = terminal_rx.await.expect("compaction terminal result");
+        assert_eq!(result.dispatch, BackendCompactionDispatchState::Rejected);
+        assert_eq!(result.mutation, BackendCompactionMutationState::NotObserved);
+        inner.rpc.shutdown().await;
     }
 
     #[tokio::test]

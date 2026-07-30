@@ -32,14 +32,26 @@ impl BackendCompactionCapability {
     }
 
     pub(crate) fn context_unavailable(reason: BackendCompactionUnavailableReason) -> Self {
+        Self::context_unavailable_with_metadata(
+            reason,
+            None,
+            BackendCompactionCapabilityEvidence::AdapterContract,
+        )
+    }
+
+    pub(crate) fn context_unavailable_with_metadata(
+        reason: BackendCompactionUnavailableReason,
+        provider_version: Option<String>,
+        evidence: BackendCompactionCapabilityEvidence,
+    ) -> Self {
         Self {
             coordinator: BackendCompactionCoordinator::ContextOperation,
             availability: BackendCompactionAvailability::Unavailable { reason },
-            provider_version: None,
+            provider_version,
             protocol_version: None,
             confidence: None,
             reseat: BackendContextReseatSupport::Unsupported,
-            evidence: BackendCompactionCapabilityEvidence::AdapterContract,
+            evidence,
         }
     }
 
@@ -147,9 +159,19 @@ pub enum BackendCompactionUnknownReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionCapabilityEvidence {
-    ClaudeInitializeCommand { name: String },
-    CodexInitializeUserAgent { user_agent: String },
-    HermesLocalGatewayProbe { version: String },
+    ClaudeInitializeCommand {
+        name: String,
+    },
+    CodexInitializeUserAgent {
+        user_agent: String,
+    },
+    CodexInstalledVersionFallback {
+        user_agent: Option<String>,
+        installed_version: String,
+    },
+    HermesLocalGatewayProbe {
+        version: String,
+    },
     AdapterContract,
     None,
 }
@@ -382,6 +404,7 @@ pub enum BackendCompactionNotDispatchedReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionDispatchState {
+    Rejected,
     Accepted,
     MayHaveReachedProvider,
 }
@@ -560,34 +583,91 @@ pub(crate) fn stable_observation_id(
 mod tests {
     use super::*;
 
+    const UNKNOWN_REASON_COUNT: usize = 5;
+    const UNAVAILABLE_REASON_COUNT: usize = 6;
+
     #[test]
-    fn unknown_capability_never_sets_fallback_safe() {
-        let capability = BackendCompactionCapability::unknown(
+    fn every_unknown_reason_stays_fail_closed() {
+        fn reason_name(reason: &BackendCompactionUnknownReason) -> &'static str {
+            match reason {
+                BackendCompactionUnknownReason::ProcessNotInitialized => "process_not_initialized",
+                BackendCompactionUnknownReason::VersionUnavailable => "version_unavailable",
+                BackendCompactionUnknownReason::VersionUnparseable => "version_unparseable",
+                BackendCompactionUnknownReason::CapabilityProbeFailed(_) => {
+                    "capability_probe_failed"
+                }
+                BackendCompactionUnknownReason::ProtocolNotAllowlisted => {
+                    "protocol_not_allowlisted"
+                }
+            }
+        }
+        let reasons: [BackendCompactionUnknownReason; UNKNOWN_REASON_COUNT] = [
             BackendCompactionUnknownReason::ProcessNotInitialized,
-            None,
-            BackendCompactionCapabilityEvidence::None,
-        );
-        assert!(matches!(
-            not_dispatched_for_capability(&capability),
-            Some(BackendCompactionStart::NotDispatched {
-                fallback_safe: false,
-                ..
-            })
-        ));
+            BackendCompactionUnknownReason::VersionUnavailable,
+            BackendCompactionUnknownReason::VersionUnparseable,
+            BackendCompactionUnknownReason::CapabilityProbeFailed("probe".to_owned()),
+            BackendCompactionUnknownReason::ProtocolNotAllowlisted,
+        ];
+        for reason in reasons {
+            assert!(!reason_name(&reason).is_empty());
+            let capability = BackendCompactionCapability::unknown(
+                reason,
+                None,
+                BackendCompactionCapabilityEvidence::None,
+            );
+            assert!(matches!(
+                not_dispatched_for_capability(&capability),
+                Some(BackendCompactionStart::NotDispatched {
+                    fallback_safe: false,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
-    fn affirmative_unavailable_capability_sets_fallback_safe_before_dispatch() {
-        let capability = BackendCompactionCapability::context_unavailable(
+    fn every_affirmative_unavailable_reason_is_safe_before_dispatch() {
+        fn reason_name(reason: &BackendCompactionUnavailableReason) -> &'static str {
+            match reason {
+                BackendCompactionUnavailableReason::ManualTriggerAbsent => "manual_trigger_absent",
+                BackendCompactionUnavailableReason::AdapterHasNoManualTransport => {
+                    "adapter_has_no_manual_transport"
+                }
+                BackendCompactionUnavailableReason::VersionTooOld { .. } => "version_too_old",
+                BackendCompactionUnavailableReason::VersionNotAllowlisted { .. } => {
+                    "version_not_allowlisted"
+                }
+                BackendCompactionUnavailableReason::TranscriptNotAuthoritative => {
+                    "transcript_not_authoritative"
+                }
+                BackendCompactionUnavailableReason::ProviderDisabledCommand => {
+                    "provider_disabled_command"
+                }
+            }
+        }
+        let reasons: [BackendCompactionUnavailableReason; UNAVAILABLE_REASON_COUNT] = [
+            BackendCompactionUnavailableReason::ManualTriggerAbsent,
             BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-        );
-        assert!(matches!(
-            not_dispatched_for_capability(&capability),
-            Some(BackendCompactionStart::NotDispatched {
-                fallback_safe: true,
-                ..
-            })
-        ));
+            BackendCompactionUnavailableReason::VersionTooOld {
+                required: "1.0.0".to_owned(),
+            },
+            BackendCompactionUnavailableReason::VersionNotAllowlisted {
+                tested: "1.0.0".to_owned(),
+            },
+            BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+            BackendCompactionUnavailableReason::ProviderDisabledCommand,
+        ];
+        for reason in reasons {
+            assert!(!reason_name(&reason).is_empty());
+            let capability = BackendCompactionCapability::context_unavailable(reason);
+            assert!(matches!(
+                not_dispatched_for_capability(&capability),
+                Some(BackendCompactionStart::NotDispatched {
+                    fallback_safe: true,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

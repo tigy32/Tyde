@@ -2174,8 +2174,8 @@ pub fn compaction_control_state(
     // Fail closed. Only an explicit `Available` enables the control: a missing
     // snapshot means the server has not spoken yet, and dispatching on unknown
     // capability is how a client sends a request the backend cannot serve and
-    // then has to explain the refusal after the fact. Unknown reads as "still
-    // determining", which is both true and self-resolving.
+    // then has to explain the refusal after the fact. A missing snapshot can
+    // resolve after initialization; an unknown protocol remains fail-closed.
     let availability = state.compaction_capability.with(|map| {
         map.get(&agent.agent_id)
             .map(|snapshot| snapshot.availability.clone())

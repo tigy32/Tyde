@@ -29,8 +29,8 @@ use protocol::{
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CompactionAvailabilityReason, CompactionMethod,
-    CompactionMutation, ContextCompactionNotifyPayload, ContextCompactionStatus, CustomAgent,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    CompactionMutation, CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionStatus,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
     HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
@@ -513,6 +513,36 @@ pub(crate) fn requested_compaction_availability(
         Availability::Unknown { .. } => RequestedCompactionAvailability::Determining {
             reason: CompactionAvailabilityReason::CapabilityStillDetermining,
         },
+    }
+}
+
+pub(crate) fn requested_context_compaction_route(
+    capability: &crate::backend::BackendCompactionCapability,
+    trigger: CompactionTrigger,
+    transcript_authoritative: bool,
+) -> Result<RequestedCompactionRoute, String> {
+    use crate::backend::{
+        BackendCompactionAvailability as Availability, BackendCompactionCoordinator,
+    };
+
+    if capability.coordinator != BackendCompactionCoordinator::ContextOperation {
+        return Err("backend is still assigned to legacy compaction".to_owned());
+    }
+    if trigger == CompactionTrigger::SupervisorRequested
+        && matches!(&capability.availability, Availability::AutomaticOnly { .. })
+    {
+        return Err("supervisor fallback is disabled for an automatic-only backend".to_owned());
+    }
+    let availability = requested_compaction_availability(
+        capability,
+        &CompactionRoutingPolicy::default(),
+        transcript_authoritative,
+    );
+    match availability {
+        RequestedCompactionAvailability::Available { route } => Ok(route),
+        unavailable => Err(format!(
+            "requested compaction route is unavailable: {unavailable:?}"
+        )),
     }
 }
 
@@ -3610,12 +3640,16 @@ impl HostHandle {
                 capability.coordinator
                     == crate::backend::BackendCompactionCoordinator::ContextOperation
             }) {
+                agent_handle
+                    .requested_compaction_route(CompactionTrigger::UserRequested)
+                    .await
+                    .map_err(|message| AppError::conflict("agent_compact", message))?;
                 let stall_timeout = enabled_supervisor_stall_timeout(
                     self.supervisor_settings_signal().await.settings,
                 );
                 agent_handle
                     .request_context_compaction(
-                        protocol::CompactionTrigger::UserRequested,
+                        CompactionTrigger::UserRequested,
                         payload.summary_prompt,
                         compaction_barrier_timeout(stall_timeout),
                     )
@@ -3656,6 +3690,13 @@ impl HostHandle {
                 capability.coordinator
                     == crate::backend::BackendCompactionCoordinator::ContextOperation
             }) {
+                if agent_handle
+                    .requested_compaction_route(CompactionTrigger::SupervisorRequested)
+                    .await
+                    .is_err()
+                {
+                    return Ok(false);
+                }
                 if !agent_handle.attach(stream).await {
                     return Ok(false);
                 }
@@ -3702,6 +3743,8 @@ impl HostHandle {
         let targets = self.team_compact_targets(&payload.team_id).await?;
         let mut context_handles = Vec::with_capacity(targets.len());
         let mut legacy_count = 0;
+        // Desktop and mobile both submit TeamCompact on the host stream, so
+        // route authority belongs here rather than in either client.
         for target in &targets {
             let handle = self.agent_handle(&target.agent_id).await.ok_or_else(|| {
                 AppError::conflict(
@@ -3714,6 +3757,15 @@ impl HostHandle {
                     if capability.coordinator
                         == crate::backend::BackendCompactionCoordinator::ContextOperation =>
                 {
+                    handle
+                        .requested_compaction_route(CompactionTrigger::TeamRequested)
+                        .await
+                        .map_err(|message| {
+                            AppError::conflict(
+                                "team_compact",
+                                format!("team agent {} cannot compact: {message}", target.agent_id),
+                            )
+                        })?;
                     context_handles.push((target.clone(), handle));
                 }
                 _ => legacy_count += 1,
@@ -30152,6 +30204,64 @@ Rules: Record only what remains true and useful for future work; drop transient 
             RequestedCompactionAvailability::Available {
                 route: RequestedCompactionRoute::InlineFallbackOnly,
             }
+        );
+        for trigger in [
+            CompactionTrigger::UserRequested,
+            CompactionTrigger::TeamRequested,
+            CompactionTrigger::SupervisorRequested,
+        ] {
+            assert_eq!(
+                requested_context_compaction_route(&unavailable, trigger, true),
+                Ok(RequestedCompactionRoute::InlineFallbackOnly)
+            );
+        }
+        assert!(
+            requested_context_compaction_route(
+                &unavailable,
+                CompactionTrigger::UserRequested,
+                false,
+            )
+            .is_err()
+        );
+
+        let unknown = crate::backend::BackendCompactionCapability::unknown(
+            crate::backend::BackendCompactionUnknownReason::VersionUnparseable,
+            Some("development".to_owned()),
+            crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
+        );
+        for trigger in [
+            CompactionTrigger::UserRequested,
+            CompactionTrigger::TeamRequested,
+            CompactionTrigger::SupervisorRequested,
+        ] {
+            assert!(
+                requested_context_compaction_route(&unknown, trigger, true).is_err(),
+                "{trigger:?} must fail closed on a genuinely unknown protocol"
+            );
+        }
+
+        let automatic = crate::backend::BackendCompactionCapability {
+            coordinator: crate::backend::BackendCompactionCoordinator::ContextOperation,
+            availability: crate::backend::BackendCompactionAvailability::AutomaticOnly {
+                reason: crate::backend::BackendCompactionUnavailableReason::ManualTriggerAbsent,
+            },
+            provider_version: None,
+            protocol_version: None,
+            confidence: None,
+            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
+            evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
+        };
+        assert_eq!(
+            requested_context_compaction_route(&automatic, CompactionTrigger::UserRequested, true,),
+            Ok(RequestedCompactionRoute::InlineFallbackOnly)
+        );
+        assert!(
+            requested_context_compaction_route(
+                &automatic,
+                CompactionTrigger::SupervisorRequested,
+                true,
+            )
+            .is_err()
         );
     }
 
