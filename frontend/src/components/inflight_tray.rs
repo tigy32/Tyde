@@ -1096,11 +1096,13 @@ fn truncate_inline(text: &str, max_chars: usize) -> String {
 mod wasm_tests {
     use super::*;
     use crate::components::tool_card::test_utils::{count, make_container, next_tick, text};
+    use crate::dispatch::{ChatEventSource, apply_chat_event, apply_chat_event_from};
     use crate::state::{AgentInfo, ToolCallId};
     use leptos::mount::mount_to;
     use protocol::{
         AgentActivityStatsPayload, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
-        Envelope, QueuedMessageEntry, StreamPath, ToolProgressData,
+        ChatEvent, Envelope, OperationCancelledData, QueuedMessageEntry, StreamPath,
+        ToolProgressData,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1452,6 +1454,216 @@ mod wasm_tests {
                 output_unavailable: None,
             }),
         }
+    }
+
+    fn command_request() -> ChatEvent {
+        ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: "toolu_bg_bash".to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_type: ToolRequestType::RunCommand {
+                command: "./dev.sh check --locked".to_owned(),
+                working_directory: "/tmp/work".to_owned(),
+            },
+        })
+    }
+
+    fn command_completion(result: ToolExecutionResult) -> ChatEvent {
+        let success = matches!(
+            &result,
+            ToolExecutionResult::RunCommand { exit_code: 0, .. }
+        );
+        ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+            tool_call_id: "toolu_bg_bash".to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_result: result,
+            success,
+            error: None,
+            normalization_failure: None,
+        })
+    }
+
+    fn seed_command_stream(state: &AppState) {
+        state.streaming_text.update(|map| {
+            map.insert(parent_ref().agent_id, streaming_state("running command"));
+        });
+    }
+
+    fn apply_live(state: &AppState, event: ChatEvent) {
+        apply_chat_event(state, "host-1", &parent_ref().agent_id, event);
+    }
+
+    fn apply_replay(state: &AppState, event: ChatEvent) {
+        apply_chat_event_from(
+            state,
+            "host-1",
+            &parent_ref().agent_id,
+            event,
+            ChatEventSource::Bootstrap,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn foreground_command_never_creates_tray_held_or_after_replay() {
+        let (container, state) = mount_tray(seed_command_stream);
+        apply_live(&state, command_request());
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "a held foreground ToolRequest has no normalized background row"
+        );
+
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            }),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "foreground completion must remain tray-free"
+        );
+
+        let (replayed_container, _replayed_state) = mount_tray(|state| {
+            seed_command_stream(state);
+            apply_replay(state, command_request());
+            apply_replay(
+                state,
+                command_completion(ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: "done".to_owned(),
+                    stderr: String::new(),
+                }),
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            count(&replayed_container, ".inflight-tray"),
+            0,
+            "terminal foreground replay must not synthesize a tray row"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn genuine_background_command_renders_once_then_stays_gone_after_replay() {
+        let (container, state) = mount_tray(seed_command_stream);
+        apply_live(&state, command_request());
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress(
+                BackgroundTaskStatus::Running,
+                None,
+            )),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray-row"),
+            1,
+            "one Running update renders exactly one command row"
+        );
+        let body = text(&container);
+        assert_eq!(
+            body.matches("./dev.sh check --locked").count(),
+            1,
+            "the genuine background command renders once: {body}"
+        );
+
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress(
+                BackgroundTaskStatus::Completed,
+                Some("Background command completed (exit code 0)"),
+            )),
+        );
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            }),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "terminal progress removes the genuine background row"
+        );
+
+        let (replayed_container, _replayed_state) = mount_tray(|state| {
+            seed_command_stream(state);
+            apply_replay(state, command_request());
+            apply_replay(
+                state,
+                ChatEvent::ToolProgress(background_command_progress(
+                    BackgroundTaskStatus::Running,
+                    None,
+                )),
+            );
+            apply_replay(
+                state,
+                ChatEvent::ToolProgress(background_command_progress(
+                    BackgroundTaskStatus::Completed,
+                    Some("Background command completed (exit code 0)"),
+                )),
+            );
+            apply_replay(
+                state,
+                command_completion(ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: "done".to_owned(),
+                    stderr: String::new(),
+                }),
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            count(&replayed_container, ".inflight-tray"),
+            0,
+            "terminal transcript replay must not resurrect the command row"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn cancelled_command_without_late_running_update_stays_tray_free() {
+        let (container, state) = mount_tray(seed_command_stream);
+        apply_live(&state, command_request());
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "a command is not background work before a Running update"
+        );
+
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::Cancelled {
+                message: "Interrupted".to_owned(),
+            }),
+        );
+        apply_live(
+            &state,
+            ChatEvent::OperationCancelled(OperationCancelledData {
+                message: "Interrupted".to_owned(),
+            }),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "terminal cancellation with no late Running update stays tray-free"
+        );
+        assert!(
+            state.tool_progress.with_untracked(|map| map.is_empty()),
+            "the normalized cancellation sequence contains no hidden background state"
+        );
     }
 
     /// A backgrounded shell command is in-flight work: it must count as
