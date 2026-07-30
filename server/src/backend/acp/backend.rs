@@ -18,6 +18,7 @@ use crate::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpRequestCtx,
     AcpSessionKind, adapter_for_spec,
 };
+use crate::acp::tools::read_paths;
 use crate::acp::{
     AcpBridge, AcpInbound, acp_mcp_servers_json, extract_message_id, extract_text_from_update,
     extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
@@ -218,10 +219,7 @@ async fn authenticate_if_required(
         match adapter.auth_method_handling(method) {
             AcpAuthMethodHandling::ProtocolAuthenticate => {
                 match bridge
-                    .request(
-                        "authenticate",
-                        json!({ "methodId": method.id.as_str() }),
-                    )
+                    .request("authenticate", json!({ "methodId": method.id.as_str() }))
                     .await
                 {
                     Ok(_) => {
@@ -1364,9 +1362,31 @@ impl KiroInner {
     /// payload is agent-defined, which is why the adapter decides.
     async fn map_tool_request(&self, params: &Value, args: &Value, workspace_root: &str) -> Value {
         let kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
-        self.adapter
+        let mapped = self
+            .adapter
             .map_tool_request(kind, args, workspace_root)
-            .await
+            .await;
+        if kind == "read" && mapped.get("kind").and_then(Value::as_str) == Some("Other") {
+            let tool_call_id = params
+                .get("toolCallId")
+                .or_else(|| params.get("tool_call_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("<missing>");
+            let mut raw_input_keys = args
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            raw_input_keys.sort();
+            tracing::warn!(
+                message = "ACP read normalization degraded to Other",
+                agent = self.adapter.display_name(),
+                tool_call_id = tool_call_id,
+                raw_input_keys = ?raw_input_keys,
+            );
+        }
+        mapped
     }
 
     /// Handle an update an adapter rewrote into standard terms.
@@ -2831,13 +2851,12 @@ pub(crate) async fn map_tool_request_type(
             })
         }
         "read" => {
-            let mut file_paths = Vec::new();
-            if let Some(ops) = args.get("ops").and_then(Value::as_array) {
-                for op in ops {
-                    if let Some(path) = op.get("path").and_then(Value::as_str) {
-                        file_paths.push(path.to_string());
-                    }
-                }
+            let file_paths = read_paths(args);
+            if file_paths.is_empty() {
+                return json!({
+                    "kind": "Other",
+                    "args": args,
+                });
             }
             json!({
                 "kind": "ReadFiles",
@@ -2945,18 +2964,49 @@ pub(crate) fn map_tool_completion_result(
             })
         }
         "read" => {
-            let file_paths = request_payload
+            let other = || {
+                json!({
+                    "kind": "Other",
+                    "result": completion.tool_result,
+                })
+            };
+            let Some(file_paths) = request_payload
+                .filter(|payload| payload.get("kind").and_then(Value::as_str) == Some("ReadFiles"))
                 .and_then(|payload| payload.get("file_paths"))
-                .and_then(Value::as_array);
-            let text_len = extract_first_item_text(&completion.tool_result)
-                .map(|t| t.len() as u64)
-                .unwrap_or(0);
-            let files: Vec<Value> = file_paths
+                .and_then(Value::as_array)
+                .filter(|paths| !paths.is_empty())
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            path.as_str()
+                                .filter(|path| !path.trim().is_empty())
+                                .map(str::to_string)
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+            else {
+                return other();
+            };
+            let Some(texts) = completion
+                .tool_result
+                .get("items")
+                .and_then(Value::as_array)
+                .filter(|items| items.len() == file_paths.len())
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.get("Text").and_then(Value::as_str))
+                        .collect::<Option<Vec<_>>>()
+                })
+            else {
+                return other();
+            };
+            let files = file_paths
                 .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(|path| json!({ "path": path, "bytes": text_len }))
-                .collect();
+                .zip(texts)
+                .map(|(path, text)| json!({ "path": path, "bytes": text.len() as u64 }))
+                .collect::<Vec<_>>();
             json!({
                 "kind": "ReadFiles",
                 "files": files,
@@ -2976,16 +3026,6 @@ fn extract_first_item_json(value: &Value) -> Option<&Value> {
         .and_then(Value::as_array)
         .and_then(|items| items.first())
         .and_then(|item| item.get("Json"))
-}
-
-/// Extracts the first `{"Text": "..."}` item from `{"items": [{"Text": "..."}]}`.
-fn extract_first_item_text(value: &Value) -> Option<&str> {
-    value
-        .get("items")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("Text"))
-        .and_then(Value::as_str)
 }
 
 fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
@@ -4492,8 +4532,61 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+    use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber;
+    use tracing::span::{Attributes, Record};
+    use tracing::{Event, Id, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct WarningRecorder {
+        events: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    struct WarningFieldVisitor<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl Visit for WarningFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl Subscriber for WarningRecorder {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut WarningFieldVisitor {
+                fields: &mut fields,
+            });
+            self.events.lock().expect("record warning").push(fields);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
 
     #[test]
     fn kiro_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
@@ -4583,13 +4676,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_tool_request_maps_to_read_files() {
-        let params = json!({"kind":"read","locations":[{"path":"hello.py"}],"rawInput":{"ops":[{"path":"hello.py"}]},"sessionUpdate":"tool_call","title":"Reading hello.py:1","toolCallId":"tooluse_LPjch7ginxZKkwYbJ42qHB"});
+    async fn latest_kiro_read_request_maps_operations_without_title_or_locations() {
+        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
+        let params = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "T1",
+            "kind": "read",
+            "locations": [{ "path": "/wrong/location-must-not-win.txt" }],
+            "title": "Reading wrong-title-path.txt",
+            "rawInput": {
+                "__tool_use_purpose": "Reading the specified file using the native file read tool",
+                "operations": [{
+                    "mode": "Line",
+                    "path": path
+                }]
+            }
+        });
         let args = params.get("rawInput").cloned().unwrap();
         let result = map_tool_request_type(&params, &args, "/workspace").await;
 
         assert_eq!(result["kind"], "ReadFiles");
-        assert_eq!(result["file_paths"], json!(["hello.py"]));
+        assert_eq!(result["file_paths"], json!([path]));
+    }
+
+    #[tokio::test]
+    async fn stock_adapter_uses_shared_latest_operations_decoder() {
+        let adapter = adapter_for_spec(&protocol::AcpAgentSpec {
+            command: "stock-agent".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            adapter: protocol::AcpAdapterId::Stock,
+        });
+        let args = json!({
+            "operations": [
+                { "path": "/workspace/first.txt" },
+                { "path": "/workspace/second.txt" }
+            ]
+        });
+
+        let result = adapter.map_tool_request("read", &args, "/workspace").await;
+
+        assert_eq!(
+            result,
+            json!({
+                "kind": "ReadFiles",
+                "file_paths": [
+                    "/workspace/first.txt",
+                    "/workspace/second.txt"
+                ]
+            })
+        );
     }
 
     #[test]
@@ -4827,6 +4964,137 @@ mod tests {
             let _ = std::fs::remove_dir_all(parent);
         }
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    async fn spawn_read_warning_test_session(
+        adapter: protocol::AcpAdapterId,
+    ) -> (KiroSession, PathBuf, PathBuf) {
+        let (program, _log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"warning-test-session"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, adapter);
+        let (session, _events) = KiroSession::spawn_for_agent(
+            &[workspace.to_string_lossy().to_string()],
+            Some(&agent),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("spawn read warning test session");
+        (session, program, workspace)
+    }
+
+    #[tokio::test]
+    async fn read_degradation_warns_once_for_kiro_and_stock_without_raw_values() {
+        let recorder = WarningRecorder::default();
+        let (kiro, kiro_program, kiro_workspace) =
+            spawn_read_warning_test_session(protocol::AcpAdapterId::Kiro).await;
+        let stale = json!({ "ops": [{ "path": "secret-value-must-not-be-logged.txt" }] });
+        let degraded = kiro
+            .inner
+            .map_tool_request(
+                &json!({ "kind": "read", "toolCallId": "kiro-read-1" }),
+                &stale,
+                "/workspace",
+            )
+            .with_subscriber(recorder.clone())
+            .await;
+        assert_eq!(
+            degraded,
+            json!({
+                "kind": "Other",
+                "args": stale,
+            })
+        );
+
+        let latest = json!({ "operations": [{ "path": "latest.txt" }] });
+        let latest_mapped = kiro
+            .inner
+            .map_tool_request(
+                &json!({ "kind": "read", "toolCallId": "kiro-read-2" }),
+                &latest,
+                "/workspace",
+            )
+            .with_subscriber(recorder.clone())
+            .await;
+        assert_eq!(latest_mapped["kind"], "ReadFiles");
+        let singular_mapped = kiro
+            .inner
+            .map_tool_request(
+                &json!({ "kind": "read", "toolCallId": "kiro-read-3" }),
+                &json!({ "filePath": "singular.txt" }),
+                "/workspace",
+            )
+            .with_subscriber(recorder.clone())
+            .await;
+        assert_eq!(singular_mapped["kind"], "ReadFiles");
+        kiro.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&kiro_program, &kiro_workspace);
+
+        let (stock, stock_program, stock_workspace) =
+            spawn_read_warning_test_session(protocol::AcpAdapterId::Stock).await;
+        let stock_stale = json!({ "ops": [{ "path": "also-secret.txt" }] });
+        let stock_degraded = stock
+            .inner
+            .map_tool_request(
+                &json!({ "kind": "read", "tool_call_id": "stock-read-1" }),
+                &stock_stale,
+                "/workspace",
+            )
+            .with_subscriber(recorder.clone())
+            .await;
+        assert_eq!(
+            stock_degraded,
+            json!({
+                "kind": "Other",
+                "args": stock_stale,
+            })
+        );
+        stock.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&stock_program, &stock_workspace);
+
+        let warnings = recorder.events.lock().expect("read warnings").clone();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(
+            warnings[0].get("message").map(String::as_str),
+            Some("ACP read normalization degraded to Other")
+        );
+        assert_eq!(warnings[0].get("agent").map(String::as_str), Some("Kiro"));
+        assert_eq!(
+            warnings[0].get("tool_call_id").map(String::as_str),
+            Some("kiro-read-1")
+        );
+        assert_eq!(
+            warnings[0].get("raw_input_keys").map(String::as_str),
+            Some("[\"ops\"]")
+        );
+        assert_eq!(
+            warnings[1].get("agent").map(String::as_str),
+            Some("fake-acp-agent")
+        );
+        assert_eq!(
+            warnings[1].get("tool_call_id").map(String::as_str),
+            Some("stock-read-1")
+        );
+        assert_eq!(
+            warnings[1].get("raw_input_keys").map(String::as_str),
+            Some("[\"ops\"]")
+        );
+        assert!(
+            warnings
+                .iter()
+                .flat_map(|warning| warning.values())
+                .all(|value| !value.contains("secret")),
+            "warnings must include keys, never raw values: {warnings:?}"
+        );
     }
 
     #[tokio::test]
@@ -5356,29 +5624,118 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
         assert_eq!(result["lines_removed"], 0);
     }
 
-    #[test]
-    fn test_read_completion_maps_to_read_files() {
-        let context = KiroToolContext {
-            tool_name: "read".to_string(),
-            tool_type: json!({"kind": "ReadFiles", "file_paths": ["hello.py"]}),
-            request_emitted: true,
-            pending_completion: None,
-        };
-        let completion = crate::acp::AcpToolCallCompletion {
-            tool_call_id: "tooluse_LPjch7ginxZKkwYbJ42qHB".to_string(),
-            tool_name: "Reading hello.py:1".to_string(),
-            kind: "read".to_string(),
-            success: true,
-            tool_result: json!({"items":[{"Text":"import random\nimport time\n"}]}),
-            error: None,
-        };
-        let result = map_tool_completion_result(&completion, Some(&context.tool_type));
+    fn read_completion(request: Option<&Value>, tool_result: Value) -> Value {
+        map_tool_completion_result(
+            &crate::acp::AcpToolCallCompletion {
+                tool_call_id: "T1".to_string(),
+                tool_name: "Reading file".to_string(),
+                kind: "read".to_string(),
+                success: true,
+                tool_result,
+                error: None,
+            },
+            request,
+        )
+    }
 
-        assert_eq!(result["kind"], "ReadFiles");
-        let files = result["files"].as_array().unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0]["path"], "hello.py");
-        assert_eq!(files[0]["bytes"], 26);
+    #[test]
+    fn latest_kiro_read_completion_reports_exact_utf8_bytes() {
+        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
+        let request = json!({ "kind": "ReadFiles", "file_paths": [path] });
+        let text = "ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π";
+        assert_eq!(text.len(), 70);
+        assert_eq!(text.chars().count(), 69);
+
+        let result = read_completion(Some(&request), json!({ "items": [{ "Text": text }] }));
+
+        assert_eq!(
+            result,
+            json!({
+                "kind": "ReadFiles",
+                "files": [{ "path": path, "bytes": 70 }]
+            })
+        );
+    }
+
+    #[test]
+    fn multi_path_read_completion_correlates_distinct_utf8_lengths() {
+        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt", "beta.txt"] });
+
+        let result = read_completion(
+            Some(&request),
+            json!({ "items": [{ "Text": "π" }, { "Text": "snowman ☃" }] }),
+        );
+
+        assert_eq!(
+            result,
+            json!({
+                "kind": "ReadFiles",
+                "files": [
+                    { "path": "alpha.txt", "bytes": 2 },
+                    { "path": "beta.txt", "bytes": 11 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_read_output_degrades_atomically_to_other() {
+        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt", "beta.txt"] });
+        let raw = json!({ "items": [{ "Text": "only one output" }] });
+
+        let result = read_completion(Some(&request), raw.clone());
+
+        assert_eq!(result, json!({ "kind": "Other", "result": raw }));
+        assert!(result.get("files").is_none());
+        assert!(!result.to_string().contains("\"bytes\""));
+    }
+
+    #[test]
+    fn missing_or_malformed_read_text_never_becomes_false_zero_bytes() {
+        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt"] });
+
+        for raw in [
+            json!({}),
+            json!({ "items": [] }),
+            json!({ "items": "not-an-array" }),
+            json!({ "items": [{}] }),
+            json!({ "items": [{ "Text": 0 }] }),
+        ] {
+            let result = read_completion(Some(&request), raw.clone());
+            assert_eq!(result, json!({ "kind": "Other", "result": raw }));
+            assert!(!result.to_string().contains("\"bytes\":0"));
+        }
+    }
+
+    #[test]
+    fn measured_empty_read_text_is_a_legitimate_zero_bytes() {
+        let request = json!({ "kind": "ReadFiles", "file_paths": ["empty.txt"] });
+
+        let result = read_completion(Some(&request), json!({ "items": [{ "Text": "" }] }));
+
+        assert_eq!(
+            result,
+            json!({
+                "kind": "ReadFiles",
+                "files": [{ "path": "empty.txt", "bytes": 0 }]
+            })
+        );
+    }
+
+    #[test]
+    fn read_completion_without_valid_typed_request_is_other() {
+        let raw = json!({ "items": [{ "Text": "content" }] });
+
+        for request in [
+            None,
+            Some(json!({ "kind": "Other", "file_paths": ["alpha.txt"] })),
+            Some(json!({ "kind": "ReadFiles", "file_paths": [] })),
+            Some(json!({ "kind": "ReadFiles", "file_paths": [""] })),
+            Some(json!({ "kind": "ReadFiles", "file_paths": [7] })),
+        ] {
+            let result = read_completion(request.as_ref(), raw.clone());
+            assert_eq!(result, json!({ "kind": "Other", "result": raw }));
+        }
     }
 
     #[test]
@@ -5717,6 +6074,105 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         path
     }
 
+    fn write_fake_kiro_read_lifecycle_program() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-kiro-read-lifecycle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake Kiro read lifecycle tempdir");
+        let path = dir.join("fake-kiro-read-lifecycle-acp");
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-read-lifecycle-session"}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-read-lifecycle-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-read-message","toolCallId":"T1","kind":"read","locations":[{"path":"/workspace/acp-read-20260730T180905Z-24232.txt"}],"rawInput":{"__tool_use_purpose":"Reading the specified file using the native file read tool","operations":[{"mode":"Line","path":"/workspace/acp-read-20260730T180905Z-24232.txt"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-read-lifecycle-session","update":{"sessionUpdate":"tool_call_update","toolCallId":"T1","kind":"read","status":"completed","rawInput":{"operations":[{"mode":"Line","path":"/workspace/acp-read-20260730T180905Z-24232.txt"}]},"rawOutput":{"items":[{"Text":"ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        std::fs::write(&path, script).expect("write fake Kiro read lifecycle program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("stat fake Kiro read lifecycle program")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions)
+                .expect("chmod fake Kiro read lifecycle program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn kiro_read_lifecycle_emits_one_correlated_measured_pair() {
+        let workspace = auth_lifecycle_workspace();
+        let program = write_fake_kiro_read_lifecycle_program();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+        let (session, mut raw_events) = KiroSession::spawn_for_agent(
+            &[workspace.to_string_lossy().to_string()],
+            Some(&agent),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("spawn fake Kiro read lifecycle");
+        session
+            .command_handle()
+            .execute(SessionCommand::SendMessage {
+                message: "read the fixture".to_string(),
+                images: None,
+            })
+            .await
+            .expect("run fake Kiro read lifecycle");
+        let events = collect_kiro_turn_events(&mut raw_events)
+            .await
+            .into_iter()
+            .filter_map(|event| serde_json::from_value::<ChatEvent>(event).ok())
+            .collect::<Vec<_>>();
+        let requests = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completions = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(requests.len(), 1, "{events:?}");
+        assert_eq!(completions.len(), 1, "{events:?}");
+        assert_eq!(requests[0].tool_call_id, "T1");
+        assert_eq!(requests[0].tool_call_id, completions[0].tool_call_id);
+        assert!(completions[0].success);
+        assert_eq!(
+            requests[0].tool_type,
+            protocol::ToolRequestType::ReadFiles {
+                file_paths: vec!["/workspace/acp-read-20260730T180905Z-24232.txt".to_string()]
+            }
+        );
+        assert_eq!(
+            completions[0].tool_result,
+            protocol::ToolExecutionResult::ReadFiles {
+                files: vec![protocol::FileInfo {
+                    path: "/workspace/acp-read-20260730T180905Z-24232.txt".to_string(),
+                    bytes: 70,
+                }]
+            }
+        );
+
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
     fn write_fake_kiro_identity_program() -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("tyde-kiro-identity-test-{}", uuid::Uuid::new_v4()));
@@ -5874,8 +6330,8 @@ read _
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
 read _
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"restore this"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"ops":[{"path":"README.md"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"read","title":"read","toolCallId":"tooluse_restore_read","status":"completed","rawOutput":{"items":[{"Text":"hello"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"operations":[{"mode":"Line","path":"README.md"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","title":"read","toolCallId":"tooluse_restore_read","status":"completed","rawInput":{"operations":[{"mode":"Line","path":"README.md"}]}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","rawInput":{"command":"grep missing README.md","working_dir":"."}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","status":"cancelled","rawOutput":{"items":[]},"error":{"message":"grep was cancelled"}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-restored-response","content":{"type":"text","text":"restored done"}}}}'
@@ -6006,6 +6462,46 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
         assert_eq!(
             failed_completions, 1,
             "expected cancelled replayed tool completion: {events:?}"
+        );
+        let read_request = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ChatEvent::ToolRequest(request) if request.tool_name == "read" => {
+                    Some((index, request))
+                }
+                _ => None,
+            })
+            .expect("replayed read request");
+        let protocol::ToolRequestType::ReadFiles { file_paths } = &read_request.1.tool_type else {
+            panic!("replayed read request must retain typed paths: {events:?}");
+        };
+        assert_eq!(file_paths, &vec!["README.md".to_string()]);
+        let read_completion = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ChatEvent::ToolExecutionCompleted(completion) if completion.tool_name == "read" => {
+                    Some((index, completion))
+                }
+                _ => None,
+            })
+            .expect("replayed read completion");
+        assert!(
+            read_request.0 < read_completion.0,
+            "request must precede correlated terminal replay: {events:?}"
+        );
+        assert_eq!(read_request.1.tool_call_id, read_completion.1.tool_call_id);
+        assert!(read_completion.1.success);
+        assert_eq!(
+            read_completion.1.tool_result,
+            protocol::ToolExecutionResult::Other { result: json!({}) }
+        );
+        assert!(
+            !serde_json::to_string(&read_completion.1.tool_result)
+                .expect("serialize replayed read completion")
+                .contains("\"bytes\""),
+            "native replay omitted content, so it must not claim bytes"
         );
 
         let host_stream = protocol::StreamPath("/host/test".to_string());

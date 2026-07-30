@@ -12,13 +12,15 @@ use fixture::Fixture;
 use protocol::{
     AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode,
     AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, ChatMessage, CommandErrorPayload,
-    CustomAgentId, Envelope, FetchSessionHistoryPayload, FrameKind, HostSettingValue, ImageData,
-    ListSessionsPayload, MessageMetadataUpdateData, MessageSender, NewAgentPayload,
-    ProtocolValidator, SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    CustomAgentId, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind,
+    HostBootstrapPayload, HostSettingValue, ImageData, ListSessionsPayload,
+    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
     SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
     SessionSummary, SetSessionSettingsPayload, SetSettingPayload, SpawnAgentParams,
     SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+    ToolRequestType,
 };
 use serde_json::{Value, json};
 use server::backend::{Backend, BackendSession};
@@ -4503,6 +4505,7 @@ fn antigravity_native_directory_entries(path: &Path) -> Result<HashSet<PathBuf>,
 
 struct RealBackendFixture {
     client: ValidatedConnection,
+    host: server::HostHandle,
     #[allow(dead_code)]
     session_store_dir: tempfile::TempDir,
     workspace_dir: tempfile::TempDir,
@@ -4527,6 +4530,13 @@ impl ValidatedConnection {
         payload: ListSessionsPayload,
     ) -> Result<(), protocol::FrameError> {
         self.inner.list_sessions(payload).await
+    }
+
+    async fn delete_session(
+        &mut self,
+        payload: DeleteSessionPayload,
+    ) -> Result<(), protocol::FrameError> {
+        self.inner.delete_session(payload).await
     }
 
     async fn close_agent(&mut self, stream: &StreamPath) -> Result<(), protocol::FrameError> {
@@ -4623,11 +4633,12 @@ impl RealBackendFixture {
         let server_config = server::ServerConfig::current();
         let client_config = client::ClientConfig::current();
 
+        let connection_host = host.clone();
         tokio::spawn(async move {
             let conn = server::accept(&server_config, server_stream)
                 .await
                 .expect("server handshake failed");
-            if let Err(err) = server::run_connection(conn, host).await {
+            if let Err(err) = server::run_connection(conn, connection_host).await {
                 eprintln!("server connection loop failed: {err:?}");
             }
         });
@@ -4642,6 +4653,7 @@ impl RealBackendFixture {
                 validator: ProtocolValidator::new(),
                 pending_bootstrap_events: VecDeque::new(),
             },
+            host,
             session_store_dir,
             workspace_dir,
         }
@@ -4649,6 +4661,31 @@ impl RealBackendFixture {
 
     fn workspace_roots(&self) -> Vec<String> {
         vec![self.workspace_dir.path().to_string_lossy().to_string()]
+    }
+
+    async fn connect(&self) -> ValidatedConnection {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server_config = server::ServerConfig::current();
+        let client_config = client::ClientConfig::current();
+        let host = self.host.clone();
+
+        tokio::spawn(async move {
+            let conn = server::accept(&server_config, server_stream)
+                .await
+                .expect("server handshake failed");
+            if let Err(err) = server::run_connection(conn, host).await {
+                eprintln!("server connection loop failed: {err:?}");
+            }
+        });
+
+        let client = client::connect(&client_config, client_stream)
+            .await
+            .expect("client handshake failed");
+        ValidatedConnection {
+            inner: client,
+            validator: ProtocolValidator::new(),
+            pending_bootstrap_events: VecDeque::new(),
+        }
     }
 }
 
@@ -4838,6 +4875,34 @@ async fn resume_agent_via_protocol(
         expect_agent_start_on_stream(client, &agent_stream, "resumed AgentStart").await;
     assert_eq!(agent_start.agent_id, new_agent.agent_id);
 
+    agent_stream
+}
+
+async fn resume_agent_without_prompt_via_protocol(
+    client: &mut ValidatedConnection,
+    name: &str,
+    session_id: protocol::SessionId,
+) -> StreamPath {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume spawn_agent failed");
+
+    let env = expect_next_event_kind(client, FrameKind::NewAgent, "resumed NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
+    let agent_stream = new_agent.instance_stream;
+    let agent_start =
+        expect_agent_start_on_stream(client, &agent_stream, "resumed AgentStart").await;
+    assert_eq!(agent_start.agent_id, new_agent.agent_id);
     agent_stream
 }
 
@@ -6980,6 +7045,314 @@ async fn real_kiro_completes_a_turn_through_the_generic_acp_backend() {
         "a real Kiro turn through the generic ACP backend produced no usable \
          assistant text; got: {assistant_text:?}"
     );
+}
+
+#[derive(Default)]
+struct KiroReadObservation {
+    events: Vec<ChatEvent>,
+    saw_expected_user: bool,
+}
+
+impl KiroReadObservation {
+    fn observe(&mut self, event: ChatEvent, expected_user: Option<&str>) {
+        if let ChatEvent::MessageAdded(message) = &event {
+            if matches!(&message.sender, MessageSender::User)
+                && expected_user.is_some_and(|expected| message.content == expected)
+            {
+                self.saw_expected_user = true;
+            }
+            if matches!(&message.sender, MessageSender::Error) {
+                panic!("Kiro read fixture returned an error: {}", message.content);
+            }
+        }
+        self.events.push(event);
+    }
+}
+
+async fn expect_live_kiro_event(client: &mut ValidatedConnection, context: &str) -> Envelope {
+    const LIVE_KIRO_READ_TIMEOUT: Duration = Duration::from_secs(120);
+    loop {
+        let envelope = tokio::time::timeout(LIVE_KIRO_READ_TIMEOUT, client.next_event())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
+            .unwrap_or_else(|error| panic!("failed waiting for {context}: {error:?}"))
+            .unwrap_or_else(|| panic!("connection closed before {context}"));
+        if matches!(
+            envelope.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+        ) {
+            continue;
+        }
+        return envelope;
+    }
+}
+
+async fn collect_live_kiro_read_observation(
+    client: &mut ValidatedConnection,
+    stream: &StreamPath,
+    expected_user: Option<&str>,
+) -> KiroReadObservation {
+    let mut observation = KiroReadObservation::default();
+    loop {
+        let envelope = expect_live_kiro_event(client, "Kiro read metadata turn").await;
+        if envelope.kind != FrameKind::ChatEvent || envelope.stream != *stream {
+            continue;
+        }
+        let event: ChatEvent = envelope.parse_payload().expect("parse Kiro read ChatEvent");
+        let terminal = matches!(event, ChatEvent::TypingStatusChanged(false))
+            && observation
+                .events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::ToolExecutionCompleted(_)))
+            && (expected_user.is_none() || observation.saw_expected_user);
+        observation.observe(event, expected_user);
+        if terminal {
+            return observation;
+        }
+    }
+}
+
+fn assert_measured_read_pair(events: &[ChatEvent], path: &str, bytes: u64) {
+    let requests = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request)
+                if matches!(
+                    &request.tool_type,
+                    ToolRequestType::ReadFiles { file_paths }
+                        if file_paths.len() == 1 && file_paths[0] == path
+                ) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected one exact read request: {events:?}"
+    );
+    let completions = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == requests[0].tool_call_id =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "expected one correlated read completion: {events:?}"
+    );
+    assert!(completions[0].success);
+    assert_eq!(
+        completions[0].tool_result,
+        ToolExecutionResult::ReadFiles {
+            files: vec![protocol::FileInfo {
+                path: path.to_string(),
+                bytes,
+            }]
+        }
+    );
+}
+
+fn assert_unmeasured_native_read_pair(events: &[ChatEvent], path: &str) {
+    let request = events
+        .iter()
+        .find_map(|event| match event {
+            ChatEvent::ToolRequest(request)
+                if matches!(
+                    &request.tool_type,
+                    ToolRequestType::ReadFiles { file_paths }
+                        if file_paths.len() == 1 && file_paths[0] == path
+                ) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("native replay lost read path {path}: {events:?}"));
+    let completions = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == request.tool_call_id =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "native replay must terminalize once: {events:?}"
+    );
+    assert!(completions[0].success);
+    assert!(matches!(
+        &completions[0].tool_result,
+        ToolExecutionResult::Other { .. }
+    ));
+    assert!(
+        !serde_json::to_string(&completions[0].tool_result)
+            .expect("serialize native replay result")
+            .contains("\"bytes\"")
+    );
+}
+
+async fn replayed_agent_events_by_name(fixture: &RealBackendFixture, name: &str) -> Vec<ChatEvent> {
+    let mut client = fixture.connect().await;
+    let agent_stream = loop {
+        let envelope = expect_live_kiro_event(&mut client, "Kiro reload HostBootstrap").await;
+        if envelope.kind != FrameKind::HostBootstrap {
+            continue;
+        }
+        let bootstrap: HostBootstrapPayload = envelope
+            .parse_payload()
+            .expect("parse Kiro reload HostBootstrap");
+        break bootstrap
+            .agents
+            .into_iter()
+            .find(|agent| agent.name == name)
+            .unwrap_or_else(|| panic!("Kiro reload missing agent {name}"))
+            .instance_stream;
+    };
+    loop {
+        let envelope = expect_live_kiro_event(&mut client, "Kiro reload AgentBootstrap").await;
+        if envelope.kind == FrameKind::AgentBootstrap && envelope.stream == agent_stream {
+            let bootstrap: AgentBootstrapPayload = envelope
+                .parse_payload()
+                .expect("parse Kiro reload AgentBootstrap");
+            return bootstrap
+                .events
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_kiro_read_metadata_survives_reload_and_native_resume() {
+    const FIXTURE_CONTENT: &str =
+        "ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π";
+    const AGENT_NAME: &str = "Kiro read metadata regression";
+
+    assert!(
+        real_ai_tests_enabled(),
+        "set TYDE_RUN_REAL_AI_TESTS=1 to authorize the real Kiro read fixture"
+    );
+    if !backend_binary_available(BackendKind::Acp) {
+        eprintln!("SKIPPED: kiro not installed");
+        return;
+    }
+    assert_eq!(FIXTURE_CONTENT.len(), 70);
+
+    let mut fixture = RealBackendFixture::new(BackendKind::Acp).await;
+    let workspace_roots = fixture.workspace_roots();
+    let workspace_root = workspace_roots[0].clone();
+    let first_file = fixture
+        .workspace_dir
+        .path()
+        .join(format!("acp-read-live-{}.txt", Uuid::new_v4()));
+    std::fs::write(&first_file, FIXTURE_CONTENT).expect("write first Kiro read fixture");
+    let first_path = first_file.to_string_lossy().to_string();
+    let first_prompt = format!(
+        "Use the native file read tool exactly once to read {first_path}. Do not use a shell command or another tool. Then reply READ_DONE."
+    );
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        BackendKind::Acp,
+        AGENT_NAME,
+        &first_prompt,
+    )
+    .await;
+    let first =
+        collect_live_kiro_read_observation(&mut fixture.client, &agent_stream, Some(&first_prompt))
+            .await;
+    assert_measured_read_pair(&first.events, &first_path, 70);
+
+    let reloaded = replayed_agent_events_by_name(&fixture, AGENT_NAME).await;
+    assert_measured_read_pair(&reloaded, &first_path, 70);
+
+    let sessions = list_sessions_via_protocol(&mut fixture.client).await;
+    let session = sessions
+        .sessions
+        .into_iter()
+        .filter(|session| {
+            session.backend_kind == BackendKind::Acp
+                && session
+                    .workspace_roots
+                    .iter()
+                    .any(|root| root == &workspace_root)
+        })
+        .max_by_key(|session| session.updated_at_ms)
+        .expect("latest Kiro session for owned workspace");
+    let session_id = session.id.clone();
+    let resumed_stream = resume_agent_without_prompt_via_protocol(
+        &mut fixture.client,
+        "Kiro read metadata native resume",
+        session_id.clone(),
+    )
+    .await;
+    let native =
+        collect_live_kiro_read_observation(&mut fixture.client, &resumed_stream, None).await;
+    assert_unmeasured_native_read_pair(&native.events, &first_path);
+
+    let second_file = fixture
+        .workspace_dir
+        .path()
+        .join(format!("acp-read-follow-up-{}.txt", Uuid::new_v4()));
+    std::fs::write(&second_file, FIXTURE_CONTENT).expect("write second Kiro read fixture");
+    let second_path = second_file.to_string_lossy().to_string();
+    let second_prompt = format!(
+        "Use the native file read tool exactly once to read {second_path}. Do not use a shell command or another tool. Then reply FOLLOW_UP_DONE."
+    );
+    fixture
+        .client
+        .send_message(&resumed_stream, second_prompt.clone())
+        .await
+        .expect("send Kiro read follow-up");
+    let second = collect_live_kiro_read_observation(
+        &mut fixture.client,
+        &resumed_stream,
+        Some(&second_prompt),
+    )
+    .await;
+    assert_measured_read_pair(&second.events, &second_path, 70);
+
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("delete owned Kiro session");
+    let remaining = list_sessions_via_protocol(&mut fixture.client).await;
+    assert!(
+        remaining
+            .sessions
+            .iter()
+            .all(|session| session.id != session_id),
+        "owned Kiro session must be removed"
+    );
+    std::fs::remove_file(&first_file).expect("remove first Kiro read fixture");
+    std::fs::remove_file(&second_file).expect("remove second Kiro read fixture");
 }
 
 #[tokio::test]

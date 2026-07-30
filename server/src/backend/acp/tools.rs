@@ -55,20 +55,27 @@ pub fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
 
 /// Collect the file paths an ACP `read` call refers to.
 ///
-/// Handles the single-path form and the batched `ops` form; returns empty when
-/// neither is recognizable.
-fn read_paths(args: &Value) -> Vec<String> {
-    if let Some(ops) = args.get("ops").and_then(Value::as_array) {
-        let paths: Vec<String> = ops
+/// Handles the latest batched `operations` form and common single-path forms;
+/// returns empty when none is recognizable.
+pub(crate) fn read_paths(args: &Value) -> Vec<String> {
+    if let Some(operations) = args.get("operations").and_then(Value::as_array) {
+        let paths: Vec<String> = operations
             .iter()
-            .filter_map(|op| op.get("path").and_then(Value::as_str))
+            .filter_map(|operation| operation.get("path").and_then(Value::as_str))
+            .filter(|path| !path.trim().is_empty())
             .map(str::to_string)
             .collect();
         if !paths.is_empty() {
             return paths;
         }
     }
-    first_str(args, &["path", "file_path", "filePath"])
+    ["path", "file_path", "filePath"]
+        .iter()
+        .find_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+        })
         .map(|path| vec![path.to_string()])
         .unwrap_or_default()
 }
@@ -204,17 +211,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_accepts_both_single_path_and_ops_forms() {
-        let single = default_map_tool_request("read", &json!({ "path": "a.rs" }), "/ws").await;
-        assert_eq!(single["file_paths"], json!(["a.rs"]));
-
-        let ops = default_map_tool_request(
+    async fn read_accepts_latest_operations_and_singular_path_aliases() {
+        // Latest live and native-replay evidence uses `operations[*].path`.
+        // `git log -S'"ops"'` attributes the replaced assertion solely to
+        // Kiro's superseded f3c06d7 payload, so retaining `ops` would preserve
+        // an unevidenced historical shape rather than the current contract.
+        let captured = default_map_tool_request(
             "read",
-            &json!({ "ops": [{ "path": "a.rs" }, { "path": "b.rs" }] }),
+            &json!({
+                "__tool_use_purpose": "Reading the specified file using the native file read tool",
+                "operations": [{
+                    "mode": "Line",
+                    "path": "/workspace/acp-read-20260730T180905Z-24232.txt"
+                }]
+            }),
             "/ws",
         )
         .await;
-        assert_eq!(ops["file_paths"], json!(["a.rs", "b.rs"]));
+        assert_eq!(
+            captured["file_paths"],
+            json!(["/workspace/acp-read-20260730T180905Z-24232.txt"])
+        );
+
+        let batch = default_map_tool_request(
+            "read",
+            &json!({
+                "operations": [
+                    { "path": "first.rs" },
+                    { "path": "second.rs" }
+                ]
+            }),
+            "/ws",
+        )
+        .await;
+        assert_eq!(batch["file_paths"], json!(["first.rs", "second.rs"]));
+
+        for alias in ["path", "file_path", "filePath"] {
+            let args = Value::Object(serde_json::Map::from_iter([(
+                alias.to_string(),
+                json!("single.rs"),
+            )]));
+            let mapped = default_map_tool_request("read", &args, "/ws").await;
+            assert_eq!(mapped["file_paths"], json!(["single.rs"]), "{alias}");
+        }
+
+        let stale = json!({ "ops": [{ "path": "stale.rs" }] });
+        let mapped = default_map_tool_request("read", &stale, "/ws").await;
+        assert_eq!(
+            mapped,
+            json!({
+                "kind": "Other",
+                "args": stale,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_read_paths_preserve_raw_arguments_in_other() {
+        for args in [
+            json!({}),
+            json!({ "operations": "not-an-array" }),
+            json!({ "operations": [] }),
+            json!({ "operations": [{ "path": "" }, { "path": "  " }] }),
+            json!({ "operations": [{ "path": 7 }, { "other": "x" }] }),
+            json!({ "path": "" }),
+            json!({ "file_path": 9 }),
+        ] {
+            let mapped = default_map_tool_request("read", &args, "/ws").await;
+            assert_eq!(
+                mapped,
+                json!({
+                    "kind": "Other",
+                    "args": args,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_preserves_nonblank_posix_whitespace_and_rejects_blank_only() {
+        let operations = default_map_tool_request(
+            "read",
+            &json!({
+                "operations": [
+                    { "path": " leading.txt" },
+                    { "path": "trailing.txt " },
+                    { "path": " \t " }
+                ]
+            }),
+            "/ws",
+        )
+        .await;
+        assert_eq!(
+            operations["file_paths"],
+            json!([" leading.txt", "trailing.txt "])
+        );
+
+        for alias in ["path", "file_path", "filePath"] {
+            let args = Value::Object(serde_json::Map::from_iter([(
+                alias.to_string(),
+                json!(" both sides.txt "),
+            )]));
+            let mapped = default_map_tool_request("read", &args, "/ws").await;
+            assert_eq!(mapped["file_paths"], json!([" both sides.txt "]), "{alias}");
+        }
+
+        let blank = json!({ "filePath": " \t " });
+        assert_eq!(
+            default_map_tool_request("read", &blank, "/ws").await,
+            json!({
+                "kind": "Other",
+                "args": blank,
+            })
+        );
     }
 
     #[test]

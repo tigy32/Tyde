@@ -10190,10 +10190,13 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
     }
 
     if claude_is_read_tool_name(tool_name) {
-        return json!({
-            "kind": "ReadFiles",
-            "file_paths": claude_argument_file_paths(arguments),
-        });
+        let file_paths = claude_argument_file_paths(arguments);
+        if !file_paths.is_empty() {
+            return json!({
+                "kind": "ReadFiles",
+                "file_paths": file_paths,
+            });
+        }
     }
 
     if claude_is_ask_user_question_tool_name(tool_name) {
@@ -11189,49 +11192,62 @@ fn extract_tool_result_events_from_message(
         }
 
         if is_read_tool {
-            let files = tool_call_by_id
+            let file_paths = tool_call_by_id
                 .get(&tool_call_id)
                 .map(|tool_call| claude_argument_file_paths(&tool_call.arguments))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|path| {
-                    json!({
+                .unwrap_or_default();
+            let tool_result = if let [path] = file_paths.as_slice() {
+                json!({
+                    "kind": "ReadFiles",
+                    "files": [{
                         "path": path,
                         "bytes": result_text.len()
-                    })
+                    }],
                 })
-                .collect::<Vec<_>>();
+            } else {
+                claude_replay_other_tool_result(block, &result_text)
+            };
             events.push(ClaudeReplayToolExecution {
                 tool_call_id,
                 tool_name,
                 success: true,
-                tool_result: json!({
-                    "kind": "ReadFiles",
-                    "files": files,
-                }),
+                tool_result,
                 error: None,
             });
             continue;
         }
 
-        let result = if result_text.trim().is_empty() {
-            block.clone()
-        } else {
-            Value::String(result_text)
-        };
         events.push(ClaudeReplayToolExecution {
             tool_call_id,
             tool_name,
             success: true,
-            tool_result: json!({
-                "kind": "Other",
-                "result": result,
-            }),
+            tool_result: claude_replay_other_tool_result(block, &result_text),
             error: None,
         });
     }
 
     events
+}
+
+fn claude_replay_other_tool_result(block: &Value, result_text: &str) -> Value {
+    let has_text_content = match block.get("content") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(Value::as_str))
+                .is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
+    };
+    let result = if result_text.trim().is_empty() || !has_text_content {
+        block.clone()
+    } else {
+        Value::String(result_text.to_string())
+    };
+    json!({
+        "kind": "Other",
+        "result": result,
+    })
 }
 
 fn extract_images_from_content(content: &Value) -> Vec<Value> {
@@ -26985,6 +27001,168 @@ for line in sys.stdin:
             .expect("file_paths");
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].as_str(), Some("/tmp/example.txt"));
+    }
+
+    fn claude_read_replay(arguments: Value, content: Value) -> ClaudeReplayToolExecution {
+        let message = json!({
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_read",
+                "content": content
+            }]
+        });
+        let tool_call = ClaudeToolCall {
+            id: "toolu_read".to_string(),
+            name: "Read".to_string(),
+            arguments,
+        };
+        let tool_names = HashMap::from([("toolu_read".to_string(), "Read".to_string())]);
+        let tool_calls = HashMap::from([("toolu_read".to_string(), tool_call)]);
+
+        extract_tool_result_events_from_message(&message, &tool_names, &tool_calls)
+            .into_iter()
+            .next()
+            .expect("Claude read replay result")
+    }
+
+    #[test]
+    fn claude_single_read_replay_reports_exact_utf8_bytes() {
+        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
+        let text = "ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π";
+        assert_eq!(text.len(), 70);
+        assert_eq!(text.chars().count(), 69);
+
+        let event = claude_read_replay(json!({ "file_path": path }), json!(text));
+
+        assert!(event.success);
+        assert_eq!(
+            event.tool_result,
+            json!({
+                "kind": "ReadFiles",
+                "files": [{ "path": path, "bytes": 70 }]
+            })
+        );
+    }
+
+    #[test]
+    fn claude_multi_path_request_retains_paths_without_replicating_bytes() {
+        let arguments = json!({
+            "file_path": "first.txt",
+            "file_paths": ["second.txt", "third.txt"],
+            "paths": ["fourth.txt", "second.txt"]
+        });
+        let request = claude_tool_request_type("Read", &arguments);
+        assert_eq!(
+            request,
+            json!({
+                "kind": "ReadFiles",
+                "file_paths": [
+                    "first.txt",
+                    "second.txt",
+                    "third.txt",
+                    "fourth.txt"
+                ]
+            })
+        );
+
+        let event = claude_read_replay(arguments, json!("one undifferentiated result"));
+
+        assert_eq!(
+            event.tool_result,
+            json!({
+                "kind": "Other",
+                "result": "one undifferentiated result"
+            })
+        );
+        assert!(event.tool_result.get("files").is_none());
+        assert!(!event.tool_result.to_string().contains("\"bytes\""));
+    }
+
+    #[test]
+    fn claude_read_replay_without_paths_preserves_result_as_other() {
+        let event =
+            claude_read_replay(json!({ "unrecognized": "value" }), json!("raw read result"));
+
+        assert_eq!(
+            event.tool_result,
+            json!({
+                "kind": "Other",
+                "result": "raw read result"
+            })
+        );
+
+        let empty = claude_read_replay(json!({ "unrecognized": true }), json!([]));
+        assert_eq!(
+            empty.tool_result,
+            json!({
+                "kind": "Other",
+                "result": {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": []
+                }
+            })
+        );
+
+        let structured =
+            claude_read_replay(json!({ "unrecognized": true }), json!([{ "count": 1 }]));
+        assert_eq!(
+            structured.tool_result,
+            json!({
+                "kind": "Other",
+                "result": {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": [{ "count": 1 }]
+                }
+            })
+        );
+
+        let text_parts = claude_read_replay(
+            json!({ "unrecognized": true }),
+            json!([{ "type": "text", "text": "first" }, "second"]),
+        );
+        assert_eq!(
+            text_parts.tool_result,
+            json!({
+                "kind": "Other",
+                "result": "first\nsecond"
+            })
+        );
+    }
+
+    #[test]
+    fn claude_single_empty_read_replay_is_legitimate_zero_bytes() {
+        let event = claude_read_replay(json!({ "path": "empty.txt" }), json!(""));
+
+        assert_eq!(
+            event.tool_result,
+            json!({
+                "kind": "ReadFiles",
+                "files": [{ "path": "empty.txt", "bytes": 0 }]
+            })
+        );
+    }
+
+    #[test]
+    fn claude_read_request_without_recognizable_path_is_raw_other() {
+        let arguments = json!({
+            "file_paths": ["", "  ", 7],
+            "unknown": "retained"
+        });
+
+        let request = claude_tool_request_type("Read", &arguments);
+
+        assert_eq!(
+            request,
+            json!({
+                "kind": "Other",
+                "args": {
+                    "tool": "Read",
+                    "arguments": arguments
+                }
+            })
+        );
     }
 
     #[test]

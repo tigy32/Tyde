@@ -1585,8 +1585,9 @@ mod live_card_wasm_tests {
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
         AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
-        BackgroundTaskState, BackgroundTaskStatus, StreamPath, ToolExecutionCompletedData,
-        ToolProgressData, ToolRequest, WorkflowAgentState, WorkflowAgentStatus,
+        BackgroundTaskState, BackgroundTaskStatus, FileInfo, StreamPath,
+        ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
+        WorkflowAgentStatus,
     };
     use serde_json::json;
     use wasm_bindgen_test::*;
@@ -1650,6 +1651,174 @@ mod live_card_wasm_tests {
                 normalization_failure: None,
             }),
         }
+    }
+
+    fn completed_read_request(
+        tool_call_id: &str,
+        file_paths: Vec<&str>,
+        tool_result: ToolExecutionResult,
+    ) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "Read".to_owned(),
+                tool_type: ToolRequestType::ReadFiles {
+                    file_paths: file_paths.into_iter().map(str::to_owned).collect(),
+                },
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "Read".to_owned(),
+                tool_result,
+                success: true,
+                error: None,
+                normalization_failure: None,
+            }),
+        }
+    }
+
+    fn selector_text(container: &HtmlElement, selector: &str) -> String {
+        container
+            .query_selector(selector)
+            .expect("query selector")
+            .unwrap_or_else(|| panic!("missing selector {selector}"))
+            .text_content()
+            .unwrap_or_default()
+    }
+
+    fn completion_summary(container: &HtmlElement) -> String {
+        container
+            .query_selector(".tool-completion-summary")
+            .expect("query completion summary")
+            .and_then(|element| element.text_content())
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen_test]
+    async fn measured_live_kiro_read_card_shows_exact_file_and_bytes() {
+        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
+        let entry = completed_read_request(
+            "T1",
+            vec![path],
+            ToolExecutionResult::ReadFiles {
+                files: vec![FileInfo {
+                    path: path.to_owned(),
+                    bytes: 70,
+                }],
+            },
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert_eq!(completion_summary(&container), "70B");
+        assert_eq!(count(&container, ".tool-result-file"), 1);
+        assert_eq!(selector_text(&container, ".tool-result-file-size"), "70B");
+        let body = text(&container);
+        assert!(body.contains("acp-read-20260730T180905Z-24232.txt"));
+        assert!(!body.contains("0 files"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn mismatched_kiro_read_card_keeps_all_paths_without_sizes() {
+        let entry = completed_read_request(
+            "T2",
+            vec!["/workspace/a.txt", "/workspace/b.txt"],
+            ToolExecutionResult::Other {
+                result: json!({ "items": [{ "Text": "only one output" }] }),
+            },
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert_eq!(count(&container, ".tool-read-file-row"), 2);
+        assert_eq!(count(&container, ".tool-result-file"), 0);
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+        assert_eq!(completion_summary(&container), "");
+        assert_eq!(count(&container, ".tool-typed-mismatch"), 0);
+        let body = text(&container);
+        assert!(body.contains("a.txt") && body.contains("b.txt"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn missing_kiro_read_text_keeps_path_without_false_zero() {
+        let entry = completed_read_request(
+            "T3",
+            vec!["/workspace/missing-text.txt"],
+            ToolExecutionResult::Other {
+                result: json!({ "items": [] }),
+            },
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert!(text(&container).contains("missing-text.txt"));
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+        assert_eq!(completion_summary(&container), "");
+    }
+
+    #[wasm_bindgen_test]
+    async fn measured_empty_kiro_read_card_shows_one_legitimate_zero() {
+        let entry = completed_read_request(
+            "T4",
+            vec!["/workspace/empty.txt"],
+            ToolExecutionResult::ReadFiles {
+                files: vec![FileInfo {
+                    path: "/workspace/empty.txt".to_owned(),
+                    bytes: 0,
+                }],
+            },
+        );
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert_eq!(completion_summary(&container), "0B");
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_kiro_replay_card_keeps_path_without_fabricated_bytes() {
+        let entry = completed_read_request(
+            "T5",
+            vec!["/workspace/native-replay.txt"],
+            ToolExecutionResult::Other { result: json!({}) },
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert!(text(&container).contains("native-replay.txt"));
+        assert_eq!(count(&container, ".tool-read-file-row"), 1);
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+        assert_eq!(completion_summary(&container), "");
+    }
+
+    #[wasm_bindgen_test]
+    async fn claude_multi_path_replay_card_keeps_paths_without_replicated_sizes() {
+        let entry = completed_read_request(
+            "T6",
+            vec!["/workspace/claude-a.txt", "/workspace/claude-b.txt"],
+            ToolExecutionResult::Other {
+                result: json!("one undifferentiated result"),
+            },
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Done");
+        assert_eq!(count(&container, ".tool-read-file-row"), 2);
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+        assert_eq!(completion_summary(&container), "");
+        let body = text(&container);
+        assert!(body.contains("claude-a.txt") && body.contains("claude-b.txt"));
     }
 
     #[wasm_bindgen_test]
