@@ -1,6 +1,8 @@
 mod fixture;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -29,6 +31,8 @@ const DEFAULT_HERMES_TEST_PYTHON: &str = "/Users/mike/.hermes/tyde-hermes-python
 const DEFAULT_HERMES_TEST_PROVIDER: &str = "openrouter";
 const DEFAULT_HERMES_TEST_MODEL: &str = "anthropic/claude-haiku-4.5";
 const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
+static REAL_ANTIGRAVITY_NATIVE_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -4084,6 +4088,419 @@ async fn compact_turn_emits_typed_marker_and_stream_end_without_legacy_notice() 
 }
 
 /// Fixture that uses real backends (not mock) so backend_kind dispatch is tested.
+struct AntigravityNativeFileSnapshot {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+    hash: Option<u64>,
+}
+
+impl AntigravityNativeFileSnapshot {
+    fn capture(path: PathBuf) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self {
+                path,
+                bytes: None,
+                permissions: None,
+                hash: None,
+            });
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("failed to snapshot {}: {error}", path.display()))?;
+        let permissions = std::fs::metadata(&path)
+            .map_err(|error| format!("failed to stat {}: {error}", path.display()))?
+            .permissions();
+        let hash = antigravity_native_bytes_hash(&bytes);
+        Ok(Self {
+            path,
+            bytes: Some(bytes),
+            permissions: Some(permissions),
+            hash: Some(hash),
+        })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        match &self.bytes {
+            Some(bytes) => {
+                if let Some(parent) = self.path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "failed to recreate native parent {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                std::fs::write(&self.path, bytes).map_err(|error| {
+                    format!(
+                        "failed to restore native file {}: {error}",
+                        self.path.display()
+                    )
+                })?;
+                if let Some(permissions) = &self.permissions {
+                    std::fs::set_permissions(&self.path, permissions.clone()).map_err(|error| {
+                        format!(
+                            "failed to restore native mode {}: {error}",
+                            self.path.display()
+                        )
+                    })?;
+                }
+            }
+            None if self.path.exists() => {
+                std::fs::remove_file(&self.path).map_err(|error| {
+                    format!(
+                        "failed to remove test-created native file {}: {error}",
+                        self.path.display()
+                    )
+                })?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        match (&self.bytes, self.hash) {
+            (Some(expected), Some(expected_hash)) => {
+                let actual = std::fs::read(&self.path).map_err(|error| {
+                    format!(
+                        "failed to verify native file {}: {error}",
+                        self.path.display()
+                    )
+                })?;
+                if actual != *expected || antigravity_native_bytes_hash(&actual) != expected_hash {
+                    return Err(format!(
+                        "native file did not return to its baseline: {}",
+                        self.path.display()
+                    ));
+                }
+                let readonly = std::fs::metadata(&self.path)
+                    .map_err(|error| {
+                        format!(
+                            "failed to verify native mode {}: {error}",
+                            self.path.display()
+                        )
+                    })?
+                    .permissions()
+                    .readonly();
+                if self
+                    .permissions
+                    .as_ref()
+                    .is_some_and(|permissions| permissions.readonly() != readonly)
+                {
+                    return Err(format!(
+                        "native file mode did not return to its baseline: {}",
+                        self.path.display()
+                    ));
+                }
+            }
+            (None, None) if self.path.exists() => {
+                return Err(format!(
+                    "test-created shared native file remains: {}",
+                    self.path.display()
+                ));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "invalid native snapshot state for {}",
+                    self.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct AntigravityNativeDirectorySnapshot {
+    path: PathBuf,
+    entries: HashSet<PathBuf>,
+}
+
+impl AntigravityNativeDirectorySnapshot {
+    fn capture(path: PathBuf) -> Result<Self, String> {
+        let entries = antigravity_native_directory_entries(&path)?;
+        Ok(Self { path, entries })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let current = antigravity_native_directory_entries(&self.path)?;
+        if current == self.entries {
+            return Ok(());
+        }
+        let added = current
+            .difference(&self.entries)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let removed = self
+            .entries
+            .difference(&current)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        Err(format!(
+            "native directory did not return to baseline {}: added={added:?} removed={removed:?}",
+            self.path.display()
+        ))
+    }
+}
+
+/// Protects the user's real Antigravity home during the opt-in paid regression.
+///
+/// `RealBackendFixture` isolates Tyde stores and roots, but `agy` still owns
+/// native conversations and shared indexes under `~/.gemini`.
+struct AntigravityNativeArtifactGuard {
+    home: PathBuf,
+    native_root: PathBuf,
+    test_token: String,
+    shared_files: Vec<AntigravityNativeFileSnapshot>,
+    directories: Vec<AntigravityNativeDirectorySnapshot>,
+    session_ids: HashSet<SessionId>,
+    owned_paths: HashSet<PathBuf>,
+    finalized: bool,
+}
+
+impl AntigravityNativeArtifactGuard {
+    fn capture(test_token: String) -> Result<Self, String> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is unavailable for Antigravity native cleanup".to_string())?;
+        let native_root = home.join(".gemini").join("antigravity-cli");
+        let cache = native_root.join("cache");
+        let summary = native_root.join("conversation_summaries.db");
+        let shared_paths = [
+            cache.join("projects.json"),
+            cache.join("default_project_id.txt"),
+            cache.join("last_conversations.json"),
+            cache.join("conversation_metadata.json"),
+            native_root.join("history.jsonl"),
+            summary.clone(),
+            PathBuf::from(format!("{}-wal", summary.display())),
+            PathBuf::from(format!("{}-shm", summary.display())),
+        ];
+        let shared_files = shared_paths
+            .into_iter()
+            .map(AntigravityNativeFileSnapshot::capture)
+            .collect::<Result<Vec<_>, _>>()?;
+        let directories = [
+            native_root.join("conversations"),
+            native_root.join("brain"),
+            native_root.join("implicit"),
+            home.join(".tyde").join("antigravity").join("logs"),
+        ]
+        .into_iter()
+        .map(AntigravityNativeDirectorySnapshot::capture)
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            home,
+            native_root,
+            test_token,
+            shared_files,
+            directories,
+            session_ids: HashSet::new(),
+            owned_paths: HashSet::new(),
+            finalized: false,
+        })
+    }
+
+    fn scratch_dir(&self) -> PathBuf {
+        self.native_root.join("scratch")
+    }
+
+    fn no_root_dir(&self) -> PathBuf {
+        self.home.join(".tyde").join("antigravity").join("no-root")
+    }
+
+    fn register_session(&mut self, session_id: SessionId) {
+        assert!(
+            Uuid::parse_str(&session_id.0).is_ok(),
+            "Antigravity native session must be an exact UUID: {session_id}"
+        );
+        self.session_ids.insert(session_id);
+    }
+
+    fn track_owned_path(&mut self, path: PathBuf) {
+        self.owned_paths.insert(path);
+    }
+
+    fn register_test_conversations_from_native_diff(&mut self) -> Result<(), String> {
+        let conversations = self
+            .directories
+            .iter()
+            .find(|snapshot| snapshot.path.ends_with("antigravity-cli/conversations"))
+            .ok_or_else(|| "Antigravity conversation baseline is unavailable".to_string())?;
+        let mut discovered = Vec::new();
+        for path in antigravity_native_directory_entries(&conversations.path)?
+            .difference(&conversations.entries)
+        {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(stem).is_err() {
+                continue;
+            }
+            let bytes = std::fs::read(path).unwrap_or_default();
+            if bytes
+                .windows(self.test_token.len())
+                .any(|window| window == self.test_token.as_bytes())
+            {
+                discovered.push(SessionId(stem.to_string()));
+            }
+        }
+        self.session_ids.extend(discovered);
+        Ok(())
+    }
+
+    fn register_test_logs(&mut self) -> Result<(), String> {
+        let logs = self
+            .directories
+            .iter()
+            .find(|snapshot| snapshot.path.ends_with(".tyde/antigravity/logs"))
+            .ok_or_else(|| "Antigravity log baseline is unavailable".to_string())?;
+        for path in antigravity_native_directory_entries(&logs.path)?
+            .difference(&logs.entries)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains(&self.test_token)
+                || self
+                    .session_ids
+                    .iter()
+                    .any(|session_id| text.contains(&session_id.0))
+            {
+                self.owned_paths.insert(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn register_test_implicit_artifacts(&mut self) -> Result<(), String> {
+        let implicit = self
+            .directories
+            .iter()
+            .find(|snapshot| snapshot.path.ends_with("antigravity-cli/implicit"))
+            .ok_or_else(|| "Antigravity implicit baseline is unavailable".to_string())?;
+        let session_ids = self
+            .session_ids
+            .iter()
+            .map(|session_id| session_id.0.as_bytes())
+            .collect::<Vec<_>>();
+        for path in antigravity_native_directory_entries(&implicit.path)?
+            .difference(&implicit.entries)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let belongs_to_test = bytes
+                .windows(self.test_token.len())
+                .any(|window| window == self.test_token.as_bytes())
+                || session_ids.iter().any(|session_id| {
+                    bytes
+                        .windows(session_id.len())
+                        .any(|window| window == *session_id)
+                });
+            if belongs_to_test {
+                self.owned_paths.insert(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<(), String> {
+        let result = self.cleanup_and_verify();
+        self.finalized = result.is_ok();
+        result
+    }
+
+    fn cleanup_and_verify(&mut self) -> Result<(), String> {
+        self.register_test_conversations_from_native_diff()?;
+        self.register_test_implicit_artifacts()?;
+        for session_id in self.session_ids.clone() {
+            let base = self
+                .native_root
+                .join("conversations")
+                .join(format!("{}.db", session_id.0));
+            self.owned_paths.insert(base.clone());
+            self.owned_paths
+                .insert(PathBuf::from(format!("{}-wal", base.display())));
+            self.owned_paths
+                .insert(PathBuf::from(format!("{}-shm", base.display())));
+            self.owned_paths
+                .insert(self.native_root.join("brain").join(&session_id.0));
+            self.owned_paths.insert(
+                self.native_root
+                    .join("implicit")
+                    .join(format!("{}.pb", session_id.0)),
+            );
+        }
+        self.register_test_logs()?;
+        let mut owned_paths = self.owned_paths.iter().cloned().collect::<Vec<_>>();
+        owned_paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for path in owned_paths {
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(|error| {
+                    format!(
+                        "failed to remove test-owned native directory {}: {error}",
+                        path.display()
+                    )
+                })?;
+            } else if path.exists() {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "failed to remove test-owned native file {}: {error}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        for snapshot in &self.shared_files {
+            snapshot.restore()?;
+        }
+        for snapshot in &self.shared_files {
+            snapshot.verify()?;
+        }
+        for snapshot in &self.directories {
+            snapshot.verify()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AntigravityNativeArtifactGuard {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = self.cleanup_and_verify();
+        }
+    }
+}
+
+fn antigravity_native_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn antigravity_native_directory_entries(path: &Path) -> Result<HashSet<PathBuf>, String> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    std::fs::read_dir(path)
+        .map_err(|error| {
+            format!(
+                "failed to read native directory {}: {error}",
+                path.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("failed to read entry in {}: {error}", path.display()))
+        })
+        .collect()
+}
+
 struct RealBackendFixture {
     client: ValidatedConnection,
     #[allow(dead_code)]
@@ -4110,6 +4527,10 @@ impl ValidatedConnection {
         payload: ListSessionsPayload,
     ) -> Result<(), protocol::FrameError> {
         self.inner.list_sessions(payload).await
+    }
+
+    async fn close_agent(&mut self, stream: &StreamPath) -> Result<(), protocol::FrameError> {
+        self.inner.close_agent(stream).await
     }
 
     async fn next_event(&mut self) -> Result<Option<Envelope>, protocol::FrameError> {
@@ -4418,6 +4839,186 @@ async fn resume_agent_via_protocol(
     assert_eq!(agent_start.agent_id, new_agent.agent_id);
 
     agent_stream
+}
+
+async fn spawn_antigravity_with_start(
+    client: &mut ValidatedConnection,
+    workspace_roots: Vec<String>,
+    name: &str,
+    prompt: &str,
+) -> (StreamPath, AgentStartPayload) {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots,
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Antigravity,
+                launch_profile_id: None,
+                cost_hint: Some(SpawnCostHint::Low),
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn Antigravity regression agent");
+
+    let envelope = expect_next_event_kind(
+        client,
+        FrameKind::NewAgent,
+        "Antigravity regression NewAgent",
+    )
+    .await;
+    let new_agent: NewAgentPayload = envelope
+        .parse_payload()
+        .expect("parse Antigravity regression NewAgent");
+    assert_eq!(new_agent.backend_kind, BackendKind::Antigravity);
+    let start = expect_agent_start_on_stream(
+        client,
+        &new_agent.instance_stream,
+        "Antigravity regression AgentStart",
+    )
+    .await;
+    assert_eq!(start.backend_kind, BackendKind::Antigravity);
+    (new_agent.instance_stream, start)
+}
+
+async fn resume_antigravity_with_start(
+    client: &mut ValidatedConnection,
+    session_id: SessionId,
+    name: &str,
+    prompt: &str,
+) -> (StreamPath, AgentStartPayload) {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: Some(prompt.to_owned()),
+            },
+        })
+        .await
+        .expect("resume Antigravity regression agent");
+
+    let envelope = expect_next_event_kind(
+        client,
+        FrameKind::NewAgent,
+        "resumed Antigravity regression NewAgent",
+    )
+    .await;
+    let new_agent: NewAgentPayload = envelope
+        .parse_payload()
+        .expect("parse resumed Antigravity regression NewAgent");
+    assert_eq!(new_agent.backend_kind, BackendKind::Antigravity);
+    let start = expect_agent_start_on_stream(
+        client,
+        &new_agent.instance_stream,
+        "resumed Antigravity regression AgentStart",
+    )
+    .await;
+    assert_eq!(start.backend_kind, BackendKind::Antigravity);
+    (new_agent.instance_stream, start)
+}
+
+async fn close_antigravity_regression_agent(client: &mut ValidatedConnection, stream: &StreamPath) {
+    client
+        .close_agent(stream)
+        .await
+        .expect("close Antigravity regression agent");
+    loop {
+        let envelope = expect_next_event(client, "Antigravity regression AgentClosed").await;
+        if envelope.kind == FrameKind::AgentClosed && envelope.stream == *stream {
+            return;
+        }
+    }
+}
+
+fn antigravity_start_session(start: &AgentStartPayload) -> SessionId {
+    start
+        .session_id
+        .clone()
+        .expect("Antigravity AgentStart must carry its native UUID")
+}
+
+fn antigravity_routing_prompt(test_token: &str, marker_file: &str, probe_file: &str) -> String {
+    format!(
+        "Routing regression token {test_token}. Use the terminal without changing directories. \
+         Run exactly: {{ printf '%s\\n' \"$PWD\"; cat '{marker_file}'; }} > '{probe_file}'; \
+         cat '{probe_file}'. Then reply with exactly the command output."
+    )
+}
+
+fn seed_antigravity_marker(
+    guard: &mut AntigravityNativeArtifactGuard,
+    root: &Path,
+    marker_file: &str,
+    marker: &str,
+) {
+    std::fs::create_dir_all(root)
+        .unwrap_or_else(|error| panic!("create routing marker root {}: {error}", root.display()));
+    let path = root.join(marker_file);
+    assert!(
+        !path.exists(),
+        "unique routing marker unexpectedly exists: {}",
+        path.display()
+    );
+    guard.track_owned_path(path.clone());
+    std::fs::write(&path, marker)
+        .unwrap_or_else(|error| panic!("write routing marker {}: {error}", path.display()));
+}
+
+fn track_antigravity_probe_paths(
+    guard: &mut AntigravityNativeArtifactGuard,
+    roots: &[&Path],
+    probe_file: &str,
+) {
+    for root in roots {
+        guard.track_owned_path(root.join(probe_file));
+    }
+}
+
+fn assert_antigravity_routing_probe(
+    expected_root: &Path,
+    prohibited_roots: &[&Path],
+    probe_file: &str,
+    expected_marker: &str,
+    assistant_text: &str,
+) {
+    let expected_probe = expected_root.join(probe_file);
+    let content = std::fs::read_to_string(&expected_probe).unwrap_or_else(|error| {
+        panic!(
+            "routing probe was not created in primary {}: {error}; assistant={assistant_text:?}",
+            expected_probe.display()
+        )
+    });
+    assert_eq!(
+        content.lines().next(),
+        Some(expected_root.to_string_lossy().as_ref()),
+        "routing probe recorded the wrong pwd: {content:?}"
+    );
+    assert!(
+        content.contains(expected_marker),
+        "routing probe did not read the primary marker: {content:?}"
+    );
+    for root in prohibited_roots {
+        assert!(
+            !root.join(probe_file).exists(),
+            "routing probe escaped to {}",
+            root.display()
+        );
+    }
+    assert!(
+        assistant_text.contains(expected_marker)
+            && assistant_text.contains(expected_root.to_string_lossy().as_ref()),
+        "rendered Antigravity result did not report the primary probe: {assistant_text:?}"
+    );
 }
 
 async fn list_sessions_via_protocol(client: &mut ValidatedConnection) -> SessionListPayload {
@@ -6379,6 +6980,238 @@ async fn real_kiro_completes_a_turn_through_the_generic_acp_backend() {
         "a real Kiro turn through the generic ACP backend produced no usable \
          assistant text; got: {assistant_text:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_antigravity_keeps_selected_workspace_across_resume() {
+    assert!(
+        real_ai_tests_enabled(),
+        "set TYDE_RUN_REAL_AI_TESTS=1 to authorize the paid Antigravity regression"
+    );
+    assert!(
+        backend_binary_available(BackendKind::Antigravity),
+        "latest installed agy is required for the Antigravity regression"
+    );
+    assert!(
+        backend_runtime_available(BackendKind::Antigravity),
+        "Antigravity runtime prerequisites are unavailable"
+    );
+
+    let _native_lock = REAL_ANTIGRAVITY_NATIVE_MUTEX.lock().await;
+    let test_token = format!("tyde-antigravity-routing-{}", Uuid::new_v4());
+    let mut native_guard = AntigravityNativeArtifactGuard::capture(test_token.clone())
+        .expect("snapshot Antigravity native state");
+    let roots_dir = tempfile::tempdir().expect("create Antigravity routing roots");
+    let primary = roots_dir.path().join("primary root");
+    let extra_one = roots_dir.path().join("extra one");
+    let extra_two = roots_dir.path().join("extra two");
+    let unrelated = roots_dir.path().join("unrelated cwd");
+    let scratch = native_guard.scratch_dir();
+    let no_root = native_guard.no_root_dir();
+    let marker_file = format!("{test_token}-marker.txt");
+    let primary_marker = format!("PRIMARY_MARKER_{test_token}");
+    let extra_one_marker = format!("EXTRA_ONE_MARKER_{test_token}");
+    let extra_two_marker = format!("EXTRA_TWO_MARKER_{test_token}");
+    let unrelated_marker = format!("UNRELATED_MARKER_{test_token}");
+    let scratch_marker = format!("SCRATCH_MARKER_{test_token}");
+    let no_root_marker = format!("NO_ROOT_MARKER_{test_token}");
+    for (root, marker) in [
+        (primary.as_path(), primary_marker.as_str()),
+        (extra_one.as_path(), extra_one_marker.as_str()),
+        (extra_two.as_path(), extra_two_marker.as_str()),
+        (unrelated.as_path(), unrelated_marker.as_str()),
+        (scratch.as_path(), scratch_marker.as_str()),
+        (no_root.as_path(), no_root_marker.as_str()),
+    ] {
+        seed_antigravity_marker(&mut native_guard, root, &marker_file, marker);
+    }
+    let workspace_roots = vec![
+        primary.to_string_lossy().to_string(),
+        extra_one.to_string_lossy().to_string(),
+        extra_two.to_string_lossy().to_string(),
+    ];
+    let all_probe_roots = [
+        primary.as_path(),
+        extra_one.as_path(),
+        extra_two.as_path(),
+        unrelated.as_path(),
+        scratch.as_path(),
+        no_root.as_path(),
+    ];
+
+    let mut fixture = RealBackendFixture::new(BackendKind::Antigravity).await;
+    let first_probe = format!("{test_token}-first.txt");
+    track_antigravity_probe_paths(&mut native_guard, &all_probe_roots, &first_probe);
+    let first_prompt = antigravity_routing_prompt(&test_token, &marker_file, &first_probe);
+    let (first_stream, first_start) = spawn_antigravity_with_start(
+        &mut fixture.client,
+        workspace_roots.clone(),
+        "Antigravity workspace first turn",
+        &first_prompt,
+    )
+    .await;
+    assert_eq!(first_start.workspace_roots, workspace_roots);
+    let first_session = antigravity_start_session(&first_start);
+    native_guard.register_session(first_session.clone());
+    let first_turn = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &first_stream,
+        &first_prompt,
+    )
+    .await;
+    assert_antigravity_routing_probe(
+        &primary,
+        &[&extra_one, &extra_two, &unrelated, &scratch, &no_root],
+        &first_probe,
+        &primary_marker,
+        &first_turn.final_text,
+    );
+
+    let follow_up_probe = format!("{test_token}-follow-up.txt");
+    track_antigravity_probe_paths(&mut native_guard, &all_probe_roots, &follow_up_probe);
+    let follow_up_prompt = antigravity_routing_prompt(&test_token, &marker_file, &follow_up_probe);
+    fixture
+        .client
+        .send_message(&first_stream, follow_up_prompt.clone())
+        .await
+        .expect("send Antigravity routing follow-up");
+    let follow_up = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &first_stream,
+        &follow_up_prompt,
+    )
+    .await;
+    assert_antigravity_routing_probe(
+        &primary,
+        &[&extra_one, &extra_two, &unrelated, &scratch, &no_root],
+        &follow_up_probe,
+        &primary_marker,
+        &follow_up.final_text,
+    );
+    let sessions = list_sessions_via_protocol(&mut fixture.client).await;
+    let stored = sessions
+        .sessions
+        .iter()
+        .find(|session| session.id == first_session)
+        .expect("stored Antigravity routing session");
+    assert_eq!(stored.workspace_roots, workspace_roots);
+
+    close_antigravity_regression_agent(&mut fixture.client, &first_stream).await;
+    let resume_probe = format!("{test_token}-resume.txt");
+    track_antigravity_probe_paths(&mut native_guard, &all_probe_roots, &resume_probe);
+    let resume_prompt = antigravity_routing_prompt(&test_token, &marker_file, &resume_probe);
+    let (resumed_stream, resumed_start) = resume_antigravity_with_start(
+        &mut fixture.client,
+        first_session.clone(),
+        "Antigravity workspace History resume",
+        &resume_prompt,
+    )
+    .await;
+    assert_eq!(
+        antigravity_start_session(&resumed_start),
+        first_session,
+        "History resume must reuse the exact native conversation UUID"
+    );
+    assert_eq!(
+        resumed_start.workspace_roots, workspace_roots,
+        "History resume must retain stored ordered roots"
+    );
+    let resumed_turn = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &resumed_stream,
+        &resume_prompt,
+    )
+    .await;
+    assert_antigravity_routing_probe(
+        &primary,
+        &[&extra_one, &extra_two, &unrelated, &scratch, &no_root],
+        &resume_probe,
+        &primary_marker,
+        &resumed_turn.final_text,
+    );
+    close_antigravity_regression_agent(&mut fixture.client, &resumed_stream).await;
+
+    let second_probe = format!("{test_token}-second-fresh.txt");
+    track_antigravity_probe_paths(&mut native_guard, &all_probe_roots, &second_probe);
+    let second_prompt = antigravity_routing_prompt(&test_token, &marker_file, &second_probe);
+    let (second_stream, second_start) = spawn_antigravity_with_start(
+        &mut fixture.client,
+        workspace_roots.clone(),
+        "Antigravity workspace second fresh turn",
+        &second_prompt,
+    )
+    .await;
+    assert_eq!(second_start.workspace_roots, workspace_roots);
+    let second_session = antigravity_start_session(&second_start);
+    assert_ne!(
+        second_session, first_session,
+        "an independent fresh spawn must create a distinct native conversation"
+    );
+    native_guard.register_session(second_session.clone());
+    let second_turn = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &second_stream,
+        &second_prompt,
+    )
+    .await;
+    assert_antigravity_routing_probe(
+        &primary,
+        &[&extra_one, &extra_two, &unrelated, &scratch, &no_root],
+        &second_probe,
+        &primary_marker,
+        &second_turn.final_text,
+    );
+    close_antigravity_regression_agent(&mut fixture.client, &second_stream).await;
+
+    let no_root_probe = format!("{test_token}-no-root.txt");
+    track_antigravity_probe_paths(&mut native_guard, &all_probe_roots, &no_root_probe);
+    let no_root_prompt = antigravity_routing_prompt(&test_token, &marker_file, &no_root_probe);
+    let (no_root_stream, no_root_start) = spawn_antigravity_with_start(
+        &mut fixture.client,
+        Vec::new(),
+        "Antigravity workspace no-root turn",
+        &no_root_prompt,
+    )
+    .await;
+    assert!(
+        no_root_start.workspace_roots.is_empty(),
+        "no-root AgentStart must preserve empty protocol roots"
+    );
+    let no_root_session = antigravity_start_session(&no_root_start);
+    assert_ne!(no_root_session, first_session);
+    assert_ne!(no_root_session, second_session);
+    native_guard.register_session(no_root_session.clone());
+    let no_root_turn = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &no_root_stream,
+        &no_root_prompt,
+    )
+    .await;
+    assert_antigravity_routing_probe(
+        &no_root,
+        &[&primary, &extra_one, &extra_two, &unrelated, &scratch],
+        &no_root_probe,
+        &no_root_marker,
+        &no_root_turn.final_text,
+    );
+    close_antigravity_regression_agent(&mut fixture.client, &no_root_stream).await;
+
+    for session_id in [&first_session, &second_session, &no_root_session] {
+        fixture
+            .client
+            .inner
+            .delete_session(protocol::DeleteSessionPayload {
+                session_id: (*session_id).clone(),
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("delete owned Antigravity session {session_id}: {error:?}")
+            });
+    }
+    native_guard
+        .finalize()
+        .expect("restore Antigravity native state");
 }
 
 #[tokio::test]

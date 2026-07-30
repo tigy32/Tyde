@@ -96,6 +96,13 @@ struct PreparedTurn {
     session_capture: Option<SessionCapture>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct AntigravityCliInvocation {
+    executable: &'static str,
+    args: Vec<String>,
+    current_dir: String,
+}
+
 struct AntigravityStdoutSummary {
     stdout: String,
     streamed_text: String,
@@ -619,9 +626,10 @@ impl AntigravityInner {
     }
 
     async fn run_turn(self: &Arc<Self>, prepared: &mut PreparedTurn) -> TurnOutcome {
-        let args = antigravity_cli_args(
+        let invocation = AntigravityCliInvocation::new(
             prepared.access_mode,
             &prepared.model,
+            &prepared.primary_root,
             &prepared.extra_roots,
             prepared.conversation_id.as_ref(),
             &prepared.log_file,
@@ -644,24 +652,22 @@ impl AntigravityInner {
             }
         };
 
-        let outcome = self.run_turn_process(prepared, &args).await;
+        let outcome = self.run_turn_process(prepared, &invocation).await;
         restore_antigravity_mcp_config(mcp_guard, outcome)
     }
 
     async fn run_turn_process(
         self: &Arc<Self>,
         prepared: &mut PreparedTurn,
-        args: &[String],
+        invocation: &AntigravityCliInvocation,
     ) -> TurnOutcome {
-        let mut command = Command::new("agy");
-        for arg in args {
-            command.arg(arg);
-        }
+        let mut command = Command::new(invocation.executable);
+        command.args(&invocation.args);
         if let Some(path) = process_env::resolved_child_process_path() {
             command.env("PATH", path);
         }
         command
-            .current_dir(&prepared.primary_root)
+            .current_dir(&invocation.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1012,38 +1018,49 @@ fn new_antigravity_log_file_path(turn_id: u64) -> Result<PathBuf, String> {
     Ok(dir.join(format!("turn-{turn_id}-{}.log", Uuid::new_v4())))
 }
 
-pub(crate) fn antigravity_cli_args(
-    access_mode: BackendAccessMode,
-    model: &str,
-    extra_roots: &[String],
-    conversation_id: Option<&SessionId>,
-    log_file: &Path,
-    prompt: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "--print-timeout".to_string(),
-        ANTIGRAVITY_PRINT_TIMEOUT.to_string(),
-        "--log-file".to_string(),
-        log_file.to_string_lossy().to_string(),
-    ];
-    match access_mode {
-        // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
-        // must use the non-sandbox path to let build/test commands write target/.
-        BackendAccessMode::Unrestricted => args.push("--dangerously-skip-permissions".to_string()),
-        BackendAccessMode::ReadOnly => args.push("--dangerously-skip-permissions".to_string()),
-    }
-    args.push("--model".to_string());
-    args.push(model.to_string());
-    if let Some(conversation_id) = conversation_id {
-        args.push(format!("--conversation={conversation_id}"));
-    }
-    for root in extra_roots {
+impl AntigravityCliInvocation {
+    fn new(
+        access_mode: BackendAccessMode,
+        model: &str,
+        primary_root: &str,
+        extra_roots: &[String],
+        conversation_id: Option<&SessionId>,
+        log_file: &Path,
+        prompt: &str,
+    ) -> Self {
+        let mut args = vec![
+            "--print-timeout".to_string(),
+            ANTIGRAVITY_PRINT_TIMEOUT.to_string(),
+            "--log-file".to_string(),
+            log_file.to_string_lossy().to_string(),
+        ];
+        match access_mode {
+            // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
+            // must use the non-sandbox path to let build/test commands write target/.
+            BackendAccessMode::Unrestricted => {
+                args.push("--dangerously-skip-permissions".to_string())
+            }
+            BackendAccessMode::ReadOnly => args.push("--dangerously-skip-permissions".to_string()),
+        }
+        args.push("--model".to_string());
+        args.push(model.to_string());
+        if let Some(conversation_id) = conversation_id {
+            args.push(format!("--conversation={conversation_id}"));
+        }
         args.push("--add-dir".to_string());
-        args.push(root.clone());
+        args.push(primary_root.to_string());
+        for root in extra_roots {
+            args.push("--add-dir".to_string());
+            args.push(root.clone());
+        }
+        args.push("-p".to_string());
+        args.push(prompt.to_string());
+        Self {
+            executable: "agy",
+            args,
+            current_dir: primary_root.to_string(),
+        }
     }
-    args.push("-p".to_string());
-    args.push(prompt.to_string());
-    args
 }
 
 impl PreparedTurn {
@@ -1942,20 +1959,34 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn invocation_add_dir_values(invocation: &AntigravityCliInvocation) -> Vec<&str> {
+        invocation
+            .args
+            .windows(2)
+            .filter_map(|pair| (pair[0] == "--add-dir").then_some(pair[1].as_str()))
+            .collect()
+    }
+
     #[test]
-    fn cli_args_include_timeout_model_roots_and_unrestricted_permission() {
+    fn invocation_includes_primary_extras_and_unrestricted_permission() {
         let log_file = Path::new("/tmp/tyde-agy.log");
-        let args = antigravity_cli_args(
+        let invocation = AntigravityCliInvocation::new(
             BackendAccessMode::Unrestricted,
             ANTIGRAVITY_DEFAULT_MODEL,
-            &["/extra/one".to_string(), "/extra/two".to_string()],
+            "/primary root",
+            &[
+                "/extra/one".to_string(),
+                "/extra/two with spaces".to_string(),
+            ],
             None,
             log_file,
             "hello",
         );
 
+        assert_eq!(invocation.executable, "agy");
+        assert_eq!(invocation.current_dir, "/primary root");
         assert_eq!(
-            args,
+            invocation.args,
             vec![
                 "--print-timeout",
                 "5m",
@@ -1965,36 +1996,137 @@ mod tests {
                 "--model",
                 "Gemini 3.5 Flash (Medium)",
                 "--add-dir",
+                "/primary root",
+                "--add-dir",
                 "/extra/one",
                 "--add-dir",
-                "/extra/two",
+                "/extra/two with spaces",
                 "-p",
                 "hello",
             ]
         );
-        assert!(!args.iter().any(|arg| arg == "--conversation"));
-        assert!(!args.iter().any(|arg| arg == "--continue"));
+        assert_eq!(
+            invocation.current_dir,
+            invocation_add_dir_values(&invocation)[0]
+        );
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--conversation" || arg == "--continue" || arg == "-c")
+        );
     }
 
     #[test]
-    fn cli_args_resume_uses_exact_conversation_id() {
+    fn invocation_resume_uses_exact_conversation_id_and_primary() {
         let session_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_string());
-        let args = antigravity_cli_args(
+        let invocation = AntigravityCliInvocation::new(
             BackendAccessMode::Unrestricted,
             ANTIGRAVITY_DEFAULT_MODEL,
-            &[],
+            "/primary root",
+            &["/extra/one".to_string()],
             Some(&session_id),
             Path::new("/tmp/tyde-agy-resume.log"),
             "follow up",
         );
 
-        assert!(args.iter().any(|arg| arg == "--log-file"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--conversation=55a3c5e1-a2e1-44c1-9246-6e3de751803d"),
-            "resume args must use exact --conversation=<UUID>: {args:?}"
+        assert_eq!(invocation.executable, "agy");
+        assert_eq!(invocation.current_dir, "/primary root");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "--print-timeout",
+                "5m",
+                "--log-file",
+                "/tmp/tyde-agy-resume.log",
+                "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.5 Flash (Medium)",
+                "--conversation=55a3c5e1-a2e1-44c1-9246-6e3de751803d",
+                "--add-dir",
+                "/primary root",
+                "--add-dir",
+                "/extra/one",
+                "-p",
+                "follow up",
+            ]
         );
-        assert!(!args.iter().any(|arg| arg == "--continue" || arg == "-c"));
+        assert_eq!(
+            invocation.current_dir,
+            invocation_add_dir_values(&invocation)[0]
+        );
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--continue" || arg == "-c")
+        );
+    }
+
+    #[test]
+    fn invocation_live_follow_up_reuses_exact_conversation_and_roots() {
+        let session_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_string());
+        let invocation = AntigravityCliInvocation::new(
+            BackendAccessMode::Unrestricted,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            "/primary root",
+            &["/extra/one".to_string()],
+            Some(&session_id),
+            Path::new("/tmp/tyde-agy-follow-up.log"),
+            "next turn",
+        );
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "--print-timeout",
+                "5m",
+                "--log-file",
+                "/tmp/tyde-agy-follow-up.log",
+                "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.5 Flash (Medium)",
+                "--conversation=55a3c5e1-a2e1-44c1-9246-6e3de751803d",
+                "--add-dir",
+                "/primary root",
+                "--add-dir",
+                "/extra/one",
+                "-p",
+                "next turn",
+            ]
+        );
+        assert_eq!(
+            invocation.current_dir,
+            invocation_add_dir_values(&invocation)[0]
+        );
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--continue" || arg == "-c")
+        );
+    }
+
+    #[test]
+    fn invocation_preserves_duplicate_extras_verbatim() {
+        let invocation = AntigravityCliInvocation::new(
+            BackendAccessMode::Unrestricted,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            "/primary",
+            &[
+                "/extra/one".to_string(),
+                "/extra/one".to_string(),
+                "/extra/two".to_string(),
+            ],
+            None,
+            Path::new("/tmp/tyde-agy-duplicates.log"),
+            "hello",
+        );
+
+        assert_eq!(
+            invocation_add_dir_values(&invocation),
+            vec!["/primary", "/extra/one", "/extra/one", "/extra/two"]
+        );
     }
 
     #[test]
@@ -2068,10 +2200,44 @@ mod tests {
         let no_root_cwd = dir.path().join("antigravity").join("no-root");
         let (primary, extra) =
             resolve_workspace_roots_with_no_root_cwd(&[], &no_root_cwd).expect("resolve no roots");
+        let invocation = AntigravityCliInvocation::new(
+            BackendAccessMode::Unrestricted,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            &primary,
+            &extra,
+            None,
+            Path::new("/tmp/tyde-agy-no-root.log"),
+            "hello",
+        );
 
         assert_eq!(primary, no_root_cwd.to_string_lossy().to_string());
         assert!(extra.is_empty());
         assert!(no_root_cwd.is_dir());
+        assert_eq!(invocation.current_dir, primary);
+        assert_eq!(invocation_add_dir_values(&invocation), vec![primary]);
+    }
+
+    #[test]
+    fn workspace_resolver_preserves_local_root_order_and_spaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("primary root");
+        let extra_one = dir.path().join("extra one");
+        let extra_two = dir.path().join("extra two");
+        for root in [&primary, &extra_one, &extra_two] {
+            std::fs::create_dir(root).expect("create workspace root");
+        }
+        let roots = vec![
+            primary.to_string_lossy().to_string(),
+            extra_one.to_string_lossy().to_string(),
+            extra_two.to_string_lossy().to_string(),
+        ];
+
+        let (resolved_primary, resolved_extras) =
+            resolve_workspace_roots_with_no_root_cwd(&roots, dir.path())
+                .expect("resolve local roots");
+
+        assert_eq!(resolved_primary, roots[0]);
+        assert_eq!(resolved_extras, roots[1..].to_vec());
     }
 
     #[test]
@@ -2368,19 +2534,22 @@ mod tests {
         // ReadOnly is advisory for `agy`; keep asserting the arg builder no
         // longer surfaces the old "no enforceable read-only mode" error.
         let log_file = Path::new("/tmp/tyde-agy-readonly.log");
-        let args = antigravity_cli_args(
+        let invocation = AntigravityCliInvocation::new(
             BackendAccessMode::ReadOnly,
             ANTIGRAVITY_DEFAULT_MODEL,
+            "/primary",
             &[],
             None,
             log_file,
             "hello",
         );
         assert!(
-            !args
+            !invocation
+                .args
                 .iter()
                 .any(|arg| arg.contains("no enforceable read-only mode")),
-            "read-only args must not carry the old refusal error: {args:?}"
+            "read-only args must not carry the old refusal error: {:?}",
+            invocation.args
         );
     }
 
@@ -2821,19 +2990,38 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_read_only_uses_skip_permissions_without_sandbox() {
-        let args = antigravity_cli_args(
+    fn invocation_read_only_uses_skip_permissions_without_sandbox() {
+        let invocation = AntigravityCliInvocation::new(
             BackendAccessMode::ReadOnly,
             ANTIGRAVITY_DEFAULT_MODEL,
+            "/primary",
             &["/extra/one".to_string()],
             None,
             Path::new("/tmp/tyde-agy-ro.log"),
             "hello",
         );
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--dangerously-skip-permissions"),
-            "read-only args must allow non-interactive build/test commands: {args:?}"
+        let args = &invocation.args;
+        assert_eq!(
+            args,
+            &vec![
+                "--print-timeout",
+                "5m",
+                "--log-file",
+                "/tmp/tyde-agy-ro.log",
+                "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.5 Flash (Medium)",
+                "--add-dir",
+                "/primary",
+                "--add-dir",
+                "/extra/one",
+                "-p",
+                "hello",
+            ]
+        );
+        assert_eq!(
+            invocation.current_dir,
+            invocation_add_dir_values(&invocation)[0]
         );
         assert!(
             !args.iter().any(|arg| arg == "--sandbox"),
@@ -2848,15 +3036,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_unrestricted_skips_permissions_without_sandbox() {
-        let args = antigravity_cli_args(
+    fn invocation_unrestricted_skips_permissions_without_sandbox() {
+        let invocation = AntigravityCliInvocation::new(
             BackendAccessMode::Unrestricted,
             ANTIGRAVITY_DEFAULT_MODEL,
+            "/primary",
             &["/extra/one".to_string()],
             None,
             Path::new("/tmp/tyde-agy-rw.log"),
             "hello",
         );
+        let args = &invocation.args;
         assert!(
             args.iter()
                 .any(|arg| arg == "--dangerously-skip-permissions"),

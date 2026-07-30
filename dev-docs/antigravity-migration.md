@@ -3,7 +3,7 @@
 I re-read `AGENTS.md`, `tests/TESTING.md`, and
 `dev-docs/01-philosophy.md` before updating this document. This is the design
 for fully removing the Gemini CLI backend and replacing it with Google's
-Antigravity CLI (`agy`). Implementation happens in a later phase.
+Antigravity CLI (`agy`), plus the current invocation contract.
 
 ---
 
@@ -15,25 +15,41 @@ host.
 ### Binary and invocation
 
 - Binary: `~/.local/bin/agy`
-- Original implementation probe version: `1.0.6`
-- Follow-up no-cost probe version: `1.0.7`
+- Current workspace-routing evidence version: `1.1.8`
 - Headless one-shot invocation works from a normal non-interactive subprocess;
   no PTY is required for `--print` / `-p`.
-- Run with `cwd` set to the primary workspace root.
-- Pass one `--add-dir <path>` for each additional workspace root.
+- Set the process `cwd` to the primary workspace root and pass that exact same
+  primary as the first `--add-dir`.
+- Pass every additional workspace root as a later `--add-dir`, verbatim and in
+  order.
 - Always set `--print-timeout`; invalid model names were observed to hang.
 
 Validated invocation shape:
 
 ```text
 ~/.local/bin/agy \
-    --model '<exact model label>' \
-    [--sandbox] \
-    [--dangerously-skip-permissions] \
     --print-timeout <duration> \
+    --log-file '<per-turn-log>' \
+    --dangerously-skip-permissions \
+    --model '<exact model label>' \
+    [--conversation=<native-agy-uuid>] \
+    --add-dir <primary-root> \
     --add-dir <extra-root> \
     -p '<prompt>'
 ```
+
+One mandatory invocation constructor owns the executable, access-mode argument
+mapping, argv, and process cwd. It receives the resolved primary once and
+projects that same value into `current_dir` and the first `--add-dir`, making
+`cwd == first --add-dir` an enforced invariant. The process launcher consumes
+the completed invocation and does not derive workspace or permission arguments.
+
+The cwd is a required process input, not a fallback for `--add-dir`. Omitting
+`current_dir` would inherit the server's unrelated launch directory, and current
+`agy` logs show that the OS cwd is included in `workspaceDirs`. Conversely,
+cwd-only routing failed by selecting `default-cli-project` and running tools in
+`~/.gemini/antigravity-cli/scratch`; the first `--add-dir` is the documented
+selector that activates the primary.
 
 Example readiness probe shape:
 
@@ -42,15 +58,17 @@ Example readiness probe shape:
     --model 'Gemini 3.5 Flash (Low)' \
     --print-timeout 30s \
     --dangerously-skip-permissions \
+    --add-dir '<probe-workspace>' \
     -p 'Reply exactly with ok'
 ```
 
-Current `agy 1.0.8 --help` documents native resume with
+Current `agy 1.1.8 --help` documents native resume with
 `--conversation <ID>` / `--continue`. Tyde uses exact
 `--conversation=<UUID>` and captures the native conversation UUID from the
 per-turn `--log-file` output (`Created conversation <UUID>` /
 `conversation=<UUID>`). The Tyde `SessionId` for new Antigravity sessions is
-the native conversation UUID.
+the native conversation UUID. The version is evidence provenance only; Tyde
+targets the latest installed CLI and does not branch, pin, or gate on it.
 
 ### Output contract
 
@@ -132,13 +150,11 @@ honored.
 
 Design decision for Antigravity `ReadOnly`:
 
-- Fail closed for `BackendAccessMode::ReadOnly` with a clear backend error.
-- Explain that Antigravity CLI has no enforceable read-only mode.
-- Keep `--sandbox` available only as an optional terminal restriction in future
-  work, not as Tyde's read-only enforcement.
-
-This follows `dev-docs/20-backend-access-mode.md`: a backend must either honor
-`ReadOnly` or reject it; it must never silently downgrade to unrestricted.
+- Include Tyde's shared read-only advisory in the prompt.
+- Pass `--dangerously-skip-permissions` without `--sandbox`, so non-interactive
+  build and test commands can run.
+- Do not claim that Antigravity provides a hard write boundary. The distinction
+  from unrestricted mode is the advisory.
 
 For `BackendAccessMode::Unrestricted`, pass `--dangerously-skip-permissions` so
 headless turns do not block on interactive approvals.
@@ -317,7 +333,7 @@ all protected by the compiler.
   native session id; Antigravity must resolve `ready_tx` with the captured
   native `agy` conversation UUID before persisting the Tyde session.
 - `server/src/backend/gemini.rs:2083-2108` — in-file Gemini arg/permission tests
-  must be replaced by Antigravity arg construction and read-only fail-closed
+  must be replaced by Antigravity arg construction and advisory read-only argv
   unit tests.
 
 ### Tests
@@ -346,8 +362,8 @@ all protected by the compiler.
 ### Dev docs
 
 - `dev-docs/20-backend-access-mode.md:92-103` — replace the `### Gemini`
-  section with `### Antigravity`, documenting that `agy` `1.0.6` has no true
-  read-only mode and Tyde fails closed for read-only Antigravity sessions.
+  section with `### Antigravity`, documenting that `agy` has no true read-only
+  mode and Tyde uses the shared advisory without `--sandbox`.
 
 ### Frontend / mobile touchpoints
 
@@ -442,9 +458,15 @@ agy --print-timeout 5m \
     --dangerously-skip-permissions \
     --model '<exact-model-label>' \
     [--conversation=<native-agy-uuid>] \
+    --add-dir '<primary-root>' \
     --add-dir '<extra-root>' \
     -p '<combined prompt>'
 ```
+
+The same constructor sets the child process cwd to `<primary-root>`. It appends
+all extras verbatim, including repeated extras, and tests assert that the cwd
+equals the first add-dir value. `BackendAccessMode` is also consumed by this
+constructor so permission arguments cannot be appended at a second site.
 
 Use exact `--conversation=<UUID>` for live follow-up turns and resumed sessions.
 Do not use `--continue`, because it is cwd-dependent.
@@ -458,7 +480,6 @@ Therefore Antigravity uses the native `agy` conversation UUID as its session
 identity:
 
 1. Validate fail-fast inputs before launching any child:
-   - `access_mode` must not be `ReadOnly`.
    - resolved model must be one of the exact known labels.
    - workspace roots must resolve to the primary `cwd` plus `--add-dir` extras.
 2. Run the first `agy -p` turn with a per-turn `--log-file`.
@@ -541,16 +562,9 @@ no-fallback and server-owned-behavior rules from `01-philosophy.md`.
 
 `BackendAccessMode::ReadOnly`:
 
-- Fail closed before launching `agy`.
-- Emit a clear backend startup/turn error, for example:
-
-```text
-Antigravity CLI has no enforceable read-only mode; refusing read_only spawn
-```
-
-This is the safest viable way to honor Tyde's read-only contract today. A later
-implementation could add a real external OS sandbox and then enable read-only
-spawns, but that is out of scope for the Gemini-removal replacement.
+- Pass `--dangerously-skip-permissions` without `--sandbox`.
+- Include Tyde's shared read-only advisory in the prompt.
+- Do not claim that this is an Antigravity-enforced sandbox.
 
 ### Auth and setup
 
@@ -661,6 +675,13 @@ Removing `BackendKind::Gemini` breaks strict deserialization anywhere persisted
 JSON still contains `"gemini"`. The migration must be one-shot at store `load()`
 time, and `read_from_disk` must remain strict afterward because it is called on
 every mutation.
+
+This release does not rewrite existing Antigravity native conversation history.
+Historical native metadata may continue to identify `default-cli-project`;
+correct workspace routing applies when a fresh, follow-up, or History-resume
+turn is run after the upgrade, while previously rendered history replays as
+stored. This limitation belongs in the RC release notes and does not introduce
+version-specific behavior.
 
 #### `sessions.json`
 
@@ -787,12 +808,12 @@ Codex implementation should remove every compiled Gemini touchpoint:
 - Update `server/src/store/agent_teams.rs` one-shot Gemini member/session repair
   migration.
 - Update `dev-docs/20-backend-access-mode.md` `### Gemini` section to describe
-  Antigravity fail-closed read-only behavior.
+  Antigravity advisory read-only behavior.
 - Update server-side tests in `tests/tests/backend.rs`,
   `tests/tests/custom_agents.rs`, and `tests/tests/settings.rs`.
 - Replace Gemini in-file backend tests with Antigravity arg construction,
   timeout, model, MCP config, spawn handshake, native resume, unsupported fork,
-  and read-only rejection tests.
+  and advisory read-only argv tests.
 - Ignore the `old/` tree unless it is actually compiled.
 
 ### Test plan
@@ -814,8 +835,8 @@ Server/mock protocol tests:
 - Assert Antigravity session settings schema is emitted as a ready schema with a
   non-null `model` select containing the exact model labels and defaulting to
   `Gemini 3.5 Flash (Medium)`.
-- Assert read-only Antigravity spawn fails visibly with a command/backend error
-  rather than silently spawning unrestricted.
+- Assert read-only Antigravity invocation includes the shared advisory,
+  `--dangerously-skip-permissions`, and no `--sandbox`.
 
 Store/unit tests:
 
@@ -840,7 +861,7 @@ Store/unit tests:
 - `antigravity.rs`: `list_sessions` returns empty, `resume` rejects legacy
   synthetic `antigravity-<uuid>` ids, native `resume` uses
   `--conversation=<UUID>`, and `fork` returns an explicit unsupported error.
-- `antigravity.rs`: read-only arg/spawn path rejects before launching `agy`.
+- `antigravity.rs`: read-only argv uses the advisory non-sandbox mapping.
 - `antigravity.rs`: plain-text stdout parser emits stream start/deltas/end and
   surfaces `Authentication required` / `Error:` lines as backend errors.
 - `antigravity.rs`: MCP config merge/restore preserves exact original bytes and
