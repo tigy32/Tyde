@@ -31,7 +31,7 @@ command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspa
 serial-backend-fakes = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
+filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/) | test(/backend::acp::backend::tests::authenticated_kiro_startup_allows_session_load_replay/)'
 test-group = 'serial-backend-fakes'
 
 # These tests intentionally exercise real CLI probes at tight process timeout
@@ -44,7 +44,7 @@ filter = '(binary_id(tests::settings) & test(/(backend_(setup_payload_(uses_sign
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
-filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
+filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/) | test(/backend::acp::backend::tests::authenticated_kiro_startup_allows_session_load_replay/)'
 test-group = 'serial-backend-fakes'
 
 [[profile.ci.overrides]]

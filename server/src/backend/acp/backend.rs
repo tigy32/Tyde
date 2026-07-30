@@ -15,7 +15,8 @@ use protocol::{
 };
 
 use crate::acp::adapter::{
-    AcpAgentAdapter, AcpCapabilities, AcpRequestCtx, AcpSessionKind, adapter_for_spec,
+    AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpRequestCtx,
+    AcpSessionKind, adapter_for_spec,
 };
 use crate::acp::{
     AcpBridge, AcpInbound, acp_mcp_servers_json, extract_message_id, extract_text_from_update,
@@ -158,11 +159,31 @@ fn parse_capabilities(response: &Value) -> AcpCapabilities {
                 methods
                     .iter()
                     .filter_map(|method| {
-                        method
+                        let id = method
                             .get("id")
-                            .or_else(|| method.get("methodId"))
                             .and_then(Value::as_str)
-                            .map(str::to_string)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .or_else(|| {
+                                method
+                                    .get("methodId")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                            })?;
+                        let optional_string = |key| {
+                            method
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                        };
+                        Some(AcpAuthMethod {
+                            id: id.to_string(),
+                            name: optional_string("name"),
+                            description: optional_string("description"),
+                        })
                     })
                     .collect()
             })
@@ -177,40 +198,73 @@ fn parse_capabilities(response: &Value) -> AcpCapabilities {
 
 /// Run `authenticate` when the agent advertises auth methods.
 ///
-/// Tries each advertised method in the order the agent listed them and
-/// succeeds on the first that works. If every method fails, that is a hard
-/// error naming the agent and the last failure — Tyde does not proceed to
-/// `session/new` hoping the agent will accept an unauthenticated session.
+/// Tries each protocol method in advertised order and succeeds on the first
+/// that works. Adapter-classified external setup is never sent to
+/// `authenticate`; it becomes an actionable hard error if no later protocol
+/// method succeeds. Tyde never proceeds to `session/new` unauthenticated.
 async fn authenticate_if_required(
     bridge: &AcpBridge,
     capabilities: &AcpCapabilities,
-    agent: &str,
+    adapter: &dyn AcpAgentAdapter,
 ) -> Result<(), String> {
     if capabilities.auth_methods.is_empty() {
         return Ok(());
     }
 
+    let agent = adapter.display_name();
     let mut last_error = None;
-    for method_id in &capabilities.auth_methods {
-        match bridge
-            .request("authenticate", json!({ "methodId": method_id }))
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!("{agent}: authenticated via ACP method '{method_id}'");
-                return Ok(());
+    let mut external_requirements = Vec::new();
+    for method in &capabilities.auth_methods {
+        match adapter.auth_method_handling(method) {
+            AcpAuthMethodHandling::ProtocolAuthenticate => {
+                match bridge
+                    .request(
+                        "authenticate",
+                        json!({ "methodId": method.id.as_str() }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::debug!("{agent}: authenticated via ACP method '{}'", method.id);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        tracing::debug!("{agent}: ACP auth method '{}' failed: {err}", method.id);
+                        last_error = Some(err);
+                    }
+                }
             }
-            Err(err) => {
-                tracing::debug!("{agent}: ACP auth method '{method_id}' failed: {err}");
-                last_error = Some(err);
+            AcpAuthMethodHandling::ExternalSetup { instruction } => {
+                external_requirements.push((&method.id, instruction));
             }
         }
+    }
+
+    if let [(method_id, instruction)] = external_requirements.as_slice() {
+        return Err(format!(
+            "{agent} authentication required via '{method_id}'. {instruction}"
+        ));
+    }
+    if !external_requirements.is_empty() {
+        let methods = external_requirements
+            .iter()
+            .map(|(method_id, instruction)| format!("'{method_id}': {instruction}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "{agent} authentication requires external setup. Complete one of: {methods}"
+        ));
     }
 
     Err(format!(
         "{agent} requires authentication and every advertised method failed \
          (tried: {}). Last error: {}",
-        capabilities.auth_methods.join(", "),
+        capabilities
+            .auth_methods
+            .iter()
+            .map(|method| method.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         last_error.unwrap_or_else(|| "no methods advertised".to_string())
     ))
 }
@@ -414,11 +468,9 @@ impl KiroSession {
         .await?;
         let capabilities = parse_capabilities(&initialize_response);
 
-        // Authenticate before creating a session when the agent advertises
-        // auth methods. Kiro advertises none, so this is a no-op for it; agents
-        // like Gemini CLI require it and would otherwise fail `session/new`
-        // with an opaque error.
-        authenticate_if_required(&bridge, &capabilities, adapter.display_name()).await?;
+        // Adapter-specific external setup remains a hard gate; protocol auth
+        // methods must succeed before a session can be created.
+        authenticate_if_required(&bridge, &capabilities, adapter.as_ref()).await?;
 
         let session_result: Result<(String, Value), String> = async {
             let mut session_params = json!({
@@ -4440,7 +4492,7 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -4581,13 +4633,545 @@ mod tests {
                 "loadSession": true,
                 "promptCapabilities": { "image": true }
             },
-            "authMethods": [{ "id": "oauth" }, { "id": "api-key" }],
+            "authMethods": [
+                {
+                    "id": "oauth",
+                    "name": "Browser login",
+                    "description": "Complete login in the browser"
+                },
+                {
+                    "methodId": "api-key",
+                    "name": "API key"
+                }
+            ],
             "agentInfo": { "name": "some-agent" }
         }));
         assert!(caps.load_session);
         assert!(caps.image);
-        assert_eq!(caps.auth_methods, vec!["oauth", "api-key"]);
+        assert_eq!(
+            caps.auth_methods,
+            vec![
+                AcpAuthMethod {
+                    id: "oauth".to_string(),
+                    name: Some("Browser login".to_string()),
+                    description: Some("Complete login in the browser".to_string()),
+                },
+                AcpAuthMethod {
+                    id: "api-key".to_string(),
+                    name: Some("API key".to_string()),
+                    description: None,
+                },
+            ]
+        );
         assert_eq!(caps.agent_info.as_deref(), Some("some-agent"));
+    }
+
+    #[test]
+    fn malformed_auth_methods_cannot_become_invocable_or_retain_extra_fields() {
+        let caps = parse_capabilities(&json!({
+            "protocolVersion": 1,
+            "authMethods": [
+                { "id": "" },
+                { "id": 7, "name": "invalid" },
+                {
+                    "id": "valid",
+                    "name": { "unexpected": true },
+                    "description": ["not", "text"],
+                    "credential": "must-not-survive"
+                },
+                {
+                    "id": " ",
+                    "methodId": "fallback-id",
+                    "name": " Fallback "
+                }
+            ]
+        }));
+
+        assert_eq!(
+            caps.auth_methods,
+            vec![
+                AcpAuthMethod {
+                    id: "valid".to_string(),
+                    name: None,
+                    description: None,
+                },
+                AcpAuthMethod {
+                    id: "fallback-id".to_string(),
+                    name: Some("Fallback".to_string()),
+                    description: None,
+                },
+            ]
+        );
+    }
+
+    struct ExternalAuthTestAdapter {
+        stock: crate::acp::adapters::stock::StockAdapter,
+    }
+
+    impl ExternalAuthTestAdapter {
+        fn new(spec: protocol::AcpAgentSpec) -> Self {
+            Self {
+                stock: crate::acp::adapters::stock::StockAdapter::new(spec),
+            }
+        }
+    }
+
+    impl AcpAgentAdapter for ExternalAuthTestAdapter {
+        fn id(&self) -> protocol::AcpAdapterId {
+            protocol::AcpAdapterId::Stock
+        }
+
+        fn display_name(&self) -> &str {
+            "External-auth agent"
+        }
+
+        fn resolve_roots<'a>(
+            &'a self,
+            workspace_roots: &'a [String],
+            ssh_host: Option<&'a str>,
+            kind: AcpSessionKind,
+        ) -> futures_util::future::BoxFuture<'a, Result<crate::acp::adapter::AcpSessionRoots, String>>
+        {
+            self.stock.resolve_roots(workspace_roots, ssh_host, kind)
+        }
+
+        fn spawn_spec(
+            &self,
+            roots: &crate::acp::adapter::AcpSessionRoots,
+            ssh_host: Option<&str>,
+        ) -> Result<crate::acp::AcpSpawnSpec, String> {
+            self.stock.spawn_spec(roots, ssh_host)
+        }
+
+        fn auth_method_handling(&self, method: &AcpAuthMethod) -> AcpAuthMethodHandling {
+            AcpAuthMethodHandling::ExternalSetup {
+                instruction: method
+                    .description
+                    .clone()
+                    .expect("external auth fixture must provide an instruction"),
+            }
+        }
+    }
+
+    fn write_auth_lifecycle_program(body: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-acp-auth-lifecycle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create ACP auth lifecycle tempdir");
+        let program = dir.join("fake-acp-agent");
+        let log = dir.join("requests.jsonl");
+        let mut script = format!("#!/bin/sh\nLOG='{}'\n", log.to_string_lossy());
+        script.push_str(
+            r#"read_logged() {
+    IFS= read -r line || return 1
+    printf '%s\n' "$line" >> "$LOG"
+}
+"#,
+        );
+        script.push_str(body);
+        std::fs::write(&program, script).expect("write ACP auth lifecycle program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&program)
+                .expect("stat ACP auth lifecycle program")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&program, permissions)
+                .expect("chmod ACP auth lifecycle program");
+        }
+        (program, log)
+    }
+
+    fn auth_lifecycle_workspace() -> PathBuf {
+        let workspace = std::env::temp_dir().join(format!(
+            "tyde-acp-auth-lifecycle-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create ACP auth lifecycle workspace");
+        workspace
+    }
+
+    fn auth_lifecycle_agent(
+        program: &Path,
+        adapter: protocol::AcpAdapterId,
+    ) -> protocol::AcpAgentSpec {
+        protocol::AcpAgentSpec {
+            command: program.to_string_lossy().to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            adapter,
+        }
+    }
+
+    fn logged_auth_lifecycle_requests(log: &Path) -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("logged request is JSON"))
+            .collect()
+    }
+
+    fn logged_auth_lifecycle_methods(log: &Path) -> Vec<String> {
+        logged_auth_lifecycle_requests(log)
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn cleanup_auth_lifecycle_fixture(program: &Path, workspace: &Path) {
+        if let Some(parent) = program.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn kiro_external_auth_blocks_new_and_resume_session_requests() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"kiro-login","name":"Kiro Login","description":"Run '\''kiro-cli login'\'' in terminal to authenticate. See https://kiro.dev/docs"}]}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("external auth gate must not hang");
+        let error = match result {
+            Ok(_) => panic!("external auth must block startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "Kiro authentication required via 'kiro-login'. Run 'kiro-cli login' in terminal to authenticate. See https://kiro.dev/docs"
+        );
+        assert_eq!(
+            logged_auth_lifecycle_methods(&log),
+            vec!["initialize"],
+            "external setup must not invoke authenticate, session/new, or session/load"
+        );
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn every_external_auth_method_is_reported_without_protocol_requests() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"browser-login","description":"Open the browser login."},{"id":"device-login","description":"Run the device login."}]}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let adapter: Arc<dyn AcpAgentAdapter> = Arc::new(ExternalAuthTestAdapter::new(
+            auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock),
+        ));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_with_mode(
+                &[workspace.to_string_lossy().to_string()],
+                KiroSpawnMode {
+                    adapter,
+                    ephemeral: false,
+                    admin_session: false,
+                    initial_model: None,
+                    ssh_host: None,
+                    startup_mcp_servers: &[],
+                    steering_content: None,
+                    probe_deadline: None,
+                },
+            ),
+        )
+        .await
+        .expect("external auth gate must not hang");
+        let error = match result {
+            Ok(_) => panic!("external auth must block startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "External-auth agent authentication requires external setup. Complete one of: \
+             'browser-login': Open the browser login.; \
+             'device-login': Run the device login."
+        );
+        assert_eq!(
+            logged_auth_lifecycle_methods(&log),
+            vec!["initialize"],
+            "external setup must not invoke authenticate or create a session"
+        );
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn empty_auth_methods_create_session_without_authenticate() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"no-auth-session"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+
+        let (session, _events) = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("unauthenticated startup must not hang")
+        .expect("empty auth methods should permit session creation");
+
+        assert_eq!(
+            logged_auth_lifecycle_methods(&log),
+            vec!["initialize", "session/new"]
+        );
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn stock_protocol_auth_succeeds_before_session_new() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-auth-session"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
+
+        let (session, _events) = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("protocol auth startup must not hang")
+        .expect("stock protocol auth should succeed");
+
+        let requests = logged_auth_lifecycle_requests(&log);
+        assert_eq!(
+            requests
+                .iter()
+                .filter_map(|request| request.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "authenticate", "session/new"]
+        );
+        assert_eq!(requests[1]["params"]["methodId"], "api-key");
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn rejected_protocol_auth_blocks_session_new() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"invalid credential"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("rejected protocol auth must not hang");
+        let error = match result {
+            Ok(_) => panic!("rejected protocol auth must block startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("invalid credential"), "{error}");
+        assert_eq!(
+            logged_auth_lifecycle_methods(&log),
+            vec!["initialize", "authenticate"]
+        );
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn failed_protocol_auth_prefers_external_setup_error() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"},{"id":"kiro-login","name":"Kiro login","description":"Run kiro-cli login outside Tyde."}]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"invalid credential"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("mixed auth failure must not hang");
+        let error = match result {
+            Ok(_) => panic!("mixed auth failure must block startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "Kiro authentication required via 'kiro-login'. Run kiro-cli login outside Tyde."
+        );
+        let requests = logged_auth_lifecycle_requests(&log);
+        assert_eq!(
+            requests
+                .iter()
+                .filter_map(|request| request.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "authenticate"]
+        );
+        assert_eq!(requests[1]["params"]["methodId"], "api-key");
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn external_setup_first_then_protocol_auth_success_creates_session() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"kiro-login","name":"Kiro login","description":"Run kiro-cli login outside Tyde."},{"id":"api-key","name":"API key"}]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"mixed-auth-session"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+
+        let (session, _events) = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("mixed auth success must not hang")
+        .expect("later protocol auth should satisfy startup");
+
+        let requests = logged_auth_lifecycle_requests(&log);
+        assert_eq!(
+            requests
+                .iter()
+                .filter_map(|request| request.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "authenticate", "session/new"],
+            "external setup must not consume an RPC and later protocol success must create once"
+        );
+        assert_eq!(requests[1]["params"]["methodId"], "api-key");
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn authenticated_kiro_startup_allows_session_load_replay() {
+        let (program, log) = write_auth_lifecycle_program(
+            r#"read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"initial-session"}}'
+read_logged
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"restored-session"}}'
+while read_logged; do :; done
+"#,
+        );
+        let workspace = auth_lifecycle_workspace();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+
+        let (session, _events) = tokio::time::timeout(
+            Duration::from_secs(2),
+            KiroSession::spawn_for_agent(
+                &[workspace.to_string_lossy().to_string()],
+                Some(&agent),
+                None,
+                None,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .expect("authenticated startup must not hang")
+        .expect("protocol auth should permit startup");
+        session
+            .command_handle()
+            .execute(SessionCommand::ResumeSession {
+                session_id: "restored-session".to_string(),
+            })
+            .await
+            .expect("authenticated session should load replay");
+
+        assert_eq!(
+            logged_auth_lifecycle_methods(&log),
+            vec!["initialize", "session/new", "session/load"]
+        );
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
     }
 
     #[tokio::test]

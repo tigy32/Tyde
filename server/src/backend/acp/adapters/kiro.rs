@@ -28,9 +28,15 @@ use serde_json::Value;
 use crate::backend::BackendSession;
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
-    AcpAgentAdapter, AcpRequestCtx, AcpSessionKind, AcpSessionRoots, NormalizedUpdate,
+    AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpRequestCtx, AcpSessionKind,
+    AcpSessionRoots, NormalizedUpdate,
 };
 use crate::backend::acp::backend as kiro_impl;
+
+const KIRO_LOGIN_METHOD_ID: &str = "kiro-login";
+const KIRO_LOGIN_FALLBACK_INSTRUCTION: &str =
+    "Run 'kiro-cli login' in a terminal, then retry Kiro in Tyde.";
+const KIRO_AUTH_INSTRUCTION_MAX_CHARS: usize = 512;
 
 pub struct KiroAdapter {
     spec: AcpAgentSpec,
@@ -48,6 +54,23 @@ impl KiroAdapter {
         cwd.contains(kiro_impl::KIRO_ADMIN_SESSION_SUBDIR)
             || cwd.contains(kiro_impl::KIRO_EPHEMERAL_SESSION_SUBDIR)
     }
+
+    fn external_login_instruction(description: Option<&str>) -> String {
+        let sanitized = description
+            .unwrap_or_default()
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>();
+        let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            KIRO_LOGIN_FALLBACK_INSTRUCTION.to_string()
+        } else {
+            normalized
+                .chars()
+                .take(KIRO_AUTH_INSTRUCTION_MAX_CHARS)
+                .collect()
+        }
+    }
 }
 
 impl AcpAgentAdapter for KiroAdapter {
@@ -57,6 +80,16 @@ impl AcpAgentAdapter for KiroAdapter {
 
     fn display_name(&self) -> &str {
         "Kiro"
+    }
+
+    fn auth_method_handling(&self, method: &AcpAuthMethod) -> AcpAuthMethodHandling {
+        if method.id == KIRO_LOGIN_METHOD_ID {
+            AcpAuthMethodHandling::ExternalSetup {
+                instruction: Self::external_login_instruction(method.description.as_deref()),
+            }
+        } else {
+            AcpAuthMethodHandling::ProtocolAuthenticate
+        }
     }
 
     fn resolve_roots<'a>(
@@ -277,6 +310,81 @@ mod tests {
             env: BTreeMap::new(),
             adapter: AcpAdapterId::Kiro,
         })
+    }
+
+    fn auth_method(id: &str, description: Option<&str>) -> AcpAuthMethod {
+        AcpAuthMethod {
+            id: id.to_string(),
+            name: Some("Kiro Login".to_string()),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kiro_login_is_external_setup_with_provider_instruction() {
+        let handling = adapter().auth_method_handling(&auth_method(
+            KIRO_LOGIN_METHOD_ID,
+            Some("Run 'kiro-cli login' in terminal to authenticate. See https://kiro.dev/docs"),
+        ));
+
+        assert_eq!(
+            handling,
+            AcpAuthMethodHandling::ExternalSetup {
+                instruction:
+                    "Run 'kiro-cli login' in terminal to authenticate. See https://kiro.dev/docs"
+                        .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn kiro_login_without_description_uses_actionable_fallback() {
+        let handling = adapter().auth_method_handling(&auth_method(KIRO_LOGIN_METHOD_ID, None));
+
+        assert_eq!(
+            handling,
+            AcpAuthMethodHandling::ExternalSetup {
+                instruction: KIRO_LOGIN_FALLBACK_INSTRUCTION.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn kiro_login_provider_instruction_is_single_line_and_bounded() {
+        let description = format!("Run login.\n{}", "x".repeat(600));
+        let handling =
+            adapter().auth_method_handling(&auth_method(KIRO_LOGIN_METHOD_ID, Some(&description)));
+        let AcpAuthMethodHandling::ExternalSetup { instruction } = handling else {
+            panic!("kiro-login must require external setup");
+        };
+
+        assert_eq!(instruction.chars().count(), KIRO_AUTH_INSTRUCTION_MAX_CHARS);
+        assert!(!instruction.chars().any(char::is_control));
+        assert!(instruction.starts_with("Run login. "));
+    }
+
+    #[test]
+    fn unknown_kiro_auth_method_remains_protocol_authentication() {
+        assert_eq!(
+            adapter().auth_method_handling(&auth_method("future-method", None)),
+            AcpAuthMethodHandling::ProtocolAuthenticate
+        );
+    }
+
+    #[test]
+    fn stock_adapter_keeps_protocol_authentication_default() {
+        let stock = crate::backend::acp::adapters::stock::StockAdapter::new(AcpAgentSpec {
+            command: "stock-agent".to_string(),
+            args: vec!["acp".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            adapter: AcpAdapterId::Stock,
+        });
+
+        assert_eq!(
+            stock.auth_method_handling(&auth_method(KIRO_LOGIN_METHOD_ID, None)),
+            AcpAuthMethodHandling::ProtocolAuthenticate
+        );
     }
 
     #[test]

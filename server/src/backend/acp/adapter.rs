@@ -45,6 +45,29 @@ pub struct AcpSessionKind {
     pub ephemeral: bool,
 }
 
+/// One authentication method advertised by an ACP agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAuthMethod {
+    /// Wire identifier sent back to agent-handled authentication.
+    pub id: String,
+    /// Optional user-facing method name.
+    pub name: Option<String>,
+    /// Optional user-facing setup instruction.
+    pub description: Option<String>,
+}
+
+/// How an adapter handles one advertised authentication method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpAuthMethodHandling {
+    /// Invoke ACP `authenticate` with the advertised method identifier.
+    ProtocolAuthenticate,
+    /// Authentication must be completed outside the ACP connection.
+    ExternalSetup {
+        /// Bounded user-facing instruction describing the required setup.
+        instruction: String,
+    },
+}
+
 /// What the agent told us it can do, from the `initialize` response.
 ///
 /// The generic backend fills this in during negotiation and refuses to use a
@@ -62,8 +85,8 @@ pub struct AcpCapabilities {
     /// `session/list`? This is the spec's own way to enumerate sessions, so an
     /// agent advertising it needs no adapter support to be resumable.
     pub session_list: bool,
-    /// `authMethods[].id`, in the order the agent listed them.
-    pub auth_methods: Vec<String>,
+    /// `authMethods`, in the order the agent listed them.
+    pub auth_methods: Vec<AcpAuthMethod>,
     /// Agent name/version from `agentInfo`, for diagnostics.
     pub agent_info: Option<String>,
 }
@@ -129,6 +152,11 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
             "fs": { "readTextFile": true, "writeTextFile": true },
             "terminal": true,
         })
+    }
+
+    /// Classify an advertised auth method before the generic lifecycle uses it.
+    fn auth_method_handling(&self, _method: &AcpAuthMethod) -> AcpAuthMethodHandling {
+        AcpAuthMethodHandling::ProtocolAuthenticate
     }
 
     /// Add non-standard fields to `session/new`. Default: nothing.
