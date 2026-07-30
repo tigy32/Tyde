@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_HELPER="$SCRIPT_DIR/release_tool.py"
 VERSION_SETTER="$SCRIPT_DIR/set_release_version.py"
 VERSION_CHECKER="$SCRIPT_DIR/check_release_version.py"
+TRANSPORT_VERSION_CHECKER="$SCRIPT_DIR/check_transport_protocol_version.py"
 RELEASE_CHECK="$SCRIPT_DIR/release_check.sh"
 
 EXIT_FAILURE=1
@@ -229,6 +230,11 @@ check_release_version() {
         "tracked release versions do not match $tag"
 }
 
+check_transport_protocol_version() {
+    python3 "$TRANSPORT_VERSION_CHECKER" >/dev/null || die \
+        "MQTT transport protocol version guard failed"
+}
+
 remote_tag_lines() {
     local tag="$1"
     git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}"
@@ -293,6 +299,7 @@ cheap_cut_gates() {
     require_main_branch
     require_head_unchanged "$release_sha"
     check_release_version "$tag"
+    check_transport_protocol_version
     fetch_origin_main
     require_origin_not_ahead
     require_tag_absent "$tag"
@@ -327,6 +334,7 @@ command_prepare() {
         "failed to update release versions"
     python3 "$VERSION_CHECKER" "$tag" >/dev/null || die \
         "release version check failed immediately after prepare"
+    check_transport_protocol_version
     printf 'Prepared %s\n' "$tag"
 
     if [[ "$commit" == true ]]; then

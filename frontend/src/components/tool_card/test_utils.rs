@@ -36,6 +36,17 @@ pub async fn next_tick() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+/// Yield through a rendered browser frame so observers have delivered.
+pub async fn next_animation_frame() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        web_sys::window()
+            .unwrap()
+            .request_animation_frame(&resolve)
+            .unwrap();
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 /// Mount a renderer-returning closure and return the surrounding container.
 /// Holds the mount handle in a thread-local so the DOM survives the test until
 /// the next `mount`.

@@ -74,12 +74,16 @@ fi
 VERSION="${VERSION#v}"
 log "Release version: $VERSION"
 
+log "Checking MQTT transport protocol version"
+python3 tools/check_transport_protocol_version.py
+
 log "Checking release tooling shell syntax"
 bash -n dev.sh tools/release.sh tools/release_check.sh
 
 log "Checking release tooling Python syntax"
 python3 -B - \
     tools/check_release_version.py \
+    tools/check_transport_protocol_version.py \
     tools/set_release_version.py \
     tools/release_tool.py <<'PY'
 import pathlib

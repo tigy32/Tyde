@@ -16,6 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check MQTT transport protocol version
+        run: python3 tools/check_transport_protocol_version.py
 
       - name: Install Linux dependencies
         run: |

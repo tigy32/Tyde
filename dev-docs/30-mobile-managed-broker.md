@@ -336,7 +336,7 @@ Request:
   "host_label": "Mike's MacBook Pro",
   "host_release_version": "0.8.19",
   "protocol_version": 36,
-  "transport_protocol_version": 3,
+  "transport_protocol_version": 4,
   "host_nonce": "base64url-random-16-plus-bytes"
 }
 ```
@@ -503,7 +503,7 @@ Request:
   "device_nonce": "base64url-random-16-plus-bytes",
   "release_version": "0.8.19",
   "protocol_version": 36,
-  "transport_protocol_version": 3
+  "transport_protocol_version": 4
 }
 ```
 
@@ -577,7 +577,7 @@ Request:
   "role": "host",
   "client_instance_id": "uuid-v4",
   "protocol_version": 36,
-  "transport_protocol_version": 3,
+  "transport_protocol_version": 4,
   "requested_rooms": [
     {
       "room_id": "base64url-room-id",

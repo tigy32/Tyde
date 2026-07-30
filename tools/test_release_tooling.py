@@ -20,6 +20,7 @@ REPO_ROOT = TOOLS_DIR.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import check_release_version as version_check
+import check_transport_protocol_version as transport_version_check
 import release_tool
 import set_release_version
 
@@ -101,6 +102,87 @@ class SetReleaseVersionTests(unittest.TestCase):
             set_release_version.normalize_tag(tag)
         self.assertLess(time.perf_counter() - start, 1.0)
 
+
+class TransportProtocolVersionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temp_dir.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=self.root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Release Test"],
+            cwd=self.root,
+            check=True,
+        )
+        for path in (
+            transport_version_check.TRANSPORT_VERSION_PATH,
+            *transport_version_check.WIRE_CONTRACT_PATHS,
+        ):
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if path == transport_version_check.TRANSPORT_VERSION_PATH:
+                target.write_text(
+                    "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 3;\n",
+                    encoding="utf-8",
+                )
+            else:
+                target.write_text(f"wire contract: {path.name}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "baseline"], cwd=self.root, check=True)
+        subprocess.run(["git", "tag", "v1.0.0"], cwd=self.root, check=True)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_rejects_wire_change_without_transport_version_bump(self) -> None:
+        path = self.root / transport_version_check.WIRE_CONTRACT_PATHS[1]
+        path.write_text("changed wire contract\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            transport_version_check.TransportVersionError,
+            "without increasing MQTT_TRANSPORT_PROTOCOL_VERSION",
+        ):
+            transport_version_check.check_transport_version(self.root)
+
+    def test_accepts_wire_change_with_transport_version_bump(self) -> None:
+        path = self.root / transport_version_check.WIRE_CONTRACT_PATHS[1]
+        path.write_text("changed wire contract\n", encoding="utf-8")
+        (self.root / transport_version_check.TRANSPORT_VERSION_PATH).write_text(
+            "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 4;\n",
+            encoding="utf-8",
+        )
+
+        baseline, old, current, changed = (
+            transport_version_check.check_transport_version(self.root)
+        )
+
+        self.assertEqual((baseline, old, current), ("v1.0.0", 3, 4))
+        self.assertEqual(changed, (transport_version_check.WIRE_CONTRACT_PATHS[1],))
+
+    def test_ignores_non_wire_source_changes(self) -> None:
+        unrelated = self.root / "README.md"
+        unrelated.write_text("unrelated\n", encoding="utf-8")
+
+        _, old, current, changed = (
+            transport_version_check.check_transport_version(self.root)
+        )
+
+        self.assertEqual((old, current, changed), (3, 3, ()))
+
+    def test_rejects_transport_version_decrease(self) -> None:
+        (self.root / transport_version_check.TRANSPORT_VERSION_PATH).write_text(
+            "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 2;\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            transport_version_check.TransportVersionError, "decreased"
+        ):
+            transport_version_check.check_transport_version(self.root)
 
 class RunStatusTests(unittest.TestCase):
     def test_selects_exact_workflow_tag_and_sha(self) -> None:

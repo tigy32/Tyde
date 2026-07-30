@@ -540,9 +540,8 @@ mod wasm_tests {
                 "position: absolute; top: 0; left: 0; width: 90px; height: 600px;",
             )
             .expect("narrow the card");
-        // ResizeObserver delivers on the next frame; give it two turns.
-        next_tick().await;
-        next_tick().await;
+        next_animation_frame().await;
+        next_animation_frame().await;
 
         assert!(
             show_more_button(&container).is_some(),
