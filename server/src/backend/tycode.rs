@@ -1208,7 +1208,7 @@ impl TycodeStartupController {
                     send_tycode_json(stdin_tx, Value::String("GetSettings".to_string()))?;
                     self.phase = TycodeStartupPhase::AwaitInitialSettings;
                 }
-                Ok(TycodeStartupObservation::Allow)
+                Ok(tycode_startup_internal_observation(value))
             }
             TycodeStartupPhase::AwaitInitialSettings => {
                 if let Some(error) = tycode_error_message(value) {
@@ -1292,9 +1292,7 @@ impl TycodeStartupController {
                             "Tycode SetRootAgent '{agent}' acknowledged unexpected root agent '{changed_agent}'"
                         ));
                     }
-                    self.send_follow_up(stdin_tx)?;
-                    self.phase = TycodeStartupPhase::Complete;
-                    return Ok(TycodeStartupObservation::Completed);
+                    return self.complete_and_send_follow_up(stdin_tx);
                 }
                 Ok(tycode_startup_internal_observation(value))
             }
@@ -1318,8 +1316,15 @@ impl TycodeStartupController {
             self.phase = TycodeStartupPhase::AwaitRootAgentChanged { agent };
             return Ok(TycodeStartupObservation::Suppress);
         }
-        self.send_follow_up(stdin_tx)?;
+        self.complete_and_send_follow_up(stdin_tx)
+    }
+
+    fn complete_and_send_follow_up(
+        &mut self,
+        stdin_tx: &mpsc::UnboundedSender<TycodeStdinCommand>,
+    ) -> Result<TycodeStartupObservation, String> {
         self.phase = TycodeStartupPhase::Complete;
+        self.send_follow_up(stdin_tx)?;
         Ok(TycodeStartupObservation::Completed)
     }
 
@@ -1357,6 +1362,9 @@ impl TycodeStartupController {
         &self,
         stdin_tx: &mpsc::UnboundedSender<TycodeStdinCommand>,
     ) -> Result<(), String> {
+        if !matches!(&self.phase, TycodeStartupPhase::Complete) {
+            return Err("Tycode follow-up cannot be sent before startup is complete".to_string());
+        }
         match &self.follow_up {
             TycodeStartupFollowUp::InitialUserInput(message) => {
                 send_tycode_json(stdin_tx, serde_json::json!({ "UserInput": message }))
@@ -1810,9 +1818,9 @@ fn tycode_root_agent_changed(value: &Value) -> Option<&str> {
 
 fn tycode_startup_internal_observation(value: &Value) -> TycodeStartupObservation {
     match value.get("kind").and_then(Value::as_str) {
-        Some("Settings" | "TimingUpdate" | "TypingStatusChanged" | "RootAgentChanged") => {
-            TycodeStartupObservation::Suppress
-        }
+        Some(
+            "Settings" | "TimingUpdate" | "TypingStatusChanged" | "RootAgentChanged" | "TaskUpdate",
+        ) => TycodeStartupObservation::Suppress,
         _ => TycodeStartupObservation::Allow,
     }
 }
@@ -2441,11 +2449,17 @@ impl Backend for TycodeBackend {
                     runtime_settings = Some(settings.clone());
                 }
 
-                if resume_replay_complete_tx.is_some() && replay_barrier.observe(&value) {
-                    if let Some(tx) = resume_replay_complete_tx.take() {
-                        let _ = tx.send(());
+                if resume_replay_complete_tx.is_some() {
+                    let observation = replay_barrier.observe(&value);
+                    if observation.suppress_current_event {
+                        continue;
                     }
-                    continue;
+                    if observation.replay_complete {
+                        if let Some(tx) = resume_replay_complete_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        continue;
+                    }
                 }
 
                 let events = map_tycode_value_to_chat_events(&value);
@@ -2932,7 +2946,15 @@ fn is_tycode_sessions_list(value: &Value) -> bool {
 struct TycodeResumeReplayBarrier {
     session_id: String,
     replay_started: bool,
+    conversation_cleared: bool,
+    native_replay_event_index: usize,
     replay_events_remaining: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TycodeResumeReplayObservation {
+    suppress_current_event: bool,
+    replay_complete: bool,
 }
 
 impl TycodeResumeReplayBarrier {
@@ -2940,24 +2962,59 @@ impl TycodeResumeReplayBarrier {
         Self {
             session_id,
             replay_started: false,
+            conversation_cleared: false,
+            native_replay_event_index: 0,
             replay_events_remaining,
         }
     }
 
-    fn observe(&mut self, value: &Value) -> bool {
+    fn observe(&mut self, value: &Value) -> TycodeResumeReplayObservation {
         if !self.replay_started {
             if is_tycode_session_started(value, &self.session_id) {
                 self.replay_started = true;
                 self.replay_events_remaining = self.replay_events_remaining.saturating_sub(1);
+                return TycodeResumeReplayObservation::default();
             }
-            return false;
+            return TycodeResumeReplayObservation {
+                suppress_current_event: is_tycode_task_update(value),
+                replay_complete: false,
+            };
         }
-        if self.replay_events_remaining > 0 {
+
+        if !self.conversation_cleared {
+            if is_tycode_conversation_cleared(value) {
+                self.conversation_cleared = true;
+                self.replay_events_remaining = self.replay_events_remaining.saturating_sub(1);
+            }
+            return TycodeResumeReplayObservation::default();
+        }
+
+        if self.replay_events_remaining != 0 {
+            let native_replay_event_index = self.native_replay_event_index;
+            self.native_replay_event_index += 1;
             self.replay_events_remaining -= 1;
-            return false;
+            // Tycode constructs TaskListModule against empty event history and
+            // synchronously records its default update before the actor starts.
+            return TycodeResumeReplayObservation {
+                suppress_current_event: native_replay_event_index == 0
+                    && is_tycode_task_update(value),
+                replay_complete: false,
+            };
         }
-        is_tycode_sessions_list(value)
+
+        TycodeResumeReplayObservation {
+            suppress_current_event: false,
+            replay_complete: is_tycode_sessions_list(value),
+        }
     }
+}
+
+fn is_tycode_task_update(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("TaskUpdate")
+}
+
+fn is_tycode_conversation_cleared(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("ConversationCleared")
 }
 
 fn is_tycode_session_started(value: &Value, session_id: &str) -> bool {
@@ -4483,6 +4540,105 @@ mod tests {
             .collect()
     }
 
+    fn captured_constructor_task_update() -> Value {
+        serde_json::json!({
+            "kind": "TaskUpdate",
+            "data": {
+                "title": "Understand user requirements",
+                "tasks": [
+                    {
+                        "id": 0,
+                        "description": "Await user request",
+                        "status": "in_progress"
+                    },
+                    {
+                        "id": 1,
+                        "description": "Understand/Explore the code base and propose a comprehensive plan",
+                        "status": "pending"
+                    }
+                ]
+            }
+        })
+    }
+
+    fn captured_genuine_task_updates() -> [Value; 3] {
+        [
+            serde_json::json!({
+                "kind": "TaskUpdate",
+                "data": {
+                    "title": "TYCODE GENUINE 9C4D",
+                    "tasks": [
+                        {
+                            "id": 0,
+                            "description": "9C4D establish genuine runtime task",
+                            "status": "in_progress"
+                        },
+                        {
+                            "id": 1,
+                            "description": "9C4D prove status transition",
+                            "status": "pending"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "TaskUpdate",
+                "data": {
+                    "title": "TYCODE GENUINE 9C4D",
+                    "tasks": [
+                        {
+                            "id": 0,
+                            "description": "9C4D establish genuine runtime task",
+                            "status": "completed"
+                        },
+                        {
+                            "id": 1,
+                            "description": "9C4D prove status transition",
+                            "status": "in_progress"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "TaskUpdate",
+                "data": {
+                    "title": "TYCODE GENUINE 9C4D",
+                    "tasks": [
+                        {
+                            "id": 0,
+                            "description": "9C4D establish genuine runtime task",
+                            "status": "completed"
+                        },
+                        {
+                            "id": 1,
+                            "description": "9C4D prove status transition",
+                            "status": "completed"
+                        }
+                    ]
+                }
+            }),
+        ]
+    }
+
+    fn captured_native_task_history() -> Vec<Value> {
+        let genuine = captured_genuine_task_updates();
+        let mut events = (0..35)
+            .map(|_| serde_json::json!({ "kind": "TypingStatusChanged", "data": false }))
+            .collect::<Vec<_>>();
+        events[0] = captured_constructor_task_update();
+        events[10] = genuine[0].clone();
+        events[19] = genuine[1].clone();
+        events[28] = genuine[2].clone();
+        events
+    }
+
+    fn recv_tycode_json(stdin_rx: &mut mpsc::UnboundedReceiver<TycodeStdinCommand>) -> Value {
+        match stdin_rx.try_recv().expect("expected Tycode stdin command") {
+            TycodeStdinCommand::Json(value) => value,
+            TycodeStdinCommand::Cancel => panic!("expected JSON command, got cancel"),
+        }
+    }
+
     fn tycode_assistant_chat_message(content: &str) -> ChatMessage {
         ChatMessage {
             message_id: None,
@@ -4658,6 +4814,120 @@ mod tests {
             .expect("unmanaged settings changes should not fail verification");
     }
 
+    #[test]
+    fn tycode_startup_suppresses_task_updates_until_complete() {
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "model_quality": null,
+            "reasoning_effort": null,
+            "autonomy_level": "plan_approval_required",
+            "review_level": "None",
+            "spawn_context_mode": "Fork",
+            "disable_custom_steering": false,
+            "disable_streaming": false
+        });
+        let constructor = captured_constructor_task_update();
+        let genuine = captured_genuine_task_updates();
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+        let mut startup = TycodeStartupController::new(
+            BackendConfigValues::default(),
+            SessionSettingsValues::default(),
+            TycodeRootAgentOverridePolicy::Supported,
+            TycodeStartupFollowUp::InitialUserInput("run genuine fixture".to_string()),
+            false,
+        );
+
+        let err = startup
+            .send_follow_up(&stdin_tx)
+            .expect_err("pre-complete follow-up must be rejected");
+        assert!(err.contains("before startup is complete"));
+        assert!(stdin_rx.try_recv().is_err());
+        assert!(matches!(
+            startup
+                .observe(&constructor, &stdin_tx)
+                .expect("observe constructor before SessionStarted"),
+            TycodeStartupObservation::Suppress
+        ));
+        assert!(stdin_rx.try_recv().is_err());
+
+        assert!(matches!(
+            startup
+                .observe(
+                    &serde_json::json!({
+                        "kind": "SessionStarted",
+                        "data": { "session_id": "fresh-session" }
+                    }),
+                    &stdin_tx,
+                )
+                .expect("observe SessionStarted"),
+            TycodeStartupObservation::Allow
+        ));
+        assert_eq!(
+            recv_tycode_json(&mut stdin_rx),
+            Value::String("GetSettings".to_string())
+        );
+        assert!(matches!(
+            startup
+                .observe(&constructor, &stdin_tx)
+                .expect("observe constructor before initial Settings"),
+            TycodeStartupObservation::Suppress
+        ));
+
+        assert!(matches!(
+            startup
+                .observe(
+                    &serde_json::json!({ "kind": "Settings", "data": settings }),
+                    &stdin_tx,
+                )
+                .expect("observe initial Settings"),
+            TycodeStartupObservation::Suppress
+        ));
+        let save_settings = recv_tycode_json(&mut stdin_rx);
+        assert_eq!(
+            recv_tycode_json(&mut stdin_rx),
+            Value::String("GetSettings".to_string())
+        );
+        assert!(matches!(
+            startup
+                .observe(&constructor, &stdin_tx)
+                .expect("observe constructor before verified Settings"),
+            TycodeStartupObservation::Suppress
+        ));
+
+        let verified_settings = save_settings
+            .get("SaveSettings")
+            .and_then(|save| save.get("settings"))
+            .cloned()
+            .expect("SaveSettings payload");
+        assert!(matches!(
+            startup
+                .observe(
+                    &serde_json::json!({
+                        "kind": "Settings",
+                        "data": verified_settings
+                    }),
+                    &stdin_tx,
+                )
+                .expect("observe verified Settings"),
+            TycodeStartupObservation::Completed
+        ));
+        assert!(matches!(&startup.phase, TycodeStartupPhase::Complete));
+        assert_eq!(
+            recv_tycode_json(&mut stdin_rx),
+            serde_json::json!({ "UserInput": "run genuine fixture" })
+        );
+        assert!(stdin_rx.try_recv().is_err());
+        assert!(matches!(
+            startup
+                .observe(&genuine[0], &stdin_tx)
+                .expect("observe genuine post-startup task update"),
+            TycodeStartupObservation::Allow
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fake_tycode_spawn_applies_settings_before_user_input() {
         let dir = TempDir::new().expect("tempdir");
@@ -4728,6 +4998,127 @@ mod tests {
         );
         assert_eq!(save["settings"]["disable_streaming"], false);
         assert_eq!(save["settings"]["providers"], settings["providers"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_drops_constructor_and_preserves_three_genuine_updates() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "model_quality": null,
+            "reasoning_effort": null,
+            "autonomy_level": "plan_approval_required",
+            "review_level": "None",
+            "spawn_context_mode": "Fork",
+            "disable_custom_steering": false,
+            "disable_streaming": false
+        });
+        let genuine = captured_genuine_task_updates();
+        let fake = write_fake_tycode_task_update_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let (backend, mut events) = TycodeBackend::spawn(
+            Vec::new(),
+            BackendSpawnConfig::default(),
+            payload("run genuine fixture"),
+        )
+        .await
+        .expect("spawn fake Tycode task fixture");
+        let (commands, task_lists) = tokio::join!(
+            read_fake_task_commands_eventually(&log, 4),
+            collect_fake_tycode_task_fixture(&mut events),
+        );
+        backend.shutdown().await;
+
+        let commands =
+            commands.unwrap_or_else(|error| panic!("{error}; task-event result: {task_lists:#?}"));
+        let command_result = validate_fake_tycode_task_commands(&commands);
+        if let Err(error) = command_result {
+            panic!("{error}; task-event result: {task_lists:#?}");
+        }
+        let task_lists = task_lists
+            .unwrap_or_else(|error| panic!("{error}; fake Tycode commands: {commands:#?}"));
+        let actual = serde_json::to_value(task_lists).expect("serialize preserved task lists");
+        let expected = Value::Array(
+            genuine
+                .iter()
+                .map(|update| update["data"].clone())
+                .collect(),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_resume_preserves_captured_task_transitions() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "model_quality": null,
+            "reasoning_effort": null,
+            "autonomy_level": "plan_approval_required",
+            "review_level": "None",
+            "spawn_context_mode": "Fork",
+            "disable_custom_steering": false,
+            "disable_streaming": false
+        });
+        let genuine = captured_genuine_task_updates();
+        let native_events = captured_native_task_history();
+        let sessions_dir = dir.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create fake sessions dir");
+        fs::write(
+            sessions_dir.join("captured-session.json"),
+            serde_json::json!({
+                "id": "captured-session",
+                "events": native_events
+            })
+            .to_string(),
+        )
+        .expect("write captured Tycode session");
+        let fake = write_fake_tycode_resume_task_update_subprocess(
+            dir.path(),
+            &settings,
+            "captured-session",
+        );
+        let _guard = TestTycodeSubprocessGuard::set_with_options(fake, Some(sessions_dir), None);
+
+        let (backend, mut events) = TycodeBackend::resume(
+            Vec::new(),
+            BackendSpawnConfig::default(),
+            SessionId("captured-session".to_string()),
+        )
+        .await
+        .expect("resume fake Tycode task fixture");
+        let replay_complete = events
+            .take_resume_replay_complete()
+            .expect("Tycode resume replay barrier");
+        tokio::time::timeout(Duration::from_secs(5), replay_complete)
+            .await
+            .expect("timed out waiting for fake Tycode replay")
+            .expect("fake Tycode replay barrier sender dropped");
+
+        let mut task_lists = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let ChatEvent::TaskUpdate(task_list) = event {
+                task_lists.push(task_list);
+            }
+        }
+        backend.shutdown().await;
+
+        let actual = serde_json::to_value(task_lists).expect("serialize replayed task lists");
+        let expected = Value::Array(
+            genuine
+                .iter()
+                .map(|update| update["data"].clone())
+                .collect(),
+        );
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5799,6 +6190,151 @@ mod tests {
         write_fake_tycode_subprocess_with_options(dir, settings, false, false, false)
     }
 
+    fn replace_fake_tycode_fixture_once(
+        body: String,
+        needle: &str,
+        replacement: &str,
+        fixture_step: &str,
+    ) -> String {
+        assert_eq!(
+            body.matches(needle).count(),
+            1,
+            "fake Tycode fixture must contain exactly one {fixture_step} insertion point"
+        );
+        body.replacen(needle, replacement, 1)
+    }
+
+    fn assert_fake_tycode_task_branch(body: &str, user_input_header: &str, expected_branch: &str) {
+        let body_lines = body.lines().collect::<Vec<_>>();
+        let branch_starts = body_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| (*line == user_input_header).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            branch_starts.len(),
+            1,
+            "fake Tycode fixture must contain exactly one UserInput branch"
+        );
+
+        let expected_lines = expected_branch.lines().collect::<Vec<_>>();
+        let branch_start = branch_starts[0];
+        let actual_lines = body_lines
+            .get(branch_start..branch_start + expected_lines.len())
+            .expect("fake Tycode UserInput branch must contain every genuine task statement");
+        assert_eq!(
+            actual_lines,
+            expected_lines.as_slice(),
+            "fake Tycode genuine task statements must remain inside the UserInput branch"
+        );
+        assert!(
+            actual_lines
+                .iter()
+                .skip(1)
+                .all(|line| line.starts_with("        emit(")),
+            "fake Tycode genuine task statements must retain branch indentation"
+        );
+    }
+
+    fn write_fake_tycode_task_update_subprocess(dir: &Path, settings: &Value) -> String {
+        let script = write_fake_tycode_subprocess(dir, settings);
+        let body = fs::read_to_string(&script).expect("read fake Tycode script");
+        let constructor = serde_json::to_string(&captured_constructor_task_update().to_string())
+            .expect("constructor Python literal");
+        let genuine = captured_genuine_task_updates()
+            .iter()
+            .map(|update| {
+                serde_json::to_string(&update.to_string()).expect("genuine update Python literal")
+            })
+            .collect::<Vec<_>>();
+        let body = replace_fake_tycode_fixture_once(
+            body,
+            "emit({\"kind\": \"SessionStarted\", \"data\": {\"session_id\": \"fake-session\"}})",
+            &format!(
+                "emit(json.loads({constructor}))\nemit({{\"kind\": \"SessionStarted\", \"data\": {{\"session_id\": \"fake-session\"}}}})"
+            ),
+            "constructor",
+        );
+        let user_input_header = "    elif isinstance(command, dict) and \"UserInput\" in command:";
+        let terminal_line =
+            "        emit(message({\"Assistant\": {\"agent\": \"tycode\"}}, \"fake done\"))";
+        let user_input_branch = format!("{user_input_header}\n{terminal_line}");
+        let genuine_task_branch = format!(
+            "{user_input_header}\n        emit(json.loads({}))\n        emit(json.loads({}))\n        emit(json.loads({}))\n{terminal_line}",
+            genuine[0], genuine[1], genuine[2]
+        );
+        let body = replace_fake_tycode_fixture_once(
+            body,
+            &user_input_branch,
+            &genuine_task_branch,
+            "genuine task sequence",
+        );
+        assert_fake_tycode_task_branch(&body, user_input_header, &genuine_task_branch);
+        fs::write(&script, body).expect("rewrite fake Tycode task script");
+        script
+    }
+
+    fn write_fake_tycode_resume_task_update_subprocess(
+        dir: &Path,
+        settings: &Value,
+        session_id: &str,
+    ) -> String {
+        let script = write_fake_tycode_subprocess(dir, settings);
+        let body = fs::read_to_string(&script).expect("read fake Tycode script");
+        let constructor = serde_json::to_string(&captured_constructor_task_update().to_string())
+            .expect("constructor Python literal");
+        let body = replace_fake_tycode_fixture_once(
+            body,
+            "emit({\"kind\": \"SessionStarted\", \"data\": {\"session_id\": \"fake-session\"}})",
+            &format!(
+                "emit(json.loads({constructor}))\nemit({{\"kind\": \"SessionStarted\", \"data\": {{\"session_id\": \"fake-session\"}}}})"
+            ),
+            "resume constructor",
+        );
+
+        let genuine = captured_genuine_task_updates();
+        let mut replay = vec![
+            genuine[2].clone(),
+            serde_json::json!({
+                "kind": "SessionStarted",
+                "data": { "session_id": session_id }
+            }),
+            serde_json::json!({ "kind": "ConversationCleared" }),
+        ];
+        replay.extend(captured_native_task_history());
+        replay.extend([
+            serde_json::json!({ "kind": "TimingUpdate", "data": {} }),
+            serde_json::json!({ "kind": "TypingStatusChanged", "data": false }),
+            serde_json::json!({ "kind": "TypingStatusChanged", "data": true }),
+        ]);
+        let replay_lines = replay
+            .iter()
+            .map(|event| {
+                let literal =
+                    serde_json::to_string(&event.to_string()).expect("resume event Python literal");
+                format!("        emit(json.loads({literal}))")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sentinel = serde_json::to_string(
+            &serde_json::json!({
+                "kind": "SessionsList",
+                "data": { "sessions": [] }
+            })
+            .to_string(),
+        )
+        .expect("SessionsList Python literal");
+        let body = body.replacen(
+            "    elif isinstance(command, dict) and \"UserInput\" in command:",
+            &format!(
+                "    elif isinstance(command, dict) and \"ResumeSession\" in command:\n{replay_lines}\n    elif command == \"ListSessions\":\n        emit(json.loads({sentinel}))\n    elif isinstance(command, dict) and \"UserInput\" in command:"
+            ),
+            1,
+        );
+        fs::write(&script, body).expect("rewrite fake Tycode resume task script");
+        script
+    }
+
     fn write_fake_tycode_subprocess_dropping_unknown_settings(
         dir: &Path,
         settings: &Value,
@@ -6437,6 +6973,98 @@ for raw_line in sys.stdin:
         read_fake_commands(log)
     }
 
+    async fn read_fake_task_commands_eventually(
+        log: &Path,
+        minimum_len: usize,
+    ) -> Result<Vec<Value>, String> {
+        for _ in 0..300 {
+            if let Ok(body) = std::fs::read_to_string(log) {
+                let commands = body
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<Result<Vec<Value>, _>>();
+                if let Ok(commands) = commands
+                    && commands.len() >= minimum_len
+                {
+                    return Ok(commands);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let body = std::fs::read_to_string(log)
+            .map_err(|error| format!("failed to read fake Tycode command log: {error}"))?;
+        body.lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|error| format!("failed to parse fake Tycode command: {error}"))
+            })
+            .collect()
+    }
+
+    fn validate_fake_tycode_task_commands(commands: &[Value]) -> Result<(), String> {
+        if commands.len() != 4 {
+            return Err(format!(
+                "fake Tycode task fixture expected four startup commands, got {commands:#?}"
+            ));
+        }
+        if commands[0] != Value::String("GetSettings".to_string()) {
+            return Err(format!(
+                "fake Tycode task fixture did not begin with GetSettings: {commands:#?}"
+            ));
+        }
+        if commands[1].get("SaveSettings").is_none() {
+            return Err(format!(
+                "fake Tycode task fixture did not save runtime settings second: {commands:#?}"
+            ));
+        }
+        if commands[2] != Value::String("GetSettings".to_string()) {
+            return Err(format!(
+                "fake Tycode task fixture did not verify settings third: {commands:#?}"
+            ));
+        }
+        let expected_input = serde_json::json!({ "UserInput": "run genuine fixture" });
+        if commands[3] != expected_input {
+            return Err(format!(
+                "fake Tycode task fixture did not receive the first input after startup: \
+                 {commands:#?}"
+            ));
+        }
+        Ok(())
+    }
+
+    const TYCODE_TASK_FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn collect_fake_tycode_task_fixture(
+        events: &mut EventStream,
+    ) -> Result<Vec<protocol::TaskList>, String> {
+        let mut task_lists = Vec::new();
+        let mut observed_events = Vec::new();
+        let result = tokio::time::timeout(TYCODE_TASK_FIXTURE_TIMEOUT, async {
+            loop {
+                let Some(event) = events.recv().await else {
+                    return Err("fake Tycode event stream ended before fake done".to_string());
+                };
+                observed_events.push(format!("{event:?}"));
+                match event {
+                    ChatEvent::TaskUpdate(task_list) => task_lists.push(task_list),
+                    ChatEvent::MessageAdded(message) if message.content == "fake done" => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(task_lists),
+            Ok(Err(error)) => Err(format!("{error}; observed events: {observed_events:#?}")),
+            Err(_) => Err(format!(
+                "timed out after {TYCODE_TASK_FIXTURE_TIMEOUT:?} waiting for fake Tycode task \
+                 fixture; observed events: {observed_events:#?}"
+            )),
+        }
+    }
+
     async fn wait_for_fake_done(events: &mut EventStream) {
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -6767,8 +7395,9 @@ for raw_line in sys.stdin:
             "data": { "sessions": [] }
         });
 
-        assert!(
-            !barrier.observe(&pre_resume_warning),
+        assert_eq!(
+            barrier.observe(&pre_resume_warning),
+            TycodeResumeReplayObservation::default(),
             "pre-resume startup output must not consume replay count or complete the barrier"
         );
         for event in [
@@ -6778,14 +7407,134 @@ for raw_line in sys.stdin:
             &historical_message,
             &historical_final_sessions_list,
         ] {
-            assert!(
-                !barrier.observe(event),
+            assert_eq!(
+                barrier.observe(event),
+                TycodeResumeReplayObservation::default(),
                 "historical replay event must not complete the barrier: {event}"
             );
         }
-        assert!(
+        assert_eq!(
             barrier.observe(&genuine_sentinel),
+            TycodeResumeReplayObservation {
+                suppress_current_event: false,
+                replay_complete: true,
+            },
             "the post-resume ListSessions response should complete the barrier"
+        );
+    }
+
+    #[test]
+    fn resume_observation_classifies_captured_35_event_history() {
+        let genuine = captured_genuine_task_updates();
+        let hydration = genuine[2].clone();
+        let target_session_started = serde_json::json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": "captured-session" }
+        });
+        let conversation_cleared = serde_json::json!({ "kind": "ConversationCleared" });
+        let sentinel = serde_json::json!({
+            "kind": "SessionsList",
+            "data": { "sessions": [] }
+        });
+        let native_events = captured_native_task_history();
+        let mut barrier = TycodeResumeReplayBarrier::new("captured-session".to_owned(), 37);
+
+        assert_eq!(
+            barrier.observe(&hydration),
+            TycodeResumeReplayObservation {
+                suppress_current_event: true,
+                replay_complete: false,
+            },
+            "pre-target task state is module hydration, not native history"
+        );
+        assert_eq!(
+            barrier.observe(&target_session_started),
+            TycodeResumeReplayObservation::default()
+        );
+        assert_eq!(
+            barrier.observe(&conversation_cleared),
+            TycodeResumeReplayObservation::default()
+        );
+
+        let mut preserved_task_updates = Vec::new();
+        for (index, event) in native_events.iter().enumerate() {
+            let observation = barrier.observe(event);
+            assert!(!observation.replay_complete);
+            assert_eq!(
+                observation.suppress_current_event,
+                index == 0,
+                "only native constructor event 0 may be suppressed; index {index}"
+            );
+            if is_tycode_task_update(event) && !observation.suppress_current_event {
+                preserved_task_updates.push(event.clone());
+            }
+        }
+        assert_eq!(preserved_task_updates, genuine.to_vec());
+        assert_eq!(barrier.replay_events_remaining, 0);
+        assert_eq!(barrier.native_replay_event_index, 35);
+
+        for tail in [
+            serde_json::json!({ "kind": "TimingUpdate", "data": {} }),
+            serde_json::json!({ "kind": "TypingStatusChanged", "data": false }),
+            serde_json::json!({ "kind": "TypingStatusChanged", "data": true }),
+        ] {
+            assert_eq!(
+                barrier.observe(&tail),
+                TycodeResumeReplayObservation::default(),
+                "post-history handshake tail must not complete replay"
+            );
+        }
+        assert_eq!(
+            barrier.observe(&sentinel),
+            TycodeResumeReplayObservation {
+                suppress_current_event: false,
+                replay_complete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resume_observation_preserves_task_update_after_non_task_event_zero() {
+        let genuine = captured_genuine_task_updates();
+        let target_session_started = serde_json::json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": "changed-order-session" }
+        });
+        let conversation_cleared = serde_json::json!({ "kind": "ConversationCleared" });
+        let non_task_event_zero = serde_json::json!({
+            "kind": "MessageAdded",
+            "data": { "content": "upstream ordering changed" }
+        });
+        let sentinel = serde_json::json!({
+            "kind": "SessionsList",
+            "data": { "sessions": [] }
+        });
+        let mut barrier = TycodeResumeReplayBarrier::new("changed-order-session".to_owned(), 4);
+
+        for event in [&target_session_started, &conversation_cleared] {
+            assert_eq!(
+                barrier.observe(event),
+                TycodeResumeReplayObservation::default()
+            );
+        }
+        assert_eq!(
+            barrier.observe(&non_task_event_zero),
+            TycodeResumeReplayObservation::default(),
+            "a non-task native event 0 must never be suppressed"
+        );
+        assert_eq!(
+            barrier.observe(&genuine[0]),
+            TycodeResumeReplayObservation::default(),
+            "a genuine TaskUpdate at native event 1 must be preserved"
+        );
+        assert_eq!(barrier.replay_events_remaining, 0);
+        assert_eq!(barrier.native_replay_event_index, 2);
+        assert_eq!(
+            barrier.observe(&sentinel),
+            TycodeResumeReplayObservation {
+                suppress_current_event: false,
+                replay_complete: true,
+            }
         );
     }
 

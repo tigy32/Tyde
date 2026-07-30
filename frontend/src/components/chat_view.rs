@@ -1844,8 +1844,9 @@ mod wasm_tests {
     use crate::state::{ActiveAgentRef, AgentInfo, AppState, ChatMessageEntry, TabContent};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, ChatMessage, MessageSender, ProjectGitChangeKind,
-        ProjectGitFileStatus, ProjectId, ProjectRootGitStatus, ProjectRootPath, StreamPath,
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, BackendKind, ChatEvent,
+        ChatMessage, MessageSender, ProjectGitChangeKind, ProjectGitFileStatus, ProjectId,
+        ProjectRootGitStatus, ProjectRootPath, StreamPath, Task, TaskList, TaskStatus,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -2710,6 +2711,282 @@ mod wasm_tests {
             .query_selector(selector)
             .unwrap()
             .and_then(|node| node.dyn_into::<Element>().ok())
+    }
+
+    fn tycode_terminal_message() -> ChatMessage {
+        ChatMessage {
+            message_id: None,
+            timestamp: 1,
+            sender: MessageSender::Assistant {
+                agent: "tycode".to_owned(),
+            },
+            content: "TYCODE_GENUINE_7F3A_DONE".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn tycode_terminal_row() -> crate::state::ChatRowHandle {
+        crate::state::ChatRowHandle::new(ChatMessageEntry {
+            message: tycode_terminal_message(),
+            tool_requests: Vec::new(),
+        })
+    }
+
+    fn tycode_rendered_task_replay() -> [TaskList; 3] {
+        let list = |first, second| TaskList {
+            title: "TYCODE GENUINE 7F3A".to_owned(),
+            tasks: vec![
+                Task {
+                    id: 0,
+                    description: "7F3A establish genuine runtime task".to_owned(),
+                    status: first,
+                },
+                Task {
+                    id: 1,
+                    description: "7F3A prove status transition".to_owned(),
+                    status: second,
+                },
+            ],
+        };
+        [
+            list(TaskStatus::InProgress, TaskStatus::Pending),
+            list(TaskStatus::Completed, TaskStatus::InProgress),
+            list(TaskStatus::Completed, TaskStatus::Completed),
+        ]
+    }
+
+    fn tycode_completed_task_list() -> TaskList {
+        tycode_rendered_task_replay()[2].clone()
+    }
+
+    fn tycode_constructor_only_bootstrap() -> AgentBootstrapPayload {
+        AgentBootstrapPayload {
+            events: vec![
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(tycode_terminal_message())),
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
+            ],
+            latest_output: Default::default(),
+            turn_active: false,
+        }
+    }
+
+    fn tycode_genuine_task_bootstrap() -> AgentBootstrapPayload {
+        let mut events = tycode_rendered_task_replay()
+            .into_iter()
+            .map(ChatEvent::TaskUpdate)
+            .map(AgentBootstrapEvent::ChatEvent)
+            .collect::<Vec<_>>();
+        events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(
+            tycode_terminal_message(),
+        )));
+        events.push(AgentBootstrapEvent::ChatEvent(
+            ChatEvent::TypingStatusChanged(false),
+        ));
+        AgentBootstrapPayload {
+            events,
+            latest_output: Default::default(),
+            turn_active: false,
+        }
+    }
+
+    fn assert_constructor_only_terminal_render(container: &HtmlElement, phase: &str) {
+        let panel = query(container, ".task-list-panel").expect("task panel shell");
+        assert!(
+            panel
+                .get_attribute("class")
+                .is_some_and(|classes| classes.split_whitespace().any(|class| class == "hidden")),
+            "{phase}: constructor-only replay must keep the task panel hidden"
+        );
+        assert!(query(container, ".context-task-hint").is_none(), "{phase}");
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("TYCODE_GENUINE_7F3A_DONE"), "{phase}: {text}");
+        assert!(!text.contains("Initialization"), "{phase}: {text}");
+        assert!(!text.contains("Deployment"), "{phase}: {text}");
+        assert!(query(container, ".chat-streaming").is_none(), "{phase}");
+    }
+
+    async fn assert_genuine_terminal_task_render(container: &HtmlElement, phase: &str) {
+        let hint = query(container, ".context-task-hint")
+            .unwrap_or_else(|| panic!("{phase}: genuine task hint missing"));
+        assert_eq!(
+            hint.text_content().unwrap_or_default(),
+            "2/2 tasks done →",
+            "{phase}"
+        );
+        hint.dyn_into::<HtmlElement>()
+            .expect("task hint button")
+            .click();
+        next_tick().await;
+        assert_eq!(
+            query(container, ".task-list-heading")
+                .expect("task heading")
+                .text_content()
+                .unwrap_or_default(),
+            "TYCODE GENUINE 7F3A",
+            "{phase}"
+        );
+        assert_eq!(
+            query(container, ".task-list-progress")
+                .expect("task progress")
+                .text_content()
+                .unwrap_or_default(),
+            "2/2 tasks completed",
+            "{phase}"
+        );
+        let rows = container
+            .query_selector_all(".task-item-row.status-completed")
+            .expect("completed rows");
+        assert_eq!(rows.length(), 2, "{phase}");
+        let descriptions = container
+            .query_selector_all(".task-item-desc")
+            .expect("task descriptions");
+        assert_eq!(descriptions.length(), 2, "{phase}");
+        assert_eq!(
+            descriptions
+                .item(0)
+                .unwrap()
+                .text_content()
+                .unwrap_or_default(),
+            "7F3A establish genuine runtime task",
+            "{phase}"
+        );
+        assert_eq!(
+            descriptions
+                .item(1)
+                .unwrap()
+                .text_content()
+                .unwrap_or_default(),
+            "7F3A prove status transition",
+            "{phase}"
+        );
+        let icons = container
+            .query_selector_all(".task-item-icon")
+            .expect("task icons");
+        assert_eq!(icons.length(), 2, "{phase}");
+        for index in 0..icons.length() {
+            assert_eq!(
+                icons
+                    .item(index)
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default(),
+                "✓",
+                "{phase}: check mark {index}"
+            );
+        }
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("TYCODE_GENUINE_7F3A_DONE"), "{phase}: {text}");
+        assert!(!text.contains("Initialization"), "{phase}: {text}");
+        assert!(!text.contains("Deployment"), "{phase}: {text}");
+        assert!(query(container, ".chat-streaming").is_none(), "{phase}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn constructor_only_terminal_replay_has_no_task_panel() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let state_for_mount = state_handle.clone();
+        let agent_id = AgentId("tycode-constructor-only".to_owned());
+        let agent_id_for_mount = agent_id.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut agent = make_target_agent("tycode-render-host", &agent_id_for_mount.0, None);
+            agent.backend_kind = BackendKind::Tycode;
+            state.agents.set(vec![agent]);
+            state.chat_rows.update(|rows| {
+                rows.insert(agent_id_for_mount.clone(), vec![tycode_terminal_row()]);
+            });
+            *state_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let bound = ActiveAgentRef {
+                host_id: "tycode-render-host".to_owned(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active = Signal::derive(|| false);
+            view! { <ChatView tab_id=TabId(27_011) agent_ref=agent_ref is_active=is_active /> }
+        });
+        next_tick().await;
+        assert_constructor_only_terminal_render(&container, "live");
+
+        let state = state_handle
+            .borrow()
+            .as_ref()
+            .expect("mounted state")
+            .clone();
+        for phase in ["reload", "resume"] {
+            crate::dispatch::apply_agent_bootstrap_for_test(
+                &state,
+                "tycode-render-host",
+                &StreamPath(format!("/agent/{}", agent_id.0)),
+                tycode_constructor_only_bootstrap(),
+            );
+            next_tick().await;
+            assert_constructor_only_terminal_render(&container, phase);
+        }
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn genuine_task_panel_survives_reload_and_resume() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let state_for_mount = state_handle.clone();
+        let agent_id = AgentId("tycode-genuine-task".to_owned());
+        let agent_id_for_mount = agent_id.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut agent = make_target_agent("tycode-render-host", &agent_id_for_mount.0, None);
+            agent.backend_kind = BackendKind::Tycode;
+            state.agents.set(vec![agent]);
+            state.chat_rows.update(|rows| {
+                rows.insert(agent_id_for_mount.clone(), vec![tycode_terminal_row()]);
+            });
+            state.task_lists.update(|lists| {
+                lists.insert(agent_id_for_mount.clone(), tycode_completed_task_list());
+            });
+            *state_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let bound = ActiveAgentRef {
+                host_id: "tycode-render-host".to_owned(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active = Signal::derive(|| false);
+            view! { <ChatView tab_id=TabId(27_012) agent_ref=agent_ref is_active=is_active /> }
+        });
+        next_tick().await;
+        assert_genuine_terminal_task_render(&container, "live").await;
+
+        let state = state_handle
+            .borrow()
+            .as_ref()
+            .expect("mounted state")
+            .clone();
+        for phase in ["reload", "resume"] {
+            state.task_lists.update(|lists| {
+                lists.remove(&agent_id);
+            });
+            next_tick().await;
+            crate::dispatch::apply_agent_bootstrap_for_test(
+                &state,
+                "tycode-render-host",
+                &StreamPath(format!("/agent/{}", agent_id.0)),
+                tycode_genuine_task_bootstrap(),
+            );
+            next_tick().await;
+            assert_genuine_terminal_task_render(&container, phase).await;
+        }
+        drop(handle);
+        container.remove();
     }
 
     /// A marker is a timeline divider, not a chat card. It carries no sender

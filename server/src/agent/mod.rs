@@ -12196,10 +12196,10 @@ mod tests {
         ModelRequestId, ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
         QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
         ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType, ToolUseData,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, Task, TaskList,
+        TaskStatus, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
+        TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -13620,6 +13620,370 @@ mod tests {
             token_usage(total_tokens),
         ));
         ChatEvent::StreamEnd(StreamEndData { message })
+    }
+
+    fn tycode_constructor_task_list() -> TaskList {
+        TaskList {
+            title: "Initialization".to_owned(),
+            tasks: vec![Task {
+                id: 0,
+                description: "Deployment".to_owned(),
+                status: TaskStatus::Completed,
+            }],
+        }
+    }
+
+    fn tycode_genuine_task_replay() -> [TaskList; 3] {
+        let list = |first, second| TaskList {
+            title: "TYCODE GENUINE 9C4D".to_owned(),
+            tasks: vec![
+                Task {
+                    id: 0,
+                    description: "9C4D establish genuine runtime task".to_owned(),
+                    status: first,
+                },
+                Task {
+                    id: 1,
+                    description: "9C4D prove status transition".to_owned(),
+                    status: second,
+                },
+            ],
+        };
+        [
+            list(TaskStatus::InProgress, TaskStatus::Pending),
+            list(TaskStatus::Completed, TaskStatus::InProgress),
+            list(TaskStatus::Completed, TaskStatus::Completed),
+        ]
+    }
+
+    fn tycode_terminal_events() -> [ChatEvent; 2] {
+        [
+            ChatEvent::MessageAdded(ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: MessageSender::Assistant {
+                    agent: "tycode".to_owned(),
+                },
+                content: "TYCODE_GENUINE_9C4D_DONE".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+            ChatEvent::TypingStatusChanged(false),
+        ]
+    }
+
+    async fn seed_tycode_session(store: &Arc<Mutex<SessionStore>>, session_id: &SessionId) {
+        store
+            .lock()
+            .await
+            .upsert_backend_session(
+                &BackendSession {
+                    id: session_id.clone(),
+                    backend_kind: BackendKind::Tycode,
+                    workspace_roots: Vec::new(),
+                    title: None,
+                    token_count: None,
+                    created_at_ms: Some(1),
+                    updated_at_ms: Some(1),
+                    resumable: true,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("seed Tycode session");
+    }
+
+    fn bootstrap_task_updates(events: &[AgentBootstrapEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TaskUpdate(tasks)) => {
+                    Some(serde_json::to_value(tasks).expect("serialize task update"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tycode_constructor_never_enters_runtime_or_replay_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("session store"),
+        ));
+        let session_id = SessionId("tycode-constructor-filtered".to_owned());
+        seed_tycode_session(&store, &session_id).await;
+
+        let canonical_stream = "/agent/tycode-constructor-filtered";
+        let transcript_store =
+            TranscriptStore::new(dir.path().join("transcripts")).with_actor_io_enabled(true);
+        register_transcript_session(canonical_stream, &session_id, &transcript_store);
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Tycode);
+        for (source_seq, event) in tycode_terminal_events().into_iter().enumerate() {
+            apply_runtime_session_updates(&store, &session_id, &event).await;
+            let mut observed = event.clone();
+            let _ = stats.observe_chat_event(&mut observed, source_seq as u64, "");
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &event,
+            )
+            .await;
+        }
+        let transcript = transcript_store.load(&session_id).expect("load transcript");
+        let surfaces = serde_json::to_string(&(
+            &event_log,
+            stats.snapshot(),
+            &transcript,
+            store.lock().await.get_task_list(&session_id),
+        ))
+        .expect("serialize fresh downstream surfaces");
+        assert!(!surfaces.contains("Initialization"), "{surfaces}");
+        assert!(!surfaces.contains("Deployment"), "{surfaces}");
+
+        let (fresh_tx, mut fresh_rx) = mpsc::unbounded_channel();
+        assert!(attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(fresh_tx),
+        ));
+        let bootstrap =
+            recv_agent_bootstrap_events(&mut fresh_rx, "fresh constructor fixture").await;
+        assert!(bootstrap_task_updates(&bootstrap).is_empty());
+        assert!(
+            serde_json::to_string(&bootstrap)
+                .expect("serialize bootstrap")
+                .contains("TYCODE_GENUINE_9C4D_DONE")
+        );
+
+        let resumed_stream = "/agent/tycode-constructor-filtered-resume";
+        let resumed_agent = AgentId("tycode-constructor-filtered-resume".to_owned());
+        let mut resumed_log = Vec::new();
+        let mut resumed_replay = AgentReplayState::default();
+        let mut resumed_stats = AgentActivityStatsTracker::for_backend(BackendKind::Tycode);
+        let mut resumed_text = String::new();
+        let mut resumed_seq = 0;
+        let (gated_tx, mut gated_rx) = mpsc::unbounded_channel();
+        let mut resumed_subscribers = vec![replay_stream(gated_tx)];
+        for mut event in tycode_terminal_events() {
+            apply_runtime_session_updates(&store, &session_id, &event).await;
+            ingest_gated_replay_event(
+                &mut event,
+                resumed_stream,
+                &resumed_agent,
+                &mut resumed_log,
+                &mut resumed_subscribers,
+                &mut resumed_replay,
+                &mut resumed_stats,
+                &mut resumed_text,
+                &mut resumed_seq,
+            )
+            .await;
+        }
+        while let Ok(envelope) = gated_rx.try_recv() {
+            assert_ne!(
+                envelope.kind,
+                FrameKind::ChatEvent,
+                "resume history and input remain gated until SessionsList"
+            );
+        }
+        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        assert!(attach_subscriber(
+            &resumed_log,
+            Some(&resumed_replay),
+            &mut resumed_subscribers,
+            replay_stream(resume_tx),
+        ));
+        let resume_bootstrap =
+            recv_agent_bootstrap_events(&mut resume_rx, "resumed constructor fixture").await;
+        assert!(bootstrap_task_updates(&resume_bootstrap).is_empty());
+        let resumed_surfaces = serde_json::to_string(&(
+            &resumed_log,
+            resumed_stats.snapshot(),
+            &resume_bootstrap,
+            store.lock().await.get_task_list(&session_id),
+        ))
+        .expect("serialize resumed surfaces");
+        assert!(
+            !resumed_surfaces.contains("Initialization"),
+            "{resumed_surfaces}"
+        );
+        assert!(
+            !resumed_surfaces.contains("Deployment"),
+            "{resumed_surfaces}"
+        );
+        assert!(resumed_surfaces.contains("TYCODE_GENUINE_9C4D_DONE"));
+    }
+
+    #[tokio::test]
+    async fn tycode_genuine_tasks_survive_store_reload_and_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions_path = dir.path().join("sessions.json");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(sessions_path.clone()).expect("session store"),
+        ));
+        let session_id = SessionId("tycode-genuine-tasks".to_owned());
+        seed_tycode_session(&store, &session_id).await;
+        let canonical_stream = "/agent/tycode-genuine-tasks";
+        let transcript_store =
+            TranscriptStore::new(dir.path().join("transcripts")).with_actor_io_enabled(true);
+        register_transcript_session(canonical_stream, &session_id, &transcript_store);
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let [started, advanced, completed] = tycode_genuine_task_replay();
+        for tasks in [&started, &advanced, &completed] {
+            let event = ChatEvent::TaskUpdate(tasks.clone());
+            apply_runtime_session_updates(&store, &session_id, &event).await;
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &event,
+            )
+            .await;
+        }
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .lock()
+                    .await
+                    .get_task_list(&session_id)
+                    .expect("runtime task state")
+            )
+            .expect("serialize runtime tasks"),
+            serde_json::to_value(&completed).expect("serialize final tasks")
+        );
+        let reloaded = SessionStore::load(sessions_path).expect("reload session store");
+        assert_eq!(
+            serde_json::to_value(
+                reloaded
+                    .get_task_list(&session_id)
+                    .expect("reloaded task state")
+            )
+            .expect("serialize reloaded tasks"),
+            serde_json::to_value(&completed).expect("serialize final tasks")
+        );
+        assert_eq!(
+            transcript_store
+                .load(&session_id)
+                .expect("load genuine transcript")
+                .into_iter()
+                .filter_map(|record| match record.event {
+                    ChatEvent::TaskUpdate(tasks) => {
+                        Some(serde_json::to_value(tasks).expect("serialize transcript task"))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [&started, &advanced, &completed]
+                .into_iter()
+                .map(|tasks| serde_json::to_value(tasks).expect("serialize expected task"))
+                .collect::<Vec<_>>()
+        );
+
+        let resumed_stream = "/agent/tycode-genuine-tasks-resume";
+        let resumed_agent = AgentId("tycode-genuine-tasks-resume".to_owned());
+        let mut resumed_log = Vec::new();
+        let mut resumed_replay = AgentReplayState::default();
+        let mut resumed_stats = AgentActivityStatsTracker::for_backend(BackendKind::Tycode);
+        let mut resumed_text = String::new();
+        let mut resumed_seq = 0;
+        let (gated_tx, mut gated_rx) = mpsc::unbounded_channel();
+        let mut resumed_subscribers = vec![replay_stream(gated_tx)];
+        for tasks in [&started, &advanced, &completed] {
+            let mut event = ChatEvent::TaskUpdate(tasks.clone());
+            ingest_gated_replay_event(
+                &mut event,
+                resumed_stream,
+                &resumed_agent,
+                &mut resumed_log,
+                &mut resumed_subscribers,
+                &mut resumed_replay,
+                &mut resumed_stats,
+                &mut resumed_text,
+                &mut resumed_seq,
+            )
+            .await;
+        }
+        while let Ok(envelope) = gated_rx.try_recv() {
+            assert_ne!(
+                envelope.kind,
+                FrameKind::ChatEvent,
+                "provider history must remain gated until SessionsList"
+            );
+        }
+        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        assert!(attach_subscriber(
+            &resumed_log,
+            Some(&resumed_replay),
+            &mut resumed_subscribers,
+            replay_stream(resume_tx),
+        ));
+        let bootstrap =
+            recv_agent_bootstrap_events(&mut resume_rx, "genuine Tycode task resume").await;
+        let expected = [&started, &advanced, &completed]
+            .into_iter()
+            .map(|tasks| serde_json::to_value(tasks).expect("serialize expected task"))
+            .collect::<Vec<_>>();
+        assert_eq!(bootstrap_task_updates(&bootstrap), expected);
+        assert_eq!(
+            bootstrap_task_updates(&bootstrap).last(),
+            Some(&serde_json::to_value(&completed).expect("serialize final task"))
+        );
+        let rendered = serde_json::to_string(&bootstrap).expect("serialize resume bootstrap");
+        assert!(!rendered.contains("Initialization"), "{rendered}");
+        assert!(!rendered.contains("Deployment"), "{rendered}");
+    }
+
+    /// Contract: sessions.task-lists.json retains no lifecycle provenance, so
+    /// automatic repair could delete a genuine list with identical content.
+    /// Legacy snapshots remain unchanged; recovery is a new chat or an
+    /// explicit manual clear.
+    #[tokio::test]
+    async fn tycode_legacy_unprovenanced_snapshot_is_not_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions_path = dir.path().join("sessions.json");
+        let task_state_path = sessions_path.with_extension("task-lists.json");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(sessions_path.clone()).expect("session store"),
+        ));
+        let session_id = SessionId("beta46-legacy-unprovenanced".to_owned());
+        seed_tycode_session(&store, &session_id).await;
+        store
+            .lock()
+            .await
+            .set_task_list(&session_id, tycode_constructor_task_list())
+            .expect("seed beta46 task snapshot");
+        let before = std::fs::read(&task_state_path).expect("read legacy snapshot");
+        drop(store);
+
+        let reloaded = SessionStore::load(sessions_path).expect("reload legacy session");
+        let after = std::fs::read(&task_state_path).expect("reread legacy snapshot");
+        assert_eq!(after, before, "reload must not migrate legacy task bytes");
+        assert_eq!(
+            serde_json::to_value(
+                reloaded
+                    .get_task_list(&session_id)
+                    .expect("legacy task snapshot remains")
+            )
+            .expect("serialize legacy task"),
+            serde_json::to_value(tycode_constructor_task_list())
+                .expect("serialize exact beta46 task")
+        );
     }
 
     #[tokio::test]

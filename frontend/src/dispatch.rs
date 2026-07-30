@@ -6571,6 +6571,16 @@ fn apply_agent_bootstrap(
     }
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn apply_agent_bootstrap_for_test(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: AgentBootstrapPayload,
+) {
+    apply_agent_bootstrap(state, host_id, stream, payload);
+}
+
 fn apply_project_bootstrap(
     state: &AppState,
     host_id: &str,
@@ -6856,8 +6866,8 @@ mod tests {
     use super::restore_fixtures::*;
     use super::*;
     use protocol::{
-        BackendKind, FileEntryOp, LaunchProfileId, ProjectFileEntry, ProjectFileKind,
-        ProjectFileVersion, ProjectRootPath,
+        BackendKind, ChatMessage, FileEntryOp, LaunchProfileId, MessageSender, ProjectFileEntry,
+        ProjectFileKind, ProjectFileVersion, ProjectRootPath, Task, TaskList, TaskStatus,
     };
 
     fn install_code_intel_source(
@@ -7865,6 +7875,120 @@ mod tests {
             fatal_error: None,
             activity_summary: Default::default(),
         }
+    }
+
+    fn tycode_genuine_task_replay() -> [TaskList; 3] {
+        let list = |first, second| TaskList {
+            title: "TYCODE GENUINE 9C4D".to_owned(),
+            tasks: vec![
+                Task {
+                    id: 0,
+                    description: "9C4D establish genuine runtime task".to_owned(),
+                    status: first,
+                },
+                Task {
+                    id: 1,
+                    description: "9C4D prove status transition".to_owned(),
+                    status: second,
+                },
+            ],
+        };
+        [
+            list(TaskStatus::InProgress, TaskStatus::Pending),
+            list(TaskStatus::Completed, TaskStatus::InProgress),
+            list(TaskStatus::Completed, TaskStatus::Completed),
+        ]
+    }
+
+    #[test]
+    fn task_replay_state_uses_final_genuine_update() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "tycode-task-replay-host";
+            let agent_id = AgentId("tycode-task-replay-agent".to_owned());
+            let stream = StreamPath("/agent/tycode-task-replay/instance".to_owned());
+            state
+                .agents
+                .set(vec![fatal_test_agent(host_id, &agent_id, &stream)]);
+            let [started, advanced, completed] = tycode_genuine_task_replay();
+
+            for update in [&started, &advanced, &completed] {
+                apply_chat_event(
+                    &state,
+                    host_id,
+                    &agent_id,
+                    ChatEvent::TaskUpdate(update.clone()),
+                );
+            }
+            assert_eq!(
+                state.task_lists.with_untracked(|lists| {
+                    lists
+                        .get(&agent_id)
+                        .map(|list| serde_json::to_value(list).expect("serialize live task list"))
+                }),
+                Some(serde_json::to_value(&completed).expect("serialize final task list"))
+            );
+
+            apply_agent_bootstrap(
+                &state,
+                host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(ChatMessage {
+                            message_id: None,
+                            timestamp: 1,
+                            sender: MessageSender::Assistant {
+                                agent: "tycode".to_owned(),
+                            },
+                            content: "TYCODE_GENUINE_9C4D_DONE".to_owned(),
+                            reasoning: None,
+                            tool_calls: Vec::new(),
+                            model_info: None,
+                            token_usage: None,
+                            context_breakdown: None,
+                            images: None,
+                        })),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+            assert!(
+                state
+                    .task_lists
+                    .with_untracked(|lists| !lists.contains_key(&agent_id)),
+                "corrected constructor-only bootstrap must leave no task entry"
+            );
+
+            apply_agent_bootstrap(
+                &state,
+                host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![started, advanced, completed.clone()]
+                        .into_iter()
+                        .map(ChatEvent::TaskUpdate)
+                        .map(AgentBootstrapEvent::ChatEvent)
+                        .collect(),
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+            assert_eq!(
+                state.task_lists.with_untracked(|lists| {
+                    lists
+                        .get(&agent_id)
+                        .map(|list| serde_json::to_value(list).expect("serialize replay task list"))
+                }),
+                Some(serde_json::to_value(&completed).expect("serialize final task list"))
+            );
+            let rendered = serde_json::to_string(&completed).expect("serialize final task list");
+            assert!(!rendered.contains("Initialization"), "{rendered}");
+            assert!(!rendered.contains("Deployment"), "{rendered}");
+        });
     }
 
     fn running_orchestration_event(label: &str) -> protocol::OrchestrationEvent {
