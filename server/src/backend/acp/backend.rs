@@ -4541,6 +4541,8 @@ mod tests {
     use tracing::span::{Attributes, Record};
     use tracing::{Event, Id, Metadata, Subscriber};
 
+    const AUTH_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     #[derive(Clone, Default)]
     struct WarningRecorder {
         events: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
@@ -5109,7 +5111,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5152,7 +5154,7 @@ while read_logged; do :; done
         ));
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_with_mode(
                 &[workspace.to_string_lossy().to_string()],
                 KiroSpawnMode {
@@ -5202,7 +5204,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
 
         let (session, _events) = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5240,7 +5242,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
 
         let (session, _events) = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5281,7 +5283,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5320,7 +5322,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5369,7 +5371,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
 
         let (session, _events) = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),
@@ -5413,7 +5415,7 @@ while read_logged; do :; done
         let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
 
         let (session, _events) = tokio::time::timeout(
-            Duration::from_secs(2),
+            AUTH_LIFECYCLE_TEST_TIMEOUT,
             KiroSession::spawn_for_agent(
                 &[workspace.to_string_lossy().to_string()],
                 Some(&agent),

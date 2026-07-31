@@ -161,6 +161,11 @@ impl ConnectionPlan {
         self.session_expires_at_ms
             .map(|expires_at_ms| managed_session_renewal_after(expires_at_ms, now_ms))
     }
+
+    /// Exact service-issued client IDs are single-connection identities at AWS IoT.
+    pub(crate) fn can_open_parallel_links(&self) -> bool {
+        matches!(self.broker.client_id, LinkClientId::Random(_))
+    }
 }
 
 const MANAGED_SESSION_RENEWAL_MARGIN_MS: u64 = 60_000;
@@ -835,6 +840,25 @@ mod tests {
                 .expect("inbound topic"),
             "tyde/prod/pair_01J/rooms/BwcHBwcHBwcHBwcHBwcHBw/client-to-host"
         );
+        assert!(
+            !plan.can_open_parallel_links(),
+            "service-issued client ids cannot be reused by simultaneous MQTT links"
+        );
+    }
+
+    #[test]
+    fn legacy_connection_plan_generates_an_identity_for_each_link() {
+        let config = MqttConnectConfig {
+            endpoint: BrokerEndpoint {
+                url: BrokerUrl::new("wss://broker.example.test/mqtt").expect("broker url"),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([7_u8; crate::types::ROOM_ID_LEN]),
+            psk: PreSharedKey::from_slice(&[9_u8; crate::types::PRE_SHARED_KEY_LEN]).expect("psk"),
+            role: ParticipantRole::Host,
+        };
+
+        assert!(ConnectionPlan::legacy(config).can_open_parallel_links());
     }
 
     #[test]

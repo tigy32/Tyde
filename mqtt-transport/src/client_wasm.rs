@@ -117,7 +117,7 @@ pub async fn connect_managed_ephemeral(
 async fn connect_ephemeral_plan(
     plan: ConnectionPlan,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    if plan.config.role == crate::config::ParticipantRole::Host {
+    if plan.config.role == crate::config::ParticipantRole::Host && plan.can_open_parallel_links() {
         return connect_ephemeral_host(plan).await;
     }
     let data = negotiate_ephemeral_data_room_wasm(&plan).await?;

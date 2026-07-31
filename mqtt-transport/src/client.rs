@@ -286,7 +286,7 @@ async fn connect_ephemeral_plan(
             diagnostic.started_at.elapsed().as_millis()
         );
     }
-    if plan.config.role == crate::config::ParticipantRole::Host {
+    if plan.config.role == crate::config::ParticipantRole::Host && plan.can_open_parallel_links() {
         return connect_ephemeral_host(plan, overrides).await;
     }
     let data = match negotiate_ephemeral_data_room_native(&plan, &overrides).await {

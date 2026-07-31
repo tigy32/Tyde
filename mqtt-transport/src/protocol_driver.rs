@@ -1333,6 +1333,17 @@ pub(crate) struct EphemeralDataRoom {
     pub(crate) psk: PreSharedKey,
 }
 
+fn decode_host_open_request(
+    config: &MqttConnectConfig,
+    payload: &[u8],
+) -> Result<Option<OpenRequest>, MqttTransportError> {
+    match decode_open_request(&config.room, &config.psk, payload) {
+        Ok(request) => Ok(Some(request)),
+        Err(FramingError::UnknownTag { .. } | FramingError::VersionMismatch { .. }) => Ok(None),
+        Err(error) => Err(MqttTransportError::Framing(error)),
+    }
+}
+
 pub(crate) async fn negotiate_ephemeral_data_room<L: MqttLink>(
     config: &MqttConnectConfig,
     inbound_topic: &str,
@@ -1391,14 +1402,9 @@ where
                                 ),
                             }));
                         }
-                        let request = match decode_open_request(
-                            &config.room,
-                            &config.psk,
-                            &publish.payload,
-                        ) {
-                            Ok(request) => request,
-                            Err(FramingError::UnknownTag { .. }) => continue,
-                            Err(error) => return Err(MqttTransportError::Framing(error)),
+                        let request = match decode_host_open_request(config, &publish.payload)? {
+                            Some(request) => request,
+                            None => continue,
                         };
                         if request.proposed_data_room == config.room {
                             return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
@@ -1484,7 +1490,9 @@ async fn await_open_and_accept<L: MqttLink>(
                         ),
                     }));
                 }
-                let request = decode_open_request(&config.room, &config.psk, &publish.payload)?;
+                let Some(request) = decode_host_open_request(config, &publish.payload)? else {
+                    continue;
+                };
                 if request.proposed_data_room == config.room {
                     return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
                         message: "rendezvous request proposed the rendezvous room as its data room"
@@ -1756,6 +1764,53 @@ mod tests {
 
     fn test_psk() -> PreSharedKey {
         PreSharedKey([0x55; 32])
+    }
+
+    fn rendezvous_config() -> MqttConnectConfig {
+        MqttConnectConfig {
+            endpoint: BrokerEndpoint {
+                url: BrokerUrl::new("wss://broker.example.test/mqtt").expect("broker url"),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: test_room(),
+            psk: test_psk(),
+            role: ParticipantRole::Host,
+        }
+    }
+
+    #[test]
+    fn host_ignores_an_open_from_an_older_transport_version() {
+        let config = rendezvous_config();
+        let request = OpenRequest {
+            connection_id: ConnectionId::random(),
+            client_nonce: random_nonce(),
+            proposed_data_room: RoomId::random(),
+        };
+        let mut frame =
+            encode_open_request(&config.room, &config.psk, &request).expect("encode open");
+        frame[0] = crate::framing::MQTT_TRANSPORT_VERSION - 1;
+
+        assert!(
+            decode_host_open_request(&config, &frame)
+                .expect("stale frame must not fail the listener")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn host_still_rejects_a_malformed_current_open() {
+        let config = rendezvous_config();
+        let malformed = [
+            crate::framing::MQTT_TRANSPORT_VERSION,
+            crate::rendezvous::RENDEZVOUS_OPEN_TAG,
+        ];
+
+        assert!(matches!(
+            decode_host_open_request(&config, &malformed),
+            Err(MqttTransportError::Framing(
+                FramingError::DataFrameTooShort { .. }
+            ))
+        ));
     }
 
     fn peer_cipher() -> Result<SessionCipher, MqttTransportError> {
