@@ -4544,6 +4544,46 @@ kbd {
     gap: 0;
 }
 
+.summary-context-view[hidden],
+.summary-task-view[hidden] {
+    display: none;
+}
+
+.summary-view-tabs {
+    display: flex;
+    min-height: 44px;
+    padding: 0 8px;
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.summary-view-tab {
+    min-width: 88px;
+    min-height: 44px;
+    padding: 8px 16px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+}
+
+.summary-view-tab[aria-selected="true"] {
+    border-bottom-color: var(--accent-primary);
+    color: var(--text-primary);
+}
+
+.summary-view-tab[aria-disabled="true"] {
+    color: var(--text-tertiary);
+    cursor: default;
+    opacity: 0.55;
+}
+
+.summary-view-tab[aria-disabled="false"]:hover {
+    background: rgba(128, 128, 128, 0.1);
+}
+
 /* --- Task View --- */
 .summary-task-view {
     display: flex;
@@ -4553,18 +4593,10 @@ kbd {
 
 .task-list-header {
     width: 100%;
-    background: none;
-    border: none;
     padding: 8px 12px;
     margin: 0;
-    cursor: pointer;
     text-align: left;
     user-select: none;
-    transition: background-color 0.2s;
-}
-
-.task-list-header:hover {
-    background: rgba(128, 128, 128, 0.1);
 }
 
 .task-list-title {
@@ -4575,11 +4607,23 @@ kbd {
     font-weight: 600;
 }
 
-.task-list-chevron {
-    width: 14px;
-    text-align: center;
+.task-list-collapse {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    margin: -8px -12px -8px 0;
+    padding: 0;
+    border: none;
+    background: none;
     color: var(--text-secondary);
-    font-size: 0.769rem;
+    cursor: pointer;
+    font-size: 0.923rem;
+}
+
+.task-list-collapse:hover {
+    background: rgba(128, 128, 128, 0.1);
 }
 
 .task-list-heading {
@@ -4973,50 +5017,6 @@ kbd {
 
 .context-breakdown-dot.dot-context {
     background: #bf69ff;
-}
-
-/* Task hint link — switches to task view */
-.context-task-hint {
-    margin-left: auto;
-    border: none;
-    background: none;
-    color: #2f8ff6;
-    font-size: 0.769rem;
-    cursor: pointer;
-    white-space: nowrap;
-    padding: 0;
-    opacity: 0.7;
-    transition: opacity 0.2s, color 0.2s;
-}
-
-.context-task-hint:hover {
-    opacity: 1;
-    text-decoration: underline;
-}
-
-/* Mini context bar — shown below task view, clickable to switch to context view */
-.context-mini-bar {
-    display: flex;
-    height: 4px;
-    margin: 4px 12px 6px 12px;
-    border-radius: 2px;
-    background: rgba(128, 128, 128, 0.15);
-    overflow: hidden;
-    cursor: pointer;
-    padding: 0;
-    border: 1px solid rgba(128, 128, 128, 0.15);
-    transition:
-        height 0.2s ease,
-        box-shadow 0.2s ease,
-        filter 0.2s ease,
-        border-color 0.2s ease;
-}
-
-.context-mini-bar:hover {
-    height: 8px;
-    border-color: rgba(99, 179, 237, 0.4);
-    box-shadow: 0 0 6px rgba(99, 179, 237, 0.25);
-    filter: brightness(1.2);
 }
 
 /* ===== Dock Tabs & Inner ===== */

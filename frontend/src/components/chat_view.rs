@@ -269,10 +269,10 @@ pub fn ChatView(
         state.streaming_text.with(|m| m.get(&agent_id).cloned())
     };
 
-    let task_list = move || {
+    let task_list: Signal<Option<protocol::TaskList>> = Signal::derive(move || {
         let agent_id = agent_ref.get()?.agent_id;
         state.task_lists.with(|m| m.get(&agent_id).cloned())
-    };
+    });
 
     let orchestration_records: Signal<Vec<crate::state::OrchestrationRecord>> =
         Signal::derive(move || {
@@ -343,7 +343,7 @@ pub fn ChatView(
             )
         });
 
-    let context_breakdown: Signal<Option<protocol::ContextBreakdown>> = Signal::derive(move || {
+    let context_breakdown: Memo<Option<protocol::ContextBreakdown>> = Memo::new(move |_| {
         let active = agent_ref.get()?;
         if current_agent
             .get()
@@ -910,15 +910,14 @@ pub fn ChatView(
                     <ReviewChangesButton agent_ref=agent_ref />
                     <CompactContextButton agent_ref=agent_ref />
                 </div>
-                {move || {
-                    view! {
-                        <TaskListView
-                            task_list=task_list()
-                            context_breakdown=context_breakdown.get()
-                            current_context_usage=current_context_usage.get()
-                        />
-                    }
-                }}
+                <TaskListView
+                    agent_id=Signal::derive(move || {
+                        agent_ref.get().map(|active| active.agent_id)
+                    })
+                    task_list=task_list
+                    context_breakdown=context_breakdown
+                    current_context_usage=current_context_usage
+                />
                 <Show when=agent_initializing>
                     <div class="chat-initializing-overlay">
                         <div class="chat-initializing-spinner"></div>
@@ -3013,7 +3012,14 @@ mod wasm_tests {
                 .is_some_and(|classes| classes.split_whitespace().any(|class| class == "hidden")),
             "{phase}: constructor-only replay must keep the task panel hidden"
         );
-        assert!(query(container, ".context-task-hint").is_none(), "{phase}");
+        assert!(
+            query(container, "[data-summary-view='tasks']")
+                .expect("tasks tab shell")
+                .get_attribute("aria-disabled")
+                .as_deref()
+                == Some("true"),
+            "{phase}: constructor-only replay must not offer an unavailable task view"
+        );
         let text = container.text_content().unwrap_or_default();
         assert!(text.contains("TYCODE_GENUINE_7F3A_DONE"), "{phase}: {text}");
         assert!(!text.contains("Initialization"), "{phase}: {text}");
@@ -3021,18 +3027,15 @@ mod wasm_tests {
         assert!(query(container, ".chat-streaming").is_none(), "{phase}");
     }
 
-    async fn assert_genuine_terminal_task_render(container: &HtmlElement, phase: &str) {
-        let hint = query(container, ".context-task-hint")
-            .unwrap_or_else(|| panic!("{phase}: genuine task hint missing"));
+    fn assert_genuine_terminal_task_render(container: &HtmlElement, phase: &str) {
         assert_eq!(
-            hint.text_content().unwrap_or_default(),
-            "2/2 tasks done →",
-            "{phase}"
+            query(container, "[data-summary-view='tasks']")
+                .expect("tasks tab")
+                .get_attribute("aria-selected")
+                .as_deref(),
+            Some("true"),
+            "{phase}: the selected task view must survive reactive updates"
         );
-        hint.dyn_into::<HtmlElement>()
-            .expect("task hint button")
-            .click();
-        next_tick().await;
         assert_eq!(
             query(container, ".task-list-heading")
                 .expect("task heading")
@@ -3175,7 +3178,13 @@ mod wasm_tests {
             view! { <ChatView tab_id=TabId(27_012) agent_ref=agent_ref is_active=is_active /> }
         });
         next_tick().await;
-        assert_genuine_terminal_task_render(&container, "live").await;
+        query(&container, "[data-summary-view='tasks']")
+            .expect("genuine task tab")
+            .dyn_into::<HtmlElement>()
+            .expect("task tab button")
+            .click();
+        next_tick().await;
+        assert_genuine_terminal_task_render(&container, "live");
 
         let state = state_handle
             .borrow()
@@ -3194,7 +3203,7 @@ mod wasm_tests {
                 tycode_genuine_task_bootstrap(),
             );
             next_tick().await;
-            assert_genuine_terminal_task_render(&container, phase).await;
+            assert_genuine_terminal_task_render(&container, phase);
         }
         drop(handle);
         container.remove();
