@@ -13,7 +13,7 @@ use protocol::{
     AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
     BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
     CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
-    CompactionStage, CompactionTrigger, ContextCompactionCapabilityPayload,
+    CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, ContinuationInstallSummary, Envelope, FrameKind,
     MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
@@ -823,6 +823,17 @@ enum TokenUsageTrackingMode {
     ModelRequests,
 }
 
+fn context_estimate_matches(
+    estimate: &ContextBreakdown,
+    current: &protocol::CurrentContextUsage,
+) -> bool {
+    current
+        .known()
+        .is_some_and(|(input_tokens, context_window)| {
+            estimate.input_tokens == input_tokens && estimate.context_window == context_window
+        })
+}
+
 #[derive(Debug, Default)]
 struct AgentActivityStatsTracker {
     stats: AgentActivityStats,
@@ -839,14 +850,18 @@ struct AgentActivityStatsTracker {
 
 impl AgentActivityStatsTracker {
     fn for_backend(backend_kind: BackendKind) -> Self {
-        Self {
+        let mut tracker = Self {
             token_usage_tracking_mode: if backend_kind == BackendKind::Codex {
                 TokenUsageTrackingMode::ModelRequests
             } else {
                 TokenUsageTrackingMode::Messages
             },
             ..Self::default()
+        };
+        if backend_kind == BackendKind::Codex {
+            tracker.stats.current_context_usage = Some(protocol::CurrentContextUsage::Unknown);
         }
+        tracker
     }
 
     fn snapshot(&self) -> AgentActivityStats {
@@ -987,8 +1002,13 @@ impl AgentActivityStatsTracker {
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
-            | ChatEvent::Orchestration(_)
-            | ChatEvent::ContextCompaction(_) => {}
+            | ChatEvent::Orchestration(_) => {}
+            ChatEvent::ContextCompaction(compaction)
+                if compaction.status == ContextCompactionTimelineStatus::Completed =>
+            {
+                self.clear_current_context_usage(source_seq);
+            }
+            ChatEvent::ContextCompaction(_) => {}
             ChatEvent::StreamStart(data) => {
                 if let Some(model) = data.model.as_ref().filter(|model| !model.trim().is_empty()) {
                     self.latest_model = Some(model.clone());
@@ -1015,8 +1035,30 @@ impl AgentActivityStatsTracker {
             },
         );
         self.stats.token_usage = usage.cumulative;
+        if let Some(current) = usage.current_context_usage {
+            self.stats.estimated_context_breakdown = usage
+                .estimated_context_breakdown
+                .filter(|estimate| context_estimate_matches(estimate, &current));
+            self.stats.current_context_usage = Some(current);
+        }
         self.stats.source_through_seq = Some(source_seq);
         self.stats != previous
+    }
+
+    fn clear_current_context_usage(&mut self, source_seq: u64) -> bool {
+        let cleared_usage = match self.token_usage_tracking_mode {
+            TokenUsageTrackingMode::ModelRequests => Some(protocol::CurrentContextUsage::Unknown),
+            TokenUsageTrackingMode::Messages => None,
+        };
+        if self.stats.current_context_usage == cleared_usage
+            && self.stats.estimated_context_breakdown.is_none()
+        {
+            return false;
+        }
+        self.stats.current_context_usage = cleared_usage;
+        self.stats.estimated_context_breakdown = None;
+        self.stats.source_through_seq = Some(source_seq);
+        true
     }
 
     fn observe_total_only_token_usage(&mut self, total_tokens: u64, source_seq: u64) -> bool {
@@ -3699,6 +3741,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut replay_state,
                                 &mut subscribers,
                                 &mut activity_stats,
+                                Some(&mut activity_event_seq),
                             )
                             .await;
                         }
@@ -3905,14 +3948,19 @@ pub(crate) fn spawn_agent_actor(
                                     );
                                 }
                             }
-                            upsert_activity_stats_snapshot(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &current_start.agent_id,
-                                activity_stats.snapshot(),
-                            )
-                            .await;
+                            let activity_stats_changed =
+                                activity_stats.clear_current_context_usage(activity_event_seq);
+                            activity_event_seq = activity_event_seq.saturating_add(1);
+                            if activity_stats_changed {
+                                upsert_activity_stats_snapshot(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &current_start.agent_id,
+                                    activity_stats.snapshot(),
+                                )
+                                .await;
+                            }
                             let marker = ContextCompactionTimelineEvent {
                                 marker_id: observed.observation_id,
                                 operation_id: None,
@@ -4602,6 +4650,20 @@ pub(crate) fn spawn_agent_actor(
                                             observed,
                                         ),
                                     ) => {
+                                        let activity_stats_changed = activity_stats
+                                            .clear_current_context_usage(activity_event_seq);
+                                        activity_event_seq =
+                                            activity_event_seq.saturating_add(1);
+                                        if activity_stats_changed {
+                                            upsert_activity_stats_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &current_start.agent_id,
+                                                activity_stats.snapshot(),
+                                            )
+                                            .await;
+                                        }
                                         let marker =
                                             ContextCompactionTimelineEvent {
                                                 marker_id: observed.observation_id,
@@ -6356,6 +6418,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut replay_state,
                                 &mut subscribers,
                                 &mut activity_stats,
+                                Some(&mut activity_event_seq),
                             )
                             .await;
                             shutdown_backend_with_timeout(
@@ -6483,6 +6546,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut replay_state,
                                             &mut subscribers,
                                             &mut activity_stats,
+                                            Some(&mut activity_event_seq),
                                         )
                                         .await;
                                         if matches!(lifecycle, ActorLifecycle::Running) {
@@ -6640,6 +6704,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut replay_state,
                                 &mut subscribers,
                                 &mut activity_stats,
+                                Some(&mut activity_event_seq),
                             )
                             .await;
                             if accepted_before_terminal {
@@ -7073,6 +7138,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut replay_state,
                                     &mut subscribers,
                                     &mut activity_stats,
+                                    Some(&mut activity_event_seq),
                                 )
                                 .await;
                             }
@@ -8325,6 +8391,7 @@ async fn enter_terminal_failure(
             context.replay_state,
             context.subscribers,
             compaction.activity_stats,
+            None,
         )
         .await;
     }
@@ -10723,6 +10790,7 @@ async fn record_context_compaction_terminal(
     replay_state: &mut AgentReplayState,
     subscribers: &mut Vec<Stream>,
     activity_stats: &mut AgentActivityStatsTracker,
+    activity_event_seq: Option<&mut u64>,
 ) {
     if let Some(task) = flight.fallback_task.take() {
         task.abort();
@@ -10782,14 +10850,25 @@ async fn record_context_compaction_terminal(
         );
     }
 
-    upsert_activity_stats_snapshot(
-        canonical_stream,
-        event_log,
-        subscribers,
-        &start.agent_id,
-        activity_stats.snapshot(),
-    )
-    .await;
+    let compaction_source_seq = activity_event_seq
+        .as_deref()
+        .copied()
+        .unwrap_or_else(|| activity_stats.stats.source_through_seq.unwrap_or_default());
+    let activity_stats_changed = terminal.status == ContextCompactionTimelineStatus::Completed
+        && activity_stats.clear_current_context_usage(compaction_source_seq);
+    if let Some(activity_event_seq) = activity_event_seq {
+        *activity_event_seq = activity_event_seq.saturating_add(1);
+    }
+    if activity_stats_changed {
+        upsert_activity_stats_snapshot(
+            canonical_stream,
+            event_log,
+            subscribers,
+            &start.agent_id,
+            activity_stats.snapshot(),
+        )
+        .await;
+    }
 
     let marker_method = resolved_method.unwrap_or(CompactionMethod::NativeRpc);
     let marker = ContextCompactionTimelineEvent {
@@ -12189,17 +12268,17 @@ mod tests {
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
         AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
-        CompactionMetrics, CompactionMutation, CompactionOperationId, CompactionStage,
-        CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionStatus,
-        ContextCompactionTimelineEvent, ContextCompactionTimelineStatus, Envelope, FrameKind,
-        MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
-        ModelRequestId, ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
-        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
-        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, Task, TaskList,
-        TaskStatus, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
-        TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
+        CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
+        CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionNotifyPayload,
+        ContextCompactionStatus, ContextCompactionTimelineEvent, ContextCompactionTimelineStatus,
+        CurrentContextUsage, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
+        MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
+        ModelTurnId, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
+        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
+        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, Task, TaskList, TaskStatus, TaskTokenUsageScope,
+        TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -14447,6 +14526,8 @@ mod tests {
             turn: token_usage(40),
             cumulative: token_usage(1_000),
             model_context_window: Some(400_000),
+            current_context_usage: None,
+            estimated_context_breakdown: None,
         };
         assert!(stats.observe_model_request_token_usage(first, 180));
 
@@ -14459,6 +14540,8 @@ mod tests {
             turn: token_usage(65),
             cumulative: token_usage(1_025),
             model_context_window: Some(400_000),
+            current_context_usage: None,
+            estimated_context_breakdown: None,
         };
         assert!(stats.observe_model_request_token_usage(second, 181));
 
@@ -14513,6 +14596,141 @@ mod tests {
             resumed.usage,
             TaskTokenUsageScope::Known { ref usage } if usage.total_tokens == 1_025
         ));
+    }
+
+    #[test]
+    fn codex_current_context_is_exact_persistent_and_compaction_scoped() {
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Codex);
+        assert_eq!(
+            stats.snapshot().current_context_usage,
+            Some(CurrentContextUsage::Unknown)
+        );
+        assert!(
+            !stats.clear_current_context_usage(0),
+            "clearing an already-unknown Codex context must not emit a stats frame"
+        );
+        assert_eq!(stats.snapshot().source_through_seq, None);
+        let matching = ContextBreakdown {
+            system_prompt_bytes: 10,
+            tool_io_bytes: 20,
+            conversation_history_bytes: 30,
+            reasoning_bytes: 40,
+            context_injection_bytes: 50,
+            input_tokens: 120,
+            context_window: 400_000,
+        };
+        let usage = |sequence: u32,
+                     current_context_usage: Option<CurrentContextUsage>,
+                     estimated_context_breakdown: Option<ContextBreakdown>| {
+            ModelRequestTokenUsage {
+                request_id: ModelRequestId {
+                    turn_id: ModelTurnId("turn-context".to_owned()),
+                    sequence,
+                },
+                request: token_usage(20),
+                turn: token_usage(20),
+                cumulative: token_usage(1_000 + u64::from(sequence)),
+                model_context_window: current_context_usage
+                    .as_ref()
+                    .and_then(CurrentContextUsage::known)
+                    .map(|(_, context_window)| context_window),
+                current_context_usage,
+                estimated_context_breakdown,
+            }
+        };
+
+        assert!(stats.observe_model_request_token_usage(
+            usage(
+                0,
+                Some(CurrentContextUsage::Known {
+                    input_tokens: 120,
+                    context_window: 400_000,
+                }),
+                Some(matching.clone()),
+            ),
+            1,
+        ));
+        assert_eq!(
+            stats.snapshot().current_context_usage,
+            Some(CurrentContextUsage::Known {
+                input_tokens: 120,
+                context_window: 400_000,
+            })
+        );
+        assert_eq!(
+            stats.snapshot().estimated_context_breakdown,
+            Some(matching.clone())
+        );
+
+        assert!(stats.observe_model_request_token_usage(usage(1, None, None), 2));
+        assert_eq!(
+            stats
+                .snapshot()
+                .current_context_usage
+                .as_ref()
+                .and_then(CurrentContextUsage::known)
+                .map(|(input_tokens, _)| input_tokens),
+            Some(120),
+            "a contextless provider row must preserve the last exact snapshot"
+        );
+        let mut cancelled = ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+            message: "interrupted".to_owned(),
+        });
+        assert!(!stats.observe_chat_event(&mut cancelled, 3, ""));
+        assert_eq!(stats.snapshot().estimated_context_breakdown, Some(matching));
+
+        let mismatched = ContextBreakdown {
+            system_prompt_bytes: 1,
+            tool_io_bytes: 2,
+            conversation_history_bytes: 3,
+            reasoning_bytes: 4,
+            context_injection_bytes: 5,
+            input_tokens: 999,
+            context_window: 400_000,
+        };
+        assert!(stats.observe_model_request_token_usage(
+            usage(
+                2,
+                Some(CurrentContextUsage::Known {
+                    input_tokens: 140,
+                    context_window: 400_000,
+                }),
+                Some(mismatched),
+            ),
+            4,
+        ));
+        assert_eq!(stats.snapshot().estimated_context_breakdown, None);
+        assert_eq!(
+            stats
+                .snapshot()
+                .current_context_usage
+                .as_ref()
+                .and_then(CurrentContextUsage::known)
+                .map(|(input_tokens, _)| input_tokens),
+            Some(140)
+        );
+
+        let mut completed_compaction =
+            ChatEvent::ContextCompaction(ContextCompactionTimelineEvent {
+                marker_id: CompactionObservationId("context-cleared".to_owned()),
+                operation_id: None,
+                trigger: CompactionTrigger::UserRequested,
+                method: CompactionMethod::NativeRpc,
+                backend_kind: BackendKind::Codex,
+                provider_session_id: None,
+                status: ContextCompactionTimelineStatus::Completed,
+                mutation: CompactionMutation::Completed,
+                metrics: CompactionMetrics::default(),
+                continuation: None,
+                message: None,
+                timestamp: 5,
+            });
+        assert!(stats.observe_chat_event(&mut completed_compaction, 5, ""));
+        assert_eq!(
+            stats.snapshot().current_context_usage,
+            Some(CurrentContextUsage::Unknown)
+        );
+        assert_eq!(stats.snapshot().estimated_context_breakdown, None);
     }
 
     #[test]
@@ -14958,6 +15176,8 @@ mod tests {
                 tool_calls: 0,
                 token_usage: token_usage(30),
                 token_usage_total_only: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
                 source_through_seq: Some(7),
             },
         };
@@ -15020,6 +15240,8 @@ mod tests {
                 tool_calls: 0,
                 token_usage: token_usage(30),
                 token_usage_total_only: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
                 source_through_seq: Some(7),
             },
         };
@@ -15071,6 +15293,8 @@ mod tests {
                 tool_calls: 0,
                 token_usage: token_usage(12),
                 token_usage_total_only: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
                 source_through_seq: Some(7),
             },
         };
@@ -15219,6 +15443,8 @@ mod tests {
                 turn: token_usage(17),
                 cumulative: token_usage(17),
                 model_context_window: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
             })
             .expect("relay model usage channel should be open");
         total_usage_tx
@@ -15322,6 +15548,19 @@ mod tests {
                 turn: token_usage(11),
                 cumulative: token_usage(11),
                 model_context_window: Some(200_000),
+                current_context_usage: Some(CurrentContextUsage::Known {
+                    input_tokens: 11,
+                    context_window: 200_000,
+                }),
+                estimated_context_breakdown: Some(ContextBreakdown {
+                    system_prompt_bytes: 4,
+                    tool_io_bytes: 8,
+                    conversation_history_bytes: 12,
+                    reasoning_bytes: 0,
+                    context_injection_bytes: 20,
+                    input_tokens: 11,
+                    context_window: 200_000,
+                }),
             })
             .expect("relay model usage channel should be open");
 
@@ -15390,6 +15629,20 @@ mod tests {
             })
             .expect("replay activity stats");
         assert_eq!(replay_stats.token_usage.total_tokens, 11);
+        assert_eq!(
+            replay_stats.current_context_usage,
+            Some(CurrentContextUsage::Known {
+                input_tokens: 11,
+                context_window: 200_000,
+            })
+        );
+        assert_eq!(
+            replay_stats
+                .estimated_context_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.input_tokens),
+            Some(11)
+        );
 
         drop(event_tx);
         drop(model_usage_tx);
@@ -15420,6 +15673,8 @@ mod tests {
                 tool_calls: 3,
                 token_usage: token_usage(30),
                 token_usage_total_only: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
                 source_through_seq: Some(9),
             },
         )

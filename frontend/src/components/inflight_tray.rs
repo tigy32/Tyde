@@ -1842,6 +1842,8 @@ mod wasm_tests {
             tool_calls,
             token_usage,
             token_usage_total_only: None,
+            current_context_usage: None,
+            estimated_context_breakdown: None,
             source_through_seq: None,
         }
     }

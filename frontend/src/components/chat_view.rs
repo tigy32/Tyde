@@ -284,40 +284,6 @@ pub fn ChatView(
                 .with(|m| m.get(&agent_id).cloned().unwrap_or_default())
         });
 
-    // Walk back from the latest message to find the most recent assistant
-    // message that carries a context_breakdown. `ContextBreakdown` does not
-    // implement `PartialEq`, so we use a derived Signal rather than a Memo.
-    // Each read still walks the vec, but it's bounded by "messages up to the
-    // most recent assistant turn" — typically a single iteration.
-    let context_breakdown: Signal<Option<protocol::ContextBreakdown>> = Signal::derive(move || {
-        let id = active_agent_id()?;
-        state.chat_rows.with(|m| {
-            let rows = m.get(&id)?;
-            for row in rows.iter().rev() {
-                // A compaction marker carries no message and no breakdown;
-                // walking past it keeps the search on real turns.
-                let Some(row_entry) = row.message_entry() else {
-                    continue;
-                };
-                let entry = row_entry.get();
-                let is_assistant = matches!(
-                    entry.message.sender,
-                    protocol::MessageSender::Assistant { .. }
-                );
-                if !is_assistant {
-                    continue;
-                }
-                if let Some(breakdown) = entry.message.context_breakdown.clone() {
-                    return Some(breakdown);
-                }
-                if entry.message.tool_calls.is_empty() {
-                    return None;
-                }
-            }
-            None
-        })
-    });
-
     let transient_events = move || {
         let agent_id = agent_ref.get()?.agent_id;
         state.transient_events.with(|m| m.get(&agent_id).cloned())
@@ -352,6 +318,70 @@ pub fn ChatView(
 
     let agent_backend =
         move || -> Option<BackendKind> { current_agent.get().map(|a| a.backend_kind) };
+
+    let current_context_usage: Signal<Option<protocol::CurrentContextUsage>> =
+        Signal::derive(move || {
+            let active = agent_ref.get()?;
+            if !current_agent
+                .get()
+                .is_some_and(|agent| agent.backend_kind == BackendKind::Codex)
+            {
+                return None;
+            }
+            Some(
+                state
+                    .agent_activity_stats
+                    .with(|stats| {
+                        stats
+                            .get(&crate::state::ActiveAgentRef {
+                                host_id: active.host_id,
+                                agent_id: active.agent_id,
+                            })
+                            .and_then(|stats| stats.current_context_usage.clone())
+                    })
+                    .unwrap_or(protocol::CurrentContextUsage::Unknown),
+            )
+        });
+
+    let context_breakdown: Signal<Option<protocol::ContextBreakdown>> = Signal::derive(move || {
+        let active = agent_ref.get()?;
+        if current_agent
+            .get()
+            .is_some_and(|agent| agent.backend_kind == BackendKind::Codex)
+        {
+            return state.agent_activity_stats.with(|stats| {
+                stats
+                    .get(&crate::state::ActiveAgentRef {
+                        host_id: active.host_id,
+                        agent_id: active.agent_id,
+                    })
+                    .and_then(|stats| stats.estimated_context_breakdown.clone())
+            });
+        }
+
+        state.chat_rows.with(|rows_by_agent| {
+            let rows = rows_by_agent.get(&active.agent_id)?;
+            for row in rows.iter().rev() {
+                let Some(row_entry) = row.message_entry() else {
+                    continue;
+                };
+                let entry = row_entry.get();
+                if !matches!(
+                    entry.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                ) {
+                    continue;
+                }
+                if let Some(breakdown) = entry.message.context_breakdown.clone() {
+                    return Some(breakdown);
+                }
+                if entry.message.tool_calls.is_empty() {
+                    return None;
+                }
+            }
+            None
+        })
+    });
 
     let agent_initializing = move || -> bool {
         current_agent
@@ -885,6 +915,7 @@ pub fn ChatView(
                         <TaskListView
                             task_list=task_list()
                             context_breakdown=context_breakdown.get()
+                            current_context_usage=current_context_usage.get()
                         />
                     }
                 }}
@@ -2441,6 +2472,186 @@ mod wasm_tests {
             fatal_error: None,
             activity_summary: Default::default(),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn codex_header_uses_selected_agent_stats_without_transcript_fallback() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let selected = RwSignal::new(Some(ActiveAgentRef {
+            host_id: "host-context".to_owned(),
+            agent_id: AgentId("root-context".to_owned()),
+        }));
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_for_mount = state_handle.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut root = make_target_agent("host-context", "root-context", None);
+            root.backend_kind = BackendKind::Codex;
+            let mut child = make_target_agent("host-context", "child-context", None);
+            child.backend_kind = BackendKind::Codex;
+            child.parent_agent_id = Some(AgentId("root-context".to_owned()));
+            let mut fresh = make_target_agent("host-context", "fresh-context", None);
+            fresh.backend_kind = BackendKind::Codex;
+            let mut neutral = make_target_agent("host-context", "neutral-context", None);
+            neutral.backend_kind = BackendKind::Codex;
+            state.agents.set(vec![root, child, fresh, neutral]);
+
+            for (agent_id, input_tokens, context_window) in
+                [("root-context", 100, 1_000), ("child-context", 200, 2_000)]
+            {
+                state.agent_activity_stats.update(|stats| {
+                    stats.insert(
+                        ActiveAgentRef {
+                            host_id: "host-context".to_owned(),
+                            agent_id: AgentId(agent_id.to_owned()),
+                        },
+                        protocol::AgentActivityStats {
+                            current_context_usage: Some(protocol::CurrentContextUsage::Known {
+                                input_tokens,
+                                context_window,
+                            }),
+                            estimated_context_breakdown: Some(protocol::ContextBreakdown {
+                                system_prompt_bytes: 4,
+                                tool_io_bytes: 8,
+                                conversation_history_bytes: 12,
+                                reasoning_bytes: 0,
+                                context_injection_bytes: 16,
+                                input_tokens,
+                                context_window,
+                            }),
+                            ..protocol::AgentActivityStats::default()
+                        },
+                    );
+                });
+                let mut transcript = mk_user_msg("stale transcript context");
+                transcript.message.sender = MessageSender::Assistant {
+                    agent: "codex".to_owned(),
+                };
+                transcript.message.context_breakdown = Some(protocol::ContextBreakdown {
+                    system_prompt_bytes: 1,
+                    tool_io_bytes: 1,
+                    conversation_history_bytes: 1,
+                    reasoning_bytes: 1,
+                    context_injection_bytes: 1,
+                    input_tokens: 999,
+                    context_window: 9_999,
+                });
+                state.chat_rows.update(|rows| {
+                    rows.insert(
+                        AgentId(agent_id.to_owned()),
+                        vec![ChatRowHandle::new(transcript)],
+                    );
+                });
+            }
+            state.agent_activity_stats.update(|stats| {
+                stats.insert(
+                    ActiveAgentRef {
+                        host_id: "host-context".to_owned(),
+                        agent_id: AgentId("neutral-context".to_owned()),
+                    },
+                    protocol::AgentActivityStats {
+                        current_context_usage: Some(protocol::CurrentContextUsage::Known {
+                            input_tokens: 300,
+                            context_window: 3_000,
+                        }),
+                        estimated_context_breakdown: None,
+                        ..protocol::AgentActivityStats::default()
+                    },
+                );
+            });
+
+            *state_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let selected_agent: Signal<Option<ActiveAgentRef>> =
+                Signal::derive(move || selected.get());
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! {
+                <ChatView
+                    tab_id=TabId(24_001)
+                    agent_ref=selected_agent
+                    is_active=is_active
+                />
+            }
+        });
+        next_tick().await;
+
+        let usage_text = || {
+            container
+                .query_selector("[data-testid='context-usage']")
+                .unwrap()
+                .and_then(|element| element.text_content())
+        };
+        assert_eq!(usage_text().as_deref(), Some("100 / 1.0K tokens (10.0%)"));
+
+        selected.set(Some(ActiveAgentRef {
+            host_id: "host-context".to_owned(),
+            agent_id: AgentId("child-context".to_owned()),
+        }));
+        next_tick().await;
+        assert_eq!(usage_text().as_deref(), Some("200 / 2.0K tokens (10.0%)"));
+
+        selected.set(Some(ActiveAgentRef {
+            host_id: "host-context".to_owned(),
+            agent_id: AgentId("fresh-context".to_owned()),
+        }));
+        next_tick().await;
+        assert_eq!(
+            usage_text().as_deref(),
+            Some("Unavailable"),
+            "a selected Codex agent must keep a neutral context panel before its first request"
+        );
+        assert!(
+            !container
+                .query_selector("[data-testid='context-bar']")
+                .unwrap()
+                .expect("unknown context bar")
+                .has_attribute("aria-valuenow"),
+            "unknown occupancy must not be exposed as zero percent"
+        );
+
+        selected.set(Some(ActiveAgentRef {
+            host_id: "host-context".to_owned(),
+            agent_id: AgentId("neutral-context".to_owned()),
+        }));
+        next_tick().await;
+        assert_eq!(usage_text().as_deref(), Some("300 / 3.0K tokens (10.0%)"));
+        assert_eq!(
+            container
+                .query_selector_all("[data-testid='context-segment']")
+                .unwrap()
+                .length(),
+            0,
+            "exact occupancy without observed estimate bytes must render a neutral bar"
+        );
+
+        selected.set(Some(ActiveAgentRef {
+            host_id: "host-context".to_owned(),
+            agent_id: AgentId("child-context".to_owned()),
+        }));
+        next_tick().await;
+
+        state_handle
+            .borrow()
+            .as_ref()
+            .expect("mounted state")
+            .agent_activity_stats
+            .update(|stats| {
+                stats
+                    .get_mut(&ActiveAgentRef {
+                        host_id: "host-context".to_owned(),
+                        agent_id: AgentId("child-context".to_owned()),
+                    })
+                    .expect("child stats")
+                    .current_context_usage = Some(protocol::CurrentContextUsage::Unknown);
+            });
+        next_tick().await;
+        assert_eq!(
+            usage_text().as_deref(),
+            Some("Unavailable"),
+            "post-compaction Codex context must stay visible without transcript fallback"
+        );
     }
 
     /// dev-docs/32 §7: every chat pane mounts its own composer, and the two are

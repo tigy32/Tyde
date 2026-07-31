@@ -22,9 +22,9 @@ use protocol::{
     BackgroundTaskState, BackgroundTaskStatus, CapacityBucket, CapacityBucketId, CapacityCoverage,
     CapacityMeasure, CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope,
     CapacitySource, CapacityUnavailableReason, CapacityWindow, ChatMessageId, CodexLimitSlot,
-    ImageData, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-    ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, TokenUsage,
-    TokenUsageUnavailableReason, ToolExecutionNormalizationFailure, ToolProgressData,
+    ContextBreakdown, CurrentContextUsage, ImageData, ModelRequestId, ModelRequestTokenUsage,
+    ModelTurnId, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
+    TokenUsage, TokenUsageUnavailableReason, ToolExecutionNormalizationFailure, ToolProgressData,
     ToolProgressUpdate, ValueProvenance,
 };
 
@@ -3157,6 +3157,12 @@ struct TurnContextEstimate {
     conversation_history_bytes: u64,
     tool_io_bytes: u64,
     reasoning_bytes: u64,
+}
+
+impl TurnContextEstimate {
+    fn has_observed_bytes(&self) -> bool {
+        self.conversation_history_bytes > 0 || self.tool_io_bytes > 0 || self.reasoning_bytes > 0
+    }
 }
 
 #[derive(Clone)]
@@ -7174,13 +7180,20 @@ impl CodexInner {
             let model = state.effective_model.clone();
             let model_usage = extract_model_request_token_usage(params, model.as_deref()).and_then(
                 |(turn_id, request, cumulative, context_window)| {
-                    record_model_request_token_usage(
+                    let turn_context = state
+                        .turn_context_by_turn
+                        .get(&turn_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut usage = record_model_request_token_usage(
                         &mut state.model_token_usage_by_turn,
                         turn_id,
                         request,
                         cumulative,
                         context_window,
-                    )
+                    )?;
+                    attach_estimated_context_breakdown(&mut usage, &turn_context, model.as_deref());
+                    Some(usage)
                 },
             );
             let Some((turn_id, token_usage)) = extract_turn_token_usage(params, model.as_deref())
@@ -9531,28 +9544,42 @@ impl CodexInner {
                     .completed_subagent_streams
                     .get_mut(stream_key)
                     .and_then(|stream| {
-                        record_model_request_token_usage(
+                        let turn_context = stream
+                            .pending_message_metadata
+                            .as_ref()
+                            .filter(|pending| pending.turn_id == turn_id)
+                            .map(|pending| pending.turn_context.clone())
+                            .unwrap_or_default();
+                        let mut usage = record_model_request_token_usage(
                             &mut stream.model_token_usage_by_turn,
                             turn_id,
                             request,
                             cumulative,
                             context_window,
-                        )
-                        .map(|usage| (Arc::clone(&stream.emitter), usage))
+                        )?;
+                        attach_estimated_context_breakdown(&mut usage, &turn_context, Some(model));
+                        Some((Arc::clone(&stream.emitter), usage))
                     })
             } else {
                 state
                     .subagent_streams
                     .get_mut(stream_key)
                     .and_then(|stream| {
-                        record_model_request_token_usage(
+                        let turn_context = stream
+                            .pending_message_metadata
+                            .as_ref()
+                            .filter(|pending| pending.turn_id == turn_id)
+                            .map(|pending| pending.turn_context.clone())
+                            .unwrap_or_default();
+                        let mut usage = record_model_request_token_usage(
                             &mut stream.model_token_usage_by_turn,
                             turn_id,
                             request,
                             cumulative,
                             context_window,
-                        )
-                        .map(|usage| (Arc::clone(&stream.emitter), usage))
+                        )?;
+                        attach_estimated_context_breakdown(&mut usage, &turn_context, Some(model));
+                        Some((Arc::clone(&stream.emitter), usage))
                     })
             }
         };
@@ -11398,13 +11425,26 @@ impl CodexInner {
             }
             let model_usage =
                 model_usage.and_then(|(turn_id, request, cumulative, context_window)| {
-                    record_model_request_token_usage(
+                    let turn_context = state
+                        .turn_context_by_turn
+                        .get(&turn_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut usage = record_model_request_token_usage(
                         &mut state.model_token_usage_by_turn,
                         turn_id,
                         request,
                         cumulative,
                         context_window,
-                    )
+                    )?;
+                    if turn_status != "interrupted" {
+                        attach_estimated_context_breakdown(
+                            &mut usage,
+                            &turn_context,
+                            model_hint.as_deref(),
+                        );
+                    }
+                    Some(usage)
                 });
 
             let completed_turn_id =
@@ -12912,7 +12952,7 @@ fn extract_model_request_token_usage(
         });
     let cumulative_value =
         normalize_token_usage_with_envelope(cumulative_raw, Some(params), model_hint)?;
-    let model_context_window = request_value.get("context_window").and_then(Value::as_u64);
+    let model_context_window = context_window_from_token_usage(raw, raw, Some(params));
     let request = serde_json::from_value(request_value).ok()?;
     let cumulative = serde_json::from_value(cumulative_value).ok()?;
     Some((turn_id, request, cumulative, model_context_window))
@@ -12927,7 +12967,21 @@ fn record_model_request_token_usage(
 ) -> Option<ModelRequestTokenUsage> {
     let state = usage_by_turn.entry(turn_id.clone()).or_default();
     if state.cumulative.as_ref() == Some(&cumulative) {
-        return None;
+        let context_window = model_context_window
+            .filter(|context_window| Some(*context_window) != state.model_context_window)?;
+        state.model_context_window = Some(context_window);
+        return Some(ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId(turn_id),
+                sequence: state.request_count.saturating_sub(1),
+            },
+            current_context_usage: Some(current_context_usage(&request, context_window)),
+            request,
+            turn: state.turn.clone(),
+            cumulative,
+            model_context_window: state.model_context_window,
+            estimated_context_breakdown: None,
+        });
     }
 
     let sequence = state.request_count;
@@ -12936,6 +12990,10 @@ fn record_model_request_token_usage(
     state.latest_request = Some(request.clone());
     state.cumulative = Some(cumulative.clone());
     state.model_context_window = model_context_window.or(state.model_context_window);
+    let current_context_usage = state
+        .model_context_window
+        .map(|context_window| current_context_usage(&request, context_window))
+        .unwrap_or(CurrentContextUsage::Unknown);
 
     Some(ModelRequestTokenUsage {
         request_id: ModelRequestId {
@@ -12946,7 +13004,40 @@ fn record_model_request_token_usage(
         turn: state.turn.clone(),
         cumulative,
         model_context_window: state.model_context_window,
+        current_context_usage: Some(current_context_usage),
+        estimated_context_breakdown: None,
     })
+}
+
+fn current_context_usage(request: &TokenUsage, context_window: u64) -> CurrentContextUsage {
+    CurrentContextUsage::Known {
+        input_tokens: request
+            .input_tokens
+            .saturating_add(request.cached_prompt_tokens.unwrap_or_default())
+            .saturating_add(request.cache_creation_input_tokens.unwrap_or_default()),
+        context_window,
+    }
+}
+
+fn attach_estimated_context_breakdown(
+    usage: &mut ModelRequestTokenUsage,
+    turn_context: &TurnContextEstimate,
+    model_hint: Option<&str>,
+) {
+    let Some(current) = usage.current_context_usage.as_ref() else {
+        return;
+    };
+    let Some((input_tokens, context_window)) = current.known() else {
+        return;
+    };
+    if !turn_context.has_observed_bytes() {
+        return;
+    }
+    let token_usage = serde_json::to_value(&usage.request).expect("TokenUsage must serialize");
+    let mut breakdown = estimate_context_breakdown(Some(&token_usage), turn_context, model_hint);
+    breakdown["input_tokens"] = json!(input_tokens);
+    breakdown["context_window"] = json!(context_window);
+    usage.estimated_context_breakdown = serde_json::from_value::<ContextBreakdown>(breakdown).ok();
 }
 
 fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
@@ -22253,6 +22344,8 @@ for line in sys.stdin:
                 ..TokenUsage::default()
             },
             model_context_window: Some(400_000),
+            current_context_usage: None,
+            estimated_context_breakdown: None,
         };
         let raw = json!({
             "kind": "ModelRequestTokenUsage",
@@ -22302,6 +22395,8 @@ for line in sys.stdin:
                 ..TokenUsage::default()
             },
             model_context_window: Some(200_000),
+            current_context_usage: None,
+            estimated_context_breakdown: None,
         };
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
@@ -32260,8 +32355,7 @@ Do not describe the tool, and do not skip the tool call."#;
                     "outputTokens": 120,
                     "reasoningOutputTokens": 45,
                     "totalTokens": 1_240
-                },
-                "modelContextWindow": 400_000
+                }
             }
         });
         let mut by_turn = HashMap::new();
@@ -32281,6 +32375,13 @@ Do not describe the tool, and do not skip the tool call."#;
         assert_eq!(first.request.total_tokens, 110);
         assert_eq!(first.turn.total_tokens, 110);
         assert_eq!(first.cumulative.total_tokens, 1_100);
+        assert_eq!(
+            first.current_context_usage,
+            Some(CurrentContextUsage::Known {
+                input_tokens: 100,
+                context_window: 400_000,
+            })
+        );
         let (turn_id, request, cumulative, context_window) =
             extract_model_request_token_usage(&first_payload, Some("gpt-5.5"))
                 .expect("duplicate usage");
@@ -32298,6 +32399,10 @@ Do not describe the tool, and do not skip the tool call."#;
 
         let (turn_id, request, cumulative, context_window) =
             extract_model_request_token_usage(&second, Some("gpt-5.5")).expect("second usage");
+        assert_eq!(
+            context_window, None,
+            "the later request intentionally omits the provider window"
+        );
         let second = record_model_request_token_usage(
             &mut by_turn,
             turn_id,
@@ -32311,6 +32416,13 @@ Do not describe the tool, and do not skip the tool call."#;
         assert_eq!(second.turn.total_tokens, 250);
         assert_eq!(second.cumulative.total_tokens, 1_240);
         assert_eq!(second.model_context_window, Some(400_000));
+        assert_eq!(
+            second.current_context_usage,
+            Some(CurrentContextUsage::Known {
+                input_tokens: 120,
+                context_window: 400_000,
+            })
+        );
 
         let (request, turn, cumulative) = codex_message_usage_values(None, by_turn.get("turn_123"));
         assert_eq!(request.expect("request usage")["total_tokens"], json!(140));
@@ -32319,6 +32431,141 @@ Do not describe the tool, and do not skip the tool call."#;
             cumulative.expect("cumulative usage")["total_tokens"],
             json!(1_240)
         );
+    }
+
+    #[test]
+    fn current_context_requires_an_explicit_provider_window() {
+        let payload = json!({
+            "turnId": "turn-no-window",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 120,
+                    "cachedInputTokens": 90,
+                    "outputTokens": 20,
+                    "totalTokens": 140
+                },
+                "total": {
+                    "inputTokens": 1_120,
+                    "cachedInputTokens": 990,
+                    "outputTokens": 120,
+                    "totalTokens": 1_240
+                }
+            }
+        });
+        let (turn_id, request, cumulative, context_window) =
+            extract_model_request_token_usage(&payload, Some("gpt-5.5"))
+                .expect("provider usage without a window");
+        assert_eq!(context_window, None);
+        let usage = record_model_request_token_usage(
+            &mut HashMap::new(),
+            turn_id,
+            request,
+            cumulative,
+            context_window,
+        )
+        .expect("request usage");
+        assert_eq!(usage.model_context_window, None);
+        assert_eq!(
+            usage.current_context_usage,
+            Some(CurrentContextUsage::Unknown)
+        );
+        assert_eq!(usage.estimated_context_breakdown, None);
+    }
+
+    #[test]
+    fn explicit_window_enriches_same_usage_without_inventing_a_request() {
+        let request = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 20,
+            total_tokens: 140,
+            cached_prompt_tokens: Some(90),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        };
+        let cumulative = TokenUsage {
+            total_tokens: 1_240,
+            ..TokenUsage::default()
+        };
+        let mut by_turn = HashMap::new();
+        let first = record_model_request_token_usage(
+            &mut by_turn,
+            "turn-window-later".to_owned(),
+            request.clone(),
+            cumulative.clone(),
+            None,
+        )
+        .expect("initial request");
+        assert_eq!(
+            first.current_context_usage,
+            Some(CurrentContextUsage::Unknown)
+        );
+
+        let enriched = record_model_request_token_usage(
+            &mut by_turn,
+            "turn-window-later".to_owned(),
+            request,
+            cumulative,
+            Some(400_000),
+        )
+        .expect("new explicit provider window");
+        assert_eq!(enriched.request_id.sequence, 0);
+        assert_eq!(
+            enriched.current_context_usage,
+            Some(CurrentContextUsage::Known {
+                input_tokens: 120,
+                context_window: 400_000,
+            })
+        );
+        assert_eq!(
+            by_turn
+                .get("turn-window-later")
+                .expect("turn state")
+                .request_count,
+            1
+        );
+    }
+
+    #[test]
+    fn model_request_breakdown_requires_observed_context_bytes() {
+        let mut usage = ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId("turn-estimate".to_owned()),
+                sequence: 0,
+            },
+            request: TokenUsage {
+                input_tokens: 30,
+                cached_prompt_tokens: Some(90),
+                ..TokenUsage::default()
+            },
+            turn: TokenUsage::default(),
+            cumulative: TokenUsage::default(),
+            model_context_window: Some(400_000),
+            current_context_usage: Some(CurrentContextUsage::Known {
+                input_tokens: 120,
+                context_window: 400_000,
+            }),
+            estimated_context_breakdown: None,
+        };
+
+        attach_estimated_context_breakdown(
+            &mut usage,
+            &TurnContextEstimate::default(),
+            Some("gpt-5.5"),
+        );
+        assert_eq!(
+            usage.estimated_context_breakdown, None,
+            "late root and child rows without observed context bytes must stay neutral"
+        );
+
+        attach_estimated_context_breakdown(
+            &mut usage,
+            &TurnContextEstimate {
+                conversation_history_bytes: 64,
+                ..TurnContextEstimate::default()
+            },
+            Some("gpt-5.5"),
+        );
+        assert!(usage.estimated_context_breakdown.is_some());
     }
 
     #[test]

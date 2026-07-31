@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use protocol::{ContextBreakdown, TaskList, TaskStatus};
+use protocol::{ContextBreakdown, CurrentContextUsage, TaskList, TaskStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SummaryView {
@@ -19,16 +19,19 @@ struct ContextCategory {
 pub fn TaskListView(
     task_list: Option<TaskList>,
     context_breakdown: Option<ContextBreakdown>,
+    #[prop(optional)] current_context_usage: Option<CurrentContextUsage>,
 ) -> impl IntoView {
     let active_view = RwSignal::new(SummaryView::Context);
     let collapsed = RwSignal::new(false);
     let task_list_for_context = task_list.clone();
     let context_breakdown_for_context = context_breakdown.clone();
+    let current_context_usage_for_context = current_context_usage.clone();
 
     let has_context = Memo::new(move |_| {
-        context_breakdown_for_context
-            .as_ref()
-            .is_some_and(|bd| bd.input_tokens > 0)
+        current_context_usage_for_context.is_some()
+            || context_breakdown_for_context
+                .as_ref()
+                .is_some_and(|bd| bd.input_tokens > 0)
     });
     let has_tasks = Memo::new(move |_| {
         task_list_for_context
@@ -57,13 +60,20 @@ pub fn TaskListView(
                     let tl = task_list.clone().expect("task list should exist when showing tasks");
                     render_task_view(
                         tl,
-                        context_breakdown.clone().filter(|_| has_context_now),
+                        context_breakdown_for_display(
+                            current_context_usage.as_ref(),
+                            context_breakdown.as_ref(),
+                        ).filter(|_| has_context_now),
                         collapsed,
                         active_view,
                     ).into_any()
                 } else {
                     render_context_view(
-                        context_breakdown.clone().filter(|_| has_context_now),
+                        current_context_usage.clone().filter(|_| has_context_now),
+                        context_breakdown_for_display(
+                            current_context_usage.as_ref(),
+                            context_breakdown.as_ref(),
+                        ).filter(|_| has_context_now),
                         task_list.clone().filter(|tl| !tl.tasks.is_empty()),
                         active_view,
                     ).into_any()
@@ -74,12 +84,14 @@ pub fn TaskListView(
 }
 
 fn render_context_view(
+    current_context_usage: Option<CurrentContextUsage>,
     breakdown: Option<ContextBreakdown>,
     task_list: Option<TaskList>,
     active_view: RwSignal<SummaryView>,
 ) -> impl IntoView {
     let metrics = breakdown.as_ref().map(compute_context_metrics);
     let has_detailed_breakdown = breakdown.as_ref().is_some_and(has_detailed_breakdown);
+    let context_is_unknown = matches!(current_context_usage, Some(CurrentContextUsage::Unknown));
 
     view! {
         <div class="summary-panel">
@@ -114,18 +126,34 @@ fn render_context_view(
                             </span>
                         }
                     })}
+                    {context_is_unknown.then(|| {
+                        view! {
+                            <span
+                                class="summary-context-usage context-unknown"
+                                data-testid="context-usage"
+                            >
+                                "Unavailable"
+                            </span>
+                        }
+                    })}
                 </div>
                 <div
-                    class="summary-context-bar"
+                    class=if context_is_unknown {
+                        "summary-context-bar context-unknown"
+                    } else {
+                        "summary-context-bar"
+                    }
                     data-testid="context-bar"
                     role="progressbar"
                     aria-label="Context utilization"
                     aria-valuemin="0"
                     aria-valuemax="100"
-                    aria-valuenow=metrics
-                        .as_ref()
-                        .map(|m| format!("{}", m.utilization_pct.round() as i32))
-                        .unwrap_or_else(|| "0".to_owned())
+                    aria-valuenow=(!context_is_unknown).then(|| {
+                        metrics
+                            .as_ref()
+                            .map(|m| format!("{}", m.utilization_pct.round() as i32))
+                            .unwrap_or_else(|| "0".to_owned())
+                    })
                     aria-valuetext=metrics
                         .as_ref()
                         .map(|m| format!(
@@ -195,6 +223,39 @@ fn render_context_view(
                 }}
             </div>
         </div>
+    }
+}
+
+fn context_breakdown_for_display(
+    current: Option<&CurrentContextUsage>,
+    estimated: Option<&ContextBreakdown>,
+) -> Option<ContextBreakdown> {
+    match current {
+        None => estimated.cloned(),
+        Some(CurrentContextUsage::Unknown) => None,
+        Some(CurrentContextUsage::Known {
+            input_tokens,
+            context_window,
+        }) => {
+            let mut breakdown = estimated
+                .filter(|estimate| {
+                    estimate.input_tokens == *input_tokens
+                        && estimate.context_window == *context_window
+                })
+                .cloned()
+                .unwrap_or(ContextBreakdown {
+                    system_prompt_bytes: 0,
+                    tool_io_bytes: 0,
+                    conversation_history_bytes: 0,
+                    reasoning_bytes: 0,
+                    context_injection_bytes: 0,
+                    input_tokens: *input_tokens,
+                    context_window: *context_window,
+                });
+            breakdown.input_tokens = *input_tokens;
+            breakdown.context_window = *context_window;
+            Some(breakdown)
+        }
     }
 }
 
@@ -550,6 +611,29 @@ mod native_tests {
             .find(|category| category.label == label)
             .unwrap_or_else(|| panic!("category {label} should exist"))
             .percent
+    }
+
+    #[test]
+    fn exact_context_without_matching_estimate_stays_neutral() {
+        let known = CurrentContextUsage::Known {
+            input_tokens: 120,
+            context_window: 400_000,
+        };
+        let mismatched = breakdown(10, 20, 30, 40, 50, 119, 400_000);
+        let display = context_breakdown_for_display(Some(&known), Some(&mismatched))
+            .expect("exact occupancy remains renderable");
+        assert_eq!(display.input_tokens, 120);
+        assert_eq!(display.context_window, 400_000);
+        assert!(!has_detailed_breakdown(&display));
+        assert_eq!(
+            context_breakdown_for_display(Some(&CurrentContextUsage::Unknown), Some(&mismatched)),
+            None
+        );
+        assert_eq!(
+            context_breakdown_for_display(None, Some(&mismatched)),
+            Some(mismatched),
+            "non-Codex breakdown rendering must remain unchanged"
+        );
     }
 
     /// Guards against re-deriving an "unaccounted" remainder by comparing the

@@ -4459,6 +4459,10 @@ pub struct AgentActivityStats {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage_total_only: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_context_usage: Option<CurrentContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_context_breakdown: Option<ContextBreakdown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_through_seq: Option<u64>,
 }
 
@@ -7322,6 +7326,32 @@ pub struct ModelRequestTokenUsage {
     pub turn: TokenUsage,
     pub cumulative: TokenUsage,
     pub model_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_context_usage: Option<CurrentContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_context_breakdown: Option<ContextBreakdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CurrentContextUsage {
+    Unknown,
+    Known {
+        input_tokens: u64,
+        context_window: u64,
+    },
+}
+
+impl CurrentContextUsage {
+    pub fn known(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Unknown => None,
+            Self::Known {
+                input_tokens,
+                context_window,
+            } => Some((*input_tokens, *context_window)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7399,7 +7429,7 @@ pub enum TokenUsageUnavailableReason {
     ProviderScopeAmbiguous,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBreakdown {
     pub system_prompt_bytes: u64,
     pub tool_io_bytes: u64,
@@ -8643,6 +8673,19 @@ mod search_serde_tests {
                 reasoning_tokens: Some(2),
             },
             token_usage_total_only: Some(15),
+            current_context_usage: Some(CurrentContextUsage::Known {
+                input_tokens: 14,
+                context_window: 200_000,
+            }),
+            estimated_context_breakdown: Some(ContextBreakdown {
+                system_prompt_bytes: 10,
+                tool_io_bytes: 20,
+                conversation_history_bytes: 30,
+                reasoning_bytes: 40,
+                context_injection_bytes: 50,
+                input_tokens: 14,
+                context_window: 200_000,
+            }),
             source_through_seq: Some(42),
         };
         let payload = AgentActivityStatsPayload {
