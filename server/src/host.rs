@@ -1051,6 +1051,7 @@ pub(crate) struct HostState {
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pending_agent_sessions: HashMap<AgentId, SessionId>,
     agent_visibility: AgentVisibilityRegistry,
+    spawn_publication_claims: HashMap<AgentId, SpawnOperationTerminalClaim>,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
     closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     activity_summary_epoch: u64,
@@ -1375,6 +1376,7 @@ struct AgentVisibilityEntry {
     phase: AgentVisibilityPhase,
     fanout_active: bool,
     host_streams: HashSet<StreamPath>,
+    fanout_covered: HashSet<StreamPath>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1397,6 +1399,7 @@ impl Default for AgentVisibilityEntry {
             phase: AgentVisibilityPhase::Visible,
             fanout_active: false,
             host_streams: HashSet::new(),
+            fanout_covered: HashSet::new(),
         }
     }
 }
@@ -1412,6 +1415,7 @@ impl AgentVisibilityRegistry {
                     phase: AgentVisibilityPhase::Pending,
                     fanout_active: false,
                     host_streams: HashSet::new(),
+                    fanout_covered: HashSet::new(),
                 },
             );
     }
@@ -1427,6 +1431,16 @@ impl AgentVisibilityRegistry {
         entry.phase = AgentVisibilityPhase::Fanout;
         entry.fanout_active = true;
         true
+    }
+
+    fn begin_fanout_batch(&self, agent_id: &AgentId, covered: HashSet<StreamPath>) {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return;
+        };
+        if entry.phase == AgentVisibilityPhase::Fanout && entry.fanout_active {
+            entry.fanout_covered = covered;
+        }
     }
 
     fn claim_startup_failure(&self, agent_id: &AgentId) -> StartupFailureVisibility {
@@ -1468,6 +1482,7 @@ impl AgentVisibilityRegistry {
             return true;
         };
         entry.fanout_active = false;
+        entry.fanout_covered.clear();
         if entry.phase == AgentVisibilityPhase::Fanout {
             entry.phase = AgentVisibilityPhase::Visible;
             false
@@ -1505,16 +1520,25 @@ impl AgentVisibilityRegistry {
             .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Cancelled)
     }
 
-    fn bootstrap_eligible(&self, agent_id: &AgentId, publicly_bound: bool) -> bool {
-        match self
-            .inner
-            .lock()
-            .expect("agent visibility mutex poisoned")
-            .get(agent_id)
-        {
-            Some(entry) => entry.phase == AgentVisibilityPhase::Visible,
-            None => publicly_bound,
+    fn claim_bootstrap_delivery(
+        &self,
+        agent_id: &AgentId,
+        host_stream: &StreamPath,
+        publicly_bound: bool,
+    ) -> bool {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return publicly_bound;
+        };
+        let eligible = match entry.phase {
+            AgentVisibilityPhase::Pending | AgentVisibilityPhase::Cancelled => false,
+            AgentVisibilityPhase::Fanout => !entry.fanout_covered.contains(host_stream),
+            AgentVisibilityPhase::Visible => true,
+        };
+        if eligible {
+            entry.host_streams.insert(host_stream.clone());
         }
+        eligible
     }
 
     fn record_new_agent(&self, agent_id: AgentId, host_stream: StreamPath) {
@@ -1568,6 +1592,7 @@ impl AgentVisibilityRegistry {
         let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
         for entry in visibility.values_mut() {
             entry.host_streams.remove(host_stream);
+            entry.fanout_covered.remove(host_stream);
         }
     }
 }
@@ -3199,10 +3224,16 @@ impl HostHandle {
         let mut agents = Vec::new();
         let mut deferred_attachments = Vec::new();
         for agent_id in agent_ids {
-            if !agent_visibility
-                .bootstrap_eligible(&agent_id, state.agent_sessions.contains_key(&agent_id))
-            {
+            let bootstrap_claimed = agent_visibility.claim_bootstrap_delivery(
+                &agent_id,
+                &host_path,
+                state.agent_sessions.contains_key(&agent_id),
+            );
+            if !bootstrap_claimed {
                 continue;
+            }
+            if let Some(terminal_claim) = state.spawn_publication_claims.get(&agent_id) {
+                terminal_claim.claim_success_at_publication();
             }
             let agent_handle = state.registry.agent_handle(&agent_id).unwrap_or_else(|| {
                 panic!(
@@ -5677,6 +5708,11 @@ impl HostHandle {
                     antigravity_conversations_dir,
                 },
             );
+            if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
+                state
+                    .spawn_publication_claims
+                    .insert(spawned.start.agent_id.clone(), terminal_claim.clone());
+            }
             (
                 spawned.start,
                 spawned.handle,
@@ -5703,6 +5739,11 @@ impl HostHandle {
         #[cfg(test)]
         notify_startup_failure_fanout_claimed_test_hook(self);
         if !fanout_started {
+            self.state
+                .lock()
+                .await
+                .spawn_publication_claims
+                .remove(&agent_id);
             return Ok(agent_id);
         }
         let mut host_streams = {
@@ -5732,6 +5773,10 @@ impl HostHandle {
                     )
                 })
                 .collect::<Vec<_>>();
+            state.agent_visibility.begin_fanout_batch(
+                &start.agent_id,
+                state.host_streams.keys().cloned().collect(),
+            );
             if diagnose_side_question_fanout {
                 tracing::warn!(
                     agent_id = %start.agent_id,
@@ -5754,8 +5799,6 @@ impl HostHandle {
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
         let mut publication_claimed = false;
-        #[cfg(test)]
-        let mut successful_fanouts = 0_usize;
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if !visibility.may_emit_new_agent() {
                 break;
@@ -5784,10 +5827,6 @@ impl HostHandle {
                     }
                     if let Some(attachment) = attachment {
                         deferred_attachments.push(attachment);
-                    }
-                    #[cfg(test)]
-                    {
-                        successful_fanouts += 1;
                     }
                     if diagnose_side_question_fanout {
                         tracing::warn!(
@@ -5827,9 +5866,7 @@ impl HostHandle {
                 .await;
         }
         #[cfg(test)]
-        for _ in 0..successful_fanouts {
-            wait_after_spawn_new_agent_fanout_test_hook(self).await;
-        }
+        wait_after_spawn_new_agent_fanout_test_hook(self).await;
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
@@ -5837,7 +5874,12 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        let cleanup_requested = visibility.finish_new_agent_fanout();
+        let cleanup_requested = {
+            let mut state = self.state.lock().await;
+            let cleanup_requested = visibility.finish_new_agent_fanout();
+            state.spawn_publication_claims.remove(&agent_id);
+            cleanup_requested
+        };
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
         authorize_agent_session_publication(
@@ -6160,7 +6202,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
-            state
+            let host_streams = state
                 .host_streams
                 .iter_mut()
                 .filter_map(|(path, subscriber)| {
@@ -6182,7 +6224,12 @@ impl HostHandle {
                         },
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            state.agent_visibility.begin_fanout_batch(
+                &start.agent_id,
+                state.host_streams.keys().cloned().collect(),
+            );
+            host_streams
         };
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         let fanout_paths = host_streams
@@ -6193,8 +6240,6 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        #[cfg(test)]
-        let mut successful_fanouts = 0_usize;
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if !visibility.may_emit_new_agent() {
                 break;
@@ -6212,10 +6257,6 @@ impl HostHandle {
                     if let Some(attachment) = attachment {
                         deferred_attachments.push(attachment);
                     }
-                    #[cfg(test)]
-                    {
-                        successful_fanouts += 1;
-                    }
                     if !continue_fanout {
                         break;
                     }
@@ -6228,9 +6269,7 @@ impl HostHandle {
             self.attach_deferred_agent_stream(attachment).await;
         }
         #[cfg(test)]
-        for _ in 0..successful_fanouts {
-            wait_after_spawn_new_agent_fanout_test_hook(self).await;
-        }
+        wait_after_spawn_new_agent_fanout_test_hook(self).await;
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
@@ -6238,7 +6277,12 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        let cleanup_requested = visibility.finish_new_agent_fanout();
+        let cleanup_requested = {
+            let mut state = self.state.lock().await;
+            let cleanup_requested = visibility.finish_new_agent_fanout();
+            state.spawn_publication_claims.remove(&agent_id);
+            cleanup_requested
+        };
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
         authorize_agent_session_publication(
@@ -9275,28 +9319,22 @@ impl HostHandle {
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
-        self.close_agent_with_host_visibility(agent_id, None).await
+        self.close_agent_with_host_visibility(agent_id, false).await
     }
 
     async fn close_agent_for_recorded_visibility(&self, agent_id: &AgentId) -> bool {
-        let (close_ids, agent_visibility) = {
+        let close_ids = {
             let state = self.state.lock().await;
-            (
-                state
-                    .registry
-                    .agent_subtree_post_order(agent_id)
-                    .into_iter()
-                    .map(|(agent_id, _)| agent_id)
-                    .collect::<Vec<_>>(),
-                state.agent_visibility.clone(),
-            )
+            state
+                .registry
+                .agent_subtree_post_order(agent_id)
+                .into_iter()
+                .map(|(agent_id, _)| agent_id)
+                .collect::<Vec<_>>()
         };
         let mut closed = false;
         for close_id in close_ids {
-            let visible_host_streams = agent_visibility.visible_host_streams(&close_id);
-            closed |= self
-                .close_agent_with_host_visibility(&close_id, Some(&visible_host_streams))
-                .await;
+            closed |= self.close_agent_with_host_visibility(&close_id, true).await;
         }
         closed
     }
@@ -9304,7 +9342,7 @@ impl HostHandle {
     async fn close_agent_with_host_visibility(
         &self,
         agent_id: &AgentId,
-        visible_host_streams: Option<&HashSet<StreamPath>>,
+        recorded_visibility_only: bool,
     ) -> bool {
         let (close_targets, host_streams) = {
             let state = self.state.lock().await;
@@ -9315,10 +9353,12 @@ impl HostHandle {
             for (_, agent_handle) in &close_targets {
                 agent_handle.begin_closing();
             }
+            let visible_host_streams = recorded_visibility_only
+                .then(|| state.agent_visibility.visible_host_streams(agent_id));
             let host_streams = state
                 .host_streams
                 .iter()
-                .filter(|(path, _)| match visible_host_streams {
+                .filter(|(path, _)| match &visible_host_streams {
                     Some(visible) => visible.contains(*path),
                     None => true,
                 })
@@ -9430,6 +9470,7 @@ impl HostHandle {
         for closed_agent_id in close_ids {
             let removed = state.registry.remove_agent(&closed_agent_id);
             state.agent_visibility.remove_agent(&closed_agent_id);
+            state.spawn_publication_claims.remove(&closed_agent_id);
             if removed.is_none() {
                 tracing::debug!(
                     agent_id = %closed_agent_id,
@@ -13769,6 +13810,7 @@ fn spawn_host_inner(
             agent_sessions: HashMap::new(),
             pending_agent_sessions: HashMap::new(),
             agent_visibility: AgentVisibilityRegistry::default(),
+            spawn_publication_claims: HashMap::new(),
             agent_activity_summaries: HashMap::new(),
             closed_agent_usage_snapshots: HashMap::new(),
             activity_summary_epoch: 0,
@@ -20740,6 +20782,35 @@ mod tests {
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+    static SPAWN_NEW_AGENT_FANOUT_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn bootstrap_delivery_claims_only_uncovered_visibility() {
+        let visibility = AgentVisibilityRegistry::default();
+        let agent_id = AgentId("coverage-agent".to_owned());
+        let covered = StreamPath("/host/covered".to_owned());
+        let uncovered = StreamPath("/host/uncovered".to_owned());
+
+        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, false));
+        assert!(visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
+
+        visibility.begin_pending(agent_id.clone());
+        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
+        assert!(visibility.begin_fanout(&agent_id));
+        visibility.begin_fanout_batch(&agent_id, HashSet::from([covered.clone()]));
+        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &covered, true));
+        assert!(visibility.claim_bootstrap_delivery(&agent_id, &uncovered, false));
+        assert_eq!(
+            visibility.visible_host_streams(&agent_id),
+            HashSet::from([uncovered.clone()])
+        );
+
+        assert!(!visibility.finish_fanout(&agent_id));
+        assert!(visibility.claim_bootstrap_delivery(&agent_id, &covered, false));
+        visibility.cancel_outer_spawn(&agent_id);
+        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
+    }
 
     #[test]
     fn installed_backend_version_selects_exact_backend_setup_value() {
@@ -22058,6 +22129,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn synchronous_parent_fanout_closes_every_advertised_subscriber() {
+        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
         let (first_tx, mut first_rx) = mpsc::unbounded_channel();
         let first_stream = Stream::new(
@@ -22198,6 +22270,297 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
+    async fn fanout_uncovered_bootstrap_is_exactly_once_and_closes() {
+        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
+        let fixture = compact_fixture().await;
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/coverage-first-{}", Uuid::new_v4())),
+                    first_tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        while first_rx.try_recv().is_ok() {}
+
+        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Fanout Coverage Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "pause after fanout".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        fanout_hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("agent paused after NewAgent fanout")
+        };
+
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/coverage-second-{}", Uuid::new_v4())),
+                    second_tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let bootstrap = timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = second_rx
+                    .recv()
+                    .await
+                    .expect("second host stream remains open");
+                if envelope.kind == FrameKind::HostBootstrap {
+                    return envelope
+                        .parse_payload::<HostBootstrapPayload>()
+                        .expect("second HostBootstrap payload");
+                }
+            }
+        })
+        .await
+        .expect("second HostBootstrap delivery");
+        assert_eq!(
+            bootstrap
+                .agents
+                .iter()
+                .filter(|agent| agent.agent_id == agent_id)
+                .count(),
+            1,
+            "a stream outside the captured fanout must receive one bootstrap agent"
+        );
+
+        drop(fanout_hook);
+        assert_eq!(
+            spawn
+                .await
+                .expect("fanout coverage spawn task")
+                .expect("fanout coverage spawn result"),
+            agent_id
+        );
+        assert!(fixture.host.close_agent(&agent_id).await);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut new_agent_count = 0;
+        let mut closed_count = 0;
+        while let Ok(envelope) = second_rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("second NewAgent payload");
+                    if payload.agent_id == agent_id {
+                        new_agent_count += 1;
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload = envelope
+                        .parse_payload()
+                        .expect("second AgentClosed payload");
+                    if payload.agent_id == agent_id {
+                        closed_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            new_agent_count, 0,
+            "bootstrap delivery must not be duplicated"
+        );
+        assert_eq!(
+            closed_count, 1,
+            "bootstrap delivery must confer terminal visibility"
+        );
+        let mut covered_new_agent_count = 0;
+        let mut covered_closed_count = 0;
+        while let Ok(envelope) = first_rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("covered NewAgent payload");
+                    if payload.agent_id == agent_id {
+                        covered_new_agent_count += 1;
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload = envelope
+                        .parse_payload()
+                        .expect("covered AgentClosed payload");
+                    if payload.agent_id == agent_id {
+                        covered_closed_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            covered_new_agent_count, 1,
+            "a stream inside the captured fanout must receive one NewAgent"
+        );
+        assert_eq!(
+            covered_closed_count, 1,
+            "covered NewAgent delivery must confer terminal visibility"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_first_publication_claims_spawn_success() {
+        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
+        let fixture = compact_fixture().await;
+        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
+        let (operation_tx, mut operation_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .start_spawn_agent_operation(
+                SpawnAgentPayload {
+                    name: Some("Bootstrap First Operation".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "publish first through bootstrap".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                },
+                StreamPath("/host/bootstrap-first-request".to_owned()),
+                Stream::new(
+                    StreamPath("/host/bootstrap-first-output".to_owned()),
+                    operation_tx,
+                ),
+            )
+            .expect("start bootstrap-first spawn operation");
+        fanout_hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("bootstrap-first operation agent")
+        };
+
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/bootstrap-first-{}", Uuid::new_v4())),
+                    host_tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let bootstrap = timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = host_rx
+                    .recv()
+                    .await
+                    .expect("bootstrap-first host remains open");
+                if envelope.kind == FrameKind::HostBootstrap {
+                    return envelope
+                        .parse_payload::<HostBootstrapPayload>()
+                        .expect("bootstrap-first HostBootstrap payload");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap-first HostBootstrap delivery");
+        assert!(
+            bootstrap
+                .agents
+                .iter()
+                .any(|agent| agent.agent_id == agent_id)
+        );
+        {
+            let state = fixture.host.state.lock().await;
+            let claim = state
+                .spawn_publication_claims
+                .get(&agent_id)
+                .expect("active spawn publication claim");
+            assert!(matches!(
+                *claim
+                    .outcome
+                    .lock()
+                    .expect("spawn operation outcome mutex poisoned"),
+                Some(SpawnOperationOutcome::Success)
+            ));
+        }
+
+        fixture.host.shutdown_spawn_operations().await;
+        drop(fanout_hook);
+        timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleanup_complete = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleanup_complete {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("bootstrap-first shutdown cleanup");
+        assert!(
+            operation_rx.try_recv().is_err(),
+            "shutdown must not reclassify a bootstrap-published spawn as cancelled"
+        );
+        let mut closed_count = 0;
+        while let Ok(envelope) = host_rx.try_recv() {
+            if envelope.kind == FrameKind::AgentClosed {
+                let payload: AgentClosedPayload = envelope
+                    .parse_payload()
+                    .expect("bootstrap-first AgentClosed payload");
+                if payload.agent_id == agent_id {
+                    closed_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            closed_count, 1,
+            "shutdown cleanup must close bootstrap visibility exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_includes_visible_unpublished_normal_spawn_once() {
         let fixture = compact_fixture().await;
         let hook = install_spawn_visible_before_publication_test_hook(&fixture.host);
@@ -22239,7 +22602,13 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 "test hook must stop before public session promotion"
             );
             assert!(
-                state.agent_visibility.bootstrap_eligible(&agent_id, false),
+                state
+                    .agent_visibility
+                    .inner
+                    .lock()
+                    .expect("agent visibility mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Visible),
                 "completed NewAgent fanout must make the agent bootstrap-eligible"
             );
         }
