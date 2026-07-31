@@ -415,6 +415,7 @@ class ReleaseShellTests(unittest.TestCase):
             "release_tool.py",
             "set_release_version.py",
             "check_release_version.py",
+            "check_transport_protocol_version.py",
         ):
             (self.tools / name).write_text("", encoding="utf-8")
         hooks = self.root / ".githooks"
@@ -496,6 +497,7 @@ case "$*" in
   *release_tool.py\ validate-download*) : ;;
   *set_release_version.py*) echo "package.json" ;;
   *check_mobile_web_manifest.py*) echo "mobile web manifest OK" ;;
+  *check_transport_protocol_version.py*) : ;;
   *check_release_version.py*) echo "1.2.3-beta.4" ;;
   *) echo "unexpected fake python3 call: $*" >&2; exit 1 ;;
 esac
@@ -662,9 +664,13 @@ esac
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
+        transport_index = commands.index(
+            f"python3 {self.tools / 'check_transport_protocol_version.py'}"
+        )
         tag_index = commands.index(f"git tag -a {TAG} -m Release {TAG}")
         main_index = commands.index("git push origin main")
         remote_tag_index = commands.index(f"git push origin {TAG}")
+        self.assertLess(transport_index, tag_index)
         self.assertLess(tag_index, main_index)
         self.assertLess(main_index, remote_tag_index)
         self.assertIn("verified both remote refs", result.stdout)
@@ -695,12 +701,21 @@ esac
         result = self.run_shell("prepare", TAG, "--commit")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        transport_index = commands.index(
+            f"python3 {self.tools / 'check_transport_protocol_version.py'}"
+        )
+        commit_index = commands.index(
+            "git commit -m Bump release to 1.2.3-beta.4 "
+            "-m Set all tracked release versions to v1.2.3-beta.4."
+        )
+        self.assertLess(transport_index, commit_index)
         self.assertIn(
             "git commit -m Bump release to 1.2.3-beta.4 "
             "-m Set all tracked release versions to v1.2.3-beta.4.",
-            self.commands(),
+            commands,
         )
-        self.assertFalse(any(line.startswith("git push ") for line in self.commands()))
+        self.assertFalse(any(line.startswith("git push ") for line in commands))
 
     def test_publish_rejects_remote_tag_outside_origin_main(self) -> None:
         (self.state / "remote-tag").touch()
