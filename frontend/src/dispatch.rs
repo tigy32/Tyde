@@ -959,6 +959,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     workspace_roots: payload.workspace_roots,
                     project_id: payload.project_id,
                     parent_agent_id: payload.parent_agent_id,
+                    team_member_id: team_member_id.clone(),
                     session_id: payload.session_id,
                     custom_agent_id: payload.custom_agent_id,
                     workflow: payload.workflow,
@@ -6402,6 +6403,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         workspace_roots: payload.workspace_roots,
         project_id: payload.project_id,
         parent_agent_id: payload.parent_agent_id,
+        team_member_id: payload.team_member_id,
         session_id: payload.session_id,
         custom_agent_id: payload.custom_agent_id,
         workflow: payload.workflow,
@@ -7866,6 +7868,7 @@ mod tests {
             workspace_roots: Vec::new(),
             project_id: None,
             parent_agent_id: None,
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,
@@ -8712,6 +8715,7 @@ mod tests {
                     workspace_roots: Vec::new(),
                     project_id: None,
                     parent_agent_id: None,
+                    team_member_id: None,
                     session_id: None,
                     custom_agent_id: None,
                     workflow: None,
@@ -8831,6 +8835,7 @@ mod tests {
                     workspace_roots: Vec::new(),
                     project_id: None,
                     parent_agent_id: Some(AgentId("parent".to_owned())),
+                    team_member_id: None,
                     session_id: None,
                     custom_agent_id: None,
                     workflow: None,
@@ -8904,6 +8909,7 @@ mod tests {
                     workspace_roots: Vec::new(),
                     project_id: None,
                     parent_agent_id: None,
+                    team_member_id: None,
                     session_id: None,
                     custom_agent_id: None,
                     workflow: None,
@@ -9623,8 +9629,24 @@ mod tests {
                 .expect("valid team-member NewAgent fixture");
             assert_eq!(payload.origin, AgentOrigin::TeamMember);
             assert!(payload.team_id.is_some());
-            assert_eq!(payload.team_member_id, Some(member_id));
+            assert_eq!(payload.team_member_id, Some(member_id.clone()));
+            assert_eq!(
+                agent_info_from_payload(host_id, payload.clone()).team_member_id,
+                Some(member_id.clone()),
+                "host bootstrap conversion retains the authoritative member identity"
+            );
             dispatch_envelope(&state, host_id, envelope);
+
+            assert_eq!(
+                state.agents.with_untracked(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.agent_id == AgentId("team-agent".to_owned()))
+                        .and_then(|agent| agent.team_member_id.clone())
+                }),
+                Some(member_id.clone()),
+                "live NewAgent state retains the authoritative member identity"
+            );
 
             assert_eq!(
                 state.center_zone.with_untracked(center_selection_snapshot),
@@ -13098,6 +13120,7 @@ mod wasm_tests {
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
+                team_member_id: None,
                 session_id: None,
                 custom_agent_id: None,
                 workflow: None,

@@ -42,7 +42,9 @@ use protocol::{
 
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
 use crate::components::chat_message::{format_compact, token_badge_data};
-use crate::components::tool_card::{agent_display_name, open_child_agent};
+use crate::components::tool_card::{
+    PersistentAgentResolution, agent_display_name, agent_open_action, persistent_agent_resolution,
+};
 use crate::components::workflow_view::run_status_label;
 use crate::send::send_frame;
 use crate::state::{ActiveAgentRef, AppState, TabContent, ToolCallId};
@@ -420,25 +422,13 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
 #[component]
 fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) -> impl IntoView {
     let state = expect_context::<AppState>();
-
-    let display_name = Signal::derive({
-        let state = state.clone();
-        let agent_id = agent_id.clone();
-        move || agent_display_name(&state, parent_ref.get(), &agent_id, None)
-    });
+    let handle = persistent_agent_resolution(&state, parent_ref, agent_id.clone(), None);
 
     let status = Signal::derive({
         let state = state.clone();
-        let agent_id = agent_id.clone();
-        move || {
-            let parent = parent_ref.get()?;
-            let agent = state.agents.with(|agents| {
-                agents
-                    .iter()
-                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
-                    .cloned()
-            })?;
-            Some(derive_child_status(&state, &agent))
+        move || match handle.resolution.get() {
+            PersistentAgentResolution::Resolved(agent) => Some(derive_child_status(&state, &agent)),
+            _ => None,
         }
     });
 
@@ -449,21 +439,21 @@ fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) 
     // known yet the label is the backend alone — never a guessed model.
     let backend_model = Signal::derive({
         let state = state.clone();
-        let agent_id = agent_id.clone();
         move || -> Option<String> {
-            let parent = parent_ref.get()?;
-            let backend = state.agents.with(|agents| {
-                agents
-                    .iter()
-                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
-                    .map(|agent| agent.backend_kind)
-            })?;
+            let PersistentAgentResolution::Resolved(agent) = handle.resolution.get() else {
+                return None;
+            };
+            let backend = agent.backend_kind;
+            let live_agent_id = agent.agent_id;
             let model = state
                 .streaming_text
-                .with(|map| map.get(&agent_id).and_then(|stream| stream.model.clone()))
+                .with(|map| {
+                    map.get(&live_agent_id)
+                        .and_then(|stream| stream.model.clone())
+                })
                 .or_else(|| {
                     state.agent_session_settings.with(|map| {
-                        map.get(&agent_id)
+                        map.get(&live_agent_id)
                             .and_then(|values| match values.0.get("model") {
                                 Some(SessionSettingValue::String(value))
                                     if !value.trim().is_empty() =>
@@ -483,10 +473,13 @@ fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) 
 
     let preview = Signal::derive({
         let state = state.clone();
-        let agent_id = agent_id.clone();
         move || {
+            let live_agent_id = match handle.resolution.get() {
+                PersistentAgentResolution::Resolved(agent) => agent.agent_id,
+                _ => return None,
+            };
             let handles = state.streaming_text.with(|map| {
-                map.get(&agent_id)
+                map.get(&live_agent_id)
                     .map(|stream| (stream.text.clone(), stream.reasoning.clone()))
             })?;
             let text = handles.0.get();
@@ -503,27 +496,21 @@ fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) 
     // infers a summary from streaming text. Shown only while no live
     // streaming preview is available, so a row carries one detail line.
     let activity_summary = Signal::derive({
-        let state = state.clone();
-        let agent_id = agent_id.clone();
-        move || {
-            let parent = parent_ref.get()?;
-            state.agents.with(|agents| {
-                agents
-                    .iter()
-                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
-                    .map(|agent| agent.activity_summary.clone())
-            })
+        move || match handle.resolution.get() {
+            PersistentAgentResolution::Resolved(agent) => Some(agent.activity_summary),
+            _ => None,
         }
     });
 
     let activity_stats: Signal<Option<AgentActivityStats>> = Signal::derive({
         let state = state.clone();
-        let agent_id = agent_id.clone();
         move || {
-            let parent = parent_ref.get()?;
+            let PersistentAgentResolution::Resolved(agent) = handle.resolution.get() else {
+                return None;
+            };
             let key = ActiveAgentRef {
-                host_id: parent.host_id,
-                agent_id: agent_id.clone(),
+                host_id: agent.host_id,
+                agent_id: agent.agent_id,
             };
             state
                 .agent_activity_stats
@@ -531,20 +518,10 @@ fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) 
         }
     });
 
-    let open_state = state.clone();
-    let open_agent_id = agent_id.clone();
-    let on_open = move |_: web_sys::MouseEvent| {
-        let Some(parent) = parent_ref.get_untracked() else {
-            log::error!("Open agent clicked on an in-flight row with no resolved agent");
-            return;
-        };
-        open_child_agent(&open_state, &parent.host_id, &open_agent_id);
-    };
-
     view! {
         <div class="tool-live-agent-row inflight-tray-row">
             <div class="tool-live-agent-main">
-                <span class="tool-live-agent-name">{move || display_name.get()}</span>
+                <span class="tool-live-agent-name">{move || handle.display_name.get()}</span>
                 {move || status.get().map(|status| view! {
                     <span class=status.class()>{status.label()}</span>
                 })}
@@ -553,7 +530,7 @@ fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) 
                 })}
             </div>
             <div class="inflight-tray-row-actions">
-                <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
+                {agent_open_action(state, handle.resolution, "tool-live-link")}
             </div>
             {move || {
                 if let Some(text) = preview.get() {
@@ -1127,6 +1104,7 @@ mod wasm_tests {
             workspace_roots: vec!["/tmp/work".to_owned()],
             project_id: None,
             parent_agent_id: Some(parent_ref().agent_id),
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,

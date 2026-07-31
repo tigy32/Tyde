@@ -25,8 +25,8 @@ use wasm_bindgen::JsCast;
 
 use crate::components::workflow_view::{WorkflowRunPanel, run_status_label};
 use crate::state::{
-    ActiveAgentRef, AppState, StreamingToolRequest, TabContent, ToolCallId, ToolOutputMode,
-    ToolRequestEntry,
+    ActiveAgentRef, AgentInfo, AppState, StreamingToolRequest, TabContent, ToolCallId,
+    ToolOutputMode, ToolRequestEntry,
 };
 
 mod ask_user_question;
@@ -458,13 +458,10 @@ pub fn ToolCardView(
         ToolRequestType::TydeSendAgentMessage { agent_id, .. } => Some(agent_id.clone()),
         _ => None,
     };
-    let recipient_detail: Signal<Option<String>> = Signal::derive({
-        let state = state.clone();
-        move || {
-            let agent_id = send_recipient_id.clone()?;
-            Some(agent_display_name(&state, agent_ref.get(), &agent_id, None))
-        }
-    });
+    let recipient_handle = send_recipient_id
+        .map(|agent_id| persistent_agent_resolution(&state, agent_ref, agent_id, None));
+    let recipient_detail: Signal<Option<String>> =
+        Signal::derive(move || recipient_handle.map(|handle| handle.display_name.get()));
 
     let header_detail = move || {
         workflow_run
@@ -794,41 +791,22 @@ fn agent_control_receipt(
                 {
                     let state = expect_context::<AppState>();
                     let agent_id = agent.agent_id.clone();
-                    let fallback_name = agent.name.clone();
-                    let display_name = Signal::derive({
-                        let state = state.clone();
-                        let agent_id = agent_id.clone();
-                        let fallback_name = fallback_name.clone();
-                        move || {
-                            agent_display_name(
-                                &state,
-                                parent_ref.get(),
-                                &agent_id,
-                                fallback_name.as_deref(),
-                            )
-                        }
-                    });
-                    let on_open = move |_: web_sys::MouseEvent| {
-                        let Some(parent) = parent_ref.get_untracked() else {
-                            log::error!(
-                                "Open agent clicked on an agent-control card with no resolved agent"
-                            );
-                            return;
-                        };
-                        open_child_agent(&state, &parent.host_id, &agent_id);
-                    };
+                    let handle = persistent_agent_resolution(
+                        &state,
+                        parent_ref,
+                        agent_id,
+                        agent.name.clone(),
+                    );
                     view! {
                         <div class="tool-live-agent-receipt-row">
                             <span class="tool-live-agent-name">
-                                {move || display_name.get()}
+                                {move || handle.display_name.get()}
                             </span>
-                            <button
-                                type="button"
-                                class="tool-live-link tool-live-agent-receipt-link"
-                                on:click=on_open
-                            >
-                                "Open agent"
-                            </button>
+                            {agent_open_action(
+                                state,
+                                handle.resolution,
+                                "tool-live-link tool-live-agent-receipt-link",
+                            )}
                         </div>
                     }
                 }
@@ -840,58 +818,204 @@ fn agent_control_receipt(
     }
 }
 
-/// An agent's live human name, resolved reactively from server-owned state on
-/// the parent's host. Falls back to the name the event carried, then to the raw
-/// id — never to an invented label. Shared by every card that has to refer to a
-/// child agent (agent-control rows, the send-message recipient, the await
-/// verdict), so they can't drift apart on what an agent is called.
+/// Result of resolving a persistent transcript reference against the current
+/// server-owned registry.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PersistentAgentResolution {
+    Resolved(Box<AgentInfo>),
+    NotFound,
+    Ambiguous,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PersistentAgentAlias {
+    team_member_id: Option<protocol::TeamMemberId>,
+    name: Option<String>,
+}
+
+/// Resolve a transcript's durable agent reference against only the current
+/// registry. Exact ids are global and decisive. Alias recovery is restricted
+/// to current direct children of a parent that itself still exists.
+pub(crate) fn resolve_persistent_agent(
+    agents: &[AgentInfo],
+    parent: Option<&ActiveAgentRef>,
+    agent_id: &protocol::AgentId,
+    team_member_id: Option<&protocol::TeamMemberId>,
+    name: Option<&str>,
+) -> PersistentAgentResolution {
+    let exact = agents
+        .iter()
+        .filter(|agent| agent.agent_id == *agent_id)
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return PersistentAgentResolution::Resolved(Box::new(exact[0].clone()));
+    }
+    if exact.len() > 1 {
+        let Some(parent) = parent else {
+            return PersistentAgentResolution::Ambiguous;
+        };
+        let children = exact
+            .into_iter()
+            .filter(|agent| agent.parent_agent_id.as_ref() == Some(&parent.agent_id))
+            .collect::<Vec<_>>();
+        return match children.as_slice() {
+            [agent] => PersistentAgentResolution::Resolved(Box::new((*agent).clone())),
+            _ => PersistentAgentResolution::Ambiguous,
+        };
+    }
+
+    let Some(parent) = parent else {
+        return PersistentAgentResolution::Unavailable;
+    };
+    if !agents.iter().any(|agent| agent.agent_id == parent.agent_id) {
+        return PersistentAgentResolution::Unavailable;
+    }
+    let children = agents
+        .iter()
+        .filter(|agent| agent.parent_agent_id.as_ref() == Some(&parent.agent_id))
+        .collect::<Vec<_>>();
+
+    if let Some(team_member_id) = team_member_id {
+        let matches = children
+            .iter()
+            .filter(|agent| agent.team_member_id.as_ref() == Some(team_member_id))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [agent] => return PersistentAgentResolution::Resolved(Box::new((**agent).clone())),
+            [] => {}
+            _ => return PersistentAgentResolution::Ambiguous,
+        }
+    }
+
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        let matches = children
+            .iter()
+            .filter(|agent| agent.name == name)
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [agent] => PersistentAgentResolution::Resolved(Box::new((**agent).clone())),
+            [] => PersistentAgentResolution::NotFound,
+            _ => PersistentAgentResolution::Ambiguous,
+        };
+    }
+    PersistentAgentResolution::NotFound
+}
+
 pub(crate) fn agent_display_name(
     state: &AppState,
-    parent_ref: Option<ActiveAgentRef>,
+    parent: Option<ActiveAgentRef>,
     agent_id: &protocol::AgentId,
     fallback_name: Option<&str>,
 ) -> String {
-    let state_name = parent_ref.and_then(|parent| {
-        state.agents.with(|agents| {
-            agents
-                .iter()
-                .find(|agent| agent.host_id == parent.host_id && agent.agent_id == *agent_id)
-                .map(|agent| agent.name.clone())
-        })
-    });
-    state_name
-        .or_else(|| fallback_name.map(str::to_owned))
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| agent_id.0.clone())
+    match state.agents.with(|agents| {
+        resolve_persistent_agent(agents, parent.as_ref(), agent_id, None, fallback_name)
+    }) {
+        PersistentAgentResolution::Resolved(agent) => agent.name,
+        _ => fallback_name
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| agent_id.0.clone()),
+    }
 }
 
-/// Open a child agent from a tool card's "Open agent" action.
-///
-/// The child lives on the parent chat's host, so it is looked up in the
-/// server-owned `agents` registry by `(parent_host, agent_id)` — the same record
-/// that renders the child's name and status here. Opening then goes through
-/// [`agents_panel::open_agent_chat`], which switches to the child's authoritative
-/// owning project (and host) *before* opening the tab. That switch is
-/// load-bearing: without it a cross-project child's tab lands in the currently
-/// active project's `center_zone` and is discarded, so the button appears to do
-/// nothing.
-///
-/// A child with no registry record cannot have its owning project resolved.
-/// Because the card's own name and status come from that same record, its
-/// absence is a bug, surfaced rather than papered over with a guessed project.
-pub(crate) fn open_child_agent(state: &AppState, parent_host: &str, agent_id: &protocol::AgentId) {
-    let child = state.agents.with_untracked(|agents| {
-        agents
-            .iter()
-            .find(|agent| agent.host_id.as_str() == parent_host && &agent.agent_id == agent_id)
-            .cloned()
+#[derive(Clone, Copy)]
+pub(crate) struct PersistentAgentHandle {
+    pub resolution: Memo<PersistentAgentResolution>,
+    pub display_name: Memo<String>,
+}
+
+pub(crate) fn persistent_agent_resolution(
+    state: &AppState,
+    parent_ref: Signal<Option<ActiveAgentRef>>,
+    agent_id: protocol::AgentId,
+    explicit_name: Option<String>,
+) -> PersistentAgentHandle {
+    let alias = RwSignal::new(PersistentAgentAlias {
+        team_member_id: None,
+        name: explicit_name.filter(|name| !name.trim().is_empty()),
     });
-    match child {
-        Some(child) => crate::components::agents_panel::open_agent_chat(state, &child),
-        None => log::error!(
-            "Open agent: no registry record for child {agent_id:?} on host {parent_host}; \
-             cannot resolve its owning project"
-        ),
+    let resolution = Memo::new({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move |_| {
+            let parent = parent_ref.get();
+            let alias = alias.get();
+            state.agents.with(|agents| {
+                resolve_persistent_agent(
+                    agents,
+                    parent.as_ref(),
+                    &agent_id,
+                    alias.team_member_id.as_ref(),
+                    alias.name.as_deref(),
+                )
+            })
+        }
+    });
+    Effect::new(move |_| {
+        if let PersistentAgentResolution::Resolved(agent) = resolution.get() {
+            let next = PersistentAgentAlias {
+                team_member_id: agent.team_member_id,
+                name: (!agent.name.trim().is_empty()).then_some(agent.name),
+            };
+            if alias.get_untracked() != next {
+                alias.set(next);
+            }
+        }
+    });
+    let display_name = Memo::new(move |_| match resolution.get() {
+        PersistentAgentResolution::Resolved(agent) => agent.name,
+        _ => alias.get().name.unwrap_or_else(|| agent_id.0.clone()),
+    });
+    PersistentAgentHandle {
+        resolution,
+        display_name,
+    }
+}
+
+pub(crate) fn agent_open_action(
+    state: AppState,
+    resolution: Memo<PersistentAgentResolution>,
+    class: &'static str,
+) -> impl IntoView {
+    let attempted = RwSignal::new(false);
+    Effect::new(move |_| {
+        if matches!(resolution.get(), PersistentAgentResolution::Resolved(_)) {
+            attempted.set(false);
+        }
+    });
+    let open_state = state.clone();
+    let on_open = move |_: web_sys::MouseEvent| match resolution.get_untracked() {
+        PersistentAgentResolution::Resolved(agent) => {
+            crate::components::agents_panel::open_agent_chat(&open_state, &agent)
+        }
+        _ => attempted.set(true),
+    };
+    view! {
+        <button type="button" class=class on:click=on_open>"Open agent"</button>
+        {move || {
+            if !attempted.get() {
+                return ().into_any();
+            }
+            match resolution.get() {
+                PersistentAgentResolution::Resolved(_) => ().into_any(),
+                PersistentAgentResolution::Unavailable => view! {
+                    <div class="tool-agent-open-feedback" role="status">
+                        "Agent unavailable while its parent reconnects. Try again."
+                    </div>
+                }.into_any(),
+                PersistentAgentResolution::NotFound => view! {
+                    <div class="tool-agent-open-feedback" role="alert">
+                        "This agent is no longer in the current registry. Try again after it reconnects."
+                    </div>
+                }.into_any(),
+                PersistentAgentResolution::Ambiguous => view! {
+                    <div class="tool-agent-open-feedback" role="alert">
+                        "Multiple current agents match this card, so Tyde cannot open one safely."
+                    </div>
+                }.into_any(),
+            }
+        }}
     }
 }
 
@@ -905,35 +1029,24 @@ fn subagent_status_line(
     progress: SubAgentProgress,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let status_text = if progress.completed {
-        format!(
-            "\u{2713} {} finished \u{b7} {} tool calls",
-            progress.agent_name, progress.tool_calls
-        )
-    } else {
-        format!(
-            "\u{27f3} {} running \u{b7} live status in the In-flight tray",
-            progress.agent_name
-        )
-    };
     let agent_id = progress.agent_id.clone();
-
-    let on_open = move |_: web_sys::MouseEvent| {
-        // The sub-agent lives on the same host as the chat that spawned it; the
-        // parent's agent_ref is plumbed in explicitly. `open_child_agent`
-        // resolves the child's authoritative owning project and switches to it
-        // before opening, so a cross-project sub-agent is not discarded.
-        let Some(parent) = agent_ref.get_untracked() else {
-            log::error!("Open agent clicked on a card with no resolved agent");
-            return;
-        };
-        open_child_agent(&state, &parent.host_id, &agent_id);
+    let handle =
+        persistent_agent_resolution(&state, agent_ref, agent_id, Some(progress.agent_name));
+    let completed = progress.completed;
+    let tool_calls = progress.tool_calls;
+    let status_text = move || {
+        let name = handle.display_name.get();
+        if completed {
+            format!("\u{2713} {name} finished \u{b7} {tool_calls} tool calls")
+        } else {
+            format!("\u{27f3} {name} running \u{b7} live status in the In-flight tray")
+        }
     };
 
     view! {
         <div class="tool-live-subagent">
             <span class="tool-live-title">{status_text}</span>
-            <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
+            {agent_open_action(state, handle.resolution, "tool-live-link")}
         </div>
     }
 }
@@ -1442,21 +1555,27 @@ mod completion_summary_tests {
 }
 
 #[cfg(test)]
-mod open_child_agent_tests {
+mod persistent_agent_resolver_tests {
     use super::*;
-    use crate::state::{ActiveProjectRef, AgentInfo};
-    use protocol::{AgentId, AgentOrigin, BackendKind, ProjectId, StreamPath};
+    use protocol::{AgentId, AgentOrigin, BackendKind, ProjectId, StreamPath, TeamMemberId};
 
-    fn child_agent(host: &str, id: &str, name: &str, project: Option<&str>) -> AgentInfo {
+    fn agent(
+        host: &str,
+        id: &str,
+        name: &str,
+        parent: Option<&str>,
+        member: Option<&str>,
+    ) -> AgentInfo {
         AgentInfo {
             host_id: host.to_owned(),
             agent_id: AgentId(id.to_owned()),
             name: name.to_owned(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Claude,
+            origin: AgentOrigin::AgentControl,
+            backend_kind: BackendKind::Codex,
             workspace_roots: Vec::new(),
-            project_id: project.map(|p| ProjectId(p.to_owned())),
-            parent_agent_id: None,
+            project_id: Some(ProjectId(format!("project-{host}"))),
+            parent_agent_id: parent.map(|id| AgentId(id.to_owned())),
+            team_member_id: member.map(|id| TeamMemberId(id.to_owned())),
             session_id: None,
             custom_agent_id: None,
             workflow: None,
@@ -1468,111 +1587,167 @@ mod open_child_agent_tests {
         }
     }
 
-    fn active_on(host: &str, project: &str) -> Option<ActiveProjectRef> {
-        Some(ActiveProjectRef {
+    fn parent_ref(host: &str) -> ActiveAgentRef {
+        ActiveAgentRef {
             host_id: host.to_owned(),
-            project_id: ProjectId(project.to_owned()),
-        })
+            agent_id: AgentId("parent".to_owned()),
+        }
     }
 
-    /// A tool card's Open agent for a child in a *different* project resolves the
-    /// child's authoritative owning project from the registry and switches to it
-    /// before opening — without the switch, the chat tab would land in the active
-    /// project's center zone and be discarded, so the button did nothing.
-    #[test]
-    fn open_child_agent_switches_to_the_childs_project_and_opens_its_chat() {
-        let owner = leptos::reactive::owner::Owner::new();
-        owner.with(|| {
-            let state = AppState::new();
-            state.active_project.set(active_on("host-1", "alpha"));
-            state.agents.set(vec![child_agent(
-                "host-1",
-                "child-1",
-                "Child",
-                Some("beta"),
-            )]);
-
-            // The parent host is host-1 (the child lives on the parent's host);
-            // the child belongs to project "beta", not the active "alpha".
-            open_child_agent(&state, "host-1", &AgentId("child-1".to_owned()));
-
-            let active = state
-                .active_project
-                .get_untracked()
-                .expect("active project stays set");
-            assert_eq!(
-                active.project_id,
-                ProjectId("beta".to_owned()),
-                "Open agent must switch to the child's owning project, not stay on the parent's"
-            );
-            assert_eq!(active.host_id, "host-1");
-
-            let agent = state
-                .active_agent
-                .get_untracked()
-                .expect("the child's chat opened and is active");
-            assert_eq!(
-                agent.agent_id,
-                AgentId("child-1".to_owned()),
-                "the exact child agent's chat is the active tab"
-            );
-            assert_eq!(agent.host_id, "host-1");
-        });
+    fn resolved_host(result: PersistentAgentResolution) -> String {
+        match result {
+            PersistentAgentResolution::Resolved(agent) => agent.host_id,
+            other => panic!("expected resolved agent, got {other:?}"),
+        }
     }
 
-    /// A same-project child opens its chat without changing the active project —
-    /// the common case must not regress into a spurious switch.
     #[test]
-    fn open_child_agent_same_project_opens_without_switching() {
-        let owner = leptos::reactive::owner::Owner::new();
-        owner.with(|| {
-            let state = AppState::new();
-            state.active_project.set(active_on("host-1", "alpha"));
-            state.agents.set(vec![child_agent(
-                "host-1",
-                "child-1",
-                "Child",
-                Some("alpha"),
-            )]);
-
-            open_child_agent(&state, "host-1", &AgentId("child-1".to_owned()));
-
-            assert_eq!(
-                state.active_project.get_untracked().map(|p| p.project_id),
-                Some(ProjectId("alpha".to_owned())),
-                "a same-project child leaves the active project unchanged"
-            );
-            let agent = state
-                .active_agent
-                .get_untracked()
-                .expect("the child's chat opened and is active");
-            assert_eq!(agent.agent_id, AgentId("child-1".to_owned()));
-        });
+    fn exact_id_ignores_stale_parent_host_and_uses_live_host() {
+        let agents = vec![agent("new-host", "child", "Worker", Some("parent"), None)];
+        assert_eq!(
+            resolved_host(resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("stale-host")),
+                &AgentId("child".to_owned()),
+                None,
+                None,
+            )),
+            "new-host"
+        );
     }
 
-    /// A child with no registry record cannot have its owning project resolved.
-    /// The action surfaces the error and performs no navigation — no guessed
-    /// project, no chat opened in the wrong place, no silent fallback.
     #[test]
-    fn open_child_agent_without_a_registry_record_navigates_nowhere() {
-        let owner = leptos::reactive::owner::Owner::new();
-        owner.with(|| {
-            let state = AppState::new();
-            state.active_project.set(active_on("host-1", "alpha"));
-            // The registry has no matching child.
+    fn duplicate_exact_ids_use_only_parent_lineage() {
+        let agents = vec![
+            agent("stored-host", "child", "Wrong", Some("other"), None),
+            agent("remote-host", "child", "Right", Some("parent"), None),
+        ];
+        assert_eq!(
+            resolved_host(resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("stored-host")),
+                &AgentId("child".to_owned()),
+                None,
+                None,
+            )),
+            "remote-host"
+        );
 
-            open_child_agent(&state, "host-1", &AgentId("missing".to_owned()));
+        let tied = vec![
+            agent("stored-host", "child", "One", Some("parent"), None),
+            agent("remote-host", "child", "Two", Some("parent"), None),
+        ];
+        assert!(matches!(
+            resolve_persistent_agent(
+                &tied,
+                Some(&parent_ref("stored-host")),
+                &AgentId("child".to_owned()),
+                None,
+                Some("One"),
+            ),
+            PersistentAgentResolution::Ambiguous
+        ));
+    }
 
-            assert_eq!(
-                state.active_project.get_untracked().map(|p| p.project_id),
-                Some(ProjectId("alpha".to_owned())),
-                "an unresolvable child must not switch the active project"
-            );
-            assert!(
-                state.active_agent.get_untracked().is_none(),
-                "and must not open a chat: no owning project means no navigation"
-            );
-        });
+    #[test]
+    fn member_id_precedes_name_during_churn() {
+        let agents = vec![
+            agent("host-a", "parent", "Parent", None, None),
+            agent(
+                "host-b",
+                "new-id",
+                "Renamed",
+                Some("parent"),
+                Some("member"),
+            ),
+            agent("host-c", "other", "Old name", Some("parent"), Some("other")),
+        ];
+        let result = resolve_persistent_agent(
+            &agents,
+            Some(&parent_ref("stale-host")),
+            &AgentId("old-id".to_owned()),
+            Some(&TeamMemberId("member".to_owned())),
+            Some("Old name"),
+        );
+        assert_eq!(resolved_host(result), "host-b");
+    }
+
+    #[test]
+    fn name_alias_is_exact_direct_child_only() {
+        let agents = vec![
+            agent("host-a", "parent", "Parent", None, None),
+            agent("host-b", "replacement", "Worker", Some("parent"), None),
+            agent("host-c", "unrelated", "Worker", Some("someone-else"), None),
+        ];
+        assert_eq!(
+            resolved_host(resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("old-host")),
+                &AgentId("stale".to_owned()),
+                None,
+                Some("Worker"),
+            )),
+            "host-b"
+        );
+        assert!(matches!(
+            resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("old-host")),
+                &AgentId("wrong".to_owned()),
+                None,
+                Some("Missing"),
+            ),
+            PersistentAgentResolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn alias_duplicates_are_ambiguous_and_absent_parent_is_unavailable() {
+        let agents = vec![
+            agent("host-a", "parent", "Parent", None, None),
+            agent("host-b", "one", "Worker", Some("parent"), None),
+            agent("host-c", "two", "Worker", Some("parent"), None),
+        ];
+        assert!(matches!(
+            resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("host-a")),
+                &AgentId("stale".to_owned()),
+                None,
+                Some("Worker"),
+            ),
+            PersistentAgentResolution::Ambiguous
+        ));
+        assert!(matches!(
+            resolve_persistent_agent(
+                &agents[1..],
+                Some(&parent_ref("host-a")),
+                &AgentId("stale".to_owned()),
+                None,
+                Some("Worker"),
+            ),
+            PersistentAgentResolution::Unavailable
+        ));
+    }
+
+    #[test]
+    fn any_exact_id_evidence_blocks_weaker_alias_fallback() {
+        let agents = vec![
+            agent("host-a", "parent", "Parent", None, None),
+            agent("host-a", "stale", "Exact one", Some("other"), None),
+            agent("host-b", "stale", "Exact two", Some("other"), None),
+            agent("host-c", "replacement", "Worker", Some("parent"), None),
+        ];
+        assert!(matches!(
+            resolve_persistent_agent(
+                &agents,
+                Some(&parent_ref("host-a")),
+                &AgentId("stale".to_owned()),
+                None,
+                Some("Worker"),
+            ),
+            PersistentAgentResolution::Ambiguous
+        ));
     }
 }
 
@@ -1585,7 +1760,7 @@ mod live_card_wasm_tests {
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
         AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
-        BackgroundTaskState, BackgroundTaskStatus, FileInfo, StreamPath,
+        BackgroundTaskState, BackgroundTaskStatus, FileInfo, ProjectId, StreamPath, TeamMemberId,
         ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
         WorkflowAgentStatus,
     };
@@ -1909,6 +2084,7 @@ mod live_card_wasm_tests {
             workspace_roots: vec!["/tmp/work".to_owned()],
             project_id: None,
             parent_agent_id: Some(chat_agent_ref().agent_id),
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,
@@ -2092,6 +2268,41 @@ mod live_card_wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn native_task_card_retries_after_registry_reconnect() {
+        let mut entry = completed_other_request("toolu_task", "Task");
+        entry.result = None;
+        let (container, state) = mount_card(entry, Some(subagent_progress_data(2, false)));
+        next_tick().await;
+
+        let link = container
+            .query_selector(".tool-live-subagent .tool-live-link")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        link.click();
+        next_tick().await;
+        assert_eq!(count(&container, ".tool-agent-open-feedback"), 1);
+
+        let mut parent = agent_info("agent-1", "Parent", true);
+        parent.parent_agent_id = None;
+        let mut replacement = agent_info("native-replacement", "Explore", true);
+        replacement.host_id = "native-host".to_owned();
+        state.agents.set(vec![parent, replacement]);
+        next_tick().await;
+
+        assert_eq!(count(&container, ".tool-agent-open-feedback"), 0);
+        link.click();
+        next_tick().await;
+        let opened = state
+            .active_agent
+            .get_untracked()
+            .expect("native replacement opens");
+        assert_eq!(opened.agent_id, AgentId("native-replacement".to_owned()));
+        assert_eq!(opened.host_id, "native-host");
+    }
+
+    #[wasm_bindgen_test]
     async fn finished_subagent_line_shows_completion() {
         let entry = completed_other_request("toolu_task", "Task");
         let (container, _state) = mount_card(entry, Some(subagent_progress_data(30, true)));
@@ -2261,6 +2472,173 @@ mod live_card_wasm_tests {
             .expect("clicking the rendered action opens the native child");
         assert_eq!(opened.agent_id, AgentId("native-child".to_owned()));
         assert_eq!(opened.host_id, "host-1");
+    }
+
+    #[wasm_bindgen_test]
+    async fn reconnect_resolves_name_alias_across_hosts_and_clears_feedback() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        next_tick().await;
+
+        let link = container
+            .query_selector(".tool-live-agent-receipt-link")
+            .expect("query receipt link")
+            .expect("receipt link")
+            .dyn_into::<HtmlElement>()
+            .expect("HTML link");
+        link.click();
+        next_tick().await;
+        assert_eq!(count(&container, ".tool-agent-open-feedback"), 1);
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='status']"),
+            1,
+            "an absent parent is announced as transient reconnect status"
+        );
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='alert']"),
+            0
+        );
+
+        let mut parent = agent_info("agent-1", "Parent", true);
+        parent.host_id = "parent-live-host".to_owned();
+        parent.parent_agent_id = None;
+        state.agents.set(vec![parent.clone()]);
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='alert']"),
+            1,
+            "a present parent with no matching child is announced as an error"
+        );
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='status']"),
+            0
+        );
+        assert!(
+            text(&container).contains("no longer in the current registry"),
+            "the alert identifies the not-found outcome"
+        );
+
+        let mut replacement = agent_info("replacement-id", "Worker", true);
+        replacement.host_id = "child-live-host".to_owned();
+        replacement.project_id = Some(ProjectId("child-project".to_owned()));
+        state.agents.set(vec![parent, replacement]);
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback"),
+            0,
+            "feedback clears as soon as the live registry resolves"
+        );
+        link.click();
+        next_tick().await;
+        let opened = state
+            .active_agent
+            .get_untracked()
+            .expect("replacement opens");
+        assert_eq!(opened.agent_id, AgentId("replacement-id".to_owned()));
+        assert_eq!(opened.host_id, "child-live-host");
+        let project = state
+            .active_project
+            .get_untracked()
+            .expect("replacement project selected");
+        assert_eq!(project.host_id, "child-live-host");
+        assert_eq!(project.project_id, ProjectId("child-project".to_owned()));
+    }
+
+    #[wasm_bindgen_test]
+    async fn churn_uses_captured_member_id_before_stale_name() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        let mut old = agent_info("agent-sub", "Worker", true);
+        old.team_member_id = Some(TeamMemberId("member-1".to_owned()));
+        state.agents.set(vec![old]);
+        next_tick().await;
+
+        let mut parent = agent_info("agent-1", "Parent", true);
+        parent.parent_agent_id = None;
+        let mut replacement = agent_info("replacement", "Renamed worker", true);
+        replacement.host_id = "host-2".to_owned();
+        replacement.team_member_id = Some(TeamMemberId("member-1".to_owned()));
+        state.agents.set(vec![parent, replacement]);
+        next_tick().await;
+
+        assert!(
+            text(&container).contains("Renamed worker"),
+            "member identity survives both id churn and rename"
+        );
+        let link = container
+            .query_selector(".tool-live-agent-receipt-link")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        link.click();
+        next_tick().await;
+        let opened = state
+            .active_agent
+            .get_untracked()
+            .expect("replacement opens");
+        assert_eq!(opened.agent_id, AgentId("replacement".to_owned()));
+        assert_eq!(opened.host_id, "host-2");
+    }
+
+    #[wasm_bindgen_test]
+    async fn ambiguous_click_alert_clears_when_registry_becomes_unique() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        let mut parent = agent_info("agent-1", "Parent", true);
+        parent.parent_agent_id = None;
+        let one = agent_info("replacement-one", "Worker", true);
+        let mut two = agent_info("replacement-two", "Worker", true);
+        two.host_id = "host-2".to_owned();
+        state.agents.set(vec![parent, one, two]);
+        next_tick().await;
+
+        let link = container
+            .query_selector(".tool-live-agent-receipt-link")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        link.click();
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='alert']"),
+            1
+        );
+        assert_eq!(
+            count(&container, ".tool-agent-open-feedback[role='status']"),
+            0
+        );
+        assert!(
+            text(&container).contains("Multiple current agents match this card"),
+            "the alert identifies the ambiguous outcome"
+        );
+        assert!(state.active_agent.get_untracked().is_none());
+
+        state.agents.update(|agents| {
+            agents.retain(|agent| agent.agent_id != AgentId("replacement-two".to_owned()));
+        });
+        next_tick().await;
+        assert_eq!(count(&container, ".tool-agent-open-feedback"), 0);
+        link.click();
+        next_tick().await;
+        assert_eq!(
+            state
+                .active_agent
+                .get_untracked()
+                .map(|agent| agent.agent_id),
+            Some(AgentId("replacement-one".to_owned()))
+        );
     }
 
     /// Neither card renders live per-agent detail, even when the server has

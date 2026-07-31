@@ -21,7 +21,7 @@ use wasm_bindgen::closure::Closure;
 use crate::markdown::render_markdown;
 use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
-use super::agent_display_name;
+use super::{agent_open_action, persistent_agent_resolution};
 
 pub(crate) fn render(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -101,11 +101,7 @@ fn SendAgentMessageCard(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let display_name = Signal::derive({
-        let state = state.clone();
-        let agent_id = agent_id.clone();
-        move || agent_display_name(&state, agent_ref.get(), &agent_id, None)
-    });
+    let handle = persistent_agent_resolution(&state, agent_ref, agent_id, None);
 
     let expanded = RwSignal::new(false);
     // Whether the clamped body actually overflows. Measured from the rendered
@@ -154,18 +150,6 @@ fn SendAgentMessageCard(
         });
     });
 
-    let on_open = {
-        let state = state.clone();
-        let agent_id = agent_id.clone();
-        move |_: web_sys::MouseEvent| {
-            let Some(parent) = agent_ref.get_untracked() else {
-                log::error!("Open agent clicked on a send-message card with no resolved agent");
-                return;
-            };
-            super::open_child_agent(&state, &parent.host_id, &agent_id);
-        }
-    };
-
     // `overflow: hidden` clips content visually but leaves it in the tab order,
     // so a keyboard user can land on a link — or one of the copy buttons that
     // `render_markdown` puts on every fenced block — that is invisible on screen
@@ -183,8 +167,8 @@ fn SendAgentMessageCard(
         <div class="tool-send-message">
             <div class="tool-send-message-header">
                 <span class="tool-send-message-label">"To"</span>
-                <span class="tool-send-message-recipient">{move || display_name.get()}</span>
-                <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
+                <span class="tool-send-message-recipient">{move || handle.display_name.get()}</span>
+                {agent_open_action(state, handle.resolution, "tool-live-link")}
             </div>
             <div
                 id=body_id
@@ -242,7 +226,7 @@ mod wasm_tests {
     use crate::components::tool_card::test_utils::*;
     use crate::state::AgentInfo;
     use leptos::mount::mount_to;
-    use protocol::{AgentOrigin, BackendKind, StreamPath};
+    use protocol::{AgentOrigin, BackendKind, StreamPath, TeamMemberId};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlButtonElement, HtmlElement};
@@ -296,6 +280,7 @@ mod wasm_tests {
             workspace_roots: vec!["/tmp/work".to_owned()],
             project_id: None,
             parent_agent_id: Some(parent_ref().agent_id),
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,
@@ -449,6 +434,47 @@ mod wasm_tests {
             body.contains("Renamed worker"),
             "rename re-renders the card: {body}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn persistent_send_card_opens_member_replacement_after_churn() {
+        let (container, state) = mount_send_card(
+            MESSAGE,
+            Some(ToolExecutionResult::TydeSendAgentMessage),
+            ToolOutputMode::Compact,
+            |state| {
+                let mut old = child_agent("Original recipient");
+                old.team_member_id = Some(TeamMemberId("member-1".to_owned()));
+                state.agents.set(vec![old]);
+            },
+        );
+        next_tick().await;
+
+        let mut parent = child_agent("Parent");
+        parent.agent_id = parent_ref().agent_id;
+        parent.parent_agent_id = None;
+        let mut replacement = child_agent("Replacement recipient");
+        replacement.host_id = "host-2".to_owned();
+        replacement.agent_id = AgentId("replacement-id".to_owned());
+        replacement.team_member_id = Some(TeamMemberId("member-1".to_owned()));
+        state.agents.set(vec![parent, replacement]);
+        next_tick().await;
+
+        assert!(text(&container).contains("Replacement recipient"));
+        let open = container
+            .query_selector("button.tool-live-link")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        open.click();
+        next_tick().await;
+        let opened = state
+            .active_agent
+            .get_untracked()
+            .expect("replacement opens");
+        assert_eq!(opened.agent_id, AgentId("replacement-id".to_owned()));
+        assert_eq!(opened.host_id, "host-2");
     }
 
     /// With no agent record yet, the id is shown rather than a fabricated name.

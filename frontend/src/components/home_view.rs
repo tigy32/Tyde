@@ -399,6 +399,7 @@ mod wasm_tests {
                 workspace_roots: Vec::new(),
                 project_id: Some(ProjectId("p-1".to_owned())),
                 parent_agent_id: None,
+                team_member_id: None,
                 session_id: None,
                 custom_agent_id: None,
                 workflow: None,

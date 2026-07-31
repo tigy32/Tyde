@@ -2338,6 +2338,7 @@ mod wasm_tests {
             workspace_roots: vec![],
             project_id: project.map(|s| ProjectId(s.to_owned())),
             parent_agent_id: None,
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,

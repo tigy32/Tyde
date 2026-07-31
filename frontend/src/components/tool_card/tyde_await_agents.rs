@@ -25,7 +25,7 @@ use protocol::{AgentControlStatus, ToolExecutionResult, ToolRequestType, TydeAge
 
 use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
-use super::agent_display_name;
+use super::persistent_agent_resolution;
 
 pub(crate) fn render(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -102,15 +102,18 @@ fn AwaitVerdict(
 
     // Names are live server state — an agent can be renamed after the wait
     // returned — so this is resolved reactively, never snapshotted.
+    let failed_handles = failed
+        .iter()
+        .map(|agent| persistent_agent_resolution(&state, agent_ref, agent.agent_id.clone(), None))
+        .collect::<Vec<_>>();
     let failed_line = Signal::derive({
-        let state = state.clone();
         move || {
-            if failed.is_empty() {
+            if failed_handles.is_empty() {
                 return None;
             }
-            let names = failed
+            let names = failed_handles
                 .iter()
-                .map(|agent| agent_display_name(&state, agent_ref.get(), &agent.agent_id, None))
+                .map(|handle| handle.display_name.get())
                 .collect::<Vec<_>>()
                 .join(", ");
             Some(format!("Failed: {names}"))
@@ -170,6 +173,7 @@ mod wasm_tests {
             workspace_roots: vec!["/tmp/work".to_owned()],
             project_id: None,
             parent_agent_id: Some(parent_ref().agent_id),
+            team_member_id: None,
             session_id: None,
             custom_agent_id: None,
             workflow: None,
