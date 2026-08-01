@@ -13822,3 +13822,176 @@ pre.tool-error-pre {
         animation: none;
     }
 }
+
+/* --- Voice layer -------------------------------------------------------- */
+/* The compact surface for a live Nova session. It sits in the same band as
+   the in-flight tray, above the composer, and never covers the transcript. */
+
+/* The control and its visible unavailable reason travel together: a disabled
+   button is not keyboard-focusable, so a tooltip alone would leave keyboard
+   and touch users with no way to learn why voice is off. */
+.chat-voice-control {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.chat-voice-unavailable {
+    color: var(--text-tertiary);
+    font-size: 11px;
+    max-width: 22ch;
+    line-height: 1.2;
+}
+
+.chat-voice-unavailable:empty {
+    display: none;
+}
+
+.chat-voice-btn {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Sized to the composer's control row. This is a pointer-first desktop
+       surface and does not claim to meet a 44px touch-target guideline. */
+    min-width: 36px;
+    height: 36px;
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+}
+
+.chat-voice-btn:hover:not(:disabled) {
+    background: var(--surface-3);
+    color: var(--text-primary);
+}
+
+.chat-voice-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Live is signalled by border, background *and* the button's own label —
+   never by colour alone. */
+.chat-voice-btn-live {
+    border-color: var(--accent-primary);
+    background: var(--accent-subtle);
+    color: var(--accent-primary);
+}
+
+.chat-voice-btn-glyph {
+    pointer-events: none;
+}
+
+.voice-strip {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: 0 var(--space-3) var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--accent-primary);
+    border-radius: 6px;
+    background: var(--accent-subtle);
+    font-size: 12px;
+}
+
+.voice-strip-hidden {
+    display: none;
+}
+
+.voice-strip-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.voice-strip-status {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.voice-strip-spacer {
+    flex: 1;
+}
+
+.voice-strip-aec {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.voice-strip-aec-warn {
+    color: var(--warning);
+}
+
+.voice-strip-btn {
+    flex-shrink: 0;
+    min-height: 32px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    background: var(--surface-1);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.voice-strip-btn:hover {
+    background: var(--surface-3);
+}
+
+.voice-strip-btn-warn {
+    border-color: var(--warning);
+    color: var(--warning);
+}
+
+.voice-strip-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.voice-strip-tool {
+    color: var(--info);
+}
+
+.voice-strip-progress {
+    color: var(--text-secondary);
+}
+
+/* What was actually said. The live caption is emphasised over settled lines so
+   the current utterance is findable at a glance. */
+.voice-strip-transcript {
+    color: var(--text-secondary);
+}
+
+.voice-strip-caption {
+    color: var(--text-primary);
+}
+
+/* A warning describes a session that is still running; an error describes one
+   that has stopped. They must not look the same. */
+.voice-strip-warning {
+    color: var(--warning);
+}
+
+.voice-strip-error {
+    color: var(--error);
+}
+
+.voice-strip-ended {
+    color: var(--text-secondary);
+}
+
+.voice-strip-diagnostics {
+    color: var(--text-tertiary);
+    font-size: 11px;
+}

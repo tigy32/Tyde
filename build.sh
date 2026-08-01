@@ -92,14 +92,19 @@ ensure_tauri_cli() {
 
 sign_and_notarize() {
     local target="$1"
+    local entitlements="$SCRIPT_DIR/frontend/tauri-shell/Entitlements.plist"
     if [[ "$(uname)" != "Darwin" ]]; then
         log "Skipping signing for $target (not macOS)"
         return 0
     fi
 
     log "Signing $target"
-    codesign --force --options runtime --deep --sign "$SIGNING_IDENTITY" "$target"
-    codesign --verify --verbose "$target"
+    [[ -f "$entitlements" ]] || error "Missing desktop entitlements: $entitlements"
+    codesign --force --options runtime --deep --entitlements "$entitlements" --sign "$SIGNING_IDENTITY" "$target"
+    codesign --verify --verbose --strict "$target"
+    codesign -d --entitlements :- "$target" 2>&1 \
+        | grep -q 'com.apple.security.device.audio-input' \
+        || error "Signed app is missing the microphone entitlement: $target"
 
     local zip="${target}.zip"
     log "Zipping for notarization"

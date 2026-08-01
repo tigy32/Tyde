@@ -8,7 +8,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::Connection;
-use crate::error::AppError;
+use crate::error::{AppError, AppErrorKind};
 use crate::host::{AgentReplayMode, HostHandle};
 use crate::router::route_client_envelope;
 use crate::stream::Stream;
@@ -377,13 +377,29 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     route_client_envelope(&host, &host_stream, &host_output_stream, envelope)
                         .await
                 {
-                    emit_command_error(
-                        &host_output_stream,
-                        request_stream,
-                        request_kind,
-                        setting_target,
-                        &error,
-                    );
+                    if let Some(session_id) = voice_session_id(&request_stream) {
+                        emit_voice_error(
+                            &host_output_stream,
+                            request_stream.clone(),
+                            session_id.clone(),
+                            &error,
+                        );
+                        let _ = host
+                            .stop_voice_session(
+                                &host_stream,
+                                &session_id,
+                                protocol::VoiceStopReason::MediaFailed,
+                            )
+                            .await;
+                    } else {
+                        emit_command_error(
+                            &host_output_stream,
+                            request_stream,
+                            request_kind,
+                            setting_target,
+                            &error,
+                        );
+                    }
 
                     if error.fatal {
                         return Ok(());
@@ -392,6 +408,52 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                 first_request.notify_one();
             }
         }
+    }
+}
+
+fn voice_session_id(stream: &protocol::StreamPath) -> Option<protocol::VoiceSessionId> {
+    let value = stream.0.strip_prefix("/voice/")?;
+    if value.is_empty()
+        || value.len() > 128
+        || value.contains('/')
+        || value.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+    Some(protocol::VoiceSessionId(value.to_owned()))
+}
+
+fn emit_voice_error(
+    host_output_stream: &Stream,
+    request_stream: protocol::StreamPath,
+    session_id: protocol::VoiceSessionId,
+    error: &AppError,
+) {
+    let code = error.voice_code.unwrap_or(match error.kind {
+        AppErrorKind::InvalidInput | AppErrorKind::ProtocolViolation => {
+            protocol::VoiceErrorCode::InvalidRequest
+        }
+        AppErrorKind::NotFound => protocol::VoiceErrorCode::AgentUnavailable,
+        AppErrorKind::Conflict => protocol::VoiceErrorCode::AlreadyActive,
+        AppErrorKind::Internal => protocol::VoiceErrorCode::Internal,
+    });
+    let message = match code {
+        protocol::VoiceErrorCode::AgentUnavailable => "The voice target is unavailable.",
+        protocol::VoiceErrorCode::AlreadyActive => "A voice session is already active.",
+        protocol::VoiceErrorCode::Internal => "Voice failed inside the Tyde server.",
+        protocol::VoiceErrorCode::NotAvailable => "Voice is not available on this host.",
+        _ => "Voice signaling was rejected.",
+    };
+    let payload = protocol::VoiceErrorPayload {
+        session_id,
+        code,
+        message: message.to_owned(),
+        fatal: true,
+    };
+    if let Ok(value) = serde_json::to_value(payload) {
+        let _ = host_output_stream
+            .with_path(request_stream)
+            .send_value(FrameKind::VoiceError, value);
     }
 }
 
@@ -606,5 +668,31 @@ mod tests {
         assert_eq!(other_error.setting_target, None);
         let encoded = serde_json::to_value(&other_error).expect("serialize other command error");
         assert!(encoded.get("setting_target").is_none());
+    }
+
+    #[test]
+    fn voice_command_errors_are_typed_and_redacted_on_the_voice_stream() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let output = Stream::new(protocol::StreamPath("/host/owner".to_owned()), tx);
+        let stream = protocol::StreamPath("/voice/00000000-0000-4000-8000-000000000001".to_owned());
+        let error = AppError::invalid(
+            "voice_start",
+            "not available because credential AKIA-DO-NOT-LEAK failed",
+        )
+        .with_voice_code(protocol::VoiceErrorCode::NotAvailable);
+        emit_voice_error(
+            &output,
+            stream.clone(),
+            protocol::VoiceSessionId("00000000-0000-4000-8000-000000000001".to_owned()),
+            &error,
+        );
+        let envelope = rx.try_recv().expect("typed voice error emitted");
+        assert_eq!(envelope.stream, stream);
+        assert_eq!(envelope.kind, FrameKind::VoiceError);
+        let payload: protocol::VoiceErrorPayload =
+            envelope.parse_payload().expect("parse typed voice error");
+        assert_eq!(payload.code, protocol::VoiceErrorCode::NotAvailable);
+        assert!(payload.fatal);
+        assert!(!payload.message.contains("AKIA"));
     }
 }

@@ -48,6 +48,8 @@ pub use reconnect::{
     MqttReconnectBackoff, RECONNECT_INITIAL, RECONNECT_MAX, ReconnectBackoffError,
 };
 pub use stream::EnvelopeStream;
+#[cfg(feature = "test-support")]
+pub use stream::{ProductionBoundaryProbe, production_boundary_probe};
 pub use types::{
     BrokerAuth, BrokerEndpoint, DEFAULT_MOBILE_MQTT_BROKER_URL, LEGACY_MOBILE_QR_VERSION,
     MOBILE_MANAGED_QR_VERSION, MOBILE_QR_VERSION, MQTT_CLEAN_START, MQTT_QOS_AT_LEAST_ONCE,

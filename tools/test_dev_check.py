@@ -16,6 +16,10 @@ TOOLS_DIR = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
 TOOLCHAIN_UPDATE_LOG = "rustup update stable toolchain=unset"
 TOOLCHAIN_INSTALL_LOG = "rustup toolchain install toolchain=unset"
+# wasm-bindgen-test-runner parses WASM_BINDGEN_TEST_TIMEOUT as a Rust `u64`, so
+# that is the exact domain tools/run-wasm-tests.sh must accept and reject.
+U64_MAX = 2**64 - 1
+U64_MAX_SECONDS = str(U64_MAX)
 
 
 class TrunkCommandTests(unittest.TestCase):
@@ -1249,6 +1253,319 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertNotEqual(identity.returncode, 0)
             self.assertIn("run preparation to provision", identity.stderr)
             self.assertFalse(marker.exists())
+
+    # ── Browser-suite timeout contract ────────────────────────────────────
+    #
+    # wasm-bindgen-test-runner applies WASM_BINDGEN_TEST_TIMEOUT to a whole
+    # headless session, not to each test, and defaults it to 20 seconds. The
+    # frontend suite measured 19.25-19.58s against that default, so the stage
+    # failed roughly a third of the time with no assertion text. These tests
+    # pin the explicit default, the caller override across the runner's full
+    # `u64` domain, propagation to both wasm invocations, and the absence of any
+    # test-selection argument — because the tempting "fix" for a slow suite is
+    # to shard or skip coverage, and that is exactly what AGENTS.md forbids.
+
+    def _write_run_fixture(
+        self, root: pathlib.Path
+    ) -> tuple[pathlib.Path, dict[str, str], pathlib.Path]:
+        """Copy the real runner into a fake repo whose `cargo` records argv."""
+        tools = root / "tools"
+        binaries = root / "bin"
+        tools.mkdir(parents=True)
+        binaries.mkdir()
+        (root / "frontend").mkdir()
+        (root / "mobile-frontend").mkdir()
+        script = tools / "run-wasm-tests.sh"
+        shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+        (root / "Cargo.lock").write_text(
+            'name = "wasm-bindgen"\nversion = "0.2.118"\n', encoding="utf-8"
+        )
+
+        chrome = binaries / "chrome"
+        driver = binaries / "chromedriver"
+        runner = binaries / "wasm-bindgen-test-runner"
+        cargo = binaries / "cargo"
+        record = root / "cargo-invocations.txt"
+        chrome.write_text(
+            "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",
+            encoding="utf-8",
+        )
+        driver.write_text(
+            "#!/usr/bin/env bash\necho 'ChromeDriver 150.0.7871.115'\n",
+            encoding="utf-8",
+        )
+        runner.write_text(
+            "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
+            encoding="utf-8",
+        )
+        cargo.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            "{\n"
+            "  printf 'cwd=%s\\n' \"$(basename \"$PWD\")\"\n"
+            "  printf 'argv=%s\\n' \"$*\"\n"
+            "  printf 'WASM_BINDGEN_TEST_TIMEOUT=%s\\n' "
+            '"${WASM_BINDGEN_TEST_TIMEOUT-<unset>}"\n'
+            "  printf 'RUSTFLAGS=%s\\n' \"${RUSTFLAGS-<unset>}\"\n"
+            "  printf '=== end ===\\n'\n"
+            '} >>"$CARGO_RECORD"\n'
+            'if [[ "${CARGO_FAIL_IN:-}" == "$(basename "$PWD")" ]]; then\n'
+            "  exit 101\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        for binary in (chrome, driver, runner, cargo):
+            binary.chmod(0o755)
+
+        env = os.environ.copy()
+        for inherited in (
+            "WASM_BINDGEN_TEST_TIMEOUT",
+            "WASM_BINDGEN_TEST_WEBDRIVER_JSON",
+            "TYDE_WASM_WEBDRIVER_SOURCE_JSON",
+            "TYDE_WASM_TOOLS_PREPARED",
+            "RUSTFLAGS",
+            "CARGO_FAIL_IN",
+        ):
+            env.pop(inherited, None)
+        env.update(
+            {
+                "PATH": f"{binaries}:{env['PATH']}",
+                "CHROME": str(chrome),
+                "CHROMEDRIVER": str(driver),
+                "WASM_BINDGEN_TEST_RUNNER": str(runner),
+                "CARGO_RECORD": str(record),
+            }
+        )
+        return script, env, record
+
+    def _cargo_invocations(self, record: pathlib.Path) -> list[dict[str, str]]:
+        if not record.exists():
+            return []
+        invocations: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in record.read_text(encoding="utf-8").splitlines():
+            if line == "=== end ===":
+                invocations.append(current)
+                current = {}
+                continue
+            key, _, value = line.partition("=")
+            current[key] = value
+        return invocations
+
+    def test_canonical_run_sets_the_default_browser_suite_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            script, env, record = self._write_run_fixture(root)
+
+            run = subprocess.run(
+                [str(script)], env=env, text=True, capture_output=True, check=False
+            )
+
+            self.assertEqual(run.returncode, 0, run.stderr)
+            invocations = self._cargo_invocations(record)
+            self.assertEqual(len(invocations), 2)
+            for invocation in invocations:
+                # 120s, not the 20s the runner defaults to when nothing sets it.
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
+
+    def test_explicit_browser_suite_timeout_wins_and_invalid_values_fail(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            script, env, record = self._write_run_fixture(root)
+
+            override = dict(env, WASM_BINDGEN_TEST_TIMEOUT="45")
+            accepted = subprocess.run(
+                [str(script)],
+                env=override,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            invocations = self._cargo_invocations(record)
+            self.assertEqual(len(invocations), 2)
+            for invocation in invocations:
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "45")
+
+            # An empty value reads as unset, matching how CHROME and
+            # CHROMEDRIVER treat empty explicit overrides.
+            record.unlink()
+            empty = subprocess.run(
+                [str(script)],
+                env=dict(env, WASM_BINDGEN_TEST_TIMEOUT=""),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(empty.returncode, 0, empty.stderr)
+            self.assertEqual(
+                self._cargo_invocations(record)[0]["WASM_BINDGEN_TEST_TIMEOUT"],
+                "120",
+            )
+
+            positive = "must be a positive whole number of seconds"
+            bounded = f"must not exceed {U64_MAX_SECONDS} seconds"
+            rejections = (
+                ("0", positive),
+                ("00", positive),
+                ("abc", positive),
+                ("-5", positive),
+                ("12.5", positive),
+                ("20s", positive),
+                (" 45", positive),
+                # Past u64::MAX the runner's `.parse::<u64>()` fails, so the
+                # guard has to fail too. Bash arithmetic wraps these to
+                # positive values, which is what HIGH-1 caught.
+                (str(U64_MAX + 1), bounded),
+                ("99999999999999999999", bounded),
+                ("184467440737095516150", bounded),
+                ("0" * 8 + str(U64_MAX + 1), bounded),
+            )
+            for invalid, expected in rejections:
+                with self.subTest(timeout=invalid):
+                    record.unlink(missing_ok=True)
+                    rejected = subprocess.run(
+                        [str(script)],
+                        env=dict(env, WASM_BINDGEN_TEST_TIMEOUT=invalid),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn(
+                        f"WASM_BINDGEN_TEST_TIMEOUT {expected}", rejected.stderr
+                    )
+                    # Fails before any browser or Cargo work, not as a
+                    # `.parse().expect()` panic once Chrome is already up.
+                    self.assertEqual(self._cargo_invocations(record), [])
+
+    def test_browser_suite_timeout_accepts_the_runner_u64_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            script, env, record = self._write_run_fixture(root)
+
+            # Everything the pinned runner can parse must survive the guard,
+            # including the exact u64::MAX boundary and leading-zero forms. The
+            # caller's string is forwarded verbatim; the runner normalises it.
+            for accepted in (
+                "1",
+                "20",
+                "007",
+                "4294967296",
+                str(U64_MAX - 1),
+                U64_MAX_SECONDS,
+            ):
+                with self.subTest(timeout=accepted):
+                    record.unlink(missing_ok=True)
+                    run = subprocess.run(
+                        [str(script)],
+                        env=dict(env, WASM_BINDGEN_TEST_TIMEOUT=accepted),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    invocations = self._cargo_invocations(record)
+                    self.assertEqual(len(invocations), 2)
+                    for invocation in invocations:
+                        self.assertEqual(
+                            invocation["WASM_BINDGEN_TEST_TIMEOUT"], accepted
+                        )
+
+    def test_browser_suite_timeout_propagates_to_both_wasm_invocations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            script, env, record = self._write_run_fixture(root)
+
+            run = subprocess.run(
+                [str(script)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+
+            invocations = self._cargo_invocations(record)
+            self.assertEqual(
+                [invocation["cwd"] for invocation in invocations],
+                ["frontend", "mobile-frontend"],
+            )
+            for invocation in invocations:
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
+                self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=0")
+
+            # Same override idiom as RUSTFLAGS: an explicit value reaches both.
+            record.unlink()
+            tuned = subprocess.run(
+                [str(script)],
+                env=dict(
+                    env, WASM_BINDGEN_TEST_TIMEOUT="90", RUSTFLAGS="-C debuginfo=2"
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(tuned.returncode, 0, tuned.stderr)
+            for invocation in self._cargo_invocations(record):
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "90")
+                self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=2")
+
+            # A failed frontend suite must not be followed by a mobile run that
+            # could mask it in the stage output.
+            record.unlink()
+            halted = subprocess.run(
+                [str(script)],
+                env=dict(env, CARGO_FAIL_IN="frontend"),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(halted.returncode, 0)
+            self.assertEqual(
+                [
+                    invocation["cwd"]
+                    for invocation in self._cargo_invocations(record)
+                ],
+                ["frontend"],
+            )
+
+    def test_canonical_run_adds_no_filter_skip_or_shard_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            script, env, record = self._write_run_fixture(root)
+
+            run = subprocess.run(
+                [str(script)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+
+            invocations = self._cargo_invocations(record)
+            # Exactly two invocations, neither carrying a filter, a --skip, or
+            # any other test-selection argument. Sharding the suite to fit a
+            # timeout would silently drop whatever falls outside the partition.
+            self.assertEqual(len(invocations), 2)
+            for invocation in invocations:
+                self.assertEqual(
+                    invocation["argv"], "test --target wasm32-unknown-unknown"
+                )
+
+            # Explicit developer filters still pass through unchanged.
+            record.unlink()
+            filtered = subprocess.run(
+                [str(script), "components::chat_view"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(filtered.returncode, 0, filtered.stderr)
+            for invocation in self._cargo_invocations(record):
+                self.assertEqual(
+                    invocation["argv"],
+                    "test --target wasm32-unknown-unknown components::chat_view",
+                )
 
 
 class RustToolchainParityTests(unittest.TestCase):

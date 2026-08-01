@@ -1696,3 +1696,123 @@ mod web_content_recovery_tests {
         assert_eq!(policies.for_label("auth").generation, 0);
     }
 }
+
+/// Packaging guards for microphone access.
+///
+/// macOS gates audio input twice, and both gates are configuration rather than
+/// code: TCC needs `NSMicrophoneUsageDescription` in the bundle `Info.plist`,
+/// and the hardened runtime (which `build.sh` enables with
+/// `codesign --options runtime`) needs `com.apple.security.device.audio-input`.
+///
+/// Getting either wrong produces a shipped build with a microphone button that
+/// cannot open a microphone — a failure that otherwise only shows up on a
+/// signed artefact, long after CI is green. These assertions turn that into a
+/// `cargo nextest` failure instead. They check content, not just presence,
+/// because an empty usage string is as fatal as a missing one.
+#[cfg(test)]
+mod voice_packaging_tests {
+    use std::path::PathBuf;
+
+    fn shell_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read(name: &str) -> String {
+        let path = shell_dir().join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must ship with the shell: {error}", path.display()))
+    }
+
+    #[test]
+    fn bundle_info_plist_declares_a_microphone_usage_string() {
+        let plist = read("Info.plist");
+        assert!(
+            plist.contains("<key>NSMicrophoneUsageDescription</key>"),
+            "macOS denies audio input to a bundle with no usage description"
+        );
+        let description = plist
+            .split("<key>NSMicrophoneUsageDescription</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("<string>").nth(1))
+            .and_then(|rest| rest.split("</string>").next())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        assert!(
+            description.len() > 20,
+            "the microphone usage string is shown to the user in the system prompt \
+             and must explain what the microphone is for, got {description:?}"
+        );
+    }
+
+    /// The bundler applies `bundle.macOS.entitlements`, and then the release
+    /// script re-signs the finished app with `--force`. A `--force` re-sign
+    /// replaces the signature wholesale, so entitlements the bundler applied
+    /// are dropped unless the same `--entitlements` is passed again — and
+    /// under the hardened runtime (`--options runtime`) a process with no
+    /// `com.apple.security.device.audio-input` cannot open a microphone.
+    ///
+    /// The failure this guards against is invisible until someone installs a
+    /// signed build and finds the microphone button does nothing, which is why
+    /// it is asserted here rather than left to release-time inspection.
+    ///
+    /// `build.sh` is a root file owned by the server/protocol writer per
+    /// `decisions.md`; this test only reads it.
+    #[test]
+    fn the_release_signer_preserves_the_microphone_entitlement() {
+        let build_sh = shell_dir().join("../../build.sh");
+        let Ok(script) = std::fs::read_to_string(&build_sh) else {
+            // Not a checkout that ships the release script; nothing to assert.
+            return;
+        };
+        let Some(signer) = script
+            .split("sign_and_notarize() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+        else {
+            panic!("build.sh no longer defines sign_and_notarize; re-point this guard");
+        };
+        let Some(codesign) = signer
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("codesign") && line.contains("--sign"))
+        else {
+            panic!("sign_and_notarize no longer signs; re-point this guard");
+        };
+        if !codesign.contains("--options runtime") {
+            // No hardened runtime means no entitlement requirement.
+            return;
+        }
+        assert!(
+            codesign.contains("--entitlements"),
+            "build.sh re-signs the bundle with the hardened runtime and no \
+             --entitlements, which strips com.apple.security.device.audio-input \
+             and leaves a shipped build whose microphone cannot open. Pass \
+             --entitlements frontend/tauri-shell/Entitlements.plist in \
+             sign_and_notarize. Owner: server/protocol writer (decisions.md). \
+             Offending command: {codesign}"
+        );
+    }
+
+    #[test]
+    fn entitlements_grant_audio_input_and_are_referenced_by_the_bundle_config() {
+        let entitlements = read("Entitlements.plist");
+        assert!(
+            entitlements.contains("<key>com.apple.security.device.audio-input</key>"),
+            "the hardened runtime blocks audio input without this entitlement"
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_str(&read("tauri.conf.json")).expect("tauri.conf.json parses");
+        let referenced = config
+            .get("bundle")
+            .and_then(|bundle| bundle.get("macOS"))
+            .and_then(|macos| macos.get("entitlements"))
+            .and_then(|value| value.as_str());
+        assert_eq!(
+            referenced,
+            Some("Entitlements.plist"),
+            "an entitlements file the bundler never reads grants nothing"
+        );
+    }
+}

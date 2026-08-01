@@ -29,6 +29,10 @@ const serviceConfigJs = readFileSync(
   fileURLToPath(new URL("../mobile-service-config.js", import.meta.url)),
   "utf8",
 );
+const cloudfrontSetup = readFileSync(
+  fileURLToPath(new URL("../../deploy/cloudfront-setup.md", import.meta.url)),
+  "utf8",
+);
 
 test("index.html has BOTH a loader shell and a distinct app mount target", () => {
   assert.match(html, /id="loader-shell"/, "expected the loader chrome container");
@@ -119,4 +123,14 @@ test("CSP permits the external config without inline script or cross-origin conn
   assert.match(csp[1], /script-src 'self' 'wasm-unsafe-eval'/);
   assert.doesNotMatch(csp[1], /script-src[^;]*'unsafe-inline'/);
   assert.match(csp[1], /connect-src 'self' wss:/);
+  assert.match(csp[1], /webrtc 'allow'/);
+  const deployed = cloudfrontSetup.match(
+    /"ContentSecurityPolicy": "([^"]+frame-ancestors 'none')"/,
+  );
+  assert.ok(deployed, "expected deployed CloudFront CSP");
+  assert.equal(deployed[1], `${csp[1]}; frame-ancestors 'none'`);
+  assert.match(
+    cloudfrontSetup,
+    /"Value": "microphone=\(self\), camera=\(self\)"/,
+  );
 });

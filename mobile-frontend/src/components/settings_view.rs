@@ -6,6 +6,7 @@ use crate::bridge;
 use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::host_browser::HostBrowser;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, ConfirmModal, EmptyState};
+use crate::send::send_frame;
 use crate::state::{AppState, PairedHostSummary, ToolOutputMode};
 
 const STORAGE_TOOL_OUTPUT_MODE: &str = "tyde-mobile-tool-output-mode";
@@ -168,6 +169,8 @@ pub fn SettingsView() -> impl IntoView {
                     }}
                 </div>
 
+                <VoiceSettingsSection />
+
                 <div class="settings-section">
                     <h2 class="settings-section-title">"Backend Setup"</h2>
                     {let state = state.clone(); move || {
@@ -249,6 +252,169 @@ pub fn SettingsView() -> impl IntoView {
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+    }
+}
+
+fn voice_availability_description(availability: protocol::VoiceAvailability) -> &'static str {
+    match availability {
+        protocol::VoiceAvailability::Available {
+            direct_connections_only: true,
+        } => "Available over a direct same-LAN or VPN route.",
+        protocol::VoiceAvailability::Available {
+            direct_connections_only: false,
+        } => "Available. This mobile client still uses a direct media route.",
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::NotEnabled,
+        } => "Unavailable until voice is enabled.",
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+        } => "Unavailable until an AWS region is configured.",
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::ServerAdapterUnavailable,
+        } => "Unavailable in this host build.",
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::NoReachableCandidate,
+        } => "Unavailable because no direct same-LAN or VPN route was found.",
+    }
+}
+
+fn send_voice_setting(state: &AppState, setting: protocol::HostSettingValue) {
+    let Some(host) = state.active_local_host_id.get_untracked() else {
+        return;
+    };
+    let Some(stream) = state
+        .host_streams
+        .with_untracked(|streams| streams.get(&host).cloned())
+    else {
+        return;
+    };
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host,
+            stream,
+            protocol::FrameKind::SetSetting,
+            &protocol::SetSettingPayload { setting },
+        )
+        .await
+        {
+            log::warn!("voice setting could not be sent: {error}");
+        }
+    });
+}
+
+#[component]
+fn VoiceSettingsSection() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let enabled_state = state.clone();
+    let enabled_disabled_state = state.clone();
+    let region_state = state.clone();
+    let region_disabled_state = state.clone();
+    let profile_state = state.clone();
+    let profile_disabled_state = state.clone();
+    let availability_state = state.clone();
+    let toggle_state = state.clone();
+    let commit_region_state = state.clone();
+    let commit_profile_state = state.clone();
+
+    view! {
+        <div class="settings-section" data-mobile-test="settings-voice">
+            <h2 class="settings-section-title">"Voice"</h2>
+            <div class="settings-info">
+                <div class="settings-row">
+                    <span class="settings-label">"Enable voice"</span>
+                    <label class="settings-toggle">
+                        <input
+                            type="checkbox"
+                            aria-label="Enable voice"
+                            data-mobile-test="settings-voice-enabled"
+                            prop:checked=move || {
+                                enabled_state
+                                    .active_host_settings()
+                                    .is_some_and(|settings| settings.voice.enabled)
+                            }
+                            disabled=move || enabled_disabled_state.active_host_settings().is_none()
+                            on:change=move |event| {
+                                let target: web_sys::HtmlInputElement = event_target(&event);
+                                let enabled = target.checked();
+                                send_voice_setting(
+                                    &toggle_state,
+                                    protocol::HostSettingValue::VoiceEnabled { enabled },
+                                );
+                            }
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
+                </div>
+                <label class="settings-voice-field">
+                    <span class="settings-label">"AWS region"</span>
+                    <input
+                        type="text"
+                        class="settings-text-input"
+                        placeholder="us-east-1"
+                        autocomplete="off"
+                        data-mobile-test="settings-voice-region"
+                        prop:value=move || {
+                            region_state
+                                .active_host_settings()
+                                .and_then(|settings| settings.voice.aws_region)
+                                .unwrap_or_default()
+                        }
+                        disabled=move || region_disabled_state.active_host_settings().is_none()
+                        on:change=move |event| {
+                            let value = event_target_value(&event);
+                            let region = (!value.trim().is_empty())
+                                .then(|| value.trim().to_owned());
+                            send_voice_setting(
+                                &commit_region_state,
+                                protocol::HostSettingValue::VoiceAwsRegion { region },
+                            );
+                        }
+                    />
+                </label>
+                <p class="settings-hint">
+                    "The host uses this region for Nova. No AWS credential is sent by the app."
+                </p>
+                <label class="settings-voice-field">
+                    <span class="settings-label">"AWS profile"</span>
+                    <input
+                        type="text"
+                        class="settings-text-input"
+                        placeholder="default"
+                        autocomplete="off"
+                        data-mobile-test="settings-voice-profile"
+                        prop:value=move || {
+                            profile_state
+                                .active_host_settings()
+                                .and_then(|settings| settings.voice.aws_profile)
+                                .unwrap_or_default()
+                        }
+                        disabled=move || profile_disabled_state.active_host_settings().is_none()
+                        on:change=move |event| {
+                            let value = event_target_value(&event);
+                            let profile = (!value.trim().is_empty())
+                                .then(|| value.trim().to_owned());
+                            send_voice_setting(
+                                &commit_profile_state,
+                                protocol::HostSettingValue::VoiceAwsProfile { profile },
+                            );
+                        }
+                    />
+                </label>
+                <p class="settings-hint">
+                    "This names a profile in the host’s AWS configuration; it is not an access key."
+                </p>
+                <p class="settings-voice-availability" role="status" data-mobile-test="settings-voice-availability">
+                    {move || {
+                        availability_state
+                            .active_host_settings()
+                            .map(|settings| {
+                                voice_availability_description(settings.voice.availability)
+                            })
+                            .unwrap_or("Connect to a host to configure voice.")
+                    }}
+                </p>
             </div>
         </div>
     }
@@ -729,9 +895,23 @@ mod wasm_tests {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
         let container = make_container();
+        let capture = crate::bridge::test_capture_sends();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.host_streams.update(|streams| {
+                streams.insert(
+                    host_for_mount.clone(),
+                    protocol::StreamPath("/host/host-1".to_owned()),
+                );
+            });
+            let mut host_settings = protocol::HostSettings::default();
+            host_settings.voice.availability = protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+            };
+            state.host_settings_by_host.update(|settings| {
+                settings.insert(host_for_mount.clone(), host_settings);
+            });
             // MCP server (http transport).
             let mut mcp = HashMap::new();
             mcp.insert(
@@ -833,6 +1013,63 @@ mod wasm_tests {
             text.contains("Code review"),
             "Skill display title must render"
         );
+
+        let availability = container
+            .query_selector("[data-mobile-test='settings-voice-availability']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            availability.text_content().as_deref(),
+            Some("Unavailable until an AWS region is configured.")
+        );
+
+        let enabled = container
+            .query_selector("[data-mobile-test='settings-voice-enabled']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        enabled.set_checked(true);
+        enabled
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        let region = container
+            .query_selector("[data-mobile-test='settings-voice-region']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        region.set_value(" us-west-2 ");
+        region
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        let lines = crate::bridge::test_sent_lines();
+        assert_eq!(lines.len(), 2);
+        let first: protocol::Envelope = serde_json::from_str(&lines[0]).unwrap();
+        let second: protocol::Envelope = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first.kind, protocol::FrameKind::SetSetting);
+        assert_eq!(second.kind, protocol::FrameKind::SetSetting);
+        assert_eq!(
+            first
+                .parse_payload::<protocol::SetSettingPayload>()
+                .unwrap()
+                .setting,
+            protocol::HostSettingValue::VoiceEnabled { enabled: true }
+        );
+        assert_eq!(
+            second
+                .parse_payload::<protocol::SetSettingPayload>()
+                .unwrap()
+                .setting,
+            protocol::HostSettingValue::VoiceAwsRegion {
+                region: Some("us-west-2".to_owned()),
+            }
+        );
+        drop(capture);
     }
 
     /// Empty state for MCP / Steering / Skills must show distinct

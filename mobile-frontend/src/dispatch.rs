@@ -25,7 +25,9 @@ use protocol::{
     StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
     TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
     TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload,
+    TeamPresetCatalogNotifyPayload, VoiceAnswerPayload, VoiceErrorPayload,
+    VoiceIceCandidatePayload, VoiceIceCandidatesCompletePayload, VoiceReadyPayload,
+    VoiceStatePayload,
 };
 
 use crate::bridge;
@@ -126,6 +128,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -261,6 +264,44 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 envelope.seq,
                 error
             ),
+        },
+        FrameKind::VoiceReady => match envelope.parse_payload::<VoiceReadyPayload>() {
+            Ok(payload) => state.voice.apply_ready(host, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse VoiceReady host={host}: {error}"),
+        },
+        FrameKind::VoiceAnswer => match envelope.parse_payload::<VoiceAnswerPayload>() {
+            Ok(payload) => state.voice.apply_answer(host, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse VoiceAnswer host={host}: {error}"),
+        },
+        FrameKind::VoiceIceCandidate => {
+            match envelope.parse_payload::<VoiceIceCandidatePayload>() {
+                Ok(payload) => state
+                    .voice
+                    .apply_remote_ice(host, &envelope.stream, payload),
+                Err(error) => {
+                    log::error!("failed to parse VoiceIceCandidate host={host}: {error}")
+                }
+            }
+        }
+        FrameKind::VoiceIceCandidatesComplete => {
+            match envelope.parse_payload::<VoiceIceCandidatesCompletePayload>() {
+                Ok(payload) => {
+                    state
+                        .voice
+                        .apply_remote_ice_complete(host, &envelope.stream, payload);
+                }
+                Err(error) => {
+                    log::error!("failed to parse VoiceIceCandidatesComplete host={host}: {error}");
+                }
+            }
+        }
+        FrameKind::VoiceState => match envelope.parse_payload::<VoiceStatePayload>() {
+            Ok(payload) => state.voice.apply_state(host, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse VoiceState host={host}: {error}"),
+        },
+        FrameKind::VoiceError => match envelope.parse_payload::<VoiceErrorPayload>() {
+            Ok(payload) => state.voice.apply_error(host, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse VoiceError host={host}: {error}"),
         },
         FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
             Ok(payload) => apply_agent_bootstrap(state, host, &envelope.stream, payload),
@@ -5024,6 +5065,7 @@ mod wasm_tests {
                 backend_config: std::collections::HashMap::new(),
                 launch_profiles: Vec::new(),
                 hermes_disabled_providers: Default::default(),
+                voice: Default::default(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,

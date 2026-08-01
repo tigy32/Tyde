@@ -293,6 +293,10 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64, viewport_width: f64) -> 
 pub fn ChatView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let more_open: RwSignal<bool> = RwSignal::new(false);
+    let voice_controller = state.voice.clone();
+    let voice_state = state.clone();
+    let voice_enabled_state = state.clone();
+    let voice_reason_state = state.clone();
 
     let s_back = state.clone();
     let on_back = move |_| {
@@ -685,6 +689,10 @@ pub fn ChatView() -> impl IntoView {
                             </div>
                         }.into_any()
                     } else {
+                        let voice_controller = voice_controller.clone();
+                        let voice_state = voice_state.clone();
+                        let voice_enabled_state = voice_enabled_state.clone();
+                        let voice_reason_state = voice_reason_state.clone();
                         view! {
                             <button
                                 type="button"
@@ -707,6 +715,62 @@ pub fn ChatView() -> impl IntoView {
                                 })}
                             </div>
                             <div class="chat-header-actions">
+                                <div class="chat-voice-entry">
+                                    <button
+                                        type="button"
+                                        class="chat-voice-button"
+                                        aria-label="Start hands-free voice"
+                                        aria-describedby="chat-voice-availability"
+                                        data-mobile-test="chat-voice"
+                                        disabled=move || {
+                                            voice_enabled_state
+                                                .host_settings_by_host
+                                                .with(|_| ());
+                                            voice_enabled_state.connection_statuses.with(|_| ());
+                                            voice_enabled_state.active_agent.get().is_none()
+                                                || !matches!(
+                                                    voice_enabled_state.voice.model().get(),
+                                                    crate::voice::VoiceModel::Idle
+                                                )
+                                                || !matches!(
+                                                    crate::voice::VoiceController::entry_availability_for_active_agent(
+                                                        &voice_enabled_state,
+                                                    ),
+                                                    crate::voice::VoiceEntryAvailability::Available
+                                                )
+                                        }
+                                        on:click=move |_| {
+                                            voice_controller.start_for_active_agent(&voice_state);
+                                        }
+                                    >
+                                        <span aria-hidden="true">"●"</span>
+                                        <span class="chat-voice-label">"Voice"</span>
+                                    </button>
+                                    {move || {
+                                        voice_reason_state.host_settings_by_host.with(|_| ());
+                                        voice_reason_state.connection_statuses.with(|_| ());
+                                        match crate::voice::VoiceController::entry_availability_for_active_agent(
+                                            &voice_reason_state,
+                                        ) {
+                                            crate::voice::VoiceEntryAvailability::Available => {
+                                                ().into_any()
+                                            }
+                                            crate::voice::VoiceEntryAvailability::Unavailable(reason)
+                                                if voice_reason_state.active_agent.get().is_some() =>
+                                            {
+                                                view! {
+                                                    <span
+                                                        id="chat-voice-availability"
+                                                        class="chat-voice-unavailable"
+                                                        data-mobile-test="chat-voice-unavailable"
+                                                    >{reason}</span>
+                                                }
+                                                .into_any()
+                                            }
+                                            _ => ().into_any(),
+                                        }
+                                    }}
+                                </div>
                                 {move || {
                                     if is_turn_active() {
                                         view! {

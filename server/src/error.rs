@@ -21,6 +21,7 @@ pub(crate) struct AppError {
     pub message: String,
     pub fatal: bool,
     pub source: Option<AnyhowError>,
+    pub voice_code: Option<protocol::VoiceErrorCode>,
 }
 
 impl AppError {
@@ -52,6 +53,7 @@ impl AppError {
             message: source.to_string(),
             fatal: false,
             source: Some(source),
+            voice_code: None,
         }
     }
 
@@ -69,6 +71,11 @@ impl AppError {
 
     pub fn with_source(mut self, source: impl Into<AnyhowError>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_voice_code(mut self, code: protocol::VoiceErrorCode) -> Self {
+        self.voice_code = Some(code);
         self
     }
 
@@ -111,6 +118,7 @@ impl AppError {
             message: message.into(),
             fatal,
             source: None,
+            voice_code: None,
         }
     }
 }

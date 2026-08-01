@@ -171,4 +171,14 @@ pub use types::{
 pub use types::{
     ACP_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_KIRO_BACKEND, LOCAL_HOST_ID, TydeReleaseVersion,
 };
+pub use types::{
+    MAX_VOICE_ICE_CANDIDATE_BYTES, MAX_VOICE_ICE_CANDIDATES, MAX_VOICE_SDP_BYTES,
+    MAX_VOICE_TOOL_MESSAGE_BYTES, VOICE_SESSION_MAX_SECONDS, VoiceAgentProgress,
+    VoiceAgentProgressKind, VoiceAnswerPayload, VoiceAudioCodec, VoiceAvailability,
+    VoiceClientCapabilities, VoiceErrorCode, VoiceErrorPayload, VoiceIceCandidate,
+    VoiceIceCandidatePayload, VoiceIceCandidatesCompletePayload, VoiceOfferPayload,
+    VoiceReadyPayload, VoiceSessionId, VoiceSessionState, VoiceSettings, VoiceStartPayload,
+    VoiceStatePayload, VoiceStopPayload, VoiceStopReason, VoiceTarget, VoiceTranscript,
+    VoiceTranscriptSpeaker, VoiceUnavailableReason,
+};
 pub use validator::{ObservedFrame, ProtocolValidator, ProtocolViolation};

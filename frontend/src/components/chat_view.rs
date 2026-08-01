@@ -16,6 +16,7 @@ use crate::components::inflight_tray::InflightTray;
 use crate::components::orchestration_view::OrchestrationView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
+use crate::components::voice_layer::VoiceStrip;
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AppState, ChatRowContent, ChatRowHandle, ChatRowId,
@@ -1091,6 +1092,12 @@ pub fn ChatView(
             // flight, and is deliberately independent of the tool-output
             // mode — live operational state is not transcript history.
             <InflightTray agent_ref=agent_ref />
+            // The voice strip sits in the same band as the in-flight tray:
+            // live operational state, not transcript history. It renders only
+            // for the chat a session is bound to, so a split shows at most one.
+            // The transcript above and the composer below stay mounted and
+            // usable for the whole session.
+            <VoiceStrip agent_ref=agent_ref />
             // Every visible chat mounts its own composer. A chat beside another
             // chat is directly repliable; neither pane has to be focused first,
             // and neither pane's draft, backend choice, or session settings can
@@ -1100,6 +1107,7 @@ pub fn ChatView(
                     agent_ref=agent_ref
                     pending_team_member=composer_pending_team_member
                     composer=composer.clone()
+                    tab_id=tab_id
                 />
             </Show>
             </div>

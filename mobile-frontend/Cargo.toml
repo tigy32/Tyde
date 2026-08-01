@@ -35,6 +35,7 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "History",
     "HtmlCanvasElement",
+    "HtmlAudioElement",
     "HtmlDetailsElement",
     "HtmlDivElement",
     "HtmlElement",
@@ -50,8 +51,20 @@ web-sys = { version = "0.3", features = [
     "MediaStream",
     "MediaStreamTrack",
     "MediaStreamConstraints",
+    "MediaTrackConstraints",
+    "MediaTrackSettings",
     "MediaDevices",
     "Navigator",
+    "RtcConfiguration",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcPeerConnection",
+    "RtcPeerConnectionIceEvent",
+    "RtcPeerConnectionState",
+    "RtcRtpSender",
+    "RtcSdpType",
+    "RtcSessionDescriptionInit",
+    "RtcTrackEvent",
     "Node",
     "NodeList",
     "Storage",
@@ -85,6 +98,7 @@ log = "0.4"
 console_log = "1"
 console_error_panic_hook = "0.1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+send_wrapper = "0.6"
 
 # Native (compile-gate only) timers come from tokio::time; the wasm bundle uses
 # wasmtimer because tokio's `time` driver does not run on wasm32.

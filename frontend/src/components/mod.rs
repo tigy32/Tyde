@@ -37,6 +37,7 @@ pub mod task_list;
 pub mod teams_panel;
 pub mod terminal_view;
 pub mod tool_card;
+pub mod voice_layer;
 pub mod workbench;
 pub mod workflow_view;
 pub mod workflows_panel;

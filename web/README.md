@@ -100,11 +100,13 @@ loader into running attacker code or a known-bad client. Defenses, in order:
    directive: no third-party JS, but the Leptos/Trunk bundle's
    `WebAssembly.instantiate` is allowed (we do NOT grant general
    `'unsafe-eval'`). Plus `object-src 'none'`, `base-uri 'none'`,
-   `default-src 'self'`, and a narrow `connect-src 'self' wss:` (the app reaches
+   `default-src 'self'`, an explicit `webrtc 'allow'`, and a narrow `connect-src 'self' wss:` (the app reaches
    the broker over wss and fetches same-origin; `https:` is intentionally
    omitted). Set via `<meta>` for local use; **Phase 6 must also send it (and
    `frame-ancestors 'none'`, which `<meta>` ignores) as an HTTP response
-   header.**
+   header.** The production response policy also sends
+   `Permissions-Policy: microphone=(self), camera=(self)`; camera remains for
+   QR pairing while microphone is restricted to the Tyde origin.
 
 This is the loader hardening the design doc calls "load-bearing" for the PSK
 storage threat model: the at-rest non-extractable `CryptoKey` is **not**

@@ -2079,7 +2079,198 @@ fn GeneralTab() -> impl IntoView {
         </div>
 
         <BackgroundAgentFeaturesSection />
+        <VoiceSettingsSection />
         <CodeIntelSettingsSection />
+    }
+}
+
+/// One labelled free-text host setting, committed on change.
+///
+/// Shared by both voice text fields so the tab adds a single monomorphised
+/// view type rather than one per field — the frontend's wasm test binary runs
+/// the whole suite in one browser instance and settings-panel additions are
+/// the usual cause of exhausting it.
+#[component]
+fn VoiceTextField(
+    label: &'static str,
+    description: &'static str,
+    placeholder: &'static str,
+    value: Signal<String>,
+    disabled: Signal<bool>,
+    on_commit: Callback<String>,
+) -> impl IntoView {
+    let on_change = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        on_commit.run(input.value());
+    };
+    view! {
+        <div class="settings-field">
+            <label class="settings-label">{label}</label>
+            <p class="settings-description">{description}</p>
+            <input
+                class="settings-input"
+                type="text"
+                placeholder=placeholder
+                prop:value=move || value.get()
+                disabled=move || disabled.get()
+                aria-label=label
+                on:change=on_change
+            />
+        </div>
+    }
+}
+
+/// The host reports `RegionNotConfigured` whenever the stored region is absent
+/// or blank; it does **not** fall back to the region in its environment or
+/// profile. The copy has to say so, or users leave it empty and see an
+/// unavailable host with no explanation they can act on.
+const VOICE_REGION_DESCRIPTION: &str = "Required. Which region the host should \
+    use for the speech model. The host reports voice unavailable until this is \
+    set — it does not fall back to the region in its environment or profile.";
+
+/// Render the host's own voice verdict.
+///
+/// Pure so it can be tested without mounting: the settings panel sits close to
+/// the wasm test instance's memory ceiling and a full mount here has OOM'd
+/// before, so coverage of this text lives in a plain unit test rather than a
+/// rendered one.
+fn voice_availability_text(availability: &protocol::VoiceAvailability) -> String {
+    match availability {
+        protocol::VoiceAvailability::Available {
+            direct_connections_only,
+        } => {
+            if *direct_connections_only {
+                "This host reports voice is available over a direct network route.".to_owned()
+            } else {
+                "This host reports voice is available.".to_owned()
+            }
+        }
+        protocol::VoiceAvailability::Unavailable { reason } => format!(
+            "Voice is unavailable on this host: {}",
+            match reason {
+                protocol::VoiceUnavailableReason::NotEnabled => "it is turned off",
+                protocol::VoiceUnavailableReason::RegionNotConfigured =>
+                    "no AWS region is configured",
+                protocol::VoiceUnavailableReason::ServerAdapterUnavailable =>
+                    "the host cannot reach the voice provider",
+                protocol::VoiceUnavailableReason::NoReachableCandidate =>
+                    "there is no direct network route for audio",
+            }
+        ),
+    }
+}
+
+/// Normalise a free-text voice setting: blank means "unset", not "empty
+/// string". A stored empty region would read as configured to the client while
+/// the host treats it as missing.
+fn voice_text_setting(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Host-scoped voice settings.
+///
+/// These are the only voice knobs the client owns. Notably absent: anything
+/// that accepts an AWS access key. Credentials are resolved by the host from
+/// its own provider chain; the client names a *profile* and a *region* and
+/// never transports a secret. `HostSettings.voice.availability` is likewise
+/// server-declared and read-only here — the client reports what the host says
+/// rather than inferring readiness from these fields being filled in.
+#[component]
+fn VoiceSettingsSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let settings_state = state.clone();
+    let settings = Memo::new(move |_| settings_state.selected_host_settings());
+
+    let disabled = Signal::derive(move || settings.get().is_none());
+
+    let enabled = Signal::derive(move || {
+        settings
+            .get()
+            .map(|settings| settings.voice.enabled)
+            .unwrap_or(false)
+    });
+    let region = Signal::derive(move || {
+        settings
+            .get()
+            .and_then(|settings| settings.voice.aws_region)
+            .unwrap_or_default()
+    });
+    let profile = Signal::derive(move || {
+        settings
+            .get()
+            .and_then(|settings| settings.voice.aws_profile)
+            .unwrap_or_default()
+    });
+
+    // The host's own verdict, shown verbatim. This is what the composer's
+    // microphone control is gated on, so surfacing it here is what makes an
+    // unavailable host explicable instead of merely disabled.
+    let availability = Memo::new(move |_| {
+        settings
+            .get()
+            .map(|settings| voice_availability_text(&settings.voice.availability))
+    });
+
+    let toggle_state = state.clone();
+    let on_toggle = Callback::new(move |enabled: bool| {
+        send_host_setting(&toggle_state, HostSettingValue::VoiceEnabled { enabled });
+    });
+
+    let region_state = state.clone();
+    let on_region = Callback::new(move |raw: String| {
+        send_host_setting(
+            &region_state,
+            HostSettingValue::VoiceAwsRegion {
+                region: voice_text_setting(&raw),
+            },
+        );
+    });
+
+    let profile_state = state.clone();
+    let on_profile = Callback::new(move |raw: String| {
+        send_host_setting(
+            &profile_state,
+            HostSettingValue::VoiceAwsProfile {
+                profile: voice_text_setting(&raw),
+            },
+        );
+    });
+
+    view! {
+        <h3 class="settings-section-title">"Voice"</h3>
+
+        <SupervisorToggleField
+            label="Enable voice"
+            description="Lets you talk to an agent instead of typing. Audio runs between this app and the host you select; the host uses its own AWS credentials to reach the speech model. No credential is ever sent from here. Off by default."
+            checked=enabled
+            disabled=disabled
+            on_toggle=on_toggle
+        />
+
+        <VoiceTextField
+            label="AWS region"
+            description=VOICE_REGION_DESCRIPTION
+            placeholder="us-east-1"
+            value=region
+            disabled=disabled
+            on_commit=on_region
+        />
+
+        <VoiceTextField
+            label="AWS profile"
+            description="Named profile from the host's own AWS configuration. Leave blank to use its default credential chain. This names a profile — it is not a credential, and no key is transmitted."
+            placeholder="default"
+            value=profile
+            disabled=disabled
+            on_commit=on_profile
+        />
+
+        <p class="settings-description" data-test="voice-availability">
+            {move || availability.get()}
+        </p>
     }
 }
 
@@ -8381,6 +8572,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 protocol::HostSettings {
+                    voice: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: enabled,
@@ -9639,6 +9831,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 protocol::HostSettings {
+                    voice: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: false,
@@ -10276,6 +10469,7 @@ mod wasm_tests {
         enabled_backends: Vec<BackendKind>,
     ) -> protocol::HostSettings {
         protocol::HostSettings {
+            voice: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             enable_mobile_connections: false,
@@ -11121,6 +11315,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 protocol::HostSettings {
+                    voice: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
                     enable_mobile_connections: false,
@@ -11766,6 +11961,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 protocol::HostSettings {
+                    voice: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,
@@ -14579,6 +14775,128 @@ mod wasm_tests {
             anthropic_tab.get_attribute("aria-selected").as_deref(),
             Some("true"),
             "the module tab is still marked selected after the snapshot"
+        );
+    }
+}
+
+/// Voice settings coverage.
+///
+/// Deliberately unmounted. The settings panel is close to the wasm test
+/// instance's memory ceiling and a full mount here has OOM'd before, so the
+/// behaviour worth pinning — what gets sent, and what the user is told about
+/// the host's verdict — is extracted into pure functions and tested directly.
+#[cfg(test)]
+mod voice_settings_tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_region_or_profile_is_unset_rather_than_an_empty_string() {
+        assert_eq!(
+            voice_text_setting("  us-east-1 "),
+            Some("us-east-1".to_owned())
+        );
+        assert_eq!(voice_text_setting(""), None);
+        assert_eq!(
+            voice_text_setting("   "),
+            None,
+            "whitespace must clear the setting; the host treats a blank region \
+             as missing, so storing one would read as configured here while \
+             voice stayed unavailable there"
+        );
+    }
+
+    #[test]
+    fn the_typed_settings_carry_no_credential_material() {
+        // The client names a profile and a region. Credentials are resolved by
+        // the host from its own chain, and there is deliberately no variant
+        // here that could carry a key.
+        let frames = [
+            HostSettingValue::VoiceEnabled { enabled: true },
+            HostSettingValue::VoiceAwsRegion {
+                region: voice_text_setting("eu-west-2"),
+            },
+            HostSettingValue::VoiceAwsProfile {
+                profile: voice_text_setting("work"),
+            },
+        ];
+        for frame in &frames {
+            let encoded = serde_json::to_string(frame).expect("settings serialize");
+            for banned in [
+                "access_key",
+                "accessKeyId",
+                "secret",
+                "session_token",
+                "aws_secret",
+            ] {
+                assert!(
+                    !encoded.to_lowercase().contains(&banned.to_lowercase()),
+                    "a voice setting must never carry {banned}: {encoded}"
+                );
+            }
+        }
+        assert!(
+            serde_json::to_string(&frames[1])
+                .expect("region serializes")
+                .contains("eu-west-2")
+        );
+    }
+
+    #[test]
+    fn every_availability_verdict_is_explained_to_the_user() {
+        let verdicts = [
+            protocol::VoiceAvailability::Available {
+                direct_connections_only: true,
+            },
+            protocol::VoiceAvailability::Available {
+                direct_connections_only: false,
+            },
+            protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NotEnabled,
+            },
+            protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+            },
+            protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::ServerAdapterUnavailable,
+            },
+            protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NoReachableCandidate,
+            },
+        ];
+        for verdict in &verdicts {
+            let text = voice_availability_text(verdict);
+            assert!(!text.is_empty(), "{verdict:?} must be explained");
+            if matches!(verdict, protocol::VoiceAvailability::Unavailable { .. }) {
+                assert!(
+                    text.contains("unavailable"),
+                    "an unavailable host must say so plainly, got {text:?}"
+                );
+                assert!(
+                    text.len() > "Voice is unavailable on this host: ".len(),
+                    "and must name the reason, got {text:?}"
+                );
+            }
+        }
+        assert!(
+            voice_availability_text(&protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+            })
+            .contains("region"),
+            "the region case is the one the settings form can actually fix"
+        );
+    }
+
+    /// The host reports `RegionNotConfigured` whenever the stored region is
+    /// absent or blank — it does not fall back to its environment or profile.
+    #[test]
+    fn the_region_help_text_does_not_promise_a_fallback_the_host_does_not_do() {
+        assert!(
+            VOICE_REGION_DESCRIPTION.starts_with("Required."),
+            "the AWS region field must be described as required, got {VOICE_REGION_DESCRIPTION:?}"
+        );
+        assert!(
+            VOICE_REGION_DESCRIPTION.contains("does not fall back"),
+            "and must say the host will not infer it, got {VOICE_REGION_DESCRIPTION:?}"
         );
     }
 }

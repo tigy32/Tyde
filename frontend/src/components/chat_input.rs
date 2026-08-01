@@ -8,8 +8,11 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::actions::spawn_new_chat;
 use crate::components::session_settings::SessionSettingsBar;
+use crate::components::voice_layer::VoiceMicButton;
 use crate::send::send_frame;
-use crate::state::{ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, PendingTeamMember};
+use crate::state::{
+    ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, PendingTeamMember, TabId,
+};
 
 use protocol::{
     AgentOrigin, BackendKind, BackendSetupStatus, FrameKind, ImageData, InterruptPayload,
@@ -769,6 +772,12 @@ pub fn ChatInput(
     /// single-pane callers that have no tab identity of their own.
     #[prop(optional)]
     composer: Option<ComposerHandle>,
+    /// The tab this composer belongs to. Supplied by `ChatView`; required for
+    /// the voice control, which must be able to focus its own chat before
+    /// starting a session. A composer with no tab identity renders no voice
+    /// control rather than guessing which chat it would target.
+    #[prop(optional)]
+    tab_id: Option<TabId>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let agent_ref = agent_ref.unwrap_or_else(|| {
@@ -1335,6 +1344,12 @@ pub fn ChatInput(
                     autocapitalize="none"
                     autocomplete="off"
                 />
+                // Voice sits beside the send group rather than in it: it is not
+                // a way to send this draft, and entering or leaving voice never
+                // touches the composer's text, attachments, or backend choice.
+                {tab_id.map(|tab_id| {
+                    view! { <VoiceMicButton agent_ref=agent_ref tab_id=tab_id /> }
+                })}
                 <div
                     class="chat-send-split"
                     role="group"

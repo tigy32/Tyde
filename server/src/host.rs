@@ -68,12 +68,13 @@ use protocol::{
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
     TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
-    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
-    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    VoiceAvailability, VoiceIceCandidate, VoiceSessionId, VoiceStartPayload, VoiceStopReason,
+    VoiceUnavailableReason, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot,
+    WorkflowCatalogLocation, WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl,
+    WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload,
+    WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest,
+    WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope,
+    WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -160,6 +161,7 @@ use crate::sub_agent::{
     HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx, SubAgentEmitter,
     SubAgentHandle,
 };
+use crate::voice::{VoiceCommand, VoiceRuntime, VoiceSessionHandle, spawn_voice_session};
 
 pub(crate) type HostCapacityTx = mpsc::UnboundedSender<HostCapacityUpdate>;
 type HostCapacityRx = mpsc::UnboundedReceiver<HostCapacityUpdate>;
@@ -357,6 +359,7 @@ pub struct HostRuntimeConfig {
     /// supplied. Defaults to `false` so production startup is unaffected.
     pub skip_real_backend_probe: bool,
     pub agents_view_preferences_primary: bool,
+    pub voice_runtime: VoiceRuntimeMode,
     #[cfg(test)]
     pub start_agent_supervisor_worker: bool,
     #[cfg(test)]
@@ -378,12 +381,21 @@ impl Default for HostRuntimeConfig {
             mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
             agents_view_preferences_primary: true,
+            voice_runtime: VoiceRuntimeMode::Production,
             #[cfg(test)]
             start_agent_supervisor_worker: true,
             #[cfg(test)]
             enable_actor_transcript_io: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VoiceRuntimeMode {
+    #[default]
+    Production,
+    Mock,
+    Unavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -1097,6 +1109,8 @@ pub(crate) struct HostState {
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
+    voice_sessions: HashMap<(StreamPath, VoiceSessionId), VoiceSessionHandle>,
+    voice_runtime: VoiceRuntime,
     workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
     /// Per-project "active search id". Each project-wide search stores its
     /// `search_id` here before spawning its walk; the walk polls this atomic
@@ -1125,6 +1139,9 @@ pub(crate) struct HostState {
 
 impl Drop for HostState {
     fn drop(&mut self) {
+        for voice in self.voice_sessions.values() {
+            let _ = voice.send(VoiceCommand::Stop(VoiceStopReason::ServerShutdown));
+        }
         for router in self.code_intel_routers.values_mut() {
             router.shutdown_all();
         }
@@ -3070,12 +3087,13 @@ impl HostHandle {
             }
         }
 
-        let settings = state
+        let mut settings = state
             .settings_store
             .lock()
             .await
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for registration: {err}"));
+        settings.voice.availability = voice_availability(&settings, &state.voice_runtime);
         let refresh_dynamic_session_schemas = settings
             .enabled_backends
             .iter()
@@ -3481,7 +3499,7 @@ impl HostHandle {
     }
 
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
-        let (project_handles, terminals, review_registry) = {
+        let (project_handles, terminals, voice_sessions, review_registry) = {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
             state.agent_visibility.remove_host_stream(path);
@@ -3523,7 +3541,17 @@ impl HostHandle {
                 };
                 terminals.push(terminal);
             }
-            (project_handles, terminals, review_registry)
+            let voice_keys = state
+                .voice_sessions
+                .keys()
+                .filter(|(host_stream, _)| host_stream == path)
+                .cloned()
+                .collect::<Vec<_>>();
+            let voice_sessions = voice_keys
+                .into_iter()
+                .filter_map(|key| state.voice_sessions.remove(&key))
+                .collect::<Vec<_>>();
+            (project_handles, terminals, voice_sessions, review_registry)
         };
 
         for handle in project_handles {
@@ -3534,6 +3562,9 @@ impl HostHandle {
 
         for terminal in terminals {
             terminal.close().await;
+        }
+        for voice in voice_sessions {
+            let _ = voice.send(VoiceCommand::Stop(VoiceStopReason::ClientGone));
         }
     }
 
@@ -8255,12 +8286,13 @@ impl HostHandle {
                     ..
                 }
         );
-        let settings = state
+        let mut settings = state
             .settings_store
             .lock()
             .await
             .apply(payload.setting)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        settings.voice.availability = voice_availability(&settings, &state.voice_runtime);
         fan_out_host_settings(&mut state, settings.clone()).await;
         apply_agent_activity_summary_setting(&mut state, &settings).await;
         apply_agent_supervisor_setting(&mut state, &settings);
@@ -9150,6 +9182,143 @@ impl HostHandle {
 
     pub(crate) async fn agent_handle(&self, agent_id: &AgentId) -> Option<AgentHandle> {
         self.state.lock().await.registry.agent_handle(agent_id)
+    }
+
+    pub(crate) async fn start_voice_session(
+        &self,
+        connection_host_stream: &StreamPath,
+        voice_output_stream: Stream,
+        payload: VoiceStartPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "voice_start";
+        let key = (connection_host_stream.clone(), payload.session_id.clone());
+        let mut state = self.state.lock().await;
+        let subscriber = state
+            .host_streams
+            .get(connection_host_stream)
+            .ok_or_else(|| AppError::not_found(OPERATION, "host stream is not registered"))?;
+        if !subscriber
+            .known_agent_streams
+            .contains(&payload.target.instance_stream)
+            || payload.target.instance_stream.0.split('/').nth(2)
+                != Some(payload.target.agent_id.0.as_str())
+        {
+            return Err(AppError::invalid(
+                OPERATION,
+                "voice target instance is not owned by this connection",
+            ));
+        }
+        state.voice_sessions.retain(|_, handle| !handle.is_closed());
+        if state
+            .voice_sessions
+            .keys()
+            .any(|(host_stream, _)| host_stream == connection_host_stream)
+        {
+            return Err(AppError::conflict(
+                OPERATION,
+                "this connection already owns a voice session",
+            ));
+        }
+        let agent = state
+            .registry
+            .agent_handle(&payload.target.agent_id)
+            .ok_or_else(|| AppError::not_found(OPERATION, "voice target agent is not running"))?;
+        let settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        if !matches!(
+            voice_availability(&settings, &state.voice_runtime),
+            VoiceAvailability::Available { .. }
+        ) {
+            return Err(
+                AppError::invalid(OPERATION, "voice is not available on this host")
+                    .with_voice_code(protocol::VoiceErrorCode::NotAvailable),
+            );
+        }
+        let handle = spawn_voice_session(
+            payload.session_id,
+            payload.target,
+            agent,
+            voice_output_stream,
+            settings.voice,
+            state.voice_runtime.clone(),
+        );
+        let previous = state.voice_sessions.insert(key, handle);
+        assert!(
+            previous.is_none(),
+            "voice session key checked before insert"
+        );
+        Ok(())
+    }
+
+    async fn voice_session_handle(
+        &self,
+        connection_host_stream: &StreamPath,
+        session_id: &VoiceSessionId,
+    ) -> AppResult<VoiceSessionHandle> {
+        self.state
+            .lock()
+            .await
+            .voice_sessions
+            .get(&(connection_host_stream.clone(), session_id.clone()))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("voice_signal", "voice session is not active"))
+    }
+
+    pub(crate) async fn send_voice_offer(
+        &self,
+        connection_host_stream: &StreamPath,
+        session_id: &VoiceSessionId,
+        sdp: String,
+    ) -> AppResult<()> {
+        self.voice_session_handle(connection_host_stream, session_id)
+            .await?
+            .send(VoiceCommand::Offer(sdp))
+            .map_err(|_| AppError::invalid("voice_offer", "voice session is closed"))
+    }
+
+    pub(crate) async fn send_voice_ice_candidates(
+        &self,
+        connection_host_stream: &StreamPath,
+        session_id: &VoiceSessionId,
+        candidates: Vec<VoiceIceCandidate>,
+    ) -> AppResult<()> {
+        self.voice_session_handle(connection_host_stream, session_id)
+            .await?
+            .send(VoiceCommand::IceCandidates(candidates))
+            .map_err(|_| AppError::invalid("voice_ice_candidate", "voice session is closed"))
+    }
+
+    pub(crate) async fn finish_voice_ice(
+        &self,
+        connection_host_stream: &StreamPath,
+        session_id: &VoiceSessionId,
+    ) -> AppResult<()> {
+        self.voice_session_handle(connection_host_stream, session_id)
+            .await?
+            .send(VoiceCommand::IceComplete)
+            .map_err(|_| AppError::invalid("voice_ice_complete", "voice session is closed"))
+    }
+
+    pub(crate) async fn stop_voice_session(
+        &self,
+        connection_host_stream: &StreamPath,
+        session_id: &VoiceSessionId,
+        reason: VoiceStopReason,
+    ) -> AppResult<()> {
+        let handle = self
+            .state
+            .lock()
+            .await
+            .voice_sessions
+            .remove(&(connection_host_stream.clone(), session_id.clone()));
+        if let Some(handle) = handle {
+            let _ = handle.send(VoiceCommand::Stop(reason));
+        }
+        Ok(())
     }
 
     pub(crate) async fn load_agent_stream(
@@ -13849,6 +14018,12 @@ fn spawn_host_inner(
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
+            voice_sessions: HashMap::new(),
+            voice_runtime: match runtime_config.voice_runtime {
+                VoiceRuntimeMode::Production => VoiceRuntime::production(),
+                VoiceRuntimeMode::Mock => VoiceRuntime::mock(),
+                VoiceRuntimeMode::Unavailable => VoiceRuntime::unavailable(),
+            },
             workbench_parent_locks: HashMap::new(),
             project_search_ids: HashMap::new(),
             code_intel_routers: HashMap::new(),
@@ -19084,6 +19259,35 @@ async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSe
     }
 }
 
+fn voice_availability(
+    settings: &protocol::HostSettings,
+    runtime: &VoiceRuntime,
+) -> VoiceAvailability {
+    if !settings.voice.enabled {
+        return VoiceAvailability::Unavailable {
+            reason: VoiceUnavailableReason::NotEnabled,
+        };
+    }
+    if settings
+        .voice
+        .aws_region
+        .as_ref()
+        .is_none_or(|region| region.trim().is_empty())
+    {
+        return VoiceAvailability::Unavailable {
+            reason: VoiceUnavailableReason::RegionNotConfigured,
+        };
+    }
+    if !runtime.is_available() {
+        return VoiceAvailability::Unavailable {
+            reason: VoiceUnavailableReason::ServerAdapterUnavailable,
+        };
+    }
+    VoiceAvailability::Available {
+        direct_connections_only: true,
+    }
+}
+
 async fn sync_code_intel_router_roots(state: &mut HostState) -> Result<(), String> {
     let projects = state
         .project_store
@@ -23090,6 +23294,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle::disabled();

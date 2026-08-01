@@ -3290,6 +3290,7 @@ mod wasm_tests {
             install_doc(&state, doc.clone());
             if !disabled.is_empty() {
                 let settings = protocol::HostSettings {
+                    voice: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: None,
                     enable_mobile_connections: false,

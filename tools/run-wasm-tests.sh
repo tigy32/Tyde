@@ -18,6 +18,11 @@
 #   tools/run-wasm-tests.sh --prepare FILE   # provision once for dev.sh
 #   tools/run-wasm-tests.sh --identity       # read-only current identity
 #
+# Environment:
+#   WASM_BINDGEN_TEST_TIMEOUT  seconds allowed for a whole browser suite, not
+#                              per test. Defaults to 120; an explicit positive
+#                              whole number wins and an invalid value fails.
+#
 # Requires: cargo; curl; unzip.
 
 set -euo pipefail
@@ -52,6 +57,37 @@ esac
 log() { printf '[run-wasm-tests] %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
 
+# Reject a seconds value the pinned wasm runner would reject, over its whole
+# domain.
+#
+# The runner parses these as `u64` and panics on anything outside it, so this
+# guard has to cover the same range or it hands the failure to a
+# `.parse().expect(...)` after Chrome is already running. Bash arithmetic cannot
+# do that check: it is fixed-width and signed, so a 20-digit string wraps and
+# `((10#$value > 0))` accepts values the runner refuses.
+#
+# Compare as digit strings instead. Strip leading zeros, then order by digit
+# count and, at equal count, lexicographically — for decimal strings with no
+# leading zeros that is exactly numeric order, and digits collate identically in
+# every locale.
+positive_u64_seconds_or_die() {
+    local name="$1" value="$2" normalized="$2"
+    local max="18446744073709551615" # u64::MAX, the runner's parse domain
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        die "$name must be a positive whole number of seconds: $value"
+    while [[ "$normalized" == 0?* ]]; do
+        normalized="${normalized#0}"
+    done
+    [[ "$normalized" != 0 ]] ||
+        die "$name must be a positive whole number of seconds: $value"
+    if ((${#normalized} > ${#max})); then
+        die "$name must not exceed $max seconds: $value"
+    fi
+    if ((${#normalized} == ${#max})) && [[ "$normalized" > "$max" ]]; then
+        die "$name must not exceed $max seconds: $value"
+    fi
+}
+
 [[ -z "${CHROME:-}" || -x "$CHROME" ]] || die "CHROME is not executable: $CHROME"
 [[ -z "${CHROMEDRIVER:-}" || -x "$CHROMEDRIVER" ]] ||
     die "CHROMEDRIVER is not executable: $CHROMEDRIVER"
@@ -60,6 +96,16 @@ die() { log "error: $*"; exit 1; }
 if [[ -n "${WASM_BINDGEN_TEST_RUNNER:-}" &&
     "$(basename "$WASM_BINDGEN_TEST_RUNNER")" != "wasm-bindgen-test-runner" ]]; then
     die "WASM_BINDGEN_TEST_RUNNER must be named wasm-bindgen-test-runner so Cargo runs the fingerprinted executable"
+fi
+
+# An explicit browser-suite timeout is authoritative, like CHROME and
+# CHROMEDRIVER, and an invalid one fails here — in every mode, before any
+# provisioning, browser, or Cargo work. Without this guard a typo surfaces as a
+# panic inside wasm-bindgen-test-runner after Chrome has already started, and a
+# `0` is accepted silently and times out every suite instantly.
+if [[ -n "${WASM_BINDGEN_TEST_TIMEOUT:-}" ]]; then
+    positive_u64_seconds_or_die \
+        WASM_BINDGEN_TEST_TIMEOUT "$WASM_BINDGEN_TEST_TIMEOUT"
 fi
 
 sha256_file() {
@@ -601,9 +647,14 @@ export PATH="$(dirname "$runner_bin"):$PATH"
 # Every frontend test runs in ONE browser instance, so the whole module has to
 # be loaded and compiled before any test runs. Debug info dominated it: 1156 MiB
 # with, 141 MiB without — an 8x difference. At the larger size Chrome's peak
-# went from 6.1 GiB to 12.9 GiB and the driver was SIGKILLed mid-load, which
-# surfaced as "Failed to detect test as having been run" with no assertion text
-# and left the repo roughly one UI feature away from being unable to add any.
+# went from 6.1 GiB to 12.9 GiB and the stage failed with "Failed to detect test
+# as having been run" and no assertion text, leaving the repo roughly one UI
+# feature away from being unable to add any.
+#
+# That message is the runner's timeout, not a crash, and the
+# `driver status: signal: 9 (SIGKILL)` line printed after it is the runner
+# killing its own chromedriver during teardown — see the timeout note below
+# before reading a stage failure here as an out-of-memory kill.
 #
 # Costs nothing that matters for diagnosis: panic locations come from
 # `#[track_caller]`, not DWARF, so failures still report
@@ -614,6 +665,31 @@ export PATH="$(dirname "$runner_bin"):$PATH"
 # Scoped to this script so native builds keep full debug info. An explicit
 # RUSTFLAGS from the environment wins, so a debugging session can opt back in.
 export RUSTFLAGS="${RUSTFLAGS:--C debuginfo=0}"
+
+# Cap the whole browser suite, not each test.
+#
+# wasm-bindgen-test-runner applies WASM_BINDGEN_TEST_TIMEOUT to the entire
+# headless session — one Instant, started before the page loads and never reset
+# by progress — even though upstream documents it as a per-test timeout. Its
+# default is 20 seconds, which this repository had never set and so silently
+# inherited.
+#
+# Every frontend test runs in one browser instance and that suite measured
+# 19.25-19.58s on main. The repository was living on under a second of margin
+# and the stage failed roughly a third of the time, on main as well as on
+# feature branches, with no assertion text and a SIGKILL line that reads exactly
+# like an out-of-memory crash and is not one. The real signal is the
+# `finished in Xs` line the harness prints on success: that is the number to
+# watch, and it is now visible instead of hiding behind a cliff.
+#
+# 120s is ~5.7x the current suite, so it absorbs years of test growth while
+# still bounding a genuinely wedged suite at two minutes. dev.sh imposes no
+# stage timeout of its own, so this is the only ceiling.
+#
+# This weakens no assertion. A hung or failing test still fails the stage. An
+# explicit value from the environment wins and is validated at the top of this
+# script, so a debugging session can shorten it without editing anything.
+export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-120}"
 
 cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
