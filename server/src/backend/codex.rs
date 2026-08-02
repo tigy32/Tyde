@@ -5964,7 +5964,11 @@ impl CodexInner {
                 state.pending_tool_call_ids.len()
             );
         }
-        if state.active_stream.is_some() || state.tool_container.is_some() {
+        let published_provider_stream = state
+            .active_stream
+            .as_ref()
+            .is_some_and(|stream| stream.stream_published);
+        if published_provider_stream || state.tool_container.is_some() {
             drop(state);
             self.reject_agent_message_identity(
                 StreamIdentityViolation::ForeignActiveMessageId,
@@ -5973,6 +5977,14 @@ impl CodexInner {
             )
             .await;
             return;
+        }
+        if let Some(stream) = state.active_stream.as_ref() {
+            tracing::debug!(
+                provider_item_id = stream.message_id.0.as_str(),
+                provider_item_reasoning = stream.reasoning_only,
+                tool_container_id = container.0.as_str(),
+                "Opening a Codex tool container beside an unpublished provider reservation"
+            );
         }
         state.tool_container = Some(container);
     }
@@ -7501,6 +7513,7 @@ impl CodexInner {
                 {
                     return;
                 }
+                self.close_subagent_tool_container_if_open(stream_key).await;
                 let (emitter, publish, emitted, violation) = {
                     let mut state = self.state.lock().await;
                     let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
@@ -7618,6 +7631,7 @@ impl CodexInner {
                 {
                     return;
                 }
+                self.close_subagent_tool_container_if_open(stream_key).await;
                 let (emitter, message_id, generated_identity, publish, emitted, violation) = {
                     let mut state = self.state.lock().await;
                     let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
@@ -7886,22 +7900,15 @@ impl CodexInner {
                         return;
                     };
                     if stream.current_message_id.is_some()
-                        && (stream.current_reasoning_only || stream.tool_container.is_some())
+                        && stream.current_stream_published
+                        && stream.current_reasoning_only
                     {
                         Err(StreamIdentityViolation::ForeignActiveMessageId)
                     } else {
-                        let publish = if stream.current_message_id.is_some()
-                            && !stream.current_stream_published
-                        {
-                            stream.current_stream_published = true;
-                            stream.current_message_id.clone()
-                        } else {
-                            None
-                        };
-                        Ok((Arc::clone(&stream.emitter), publish))
+                        Ok(Arc::clone(&stream.emitter))
                     }
                 };
-                let (emitter, publish) = match boundary {
+                let emitter = match boundary {
                     Ok(boundary) => boundary,
                     Err(violation) => {
                         self.reject_subagent_message_identity(stream_key, violation, method)
@@ -7909,13 +7916,6 @@ impl CodexInner {
                         return;
                     }
                 };
-                if let Some(message_id) = publish {
-                    emitter.stream_start_with_id(
-                        message_id,
-                        AgentName(CODEX_AGENT_NAME),
-                        Some(model),
-                    );
-                }
                 let (container, tool_call_ids) = self
                     .handle_subagent_item_started(params, emitter.as_ref())
                     .await;
@@ -7929,22 +7929,29 @@ impl CodexInner {
                                 stream
                                     .pending_tool_call_ids
                                     .extend(tool_call_ids.iter().cloned());
-                                if stream.current_message_id.is_some() {
-                                    if container.is_some() {
+                                if let Some(container) = container {
+                                    if stream.current_stream_published
+                                        || stream.tool_container.is_some()
+                                    {
                                         return Some(Arc::clone(&stream.emitter));
                                     }
+                                    if let Some(message_id) = stream.current_message_id.as_ref() {
+                                        tracing::debug!(
+                                            child_thread_id = stream_key,
+                                            provider_item_id = message_id.0.as_str(),
+                                            tool_container_id = container.0.as_str(),
+                                            "Opening a Codex child tool container beside an unpublished provider reservation"
+                                        );
+                                    }
+                                    stream.tool_container = Some(container);
+                                } else if stream.tool_container.is_none()
+                                    && stream.current_message_id.is_some()
+                                {
                                     for tool_call_id in tool_call_ids {
                                         if !stream.current_tool_call_ids.contains(&tool_call_id) {
                                             stream.current_tool_call_ids.push(tool_call_id);
                                         }
                                     }
-                                    return None;
-                                }
-                                if let Some(container) = container {
-                                    if stream.tool_container.is_some() {
-                                        return Some(Arc::clone(&stream.emitter));
-                                    }
-                                    stream.tool_container = Some(container);
                                 }
                                 None
                             })
@@ -8207,6 +8214,7 @@ impl CodexInner {
     async fn record_subagent_tool_container(
         &self,
         stream_key: &str,
+        tool_call_id: &str,
         container: Option<ChatMessageId>,
     ) {
         let Some(container) = container else {
@@ -8218,8 +8226,23 @@ impl CodexInner {
                 .subagent_streams
                 .get_mut(stream_key)
                 .is_some_and(|stream| {
-                    if stream.current_message_id.is_some() || stream.tool_container.is_some() {
+                    let published_provider_stream = stream.current_message_id.is_some()
+                        && stream.current_stream_published;
+                    let unrequested_completion_conflict = stream.current_message_id.is_some()
+                        && !stream.pending_tool_call_ids.contains(tool_call_id);
+                    if published_provider_stream
+                        || unrequested_completion_conflict
+                        || stream.tool_container.is_some()
+                    {
                         return true;
+                    }
+                    if let Some(message_id) = stream.current_message_id.as_ref() {
+                        tracing::debug!(
+                            child_thread_id = stream_key,
+                            provider_item_id = message_id.0.as_str(),
+                            tool_container_id = container.0.as_str(),
+                            "Opening a Codex child tool container beside an unpublished provider reservation"
+                        );
                     }
                     stream.tool_container = Some(container);
                     false
@@ -8738,7 +8761,7 @@ impl CodexInner {
                     success,
                     error: error_message.as_deref(),
                 });
-                self.record_subagent_tool_container(stream_key, container)
+                self.record_subagent_tool_container(stream_key, &item_id, container)
                     .await;
                 self.complete_subagent_tool_calls(stream_key, std::slice::from_ref(&item_id))
                     .await;
@@ -8778,7 +8801,7 @@ impl CodexInner {
                         success,
                         error: err_str,
                     });
-                    self.record_subagent_tool_container(stream_key, container)
+                    self.record_subagent_tool_container(stream_key, &item_id, container)
                         .await;
                     self.complete_subagent_tool_calls(stream_key, std::slice::from_ref(&item_id))
                         .await;
@@ -8799,7 +8822,7 @@ impl CodexInner {
                         success,
                         error: err_str,
                     });
-                    self.record_subagent_tool_container(stream_key, container)
+                    self.record_subagent_tool_container(stream_key, &call_id, container)
                         .await;
                     completed_call_ids.push(call_id);
                 }
@@ -8834,7 +8857,7 @@ impl CodexInner {
                     success,
                     error: error_message.as_deref(),
                 });
-                self.record_subagent_tool_container(stream_key, container)
+                self.record_subagent_tool_container(stream_key, &item_id, container)
                     .await;
                 self.complete_subagent_tool_calls(stream_key, std::slice::from_ref(&item_id))
                     .await;
@@ -8864,7 +8887,7 @@ impl CodexInner {
                     success,
                     error: error_message.as_deref(),
                 });
-                self.record_subagent_tool_container(stream_key, container)
+                self.record_subagent_tool_container(stream_key, &item_id, container)
                     .await;
                 self.complete_subagent_tool_calls(stream_key, std::slice::from_ref(&item_id))
                     .await;
@@ -8913,7 +8936,7 @@ impl CodexInner {
             success,
             error: error.as_deref(),
         });
-        self.record_subagent_tool_container(stream_key, container)
+        self.record_subagent_tool_container(stream_key, item_id, container)
             .await;
         self.complete_subagent_tool_calls_with_images(stream_key, &[item_id.to_owned()], images)
             .await;
@@ -8938,7 +8961,7 @@ impl CodexInner {
             success: true,
             error: None,
         });
-        self.record_subagent_tool_container(stream_key, container)
+        self.record_subagent_tool_container(stream_key, item_id, container)
             .await;
         self.complete_subagent_tool_calls(stream_key, &[item_id.to_owned()])
             .await;
@@ -25253,15 +25276,17 @@ Do not describe the tool, and do not skip the tool call."#;
                     "ToolRequest",
                     "ToolExecutionCompleted",
                     "StreamEnd",
+                    "StreamStart",
+                    "StreamEnd",
                     "TypingStatusChanged"
                 ],
-                "child routing must retain the provider message boundary through its tool lifecycle: {subagent_events:?}"
+                "an unpublished provider reservation must remain distinct from the tool container: {subagent_events:?}"
             );
             assert_eq!(
                 subagent_events[1]
                     .pointer("/data/message_id")
                     .and_then(Value::as_str),
-                Some("msg-sub-1")
+                Some("cmd-sub-1")
             );
             assert_eq!(
                 subagent_events[2]
@@ -25291,19 +25316,38 @@ Do not describe the tool, and do not skip the tool call."#;
                 subagent_events[4]
                     .pointer("/data/message/message_id")
                     .and_then(Value::as_str),
-                Some("msg-sub-1")
-            );
-            assert_eq!(
-                subagent_events[4]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("LIVE_SUBAGENT_OK")
+                Some("cmd-sub-1")
             );
             assert_eq!(
                 subagent_events[4]
                     .pointer("/data/message/tool_calls/0/id")
                     .and_then(Value::as_str),
                 Some("cmd-sub-1")
+            );
+            assert_eq!(
+                subagent_events[5]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-1")
+            );
+            assert_eq!(
+                subagent_events[6]
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-1")
+            );
+            assert_eq!(
+                subagent_events[6]
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str),
+                Some("LIVE_SUBAGENT_OK")
+            );
+            assert!(
+                subagent_events[6]
+                    .pointer("/data/message/tool_calls")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty),
+                "the synthetic tool container, not the unpublished provider reservation, owns the tool"
             );
 
             inner
@@ -25326,6 +25370,16 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
             inner
                 .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "itemId": "reasoning-sub-foreign-tool",
+                        "delta": "Published reasoning owns this boundary."
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
                     "item/started",
                     &json!({
                         "threadId": "thread-sub-1",
@@ -25343,11 +25397,14 @@ Do not describe the tool, and do not skip the tool call."#;
                 event_kinds(&foreign_boundary),
                 vec![
                     "TypingStatusChanged",
+                    "StreamStart",
+                    "StreamReasoningDelta",
+                    "StreamEnd",
                     "MessageAdded",
                     "OperationCancelled",
                     "TypingStatusChanged"
                 ],
-                "a tool cannot be attached to a foreign reasoning identity"
+                "a published reasoning stream must still reject a foreign tool container"
             );
             assert!(foreign_boundary.iter().all(|event| {
                 event.get("kind").and_then(Value::as_str) != Some("ToolRequest")
@@ -25355,6 +25412,345 @@ Do not describe the tool, and do not skip the tool call."#;
             assert!(drain_events(&mut parent_rx).is_empty());
 
             inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_child_unpublished_reasoning_allows_tool_container_then_resumes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            for (child_thread, item_id) in [
+                ("child-reserved-provider", Some("child-reasoning-provider")),
+                ("child-reserved-idless", None),
+            ] {
+                let (inner, mut parent_rx) = test_codex_inner();
+                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
+                inner
+                    .handle_notification(
+                        "turn/started",
+                        &json!({
+                            "threadId": child_thread,
+                            "turn": { "id": format!("turn-{child_thread}") }
+                        }),
+                    )
+                    .await;
+                drain_events(&mut child_rx);
+
+                let mut started = json!({ "type": "reasoning" });
+                if let Some(item_id) = item_id {
+                    started["id"] = Value::String(item_id.to_owned());
+                }
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({ "threadId": child_thread, "item": started }),
+                    )
+                    .await;
+                assert!(drain_events(&mut child_rx).is_empty());
+
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": child_thread,
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "child-reserved-tool",
+                                "command": "pwd",
+                                "cwd": "/tmp"
+                            }
+                        }),
+                    )
+                    .await;
+                inner
+                    .handle_notification(
+                        "item/completed",
+                        &json!({
+                            "threadId": child_thread,
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "child-reserved-tool",
+                                "exitCode": 0,
+                                "aggregatedOutput": "/tmp"
+                            }
+                        }),
+                    )
+                    .await;
+                let tool_events = drain_events(&mut child_rx);
+                assert_eq!(
+                    event_kinds(&tool_events),
+                    vec![
+                        "StreamStart",
+                        "ToolRequest",
+                        "ToolExecutionCompleted",
+                        "StreamEnd"
+                    ]
+                );
+                assert_eq!(
+                    tool_events[3]
+                        .pointer("/data/message/tool_calls/0/id")
+                        .and_then(Value::as_str),
+                    Some("child-reserved-tool")
+                );
+
+                let mut delta = json!({
+                    "threadId": child_thread,
+                    "delta": "Child reasoning resumed."
+                });
+                if let Some(item_id) = item_id {
+                    delta["itemId"] = Value::String(item_id.to_owned());
+                }
+                inner
+                    .handle_notification("item/reasoning/delta", &delta)
+                    .await;
+                let resumed = drain_events(&mut child_rx);
+                assert_eq!(
+                    event_kinds(&resumed)
+                        .into_iter()
+                        .filter(|kind| *kind != "TypingStatusChanged")
+                        .collect::<Vec<_>>(),
+                    vec!["StreamStart", "StreamReasoningDelta"]
+                );
+                let resumed_id = resumed
+                    .iter()
+                    .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .and_then(codex_event_message_id)
+                    .expect("resumed child reasoning message id")
+                    .to_owned();
+                if let Some(item_id) = item_id {
+                    assert_eq!(resumed_id, item_id);
+                } else {
+                    assert!(resumed_id.starts_with("server-generated:idless_reasoning:"));
+                }
+
+                let mut completion = json!({
+                    "threadId": child_thread,
+                    "item": {
+                        "type": "reasoning",
+                        "summary": "Child reasoning resumed."
+                    }
+                });
+                if let Some(item_id) = item_id {
+                    completion["item"]["id"] = Value::String(item_id.to_owned());
+                }
+                inner
+                    .handle_notification("item/completed", &completion)
+                    .await;
+                let terminal = drain_events(&mut child_rx);
+                assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
+                assert_eq!(
+                    codex_event_message_id(&terminal[0]),
+                    Some(resumed_id.as_str())
+                );
+                assert!(drain_events(&mut parent_rx).is_empty());
+                assert_codex_protocol_valid(&[tool_events, resumed, terminal].concat());
+                inner.rpc.shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn codex_child_overlapping_tools_share_container_with_optional_reservation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            for (child_thread, reserve_reasoning) in [
+                ("child-overlap-no-provider", false),
+                ("child-overlap-reserved", true),
+            ] {
+                let (inner, mut parent_rx) = test_codex_inner();
+                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
+                inner
+                    .handle_notification(
+                        "turn/started",
+                        &json!({
+                            "threadId": child_thread,
+                            "turn": { "id": format!("turn-{child_thread}") }
+                        }),
+                    )
+                    .await;
+                drain_events(&mut child_rx);
+                if reserve_reasoning {
+                    inner
+                        .handle_notification(
+                            "item/started",
+                            &json!({
+                                "threadId": child_thread,
+                                "item": {
+                                    "type": "reasoning",
+                                    "id": "overlap-reservation"
+                                }
+                            }),
+                        )
+                        .await;
+                }
+
+                for tool_id in ["overlap-tool-a", "overlap-tool-b"] {
+                    inner
+                        .handle_notification(
+                            "item/started",
+                            &json!({
+                                "threadId": child_thread,
+                                "item": {
+                                    "type": "commandExecution",
+                                    "id": tool_id,
+                                    "command": "pwd",
+                                    "cwd": "/tmp"
+                                }
+                            }),
+                        )
+                        .await;
+                }
+                for tool_id in ["overlap-tool-a", "overlap-tool-b"] {
+                    inner
+                        .handle_notification(
+                            "item/completed",
+                            &json!({
+                                "threadId": child_thread,
+                                "item": {
+                                    "type": "commandExecution",
+                                    "id": tool_id,
+                                    "exitCode": 0,
+                                    "aggregatedOutput": "/tmp"
+                                }
+                            }),
+                        )
+                        .await;
+                }
+
+                let events = drain_events(&mut child_rx);
+                assert_eq!(
+                    event_kinds(&events),
+                    vec![
+                        "StreamStart",
+                        "ToolRequest",
+                        "ToolRequest",
+                        "ToolExecutionCompleted",
+                        "ToolExecutionCompleted",
+                        "StreamEnd"
+                    ]
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event.get("kind").and_then(Value::as_str) == Some("ToolRequest")
+                        })
+                        .filter_map(|event| {
+                            event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>(),
+                    vec!["overlap-tool-a", "overlap-tool-b"]
+                );
+                assert_eq!(
+                    events[5]
+                        .pointer("/data/message/tool_calls")
+                        .and_then(Value::as_array)
+                        .expect("shared child tool container declarations")
+                        .iter()
+                        .filter_map(|tool| tool.get("id").and_then(Value::as_str))
+                        .collect::<Vec<_>>(),
+                    vec!["overlap-tool-a", "overlap-tool-b"]
+                );
+                assert!(events.iter().all(|event| {
+                    !matches!(
+                        event.get("kind").and_then(Value::as_str),
+                        Some("MessageAdded" | "OperationCancelled" | "Error")
+                    )
+                }));
+                assert!(drain_events(&mut parent_rx).is_empty());
+                assert_codex_protocol_valid(&events);
+                inner.rpc.shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn child_completion_container_requires_exact_pending_tool_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            for (child_thread, completion_id, accepted) in [
+                ("child-exact-requested", "pending-tool", true),
+                ("child-exact-unrequested", "foreign-tool", false),
+            ] {
+                let (inner, mut parent_rx) = test_codex_inner();
+                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
+                inner
+                    .handle_notification(
+                        "turn/started",
+                        &json!({
+                            "threadId": child_thread,
+                            "turn": { "id": format!("turn-{child_thread}") }
+                        }),
+                    )
+                    .await;
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": child_thread,
+                            "item": { "type": "reasoning", "id": "exact-reservation" }
+                        }),
+                    )
+                    .await;
+                drain_events(&mut child_rx);
+                {
+                    let mut state = inner.state.lock().await;
+                    state
+                        .subagent_streams
+                        .get_mut(child_thread)
+                        .expect("child stream")
+                        .pending_tool_call_ids
+                        .insert("pending-tool".to_owned());
+                }
+
+                inner
+                    .record_subagent_tool_container(
+                        child_thread,
+                        completion_id,
+                        Some(ChatMessageId("completion-container".to_owned())),
+                    )
+                    .await;
+                let events = drain_events(&mut child_rx);
+                if accepted {
+                    assert!(events.is_empty());
+                    let state = inner.state.lock().await;
+                    assert_eq!(
+                        state
+                            .subagent_streams
+                            .get(child_thread)
+                            .and_then(|stream| stream.tool_container.as_ref())
+                            .map(|container| container.0.as_str()),
+                        Some("completion-container")
+                    );
+                } else {
+                    assert!(events.iter().any(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
+                    }));
+                    assert!(events.iter().any(|event| {
+                        event
+                            .pointer("/data/content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| content.contains("foreign active message id"))
+                    }));
+                }
+                assert!(drain_events(&mut parent_rx).is_empty());
+                inner.rpc.shutdown().await;
+            }
         });
     }
 
@@ -27307,6 +27703,277 @@ Do not describe the tool, and do not skip the tool call."#;
                 event.get("kind").and_then(Value::as_str) != Some("StreamStart")
                     && event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
             }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_unpublished_reasoning_allows_tool_container_then_resumes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            for (turn_id, item_id) in [
+                ("reserved-provider-id", Some("reasoning-provider-id")),
+                ("reserved-idless", None),
+            ] {
+                let (inner, mut rx) = test_codex_inner();
+                inner
+                    .handle_notification(
+                        "turn/started",
+                        &json!({ "threadId": "thread-test", "turn": { "id": turn_id } }),
+                    )
+                    .await;
+                drain_events(&mut rx);
+
+                start_test_codex_provider_item(
+                    &inner,
+                    "thread-test",
+                    item_id,
+                    CodexProviderItemKind::Reasoning,
+                )
+                .await;
+                assert!(drain_events(&mut rx).is_empty());
+
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "reserved-tool",
+                                "command": "pwd",
+                                "cwd": "/tmp"
+                            }
+                        }),
+                    )
+                    .await;
+                inner
+                    .handle_notification(
+                        "item/completed",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "reserved-tool",
+                                "exitCode": 0,
+                                "aggregatedOutput": "/tmp"
+                            }
+                        }),
+                    )
+                    .await;
+                let tool_events = drain_events(&mut rx);
+                assert_eq!(
+                    event_kinds(&tool_events),
+                    vec![
+                        "StreamStart",
+                        "ToolRequest",
+                        "ToolExecutionCompleted",
+                        "StreamEnd"
+                    ]
+                );
+                assert_eq!(
+                    tool_events[3]
+                        .pointer("/data/message/tool_calls/0/id")
+                        .and_then(Value::as_str),
+                    Some("reserved-tool")
+                );
+
+                delta_test_codex_provider_item(
+                    &inner,
+                    "thread-test",
+                    item_id,
+                    CodexProviderItemKind::Reasoning,
+                    "Resumed reasoning.",
+                )
+                .await;
+                let resumed = drain_events(&mut rx);
+                assert_eq!(
+                    event_kinds(&resumed)
+                        .into_iter()
+                        .filter(|kind| *kind != "TypingStatusChanged")
+                        .collect::<Vec<_>>(),
+                    vec!["StreamStart", "StreamReasoningDelta"]
+                );
+                let resumed_id = resumed
+                    .iter()
+                    .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .and_then(codex_event_message_id)
+                    .expect("resumed reasoning message id")
+                    .to_owned();
+                if let Some(item_id) = item_id {
+                    assert_eq!(resumed_id, item_id);
+                } else {
+                    assert!(resumed_id.starts_with("server-generated:idless_reasoning:"));
+                }
+
+                let mut completion = json!({
+                    "threadId": "thread-test",
+                    "item": { "type": "reasoning", "summary": "Resumed reasoning." }
+                });
+                if let Some(item_id) = item_id {
+                    completion["item"]["id"] = Value::String(item_id.to_owned());
+                }
+                inner
+                    .handle_notification("item/completed", &completion)
+                    .await;
+                let terminal = drain_events(&mut rx);
+                assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
+                assert_eq!(
+                    codex_event_message_id(&terminal[0]),
+                    Some(resumed_id.as_str())
+                );
+                assert_codex_protocol_valid(&[tool_events, resumed, terminal].concat());
+                inner.rpc.shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn codex_published_provider_stream_rejects_foreign_tool_container() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "published" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("published-reasoning"),
+                CodexProviderItemKind::Reasoning,
+                "Already visible.",
+            )
+            .await;
+            drain_events(&mut rx);
+
+            inner
+                .record_tool_container(Some(ChatMessageId("foreign-tool-container".to_owned())))
+                .await;
+            let rejected = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&rejected),
+                vec![
+                    "StreamEnd",
+                    "MessageAdded",
+                    "OperationCancelled",
+                    "TypingStatusChanged"
+                ]
+            );
+            assert!(rejected.iter().any(|event| {
+                event
+                    .pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("foreign active message id"))
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_spawn_screenshot_order_tolerates_unpublished_reasoning_reservation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "spawn-screenshot-order" }
+                    }),
+                )
+                .await;
+
+            let spawn_item = |id: &str, name: &str, status: &str| {
+                json!({
+                    "type": "mcpToolCall",
+                    "id": id,
+                    "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
+                    "arguments": { "name": name },
+                    "status": status,
+                    "output": format!(r#"{{"agent_id":"agent-{name}","name":"{name}"}}"#)
+                })
+            };
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": spawn_item("spawn-one", "One", "inProgress")
+                    }),
+                )
+                .await;
+            start_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                None,
+                CodexProviderItemKind::Reasoning,
+            )
+            .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": spawn_item("spawn-one", "One", "completed")
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": spawn_item("spawn-two", "Two", "inProgress")
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let tool_positions = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    (event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let first_completion = events
+                .iter()
+                .position(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                })
+                .expect("first spawn completion");
+            assert_eq!(tool_positions.len(), 2);
+            assert!(tool_positions[0] < first_completion && first_completion < tool_positions[1]);
+            assert!(events.iter().all(|event| {
+                !matches!(
+                    event.get("kind").and_then(Value::as_str),
+                    Some("OperationCancelled" | "Error")
+                )
+            }));
+            {
+                let state = inner.state.lock().await;
+                let reservation = state.active_stream.as_ref().expect("reasoning reservation");
+                assert!(!reservation.stream_published);
+                assert!(state.tool_container.is_some());
+            }
             inner.rpc.shutdown().await;
         });
     }
