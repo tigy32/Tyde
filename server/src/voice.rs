@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,6 +61,7 @@ pub(crate) enum VoiceRuntimeError {
 pub(crate) struct ProviderFailure {
     pub code: VoiceErrorCode,
     pub category: String,
+    pub request_id: Option<String>,
 }
 
 pub(crate) type VoiceMediaFuture<'a, T> =
@@ -192,6 +194,25 @@ impl NovaInputEvent {
     fn new(event: NovaInputEventKind) -> Self {
         Self { event }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_session_end() -> Self {
+        Self::new(NovaInputEventKind::SessionEnd {})
+    }
+
+    pub(crate) fn safe_event_name(&self) -> &'static str {
+        match &self.event {
+            NovaInputEventKind::SessionStart { .. } => "sessionStart",
+            NovaInputEventKind::PromptStart { .. } => "promptStart",
+            NovaInputEventKind::ContentStart { .. } => "contentStart",
+            NovaInputEventKind::TextInput { .. } => "textInput",
+            NovaInputEventKind::AudioInput { .. } => "audioInput",
+            NovaInputEventKind::ToolResult { .. } => "toolResult",
+            NovaInputEventKind::ContentEnd { .. } => "contentEnd",
+            NovaInputEventKind::PromptEnd { .. } => "promptEnd",
+            NovaInputEventKind::SessionEnd {} => "sessionEnd",
+        }
+    }
 }
 
 pub(crate) fn valid_external_nova_event(event: &NovaInputEvent) -> bool {
@@ -253,7 +274,7 @@ pub(crate) fn valid_external_nova_event(event: &NovaInputEvent) -> bool {
                     "inputSchema",
                     "json",
                 ])
-                .is_some_and(serde_json::Value::is_object)
+                .is_some_and(valid_agent_tool_input_schema)
         }
         "contentStart" => {
             uuid_field("promptName")
@@ -299,6 +320,21 @@ pub(crate) fn valid_external_nova_event(event: &NovaInputEvent) -> bool {
         "sessionEnd" => payload.is_empty(),
         _ => false,
     }
+}
+
+fn agent_tool_input_schema_document() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"]
+    })
+}
+
+fn valid_agent_tool_input_schema(value: &serde_json::Value) -> bool {
+    value
+        .as_str()
+        .and_then(|schema| serde_json::from_str::<serde_json::Value>(schema).ok())
+        .is_some_and(|schema| schema == agent_tool_input_schema_document())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -369,10 +405,24 @@ impl VoiceRuntime {
 
     pub(crate) fn mock() -> Self {
         Self {
-            provider: Arc::new(MockNovaProvider),
+            provider: Arc::new(MockNovaProvider { scripted: false }),
             media: Arc::new(FakeMediaFactory),
             available: true,
         }
+    }
+
+    pub(crate) fn dev_mock_provider() -> Option<Self> {
+        Self::dev_mock_provider_if(
+            std::env::var_os("TYDE_DEV_INSTANCE").as_deref() == Some(std::ffi::OsStr::new("1")),
+        )
+    }
+
+    fn dev_mock_provider_if(enabled: bool) -> Option<Self> {
+        enabled.then(|| Self {
+            provider: Arc::new(MockNovaProvider { scripted: true }),
+            media: Arc::new(crate::voice_webrtc::Str0mMediaFactory),
+            available: true,
+        })
     }
 }
 
@@ -392,27 +442,38 @@ impl VoiceMediaFactory for UnavailableMediaFactory {
     }
 }
 
-struct MockNovaProvider;
+struct MockNovaProvider {
+    scripted: bool,
+}
 
 impl NovaProvider for MockNovaProvider {
     fn open<'a>(&'a self, _settings: &'a VoiceSettings) -> NovaOpenFuture<'a> {
-        Box::pin(async { Ok(Box::new(MockNovaSession::standalone()) as Box<dyn NovaSession>) })
+        let scripted = self.scripted;
+        Box::pin(async move {
+            Ok(Box::new(MockNovaSession::standalone(scripted)) as Box<dyn NovaSession>)
+        })
     }
 }
 
 pub(crate) struct MockNovaSession {
     sent: Arc<std::sync::Mutex<Vec<NovaInputEvent>>>,
-    _output_tx: mpsc::Sender<NovaOutputEvent>,
+    output_tx: mpsc::Sender<NovaOutputEvent>,
     output_rx: mpsc::Receiver<NovaOutputEvent>,
+    scripted: bool,
+    script_started: bool,
+    script_completed: bool,
 }
 
 impl MockNovaSession {
-    fn standalone() -> Self {
+    fn standalone(scripted: bool) -> Self {
         let (output_tx, output_rx) = mpsc::channel(NOVA_OUTPUT_QUEUE_CAPACITY);
         Self {
             sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-            _output_tx: output_tx,
+            output_tx,
             output_rx,
+            scripted,
+            script_started: false,
+            script_completed: false,
         }
     }
 
@@ -423,8 +484,11 @@ impl MockNovaSession {
         (
             Self {
                 sent: Arc::clone(&sent),
-                _output_tx: output_tx.clone(),
+                output_tx: output_tx.clone(),
                 output_rx,
+                scripted: false,
+                script_started: false,
+                script_completed: false,
             },
             MockNovaControl { sent, output_tx },
         )
@@ -436,10 +500,53 @@ impl NovaSession for MockNovaSession {
         if !valid_external_nova_event(&event) {
             return Err(VoiceRuntimeError::InvalidSignal);
         }
+        let starts_script = self.scripted
+            && !self.script_started
+            && matches!(&event.event, NovaInputEventKind::AudioInput { .. });
+        let completes_script = self.scripted
+            && self.script_started
+            && !self.script_completed
+            && matches!(&event.event, NovaInputEventKind::ToolResult { .. });
         self.sent
             .lock()
             .map_err(|_| VoiceRuntimeError::Closed)?
             .push(event);
+        if starts_script {
+            self.script_started = true;
+            self.output_tx
+                .try_send(NovaOutputEvent::Transcript {
+                    speaker: VoiceTranscriptSpeaker::User,
+                    text: "Run the dev voice round trip.".to_owned(),
+                    is_final: true,
+                })
+                .map_err(|_| VoiceRuntimeError::Closed)?;
+            self.output_tx
+                .try_send(NovaOutputEvent::ToolUse {
+                    tool_use_id: "dev-voice-tool-1".to_owned(),
+                    name: AGENT_TOOL_NAME.to_owned(),
+                    input: serde_json::json!({
+                        "message": "Reply with a brief dev voice confirmation."
+                    }),
+                })
+                .map_err(|_| VoiceRuntimeError::Closed)?;
+        } else if completes_script {
+            self.script_completed = true;
+            self.output_tx
+                .try_send(NovaOutputEvent::Transcript {
+                    speaker: VoiceTranscriptSpeaker::Assistant,
+                    text: "The dev voice round trip completed.".to_owned(),
+                    is_final: true,
+                })
+                .map_err(|_| VoiceRuntimeError::Closed)?;
+            self.output_tx
+                .try_send(NovaOutputEvent::AudioOutput(VoicePcmFrame {
+                    sample_rate_hertz: 24_000,
+                    samples: (0..2_400)
+                        .map(|index| if index % 120 < 60 { 1_200 } else { -1_200 })
+                        .collect(),
+                }))
+                .map_err(|_| VoiceRuntimeError::Closed)?;
+        }
         Ok(())
     }
 
@@ -814,6 +921,30 @@ async fn run_voice_session(resources: VoiceSessionResources) {
             return;
         }
     }
+    let mut startup_nova_events = VecDeque::new();
+    loop {
+        match nova.output().try_recv() {
+            Ok(NovaOutputEvent::ProviderFailed(failure)) => {
+                emit_provider_failure(&output, &session_id, &failure);
+                nova.close();
+                media.close();
+                return;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                emit_fatal(
+                    &output,
+                    &session_id,
+                    VoiceErrorCode::ProviderUnavailable,
+                    "Voice provider closed before the session became ready.",
+                );
+                nova.close();
+                media.close();
+                return;
+            }
+            Ok(event) => startup_nova_events.push_back(event),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+        }
+    }
     send_payload(
         &output,
         FrameKind::VoiceReady,
@@ -1010,7 +1141,14 @@ async fn run_voice_session(resources: VoiceSessionResources) {
                 );
                 emit_state(&output, &session_id, VoiceSessionState::Listening, None, None);
             }
-            nova_event = nova.output().recv() => {
+            nova_event = async {
+                // Keeping `pop_front` inside this provider-event branch prevents cancellation by another
+                // `select!` branch from dropping the buffered provider event.
+                match startup_nova_events.pop_front() {
+                    Some(event) => Some(event),
+                    None => nova.output().recv().await,
+                }
+            } => {
                 let Some(nova_event) = nova_event else {
                     emit_fatal(&output, &session_id, VoiceErrorCode::ProviderUnavailable, "Voice provider closed unexpectedly.");
                     terminal_error = true;
@@ -1241,12 +1379,9 @@ fn start_nova_grammar(
         tool_configuration: serde_json::json!({"tools": [{"toolSpec": NovaToolSpecification {
             name: AGENT_TOOL_NAME.to_owned(),
             description: "Send one ordinary user message to the fixed Tyde agent.".to_owned(),
-            input_schema: serde_json::json!({"json": {
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
-                "additionalProperties": false
-            }}),
+            input_schema: serde_json::json!({
+                "json": agent_tool_input_schema_document().to_string()
+            }),
         }}], "toolChoice": {"auto": {}}}),
     }))?;
     nova.send(NovaInputEvent::new(NovaInputEventKind::ContentStart {
@@ -1436,15 +1571,25 @@ fn emit_provider_failure(output: &Stream, session_id: &VoiceSessionId, failure: 
         "invalid_request" => "AWS rejected the Nova session configuration.",
         "timeout" => "The Nova stream timed out.",
         "service_unavailable" => "Amazon Bedrock is temporarily unavailable.",
-        "credentials_or_transport" => {
-            "AWS credentials could not be used or Bedrock could not be reached. Check the selected profile, region, and network."
-        }
-        "stream_transport" => "The connection to Amazon Bedrock was interrupted.",
         "stream_closed" => "Amazon Bedrock closed the Nova stream unexpectedly.",
         "invalid_response" => "Amazon Bedrock returned an invalid Nova event.",
+        "sdk_construction" => "Tyde could not construct the Amazon Bedrock request.",
+        "dispatch_timeout" => "The Amazon Bedrock request timed out during dispatch.",
+        "dispatch_io" => "The Amazon Bedrock stream transport failed.",
+        "dispatch_user" => "The Amazon Bedrock transport rejected the request locally.",
+        "dispatch_other" => "The Amazon Bedrock request could not be dispatched.",
+        "response_decode" => "Tyde could not decode the Amazon Bedrock response.",
+        "service_error" => "Amazon Bedrock reported an unclassified service error.",
+        "parse_input" => "Amazon Bedrock could not parse a Nova input event.",
+        "unmodeled_validation" => "Amazon Bedrock reported an input validation failure.",
+        "sdk_unknown_variant" => "The AWS SDK reported an unknown failure category.",
         _ => "The Nova provider failed unexpectedly.",
     };
-    emit_fatal(output, session_id, failure.code, message);
+    let message = failure.request_id.as_ref().map_or_else(
+        || message.to_owned(),
+        |request_id| format!("{message} AWS request reference: {request_id}."),
+    );
+    emit_fatal(output, session_id, failure.code, &message);
 }
 
 fn send_payload<T: Serialize>(output: &Stream, kind: FrameKind, payload: &T) {
@@ -1486,6 +1631,14 @@ mod tests {
             .find(|event| matches!(event.event, NovaInputEventKind::PromptStart { .. }))
             .expect("promptStart event");
         let prompt_start = serde_json::to_value(prompt_start).expect("serialize promptStart");
+        let expected_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"]
+        });
+        // The authorized AWS attempt returned the service-side parse_input_chunk fingerprint
+        // for this startup batch, while AWS's executable Nova 2 Sonic sample sends this schema
+        // as a JSON string and omits unsupported top-level fields.
         assert_eq!(
             prompt_start["event"]["promptStart"]["toolConfiguration"],
             serde_json::json!({
@@ -1494,18 +1647,39 @@ mod tests {
                         "name": "send_to_focused_tyde_agent",
                         "description": "Send one ordinary user message to the fixed Tyde agent.",
                         "inputSchema": {
-                            "json": {
-                                "type": "object",
-                                "properties": {"message": {"type": "string"}},
-                                "required": ["message"],
-                                "additionalProperties": false
-                            }
+                            "json": expected_schema.to_string()
                         }
                     }
                 }],
                 "toolChoice": {"auto": {}}
             })
         );
+        let schema_wire = prompt_start["event"]["promptStart"]["toolConfiguration"]["tools"][0]
+            ["toolSpec"]["inputSchema"]["json"]
+            .as_str()
+            .expect("inputSchema.json must be serialized JSON");
+        let schema: serde_json::Value =
+            serde_json::from_str(schema_wire).expect("parse serialized tool schema");
+        assert_eq!(schema, expected_schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["message"]["type"], "string");
+        assert_eq!(schema["required"], serde_json::json!(["message"]));
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(valid_agent_tool_input_schema(&serde_json::Value::String(
+            schema_wire.to_owned()
+        )));
+        assert!(!valid_agent_tool_input_schema(&expected_schema));
+        assert!(!valid_agent_tool_input_schema(&serde_json::Value::String(
+            "{not-json}".to_owned()
+        )));
+        let mut unsupported_schema = expected_schema.clone();
+        unsupported_schema
+            .as_object_mut()
+            .expect("object schema")
+            .insert("additionalProperties".to_owned(), serde_json::json!(false));
+        assert!(!valid_agent_tool_input_schema(&serde_json::Value::String(
+            unsupported_schema.to_string()
+        )));
         let mut open = Vec::new();
         for event in sent {
             match event.event {
@@ -1797,6 +1971,34 @@ mod tests {
         }
     }
 
+    struct FailBeforeReadyNovaProvider;
+
+    impl NovaProvider for FailBeforeReadyNovaProvider {
+        fn open<'a>(&'a self, _settings: &'a VoiceSettings) -> NovaOpenFuture<'a> {
+            Box::pin(async {
+                let (output_tx, output_rx) = mpsc::channel(4);
+                output_tx
+                    .try_send(NovaOutputEvent::Transcript {
+                        speaker: VoiceTranscriptSpeaker::Assistant,
+                        text: "queued before failure".to_owned(),
+                        is_final: true,
+                    })
+                    .expect("seed provider output");
+                output_tx
+                    .try_send(NovaOutputEvent::ProviderFailed(ProviderFailure {
+                        code: VoiceErrorCode::ProviderUnavailable,
+                        category: "dispatch_io".to_owned(),
+                        request_id: Some("request-123".to_owned()),
+                    }))
+                    .expect("seed provider failure");
+                Ok(Box::new(AudioNovaSession {
+                    output_tx: Some(output_tx),
+                    output_rx,
+                }) as Box<dyn NovaSession>)
+            })
+        }
+    }
+
     struct AudioNovaSession {
         output_tx: Option<mpsc::Sender<NovaOutputEvent>>,
         output_rx: mpsc::Receiver<NovaOutputEvent>,
@@ -1866,6 +2068,111 @@ mod tests {
             commands,
             closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn provider_only_dev_runtime_fails_closed() {
+        assert!(VoiceRuntime::dev_mock_provider_if(false).is_none());
+        let runtime = VoiceRuntime::dev_mock_provider_if(true).expect("dev voice runtime");
+        assert!(runtime.is_available());
+        let environment_enabled =
+            std::env::var_os("TYDE_DEV_INSTANCE").as_deref() == Some(std::ffi::OsStr::new("1"));
+        assert_eq!(
+            VoiceRuntime::dev_mock_provider().is_some(),
+            environment_enabled
+        );
+    }
+
+    #[test]
+    fn scripted_dev_provider_exercises_tool_result_and_audio_output() {
+        let mut session = MockNovaSession::standalone(true);
+        let grammar = NovaGrammar::new();
+        start_nova_grammar(&mut session, &grammar).expect("start mock Nova grammar");
+        session
+            .send(
+                audio_input_event(
+                    VoicePcmFrame {
+                        sample_rate_hertz: 16_000,
+                        samples: vec![0; 320],
+                    },
+                    &grammar,
+                )
+                .expect("mock audio input"),
+            )
+            .expect("send mock audio input");
+
+        assert!(matches!(
+            session.output_rx.try_recv(),
+            Ok(NovaOutputEvent::Transcript {
+                speaker: VoiceTranscriptSpeaker::User,
+                is_final: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            session.output_rx.try_recv(),
+            Ok(NovaOutputEvent::ToolUse { tool_use_id, name, input })
+                if tool_use_id == "dev-voice-tool-1"
+                    && name == AGENT_TOOL_NAME
+                    && input["message"] == "Reply with a brief dev voice confirmation."
+        ));
+
+        send_tool_result(
+            &mut session,
+            &grammar,
+            "dev-voice-tool-1".to_owned(),
+            true,
+            "Dev agent response.",
+        )
+        .expect("send mock tool result");
+        assert!(matches!(
+            session.output_rx.try_recv(),
+            Ok(NovaOutputEvent::Transcript {
+                speaker: VoiceTranscriptSpeaker::Assistant,
+                is_final: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            session.output_rx.try_recv(),
+            Ok(NovaOutputEvent::AudioOutput(VoicePcmFrame {
+                sample_rate_hertz: 24_000,
+                samples,
+            })) if samples.len() == 2_400
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_failure_queued_before_ready_suppresses_voice_ready() {
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let output = Stream::new(StreamPath("/voice/session-audio".to_owned()), output_tx);
+        let (_command_tx, command_rx) = mpsc::channel(4);
+        run_voice_session(test_resources(
+            test_agent(),
+            output,
+            VoiceRuntime {
+                provider: Arc::new(FailBeforeReadyNovaProvider),
+                media: Arc::new(FakeMediaFactory),
+                available: true,
+            },
+            command_rx,
+        ))
+        .await;
+        let envelopes: Vec<_> = std::iter::from_fn(|| output_rx.try_recv().ok()).collect();
+        assert!(
+            !envelopes
+                .iter()
+                .any(|envelope| envelope.kind == FrameKind::VoiceReady)
+        );
+        let error = envelopes
+            .iter()
+            .find(|envelope| envelope.kind == FrameKind::VoiceError)
+            .expect("provider VoiceError")
+            .parse_payload::<VoiceErrorPayload>()
+            .expect("valid VoiceError");
+        assert!(error.fatal);
+        assert!(error.message.contains("stream transport failed"));
+        assert!(error.message.contains("request-123"));
     }
 
     #[tokio::test(start_paused = true)]

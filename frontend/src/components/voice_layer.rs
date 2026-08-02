@@ -20,17 +20,19 @@ use crate::voice::{
 };
 
 /// Microphone control for one chat's composer, plus the visible reason when it
-/// is unavailable.
+/// is temporarily unavailable. A host that has voice turned off renders no
+/// entry unless this chat already owns a session that must remain endable.
 ///
 /// Takes the chat's own `agent_ref` rather than reading the global focused
 /// agent: in a split, each composer must target its own chat. Before starting,
 /// the chat is revealed so it becomes the composer owner — otherwise the focus
 /// guard would end the session in the same tick it began.
 ///
-/// The unavailable reason is rendered as **visible text**, not only as `title`
-/// and `aria-label`. A disabled button is not keyboard-focusable in normal
-/// browser behaviour, so a tooltip is unreachable for keyboard and touch users
-/// and the "visible unavailable state" the design calls for would not exist.
+/// Actionable unavailable reasons are rendered as **visible text**, not only as
+/// `title` and `aria-label`. A disabled button is not keyboard-focusable in
+/// normal browser behaviour, so a tooltip is unreachable for keyboard and
+/// touch users and the "visible unavailable state" the design calls for would
+/// not exist.
 #[component]
 pub fn VoiceMicButton(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -64,6 +66,17 @@ pub fn VoiceMicButton(
         })
     };
 
+    let hidden = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            state.host_settings_by_host.with(|_| ());
+            state.active_project.with(|_| ());
+            state.selected_host_id.with(|_| ());
+            let agent = agent_ref.get();
+            !is_live.get() && voice::voice_entry_is_hidden(&state, agent.as_ref())
+        })
+    };
+
     // Only shown when the chat itself is otherwise usable. "Open a chat to use
     // voice" next to every draft composer would be noise, not information.
     let visible_reason = Memo::new(move |_| match readiness.get() {
@@ -71,13 +84,13 @@ pub fn VoiceMicButton(
         _ => None,
     });
 
-    let on_click = {
-        let state = state.clone();
-        move |_| {
-            if is_live.get_untracked() {
-                voice::end(voice::session::VoiceEndReason::UserRequested);
-                return;
-            }
+    let stored_state = StoredValue::new(state.clone());
+    let on_click = move |_| {
+        if is_live.get_untracked() {
+            voice::end(voice::session::VoiceEndReason::UserRequested);
+            return;
+        }
+        stored_state.with_value(|state| {
             // Make this chat the composer owner first. `reveal_tab` moves pane
             // focus as well as activating the tab, which is what makes the
             // started session's target the derived focused agent.
@@ -85,7 +98,7 @@ pub fn VoiceMicButton(
                 center_zone.reveal_tab(tab_id);
             });
             let agent = agent_ref.get_untracked();
-            match voice::availability(&state, agent.as_ref()) {
+            match voice::availability(state, agent.as_ref()) {
                 Ok(target) => voice::start(target),
                 Err(reason) => {
                     crate::components::header::report_user_error(format!(
@@ -94,30 +107,32 @@ pub fn VoiceMicButton(
                     ));
                 }
             }
-        }
+        });
     };
 
     view! {
-        <div class="chat-voice-control">
-            <button
-                type="button"
-                class="chat-voice-btn"
-                class:chat-voice-btn-live=move || is_live.get()
-                data-test="chat-voice-toggle"
-                disabled=move || !is_live.get() && readiness.get().is_err()
-                on:click=on_click
-                aria-pressed=move || if is_live.get() { "true" } else { "false" }
-                aria-label=move || mic_label(is_live.get(), &readiness.get())
-                title=move || mic_label(is_live.get(), &readiness.get())
-            >
-                <span class="chat-voice-btn-glyph" aria-hidden="true">
-                    {move || if is_live.get() { "◉" } else { "🎙" }}
+        <Show when=move || !hidden.get()>
+            <div class="chat-voice-control">
+                <button
+                    type="button"
+                    class="chat-voice-btn"
+                    class:chat-voice-btn-live=move || is_live.get()
+                    data-test="chat-voice-toggle"
+                    disabled=move || !is_live.get() && readiness.get().is_err()
+                    on:click=on_click
+                    aria-pressed=move || if is_live.get() { "true" } else { "false" }
+                    aria-label=move || mic_label(is_live.get(), &readiness.get())
+                    title=move || mic_label(is_live.get(), &readiness.get())
+                >
+                    <span class="chat-voice-btn-glyph" aria-hidden="true">
+                        {move || if is_live.get() { "◉" } else { "🎙" }}
+                    </span>
+                </button>
+                <span class="chat-voice-unavailable" data-test="chat-voice-unavailable">
+                    {move || visible_reason.get()}
                 </span>
-            </button>
-            <span class="chat-voice-unavailable" data-test="chat-voice-unavailable">
-                {move || visible_reason.get()}
-            </span>
-        </div>
+            </div>
+        </Show>
     }
 }
 
@@ -879,12 +894,13 @@ mod wasm_tests {
         let tab = open_chat(&state, AGENT);
         let composer = state.composer_for(tab);
         composer.text.set("a draft the user typed".to_owned());
+        let bound_agent = RwSignal::new(Some(agent_ref(AGENT)));
 
         let handle = mount_to(root.clone().unchecked_into(), {
             let state = state.clone();
             move || {
                 provide_context(state.clone());
-                let bound = Signal::derive(move || Some(agent_ref(AGENT)));
+                let bound = Signal::derive(move || bound_agent.get());
                 view! {
                     <div>
                         // Stands in for the surrounding chat: if voice ever
@@ -930,6 +946,30 @@ mod wasm_tests {
             1,
             "exactly one strip, bound to this chat"
         );
+
+        set_availability(
+            &state,
+            VoiceAvailability::Unavailable {
+                reason: VoiceUnavailableReason::NotEnabled,
+            },
+        );
+        next_tick().await;
+        let end = find(&root, "[data-test='chat-voice-toggle']")
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert_eq!(
+            end.get_attribute("aria-label").as_deref(),
+            Some("End voice"),
+            "turning voice off must not hide the End affordance for its bound session"
+        );
+        assert!(!end.disabled(), "the active session must remain endable");
+        set_availability(
+            &state,
+            VoiceAvailability::Available {
+                direct_connections_only: true,
+            },
+        );
+        next_tick().await;
 
         // ── a live session renders what the host reported ───────────────────
         go_live(VoiceActivity::AgentSpeaking, Some(true));
@@ -1095,6 +1135,71 @@ mod wasm_tests {
             "the reason must reach assistive technology too"
         );
         assert!(!voice::is_engaged(), "a disabled control starts nothing");
+
+        // ── a host with voice turned off renders no entry at all ────────────
+        set_availability(
+            &state,
+            VoiceAvailability::Unavailable {
+                reason: VoiceUnavailableReason::NotEnabled,
+            },
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(HOST.to_owned(), ConnectionStatus::Disconnected);
+        });
+        next_tick().await;
+        assert!(
+            root.query_selector("[data-test='chat-voice-toggle']")
+                .unwrap()
+                .is_none(),
+            "NotEnabled must remove the voice control even while the host is disconnected"
+        );
+        assert!(
+            root.query_selector(".chat-voice-control")
+                .unwrap()
+                .is_none(),
+            "NotEnabled takes precedence over the disconnected reason for the entire entry"
+        );
+
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(HOST.to_owned(), ConnectionStatus::Connected);
+        });
+        set_availability(
+            &state,
+            VoiceAvailability::Available {
+                direct_connections_only: true,
+            },
+        );
+        next_tick().await;
+        assert!(
+            !find(&root, "[data-test='chat-voice-toggle']")
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+                .disabled(),
+            "the real reactive entry returns when the host enables voice"
+        );
+
+        state.selected_host_id.set(Some(HOST.to_owned()));
+        bound_agent.set(None);
+        next_tick().await;
+        assert!(
+            root.query_selector("[data-test='chat-voice-toggle']")
+                .unwrap()
+                .is_some(),
+            "an available selected host keeps the New Chat voice state visible"
+        );
+        set_availability(
+            &state,
+            VoiceAvailability::Unavailable {
+                reason: VoiceUnavailableReason::NotEnabled,
+            },
+        );
+        next_tick().await;
+        assert!(
+            root.query_selector(".chat-voice-control")
+                .unwrap()
+                .is_none(),
+            "a New Chat composer must render no voice entry when its selected host disables voice"
+        );
 
         drop(handle);
         root.remove();

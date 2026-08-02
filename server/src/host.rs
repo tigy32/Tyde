@@ -396,7 +396,25 @@ pub enum VoiceRuntimeMode {
     #[default]
     Production,
     Mock,
+    DevMockProvider,
     Unavailable,
+}
+
+fn validate_voice_runtime_mode(
+    mode: VoiceRuntimeMode,
+    use_mock_backend: bool,
+    dev_instance: bool,
+) -> Result<VoiceRuntimeMode, String> {
+    if mode != VoiceRuntimeMode::DevMockProvider {
+        return Ok(mode);
+    }
+    if !dev_instance {
+        return Err("provider-only mock voice requires TYDE_DEV_INSTANCE=1".to_owned());
+    }
+    if !use_mock_backend {
+        return Err("provider-only mock voice requires the mock chat backend".to_owned());
+    }
+    Ok(mode)
 }
 
 #[derive(Clone, Debug)]
@@ -13832,6 +13850,18 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
+    let voice_runtime_mode = validate_voice_runtime_mode(
+        runtime_config.voice_runtime,
+        use_mock_backend,
+        std::env::var_os("TYDE_DEV_INSTANCE").as_deref() == Some(std::ffi::OsStr::new("1")),
+    )?;
+    let voice_runtime = match voice_runtime_mode {
+        VoiceRuntimeMode::Production => VoiceRuntime::production(),
+        VoiceRuntimeMode::Mock => VoiceRuntime::mock(),
+        VoiceRuntimeMode::DevMockProvider => VoiceRuntime::dev_mock_provider()
+            .ok_or_else(|| "provider-only mock voice is unavailable".to_owned())?,
+        VoiceRuntimeMode::Unavailable => VoiceRuntime::unavailable(),
+    };
     let transcript_root =
         if std::env::var("TYDE_TRANSCRIPT_STORE_DIR").is_ok_and(|path| !path.trim().is_empty()) {
             TranscriptStore::default_root()?
@@ -14027,11 +14057,7 @@ fn spawn_host_inner(
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             voice_sessions: HashMap::new(),
-            voice_runtime: match runtime_config.voice_runtime {
-                VoiceRuntimeMode::Production => VoiceRuntime::production(),
-                VoiceRuntimeMode::Mock => VoiceRuntime::mock(),
-                VoiceRuntimeMode::Unavailable => VoiceRuntime::unavailable(),
-            },
+            voice_runtime,
             workbench_parent_locks: HashMap::new(),
             project_search_ids: HashMap::new(),
             code_intel_routers: HashMap::new(),
@@ -21019,6 +21045,28 @@ mod tests {
         tokio::sync::Mutex::const_new(());
     static SPAWN_NEW_AGENT_FANOUT_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn provider_only_mock_voice_requires_dev_mock_host() {
+        assert_eq!(
+            validate_voice_runtime_mode(VoiceRuntimeMode::Production, false, false)
+                .expect("production remains the default"),
+            VoiceRuntimeMode::Production
+        );
+        assert!(
+            validate_voice_runtime_mode(VoiceRuntimeMode::DevMockProvider, true, false).is_err(),
+            "the mock provider must fail closed outside a dev instance"
+        );
+        assert!(
+            validate_voice_runtime_mode(VoiceRuntimeMode::DevMockProvider, false, true).is_err(),
+            "the mock provider must never accompany a real chat backend"
+        );
+        assert_eq!(
+            validate_voice_runtime_mode(VoiceRuntimeMode::DevMockProvider, true, true)
+                .expect("contained dev QA selection"),
+            VoiceRuntimeMode::DevMockProvider
+        );
+    }
 
     #[test]
     fn bootstrap_delivery_claims_only_uncovered_visibility() {

@@ -1630,7 +1630,9 @@ mod wasm_tests {
             local_host_id: host.clone(),
             agent_id: agent.agent_id.clone(),
         };
-        let state = AppState::new();
+        let (controller, close_count) = lifecycle_controller();
+        let mut state = AppState::new();
+        state.voice = controller.clone();
         state.active_local_host_id.set(Some(host.clone()));
         state.connection_statuses.update(|statuses| {
             statuses.insert(host.clone(), ConnectionStatus::Connected);
@@ -1715,6 +1717,29 @@ mod wasm_tests {
             .dyn_into::<web_sys::HtmlTextAreaElement>()
             .unwrap();
         assert_eq!(input.value(), "preserved draft");
+
+        state.host_settings_by_host.update(|all| {
+            let settings = all.get_mut(&host).expect("active host settings");
+            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NotEnabled,
+            };
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-voice']")
+                .unwrap()
+                .is_none(),
+            "NotEnabled removes the mobile voice entry even while voice is live"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='voice-done']")
+                .unwrap()
+                .is_some(),
+            "the active session keeps its visible Done control"
+        );
+
         state.voice.model().set(VoiceModel::Idle);
         state.host_settings_by_host.update(|all| {
             let settings = all.get_mut(&host).expect("active host settings");
@@ -1738,6 +1763,135 @@ mod wasm_tests {
         assert_eq!(
             reason.text_content().as_deref(),
             Some("Same LAN or VPN required for voice.")
+        );
+
+        state.host_settings_by_host.update(|all| {
+            let settings = all.get_mut(&host).expect("active host settings");
+            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NotEnabled,
+            };
+        });
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-voice']")
+                .unwrap()
+                .is_none(),
+            "NotEnabled removes the idle voice control even while the host is disconnected"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-voice-unavailable']")
+                .unwrap()
+                .is_none(),
+            "NotEnabled takes precedence over the disconnected reason for the entire entry"
+        );
+
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|all| {
+            let settings = all.get_mut(&host).expect("active host settings");
+            settings.voice.availability = protocol::VoiceAvailability::Available {
+                direct_connections_only: true,
+            };
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-voice']")
+                .unwrap()
+                .is_some(),
+            "the real reactive entry returns when voice is enabled"
+        );
+
+        state.active_agent.set(None);
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector("[data-mobile-test='chat-title']")
+                .unwrap()
+                .and_then(|title| title.text_content())
+                .as_deref(),
+            Some("New Chat")
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-voice']")
+                .unwrap()
+                .is_some(),
+            "an available selected host keeps the New Chat voice state visible"
+        );
+        state.host_settings_by_host.update(|all| {
+            let settings = all.get_mut(&host).expect("active host settings");
+            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NotEnabled,
+            };
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".chat-voice-entry")
+                .unwrap()
+                .is_none(),
+            "a New Chat composer must render no voice entry when its selected host disables voice"
+        );
+
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent.agent_id.clone(),
+        }));
+        state.host_settings_by_host.update(|all| {
+            let settings = all.get_mut(&host).expect("active host settings");
+            settings.voice.availability = protocol::VoiceAvailability::Available {
+                direct_connections_only: true,
+            };
+        });
+        next_tick().await;
+
+        controller.start(voice_target(&agent));
+        next_tick().await;
+        next_tick().await;
+        let session = controller.model().with_untracked(|model| match model {
+            VoiceModel::Live {
+                session: Some(session),
+                ..
+            } => session.clone(),
+            other => panic!("voice start must create a signaling session, got {other:?}"),
+        });
+        let provider_message = "The connection to Amazon Bedrock was interrupted.";
+        controller.apply_error(
+            &host,
+            &session.stream,
+            protocol::VoiceErrorPayload {
+                session_id: protocol::VoiceSessionId(session.id.clone()),
+                code: protocol::VoiceErrorCode::ProviderUnavailable,
+                message: provider_message.to_owned(),
+                fatal: true,
+            },
+        );
+        next_tick().await;
+        let error_text = container
+            .query_selector("[data-mobile-test='voice-error']")
+            .unwrap()
+            .expect("the mounted voice surface must render the provider failure")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            error_text.contains(provider_message),
+            "mobile must preserve the host-supplied provider message, got {error_text:?}"
+        );
+        assert!(
+            !error_text.contains("not configured"),
+            "a provider transport failure must not be rewritten as configuration failure"
+        );
+        assert_eq!(
+            close_count.get(),
+            1,
+            "the real fatal-error path must close the mounted session's media"
         );
         drop(mount);
         container.remove();

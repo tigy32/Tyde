@@ -291,6 +291,33 @@ fn make_platform() -> Option<Rc<dyn MediaPlatform>> {
 
 // ── Availability ────────────────────────────────────────────────────────────
 
+pub(crate) fn voice_entry_is_hidden(state: &AppState, agent: Option<&ActiveAgentRef>) -> bool {
+    let host_id = agent
+        .map(|agent| agent.host_id.clone())
+        .or_else(|| {
+            state
+                .active_project
+                .get_untracked()
+                .map(|project| project.host_id)
+        })
+        .or_else(|| state.selected_host_id.get_untracked());
+    let Some(host_id) = host_id else {
+        return false;
+    };
+    let Some(settings) = state.host_settings_untracked(&host_id) else {
+        return false;
+    };
+    match settings.voice.availability {
+        protocol::VoiceAvailability::Available { .. } => false,
+        protocol::VoiceAvailability::Unavailable { reason } => match reason {
+            protocol::VoiceUnavailableReason::NotEnabled => true,
+            protocol::VoiceUnavailableReason::RegionNotConfigured
+            | protocol::VoiceUnavailableReason::ServerAdapterUnavailable
+            | protocol::VoiceUnavailableReason::NoReachableCandidate => false,
+        },
+    }
+}
+
 /// Can this chat start a voice session right now?
 ///
 /// Every rejection carries a sentence the UI shows verbatim. Availability for

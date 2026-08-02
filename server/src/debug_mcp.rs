@@ -45,6 +45,40 @@ pub const DEBUG_REPO_ROOT_HEADER: &str = "x-tyde-debug-repo-root";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
 const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
+const DEV_VOICE_PROVIDER_ENV: &str = "TYDE_DEV_VOICE_PROVIDER";
+const DEV_VOICE_PROVIDER_MOCK: &str = "mock";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum DevInstanceVoiceProvider {
+    Mock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DevInstanceVoiceEnvironment {
+    provider: DevInstanceVoiceProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevInstanceVoiceEnvironmentAttestation {
+    provider: DevInstanceVoiceProvider,
+    mock_backend: bool,
+    media: &'static str,
+    provider_credentials_stripped: bool,
+}
+
+fn voice_environment_attestation(
+    voice: &DevInstanceVoiceEnvironment,
+) -> DevInstanceVoiceEnvironmentAttestation {
+    DevInstanceVoiceEnvironmentAttestation {
+        provider: voice.provider,
+        mock_backend: true,
+        media: "str0m",
+        provider_credentials_stripped: true,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DebugMcpHandle {
@@ -67,6 +101,7 @@ struct DevInstanceRecord {
     config_path: PathBuf,
     store_dir: PathBuf,
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
+    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     startup_output: Arc<StdMutex<BoundedDebugOutput>>,
     startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
@@ -83,6 +118,8 @@ struct DevInstanceSummary {
     stores_ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -112,6 +149,8 @@ struct StartInstanceToolInput {
     project_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hermes: Option<DisposableHermesEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    voice: Option<DevInstanceVoiceEnvironment>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -198,6 +237,8 @@ struct StartInstanceResult {
     stores_ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -247,7 +288,7 @@ fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
 #[tool_router]
 impl TydeDebugMcpServer {
     #[tool(
-        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, launcher-chain/skipped-wrapper, and isolation attestations after the typed host and UI-debug loopback endpoints are ready. A false launcherEnvironmentPreserved value means skipped shell-wrapper environment was not reproduced. Stop and restart it to pick up code changes."
+        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input contains Hermes behind an IPv4 loopback stub. An optional voice.provider=mock input selects a mock chat backend and mocks only Nova while retaining real str0m WebRTC; provider credentials are stripped and provider proxy egress is denied. Returns canonical store and containment attestations after the typed host and UI-debug loopback endpoints are ready. Stop and restart it to pick up code changes."
     )]
     async fn tyde_dev_instance_start(
         &self,
@@ -452,6 +493,7 @@ async fn start_instance(
         .zip(resolved_hermes_runtime.as_ref())
         .map(|(hermes, runtime)| prepare_disposable_hermes_environment(&store_dir, hermes, runtime))
         .transpose()?;
+    let voice_environment = input.voice.as_ref().map(voice_environment_attestation);
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
@@ -464,7 +506,12 @@ async fn start_instance(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref());
+    configure_dev_instance_environment(
+        &mut command,
+        &store_dir,
+        prepared_hermes.as_ref(),
+        input.voice.as_ref(),
+    )?;
 
     let mut child = command
         .group_spawn()
@@ -497,6 +544,7 @@ async fn start_instance(
         config_path,
         store_dir,
         hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
+        voice_environment,
         startup_output,
         startup_capture_tasks,
         child,
@@ -516,6 +564,7 @@ async fn start_instance(
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
         hermes_environment: record.hermes_environment.clone(),
+        voice_environment: record.voice_environment.clone(),
         frontend_url: frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -532,18 +581,37 @@ fn configure_dev_instance_environment(
     command: &mut Command,
     store_dir: &Path,
     hermes: Option<&PreparedDisposableHermesEnvironment>,
-) {
+    voice: Option<&DevInstanceVoiceEnvironment>,
+) -> Result<(), String> {
     for (env, path) in dev_instance_mutable_paths(store_dir) {
         command.env(env, path);
     }
-    let Some(hermes) = hermes else {
-        return;
-    };
-
-    preserve_toolchain_homes(command);
-    command
-        .env(DEV_INSTANCE_HOME_ENV, &hermes.home)
-        .env(DEV_INSTANCE_HERMES_HOME_ENV, &hermes.hermes_home);
+    command.env_remove(DEV_VOICE_PROVIDER_ENV);
+    if let Some(hermes) = hermes {
+        preserve_toolchain_homes(command, &hermes.home)?;
+        command
+            .env(DEV_INSTANCE_HOME_ENV, &hermes.home)
+            .env(DEV_INSTANCE_HERMES_HOME_ENV, &hermes.hermes_home);
+        if let Some(executable) = &hermes.runtime.executable {
+            command.env(DEV_INSTANCE_HERMES_EXECUTABLE_ENV, executable);
+        }
+        if let Some(python) = &hermes.runtime.python {
+            command.env(DEV_INSTANCE_HERMES_PYTHON_ENV, python);
+        }
+    } else if voice.is_some() {
+        preserve_toolchain_homes(command, store_dir)?;
+        command.env(DEV_INSTANCE_HOME_ENV, store_dir);
+    }
+    if let Some(voice) = voice {
+        match voice.provider {
+            DevInstanceVoiceProvider::Mock => {
+                command.env(DEV_VOICE_PROVIDER_ENV, DEV_VOICE_PROVIDER_MOCK);
+            }
+        }
+    }
+    if hermes.is_none() && voice.is_none() {
+        return Ok(());
+    }
     for env in DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS {
         command.env_remove(env);
     }
@@ -551,12 +619,6 @@ fn configure_dev_instance_environment(
         if is_provider_environment_key(&env) {
             command.env_remove(env);
         }
-    }
-    if let Some(executable) = &hermes.runtime.executable {
-        command.env(DEV_INSTANCE_HERMES_EXECUTABLE_ENV, executable);
-    }
-    if let Some(python) = &hermes.runtime.python {
-        command.env(DEV_INSTANCE_HERMES_PYTHON_ENV, python);
     }
     for env in [
         "HTTP_PROXY",
@@ -573,18 +635,24 @@ fn configure_dev_instance_environment(
         .env("GOOGLE_CLOUD_DISABLE_GCE_CHECK", "true")
         .env("NO_PROXY", "127.0.0.1")
         .env("no_proxy", "127.0.0.1");
+    Ok(())
 }
 
-fn preserve_toolchain_homes(command: &mut Command) {
+fn preserve_toolchain_homes(command: &mut Command, isolated_home: &Path) -> Result<(), String> {
     let home = std::env::var_os(DEV_INSTANCE_HOME_ENV);
     let cargo_home = std::env::var_os("CARGO_HOME");
     let rustup_home = std::env::var_os("RUSTUP_HOME");
+    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME");
     preserve_toolchain_homes_from(
         command,
         home.as_deref(),
         cargo_home.as_deref(),
         rustup_home.as_deref(),
     );
+    preserve_trunk_tool_cache_from(isolated_home, home.as_deref(), xdg_cache_home.as_deref())?;
+    #[cfg(target_os = "linux")]
+    command.env("XDG_CACHE_HOME", isolated_home.join(".cache"));
+    Ok(())
 }
 
 fn preserve_toolchain_homes_from(
@@ -603,6 +671,89 @@ fn preserve_toolchain_homes_from(
     } else if let Some(home) = home {
         command.env("RUSTUP_HOME", PathBuf::from(home).join(".rustup"));
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn trunk_tool_cache_paths(
+    isolated_home: &Path,
+    parent_home: &Path,
+    parent_xdg_cache_home: Option<&std::ffi::OsStr>,
+) -> (PathBuf, PathBuf) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = parent_xdg_cache_home;
+        let relative = Path::new("Library/Caches/dev.trunkrs.trunk");
+        (parent_home.join(relative), isolated_home.join(relative))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let parent_cache_root = parent_xdg_cache_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| parent_home.join(".cache"));
+        (
+            parent_cache_root.join("trunk"),
+            isolated_home.join(".cache/trunk"),
+        )
+    }
+}
+
+fn preserve_trunk_tool_cache_from(
+    isolated_home: &Path,
+    parent_home: Option<&std::ffi::OsStr>,
+    parent_xdg_cache_home: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let Some(parent_home) = parent_home else {
+            return Ok(());
+        };
+        let (source, destination) =
+            trunk_tool_cache_paths(isolated_home, Path::new(parent_home), parent_xdg_cache_home);
+        if !source.is_dir() {
+            return Ok(());
+        }
+        if destination.exists() {
+            let linked = std::fs::canonicalize(&destination).map_err(|error| {
+                format!(
+                    "failed to resolve preserved Trunk tool cache {}: {error}",
+                    destination.display()
+                )
+            })?;
+            let source = std::fs::canonicalize(&source).map_err(|error| {
+                format!(
+                    "failed to resolve parent Trunk tool cache {}: {error}",
+                    source.display()
+                )
+            })?;
+            return if linked == source {
+                Ok(())
+            } else {
+                Err(format!(
+                    "isolated Trunk tool cache {} does not point to the parent cache",
+                    destination.display()
+                ))
+            };
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "isolated Trunk cache path has no parent".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to prepare isolated Trunk cache parent {}: {error}",
+                parent.display()
+            )
+        })?;
+        std::os::unix::fs::symlink(&source, &destination).map_err(|error| {
+            format!(
+                "failed to preserve Trunk tool cache {} at {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (isolated_home, parent_home, parent_xdg_cache_home);
+    Ok(())
 }
 
 fn resolve_parent_hermes_runtime_for_dev_instance()
@@ -856,6 +1007,7 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
         hermes_environment: record.hermes_environment.clone(),
+        voice_environment: record.voice_environment.clone(),
         frontend_url: record.frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -1234,7 +1386,8 @@ mod tests {
     fn dev_instance_environment_isolates_every_mutable_path() {
         let store_dir = Path::new("/isolated/tyde-instance");
         let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store_dir, None);
+        configure_dev_instance_environment(&mut command, store_dir, None, None)
+            .expect("configure default dev environment");
         let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
 
         for entry in devtools_protocol::DEV_INSTANCE_MUTABLE_PATHS {
@@ -1260,6 +1413,142 @@ mod tests {
     }
 
     #[test]
+    fn typed_voice_option_accepts_only_mock_provider() {
+        let parsed: StartInstanceToolInput = serde_json::from_value(json!({
+            "project_dir": "/repo",
+            "voice": {"provider": "mock"}
+        }))
+        .expect("typed mock voice option");
+        assert_eq!(
+            parsed.voice.expect("voice option").provider,
+            DevInstanceVoiceProvider::Mock
+        );
+        assert!(
+            serde_json::from_value::<StartInstanceToolInput>(json!({
+                "project_dir": "/repo",
+                "voice": {"provider": "mock", "endpoint": "https://example.invalid"}
+            }))
+            .is_err(),
+            "nested voice fields must fail closed"
+        );
+        assert!(
+            serde_json::from_value::<StartInstanceToolInput>(json!({
+                "project_dir": "/repo",
+                "voiceProvider": "mock"
+            }))
+            .is_err(),
+            "the duplicated launch contract must remain typed"
+        );
+    }
+
+    #[test]
+    fn mock_voice_environment_strips_providers_and_attests_real_media() {
+        let store = tempfile::tempdir().expect("store dir");
+        let voice = DevInstanceVoiceEnvironment {
+            provider: DevInstanceVoiceProvider::Mock,
+        };
+        let mut command = Command::new("tyde");
+        configure_dev_instance_environment(&mut command, store.path(), None, Some(&voice))
+            .expect("configure mock voice environment");
+        let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_ENV))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_MOCK))
+        );
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_PROFILE",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ] {
+            assert_eq!(
+                configured.get(std::ffi::OsStr::new(key)).copied(),
+                Some(None),
+                "{key} must not reach mock voice mode"
+            );
+        }
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("AWS_EC2_METADATA_DISABLED"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("true"))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("HTTPS_PROXY"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new(DEV_INSTANCE_DENY_PROXY_URL))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV))
+                .copied()
+                .flatten(),
+            Some(store.path().as_os_str()),
+            "voice-only mode must not expose credential files from the parent home"
+        );
+        assert_eq!(
+            voice_environment_attestation(&voice),
+            DevInstanceVoiceEnvironmentAttestation {
+                provider: DevInstanceVoiceProvider::Mock,
+                mock_backend: true,
+                media: "str0m",
+                provider_credentials_stripped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn start_input_schema_keeps_voice_option_closed_and_optional() {
+        let schema = serde_json::to_value(schemars::schema_for!(StartInstanceToolInput))
+            .expect("serialize start schema");
+        // Cargo.lock resolves rmcp's schema API to schemars 1.2.1. Its
+        // allow_null source appends <()>::json_schema to anyOf, and its unit
+        // primitive is defined by simple_impl!(() => "null"), which serializes
+        // as {"type":"null"}; the canonical check refuted const:null here.
+        let voice_option = schema["properties"]["voice"]
+            .get("anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("optional voice schema must use anyOf");
+        assert_eq!(voice_option.len(), 2, "voice must have one value and null");
+        let non_null: Vec<_> = voice_option
+            .iter()
+            .filter(|branch| branch.get("$ref").is_some())
+            .collect();
+        assert_eq!(non_null.len(), 1, "voice must have exactly one ref branch");
+        assert_eq!(
+            non_null[0],
+            &json!({"$ref": "#/$defs/DevInstanceVoiceEnvironment"})
+        );
+        let nullable: Vec<_> = voice_option
+            .iter()
+            .filter(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+            .collect();
+        assert_eq!(nullable.len(), 1, "voice must have exactly one null branch");
+        assert_eq!(nullable[0], &json!({"type": "null"}));
+
+        let voice = &schema["$defs"]["DevInstanceVoiceEnvironment"];
+        assert_eq!(voice["additionalProperties"], json!(false));
+        assert_eq!(
+            voice["properties"]["provider"]["$ref"],
+            json!("#/$defs/DevInstanceVoiceProvider")
+        );
+        assert_eq!(
+            schema["$defs"]["DevInstanceVoiceProvider"]["enum"],
+            json!(["mock"])
+        );
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!(["project_dir"]));
+    }
+
+    #[test]
     fn disposable_hermes_environment_is_attested_and_denies_provider_egress() {
         let store = tempfile::tempdir().expect("store dir");
         let runtime = devtools_protocol::ResolvedHermesRuntime {
@@ -1279,7 +1568,8 @@ mod tests {
         )
         .expect("prepare Hermes environment");
         let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store.path(), Some(&prepared));
+        configure_dev_instance_environment(&mut command, store.path(), Some(&prepared), None)
+            .expect("configure Hermes environment");
         let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
 
         assert_eq!(
@@ -1427,6 +1717,39 @@ mod tests {
                 .copied()
                 .flatten(),
             Some(std::ffi::OsStr::new("/toolchain/rustup"))
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn trunk_cache_survives_while_home_remains_isolated() {
+        let parent = tempfile::tempdir().expect("parent home");
+        let store = tempfile::tempdir().expect("dev store");
+        let isolated_home = store.path().join("home");
+        std::fs::create_dir(&isolated_home).expect("create isolated home");
+        let (source, destination) = trunk_tool_cache_paths(&isolated_home, parent.path(), None);
+        std::fs::create_dir_all(&source).expect("create parent Trunk cache");
+        std::fs::write(source.join("wasm-bindgen-marker"), b"cached")
+            .expect("seed parent Trunk cache");
+
+        preserve_trunk_tool_cache_from(&isolated_home, Some(parent.path().as_os_str()), None)
+            .expect("preserve Trunk cache");
+        let mut command = Command::new("tyde");
+        command.env(DEV_INSTANCE_HOME_ENV, &isolated_home);
+        let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV))
+                .copied()
+                .flatten(),
+            Some(isolated_home.as_os_str())
+        );
+        assert!(isolated_home.starts_with(store.path()));
+        assert!(!source.starts_with(store.path()));
+        assert_eq!(
+            std::fs::canonicalize(destination).expect("resolve linked Trunk cache"),
+            std::fs::canonicalize(source).expect("resolve parent Trunk cache")
         );
     }
 

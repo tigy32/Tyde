@@ -28,6 +28,53 @@ use tauri_plugin_dialog::{
     DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
 
+const DEV_INSTANCE_ENV: &str = "TYDE_DEV_INSTANCE";
+const DEV_VOICE_PROVIDER_ENV: &str = "TYDE_DEV_VOICE_PROVIDER";
+const DEV_VOICE_PROVIDER_MOCK: &str = "mock";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddedHostMode {
+    Production,
+    DevMockVoice,
+}
+
+fn embedded_host_mode_from(
+    dev_instance: Option<&std::ffi::OsStr>,
+    voice_provider: Option<&std::ffi::OsStr>,
+) -> Result<EmbeddedHostMode, String> {
+    match voice_provider {
+        None => Ok(EmbeddedHostMode::Production),
+        Some(provider) if provider == DEV_VOICE_PROVIDER_MOCK => {
+            if dev_instance == Some(std::ffi::OsStr::new("1")) {
+                Ok(EmbeddedHostMode::DevMockVoice)
+            } else {
+                Err("mock voice provider requires TYDE_DEV_INSTANCE=1".to_owned())
+            }
+        }
+        Some(_) => Err(format!("unsupported {DEV_VOICE_PROVIDER_ENV} value")),
+    }
+}
+
+fn embedded_host_mode() -> Result<EmbeddedHostMode, String> {
+    let dev_instance = std::env::var_os(DEV_INSTANCE_ENV);
+    let voice_provider = std::env::var_os(DEV_VOICE_PROVIDER_ENV);
+    embedded_host_mode_from(dev_instance.as_deref(), voice_provider.as_deref())
+}
+
+fn embedded_host_runtime_config(mode: EmbeddedHostMode) -> (bool, server::HostRuntimeConfig) {
+    match mode {
+        EmbeddedHostMode::Production => (false, server::HostRuntimeConfig::default()),
+        EmbeddedHostMode::DevMockVoice => (
+            true,
+            server::HostRuntimeConfig {
+                skip_real_backend_probe: true,
+                voice_runtime: server::VoiceRuntimeMode::DevMockProvider,
+                ..server::HostRuntimeConfig::default()
+            },
+        ),
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos_webview_defaults {
     use std::ffi::CString;
@@ -759,6 +806,62 @@ mod tests {
     }
 
     #[test]
+    fn embedded_host_mode_defaults_to_production() {
+        assert_eq!(
+            embedded_host_mode_from(None, None).expect("default host mode"),
+            EmbeddedHostMode::Production
+        );
+        assert_eq!(
+            embedded_host_mode_from(Some(std::ffi::OsStr::new("1")), None)
+                .expect("ordinary dev instance host mode"),
+            EmbeddedHostMode::Production
+        );
+    }
+
+    #[test]
+    fn embedded_host_mode_selects_mock_voice_only_inside_dev_instance() {
+        assert_eq!(
+            embedded_host_mode_from(
+                Some(std::ffi::OsStr::new("1")),
+                Some(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_MOCK)),
+            )
+            .expect("contained voice QA mode"),
+            EmbeddedHostMode::DevMockVoice
+        );
+        assert!(
+            embedded_host_mode_from(None, Some(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_MOCK)))
+                .is_err()
+        );
+        assert!(
+            embedded_host_mode_from(
+                Some(std::ffi::OsStr::new("0")),
+                Some(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_MOCK))
+            )
+            .is_err()
+        );
+        assert!(
+            embedded_host_mode_from(
+                Some(std::ffi::OsStr::new("1")),
+                Some(std::ffi::OsStr::new("production"))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn embedded_host_mock_voice_selects_mock_chat_and_provider_only_runtime() {
+        let (use_mock_backend, runtime_config) =
+            embedded_host_runtime_config(EmbeddedHostMode::DevMockVoice);
+
+        assert!(use_mock_backend);
+        assert!(runtime_config.skip_real_backend_probe);
+        assert_eq!(
+            runtime_config.voice_runtime,
+            server::VoiceRuntimeMode::DevMockProvider
+        );
+    }
+
+    #[test]
     fn external_url_validation_allows_web_and_mail_links() {
         let dev = dev_url(1420);
         let dev = Some(&dev);
@@ -1256,15 +1359,29 @@ pub fn run() {
                 tracing::info!("ui debug HTTP server ready at {url}");
             }
 
-            let host = server::spawn_host_with_store_paths_and_runtime_config(
-                server::store::session::SessionStore::default_path()
-                    .map_err(std::io::Error::other)?,
-                server::store::project::ProjectStore::default_path()
-                    .map_err(std::io::Error::other)?,
-                server::store::settings::HostSettingsStore::default_path()
-                    .map_err(std::io::Error::other)?,
-                server::HostRuntimeConfig::default(),
-            )
+            let session_path = server::store::session::SessionStore::default_path()
+                .map_err(std::io::Error::other)?;
+            let project_path = server::store::project::ProjectStore::default_path()
+                .map_err(std::io::Error::other)?;
+            let settings_path = server::store::settings::HostSettingsStore::default_path()
+                .map_err(std::io::Error::other)?;
+            let (use_mock_backend, runtime_config) =
+                embedded_host_runtime_config(embedded_host_mode().map_err(std::io::Error::other)?);
+            let host = if use_mock_backend {
+                server::spawn_host_with_mock_backend_and_runtime_config(
+                    session_path,
+                    project_path,
+                    settings_path,
+                    runtime_config,
+                )
+            } else {
+                server::spawn_host_with_store_paths_and_runtime_config(
+                    session_path,
+                    project_path,
+                    settings_path,
+                    runtime_config,
+                )
+            }
             .map_err(std::io::Error::other)?;
 
             if let Some(addr) =

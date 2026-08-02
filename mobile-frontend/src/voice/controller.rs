@@ -27,6 +27,7 @@ const DISCONNECTED_GRACE: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VoiceEntryAvailability {
     Available,
+    Hidden(&'static str),
     Unavailable(&'static str),
 }
 
@@ -282,10 +283,10 @@ impl VoiceController {
         ) {
             return Err("Voice needs a connected Tyde host.".to_owned());
         }
-        if let VoiceEntryAvailability::Unavailable(reason) =
-            Self::entry_availability_for_active_agent(state)
-        {
-            return Err(reason.to_owned());
+        match Self::entry_availability_for_active_agent(state) {
+            VoiceEntryAvailability::Available => {}
+            VoiceEntryAvailability::Hidden(reason)
+            | VoiceEntryAvailability::Unavailable(reason) => return Err(reason.to_owned()),
         }
         state
             .agents
@@ -307,32 +308,42 @@ impl VoiceController {
     }
 
     pub fn entry_availability_for_active_agent(state: &AppState) -> VoiceEntryAvailability {
-        let Some(active) = state.active_agent.get_untracked() else {
-            return VoiceEntryAvailability::Unavailable("Open an agent to use voice.");
-        };
-        if !matches!(
-            state
-                .connection_statuses
-                .with_untracked(|statuses| statuses.get(&active.local_host_id).cloned()),
-            Some(ConnectionStatus::Connected)
-        ) {
-            return VoiceEntryAvailability::Unavailable("Reconnect the host to use voice.");
-        }
+        let active = state.active_agent.get_untracked();
+        let host = active
+            .as_ref()
+            .map(|active| active.local_host_id.clone())
+            .or_else(|| state.active_local_host_id.get_untracked());
         let availability = state.host_settings_by_host.with_untracked(|settings| {
-            settings
-                .get(&active.local_host_id)
-                .map(|settings| settings.voice.availability.clone())
+            host.as_ref().and_then(|host| {
+                settings
+                    .get(host)
+                    .map(|settings| settings.voice.availability.clone())
+            })
+        });
+        let connected = host.as_ref().is_some_and(|host| {
+            matches!(
+                state
+                    .connection_statuses
+                    .with_untracked(|statuses| statuses.get(host).cloned()),
+                Some(ConnectionStatus::Connected)
+            )
         });
         match availability {
+            Some(protocol::VoiceAvailability::Unavailable {
+                reason: protocol::VoiceUnavailableReason::NotEnabled,
+            }) => VoiceEntryAvailability::Hidden("Enable voice in host settings."),
+            _ if active.is_none() => {
+                VoiceEntryAvailability::Unavailable("Open an agent to use voice.")
+            }
+            _ if !connected => {
+                VoiceEntryAvailability::Unavailable("Reconnect the host to use voice.")
+            }
             Some(protocol::VoiceAvailability::Available { .. }) => {
                 VoiceEntryAvailability::Available
             }
             Some(protocol::VoiceAvailability::Unavailable {
                 reason: protocol::VoiceUnavailableReason::NoReachableCandidate,
             }) => VoiceEntryAvailability::Unavailable("Same LAN or VPN required for voice."),
-            Some(protocol::VoiceAvailability::Unavailable {
-                reason: protocol::VoiceUnavailableReason::NotEnabled,
-            }) => VoiceEntryAvailability::Unavailable("Enable voice in host settings."),
             Some(protocol::VoiceAvailability::Unavailable {
                 reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
             }) => VoiceEntryAvailability::Unavailable("Set the AWS region on the host."),
@@ -678,21 +689,21 @@ impl VoiceController {
         };
         let message = match payload.code {
             VoiceErrorCode::MediaNegotiationFailed => {
-                "Voice is unavailable: no direct route to this Tyde host. Connect both devices to the same LAN or VPN and try again."
+                "Voice is unavailable: no direct route to this Tyde host. Connect both devices to the same LAN or VPN and try again.".to_owned()
             }
             VoiceErrorCode::NotAvailable | VoiceErrorCode::ProviderUnavailable => {
-                "Voice is not configured on this Tyde host."
+                payload.message.clone()
             }
             VoiceErrorCode::AgentUnavailable => {
-                "The selected agent is no longer available for voice."
+                "The selected agent is no longer available for voice.".to_owned()
             }
             VoiceErrorCode::AlreadyActive => {
-                "Another voice session is already active on this host."
+                "Another voice session is already active on this host.".to_owned()
             }
-            _ => "The voice session ended because the host reported an error.",
+            _ => "The voice session ended because the host reported an error.".to_owned(),
         };
         if payload.fatal {
-            self.fail_current(generation, message.to_owned());
+            self.fail_current(generation, message);
         }
     }
 
@@ -1729,6 +1740,22 @@ mod tests {
             VoiceController::entry_availability_for_active_agent(&state),
             VoiceEntryAvailability::Unavailable("Same LAN or VPN required for voice.")
         );
+        settings.voice.availability = protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::NotEnabled,
+        };
+        state.host_settings_by_host.update(|all| {
+            all.insert(host.clone(), settings.clone());
+        });
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
+        });
+        assert_eq!(
+            VoiceController::entry_availability_for_active_agent(&state),
+            VoiceEntryAvailability::Hidden("Enable voice in host settings.")
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
         settings.voice.availability = protocol::VoiceAvailability::Available {
             direct_connections_only: true,
         };
