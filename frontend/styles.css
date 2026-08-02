@@ -4549,41 +4549,6 @@ kbd {
     display: none;
 }
 
-.summary-view-tabs {
-    display: flex;
-    min-height: 44px;
-    padding: 0 8px;
-    border-bottom: 1px solid var(--border-primary);
-}
-
-.summary-view-tab {
-    min-width: 88px;
-    min-height: 44px;
-    padding: 8px 16px;
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    font: inherit;
-    font-weight: 600;
-}
-
-.summary-view-tab[aria-selected="true"] {
-    border-bottom-color: var(--accent-primary);
-    color: var(--text-primary);
-}
-
-.summary-view-tab[aria-disabled="true"] {
-    color: var(--text-tertiary);
-    cursor: default;
-    opacity: 0.55;
-}
-
-.summary-view-tab[aria-disabled="false"]:hover {
-    background: rgba(128, 128, 128, 0.1);
-}
-
 /* --- Task View --- */
 .summary-task-view {
     display: flex;
@@ -5017,6 +4982,58 @@ kbd {
 
 .context-breakdown-dot.dot-context {
     background: #bf69ff;
+}
+
+.context-task-hint {
+    margin-left: auto;
+    padding: 0;
+    border: none;
+    background: none;
+    color: #2f8ff6;
+    cursor: pointer;
+    font-size: 0.769rem;
+    opacity: 0.7;
+    white-space: nowrap;
+    transition: opacity 0.2s, color 0.2s;
+}
+
+.context-task-hint:hover {
+    opacity: 1;
+    text-decoration: underline;
+}
+
+.context-mini-bar {
+    display: flex;
+    height: 4px;
+    margin: 4px 12px 6px;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid rgba(128, 128, 128, 0.15);
+    border-radius: 2px;
+    background: rgba(128, 128, 128, 0.15);
+    cursor: pointer;
+    transition:
+        height 0.2s ease,
+        box-shadow 0.2s ease,
+        filter 0.2s ease,
+        border-color 0.2s ease;
+}
+
+.context-mini-bar.context-unknown {
+    background: repeating-linear-gradient(
+        135deg,
+        rgba(128, 128, 128, 0.18),
+        rgba(128, 128, 128, 0.18) 4px,
+        rgba(128, 128, 128, 0.08) 4px,
+        rgba(128, 128, 128, 0.08) 8px
+    );
+}
+
+.context-mini-bar:hover {
+    height: 8px;
+    border-color: rgba(99, 179, 237, 0.4);
+    box-shadow: 0 0 6px rgba(99, 179, 237, 0.25);
+    filter: brightness(1.2);
 }
 
 /* ===== Dock Tabs & Inner ===== */

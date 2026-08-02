@@ -18,6 +18,14 @@ struct ContextCategory {
     percent: f64,
 }
 
+struct TaskViewContext {
+    breakdown: Option<ContextBreakdown>,
+    is_unknown: bool,
+    is_available: bool,
+    preferred_view: RwSignal<SummaryView>,
+    panel_id: String,
+}
+
 #[component]
 pub fn TaskListView(
     agent_id: Signal<Option<AgentId>>,
@@ -26,16 +34,11 @@ pub fn TaskListView(
     current_context_usage: Signal<Option<CurrentContextUsage>>,
 ) -> impl IntoView {
     let preferred_view = RwSignal::new(SummaryView::Context);
-    let focused_view = RwSignal::new(SummaryView::Context);
     let collapsed = RwSignal::new(false);
     let last_agent_id = RwSignal::new(agent_id.get_untracked());
     let summary_id = NEXT_SUMMARY_ID.fetch_add(1, Ordering::Relaxed);
-    let context_tab_id = format!("conversation-summary-{summary_id}-context-tab");
     let context_panel_id = format!("conversation-summary-{summary_id}-context-panel");
-    let tasks_tab_id = format!("conversation-summary-{summary_id}-tasks-tab");
     let tasks_panel_id = format!("conversation-summary-{summary_id}-tasks-panel");
-    let context_tab_ref = NodeRef::<leptos::html::Button>::new();
-    let tasks_tab_ref = NodeRef::<leptos::html::Button>::new();
 
     let has_context = Memo::new(move |_| {
         current_context_usage.get().is_some()
@@ -56,7 +59,6 @@ pub fn TaskListView(
         if current_agent_id != last_agent_id.get_untracked() {
             last_agent_id.set(current_agent_id);
             preferred_view.set(SummaryView::Context);
-            focused_view.set(SummaryView::Context);
             collapsed.set(false);
         }
     });
@@ -85,92 +87,20 @@ pub fn TaskListView(
                     current_context_usage_now.as_ref(),
                     context_breakdown_now.as_ref(),
                 ).filter(|_| has_context_now);
+                let context_is_unknown = matches!(
+                    current_context_usage_now,
+                    Some(CurrentContextUsage::Unknown)
+                );
 
                 view! {
                     <div class="summary-panel">
-                        <div
-                            class="summary-view-tabs"
-                            role="tablist"
-                            aria-label="Conversation summary"
-                        >
-                            <button
-                                type="button"
-                                class="summary-view-tab"
-                                id=context_tab_id.clone()
-                                role="tab"
-                                data-summary-view="context"
-                                node_ref=context_tab_ref
-                                aria-selected=(view_mode == SummaryView::Context).to_string()
-                                aria-disabled=(!has_context_now).to_string()
-                                aria-controls=context_panel_id.clone()
-                                tabindex=move || if focused_view.get() == SummaryView::Context {
-                                    "0"
-                                } else {
-                                    "-1"
-                                }
-                                on:click=move |_| {
-                                    focused_view.set(SummaryView::Context);
-                                    if has_context_now {
-                                        preferred_view.set(SummaryView::Context);
-                                    }
-                                }
-                                on:keydown=move |event: web_sys::KeyboardEvent| {
-                                    if matches!(event.key().as_str(), "ArrowLeft" | "ArrowRight") {
-                                        event.prevent_default();
-                                        focused_view.set(SummaryView::Tasks);
-                                        if has_tasks_now {
-                                            preferred_view.set(SummaryView::Tasks);
-                                        }
-                                        if let Some(tab) = tasks_tab_ref.get() {
-                                            let _ = tab.focus();
-                                        }
-                                    }
-                                }
-                            >
-                                "Context"
-                            </button>
-                            <button
-                                type="button"
-                                class="summary-view-tab"
-                                id=tasks_tab_id.clone()
-                                role="tab"
-                                data-summary-view="tasks"
-                                node_ref=tasks_tab_ref
-                                aria-selected=(view_mode == SummaryView::Tasks).to_string()
-                                aria-disabled=(!has_tasks_now).to_string()
-                                aria-controls=tasks_panel_id.clone()
-                                tabindex=move || if focused_view.get() == SummaryView::Tasks {
-                                    "0"
-                                } else {
-                                    "-1"
-                                }
-                                on:click=move |_| {
-                                    focused_view.set(SummaryView::Tasks);
-                                    if has_tasks_now {
-                                        preferred_view.set(SummaryView::Tasks);
-                                    }
-                                }
-                                on:keydown=move |event: web_sys::KeyboardEvent| {
-                                    if matches!(event.key().as_str(), "ArrowLeft" | "ArrowRight") {
-                                        event.prevent_default();
-                                        focused_view.set(SummaryView::Context);
-                                        if has_context_now {
-                                            preferred_view.set(SummaryView::Context);
-                                        }
-                                        if let Some(tab) = context_tab_ref.get() {
-                                            let _ = tab.focus();
-                                        }
-                                    }
-                                }
-                            >
-                                "Tasks"
-                            </button>
-                        </div>
                         {render_context_view(
-                            current_context_usage_now.filter(|_| has_context_now),
-                            breakdown,
+                            current_context_usage_now.clone().filter(|_| has_context_now),
+                            breakdown.clone(),
+                            task_list_now.clone().filter(|tasks| !tasks.tasks.is_empty()),
+                            preferred_view,
                             context_panel_id.clone(),
-                            context_tab_id.clone(),
+                            tasks_panel_id.clone(),
                             view_mode != SummaryView::Context,
                         )}
                         {task_list_now
@@ -180,16 +110,19 @@ pub fn TaskListView(
                                     tasks,
                                     collapsed,
                                     tasks_panel_id.clone(),
-                                    tasks_tab_id.clone(),
                                     view_mode != SummaryView::Tasks,
+                                    TaskViewContext {
+                                        breakdown,
+                                        is_unknown: context_is_unknown,
+                                        is_available: has_context_now,
+                                        preferred_view,
+                                        panel_id: context_panel_id.clone(),
+                                    },
                                 )
                                     .into_any()
                             })
                             .unwrap_or_else(|| {
-                                render_empty_task_panel(
-                                    tasks_panel_id.clone(),
-                                    tasks_tab_id.clone(),
-                                )
+                                render_empty_task_panel(tasks_panel_id.clone())
                             })}
                     </div>
                 }
@@ -202,8 +135,10 @@ pub fn TaskListView(
 fn render_context_view(
     current_context_usage: Option<CurrentContextUsage>,
     breakdown: Option<ContextBreakdown>,
+    task_list: Option<TaskList>,
+    preferred_view: RwSignal<SummaryView>,
     panel_id: String,
-    labelled_by: String,
+    tasks_panel_id: String,
     hidden: bool,
 ) -> impl IntoView {
     let metrics = breakdown.as_ref().map(compute_context_metrics);
@@ -214,8 +149,8 @@ fn render_context_view(
         <div
             class="summary-context-view"
             id=panel_id
-            role="tabpanel"
-            aria-labelledby=labelled_by
+            role="region"
+            aria-label="Current context"
             hidden=hidden
         >
                 <div class="summary-context-header">
@@ -307,9 +242,22 @@ fn render_context_view(
                         }).collect::<Vec<_>>()
                     })}
                 </div>
-                {metrics.as_ref().map(|m| view! {
+                {(metrics.is_some() || task_list.is_some()).then(|| view! {
                     <div class="summary-context-meta">
-                        {render_breakdown_or_note(&m.categories, has_detailed_breakdown)}
+                        {metrics.as_ref().map(|m| {
+                            render_breakdown_or_note(&m.categories, has_detailed_breakdown)
+                        })}
+                        {task_list.map(|tasks| view! {
+                            <button
+                                type="button"
+                                class="context-task-hint"
+                                data-summary-action="tasks"
+                                aria-controls=tasks_panel_id
+                                on:click=move |_| preferred_view.set(SummaryView::Tasks)
+                            >
+                                {build_task_hint_text(&tasks.tasks)}
+                            </button>
+                        })}
                     </div>
                 })}
             </div>
@@ -353,8 +301,8 @@ fn render_task_view(
     task_list: TaskList,
     collapsed: RwSignal<bool>,
     panel_id: String,
-    labelled_by: String,
     hidden: bool,
+    context: TaskViewContext,
 ) -> impl IntoView {
     let completed_count = task_list
         .tasks
@@ -367,12 +315,13 @@ fn render_task_view(
     } else {
         task_list.title.clone()
     };
+    let metrics = context.breakdown.as_ref().map(compute_context_metrics);
     view! {
         <div
             class="summary-task-view"
             id=panel_id
-            role="tabpanel"
-            aria-labelledby=labelled_by
+            role="region"
+            aria-label="Tasks"
             hidden=hidden
         >
             <div class="task-list-header">
@@ -409,17 +358,43 @@ fn render_task_view(
                     }
                 }).collect::<Vec<_>>()}
             </div>
+            {context.is_available.then(|| view! {
+                <button
+                    type="button"
+                    class=if context.is_unknown {
+                        "context-mini-bar context-unknown"
+                    } else {
+                        "context-mini-bar"
+                    }
+                    data-summary-action="context"
+                    aria-label="View current context"
+                    aria-controls=context.panel_id
+                    on:click=move |_| context.preferred_view.set(SummaryView::Context)
+                >
+                    {metrics.as_ref().map(|m| {
+                        m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
+                            view! {
+                                <span
+                                    class=format!("summary-context-segment {}", cat.css_class)
+                                    aria-hidden="true"
+                                    style=format!("width: {:.2}%", cat.percent)
+                                ></span>
+                            }
+                        }).collect::<Vec<_>>()
+                    })}
+                </button>
+            })}
         </div>
     }
 }
 
-fn render_empty_task_panel(panel_id: String, labelled_by: String) -> AnyView {
+fn render_empty_task_panel(panel_id: String) -> AnyView {
     view! {
         <div
             class="summary-task-view"
             id=panel_id
-            role="tabpanel"
-            aria-labelledby=labelled_by
+            role="region"
+            aria-label="Tasks"
             hidden
         ></div>
     }
@@ -489,6 +464,23 @@ fn task_rows_for_display(tasks: &[protocol::Task], collapsed: bool) -> Vec<TaskR
             }]
         })
         .unwrap_or_default()
+}
+
+fn build_task_hint_text(tasks: &[protocol::Task]) -> String {
+    let total = tasks.len().max(1);
+    let completed = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Completed))
+        .count();
+    let has_in_progress = tasks
+        .iter()
+        .any(|task| matches!(task.status, TaskStatus::InProgress));
+    if has_in_progress {
+        let current = (completed + 1).min(total);
+        format!("Task {current} of {total} in progress →")
+    } else {
+        format!("{completed}/{total} tasks done →")
+    }
 }
 
 /// The legend when the backend attributed anything, and an explicit note when
@@ -882,6 +874,7 @@ mod wasm_tests {
         agent_id: RwSignal<Option<AgentId>>,
         task_list: RwSignal<Option<TaskList>>,
         breakdown: RwSignal<Option<ContextBreakdown>>,
+        current_usage: RwSignal<Option<CurrentContextUsage>>,
     }
 
     fn task_list(title: &str, description: &str, status: TaskStatus) -> TaskList {
@@ -919,10 +912,12 @@ mod wasm_tests {
                 TaskStatus::InProgress,
             )));
             let breakdown = RwSignal::new(Some(breakdown(2_000)));
+            let current_usage = RwSignal::new(None);
             *slots.borrow_mut() = Some(SummarySignals {
                 agent_id,
                 task_list,
                 breakdown,
+                current_usage,
             });
             let context_breakdown = Memo::new(move |_| breakdown.get());
             view! {
@@ -930,7 +925,7 @@ mod wasm_tests {
                     agent_id=agent_id.into()
                     task_list=task_list.into()
                     context_breakdown=context_breakdown
-                    current_context_usage=Signal::derive(|| None)
+                    current_context_usage=current_usage.into()
                 />
             }
         })
@@ -991,34 +986,25 @@ mod wasm_tests {
         slots.borrow().as_ref().copied().expect("summary signals")
     }
 
-    fn selected(container: &HtmlElement, view: &str) -> bool {
-        button(container, &format!("[data-summary-view='{view}']"))
-            .get_attribute("aria-selected")
-            .as_deref()
-            == Some("true")
-    }
-
-    fn press_key(element: &HtmlElement, key: &str) {
-        let init = web_sys::KeyboardEventInit::new();
-        init.set_key(key);
-        init.set_bubbles(true);
-        init.set_cancelable(true);
-        let event =
-            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap();
-        element.dispatch_event(&event).unwrap();
+    fn panel_is_active(container: &HtmlElement, selector: &str) -> bool {
+        !container
+            .query_selector(selector)
+            .unwrap()
+            .expect("summary panel")
+            .has_attribute("hidden")
     }
 
     #[wasm_bindgen_test]
-    async fn dominant_tabs_switch_both_directions() {
+    async fn compact_controls_switch_both_directions() {
         let container = make_container();
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots);
         next_tick().await;
 
-        assert!(selected(&container, "context"));
-        button(&container, "[data-summary-view='tasks']").click();
+        assert!(panel_is_active(&container, ".summary-context-view"));
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
-        assert!(selected(&container, "tasks"));
+        assert!(panel_is_active(&container, ".summary-task-view"));
         assert!(
             container
                 .text_content()
@@ -1026,9 +1012,9 @@ mod wasm_tests {
                 .contains("Initial task")
         );
 
-        button(&container, "[data-summary-view='context']").click();
+        button(&container, "[data-summary-action='context']").click();
         next_tick().await;
-        assert!(selected(&container, "context"));
+        assert!(panel_is_active(&container, ".summary-context-view"));
         assert!(
             container
                 .text_content()
@@ -1044,7 +1030,7 @@ mod wasm_tests {
         let _handle = mount_summary(&container, slots);
         next_tick().await;
 
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
         let collapse = button(&container, ".task-list-collapse");
         assert_eq!(
@@ -1054,7 +1040,7 @@ mod wasm_tests {
 
         collapse.click();
         next_tick().await;
-        assert!(selected(&container, "tasks"));
+        assert!(panel_is_active(&container, ".summary-task-view"));
         assert_eq!(
             button(&container, ".task-list-collapse")
                 .get_attribute("aria-expanded")
@@ -1062,9 +1048,9 @@ mod wasm_tests {
             Some("false")
         );
 
-        button(&container, "[data-summary-view='context']").click();
+        button(&container, "[data-summary-action='context']").click();
         next_tick().await;
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
         assert_eq!(
             button(&container, ".task-list-collapse")
@@ -1081,7 +1067,7 @@ mod wasm_tests {
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots.clone());
         next_tick().await;
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
 
         let signals = signals(&slots);
@@ -1093,7 +1079,7 @@ mod wasm_tests {
         signals.breakdown.set(Some(breakdown(7_000)));
         next_tick().await;
 
-        assert!(selected(&container, "tasks"));
+        assert!(panel_is_active(&container, ".summary-task-view"));
         let text = container.text_content().unwrap_or_default();
         assert!(text.contains("Reactive task update"), "{text}");
         assert!(
@@ -1112,18 +1098,22 @@ mod wasm_tests {
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots.clone());
         next_tick().await;
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
 
         let signals = signals(&slots);
         signals.task_list.set(None);
         next_tick().await;
-        assert!(selected(&container, "context"));
         assert!(
-            button(&container, "[data-summary-view='tasks']")
-                .get_attribute("aria-disabled")
-                .as_deref()
-                == Some("true")
+            panel_is_active(&container, ".summary-context-view"),
+            "the available context view must be shown during the task gap"
+        );
+        assert!(
+            container
+                .query_selector("[data-summary-action='tasks']")
+                .unwrap()
+                .is_none(),
+            "an unavailable task view must not have a switch control"
         );
 
         signals.task_list.set(Some(task_list(
@@ -1132,7 +1122,7 @@ mod wasm_tests {
             TaskStatus::InProgress,
         )));
         next_tick().await;
-        assert!(selected(&container, "tasks"));
+        assert!(panel_is_active(&container, ".summary-task-view"));
         assert!(
             container
                 .text_content()
@@ -1150,26 +1140,21 @@ mod wasm_tests {
 
         signals(&slots).breakdown.set(None);
         next_tick().await;
-        assert!(selected(&container, "tasks"));
+        assert!(panel_is_active(&container, ".summary-task-view"));
         assert!(
-            button(&container, "[data-summary-view='context']")
-                .get_attribute("aria-disabled")
-                .as_deref()
-                == Some("true"),
-            "an unavailable context view must not remain actionable"
+            container
+                .query_selector("[data-summary-action='context']")
+                .unwrap()
+                .is_none(),
+            "an unavailable context view must not have a switch control"
         );
         assert!(
-            button(&container, "[data-summary-view='tasks']")
-                .get_attribute("aria-disabled")
-                .as_deref()
-                == Some("false"),
-            "the available task view must remain actionable"
-        );
-        button(&container, "[data-summary-view='context']").click();
-        next_tick().await;
-        assert!(
-            selected(&container, "tasks"),
-            "activating an aria-disabled tab must not select unavailable content"
+            container
+                .query_selector(".summary-context-view")
+                .unwrap()
+                .expect("mounted context panel")
+                .has_attribute("hidden"),
+            "the unavailable context panel stays mounted without taking space"
         );
     }
 
@@ -1179,7 +1164,7 @@ mod wasm_tests {
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots.clone());
         next_tick().await;
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
         button(&container, ".task-list-collapse").click();
         next_tick().await;
@@ -1188,9 +1173,9 @@ mod wasm_tests {
             .agent_id
             .set(Some(AgentId("agent-b".to_owned())));
         next_tick().await;
-        assert!(selected(&container, "context"));
+        assert!(panel_is_active(&container, ".summary-context-view"));
 
-        button(&container, "[data-summary-view='tasks']").click();
+        button(&container, "[data-summary-action='tasks']").click();
         next_tick().await;
         assert_eq!(
             button(&container, ".task-list-collapse")
@@ -1202,45 +1187,37 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn tabs_expose_roles_state_and_large_targets() {
+    async fn compact_controls_replace_the_permanent_tab_strip() {
         ensure_styles_loaded();
         let container = make_container();
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots);
         next_tick().await;
 
-        let tablist = container
-            .query_selector(".summary-view-tabs")
-            .unwrap()
-            .expect("tab list");
-        assert_eq!(tablist.get_attribute("role").as_deref(), Some("tablist"));
-        assert_eq!(
-            tablist.get_attribute("aria-label").as_deref(),
-            Some("Conversation summary")
+        assert!(
+            container
+                .query_selector(".summary-view-tabs")
+                .unwrap()
+                .is_none()
         );
-        for view in ["context", "tasks"] {
-            let tab = button(&container, &format!("[data-summary-view='{view}']"));
-            assert_eq!(tab.get_attribute("role").as_deref(), Some("tab"));
-            let rect = tab.get_bounding_client_rect();
-            assert!(rect.width() >= 44.0, "{view} tab width: {}", rect.width());
-            assert!(
-                rect.height() >= 44.0,
-                "{view} tab height: {}",
-                rect.height()
-            );
-        }
+        assert!(container.query_selector("[role='tab']").unwrap().is_none());
+        assert!(
+            container
+                .query_selector("[role='tabpanel']")
+                .unwrap()
+                .is_none()
+        );
+        let hint = button(&container, "[data-summary-action='tasks']");
+        assert!(hint.get_bounding_client_rect().height() < 30.0);
 
-        button(&container, "[data-summary-view='tasks']").click();
+        hint.click();
         next_tick().await;
-        let collapse = button(&container, ".task-list-collapse");
-        assert!(collapse.get_attribute("aria-label").is_some());
-        let rect = collapse.get_bounding_client_rect();
-        assert!(rect.width() >= 44.0, "collapse width: {}", rect.width());
-        assert!(rect.height() >= 44.0, "collapse height: {}", rect.height());
+        let mini = button(&container, "[data-summary-action='context']");
+        assert!(mini.get_bounding_client_rect().height() <= 10.0);
     }
 
     #[wasm_bindgen_test]
-    async fn tabs_and_panels_have_resolved_stable_linkage() {
+    async fn compact_controls_and_panels_have_stable_linkage() {
         ensure_styles_loaded();
         let container = make_container();
         let slots = Rc::new(RefCell::new(None));
@@ -1248,53 +1225,32 @@ mod wasm_tests {
         next_tick().await;
         let document = web_sys::window().unwrap().document().unwrap();
 
-        let context_tab = button(&container, "[data-summary-view='context']");
-        let context_tab_id = context_tab.id();
-        let context_panel_id = context_tab
+        let tasks_control = button(&container, "[data-summary-action='tasks']");
+        let tasks_panel_id = tasks_control
             .get_attribute("aria-controls")
-            .expect("context tab controls a panel");
-        let context_panel = document
-            .get_element_by_id(&context_panel_id)
-            .expect("context aria-controls resolves");
-        assert_eq!(
-            context_panel.get_attribute("aria-labelledby").as_deref(),
-            Some(context_tab_id.as_str())
-        );
+            .expect("task hint controls a panel");
+        let context_panel = container
+            .query_selector(".summary-context-view")
+            .unwrap()
+            .expect("context panel");
+        let context_panel_id = context_panel.id();
         assert_active_panel(&context_panel, "context");
 
-        let tasks_tab = button(&container, "[data-summary-view='tasks']");
-        let tasks_tab_id = tasks_tab.id();
-        let tasks_panel_id = tasks_tab
-            .get_attribute("aria-controls")
-            .expect("tasks tab controls a panel");
         let tasks_panel = document
             .get_element_by_id(&tasks_panel_id)
-            .expect("tasks aria-controls resolves");
-        assert_eq!(
-            tasks_panel.get_attribute("aria-labelledby").as_deref(),
-            Some(tasks_tab_id.as_str())
-        );
+            .expect("task hint aria-controls resolves");
         assert!(
             tasks_panel.has_attribute("hidden"),
             "the inactive but linked task panel stays in the DOM"
         );
         assert_inactive_panel(&tasks_panel, "task");
 
-        tasks_tab.click();
+        tasks_control.click();
         next_tick().await;
+        let context_control = button(&container, "[data-summary-action='context']");
         assert_eq!(
-            button(&container, "[data-summary-view='tasks']")
-                .get_attribute("aria-controls")
-                .as_deref(),
-            Some(tasks_panel_id.as_str()),
-            "panel ids must remain stable across view changes"
-        );
-        assert!(
-            !document
-                .get_element_by_id(&tasks_panel_id)
-                .expect("task panel remains linked")
-                .has_attribute("hidden"),
-            "the selected task panel becomes visible"
+            context_control.get_attribute("aria-controls").as_deref(),
+            Some(context_panel_id.as_str())
         );
         let context_panel = document
             .get_element_by_id(&context_panel_id)
@@ -1305,7 +1261,7 @@ mod wasm_tests {
         assert_inactive_panel(&context_panel, "context");
         assert_active_panel(&tasks_panel, "task");
 
-        button(&container, "[data-summary-view='context']").click();
+        context_control.click();
         next_tick().await;
         let context_panel = document
             .get_element_by_id(&context_panel_id)
@@ -1318,57 +1274,49 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn arrow_keys_roam_focus_and_activate_available_tabs() {
+    async fn task_hint_reports_progress_and_survives_unknown_context() {
         let container = make_container();
         let slots = Rc::new(RefCell::new(None));
         let _handle = mount_summary(&container, slots.clone());
         next_tick().await;
-        let document = web_sys::window().unwrap().document().unwrap();
-
-        let context = button(&container, "[data-summary-view='context']");
-        context.focus().unwrap();
-        press_key(&context, "ArrowRight");
+        let signals = signals(&slots);
+        signals.task_list.set(Some(TaskList {
+            title: "Five tasks".to_owned(),
+            tasks: (0..5)
+                .map(|id| Task {
+                    id,
+                    description: format!("Task {id}"),
+                    status: if id == 0 {
+                        TaskStatus::InProgress
+                    } else {
+                        TaskStatus::Pending
+                    },
+                })
+                .collect(),
+        }));
+        signals.breakdown.set(None);
+        signals
+            .current_usage
+            .set(Some(CurrentContextUsage::Unknown));
         next_tick().await;
-        let tasks = button(&container, "[data-summary-view='tasks']");
-        assert!(selected(&container, "tasks"));
-        assert_eq!(tasks.get_attribute("tabindex").as_deref(), Some("0"));
+        let hint = button(&container, "[data-summary-action='tasks']");
         assert_eq!(
-            document.active_element().map(|element| element.id()),
-            Some(tasks.id())
+            hint.text_content().as_deref(),
+            Some("Task 1 of 5 in progress →")
         );
 
-        press_key(&tasks, "ArrowLeft");
+        hint.click();
         next_tick().await;
-        let context = button(&container, "[data-summary-view='context']");
-        assert!(selected(&container, "context"));
-        assert_eq!(context.get_attribute("tabindex").as_deref(), Some("0"));
-        assert_eq!(
-            document.active_element().map(|element| element.id()),
-            Some(context.id())
-        );
-
-        button(&container, "[data-summary-view='tasks']").click();
-        signals(&slots).breakdown.set(None);
-        next_tick().await;
-        let tasks = button(&container, "[data-summary-view='tasks']");
-        press_key(&tasks, "ArrowLeft");
-        next_tick().await;
-        let unavailable_context = button(&container, "[data-summary-view='context']");
-        assert_eq!(
-            unavailable_context
-                .get_attribute("aria-disabled")
-                .as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            document.active_element().map(|element| element.id()),
-            Some(unavailable_context.id()),
-            "arrow navigation must still reach an unavailable tab"
-        );
+        let mini = button(&container, "[data-summary-action='context']");
         assert!(
-            selected(&container, "tasks"),
-            "focus may reach unavailable content without activating it"
+            mini.get_attribute("class").is_some_and(|classes| classes
+                .split_whitespace()
+                .any(|class| class == "context-unknown")),
+            "unknown context must keep an honest return control"
         );
+        mini.click();
+        next_tick().await;
+        assert!(panel_is_active(&container, ".summary-context-view"));
     }
 
     fn segments(container: &HtmlElement) -> Vec<web_sys::Element> {

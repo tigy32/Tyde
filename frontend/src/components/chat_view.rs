@@ -3023,11 +3023,7 @@ mod wasm_tests {
             "{phase}: constructor-only replay must keep the task panel hidden"
         );
         assert!(
-            query(container, "[data-summary-view='tasks']")
-                .expect("tasks tab shell")
-                .get_attribute("aria-disabled")
-                .as_deref()
-                == Some("true"),
+            query(container, "[data-summary-action='tasks']").is_none(),
             "{phase}: constructor-only replay must not offer an unavailable task view"
         );
         let text = container.text_content().unwrap_or_default();
@@ -3038,12 +3034,10 @@ mod wasm_tests {
     }
 
     fn assert_genuine_terminal_task_render(container: &HtmlElement, phase: &str) {
-        assert_eq!(
-            query(container, "[data-summary-view='tasks']")
-                .expect("tasks tab")
-                .get_attribute("aria-selected")
-                .as_deref(),
-            Some("true"),
+        assert!(
+            !query(container, ".summary-task-view")
+                .expect("task view")
+                .has_attribute("hidden"),
             "{phase}: the selected task view must survive reactive updates"
         );
         assert_eq!(
@@ -3188,10 +3182,10 @@ mod wasm_tests {
             view! { <ChatView tab_id=TabId(27_012) agent_ref=agent_ref is_active=is_active /> }
         });
         next_tick().await;
-        query(&container, "[data-summary-view='tasks']")
-            .expect("genuine task tab")
+        query(&container, "[data-summary-action='tasks']")
+            .expect("genuine task link")
             .dyn_into::<HtmlElement>()
-            .expect("task tab button")
+            .expect("task link button")
             .click();
         next_tick().await;
         assert_genuine_terminal_task_render(&container, "live");

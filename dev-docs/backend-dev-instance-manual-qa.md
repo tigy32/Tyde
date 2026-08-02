@@ -352,19 +352,25 @@ failure.
 6. Confirm tool-only and reasoning-only phases attribute usage to the correct
    completed message without creating an empty row.
 
-### Context Usage bar
+### Current context bar
 
-1. Confirm **Context Usage** appears for the active conversation after usage
+1. Confirm **Current context** appears for the active conversation after usage
    metadata arrives.
-2. Confirm it has a non-empty coloured fill rather than an empty track.
-3. Open **View context usage** and verify counts and percentages are populated,
-   finite, non-negative, and within the reported context-window limit.
-4. Confirm the used-context value is positive and the percentage approximately
+2. If the backend reports category detail, confirm the coloured fill matches it.
+   Otherwise confirm the UI says the breakdown is unavailable instead of
+   inventing categories.
+3. When tasks exist, click the compact task progress link (for example,
+   **Task 1 of 5 in progress →**) and confirm the task list replaces the context
+   view. Click the thin context bar below the task list and confirm it switches
+   back.
+4. Verify context counts and percentages are populated, finite, non-negative,
+   and within the reported context-window limit.
+5. Confirm the used-context value is positive and the percentage approximately
    agrees with `used tokens / context-window tokens`.
-5. After each later turn, confirm the view refreshes and still refers to the
+6. After each later turn, confirm the view refreshes and still refers to the
    active conversation. It need not always increase because a backend may
    compact or report a different authoritative snapshot.
-6. Switch between two chats and confirm neither chat displays the other's
+7. Switch between two chats and confirm neither chat displays the other's
    context snapshot.
 
 ### Task total in Session Settings
@@ -390,7 +396,7 @@ failure.
 These surfaces answer different questions and need not show the same number:
 
 - a message footer shows that request's usage;
-- Context Usage shows the current context-window snapshot;
+- Current context shows the current context-window snapshot;
 - Session Settings shows task-wide cumulative usage, including sub-agents.
 
 They must nevertheless be internally consistent, correctly attributed, and
