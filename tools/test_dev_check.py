@@ -4,6 +4,7 @@ import hashlib
 import os
 import pathlib
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -689,6 +690,16 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             build_job.index("CMAKE_POLICY_VERSION_MINIMUM"),
             build_job.index("- name: Install repository Rust toolchain"),
         )
+
+    def test_macos_release_metadata_is_valid_plist_xml(self) -> None:
+        tauri_shell = REPO_ROOT / "frontend" / "tauri-shell"
+        entitlements = plistlib.loads(
+            (tauri_shell / "Entitlements.plist").read_bytes()
+        )
+        info = plistlib.loads((tauri_shell / "Info.plist").read_bytes())
+
+        self.assertIs(entitlements["com.apple.security.device.audio-input"], True)
+        self.assertTrue(info["NSMicrophoneUsageDescription"])
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
