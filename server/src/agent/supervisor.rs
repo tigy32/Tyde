@@ -19,8 +19,9 @@ use super::{
     HostCapacityTx, HostSubAgentEmitterContext, SpawnCostHint, ToolPolicy, spawn_backend,
 };
 
-/// Byte caps for each supervision prompt section, so one huge message cannot
-/// blow up the (paid) supervision call.
+/// Byte caps for ancillary supervision prompt sections, so one huge message
+/// cannot blow up the (paid) supervision call. The final assistant message is
+/// deliberately uncapped because its actual ending determines the verdict.
 const SUPERVISION_SECTION_MAX_BYTES: usize = 4 * 1024;
 const SUPERVISION_ERROR_MAX_BYTES: usize = 2 * 1024;
 
@@ -447,7 +448,7 @@ fn build_supervision_prompt(request: &GenerateSupervisionVerdictRequest) -> Stri
     let last_agent_message = request
         .last_assistant_message
         .as_deref()
-        .map(|text| cap_text(text, SUPERVISION_SECTION_MAX_BYTES))
+        .map(|text| text.trim().to_owned())
         .unwrap_or_else(|| "None".to_owned());
     let last_error = request
         .last_error
@@ -1210,6 +1211,38 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             "a first verdict has no prior attempt to report"
         );
         assert!(prompt.contains("Those are the only grounds for continue."));
+    }
+
+    #[test]
+    fn prompt_preserves_the_complete_final_assistant_message() {
+        let final_message = format!(
+            "{}\nAll requested work is complete.",
+            "Detailed implementation result. ".repeat(200)
+        );
+        assert!(final_message.len() > SUPERVISION_SECTION_MAX_BYTES);
+        let request = GenerateSupervisionVerdictRequest {
+            verdict_agent_id: AgentId("test".to_owned()),
+            backend_kind: BackendKind::Claude,
+            last_user_message: "implement the parser".to_owned(),
+            task_list: None,
+            last_assistant_message: Some(final_message.clone()),
+            last_error: None,
+            stall_interrupted: false,
+            kicks_so_far: 0,
+            last_kick_message: None,
+            last_reply_to_kick: None,
+            cost_hint: Some(SpawnCostHint::Low),
+            session_settings: None,
+            use_mock_backend: true,
+            capacity_tx: mpsc::unbounded_channel().0,
+        };
+
+        let prompt = build_supervision_prompt(&request);
+        assert!(
+            prompt.contains(&final_message),
+            "the supervisor must see the real ending instead of a synthetic truncation"
+        );
+        assert!(prompt.contains("All requested work is complete."));
     }
 
     #[test]
