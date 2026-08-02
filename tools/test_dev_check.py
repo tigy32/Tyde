@@ -678,6 +678,18 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 linux_install.index("- name: Install repository Rust toolchain"),
             )
 
+    def test_release_build_supports_bundled_opus_with_cmake_four(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        build_job = workflow[workflow.index("  build:") :]
+
+        self.assertIn("      CMAKE_POLICY_VERSION_MINIMUM: '3.5'\n", build_job)
+        self.assertLess(
+            build_job.index("CMAKE_POLICY_VERSION_MINIMUM"),
+            build_job.index("- name: Install repository Rust toolchain"),
+        )
+
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
         env["DEV_CHECK_CONTRACT_CHILD"] = "1"
