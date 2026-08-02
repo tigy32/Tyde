@@ -40,6 +40,9 @@ pub enum MqttTransportError {
         token: Option<u64>,
     },
 
+    #[error("timed out waiting for MQTT PUBACK for token {token} after {timeout_ms}ms")]
+    PublishAckTimeout { token: u64, timeout_ms: u64 },
+
     #[error("transport framing error: {0}")]
     Framing(#[from] FramingError),
 
@@ -72,6 +75,7 @@ impl MqttTransportError {
             | Self::Subscribe { .. }
             | Self::SubscribeRejected { .. }
             | Self::Publish { .. }
+            | Self::PublishAckTimeout { .. }
             | Self::BrokerDisconnected { .. }
             | Self::ManagedSessionExpired
             | Self::ActorClosed => true,

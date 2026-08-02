@@ -1407,6 +1407,7 @@ fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {
         MqttTransportError::Framing(_)
         | MqttTransportError::RetainedMessage { .. }
         | MqttTransportError::PublishAckMismatch { .. }
+        | MqttTransportError::PublishAckTimeout { .. }
         | MqttTransportError::ReceiverCreditTimeout { .. } => {
             MobileAccessErrorCode::TransportFailed
         }

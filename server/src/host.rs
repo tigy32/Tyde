@@ -228,6 +228,7 @@ struct HostSubscriber {
     last_backend_capacity: Option<Vec<BackendCapacitySnapshot>>,
     capacity_replay_ready: bool,
     last_launch_profile_catalog: Option<LaunchProfileCatalog>,
+    last_task_token_usages: HashMap<AgentId, TaskTokenUsagePayload>,
 }
 
 struct PendingNewAgentFanout {
@@ -3012,6 +3013,7 @@ impl HostHandle {
                 last_backend_capacity: None,
                 capacity_replay_ready: false,
                 last_launch_profile_catalog: None,
+                last_task_token_usages: HashMap::new(),
             },
         );
         assert!(
@@ -3383,6 +3385,11 @@ impl HostHandle {
                 Some(bootstrap.backend_config_snapshots.clone());
             subscriber.last_backend_native_settings_snapshots = Some(Vec::new());
             subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
+            subscriber.last_task_token_usages = bootstrap
+                .task_token_usages
+                .iter()
+                .map(|payload| (payload.root_agent_id.clone(), payload.clone()))
+                .collect();
             (
                 std::mem::take(&mut subscriber.pending_bootstrap_new_agents),
                 std::mem::take(&mut subscriber.pending_bootstrap_frames),
@@ -9656,6 +9663,7 @@ impl HostHandle {
             state.agent_activity_summaries.remove(&closed_agent_id);
             for subscriber in state.host_streams.values_mut() {
                 forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
+                subscriber.last_task_token_usages.clear();
             }
             let snapshot_session_id = removed
                 .as_ref()
@@ -14181,6 +14189,19 @@ fn spawn_task_token_usage_task(host: HostHandle) {
             if status_rx.changed().await.is_err() {
                 break;
             }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let quiet_period = remaining.min(Duration::from_millis(500));
+                match tokio::time::timeout(quiet_period, status_rx.changed()).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => return,
+                    Err(_) => break,
+                }
+            }
             host.fan_out_task_token_usages().await;
         }
     };
@@ -18514,6 +18535,13 @@ async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskToke
             continue;
         };
         for payload in &payloads {
+            if subscriber
+                .last_task_token_usages
+                .get(&payload.root_agent_id)
+                == Some(payload)
+            {
+                continue;
+            }
             if emit_task_token_usage_for_subscriber(payload, subscriber)
                 .await
                 .is_err()
@@ -18521,6 +18549,9 @@ async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskToke
                 dead_paths.push(path.clone());
                 break;
             }
+            subscriber
+                .last_task_token_usages
+                .insert(payload.root_agent_id.clone(), payload.clone());
         }
     }
 
@@ -23635,6 +23666,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             last_backend_capacity: None,
             capacity_replay_ready: true,
             last_launch_profile_catalog: None,
+            last_task_token_usages: HashMap::new(),
         };
         let shared_session_id = SessionId("shared-resume-session".to_owned());
         let producer_agent_id = AgentId("existing-session-agent".to_owned());
@@ -25259,6 +25291,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     last_backend_capacity: None,
                     capacity_replay_ready: true,
                     last_launch_profile_catalog: None,
+                    last_task_token_usages: HashMap::new(),
                 },
             );
             assert_eq!(
@@ -25814,6 +25847,42 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
+    async fn unchanged_task_token_usage_is_not_resent_after_bootstrap() {
+        let fixture = compact_fixture().await;
+        spawn_idle_user_agent(&fixture.host, "deduplicate token usage").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/token-usage-dedup-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path, tx);
+
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream, AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let bootstrap = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("registration should emit HostBootstrap")
+            .expect("output envelope");
+        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+
+        fixture.host.fan_out_task_token_usages().await;
+        let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(envelope) = rx.recv().await {
+                if envelope.kind == FrameKind::TaskTokenUsage {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "unchanged bootstrap token usage was emitted again"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrapping_new_agent_fanout_is_deferred_until_after_bootstrap() {
         let fixture = compact_fixture().await;
         let (agent_id, _) =
@@ -25850,6 +25919,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             last_backend_capacity: None,
             capacity_replay_ready: false,
             last_launch_profile_catalog: None,
+            last_task_token_usages: HashMap::new(),
         };
 
         assert!(
@@ -25926,6 +25996,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             last_backend_capacity: None,
             capacity_replay_ready: true,
             last_launch_profile_catalog: None,
+            last_task_token_usages: HashMap::new(),
         };
         let native_settings = vec![BackendNativeSettingsSnapshot {
             backend_kind: BackendKind::Tycode,
@@ -26004,6 +26075,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             last_backend_capacity: None,
             capacity_replay_ready: true,
             last_launch_profile_catalog: None,
+            last_task_token_usages: HashMap::new(),
         };
 
         emit_session_schemas_for_subscriber(&[], &mut subscriber, false)

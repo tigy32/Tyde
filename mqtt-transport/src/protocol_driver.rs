@@ -54,6 +54,10 @@ const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
+#[cfg(not(test))]
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(200);
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RENDEZVOUS_CANDIDATES: usize = 3;
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
@@ -341,6 +345,10 @@ impl<L: MqttLink> ProtocolDriver<L> {
             let credit_debounce_timer = sleep(credit_debounce_delay.unwrap_or(CREDIT_DEBOUNCE));
             tokio::pin!(credit_debounce_timer);
 
+            let publish_ack_delay = in_flight.next_ack_timeout_delay();
+            let publish_ack_timer = sleep(publish_ack_delay.unwrap_or(PUBLISH_ACK_TIMEOUT));
+            tokio::pin!(publish_ack_timer);
+
             let can_accept_outbound = !outbound_closed
                 && deferred_outbound.is_none()
                 && in_flight.has_data_slot()
@@ -363,6 +371,18 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 }
                 _ = &mut credit_debounce_timer, if credit_debounce_delay.is_some() => {
                     continue;
+                }
+                _ = &mut publish_ack_timer, if publish_ack_delay.is_some() => {
+                    let token = in_flight
+                        .oldest_token()
+                        .expect("PUBACK timer requires an in-flight publish");
+                    let error = MqttTransportError::PublishAckTimeout {
+                        token: token.value(),
+                        timeout_ms: PUBLISH_ACK_TIMEOUT.as_millis() as u64,
+                    };
+                    ack_deferred_outbound(&mut deferred_outbound, &error);
+                    self.fail_stream(&mut in_flight, error).await;
+                    return;
                 }
                 event = self.link.poll() => {
                     match event {
@@ -447,6 +467,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         };
         in_flight.insert(InflightPublish::Data {
             token: published.token,
+            enqueued_at: Instant::now(),
             counter: published.counter,
             plaintext_len: published.plaintext_len,
             frame: published.frame,
@@ -527,6 +548,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         credit.mark_published(next_expected);
         in_flight.insert(InflightPublish::Credit {
             token,
+            enqueued_at: Instant::now(),
             next_expected,
             frame,
             quota_retries: 0,
@@ -904,6 +926,7 @@ struct PublishedFrame {
 enum InflightPublish {
     Data {
         token: PublishToken,
+        enqueued_at: Instant,
         counter: u64,
         plaintext_len: usize,
         frame: Vec<u8>,
@@ -912,6 +935,7 @@ enum InflightPublish {
     },
     Credit {
         token: PublishToken,
+        enqueued_at: Instant,
         next_expected: u64,
         frame: Vec<u8>,
         quota_retries: u8,
@@ -931,6 +955,12 @@ impl InflightPublish {
         }
     }
 
+    fn enqueued_at(&self) -> Instant {
+        match self {
+            Self::Data { enqueued_at, .. } | Self::Credit { enqueued_at, .. } => *enqueued_at,
+        }
+    }
+
     fn quota_retries(&self) -> u8 {
         match self {
             Self::Data { quota_retries, .. } | Self::Credit { quota_retries, .. } => *quota_retries,
@@ -941,15 +971,18 @@ impl InflightPublish {
         match self {
             Self::Data {
                 token,
+                enqueued_at,
                 quota_retries,
                 ..
             }
             | Self::Credit {
                 token,
+                enqueued_at,
                 quota_retries,
                 ..
             } => {
                 *token = new_token;
+                *enqueued_at = Instant::now();
                 *quota_retries = quota_retries.saturating_add(1);
             }
         }
@@ -996,6 +1029,26 @@ impl InflightPublishes {
 
     fn contains(&self, token: PublishToken) -> bool {
         self.by_token.contains_key(&token)
+    }
+
+    fn oldest_token(&self) -> Option<PublishToken> {
+        self.by_token
+            .values()
+            .min_by_key(|publish| publish.enqueued_at())
+            .map(InflightPublish::token)
+    }
+
+    fn next_ack_timeout_delay(&self) -> Option<Duration> {
+        let enqueued_at = self
+            .by_token
+            .values()
+            .map(InflightPublish::enqueued_at)
+            .min()?;
+        Some(
+            PUBLISH_ACK_TIMEOUT
+                .checked_sub(Instant::now().duration_since(enqueued_at))
+                .unwrap_or(Duration::ZERO),
+        )
     }
 
     fn insert(&mut self, publish: InflightPublish) {
@@ -1935,6 +1988,28 @@ mod tests {
             InboundEvent::Error(error)
                 if matches!(*error, MqttTransportError::ManagedSessionExpired)
         ));
+    }
+
+    #[tokio::test]
+    async fn missing_puback_fails_the_stream_instead_of_blocking_writes() {
+        let mut harness = spawn_stream_driver().unwrap();
+        let ack_rx = send_full_chunk(&mut harness.outbound_tx, 1).await.unwrap();
+        let publish = next_data_publish(&mut harness.publish_rx).await;
+
+        let event = timeout(Duration::from_secs(1), harness.inbound_rx.recv())
+            .await
+            .expect("PUBACK watchdog did not fire")
+            .expect("driver closed without reporting the timeout");
+        assert!(matches!(
+            event,
+            InboundEvent::Error(error)
+                if matches!(
+                    *error,
+                    MqttTransportError::PublishAckTimeout { token, .. }
+                        if token == publish.token.value()
+                )
+        ));
+        expect_ack_error(ack_rx, "timed out waiting for MQTT PUBACK").await;
     }
 
     fn full_chunk(byte: u8) -> (OutboundChunk, oneshot::Receiver<Result<(), String>>) {
