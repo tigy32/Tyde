@@ -197,6 +197,11 @@ pub(crate) fn clear_app_listeners() {
     });
 }
 
+pub(crate) fn cleanup_app_lifecycle() {
+    crate::voice::end_for_lifecycle(false);
+    clear_app_listeners();
+}
+
 fn keyboard_event_is_cmd_modifier(ev: &web_sys::KeyboardEvent) -> bool {
     ev.ctrl_key() || ev.meta_key() || matches!(ev.key().as_str(), "Control" | "Meta")
 }
@@ -1242,7 +1247,7 @@ pub fn App() -> impl IntoView {
 
     let listener_token = begin_app_listener_lifecycle();
     set_app_listeners_active(true);
-    on_cleanup(clear_app_listeners);
+    on_cleanup(cleanup_app_lifecycle);
 
     // Pre-warm syntect AFTER first paint so the first file open / first
     // markdown render doesn't pay the ~50-200ms grammar-deserialization cost

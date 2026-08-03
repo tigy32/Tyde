@@ -49,9 +49,11 @@ use protocol::{Envelope, FrameKind, StreamPath};
 
 use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus};
 use media::{MediaEvent, MediaEventSink, MediaPlatform, MediaStartRequest, RemoteIceCandidate};
+#[cfg(test)]
+use session::VoicePhase;
 use session::{
-    EffectiveAudio, VoiceEndReason, VoiceFailure, VoiceGeneration, VoicePhase, VoiceSessionKey,
-    VoiceStage, VoiceTarget, VoiceUiState, VoiceUnavailable,
+    EffectiveAudio, VoiceEndReason, VoiceFailure, VoiceGeneration, VoiceSessionKey, VoiceStage,
+    VoiceTarget, VoiceUiState, VoiceUnavailable,
 };
 use wire::InboundVoice;
 
@@ -87,9 +89,12 @@ const NEGOTIATION_DEADLINE_MS: i32 = 20_000;
 /// something owns a microphone and must be released.
 struct SessionRuntime {
     generation: VoiceGeneration,
+    target: VoiceTarget,
     host_id: String,
     session: VoiceSessionKey,
     platform: Rc<dyn MediaPlatform>,
+    host_admitted: bool,
+    media_connected: bool,
     local_candidates_sent: usize,
     /// Local candidates gathered before `VoiceOffer` was queued. The host
     /// terminates a session that receives a candidate before it has accepted
@@ -464,9 +469,12 @@ pub fn start(target: VoiceTarget) {
     RUNTIME.with(|slot| {
         *slot.borrow_mut() = Some(SessionRuntime {
             generation,
+            target: target.clone(),
             host_id: target.host_id().to_owned(),
             session: session.clone(),
             platform: platform.clone(),
+            host_admitted: false,
+            media_connected: false,
             local_candidates_sent: 0,
             pending_local_candidates: Vec::new(),
             offer_queued: false,
@@ -661,14 +669,18 @@ fn arm_disconnect_grace(generation: VoiceGeneration, epoch: u64) {
 }
 
 fn on_negotiation_deadline(generation: VoiceGeneration) {
-    if !is_current(generation) || !read_state(VoiceUiState::is_engaged) {
+    let Some((host_admitted, media_connected)) = RUNTIME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|runtime| runtime.generation == generation)
+            .map(|runtime| (runtime.host_admitted, runtime.media_connected))
+    }) else {
+        return;
+    };
+    if media_connected {
         return;
     }
-    if read_state(|voice| matches!(voice.phase, VoicePhase::Live)) {
-        return;
-    }
-    let admitted = read_state(|voice| voice.host_admitted);
-    let message = if admitted {
+    let message = if host_admitted {
         "The host accepted voice but audio never connected. Check that this \
          machine and the host share a direct network route."
             .to_owned()
@@ -697,7 +709,7 @@ fn on_disconnect_grace_expired(generation: VoiceGeneration, epoch: u64) {
             runtime.generation == generation && runtime.disconnect_epoch == epoch
         })
     });
-    if !still_waiting || !is_current(generation) || !read_state(VoiceUiState::is_engaged) {
+    if !still_waiting {
         return;
     }
     end_with_failure(
@@ -736,15 +748,16 @@ pub fn end(reason: VoiceEndReason) {
             .borrow_mut()
             .retain(|frame| frame.generation != runtime.generation);
     });
-    if let Some(session) = ended.and_then(|ended| ended.session) {
-        enqueue(
-            runtime.generation,
-            &runtime.host_id,
-            session.stream.clone(),
-            FrameKind::VoiceStop,
-            &wire::stop_payload(&session, reason),
-        );
-    }
+    let session = ended
+        .and_then(|ended| ended.session)
+        .unwrap_or_else(|| runtime.session.clone());
+    enqueue(
+        runtime.generation,
+        &runtime.host_id,
+        session.stream.clone(),
+        FrameKind::VoiceStop,
+        &wire::stop_payload(&session, reason),
+    );
 }
 
 fn end_with_failure(reason: VoiceEndReason, failure: VoiceFailure) {
@@ -910,6 +923,7 @@ fn on_media_event(generation: VoiceGeneration, event: MediaEvent) {
                     .as_mut()
                     .filter(|runtime| runtime.generation == generation)
                 {
+                    runtime.media_connected = true;
                     runtime.disconnect_epoch = runtime.disconnect_epoch.wrapping_add(1);
                     clear_timer(&mut runtime.disconnect_grace);
                 }
@@ -1253,6 +1267,15 @@ fn apply_inbound(generation: VoiceGeneration, inbound: InboundVoice) {
                 );
                 return;
             }
+            RUNTIME.with(|slot| {
+                if let Some(runtime) = slot
+                    .borrow_mut()
+                    .as_mut()
+                    .filter(|runtime| runtime.generation == generation)
+                {
+                    runtime.host_admitted = true;
+                }
+            });
             update_state(|voice| voice.ready(generation, direct_connections_only));
         }
         InboundVoice::Answer { sdp } => apply_answer(generation, sdp),
@@ -1619,12 +1642,11 @@ pub fn enforce_target(state: &AppState, focused: Option<&ActiveAgentRef>) {
     // Read the binding from the runtime, not the phase: a session whose phase
     // has moved on for display reasons still owns a microphone and must still
     // be torn down when its target goes away.
-    let Some(bound) = read_state(|voice| voice.target.clone()) else {
+    let Some(bound) =
+        RUNTIME.with(|slot| slot.borrow().as_ref().map(|runtime| runtime.target.clone()))
+    else {
         return;
     };
-    if RUNTIME.with(|slot| slot.borrow().is_none()) {
-        return;
-    }
 
     // A different focused chat — including no chat at all, which is what Home
     // and a New Chat tab produce — ends the session.
@@ -1703,9 +1725,7 @@ pub(crate) fn phase() -> VoicePhase {
 pub(crate) fn reset_for_tests() {
     #[cfg(not(target_arch = "wasm32"))]
     PENDING_TASKS.with(|tasks| tasks.borrow_mut().clear());
-    if let Some(mut runtime) = RUNTIME.with(|slot| slot.borrow_mut().take()) {
-        runtime.clear_deadline();
-    }
+    release_runtime();
     OUTBOX.with(|outbox| outbox.borrow_mut().clear());
     OUTBOX_PUMPING.with(|flag| flag.set(false));
     PLATFORM_FACTORY.with(|slot| *slot.borrow_mut() = None);
@@ -1851,12 +1871,24 @@ mod tests {
             .expect("a fake media platform is installed")
     }
 
+    fn sent_stop_count() -> usize {
+        sent_frame_kinds()
+            .into_iter()
+            .filter(|kind| *kind == FrameKind::VoiceStop)
+            .count()
+    }
+
     /// Drive the reducer to `Live` without a browser media stack.
     ///
     /// The immediately-ready fake already advances past `RequestingMic`, so
     /// the grant is best-effort here and only `connected` is required.
     fn force_live() -> VoiceGeneration {
         let generation = read_state(|voice| voice.generation);
+        RUNTIME.with(|slot| {
+            if let Some(runtime) = slot.borrow_mut().as_mut() {
+                runtime.media_connected = true;
+            }
+        });
         update_state(|voice| voice.mic_granted(generation, EffectiveAudio::default()));
         update_state(|voice| voice.connected(generation));
         generation
@@ -2717,6 +2749,14 @@ mod tests {
             assert!(!is_engaged());
             assert!(!runtime_is_live());
             assert_eq!(platform.calls().stops, 1);
+            assert_eq!(
+                read_state(|voice| voice
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.message.clone())),
+                Some("The audio connection failed.".to_owned()),
+                "safe diagnostics must not alter the load-bearing user sentence"
+            );
         });
     }
 
@@ -2961,6 +3001,9 @@ mod tests {
         with_voice(|state| {
             start_for(&state, "a");
             let generation = read_state(|voice| voice.generation);
+            RUNTIME.with(|slot| {
+                slot.borrow_mut().as_mut().unwrap().host_admitted = true;
+            });
             update_state(|voice| voice.ready(generation, true));
 
             on_negotiation_deadline(generation);
@@ -3003,7 +3046,10 @@ mod tests {
                 )
             });
             assert!(!is_engaged(), "the phase is terminal");
-            assert!(runtime_is_live(), "but the microphone is not");
+            assert!(
+                runtime_is_live(),
+                "the terminal display must not hide the runtime's microphone ownership"
+            );
 
             enforce_target(&state, Some(&agent_ref("b")));
             assert_eq!(
@@ -3011,6 +3057,152 @@ mod tests {
                 1,
                 "the guard must release media it can still see, whatever the phase says"
             );
+            assert!(!runtime_is_live());
+            assert_eq!(sent_stop_count(), 1);
+        });
+    }
+
+    #[test]
+    fn dismissed_terminal_ui_cannot_hide_a_runtime_from_the_target_guard() {
+        with_voice(|state| {
+            start_for(&state, "a");
+            let platform = fake();
+            let generation = read_state(|voice| voice.generation);
+            update_state(|voice| {
+                voice.fail(
+                    generation,
+                    VoiceFailure {
+                        stage: VoiceStage::Server,
+                        message: "forced".to_owned(),
+                        retryable: false,
+                    },
+                )
+            });
+            update_state(VoiceUiState::dismiss);
+            assert!(read_state(|voice| voice.target.is_none()));
+            assert!(runtime_is_live());
+
+            enforce_target(&state, Some(&agent_ref("b")));
+
+            assert_eq!(platform.calls().stops, 1);
+            assert!(!runtime_is_live());
+            assert_eq!(sent_stop_count(), 1);
+        });
+    }
+
+    #[test]
+    fn negotiation_deadline_releases_runtime_behind_dismissed_terminal_ui() {
+        with_voice(|state| {
+            start_for(&state, "a");
+            let platform = fake();
+            let generation = read_state(|voice| voice.generation);
+            update_state(|voice| {
+                voice.fail(
+                    generation,
+                    VoiceFailure {
+                        stage: VoiceStage::Server,
+                        message: "forced".to_owned(),
+                        retryable: false,
+                    },
+                )
+            });
+            update_state(VoiceUiState::dismiss);
+
+            on_negotiation_deadline(generation);
+
+            assert_eq!(platform.calls().stops, 1);
+            assert!(!runtime_is_live());
+            assert_eq!(sent_stop_count(), 1);
+        });
+    }
+
+    #[test]
+    fn disconnect_grace_releases_runtime_behind_dismissed_terminal_ui() {
+        with_voice(|state| {
+            start_for(&state, "a");
+            let generation = force_live();
+            let platform = fake();
+            platform.emit(MediaEvent::ConnectionUnstable);
+            let epoch = RUNTIME
+                .with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|runtime| runtime.disconnect_epoch)
+                })
+                .expect("runtime");
+            update_state(|voice| {
+                voice.fail(
+                    generation,
+                    VoiceFailure {
+                        stage: VoiceStage::Server,
+                        message: "forced".to_owned(),
+                        retryable: false,
+                    },
+                )
+            });
+            update_state(VoiceUiState::dismiss);
+
+            on_disconnect_grace_expired(generation, epoch);
+
+            assert_eq!(platform.calls().stops, 1);
+            assert!(!runtime_is_live());
+            assert_eq!(sent_stop_count(), 1);
+        });
+    }
+
+    #[test]
+    fn app_cleanup_releases_runtime_before_listener_teardown() {
+        with_voice(|state| {
+            start_for(&state, "a");
+            let platform = fake();
+
+            crate::app::cleanup_app_lifecycle();
+
+            assert_eq!(platform.calls().stops, 1);
+            assert!(!runtime_is_live());
+            assert_eq!(sent_stop_count(), 1);
+            assert_eq!(
+                read_state(|voice| voice.ended_reason),
+                Some(VoiceEndReason::PageTeardown)
+            );
+        });
+    }
+
+    #[test]
+    fn app_cleanup_cancels_acquisition_that_resolves_after_unmount() {
+        with_scripted_voice(
+            FakeMediaScript {
+                start_pending: true,
+                ..FakeMediaScript::default()
+            },
+            |state| {
+                start_for(&state, "a");
+                let platform = fake();
+
+                crate::app::cleanup_app_lifecycle();
+                platform.resolve_start();
+                pump_async_for_tests();
+
+                assert_eq!(platform.calls().stops, 1);
+                assert!(platform.is_cancelled());
+                assert!(!runtime_is_live());
+                assert!(!is_engaged());
+            },
+        );
+    }
+
+    #[test]
+    fn test_reset_uses_the_production_media_stop_path() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            reset_for_tests();
+            let platform = install_fake(FakeMediaScript::default());
+            let state = ready_state();
+            start_for(&state, "a");
+
+            reset_for_tests();
+
+            assert_eq!(platform.calls().stops, 1);
             assert!(!runtime_is_live());
         });
     }

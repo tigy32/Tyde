@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,159 @@ const MDNS_SESSION_BUDGET: Duration = Duration::from_secs(2);
 const NO_REMOTE_CANDIDATE_WATCHDOG: Duration = Duration::from_secs(3);
 const CANDIDATE_QUEUE_CAPACITY: usize = MAX_VOICE_ICE_CANDIDATES + 1;
 const CANDIDATE_PREFLIGHT_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    fn of(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(_) => Self::Ipv4,
+            IpAddr::V6(_) => Self::Ipv6,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Ipv4 => 1,
+            Self::Ipv6 => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> &'static str {
+        match code {
+            1 => "ipv4",
+            2 => "ipv6",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticTrigger {
+    GatheringComplete,
+    CandidateWorkerFailure,
+    CandidateWorkerExit,
+    SessionClose,
+    MediaWorkerExit,
+}
+
+impl DiagnosticTrigger {
+    fn bit(self) -> u8 {
+        match self {
+            Self::GatheringComplete => 1,
+            Self::CandidateWorkerFailure => 2,
+            Self::CandidateWorkerExit => 4,
+            Self::SessionClose => 8,
+            Self::MediaWorkerExit => 16,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::GatheringComplete => "gathering_complete",
+            Self::CandidateWorkerFailure => "candidate_worker_failure",
+            Self::CandidateWorkerExit => "candidate_worker_exit",
+            Self::SessionClose => "session_close",
+            Self::MediaWorkerExit => "media_worker_exit",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UdpSendErrorKind {
+    WouldBlock,
+    PermissionDenied,
+    Address,
+    Other,
+}
+
+impl UdpSendErrorKind {
+    fn of(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::WouldBlock => Self::WouldBlock,
+            ErrorKind::PermissionDenied => Self::PermissionDenied,
+            ErrorKind::AddrNotAvailable | ErrorKind::InvalidInput => Self::Address,
+            _ => Self::Other,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::WouldBlock => 1,
+            Self::PermissionDenied => 2,
+            Self::Address => 3,
+            Self::Other => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> &'static str {
+        match code {
+            1 => "would_block",
+            2 => "permission_denied",
+            3 => "address",
+            4 => "other",
+            _ => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MediaWorkerExitReason {
+    LocalCandidateCreate,
+    LocalCandidateRejected,
+    EncoderCreate,
+    DecoderCreate,
+    BrowserStop,
+    CommandClose,
+    WatchdogExpired,
+    EncoderFailure,
+    WriterUnavailable,
+    OpusPayloadUnavailable,
+    RtpWriteFailure,
+    EventConsumerClosed,
+    IceDisconnected,
+    AudioConsumerUnavailable,
+    TimeoutInputFailure,
+    RtcPollFailure,
+    ReceiveInputFailure,
+    UdpReceiveFailure,
+    Unclassified,
+}
+
+impl MediaWorkerExitReason {
+    fn code(self) -> u8 {
+        self as u8 + 1
+    }
+
+    fn from_code(code: u8) -> &'static str {
+        match code {
+            1 => "local_candidate_create",
+            2 => "local_candidate_rejected",
+            3 => "encoder_create",
+            4 => "decoder_create",
+            5 => "browser_stop",
+            6 => "command_close",
+            7 => "watchdog_expired",
+            8 => "encoder_failure",
+            9 => "writer_unavailable",
+            10 => "opus_payload_unavailable",
+            11 => "rtp_write_failure",
+            12 => "event_consumer_closed",
+            13 => "ice_disconnected",
+            14 => "audio_consumer_unavailable",
+            15 => "timeout_input_failure",
+            16 => "rtc_poll_failure",
+            17 => "receive_input_failure",
+            18 => "udp_receive_failure",
+            19 => "unclassified",
+            _ => "running",
+        }
+    }
+}
 
 pub(crate) struct Str0mMediaFactory;
 
@@ -84,6 +237,11 @@ fn open_str0m(
     let closed = Arc::new(AtomicBool::new(false));
     let thread_closed = Arc::clone(&closed);
     let candidate_event_tx = event_tx.downgrade();
+    let diagnostics = Arc::new(IceCandidateCounters::default());
+    diagnostics
+        .socket_family
+        .store(AddressFamily::of(local_addr.ip()).code(), Ordering::Relaxed);
+    let media_diagnostics = Arc::clone(&diagnostics);
     std::thread::Builder::new()
         .name("tyde-voice-webrtc".to_owned())
         .spawn(move || {
@@ -94,10 +252,10 @@ fn open_str0m(
                 event_tx,
                 audio_tx,
                 thread_closed,
+                media_diagnostics,
             )
         })
         .map_err(|_| VoiceRuntimeError::Unavailable)?;
-    let diagnostics = Arc::new(IceCandidateCounters::default());
     let candidate_task = runtime.spawn(run_candidate_worker(
         candidate_rx,
         command_tx.clone(),
@@ -335,7 +493,10 @@ enum CachedMdnsResolution {
 
 #[derive(Default)]
 struct IceCandidateCounters {
-    numeric_accepted: AtomicUsize,
+    numeric_ipv4_accepted: AtomicUsize,
+    numeric_ipv6_accepted: AtomicUsize,
+    numeric_ipv4_skipped: AtomicUsize,
+    numeric_ipv6_skipped: AtomicUsize,
     mdns_resolved: AtomicUsize,
     mdns_skipped_no_response: AtomicUsize,
     mdns_skipped_unavailable: AtomicUsize,
@@ -345,12 +506,27 @@ struct IceCandidateCounters {
     mdns_skipped_expansion_budget: AtomicUsize,
     mdns_skipped_unsupported_tcp: AtomicUsize,
     malformed_rejected: AtomicUsize,
-    summary_emitted: AtomicBool,
+    socket_family: AtomicU8,
+    connected: AtomicBool,
+    watchdog_armed: AtomicBool,
+    udp_send_errors_ipv4: AtomicUsize,
+    udp_send_errors_ipv6: AtomicUsize,
+    udp_send_errors_would_block: AtomicUsize,
+    udp_send_errors_permission_denied: AtomicUsize,
+    udp_send_errors_address: AtomicUsize,
+    udp_send_errors_other: AtomicUsize,
+    last_udp_error_kind: AtomicU8,
+    last_udp_error_family: AtomicU8,
+    media_exit_reason: AtomicU8,
+    emitted_triggers: AtomicU8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct IceCandidateDiagnosticEvent {
-    numeric_accepted: usize,
+    numeric_ipv4_accepted: usize,
+    numeric_ipv6_accepted: usize,
+    numeric_ipv4_skipped: usize,
+    numeric_ipv6_skipped: usize,
     mdns_resolved: usize,
     mdns_skipped_no_response: usize,
     mdns_skipped_unavailable: usize,
@@ -360,18 +536,39 @@ struct IceCandidateDiagnosticEvent {
     mdns_skipped_expansion_budget: usize,
     mdns_skipped_unsupported_tcp: usize,
     malformed_rejected: usize,
+    socket_family: &'static str,
+    connected: bool,
+    watchdog_armed: bool,
+    udp_send_errors_ipv4: usize,
+    udp_send_errors_ipv6: usize,
+    udp_send_errors_would_block: usize,
+    udp_send_errors_permission_denied: usize,
+    udp_send_errors_address: usize,
+    udp_send_errors_other: usize,
+    last_udp_error_kind: &'static str,
+    last_udp_error_family: &'static str,
+    media_exit_reason: &'static str,
 }
 
 impl std::fmt::Display for IceCandidateDiagnosticEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "numeric_accepted={} mdns_resolved={} mdns_skipped_no_response={} \
+            "numeric_ipv4_accepted={} numeric_ipv6_accepted={} \
+             numeric_ipv4_skipped={} numeric_ipv6_skipped={} \
+             mdns_resolved={} mdns_skipped_no_response={} \
              mdns_skipped_unavailable={} mdns_skipped_timeout={} \
              mdns_skipped_name_budget={} mdns_skipped_time_budget={} \
              mdns_skipped_expansion_budget={} mdns_skipped_unsupported_tcp={} \
-             malformed_rejected={}",
-            self.numeric_accepted,
+             malformed_rejected={} socket_family={} connected={} watchdog_armed={} \
+             udp_send_errors_ipv4={} udp_send_errors_ipv6={} \
+             udp_send_errors_would_block={} udp_send_errors_permission_denied={} \
+             udp_send_errors_address={} udp_send_errors_other={} \
+             last_udp_error_kind={} last_udp_error_family={} media_exit_reason={}",
+            self.numeric_ipv4_accepted,
+            self.numeric_ipv6_accepted,
+            self.numeric_ipv4_skipped,
+            self.numeric_ipv6_skipped,
             self.mdns_resolved,
             self.mdns_skipped_no_response,
             self.mdns_skipped_unavailable,
@@ -380,7 +577,19 @@ impl std::fmt::Display for IceCandidateDiagnosticEvent {
             self.mdns_skipped_time_budget,
             self.mdns_skipped_expansion_budget,
             self.mdns_skipped_unsupported_tcp,
-            self.malformed_rejected
+            self.malformed_rejected,
+            self.socket_family,
+            self.connected,
+            self.watchdog_armed,
+            self.udp_send_errors_ipv4,
+            self.udp_send_errors_ipv6,
+            self.udp_send_errors_would_block,
+            self.udp_send_errors_permission_denied,
+            self.udp_send_errors_address,
+            self.udp_send_errors_other,
+            self.last_udp_error_kind,
+            self.last_udp_error_family,
+            self.media_exit_reason
         )
     }
 }
@@ -388,6 +597,41 @@ impl std::fmt::Display for IceCandidateDiagnosticEvent {
 impl IceCandidateCounters {
     fn increment(counter: &AtomicUsize, amount: usize) {
         counter.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    fn record_numeric(&self, family: AddressFamily, accepted: bool) {
+        let counter = match (family, accepted) {
+            (AddressFamily::Ipv4, true) => &self.numeric_ipv4_accepted,
+            (AddressFamily::Ipv6, true) => &self.numeric_ipv6_accepted,
+            (AddressFamily::Ipv4, false) => &self.numeric_ipv4_skipped,
+            (AddressFamily::Ipv6, false) => &self.numeric_ipv6_skipped,
+        };
+        Self::increment(counter, 1);
+    }
+
+    fn record_udp_send_error(&self, error: &std::io::Error, destination: SocketAddr) {
+        let family = AddressFamily::of(destination.ip());
+        Self::increment(
+            match family {
+                AddressFamily::Ipv4 => &self.udp_send_errors_ipv4,
+                AddressFamily::Ipv6 => &self.udp_send_errors_ipv6,
+            },
+            1,
+        );
+        let kind = UdpSendErrorKind::of(error.kind());
+        Self::increment(
+            match kind {
+                UdpSendErrorKind::WouldBlock => &self.udp_send_errors_would_block,
+                UdpSendErrorKind::PermissionDenied => &self.udp_send_errors_permission_denied,
+                UdpSendErrorKind::Address => &self.udp_send_errors_address,
+                UdpSendErrorKind::Other => &self.udp_send_errors_other,
+            },
+            1,
+        );
+        self.last_udp_error_kind
+            .store(kind.code(), Ordering::Relaxed);
+        self.last_udp_error_family
+            .store(family.code(), Ordering::Relaxed);
     }
 
     fn record_skip(&self, reason: MdnsSkipReason) {
@@ -405,7 +649,10 @@ impl IceCandidateCounters {
 
     fn snapshot(&self) -> IceCandidateDiagnosticEvent {
         IceCandidateDiagnosticEvent {
-            numeric_accepted: self.numeric_accepted.load(Ordering::Relaxed),
+            numeric_ipv4_accepted: self.numeric_ipv4_accepted.load(Ordering::Relaxed),
+            numeric_ipv6_accepted: self.numeric_ipv6_accepted.load(Ordering::Relaxed),
+            numeric_ipv4_skipped: self.numeric_ipv4_skipped.load(Ordering::Relaxed),
+            numeric_ipv6_skipped: self.numeric_ipv6_skipped.load(Ordering::Relaxed),
             mdns_resolved: self.mdns_resolved.load(Ordering::Relaxed),
             mdns_skipped_no_response: self.mdns_skipped_no_response.load(Ordering::Relaxed),
             mdns_skipped_unavailable: self.mdns_skipped_unavailable.load(Ordering::Relaxed),
@@ -417,24 +664,44 @@ impl IceCandidateCounters {
                 .load(Ordering::Relaxed),
             mdns_skipped_unsupported_tcp: self.mdns_skipped_unsupported_tcp.load(Ordering::Relaxed),
             malformed_rejected: self.malformed_rejected.load(Ordering::Relaxed),
+            socket_family: AddressFamily::from_code(self.socket_family.load(Ordering::Relaxed)),
+            connected: self.connected.load(Ordering::Relaxed),
+            watchdog_armed: self.watchdog_armed.load(Ordering::Relaxed),
+            udp_send_errors_ipv4: self.udp_send_errors_ipv4.load(Ordering::Relaxed),
+            udp_send_errors_ipv6: self.udp_send_errors_ipv6.load(Ordering::Relaxed),
+            udp_send_errors_would_block: self.udp_send_errors_would_block.load(Ordering::Relaxed),
+            udp_send_errors_permission_denied: self
+                .udp_send_errors_permission_denied
+                .load(Ordering::Relaxed),
+            udp_send_errors_address: self.udp_send_errors_address.load(Ordering::Relaxed),
+            udp_send_errors_other: self.udp_send_errors_other.load(Ordering::Relaxed),
+            last_udp_error_kind: UdpSendErrorKind::from_code(
+                self.last_udp_error_kind.load(Ordering::Relaxed),
+            ),
+            last_udp_error_family: AddressFamily::from_code(
+                self.last_udp_error_family.load(Ordering::Relaxed),
+            ),
+            media_exit_reason: MediaWorkerExitReason::from_code(
+                self.media_exit_reason.load(Ordering::Relaxed),
+            ),
         }
     }
 
-    fn emit_summary(&self) {
-        if self
-            .summary_emitted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+    fn emit_summary(&self, trigger: DiagnosticTrigger) {
+        let bit = trigger.bit();
+        if self.emitted_triggers.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
             return;
         }
         let diagnostics = self.snapshot();
-        tracing::info!(diagnostics = %diagnostics, "voice ICE candidate summary");
+        tracing::info!(trigger = trigger.label(), diagnostics = %diagnostics, "voice ICE candidate summary");
     }
 }
 
 enum QueuedRemoteCandidate {
-    Numeric(VoiceIceCandidate),
+    Numeric {
+        candidate: VoiceIceCandidate,
+        family: AddressFamily,
+    },
     Mdns {
         candidate: VoiceIceCandidate,
         mdns: MdnsCandidate,
@@ -451,8 +718,11 @@ fn classify_remote_candidate(
     candidate: &VoiceIceCandidate,
     counters: &IceCandidateCounters,
 ) -> Result<QueuedRemoteCandidate, VoiceRuntimeError> {
-    if Candidate::from_sdp_string(&candidate.candidate).is_ok() {
-        return Ok(QueuedRemoteCandidate::Numeric(candidate.clone()));
+    if let Ok(parsed) = Candidate::from_sdp_string(&candidate.candidate) {
+        return Ok(QueuedRemoteCandidate::Numeric {
+            candidate: candidate.clone(),
+            family: AddressFamily::of(parsed.addr().ip()),
+        });
     }
     let Some(mdns) = mdns_candidate(&candidate.candidate) else {
         IceCandidateCounters::increment(&counters.malformed_rejected, 1);
@@ -542,7 +812,7 @@ impl RemoteCandidatePreparer {
         candidate: &VoiceIceCandidate,
     ) -> Result<Vec<VoiceIceCandidate>, VoiceRuntimeError> {
         match classify_remote_candidate(candidate, &self.counters)? {
-            QueuedRemoteCandidate::Numeric(candidate) => Ok(vec![candidate]),
+            QueuedRemoteCandidate::Numeric { candidate, .. } => Ok(vec![candidate]),
             QueuedRemoteCandidate::Mdns { candidate, mdns } => {
                 self.prepare_mdns(&candidate, &mdns).await
             }
@@ -603,11 +873,12 @@ async fn run_candidate_worker(
 ) {
     while let Some(command) = commands.recv().await {
         let result = match command {
-            CandidateWorkerCommand::Candidate(QueuedRemoteCandidate::Numeric(candidate)) => {
+            CandidateWorkerCommand::Candidate(QueuedRemoteCandidate::Numeric {
+                candidate,
+                family,
+            }) => {
                 let result = forward_candidates(&media_commands, vec![candidate]).await;
-                if result.is_ok() {
-                    IceCandidateCounters::increment(&preparer.counters.numeric_accepted, 1);
-                }
+                preparer.counters.record_numeric(family, result.is_ok());
                 result
             }
             CandidateWorkerCommand::Candidate(QueuedRemoteCandidate::Mdns { candidate, mdns }) => {
@@ -634,18 +905,25 @@ async fn run_candidate_worker(
                 Ok(())
             }
             CandidateWorkerCommand::EndCandidates => {
-                preparer.counters.emit_summary();
+                preparer
+                    .counters
+                    .emit_summary(DiagnosticTrigger::GatheringComplete);
                 forward_end_candidates(&media_commands).await
             }
         };
         if result.is_err() {
+            preparer
+                .counters
+                .emit_summary(DiagnosticTrigger::CandidateWorkerFailure);
             if let Some(media_events) = media_events.upgrade() {
                 let _ = media_events.try_send(VoiceMediaEvent::Failed);
             }
             break;
         }
     }
-    preparer.counters.emit_summary();
+    preparer
+        .counters
+        .emit_summary(DiagnosticTrigger::CandidateWorkerExit);
 }
 
 async fn forward_candidates(
@@ -757,7 +1035,8 @@ impl VoiceMediaSession for Str0mMediaSession {
         if let Some(task) = self.candidate_task.take() {
             task.abort();
         }
-        self.diagnostics.emit_summary();
+        self.diagnostics
+            .emit_summary(DiagnosticTrigger::SessionClose);
         let _ = self.command_tx.try_send(MediaCommand::Close);
     }
 }
@@ -770,15 +1049,19 @@ impl Drop for Str0mMediaSession {
 
 struct MediaWorkerExitGuard {
     events: mpsc::Sender<VoiceMediaEvent>,
+    diagnostics: Arc<IceCandidateCounters>,
     failure_reported: bool,
+    reason: MediaWorkerExitReason,
     intentional_shutdown: bool,
 }
 
 impl MediaWorkerExitGuard {
-    fn new(events: mpsc::Sender<VoiceMediaEvent>) -> Self {
+    fn new(events: mpsc::Sender<VoiceMediaEvent>, diagnostics: Arc<IceCandidateCounters>) -> Self {
         Self {
             events,
+            diagnostics,
             failure_reported: false,
+            reason: MediaWorkerExitReason::Unclassified,
             intentional_shutdown: false,
         }
     }
@@ -787,7 +1070,8 @@ impl MediaWorkerExitGuard {
         self.events.try_send(event).is_ok()
     }
 
-    fn report_failure(&mut self) {
+    fn fail(&mut self, reason: MediaWorkerExitReason) {
+        self.reason = reason;
         if self.failure_reported {
             return;
         }
@@ -795,7 +1079,8 @@ impl MediaWorkerExitGuard {
         let _ = self.events.try_send(VoiceMediaEvent::Failed);
     }
 
-    fn mark_intentional_shutdown(&mut self) {
+    fn close(&mut self, reason: MediaWorkerExitReason) {
+        self.reason = reason;
         self.intentional_shutdown = true;
     }
 }
@@ -803,8 +1088,13 @@ impl MediaWorkerExitGuard {
 impl Drop for MediaWorkerExitGuard {
     fn drop(&mut self) {
         if !self.intentional_shutdown {
-            self.report_failure();
+            self.fail(self.reason);
         }
+        self.diagnostics
+            .media_exit_reason
+            .store(self.reason.code(), Ordering::Release);
+        self.diagnostics
+            .emit_summary(DiagnosticTrigger::MediaWorkerExit);
     }
 }
 
@@ -840,19 +1130,24 @@ fn run_webrtc(
     event_tx: mpsc::Sender<VoiceMediaEvent>,
     audio_tx: mpsc::Sender<VoicePcmFrame>,
     closed: Arc<AtomicBool>,
+    diagnostics: Arc<IceCandidateCounters>,
 ) {
-    let mut exit_guard = MediaWorkerExitGuard::new(event_tx);
+    let mut exit_guard = MediaWorkerExitGuard::new(event_tx, Arc::clone(&diagnostics));
     let mut rtc = RtcConfig::new().build(Instant::now());
     let Ok(candidate) = Candidate::host(local_addr, "udp") else {
+        exit_guard.fail(MediaWorkerExitReason::LocalCandidateCreate);
         return;
     };
     if rtc.add_local_candidate(candidate).is_none() {
+        exit_guard.fail(MediaWorkerExitReason::LocalCandidateRejected);
         return;
     }
     let Ok(mut encoder) = Encoder::new(48_000, Channels::Mono, Application::Voip) else {
+        exit_guard.fail(MediaWorkerExitReason::EncoderCreate);
         return;
     };
     let Ok(mut decoder) = Decoder::new(48_000, Channels::Mono) else {
+        exit_guard.fail(MediaWorkerExitReason::DecoderCreate);
         return;
     };
     let mut media_mid = None;
@@ -868,7 +1163,7 @@ fn run_webrtc(
 
     loop {
         if closed.load(Ordering::Acquire) {
-            exit_guard.mark_intentional_shutdown();
+            exit_guard.close(MediaWorkerExitReason::BrowserStop);
             return;
         }
         if post_gather_watchdog.expired(Instant::now()) {
@@ -876,7 +1171,8 @@ fn run_webrtc(
                 reason = "no_usable_remote_candidates",
                 "voice ICE connection watchdog expired"
             );
-            exit_guard.report_failure();
+            diagnostics.watchdog_armed.store(false, Ordering::Relaxed);
+            exit_guard.fail(MediaWorkerExitReason::WatchdogExpired);
             return;
         }
         let permit_mutation = !drain_before_mutation;
@@ -910,12 +1206,16 @@ fn run_webrtc(
                         accepted_remote_candidates =
                             accepted_remote_candidates.saturating_add(candidate_count);
                         post_gather_watchdog.candidate_accepted();
+                        diagnostics.watchdog_armed.store(false, Ordering::Relaxed);
                     }
                     let _ = reply.send(result);
                 }
                 MediaCommand::EndCandidates(reply) => {
                     remote_ice.complete();
                     post_gather_watchdog.arm(connected, accepted_remote_candidates, Instant::now());
+                    diagnostics
+                        .watchdog_armed
+                        .store(post_gather_watchdog.deadline.is_some(), Ordering::Relaxed);
                     let _ = reply.send(Ok(()));
                 }
                 MediaCommand::Play(frame) => {
@@ -932,7 +1232,7 @@ fn run_webrtc(
                     }
                 }
                 MediaCommand::Close => {
-                    exit_guard.mark_intentional_shutdown();
+                    exit_guard.close(MediaWorkerExitReason::CommandClose);
                     return;
                 }
             }
@@ -947,9 +1247,11 @@ fn run_webrtc(
             let pcm: Vec<_> = outgoing_pcm.drain(..OPUS_FRAME_SAMPLES).collect();
             let mut encoded = [0_u8; 1_500];
             let Ok(length) = encoder.encode(&pcm, &mut encoded) else {
+                exit_guard.fail(MediaWorkerExitReason::EncoderFailure);
                 return;
             };
             let Some(writer) = rtc.writer(mid) else {
+                exit_guard.fail(MediaWorkerExitReason::WriterUnavailable);
                 return;
             };
             let Some(pt) = writer
@@ -957,6 +1259,7 @@ fn run_webrtc(
                 .find(|params| params.spec().codec == Codec::Opus)
                 .map(|params| params.pt())
             else {
+                exit_guard.fail(MediaWorkerExitReason::OpusPayloadUnavailable);
                 return;
             };
             if writer
@@ -968,6 +1271,7 @@ fn run_webrtc(
                 )
                 .is_err()
             {
+                exit_guard.fail(MediaWorkerExitReason::RtpWriteFailure);
                 return;
             }
             media_time = media_time.saturating_add(OPUS_FRAME_SAMPLES as u64);
@@ -977,19 +1281,25 @@ fn run_webrtc(
         loop {
             match rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
-                    let _ = socket.send_to(&transmit.contents, transmit.destination);
+                    if let Err(error) = socket.send_to(&transmit.contents, transmit.destination) {
+                        diagnostics.record_udp_send_error(&error, transmit.destination);
+                    }
                 }
                 Ok(Output::Event(Event::Connected)) => {
                     connected = true;
                     post_gather_watchdog.connection_observed();
+                    diagnostics.connected.store(true, Ordering::Relaxed);
+                    diagnostics.watchdog_armed.store(false, Ordering::Relaxed);
                     if !exit_guard.send(VoiceMediaEvent::Connected) {
+                        exit_guard.fail(MediaWorkerExitReason::EventConsumerClosed);
                         return;
                     }
                 }
                 Ok(Output::Event(Event::IceConnectionStateChange(
                     IceConnectionState::Disconnected,
                 ))) => {
-                    exit_guard.report_failure();
+                    diagnostics.connected.store(false, Ordering::Relaxed);
+                    exit_guard.fail(MediaWorkerExitReason::IceDisconnected);
                     return;
                 }
                 Ok(Output::Event(Event::MediaAdded(media))) => {
@@ -1012,6 +1322,7 @@ fn run_webrtc(
                         })
                         .is_err()
                     {
+                        exit_guard.fail(MediaWorkerExitReason::AudioConsumerUnavailable);
                         return;
                     }
                 }
@@ -1019,13 +1330,17 @@ fn run_webrtc(
                 Ok(Output::Timeout(deadline)) => {
                     if deadline <= Instant::now() {
                         if rtc.handle_input(Input::Timeout(Instant::now())).is_err() {
+                            exit_guard.fail(MediaWorkerExitReason::TimeoutInputFailure);
                             return;
                         }
                         drain_before_mutation = true;
                     }
                     break;
                 }
-                Err(_) => return,
+                Err(_) => {
+                    exit_guard.fail(MediaWorkerExitReason::RtcPollFailure);
+                    return;
+                }
             }
         }
 
@@ -1047,6 +1362,7 @@ fn run_webrtc(
                     .handle_input(Input::Receive(Instant::now(), receive))
                     .is_err()
                 {
+                    exit_guard.fail(MediaWorkerExitReason::ReceiveInputFailure);
                     return;
                 }
                 drain_before_mutation = true;
@@ -1054,7 +1370,10 @@ fn run_webrtc(
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(2));
             }
-            Err(_) => return,
+            Err(_) => {
+                exit_guard.fail(MediaWorkerExitReason::UdpReceiveFailure);
+                return;
+            }
         }
     }
 }
@@ -1626,7 +1945,7 @@ mod tests {
         drop(candidate_tx);
         worker.await.unwrap();
         assert!(event_rx.try_recv().is_err());
-        assert_eq!(count(&diagnostics.numeric_accepted), 1);
+        assert_eq!(count(&diagnostics.numeric_ipv4_accepted), 1);
         assert_eq!(count(&diagnostics.mdns_resolved), 1);
     }
 
@@ -1667,7 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn silent_media_worker_death_is_terminal_with_an_idle_resolver_worker() {
         let diagnostics = Arc::new(IceCandidateCounters::default());
-        let preparer = RemoteCandidatePreparer::new(None, diagnostics);
+        let preparer = RemoteCandidatePreparer::new(None, Arc::clone(&diagnostics));
         let (candidate_tx, candidate_rx) = mpsc::channel(1);
         let (media_tx, _media_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(2);
@@ -1678,8 +1997,12 @@ mod tests {
             preparer,
         ));
 
-        drop(MediaWorkerExitGuard::new(event_tx));
+        drop(MediaWorkerExitGuard::new(
+            event_tx,
+            Arc::clone(&diagnostics),
+        ));
         assert!(matches!(event_rx.try_recv(), Ok(VoiceMediaEvent::Failed)));
+        assert_eq!(diagnostics.snapshot().media_exit_reason, "unclassified");
         assert!(matches!(
             event_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -1692,10 +2015,12 @@ mod tests {
     #[tokio::test]
     async fn intentional_media_worker_shutdown_closes_without_failure() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
-        let mut guard = MediaWorkerExitGuard::new(event_tx);
-        guard.mark_intentional_shutdown();
+        let diagnostics = Arc::new(IceCandidateCounters::default());
+        let mut guard = MediaWorkerExitGuard::new(event_tx, Arc::clone(&diagnostics));
+        guard.close(MediaWorkerExitReason::CommandClose);
         drop(guard);
         assert!(event_rx.recv().await.is_none());
+        assert_eq!(diagnostics.snapshot().media_exit_reason, "command_close");
     }
 
     #[test]
@@ -1723,7 +2048,8 @@ mod tests {
     #[test]
     fn diagnostic_event_exposes_only_bounded_counts() {
         let counters = IceCandidateCounters::default();
-        IceCandidateCounters::increment(&counters.numeric_accepted, 1);
+        counters.record_numeric(AddressFamily::Ipv4, true);
+        counters.record_numeric(AddressFamily::Ipv6, false);
         IceCandidateCounters::increment(&counters.mdns_resolved, 2);
         counters.record_skip(MdnsSkipReason::NoResponse);
         counters.record_skip(MdnsSkipReason::UnsupportedTcp);
@@ -1732,7 +2058,10 @@ mod tests {
         assert_eq!(
             event,
             IceCandidateDiagnosticEvent {
-                numeric_accepted: 1,
+                numeric_ipv4_accepted: 1,
+                numeric_ipv6_accepted: 0,
+                numeric_ipv4_skipped: 0,
+                numeric_ipv6_skipped: 1,
                 mdns_resolved: 2,
                 mdns_skipped_no_response: 1,
                 mdns_skipped_unavailable: 0,
@@ -1742,19 +2071,66 @@ mod tests {
                 mdns_skipped_expansion_budget: 0,
                 mdns_skipped_unsupported_tcp: 1,
                 malformed_rejected: 1,
+                socket_family: "unknown",
+                connected: false,
+                watchdog_armed: false,
+                udp_send_errors_ipv4: 0,
+                udp_send_errors_ipv6: 0,
+                udp_send_errors_would_block: 0,
+                udp_send_errors_permission_denied: 0,
+                udp_send_errors_address: 0,
+                udp_send_errors_other: 0,
+                last_udp_error_kind: "none",
+                last_udp_error_family: "unknown",
+                media_exit_reason: "running",
             }
         );
         let rendered = event.to_string();
-        assert_eq!(
-            rendered,
-            "numeric_accepted=1 mdns_resolved=2 mdns_skipped_no_response=1 \
-             mdns_skipped_unavailable=0 mdns_skipped_timeout=0 \
-             mdns_skipped_name_budget=0 mdns_skipped_time_budget=0 \
-             mdns_skipped_expansion_budget=0 mdns_skipped_unsupported_tcp=1 \
-             malformed_rejected=1"
-        );
+        assert!(rendered.contains("numeric_ipv4_accepted=1"));
+        assert!(rendered.contains("numeric_ipv6_skipped=1"));
         assert!(!rendered.contains(".local"));
         assert!(!rendered.contains("192."));
+    }
+
+    #[test]
+    fn sensitive_candidate_and_destination_values_cannot_enter_diagnostics() {
+        const HOSTNAME: &str = "sensitive-session-host.local";
+        const ADDRESS: &str = "203.0.113.247";
+        let counters = IceCandidateCounters::default();
+        let mdns = wire_candidate(format!(
+            "candidate:sentinel 1 udp 1 {HOSTNAME} 5000 typ host generation 0"
+        ));
+        assert!(classify_remote_candidate(&mdns, &counters).is_ok());
+        counters.record_udp_send_error(
+            &std::io::Error::from(ErrorKind::PermissionDenied),
+            format!("{ADDRESS}:5000").parse().unwrap(),
+        );
+
+        let rendered = counters.snapshot().to_string();
+        assert!(rendered.contains("udp_send_errors_permission_denied=1"));
+        assert!(rendered.contains("last_udp_error_family=ipv4"));
+        assert!(!rendered.contains("candidate:sentinel"));
+        assert!(!rendered.contains(HOSTNAME));
+        assert!(!rendered.contains(ADDRESS));
+    }
+
+    #[test]
+    fn numeric_candidate_transitions_preserve_family_and_outcome() {
+        let counters = IceCandidateCounters::default();
+        for (address, accepted) in [("192.0.2.10", true), ("2001:db8::10", false)] {
+            let candidate = wire_candidate(format!(
+                "candidate:family 1 udp 1 {address} 5000 typ host generation 0"
+            ));
+            let QueuedRemoteCandidate::Numeric { family, .. } =
+                classify_remote_candidate(&candidate, &counters).unwrap()
+            else {
+                panic!("numeric candidate must retain its address family");
+            };
+            counters.record_numeric(family, accepted);
+        }
+        let event = counters.snapshot();
+        assert_eq!(event.numeric_ipv4_accepted, 1);
+        assert_eq!(event.numeric_ipv6_skipped, 1);
     }
 
     #[test]

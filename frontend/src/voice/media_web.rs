@@ -56,6 +56,7 @@ struct WebSession {
     on_track: Option<Closure<dyn FnMut(RtcTrackEvent)>>,
     on_connection_state: Option<Closure<dyn FnMut(JsValue)>>,
     on_track_ended: Option<Closure<dyn FnMut(JsValue)>>,
+    diagnostics: BrowserMediaDiagnostics,
 }
 
 impl WebSession {
@@ -104,6 +105,121 @@ impl WebSession {
     }
 }
 
+impl Drop for WebSession {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct PendingCapture {
+    stream: MediaStream,
+    track: Option<MediaStreamTrack>,
+    armed: bool,
+}
+
+impl PendingCapture {
+    fn new(stream: MediaStream) -> Self {
+        Self {
+            stream,
+            track: None,
+            armed: true,
+        }
+    }
+
+    fn set_track(&mut self, track: MediaStreamTrack) {
+        self.track = Some(track);
+    }
+
+    fn handles(&self) -> Result<(MediaStream, MediaStreamTrack), MediaError> {
+        Ok((
+            self.stream.clone(),
+            self.track
+                .as_ref()
+                .ok_or_else(|| MediaError::microphone("the captured stream has no audio track"))?
+                .clone(),
+        ))
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingCapture {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for track in self.stream.get_tracks().iter() {
+            if let Ok(track) = track.dyn_into::<MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+        if let Some(track) = self.track.as_ref() {
+            track.stop();
+        }
+    }
+}
+
+#[derive(Default)]
+struct BrowserMediaDiagnostics {
+    ever_connected: bool,
+}
+
+impl BrowserMediaDiagnostics {
+    fn observe_connected(&mut self) {
+        self.ever_connected = true;
+    }
+
+    fn terminal_class(&self, terminal: &'static str, ice_connection: &'static str) -> &'static str {
+        classify_terminal(terminal, ice_connection, self.ever_connected)
+    }
+}
+
+fn classify_terminal(
+    terminal: &'static str,
+    ice_connection: &'static str,
+    ever_connected: bool,
+) -> &'static str {
+    if terminal == "closed" {
+        return if ever_connected {
+            "closed_after_connect"
+        } else {
+            "closed_before_connect"
+        };
+    }
+    if ever_connected {
+        "post_connect_disconnect"
+    } else if ice_connection == "failed" {
+        "ice_failure_before_connect"
+    } else if matches!(ice_connection, "connected" | "completed") {
+        "dtls_or_peer_failure"
+    } else {
+        "peer_failure_before_connect"
+    }
+}
+
+fn safe_peer_ice_connection(peer: &RtcPeerConnection) -> &'static str {
+    Reflect::get(peer.as_ref(), &JsValue::from_str("iceConnectionState"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .map(|value| safe_ice_connection_state(&value))
+        .unwrap_or("unknown")
+}
+
+fn safe_ice_connection_state(value: &str) -> &'static str {
+    match value {
+        "new" => "new",
+        "checking" => "checking",
+        "connected" => "connected",
+        "completed" => "completed",
+        "disconnected" => "disconnected",
+        "failed" => "failed",
+        "closed" => "closed",
+        _ => "unknown",
+    }
+}
+
 #[derive(Default)]
 pub struct WebMediaPlatform {
     session: Rc<RefCell<WebSession>>,
@@ -112,6 +228,16 @@ pub struct WebMediaPlatform {
 impl WebMediaPlatform {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Drop for WebMediaPlatform {
+    fn drop(&mut self) {
+        // The start future holds its own session Rc while getUserMedia is
+        // pending, so WebSession::drop alone cannot cancel owner loss.
+        let mut session = self.session.borrow_mut();
+        session.cancelled = true;
+        session.release();
     }
 }
 
@@ -239,7 +365,7 @@ fn create_audio_element() -> Result<HtmlAudioElement, MediaError> {
     Ok(audio)
 }
 
-async fn acquire_microphone() -> Result<(MediaStream, MediaStreamTrack), MediaError> {
+async fn acquire_microphone() -> Result<PendingCapture, MediaError> {
     let window = web_sys::window().ok_or_else(|| MediaError::microphone("no browser window"))?;
     let devices = window.navigator().media_devices().map_err(|error| {
         // This is the packaged-desktop failure mode: a non-secure context has
@@ -276,14 +402,17 @@ async fn acquire_microphone() -> Result<(MediaStream, MediaStreamTrack), MediaEr
         .map_err(|error| MediaError::microphone(js_message(&error)))?
         .dyn_into()
         .map_err(|_| MediaError::microphone("the browser did not return an audio stream"))?;
+    let mut capture = PendingCapture::new(stream);
 
-    let track: MediaStreamTrack = stream
+    let track: MediaStreamTrack = capture
+        .stream
         .get_audio_tracks()
         .get(0)
         .dyn_into()
         .map_err(|_| MediaError::microphone("the captured stream has no audio track"))?;
+    capture.set_track(track);
 
-    Ok((stream, track))
+    Ok(capture)
 }
 
 impl MediaPlatform for WebMediaPlatform {
@@ -300,10 +429,12 @@ impl MediaPlatform for WebMediaPlatform {
             let mut session = slot.borrow_mut();
             session.release();
             session.cancelled = false;
+            session.diagnostics = BrowserMediaDiagnostics::default();
         }
         Box::pin(async move {
             // Microphone first — see the module comment on mDNS candidates.
-            let (stream, track) = acquire_microphone().await?;
+            let mut capture = acquire_microphone().await?;
+            let (stream, track) = capture.handles()?;
 
             // Register both immediately, before anything else can fail or
             // suspend. From here on, `stop` can release them.
@@ -311,15 +442,16 @@ impl MediaPlatform for WebMediaPlatform {
                 let mut session = slot.borrow_mut();
                 if session.cancelled {
                     // Teardown happened while the permission sheet was open.
-                    // Park them so `release` stops them, then bail.
-                    session.stream = Some(stream);
-                    session.track = Some(track);
+                    // The still-armed capture guard stops the newly returned
+                    // stream without adopting it into the cancelled session.
                     drop(session);
                     return Err(abandon(&slot));
                 }
                 session.stream = Some(stream.clone());
                 session.track = Some(track.clone());
             }
+            capture.disarm();
+            drop(capture);
             let audio_settings = effective_audio(&track);
 
             let configuration = RtcConfiguration::new();
@@ -405,21 +537,44 @@ impl MediaPlatform for WebMediaPlatform {
 
             let state_events = events.clone();
             let state_peer = peer.clone();
+            let state_slot = Rc::downgrade(&slot);
             let on_connection_state = Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
                 // `disconnected` is the *recoverable* ICE state — a consent
                 // refresh lapse or a brief roam commonly returns to
                 // `connected` without renegotiation. Only `failed` and
                 // `closed` are terminal, so `disconnected` is reported
                 // separately and the controller treats it as a warning.
-                match state_peer.connection_state() {
-                    RtcPeerConnectionState::Connected => state_events(MediaEvent::Connected),
+                let state = state_peer.connection_state();
+                match state {
+                    RtcPeerConnectionState::Connected => {
+                        if let Some(slot) = state_slot.upgrade() {
+                            slot.borrow_mut().diagnostics.observe_connected();
+                        }
+                        state_events(MediaEvent::Connected)
+                    }
                     RtcPeerConnectionState::Disconnected => {
                         state_events(MediaEvent::ConnectionUnstable)
                     }
                     RtcPeerConnectionState::Failed => {
+                        let ice_connection = safe_peer_ice_connection(&state_peer);
+                        if let Some(slot) = state_slot.upgrade() {
+                            let class = slot
+                                .borrow()
+                                .diagnostics
+                                .terminal_class("failed", ice_connection);
+                            log::error!("voice media peer failed: class={class}");
+                        }
                         state_events(MediaEvent::Disconnected("failed".to_owned()))
                     }
                     RtcPeerConnectionState::Closed => {
+                        let ice_connection = safe_peer_ice_connection(&state_peer);
+                        if let Some(slot) = state_slot.upgrade() {
+                            let class = slot
+                                .borrow()
+                                .diagnostics
+                                .terminal_class("closed", ice_connection);
+                            log::error!("voice media peer closed: class={class}");
+                        }
                         state_events(MediaEvent::Disconnected("closed".to_owned()))
                     }
                     _ => {}
@@ -600,5 +755,77 @@ impl MediaPlatform for WebMediaPlatform {
         let mut session = self.session.borrow_mut();
         session.cancelled = true;
         session.release();
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_classification_distinguishes_known_boundaries() {
+        assert_eq!(
+            classify_terminal("failed", "failed", false),
+            "ice_failure_before_connect"
+        );
+        assert_eq!(
+            classify_terminal("failed", "connected", false),
+            "dtls_or_peer_failure"
+        );
+        assert_eq!(
+            classify_terminal("failed", "disconnected", true),
+            "post_connect_disconnect"
+        );
+        assert_eq!(
+            classify_terminal("closed", "closed", false),
+            "closed_before_connect"
+        );
+        assert_eq!(
+            classify_terminal("closed", "closed", true),
+            "closed_after_connect"
+        );
+    }
+
+    #[test]
+    fn unexpected_browser_state_is_reduced_to_a_closed_value() {
+        assert_eq!(
+            safe_ice_connection_state("sensitive-untrusted-state"),
+            "unknown"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_resource_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn dropping_a_web_session_closes_browser_resources() {
+        let stream = MediaStream::new().expect("empty browser stream");
+        let peer = RtcPeerConnection::new().expect("browser peer");
+        let audio = create_audio_element().expect("browser audio element");
+        audio.set_src_object(Some(&stream));
+        assert!(audio.is_connected());
+        let on_connection_state = Closure::<dyn FnMut(JsValue)>::new(|_: JsValue| {});
+        peer.set_onconnectionstatechange(Some(on_connection_state.as_ref().unchecked_ref()));
+
+        let mut session = WebSession::default();
+        session.stream = Some(stream);
+        session.peer = Some(peer.clone());
+        session.audio = Some(audio.clone());
+        session.on_connection_state = Some(on_connection_state);
+        drop(session);
+
+        assert_eq!(peer.connection_state(), RtcPeerConnectionState::Closed);
+        assert!(
+            Reflect::get(peer.as_ref(), &JsValue::from_str("onconnectionstatechange"))
+                .expect("callback property")
+                .is_null()
+        );
+        assert!(audio.src_object().is_none());
+        assert!(!audio.is_connected());
     }
 }
