@@ -20885,7 +20885,6 @@ mod tests {
                 status: ContextCompactionStatus::Completed,
                 provider_version: None,
                 metrics: CompactionMetrics::default(),
-                continuation: None,
                 message: None,
             },
         );
@@ -30690,7 +30689,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
             },
             provider_version: None,
             protocol_version: None,
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         };
         assert_eq!(
@@ -30830,7 +30828,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     binding_generation_after: None,
                     transcript_high_water: 1,
                     metrics: CompactionMetrics::default(),
-                    continuation: None,
                     message: None,
                     started_at_ms: 1,
                     finished_at_ms: Some(2),

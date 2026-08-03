@@ -2238,7 +2238,6 @@ mod tests {
                 },
                 provider_version: None,
                 metrics: Default::default(),
-                continuation: None,
                 message: None,
             },
         )

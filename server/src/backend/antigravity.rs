@@ -26,10 +26,10 @@ use crate::backend::{
     Backend, BackendCompactionAvailability, BackendCompactionCapability,
     BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
     BackendCompactionNotDispatchedReason, BackendCompactionRequest, BackendCompactionStart,
-    BackendCompactionUnavailableReason, BackendContextReseatSupport, BackendSession,
-    BackendSpawnConfig, BackendStartupError, EventStream, StartupMcpServer, StartupMcpTransport,
-    backend_fork_unsupported_message, protocol_images_to_attachments,
-    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
+    BackendCompactionUnavailableReason, BackendSession, BackendSpawnConfig, BackendStartupError,
+    EventStream, StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
+    protocol_images_to_attachments, render_combined_spawn_instructions,
+    resolve_settings as resolve_backend_settings,
 };
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
@@ -272,7 +272,6 @@ fn antigravity_compaction_capability(
         },
         provider_version,
         protocol_version: None,
-        reseat: BackendContextReseatSupport::Unsupported,
         evidence: BackendCompactionCapabilityEvidence::AdapterContract,
     }
 }

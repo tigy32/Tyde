@@ -15,15 +15,14 @@ use protocol::{
     CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
     CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
-    ContextCompactionTimelineStatus, ContinuationInstallSummary, Envelope, FrameKind,
-    MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
-    ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
-    QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
-    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
-    ToolRequestType,
+    ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
+    MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
+    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData, ReviewErrorContext,
+    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues,
+    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -457,7 +456,6 @@ struct CompactionFlight {
     operation_id: CompactionOperationId,
     trigger: CompactionTrigger,
     focus: Option<String>,
-    continuation: crate::backend::BackendContinuationContext,
     queue_watermark: u64,
     state: StoredCompactionState,
     binding_generation_before: u64,
@@ -468,7 +466,6 @@ struct CompactionFlight {
     retry_armed: bool,
     retry_attempt: u8,
     method: Option<CompactionMethod>,
-    reseat: crate::backend::BackendContextReseatSupport,
     provider_version: Option<String>,
     terminal_taken: bool,
 }
@@ -584,8 +581,6 @@ fn context_compaction_retry_delay(attempt: u8) -> Duration {
 struct PreparedContextFallback {
     binding: crate::backend::PreparedBackendBinding,
     metrics: CompactionMetrics,
-    continuation: Option<ContinuationInstallSummary>,
-    message: Option<String>,
 }
 
 #[derive(Default)]
@@ -1945,7 +1940,6 @@ struct PrepareContextFallbackRequest {
     transcript_store: TranscriptStore,
     transcript_high_water: u64,
     requested_focus: Option<String>,
-    continuation: crate::backend::BackendContinuationContext,
     spawn_config: BackendSpawnConfig,
     use_mock_backend: bool,
     capacity_tx: HostCapacityTx,
@@ -2188,7 +2182,6 @@ async fn prepare_context_fallback(
     let seed = crate::backend::BackendContextSeed {
         workspace_roots: request.workspace_roots,
         summary,
-        continuation: request.continuation,
     };
     let binding = if request.use_mock_backend {
         crate::backend::prepare_mock_compacted_backend_binding(
@@ -2218,8 +2211,6 @@ async fn prepare_context_fallback(
             "prepared backend binding did not provide complete readiness evidence".to_owned(),
         );
     }
-    let (continuation, warning) =
-        summarize_continuation_result(&binding.continuation, "fallback bootstrap");
     Ok(PreparedContextFallback {
         binding,
         metrics: CompactionMetrics {
@@ -2229,8 +2220,6 @@ async fn prepare_context_fallback(
             precomputed: Some(true),
             ..CompactionMetrics::default()
         },
-        continuation: Some(continuation),
-        message: warning,
     })
 }
 
@@ -2368,102 +2357,6 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
     tokio::time::timeout(Duration::from_secs(300), collect)
         .await
         .map_err(|_| "fallback summary generator timed out".to_owned())?
-}
-
-fn summarize_continuation_result(
-    result: &crate::backend::BackendContextReseatResult,
-    phase: &str,
-) -> (ContinuationInstallSummary, Option<String>) {
-    use crate::backend::ContinuationInstallStatus;
-
-    let failure =
-        [&result.required, &result.advisory]
-            .into_iter()
-            .find_map(|status| match status {
-                ContinuationInstallStatus::Failed { message } => Some(message.clone()),
-                _ => None,
-            });
-    if let Some(message) = failure {
-        return (
-            ContinuationInstallSummary::Failed {
-                message: message.clone(),
-            },
-            Some(format!(
-                "context compaction completed, but {phase} continuation installation failed: {message}"
-            )),
-        );
-    }
-    if [&result.required, &result.advisory]
-        .into_iter()
-        .any(|status| matches!(status, ContinuationInstallStatus::Unsupported))
-    {
-        return (
-            ContinuationInstallSummary::Unsupported,
-            Some(format!(
-                "context compaction completed, but {phase} could not install advisory continuation state"
-            )),
-        );
-    }
-    if [&result.required, &result.advisory]
-        .into_iter()
-        .any(|status| matches!(status, ContinuationInstallStatus::Installed))
-    {
-        return (ContinuationInstallSummary::Installed, None);
-    }
-    if [&result.required, &result.advisory]
-        .into_iter()
-        .any(|status| matches!(status, ContinuationInstallStatus::PreservedByNative))
-    {
-        return (ContinuationInstallSummary::PreservedByNative, None);
-    }
-    (ContinuationInstallSummary::NotRequired, None)
-}
-
-fn preserved_continuation_result(
-    context: &crate::backend::BackendContinuationContext,
-) -> crate::backend::BackendContextReseatResult {
-    let status = |empty: bool| {
-        if empty {
-            crate::backend::ContinuationInstallStatus::NotRequired
-        } else {
-            crate::backend::ContinuationInstallStatus::PreservedByNative
-        }
-    };
-    crate::backend::BackendContextReseatResult {
-        required: status(context.required.is_empty()),
-        advisory: status(context.advisory.is_empty()),
-    }
-}
-
-async fn install_post_native_continuation(
-    backend: &BackendHandle,
-    flight: &CompactionFlight,
-) -> crate::backend::BackendContextReseatResult {
-    #[cfg(test)]
-    if flight
-        .focus
-        .as_deref()
-        .is_some_and(|focus| focus.contains("__test_fail_continuation__"))
-    {
-        return crate::backend::BackendContextReseatResult {
-            required: crate::backend::ContinuationInstallStatus::NotRequired,
-            advisory: crate::backend::ContinuationInstallStatus::Failed {
-                message: "test-forced continuation injection failure".to_owned(),
-            },
-        };
-    }
-    match flight.reseat {
-        crate::backend::BackendContextReseatSupport::PreservedByNative
-        | crate::backend::BackendContextReseatSupport::IncludeInNativeRequest => {
-            preserved_continuation_result(&flight.continuation)
-        }
-        crate::backend::BackendContextReseatSupport::InjectAfterNative
-        | crate::backend::BackendContextReseatSupport::Unsupported => {
-            backend
-                .install_continuation_context(flight.continuation.clone())
-                .await
-        }
-    }
 }
 
 async fn collect_agent_activity_summary_events(
@@ -2639,16 +2532,6 @@ trait BackendSender: Send + Sync + 'static {
     ) -> Pin<
         Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
     >;
-    fn install_continuation_context<'a>(
-        &'a self,
-        context: crate::backend::BackendContinuationContext,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = crate::backend::BackendContextReseatResult>
-                + Send
-                + 'a,
-        >,
-    >;
     fn send_with_outcome<'a>(
         &'a self,
         input: AgentInput,
@@ -2673,19 +2556,6 @@ impl<B: Backend> BackendSender for B {
         Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
     > {
         Box::pin(Backend::begin_compaction(self, request))
-    }
-
-    fn install_continuation_context<'a>(
-        &'a self,
-        context: crate::backend::BackendContinuationContext,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = crate::backend::BackendContextReseatResult>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(Backend::install_continuation_context(self, context))
     }
 
     fn send_with_outcome<'a>(
@@ -3723,7 +3593,6 @@ pub(crate) fn spawn_agent_actor(
                                     metrics: CompactionMetrics::default(),
                                     provider_session_id: None,
                                     status: ContextCompactionTimelineStatus::Failed,
-                                    continuation: None,
                                     message: Some(
                                         "agent backend closed during context compaction"
                                             .to_owned(),
@@ -3918,7 +3787,6 @@ pub(crate) fn spawn_agent_actor(
                                             duration_ms: progress.elapsed_ms,
                                             ..CompactionMetrics::default()
                                         },
-                                        continuation: None,
                                         message: None,
                                     },
                                 )
@@ -3971,7 +3839,6 @@ pub(crate) fn spawn_agent_actor(
                                 status: ContextCompactionTimelineStatus::Completed,
                                 mutation: CompactionMutation::Completed,
                                 metrics: observed.metrics,
-                                continuation: None,
                                 message: None,
                                 timestamp: now_ms(),
                             };
@@ -4678,7 +4545,6 @@ pub(crate) fn spawn_agent_actor(
                                                 mutation:
                                                     CompactionMutation::Completed,
                                                 metrics: observed.metrics,
-                                                continuation: None,
                                                 message: None,
                                                 timestamp: now_ms(),
                                             };
@@ -5936,18 +5802,13 @@ pub(crate) fn spawn_agent_actor(
                             let session_snapshot = run_session_store_io(
                                 &session_store,
                                 move |store| {
-                                    Ok(store.get(&session_id_for_read).map(|record| {
-                                        let task_list =
-                                            store.get_task_list(&session_id_for_read);
-                                        (
-                                            record.active_backend_binding_generation,
-                                            task_list,
-                                        )
-                                    }))
+                                    Ok(store
+                                        .get(&session_id_for_read)
+                                        .map(|record| record.active_backend_binding_generation))
                                 },
                             )
                             .await;
-                            let (binding_generation, task_list) = match session_snapshot {
+                            let binding_generation = match session_snapshot {
                                 Ok(Some(snapshot)) => snapshot,
                                 Ok(None) => {
                                     let _ = reply.send(Err(
@@ -5963,12 +5824,6 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             };
                             let transcript_high_water = event_log.len() as u64;
-                            let continuation = backend_continuation_context(
-                                &current_start,
-                                session_id,
-                                transcript_high_water,
-                                task_list,
-                            );
                             let operation = CompactionOperationRecord {
                                 operation_id: operation_id.clone(),
                                 logical_session_id: session_id.clone(),
@@ -5981,7 +5836,6 @@ pub(crate) fn spawn_agent_actor(
                                 binding_generation_after: None,
                                 transcript_high_water,
                                 metrics: CompactionMetrics::default(),
-                                continuation: None,
                                 message: None,
                                 started_at_ms: now_ms(),
                                 finished_at_ms: None,
@@ -6004,21 +5858,10 @@ pub(crate) fn spawn_agent_actor(
                                 continue;
                             }
                             let queue_watermark = next_queue_sequence.saturating_sub(1);
-                            #[cfg(test)]
-                            let reseat = if focus.as_deref().is_some_and(|focus| {
-                                focus.contains("__test_fail_continuation__")
-                            }) {
-                                crate::backend::BackendContextReseatSupport::Unsupported
-                            } else {
-                                capability.reseat
-                            };
-                            #[cfg(not(test))]
-                            let reseat = capability.reseat;
                             context_compaction = Some(CompactionFlight {
                                 operation_id: operation_id.clone(),
                                 trigger,
                                 focus,
-                                continuation,
                                 queue_watermark,
                                 state: StoredCompactionState::Deferred,
                                 binding_generation_before: binding_generation,
@@ -6029,7 +5872,6 @@ pub(crate) fn spawn_agent_actor(
                                 retry_armed: false,
                                 retry_attempt: 0,
                                 method: None,
-                                reseat,
                                 provider_version: capability.provider_version.clone(),
                                 terminal_taken: false,
                             });
@@ -6050,7 +5892,6 @@ pub(crate) fn spawn_agent_actor(
                                     },
                                     provider_version: capability.provider_version,
                                     metrics: CompactionMetrics::default(),
-                                    continuation: None,
                                     message: None,
                                 },
                             )
@@ -6323,9 +6164,6 @@ pub(crate) fn spawn_agent_actor(
                             let session_id_for_commit = session_id.clone();
                             let operation_id_for_commit = operation_id.clone();
                             let commit_metrics = prepared.metrics.clone();
-                            let commit_continuation =
-                                prepared.continuation.clone();
-                            let commit_message = prepared.message.clone();
                             let provider_session_id_for_commit =
                                 provider_session_id.clone();
                             if let Err(error) = run_session_store_io(
@@ -6341,8 +6179,7 @@ pub(crate) fn spawn_agent_actor(
                                                 provider_session_id:
                                                     provider_session_id_for_commit,
                                                 metrics: commit_metrics,
-                                                continuation: commit_continuation,
-                                                message: commit_message,
+                                                message: None,
                                             },
                                         )
                                         .map(|_| ())
@@ -6406,8 +6243,7 @@ pub(crate) fn spawn_agent_actor(
                                     provider_session_id: Some(provider_session_id),
                                     status:
                                         ContextCompactionTimelineStatus::Completed,
-                                    continuation: prepared.continuation,
-                                    message: prepared.message,
+                                    message: None,
                                     trusted_post_context_tokens: Some(None),
                                 },
                                 &session_store,
@@ -6531,7 +6367,6 @@ pub(crate) fn spawn_agent_actor(
                                             metrics: CompactionMetrics::default(),
                                             provider_session_id: None,
                                             status: ContextCompactionTimelineStatus::Failed,
-                                            continuation: None,
                                             message: Some(error),
                                             trusted_post_context_tokens: None,
                                         };
@@ -6586,7 +6421,6 @@ pub(crate) fn spawn_agent_actor(
                                             metrics: CompactionMetrics::default(),
                                             provider_session_id: None,
                                             status: ContextCompactionTimelineStatus::Failed,
-                                            continuation: None,
                                             message: Some(format!(
                                                 "backend returned terminal result for operation {}",
                                                 result.operation_id.0
@@ -6608,7 +6442,7 @@ pub(crate) fn spawn_agent_actor(
                                         crate::backend::BackendCompactionDispatchState::Accepted
                                             | crate::backend::BackendCompactionDispatchState::MayHaveReachedProvider
                                     );
-                                    let (status, mut message) = match result.outcome {
+                                    let (status, message) = match result.outcome {
                                         Ok(_) if mutation == CompactionMutation::Completed => {
                                             (ContextCompactionTimelineStatus::Completed, None)
                                         }
@@ -6644,25 +6478,6 @@ pub(crate) fn spawn_agent_actor(
                                     } else {
                                         None
                                     };
-                                    let mut continuation = None;
-                                    if status == ContextCompactionTimelineStatus::Completed {
-                                        let installed = install_post_native_continuation(
-                                            backend
-                                                .as_ref()
-                                                .expect("backend must exist while finalizing compaction"),
-                                            &flight,
-                                        )
-                                        .await;
-                                        let (summary, warning) =
-                                            summarize_continuation_result(
-                                                &installed,
-                                                "post-native",
-                                            );
-                                        continuation = Some(summary);
-                                        if warning.is_some() {
-                                            message = warning;
-                                        }
-                                    }
                                     ContextCompactionTerminalRecord {
                                         accepted,
                                         mutation,
@@ -6670,7 +6485,6 @@ pub(crate) fn spawn_agent_actor(
                                         metrics,
                                         provider_session_id: result.provider_session_id,
                                         status,
-                                        continuation,
                                         message,
                                         trusted_post_context_tokens,
                                     }
@@ -6687,7 +6501,6 @@ pub(crate) fn spawn_agent_actor(
                                     metrics: CompactionMetrics::default(),
                                     provider_session_id: None,
                                     status: ContextCompactionTimelineStatus::Failed,
-                                    continuation: None,
                                     message: Some(error),
                                     trusted_post_context_tokens:
                                         accepted_before_terminal.then_some(None),
@@ -7125,7 +6938,6 @@ pub(crate) fn spawn_agent_actor(
                                         provider_session_id: None,
                                         status:
                                             ContextCompactionTimelineStatus::Failed,
-                                        continuation: None,
                                         message: Some(message),
                                         trusted_post_context_tokens:
                                             accepted.then_some(None),
@@ -8379,7 +8191,6 @@ async fn enter_terminal_failure(
                 metrics: CompactionMetrics::default(),
                 provider_session_id: None,
                 status: ContextCompactionTimelineStatus::Failed,
-                continuation: None,
                 message: Some(payload.message.clone()),
                 trusted_post_context_tokens: accepted.then_some(None),
             },
@@ -10731,41 +10542,6 @@ struct ContextCompactionDispatchReadiness<'a> {
     background_mutation_active: bool,
 }
 
-fn backend_continuation_context(
-    start: &AgentStartPayload,
-    session_id: &SessionId,
-    transcript_high_water: u64,
-    task_list: Option<protocol::TaskList>,
-) -> crate::backend::BackendContinuationContext {
-    let mut advisory = vec![
-        crate::backend::BackendContinuationItem {
-            kind: "logical_identity".to_owned(),
-            payload: serde_json::json!({
-                "agent_id": start.agent_id.clone(),
-                "logical_session_id": session_id,
-                "custom_agent_id": start.custom_agent_id.clone(),
-                "team_id": start.team_id.clone(),
-                "team_member_id": start.team_member_id.clone(),
-            }),
-        },
-        crate::backend::BackendContinuationItem {
-            kind: "transcript_high_water".to_owned(),
-            payload: serde_json::json!(transcript_high_water),
-        },
-    ];
-    if let Some(task_list) = task_list {
-        advisory.push(crate::backend::BackendContinuationItem {
-            kind: "task_state".to_owned(),
-            payload: serde_json::to_value(task_list)
-                .expect("typed task state must serialize for continuation"),
-        });
-    }
-    crate::backend::BackendContinuationContext {
-        required: Vec::new(),
-        advisory,
-    }
-}
-
 struct ContextCompactionTerminalRecord {
     accepted: bool,
     mutation: CompactionMutation,
@@ -10773,7 +10549,6 @@ struct ContextCompactionTerminalRecord {
     metrics: CompactionMetrics,
     provider_session_id: Option<SessionId>,
     status: ContextCompactionTimelineStatus,
-    continuation: Option<ContinuationInstallSummary>,
     message: Option<String>,
     trusted_post_context_tokens: Option<Option<u64>>,
 }
@@ -10818,7 +10593,6 @@ async fn record_context_compaction_terminal(
     let persisted_session_id = session_id.clone();
     let persisted_operation_id = flight.operation_id.clone();
     let persisted_metrics = terminal.metrics.clone();
-    let persisted_continuation = terminal.continuation.clone();
     let persisted_message = terminal.message.clone();
     let persisted_accepted = terminal.accepted;
     let persisted_mutation = terminal.mutation;
@@ -10835,7 +10609,6 @@ async fn record_context_compaction_terminal(
                     mutation: persisted_mutation,
                     method: persisted_method,
                     metrics: persisted_metrics,
-                    continuation: persisted_continuation,
                     message: persisted_message,
                 },
             )
@@ -10881,7 +10654,6 @@ async fn record_context_compaction_terminal(
         status: terminal.status,
         mutation: terminal.mutation,
         metrics: terminal.metrics.clone(),
-        continuation: terminal.continuation.clone(),
         message: terminal.message.clone(),
         timestamp: now_ms(),
     };
@@ -10918,7 +10690,6 @@ async fn record_context_compaction_terminal(
             },
             provider_version: flight.provider_version,
             metrics: terminal.metrics,
-            continuation: terminal.continuation,
             message: terminal.message,
         },
     )
@@ -11042,7 +10813,6 @@ async fn begin_inline_context_fallback(
             },
             provider_version: active.provider_version.clone(),
             metrics: CompactionMetrics::default(),
-            continuation: None,
             message: Some(message),
         },
     )
@@ -11054,7 +10824,6 @@ async fn begin_inline_context_fallback(
         transcript_store: context.transcript_store.clone(),
         transcript_high_water,
         requested_focus: active.focus.clone(),
-        continuation: active.continuation.clone(),
         spawn_config: context.spawn_config.clone(),
         use_mock_backend: context.use_mock_backend,
         capacity_tx: context.capacity_tx.clone(),
@@ -11179,7 +10948,6 @@ async fn try_dispatch_context_compaction(
             },
             provider_version: active.provider_version.clone(),
             metrics: CompactionMetrics::default(),
-            continuation: None,
             message: None,
         },
     )
@@ -11194,7 +10962,6 @@ async fn try_dispatch_context_compaction(
             context.session_id,
         )
         .await,
-        continuation: active.continuation.clone(),
     };
     match context.backend.begin_compaction(request).await {
         crate::backend::BackendCompactionStart::Accepted(accepted) => {
@@ -11258,7 +11025,6 @@ async fn try_dispatch_context_compaction(
                     },
                     provider_version: active.provider_version.clone(),
                     metrics: CompactionMetrics::default(),
-                    continuation: None,
                     message: Some(format!("backend deferred compaction: {reason:?}")),
                 },
             )
@@ -12306,14 +12072,14 @@ mod tests {
         record_agent_started, record_chat_event_for_replay, register_transcript_session,
         replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
         session_history_entries_from_log, session_history_window, spawn_agent_actor,
-        spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
-        upsert_activity_stats_snapshot, upsert_context_compaction_snapshot,
+        spawn_relay_agent_actor, terminal_input_rejected_payload, upsert_activity_stats_snapshot,
+        upsert_context_compaction_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
     use crate::agent::{backend_turn_visibly_busy, supervisor};
     use crate::backend::{
-        Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
+        BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
         BackendTranscriptEventMetadata, EventStream,
     };
     use crate::review::ReviewRegistry;
@@ -14721,7 +14487,6 @@ mod tests {
                 status: ContextCompactionTimelineStatus::Completed,
                 mutation: CompactionMutation::Completed,
                 metrics: CompactionMetrics::default(),
-                continuation: None,
                 message: None,
                 timestamp: 5,
             });
@@ -16250,7 +16015,6 @@ mod tests {
                     after_tokens: Some(3_000),
                     ..protocol::CompactionMetrics::default()
                 },
-                continuation: None,
                 message: None,
                 timestamp: 2,
             }),
@@ -19169,10 +18933,6 @@ mod tests {
             operation_id: CompactionOperationId("operation".to_owned()),
             trigger: CompactionTrigger::UserRequested,
             focus: None,
-            continuation: crate::backend::BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
             queue_watermark: 2,
             state: StoredCompactionState::Deferred,
             binding_generation_before: 0,
@@ -19183,7 +18943,6 @@ mod tests {
             retry_armed: false,
             retry_attempt: 0,
             method: None,
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             provider_version: None,
             terminal_taken: false,
         };
@@ -19263,10 +19022,6 @@ mod tests {
             operation_id: CompactionOperationId("operation".to_owned()),
             trigger: CompactionTrigger::UserRequested,
             focus: None,
-            continuation: crate::backend::BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
             queue_watermark: 0,
             state: StoredCompactionState::NativeAccepted,
             binding_generation_before: 0,
@@ -19277,7 +19032,6 @@ mod tests {
             retry_armed: false,
             retry_attempt: 0,
             method: Some(CompactionMethod::NativeRpc),
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             provider_version: Some("arbitrary diagnostic".to_owned()),
             terminal_taken: true,
         };
@@ -19315,10 +19069,6 @@ mod tests {
             operation_id: CompactionOperationId("operation".to_owned()),
             trigger: CompactionTrigger::UserRequested,
             focus: None,
-            continuation: crate::backend::BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
             queue_watermark: 0,
             state: StoredCompactionState::Deferred,
             binding_generation_before: 0,
@@ -19329,7 +19079,6 @@ mod tests {
             retry_armed: false,
             retry_attempt: 0,
             method: None,
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             provider_version: None,
             terminal_taken: false,
         };
@@ -19415,10 +19164,6 @@ mod tests {
             operation_id: CompactionOperationId("deferred-operation".to_owned()),
             trigger: CompactionTrigger::UserRequested,
             focus: None,
-            continuation: crate::backend::BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
             queue_watermark: 0,
             state: StoredCompactionState::Deferred,
             binding_generation_before: 0,
@@ -19429,7 +19174,6 @@ mod tests {
             retry_armed: false,
             retry_attempt: 0,
             method: None,
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             provider_version: None,
             terminal_taken: false,
         };
@@ -19485,7 +19229,6 @@ mod tests {
             },
             provider_version: Some("antigravity-test".to_owned()),
             protocol_version: None,
-            reseat: crate::backend::BackendContextReseatSupport::Unsupported,
             evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         };
         assert!(context_compaction_fallback_allowed(
@@ -19515,7 +19258,6 @@ mod tests {
         let claude_native = crate::backend::BackendCompactionCapability::native(
             crate::backend::BackendCompactionMechanism::InterceptedTextCommand,
             Some("claude-test".to_owned()),
-            crate::backend::BackendContextReseatSupport::InjectAfterNative,
             crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
         );
         let flight_method = super::compaction_method_for_capability(&claude_native);
@@ -19710,7 +19452,6 @@ mod tests {
             },
             provider_version: None,
             metrics: CompactionMetrics::default(),
-            continuation: None,
             message: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -19911,7 +19652,6 @@ mod tests {
             NativeProviderFailure,
             RejectedFallbackInterrupt,
             DeferredDeadline,
-            ContinuationInjectionFailure,
             FallbackSummaryFailure,
             PreparedBindingFailure,
             FallbackCommitRevalidationRejection,
@@ -19924,7 +19664,6 @@ mod tests {
             TerminalPath::NativeProviderFailure,
             TerminalPath::RejectedFallbackInterrupt,
             TerminalPath::DeferredDeadline,
-            TerminalPath::ContinuationInjectionFailure,
             TerminalPath::FallbackSummaryFailure,
             TerminalPath::PreparedBindingFailure,
             TerminalPath::FallbackCommitRevalidationRejection,
@@ -19999,9 +19738,6 @@ mod tests {
                     Some(crate::backend::mock::MOCK_COMPACT_HANG_SENTINEL.to_owned())
                 }
                 TerminalPath::DeferredDeadline | TerminalPath::Interrupt => None,
-                TerminalPath::ContinuationInjectionFailure => {
-                    Some("__test_fail_continuation__".to_owned())
-                }
                 TerminalPath::FallbackSummaryFailure => Some(format!(
                     "{} __test_fail_fallback_summary__",
                     crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL
@@ -20226,13 +19962,6 @@ mod tests {
             "hidden summary generation changed the supervisor fold"
         );
 
-        let continuation = crate::backend::BackendContinuationContext {
-            required: Vec::new(),
-            advisory: vec![crate::backend::BackendContinuationItem {
-                kind: "task_state".to_owned(),
-                payload: serde_json::json!({"active": true}),
-            }],
-        };
         let seed_input = internal_compaction_input("seed".to_owned());
         assert_ne!(seed_input.origin, Some(MessageOrigin::User));
         let mut prepared = crate::backend::prepare_mock_compacted_backend_binding(
@@ -20241,7 +19970,6 @@ mod tests {
             crate::backend::BackendContextSeed {
                 workspace_roots: Vec::new(),
                 summary,
-                continuation: continuation.clone(),
             },
         )
         .await
@@ -20261,17 +19989,7 @@ mod tests {
             after_seed, before,
             "prepared replacement seeding changed the supervisor fold"
         );
-        let continuation_input = internal_compaction_input("continuation_injection".to_owned());
-        assert_ne!(continuation_input.origin, Some(MessageOrigin::User));
-        let result = match prepared.backend {
-            crate::backend::PreparedBackendHandle::Mock { backend, .. } => {
-                let result = Backend::install_continuation_context(&*backend, continuation).await;
-                Backend::shutdown(*backend).await;
-                result
-            }
-            _ => panic!("mock preparation returned non-mock backend"),
-        };
-        let _ = summarize_continuation_result(&result, "test");
+        prepared.backend.shutdown().await;
         while let Ok(event) = prepared.events.try_recv_backend() {
             if let BackendEvent::Chat(event) = event {
                 log.push(replay_envelope(
@@ -20285,7 +20003,7 @@ mod tests {
         let after = supervisor::supervision_context_snapshot(&log);
         assert_eq!(
             after, before,
-            "post-native continuation installation changed the supervisor fold"
+            "prepared replacement teardown changed the supervisor fold"
         );
         assert_eq!(after.user_message_count, before.user_message_count);
         assert_eq!(after.last_user_message, before.last_user_message);
@@ -20332,7 +20050,6 @@ mod tests {
                     after_tokens: Some(42),
                     ..protocol::CompactionMetrics::default()
                 },
-                continuation: Some(protocol::ContinuationInstallSummary::Installed),
                 message: None,
                 timestamp: 1,
             }),

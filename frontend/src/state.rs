@@ -2804,7 +2804,6 @@ pub fn merge_richer_marker(
         .provider_session_id
         .take()
         .or(incoming.provider_session_id);
-    existing.continuation = existing.continuation.take().or(incoming.continuation);
     existing.message = existing.message.take().or(incoming.message);
     if existing.timestamp == 0 {
         existing.timestamp = incoming.timestamp;

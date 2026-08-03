@@ -28,9 +28,9 @@ use super::{
     BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
     BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionRequest,
     BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendContextReseatSupport, BackendEvent,
-    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendStartupError,
-    EventStream, PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport,
+    BackendCompactionTerminalEvidence, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
+    StartupMcpServer, StartupMcpTransport,
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
@@ -305,7 +305,6 @@ fn native_mock_compaction_capability() -> BackendCompactionCapability {
         },
         provider_version: Some("mock-native-compaction-v1".to_owned()),
         protocol_version: Some("mock-native-compaction-v1".to_owned()),
-        reseat: BackendContextReseatSupport::PreservedByNative,
         evidence: BackendCompactionCapabilityEvidence::AdapterContract,
     }
 }
@@ -2517,7 +2516,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::agent::customization::ResolvedSpawnConfig;
-    use crate::backend::{BackendCompactionUnavailableReason, BackendContinuationContext};
+    use crate::backend::BackendCompactionUnavailableReason;
 
     #[tokio::test]
     async fn mock_backend_records_read_only_access_mode() {
@@ -2741,10 +2740,6 @@ mod tests {
             trigger: CompactionTrigger::UserRequested,
             focus: focus.map(str::to_owned),
             transcript_authoritative: true,
-            continuation: BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
         }
     }
 

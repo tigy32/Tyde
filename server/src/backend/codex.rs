@@ -357,13 +357,6 @@ impl CodexCommandHandle {
     async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
         self.inner.begin_compaction(request).await
     }
-
-    async fn install_continuation_context(
-        &self,
-        context: super::BackendContinuationContext,
-    ) -> super::BackendContextReseatResult {
-        self.inner.install_continuation_context(context).await
-    }
 }
 
 struct CodexSkillProjection {
@@ -1150,7 +1143,6 @@ fn codex_compaction_capability_with_installed_version(
     BackendCompactionCapability::native(
         BackendCompactionMechanism::JsonRpcRequest,
         provider_version,
-        BackendContextReseatSupport::InjectAfterNative,
         BackendCompactionCapabilityEvidence::CodexMethodProbe,
     )
 }
@@ -2265,8 +2257,8 @@ impl CodexSession {
                 execution_mode: config.execution_mode,
                 turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
                 active_turn_id: None,
+                interrupt_next_root_turn: false,
                 pending_compaction: None,
-                pending_continuation: None,
                 active_stream: None,
                 tool_container: None,
                 notification_sequence: 0,
@@ -3398,8 +3390,12 @@ struct CodexState {
     execution_mode: BackendExecutionMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
+    /// Set when the user cancels while no root turn is tracked. A root turn
+    /// that starts while this is set raced the cancel — the user has already
+    /// been told the agent is idle, so that turn is interrupted and
+    /// tombstoned instead of being adopted.
+    interrupt_next_root_turn: bool,
     pending_compaction: Option<PendingCodexCompaction>,
-    pending_continuation: Option<PendingCodexContinuation>,
     active_stream: Option<ActiveStreamState>,
     tool_container: Option<ChatMessageId>,
     notification_sequence: u64,
@@ -3461,11 +3457,6 @@ struct PendingCodexCompaction {
     item_completed: bool,
     turn_status: Option<String>,
     deprecated_notification_seen: bool,
-}
-
-struct PendingCodexContinuation {
-    terminal_tx: Option<oneshot::Sender<Result<(), String>>>,
-    turn_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -3622,11 +3613,6 @@ impl CodexInner {
                     reason: BackendCompactionDeferredReason::AnotherCompactionActive,
                 };
             }
-            if state.pending_continuation.is_some() {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::BackgroundMutationActive,
-                };
-            }
             if state.active_turn_id.is_some()
                 || state.active_stream.is_some()
                 || state.pending_request.is_some()
@@ -3746,147 +3732,6 @@ impl CodexInner {
             operation_id: request.operation_id,
             terminal,
         })
-    }
-
-    async fn install_continuation_context(
-        &self,
-        context: super::BackendContinuationContext,
-    ) -> super::BackendContextReseatResult {
-        let required_present = !context.required.is_empty();
-        let advisory_present = !context.advisory.is_empty();
-        if !required_present && !advisory_present {
-            return super::BackendContextReseatResult {
-                required: super::ContinuationInstallStatus::NotRequired,
-                advisory: super::ContinuationInstallStatus::NotRequired,
-            };
-        }
-        let rendered = [
-            ("Required continuation", &context.required),
-            ("Advisory continuation", &context.advisory),
-        ]
-        .into_iter()
-        .filter(|(_, items)| !items.is_empty())
-        .map(|(label, items)| {
-            let items = items
-                .iter()
-                .map(|item| format!("{}={}", item.kind, item.payload))
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!("{label}: {items}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let (thread_id, model, effort, approval, access_mode, execution_mode, network, terminal) = {
-            let mut state = self.state.lock().await;
-            if state.active_turn_id.is_some()
-                || state.active_stream.is_some()
-                || state.pending_request.is_some()
-                || state.pending_compaction.is_some()
-                || state.pending_continuation.is_some()
-                || state.tool_container.is_some()
-                || !state.pending_tool_call_ids.is_empty()
-                || !state.background_commands.is_empty()
-                || !state.pending_subagent_spawns.is_empty()
-                || !state.registering_subagent_threads.is_empty()
-                || !state.subagent_streams.is_empty()
-            {
-                let failed = super::ContinuationInstallStatus::Failed {
-                    message: "Codex is not idle for continuation installation".to_string(),
-                };
-                return super::BackendContextReseatResult {
-                    required: if required_present {
-                        failed.clone()
-                    } else {
-                        super::ContinuationInstallStatus::NotRequired
-                    },
-                    advisory: if advisory_present {
-                        failed
-                    } else {
-                        super::ContinuationInstallStatus::NotRequired
-                    },
-                };
-            }
-            let (terminal_tx, terminal) = oneshot::channel();
-            state.pending_continuation = Some(PendingCodexContinuation {
-                terminal_tx: Some(terminal_tx),
-                turn_id: None,
-            });
-            (
-                state.thread_id.clone(),
-                state.model_override.clone(),
-                state.reasoning_effort_override.clone(),
-                state.approval_policy.clone(),
-                state.access_mode,
-                state.execution_mode,
-                state.turn_network_access,
-                terminal,
-            )
-        };
-        let mut params = json!({
-            "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": rendered,
-                "text_elements": []
-            }],
-            "summary": CODEX_REASONING_SUMMARY_LEVEL,
-            "approvalPolicy": approval
-                .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string()),
-            "sandboxPolicy": codex_sandbox_policy(access_mode, network, execution_mode),
-        });
-        if let Some(model) = model {
-            params["model"] = Value::String(model);
-        }
-        if let Some(effort) = effort {
-            params["effort"] = Value::String(effort);
-        }
-        if let Err(error) = self.rpc.request("turn/start", params).await {
-            self.finish_codex_continuation(Err(error)).await;
-        }
-        let outcome = match tokio::time::timeout(Duration::from_secs(300), terminal).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err("Codex continuation terminal channel closed".to_string()),
-            Err(_) => {
-                self.finish_codex_continuation(Err(
-                    "Codex continuation installation timed out".to_string()
-                ))
-                .await;
-                Err("Codex continuation installation timed out".to_string())
-            }
-        };
-        let installed = match outcome {
-            Ok(()) => super::ContinuationInstallStatus::Installed,
-            Err(message) => super::ContinuationInstallStatus::Failed { message },
-        };
-        super::BackendContextReseatResult {
-            required: if required_present {
-                installed.clone()
-            } else {
-                super::ContinuationInstallStatus::NotRequired
-            },
-            advisory: if advisory_present {
-                installed
-            } else {
-                super::ContinuationInstallStatus::NotRequired
-            },
-        }
-    }
-
-    async fn finish_codex_continuation(&self, result: Result<(), String>) {
-        let terminal_tx = {
-            let mut state = self.state.lock().await;
-            let Some(mut pending) = state.pending_continuation.take() else {
-                return;
-            };
-            if let Some(turn_id) = pending.turn_id.as_ref() {
-                push_codex_terminated_turn(&mut state.terminated_turns, turn_id.clone());
-            }
-            pending.terminal_tx.take()
-        };
-        if let Some(terminal_tx) = terminal_tx {
-            let _ = terminal_tx.send(result);
-        }
     }
 
     async fn observe_codex_notification_contract(&self, method: &str) {
@@ -4226,64 +4071,6 @@ impl CodexInner {
             return true;
         }
         false
-    }
-
-    async fn intercept_continuation_notification(&self, method: &str, params: &Value) -> bool {
-        let notification_thread_id = extract_notification_thread_id(params);
-        let notification_turn_id = extract_turn_id(params).or_else(|| {
-            params
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-        let mut terminal = None;
-        let intercept = {
-            let mut state = self.state.lock().await;
-            let root = notification_thread_id
-                .as_ref()
-                .is_none_or(|thread_id| thread_id == &state.thread_id);
-            let Some(pending) = state.pending_continuation.as_mut() else {
-                return false;
-            };
-            if !root {
-                return false;
-            }
-            if pending.turn_id.is_none()
-                && is_codex_response_side_notification(method)
-                && notification_turn_id.is_some()
-            {
-                pending.turn_id = notification_turn_id.clone();
-            }
-            match method {
-                "turn/started" if pending.turn_id.is_none() => {
-                    pending.turn_id = notification_turn_id;
-                    true
-                }
-                "turn/completed"
-                    if pending.turn_id.is_some()
-                        && notification_turn_id.as_ref() == pending.turn_id.as_ref() =>
-                {
-                    let completed = params
-                        .get("turn")
-                        .and_then(|turn| turn.get("status"))
-                        .and_then(Value::as_str)
-                        == Some("completed");
-                    terminal = Some(if completed {
-                        Ok(())
-                    } else {
-                        Err("Codex continuation turn did not complete".to_string())
-                    });
-                    true
-                }
-                method if is_codex_response_side_notification(method) => true,
-                _ => false,
-            }
-        };
-        if let Some(terminal) = terminal {
-            self.finish_codex_continuation(terminal).await;
-        }
-        intercept
     }
 
     /// Record a command execution that has started but not finished, and arm
@@ -6079,6 +5866,9 @@ impl CodexInner {
                     turn_network_access,
                 ) = {
                     let mut state = self.state.lock().await;
+                    // This send supersedes any cancel that raced an earlier
+                    // turn start; the next turn/started belongs to it.
+                    state.interrupt_next_root_turn = false;
                     state.pending_user_input_bytes = message.len() as u64;
                     let (model_override, effort_override) = match state.execution_mode {
                         BackendExecutionMode::Agent => (
@@ -6144,6 +5934,15 @@ impl CodexInner {
                     (state.thread_id.clone(), state.active_turn_id.clone())
                 };
                 let Some(turn_id) = turn_id_opt else {
+                    // No tracked turn to interrupt. A turn may still be
+                    // spooling (turn/start dispatched, turn/started not yet
+                    // delivered), so latch an interrupt for the next root
+                    // turn and resolve the cancel now — returning a silent
+                    // Ok here leaves the client stuck on "Cancelling…"
+                    // forever waiting for events that will never come.
+                    // operation_cancelled ends with TypingStatusChanged(false).
+                    self.state.lock().await.interrupt_next_root_turn = true;
+                    self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
                 let _ = self
@@ -6618,10 +6417,6 @@ impl CodexInner {
                 self.emitter.subprocess_stderr(&line);
             }
             CodexInbound::Closed { exit_code } => {
-                self.finish_codex_continuation(Err(
-                    "Codex app-server exited during continuation installation".to_string(),
-                ))
-                .await;
                 self.finish_compaction_failure(
                     BackendCompactionFailureKind::TransportClosed,
                     "Codex app-server exited during compaction".to_string(),
@@ -6650,12 +6445,6 @@ impl CodexInner {
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
         self.observe_codex_notification_contract(method).await;
-        if self
-            .intercept_continuation_notification(method, params)
-            .await
-        {
-            return;
-        }
         if self.intercept_compaction_notification(method, params).await {
             return;
         }
@@ -6824,6 +6613,22 @@ impl CodexInner {
                     }
                     if state.active_turn_id.as_ref() == Some(&turn_id) {
                         tracing::debug!(turn_id, "Ignoring duplicate Codex root turn start");
+                        return;
+                    }
+                    if state.interrupt_next_root_turn {
+                        state.interrupt_next_root_turn = false;
+                        push_codex_terminated_turn(&mut state.terminated_turns, turn_id.clone());
+                        state.terminated_turn_awaiting_replacement = Some(turn_id.clone());
+                        let thread_id = state.thread_id.clone();
+                        drop(state);
+                        tracing::info!(turn_id, "Interrupting Codex root turn that raced a cancel");
+                        self.rpc.spawn_request(
+                            "turn/interrupt",
+                            json!({
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                            }),
+                        );
                         return;
                     }
                     state.terminated_turn_awaiting_replacement = None;
@@ -14554,11 +14359,10 @@ use super::{
     BackendCompactionMutationState, BackendCompactionObservationSource, BackendCompactionProgress,
     BackendCompactionRequest, BackendCompactionResult, BackendCompactionStart,
     BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnavailableReason, BackendCompactionUnknownReason,
-    BackendContextReseatSupport, BackendEvent, BackendObservedCompaction, BackendSession,
-    BackendSpawnConfig, BackendTranscriptEventMetadata, EventStream, PostCompactionTokenCount,
-    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
-    session_settings_to_json,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendEvent,
+    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendTranscriptEventMetadata,
+    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 pub struct CodexBackend {
@@ -16196,35 +16000,6 @@ impl Backend for CodexBackend {
             None => BackendCompactionStart::Deferred {
                 reason: BackendCompactionDeferredReason::SessionInitializing,
             },
-        }
-    }
-
-    async fn install_continuation_context(
-        &self,
-        context: super::BackendContinuationContext,
-    ) -> super::BackendContextReseatResult {
-        let handle = self
-            .compaction_handle
-            .lock()
-            .expect("Codex compaction handle mutex poisoned")
-            .clone();
-        match handle {
-            Some(handle) => handle.install_continuation_context(context).await,
-            None => {
-                let status = |items: &[super::BackendContinuationItem]| {
-                    if items.is_empty() {
-                        super::ContinuationInstallStatus::NotRequired
-                    } else {
-                        super::ContinuationInstallStatus::Failed {
-                            message: "Codex session is still initializing".to_string(),
-                        }
-                    }
-                };
-                super::BackendContextReseatResult {
-                    required: status(&context.required),
-                    advisory: status(&context.advisory),
-                }
-            }
         }
     }
 
@@ -21885,8 +21660,8 @@ for line in sys.stdin:
             execution_mode: BackendExecutionMode::Agent,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
+            interrupt_next_root_turn: false,
             pending_compaction: None,
-            pending_continuation: None,
             active_stream: Some(ActiveStreamState {
                 turn_id: "turn-test".to_string(),
                 message_id: ChatMessageId("msg-seed".to_string()),
@@ -21974,7 +21749,6 @@ for line in sys.stdin:
                 BackendCompactionCapability::native(
                     BackendCompactionMechanism::JsonRpcRequest,
                     Some("0.144.3".to_string()),
-                    BackendContextReseatSupport::InjectAfterNative,
                     BackendCompactionCapabilityEvidence::CodexMethodProbe,
                 ),
             )),
@@ -34057,10 +33831,6 @@ Do not describe the tool, and do not skip the tool call."#;
                 trigger: CompactionTrigger::UserRequested,
                 focus: None,
                 transcript_authoritative: true,
-                continuation: crate::backend::BackendContinuationContext {
-                    required: Vec::new(),
-                    advisory: Vec::new(),
-                },
             },
             terminal_tx: Some(terminal_tx),
             accepted: false,
@@ -34099,10 +33869,6 @@ Do not describe the tool, and do not skip the tool call."#;
                     trigger: CompactionTrigger::UserRequested,
                     focus: None,
                     transcript_authoritative: true,
-                    continuation: crate::backend::BackendContinuationContext {
-                        required: Vec::new(),
-                        advisory: Vec::new(),
-                    },
                 },
                 terminal_tx: Some(terminal_tx),
                 accepted: true,
@@ -34161,46 +33927,67 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[tokio::test]
-    async fn continuation_turn_is_suppressed_from_public_chat() {
+    async fn cancel_without_active_turn_resolves_and_interrupts_the_raced_turn() {
         let (inner, mut events) = test_codex_inner();
-        let (terminal_tx, terminal_rx) = oneshot::channel();
         {
             let mut state = inner.state.lock().await;
             state.active_turn_id = None;
             state.active_stream = None;
-            state.pending_continuation = Some(PendingCodexContinuation {
-                terminal_tx: Some(terminal_tx),
-                turn_id: None,
-            });
         }
-        assert!(
-            inner
-                .intercept_continuation_notification(
-                    "turn/started",
-                    &json!({"threadId":"thread-test","turn":{"id":"turn-continuation"}}),
-                )
-                .await
+
+        inner
+            .execute(SessionCommand::CancelConversation)
+            .await
+            .expect("cancel with no active turn");
+        let mut cancelled = 0;
+        let mut typing_false = 0;
+        while let Ok(event) = events.try_recv() {
+            match event.get("kind").and_then(Value::as_str) {
+                Some("OperationCancelled") => cancelled += 1,
+                Some("TypingStatusChanged") if event.get("data") == Some(&json!(false)) => {
+                    typing_false += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            cancelled, 1,
+            "an idle cancel must resolve visibly instead of silently succeeding"
         );
-        assert!(
-            inner
-                .intercept_continuation_notification(
-                    "item/agentMessage/delta",
-                    &json!({"threadId":"thread-test","turnId":"turn-continuation","itemId":"hidden","delta":"internal"}),
-                )
-                .await
+        assert_eq!(
+            typing_false, 1,
+            "an idle cancel must return the chat to idle"
         );
-        assert!(
-            inner
-                .intercept_continuation_notification(
-                    "turn/completed",
-                    &json!({"threadId":"thread-test","turn":{"id":"turn-continuation","status":"completed"}}),
-                )
-                .await
-        );
-        assert_eq!(terminal_rx.await.expect("continuation terminal"), Ok(()));
-        assert!(
-            events.try_recv().is_err(),
-            "continuation injection must not emit a public chat lifecycle"
-        );
+        assert!(inner.state.lock().await.interrupt_next_root_turn);
+
+        inner
+            .handle_notification(
+                "turn/started",
+                &json!({"threadId":"thread-test","turn":{"id":"turn-raced-cancel"}}),
+            )
+            .await;
+        {
+            let state = inner.state.lock().await;
+            assert!(
+                state.active_turn_id.is_none(),
+                "a turn that raced a cancel must not be adopted as active"
+            );
+            assert!(
+                state
+                    .terminated_turns
+                    .iter()
+                    .any(|turn| turn.turn_id == "turn-raced-cancel"),
+                "the raced turn must be tombstoned so its late events stay inert"
+            );
+            assert!(!state.interrupt_next_root_turn);
+        }
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !(event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                    && event.get("data") == Some(&json!(true))),
+                "a turn that raced a cancel must not resurrect the typing indicator"
+            );
+        }
+        inner.rpc.shutdown().await;
     }
 }

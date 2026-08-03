@@ -65,9 +65,6 @@ mod compaction_contract_tests {
             },
             provider_version: Some("1.0.0".to_owned()),
             metrics: metrics(),
-            continuation: Some(ContinuationInstallSummary::Failed {
-                message: "reseat failed".to_owned(),
-            }),
             message: Some("provider closed".to_owned()),
         };
         let encoded = serde_json::to_value(&payload).expect("serialize notify");
@@ -140,7 +137,6 @@ mod compaction_contract_tests {
             status: ContextCompactionTimelineStatus::Completed,
             mutation: CompactionMutation::Completed,
             metrics: metrics(),
-            continuation: Some(ContinuationInstallSummary::PreservedByNative),
             message: None,
             timestamp: 42,
         };
@@ -3912,16 +3908,6 @@ pub struct CompactionMetrics {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ContinuationInstallSummary {
-    NotRequired,
-    PreservedByNative,
-    Installed,
-    Unsupported,
-    Failed { message: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContextCompactionStatus {
     Deferred {
         stage: CompactionStage,
@@ -3959,8 +3945,6 @@ pub struct ContextCompactionNotifyPayload {
     pub provider_version: Option<String>,
     #[serde(default)]
     pub metrics: CompactionMetrics,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation: Option<ContinuationInstallSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -4026,8 +4010,6 @@ pub struct ContextCompactionTimelineEvent {
     pub mutation: CompactionMutation,
     #[serde(default)]
     pub metrics: CompactionMetrics,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation: Option<ContinuationInstallSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub timestamp: u64,

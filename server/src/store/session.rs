@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     ACP_BACKEND, BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation,
-    CompactionOperationId, CompactionTrigger, ContinuationInstallSummary, CustomAgentId,
-    KIRO_LAUNCH_PROFILE_ID, LEGACY_KIRO_BACKEND, LaunchProfileId, ProjectId, SessionId,
-    SessionListScope, SessionSettingsValues, SessionSummary, TaskList,
+    CompactionOperationId, CompactionTrigger, CustomAgentId, KIRO_LAUNCH_PROFILE_ID,
+    LEGACY_KIRO_BACKEND, LaunchProfileId, ProjectId, SessionId, SessionListScope,
+    SessionSettingsValues, SessionSummary, TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,8 +60,6 @@ pub(crate) struct CompactionOperationRecord {
     #[serde(default)]
     pub metrics: CompactionMetrics,
     #[serde(default)]
-    pub continuation: Option<ContinuationInstallSummary>,
-    #[serde(default)]
     pub message: Option<String>,
     pub started_at_ms: u64,
     #[serde(default)]
@@ -84,7 +82,6 @@ pub(crate) struct FinishCompactionOperation {
     pub mutation: CompactionMutation,
     pub method: Option<CompactionMethod>,
     pub metrics: CompactionMetrics,
-    pub continuation: Option<ContinuationInstallSummary>,
     pub message: Option<String>,
 }
 
@@ -94,7 +91,6 @@ pub(crate) struct CommitCompactedBinding {
     pub backend_kind: BackendKind,
     pub provider_session_id: SessionId,
     pub metrics: CompactionMetrics,
-    pub continuation: Option<ContinuationInstallSummary>,
     pub message: Option<String>,
 }
 
@@ -530,7 +526,6 @@ impl SessionStore {
             mutation,
             method,
             metrics,
-            continuation,
             message,
         } = update;
         if !matches!(
@@ -556,7 +551,6 @@ impl SessionStore {
             operation.mutation = mutation;
             operation.method = method;
             operation.metrics = metrics;
-            operation.continuation = continuation;
             operation.message = message;
             operation.finished_at_ms = Some(now_ms());
             record.compaction_epoch = record.compaction_epoch.saturating_add(1);
@@ -576,7 +570,6 @@ impl SessionStore {
             backend_kind,
             provider_session_id,
             metrics,
-            continuation,
             message,
         } = commit;
         self.read_modify_write(|records| {
@@ -622,7 +615,6 @@ impl SessionStore {
             operation.method = Some(CompactionMethod::InlineFallback);
             operation.binding_generation_after = Some(generation);
             operation.metrics = metrics;
-            operation.continuation = continuation;
             operation.message = message;
             operation.finished_at_ms = Some(now_ms());
             Ok((binding, operation.clone()))
@@ -1433,7 +1425,6 @@ mod tests {
                 binding_generation_after: None,
                 transcript_high_water: 9,
                 metrics: CompactionMetrics::default(),
-                continuation: None,
                 message: None,
                 started_at_ms: 1,
                 finished_at_ms: None,

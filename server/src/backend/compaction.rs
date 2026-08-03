@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::sync::oneshot;
 
 use protocol::{
@@ -13,7 +12,6 @@ pub struct BackendCompactionCapability {
     pub availability: BackendCompactionAvailability,
     pub provider_version: Option<String>,
     pub protocol_version: Option<String>,
-    pub reseat: BackendContextReseatSupport,
     pub evidence: BackendCompactionCapabilityEvidence,
 }
 
@@ -24,7 +22,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unavailable { reason },
             provider_version: None,
             protocol_version: None,
-            reseat: BackendContextReseatSupport::Unsupported,
             evidence: BackendCompactionCapabilityEvidence::AdapterContract,
         }
     }
@@ -47,7 +44,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unavailable { reason },
             provider_version,
             protocol_version: None,
-            reseat: BackendContextReseatSupport::Unsupported,
             evidence,
         }
     }
@@ -55,7 +51,6 @@ impl BackendCompactionCapability {
     pub(crate) fn native(
         mechanism: BackendCompactionMechanism,
         provider_version: Option<String>,
-        reseat: BackendContextReseatSupport,
         evidence: BackendCompactionCapabilityEvidence,
     ) -> Self {
         Self {
@@ -63,7 +58,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Native { mechanism },
             provider_version,
             protocol_version: None,
-            reseat,
             evidence,
         }
     }
@@ -78,7 +72,6 @@ impl BackendCompactionCapability {
             availability: BackendCompactionAvailability::Unknown { reason },
             provider_version,
             protocol_version: None,
-            reseat: BackendContextReseatSupport::Unsupported,
             evidence,
         }
     }
@@ -118,14 +111,6 @@ pub enum BackendCompactionMechanism {
     JsonRpcRequest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BackendContextReseatSupport {
-    PreservedByNative,
-    InjectAfterNative,
-    IncludeInNativeRequest,
-    Unsupported,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionUnavailableReason {
     ManualTriggerAbsent,
@@ -150,22 +135,9 @@ pub enum BackendCompactionCapabilityEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BackendContinuationContext {
-    pub required: Vec<BackendContinuationItem>,
-    pub advisory: Vec<BackendContinuationItem>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BackendContinuationItem {
-    pub kind: String,
-    pub payload: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackendContextSeed {
     pub workspace_roots: Vec<String>,
     pub summary: String,
-    pub continuation: BackendContinuationContext,
 }
 
 impl BackendContextSeed {
@@ -176,45 +148,12 @@ impl BackendContextSeed {
                 message: "compacted backend seed summary was empty".to_owned(),
             });
         }
-        let required = render_seed_items(&self.continuation.required);
-        let advisory = render_seed_items(&self.continuation.advisory);
-        let mut sections = vec![
+        let sections = [
             "Restore this compacted working context. Do not call tools. Acknowledge only with READY."
                 .to_owned(),
             format!("Compacted context:\n{summary}"),
         ];
-        if let Some(required) = required {
-            sections.push(format!("Required continuation state:\n{required}"));
-        }
-        if let Some(advisory) = advisory {
-            sections.push(format!("Advisory continuation state:\n{advisory}"));
-        }
         Ok(sections.join("\n\n"))
-    }
-
-    pub(crate) fn continuation_result(&self) -> BackendContextReseatResult {
-        BackendContextReseatResult {
-            required: seed_install_status(&self.continuation.required),
-            advisory: seed_install_status(&self.continuation.advisory),
-        }
-    }
-}
-
-fn render_seed_items(items: &[BackendContinuationItem]) -> Option<String> {
-    (!items.is_empty()).then(|| {
-        items
-            .iter()
-            .map(|item| format!("{}={}", item.kind, item.payload))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
-}
-
-fn seed_install_status(items: &[BackendContinuationItem]) -> ContinuationInstallStatus {
-    if items.is_empty() {
-        ContinuationInstallStatus::NotRequired
-    } else {
-        ContinuationInstallStatus::Installed
     }
 }
 
@@ -334,7 +273,6 @@ pub struct BackendCompactionRequest {
     pub trigger: CompactionTrigger,
     pub focus: Option<String>,
     pub transcript_authoritative: bool,
-    pub continuation: BackendContinuationContext,
 }
 
 #[derive(Debug)]
@@ -372,7 +310,6 @@ pub enum BackendCompactionNotDispatchedReason {
     CapabilityUnknown(BackendCompactionUnknownReason),
     BackendClosed,
     InvalidFocus,
-    RequiredContinuationUnsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,21 +443,6 @@ pub(crate) enum BackendCompactionUserFocusProvenance {
     ProviderEcho,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContinuationInstallStatus {
-    NotRequired,
-    PreservedByNative,
-    Installed,
-    Unsupported,
-    Failed { message: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendContextReseatResult {
-    pub required: ContinuationInstallStatus,
-    pub advisory: ContinuationInstallStatus,
-}
-
 pub(crate) fn not_dispatched_for_capability(
     capability: &BackendCompactionCapability,
 ) -> Option<BackendCompactionStart> {
@@ -626,27 +548,15 @@ mod tests {
     }
 
     #[test]
-    fn hidden_seed_renders_summary_and_continuation_without_user_origin_metadata() {
+    fn hidden_seed_renders_summary_without_user_origin_metadata() {
         let seed = BackendContextSeed {
             workspace_roots: vec!["/tmp/workspace".to_owned()],
             summary: "Keep cursor `opaque:00/+==` verbatim.".to_owned(),
-            continuation: BackendContinuationContext {
-                required: vec![BackendContinuationItem {
-                    kind: "plan".to_owned(),
-                    payload: serde_json::json!({"cursor": "opaque:00/+=="}),
-                }],
-                advisory: Vec::new(),
-            },
         };
         let rendered = seed.render_hidden_bootstrap().expect("render seed");
         assert!(rendered.contains("Keep cursor `opaque:00/+==` verbatim."));
-        assert!(rendered.contains(r#"plan={"cursor":"opaque:00/+=="}"#));
-        assert_eq!(
-            seed.continuation_result(),
-            BackendContextReseatResult {
-                required: ContinuationInstallStatus::Installed,
-                advisory: ContinuationInstallStatus::NotRequired,
-            }
-        );
+        assert!(rendered.starts_with(
+            "Restore this compacted working context. Do not call tools. Acknowledge only with READY."
+        ));
     }
 }

@@ -645,7 +645,6 @@ mod wasm_tests {
                 after_tokens: Some(12_518),
                 ..Default::default()
             },
-            continuation: None,
             message: None,
             timestamp: 1,
         };
@@ -693,7 +692,6 @@ mod wasm_tests {
                 after_tokens: None,
                 ..Default::default()
             },
-            continuation: None,
             message: None,
             timestamp: 1,
         };

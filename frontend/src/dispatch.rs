@@ -4235,7 +4235,6 @@ fn apply_team_context_compaction_notify(
             status: member.status.clone(),
             provider_version: None,
             metrics: protocol::CompactionMetrics::default(),
-            continuation: None,
             message: member.message.clone(),
         };
         // Team results arrive on the host stream, so the per-agent stream guard
@@ -9892,7 +9891,6 @@ mod tests {
                 duration_ms: Some(169_775),
                 ..Default::default()
             },
-            continuation: None,
             message: None,
             timestamp: 0,
         }
@@ -9913,7 +9911,6 @@ mod tests {
             status,
             provider_version: None,
             metrics: protocol::CompactionMetrics::default(),
-            continuation: None,
             message: None,
         }
     }

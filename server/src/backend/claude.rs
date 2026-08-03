@@ -11683,11 +11683,10 @@ use super::{
     BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
     BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
     BackendCompactionUnknownReason, BackendCompactionUserFocus,
-    BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
-    BackendContinuationContext, BackendContinuationItem, BackendEvent, BackendObservedCompaction,
-    BackendSession, BackendSpawnConfig, BackendStartupError, ContinuationInstallStatus,
-    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
@@ -12307,7 +12306,6 @@ fn claude_compaction_capability(
         Some(true) => BackendCompactionCapability::native(
             BackendCompactionMechanism::InterceptedTextCommand,
             provider_version,
-            BackendContextReseatSupport::IncludeInNativeRequest,
             evidence,
         ),
     }
@@ -12322,31 +12320,13 @@ fn sanitize_claude_compaction_focus(value: &str) -> Result<String, ()> {
 }
 
 fn claude_compaction_focus(request: &BackendCompactionRequest) -> Result<Option<String>, ()> {
-    let mut parts = Vec::new();
-    if let Some(focus) = request.focus.as_deref() {
-        let focus = sanitize_claude_compaction_focus(focus)?;
-        if !focus.is_empty() {
-            parts.push(focus);
-        }
-    }
-    for (label, items) in [
-        ("Required continuation", &request.continuation.required),
-        ("Advisory continuation", &request.continuation.advisory),
-    ] {
-        if items.is_empty() {
-            continue;
-        }
-        let rendered = items
-            .iter()
-            .map(|item| format!("{}={}", item.kind, item.payload))
-            .collect::<Vec<_>>()
-            .join("; ");
-        parts.push(format!("{label}: {rendered}"));
-    }
-    if parts.is_empty() {
+    let Some(focus) = request.focus.as_deref() else {
+        return Ok(None);
+    };
+    let focus = sanitize_claude_compaction_focus(focus)?;
+    if focus.is_empty() {
         return Ok(None);
     }
-    let focus = sanitize_claude_compaction_focus(&parts.join(". "))?;
     Ok(Some(focus))
 }
 
@@ -13092,23 +13072,6 @@ impl Backend for ClaudeBackend {
             None => BackendCompactionStart::Deferred {
                 reason: BackendCompactionDeferredReason::SessionInitializing,
             },
-        }
-    }
-
-    async fn install_continuation_context(
-        &self,
-        context: BackendContinuationContext,
-    ) -> BackendContextReseatResult {
-        let status = |items: &[BackendContinuationItem]| {
-            if items.is_empty() {
-                ContinuationInstallStatus::NotRequired
-            } else {
-                ContinuationInstallStatus::PreservedByNative
-            }
-        };
-        BackendContextReseatResult {
-            required: status(&context.required),
-            advisory: status(&context.advisory),
         }
     }
 
@@ -26223,10 +26186,6 @@ for line in sys.stdin:
             trigger: CompactionTrigger::UserRequested,
             focus,
             transcript_authoritative: true,
-            continuation: BackendContinuationContext {
-                required: Vec::new(),
-                advisory: Vec::new(),
-            },
         };
         let (inner, _events) = make_test_inner();
         let inner = Arc::new(inner);
@@ -26278,10 +26237,6 @@ for line in sys.stdin:
                     trigger: CompactionTrigger::UserRequested,
                     focus: None,
                     transcript_authoritative: true,
-                    continuation: crate::backend::BackendContinuationContext {
-                        required: Vec::new(),
-                        advisory: Vec::new(),
-                    },
                 },
                 terminal_tx: Some(terminal_tx),
                 timeout_cancel_tx: Some(timeout_cancel_tx),

@@ -2282,7 +2282,6 @@ mod wasm_tests {
             status,
             provider_version: None,
             metrics: Default::default(),
-            continuation: None,
             message: None,
         };
 
@@ -2344,7 +2343,6 @@ mod wasm_tests {
             status: protocol::ContextCompactionTimelineStatus::Completed,
             mutation: protocol::CompactionMutation::Completed,
             metrics: Default::default(),
-            continuation: None,
             message: None,
             timestamp: 1,
         };

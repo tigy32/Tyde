@@ -1385,7 +1385,6 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
                 after_tokens: Some(25),
                 ..protocol::CompactionMetrics::default()
             },
-            continuation: None,
             message: None,
             timestamp: 1,
         });
@@ -1453,7 +1452,6 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             status: protocol::ContextCompactionTimelineStatus::Failed,
             mutation: protocol::CompactionMutation::NotObserved,
             metrics: protocol::CompactionMetrics::default(),
-            continuation: None,
             message: Some("not dispatched".to_owned()),
             timestamp: 2,
         });
@@ -1475,7 +1473,6 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
             status: protocol::ContextCompactionTimelineStatus::Completed,
             mutation: protocol::CompactionMutation::Completed,
             metrics: protocol::CompactionMetrics::default(),
-            continuation: None,
             message: None,
             timestamp: 1,
         });

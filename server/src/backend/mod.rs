@@ -47,9 +47,8 @@ pub(crate) use compaction::{
     BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
     BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
     BackendCompactionUnknownReason, BackendCompactionUserFocus,
-    BackendCompactionUserFocusProvenance, BackendContextReseatResult, BackendContextReseatSupport,
-    BackendContextSeed, BackendContinuationContext, BackendContinuationItem,
-    BackendObservedCompaction, ContinuationInstallStatus, PostCompactionTokenCount,
+    BackendCompactionUserFocusProvenance, BackendContextSeed, BackendObservedCompaction,
+    PostCompactionTokenCount,
 };
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
@@ -524,25 +523,6 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
-    fn install_continuation_context(
-        &self,
-        context: BackendContinuationContext,
-    ) -> impl std::future::Future<Output = BackendContextReseatResult> + Send {
-        async move {
-            let required = if context.required.is_empty() {
-                ContinuationInstallStatus::NotRequired
-            } else {
-                ContinuationInstallStatus::Unsupported
-            };
-            let advisory = if context.advisory.is_empty() {
-                ContinuationInstallStatus::NotRequired
-            } else {
-                ContinuationInstallStatus::Unsupported
-            };
-            BackendContextReseatResult { required, advisory }
-        }
-    }
-
     fn update_session_settings(
         &mut self,
         payload: protocol::SetSessionSettingsPayload,
@@ -584,7 +564,6 @@ pub(crate) struct PreparedBackendBinding {
     pub events: EventStream,
     pub provider_session_id: SessionId,
     pub ready: BackendBindingReadyEvidence,
-    pub continuation: BackendContextReseatResult,
 }
 
 impl PreparedBackendHandle {
@@ -606,7 +585,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
     spawn: BackendSpawnConfig,
     seed: BackendContextSeed,
 ) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
-    let continuation = seed.continuation_result();
     match kind {
         BackendKind::Tycode => {
             let (backend, events, provider_session_id, ready) =
@@ -617,7 +595,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
         BackendKind::Acp => {
@@ -628,7 +605,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
         BackendKind::Claude => {
@@ -640,7 +616,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
         BackendKind::Codex => {
@@ -651,7 +626,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
         BackendKind::Antigravity => {
@@ -664,7 +638,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
         BackendKind::Hermes => {
@@ -676,7 +649,6 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 events,
                 provider_session_id,
                 ready,
-                continuation,
             })
         }
     }
@@ -687,7 +659,6 @@ pub(crate) async fn prepare_mock_compacted_backend_binding(
     spawn: BackendSpawnConfig,
     seed: BackendContextSeed,
 ) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
-    let continuation = seed.continuation_result();
     let (backend, events, provider_session_id, ready) =
         prepare_concrete_backend_binding::<mock::MockBackend>(kind, spawn, seed).await?;
     Ok(PreparedBackendBinding {
@@ -697,7 +668,6 @@ pub(crate) async fn prepare_mock_compacted_backend_binding(
         events,
         provider_session_id,
         ready,
-        continuation,
     })
 }
 
@@ -1649,10 +1619,6 @@ mod tests {
             super::BackendContextSeed {
                 workspace_roots: vec!["/tmp".to_owned()],
                 summary: "Preserve the compacted mock state.".to_owned(),
-                continuation: super::BackendContinuationContext {
-                    required: Vec::new(),
-                    advisory: Vec::new(),
-                },
             },
         )
         .await

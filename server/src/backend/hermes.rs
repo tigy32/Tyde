@@ -36,11 +36,11 @@ use crate::backend::{
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
     BackendCompactionNotDispatchedReason, BackendCompactionProgress, BackendCompactionRequest,
     BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
-    BackendContextReseatSupport, BackendEvent, BackendSession, BackendSpawnConfig,
-    BackendStartupError, EventStream, PostCompactionTokenCount, StartupMcpServer,
-    StartupMcpTransport, backend_fork_unsupported_message, render_combined_spawn_instructions,
-    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
+    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason, BackendEvent,
+    BackendSession, BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
+    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
+    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
+    tyde_owned_no_root_cwd,
 };
 use crate::hermes_mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
@@ -417,7 +417,6 @@ fn hermes_compaction_capability(version: Option<&str>) -> BackendCompactionCapab
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned),
-        BackendContextReseatSupport::PreservedByNative,
         BackendCompactionCapabilityEvidence::HermesMethodProbe,
     )
 }
@@ -1034,23 +1033,6 @@ impl Backend for HermesBackend {
                 reason: BackendCompactionNotDispatchedReason::BackendClosed,
                 fallback_safe: false,
             })
-    }
-
-    async fn install_continuation_context(
-        &self,
-        context: crate::backend::BackendContinuationContext,
-    ) -> crate::backend::BackendContextReseatResult {
-        let status = |items: &[crate::backend::BackendContinuationItem]| {
-            if items.is_empty() {
-                crate::backend::ContinuationInstallStatus::NotRequired
-            } else {
-                crate::backend::ContinuationInstallStatus::PreservedByNative
-            }
-        };
-        crate::backend::BackendContextReseatResult {
-            required: status(&context.required),
-            advisory: status(&context.advisory),
-        }
     }
 
     async fn send(&self, input: AgentInput) -> bool {

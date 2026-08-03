@@ -252,7 +252,6 @@ mod tests {
                 status: ContextCompactionTimelineStatus::Completed,
                 mutation: CompactionMutation::Completed,
                 metrics: CompactionMetrics::default(),
-                continuation: None,
                 message: None,
                 timestamp: sequence,
             }),

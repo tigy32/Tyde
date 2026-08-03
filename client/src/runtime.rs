@@ -1687,7 +1687,6 @@ mod compaction_session_tests {
             },
             provider_version: None,
             metrics: Default::default(),
-            continuation: None,
             message: None,
         }
     }

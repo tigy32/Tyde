@@ -2419,7 +2419,6 @@ mod tests {
             status,
             provider_version: None,
             metrics: protocol::CompactionMetrics::default(),
-            continuation: None,
             message: None,
         };
 

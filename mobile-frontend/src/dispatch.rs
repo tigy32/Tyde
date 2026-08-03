@@ -1801,7 +1801,6 @@ fn apply_team_context_compaction_notify(
                 status: member.status,
                 provider_version: None,
                 metrics: Default::default(),
-                continuation: None,
                 message: member.message,
             },
         );
@@ -3119,7 +3118,6 @@ mod tests {
                 after_tokens: Some(12_518),
                 ..Default::default()
             },
-            continuation: None,
             message: None,
             timestamp: 10,
         }
@@ -3154,7 +3152,6 @@ mod tests {
             status,
             provider_version: Some("2.1.220".to_owned()),
             metrics: Default::default(),
-            continuation: None,
             message: None,
         }
     }
