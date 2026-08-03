@@ -168,7 +168,14 @@ impl ConnectionPlan {
     }
 }
 
-const MANAGED_SESSION_RENEWAL_MARGIN_MS: u64 = 60_000;
+/// Renew managed credentials this long before their nominal expiry. AWS IoT
+/// re-invokes the custom authorizer roughly every 300 s with the original
+/// CONNECT token, and the authorizer refuses grants close to expiry — so a
+/// session must be handed fresh credentials well before `expires_at_ms`, not
+/// 60 s before it (which in production scheduled renewal ~4 minutes after the
+/// broker had already de-authorized the connection). With the standard 900 s
+/// grant TTL this renews at ~540 s, ahead of the second authorizer refresh.
+const MANAGED_SESSION_RENEWAL_MARGIN_MS: u64 = 360_000;
 
 fn managed_session_renewal_after(expires_at_ms: u64, now_ms: u64) -> Duration {
     Duration::from_millis(
@@ -810,7 +817,7 @@ mod tests {
     fn managed_session_renews_before_expiry_and_immediately_when_late() {
         assert_eq!(
             managed_session_renewal_after(900_000, 100_000),
-            Duration::from_millis(740_000)
+            Duration::from_millis(440_000)
         );
         assert_eq!(
             managed_session_renewal_after(900_000, 850_000),

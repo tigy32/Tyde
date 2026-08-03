@@ -70,8 +70,14 @@ pub enum MqttTransportError {
 impl MqttTransportError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::PublishRejected { reason } => !reason.is_not_authorized(),
-            Self::BrokerConnect { .. }
+            // A NotAuthorized PUBACK means the broker's authorizer no longer
+            // accepts this connection's grant (AWS re-validates the CONNECT
+            // token roughly every 5 minutes). Reconnecting with freshly minted
+            // credentials recovers; callers must pair this with
+            // `invalidates_managed_credentials` so the retry does not reuse the
+            // rejected grant.
+            Self::PublishRejected { .. }
+            | Self::BrokerConnect { .. }
             | Self::Subscribe { .. }
             | Self::SubscribeRejected { .. }
             | Self::Publish { .. }
@@ -81,6 +87,48 @@ impl MqttTransportError {
             | Self::ActorClosed => true,
             _ => false,
         }
+    }
+
+    /// True when the failure indicates the managed broker grant itself is no
+    /// longer accepted, so a retry must mint fresh credentials instead of
+    /// reusing a cached grant.
+    pub fn invalidates_managed_credentials(&self) -> bool {
+        match self {
+            Self::PublishRejected { reason } => reason.is_not_authorized(),
+            Self::ManagedSessionExpired => true,
+            _ => false,
+        }
+    }
+}
+
+/// Failure delivered on an outbound write acknowledgement. Write acks cross the
+/// `io::Error` boundary in `EnvelopeStream`, which erases concrete types; this
+/// carries the retryability and credential classification of the underlying
+/// [`MqttTransportError`] so reconnect policy does not depend on which side of
+/// the stream observed the failure first.
+#[derive(Debug, Clone, Error)]
+#[error("{message}")]
+pub struct WriteAckError {
+    message: String,
+    retryable: bool,
+    invalidates_managed_credentials: bool,
+}
+
+impl WriteAckError {
+    pub(crate) fn from_error(error: &MqttTransportError) -> Self {
+        Self {
+            message: error.to_string(),
+            retryable: error.is_retryable(),
+            invalidates_managed_credentials: error.invalidates_managed_credentials(),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn invalidates_managed_credentials(&self) -> bool {
+        self.invalidates_managed_credentials
     }
 }
 
@@ -213,8 +261,14 @@ impl fmt::Display for CounterViolation {
 mod tests {
     use super::*;
 
+    // NotAuthorized used to be classified terminal, which permanently stopped
+    // the mobile reconnect loop when AWS IoT's periodic authorizer refresh
+    // rejected an aging grant (confirmed in production: PUBACK 135 ~10 minutes
+    // into every managed session). It is retryable *with fresh credentials*;
+    // `invalidates_managed_credentials` carries the "do not reuse the cached
+    // grant" half of that contract.
     #[test]
-    fn authorization_rejection_is_terminal_but_quota_is_retryable() {
+    fn authorization_rejection_retries_with_fresh_credentials() {
         let not_authorized = MqttTransportError::PublishRejected {
             reason: PublishRejection {
                 code: 0x87,
@@ -230,7 +284,14 @@ mod tests {
             },
         };
 
-        assert!(!not_authorized.is_retryable());
+        assert!(not_authorized.is_retryable());
+        assert!(not_authorized.invalidates_managed_credentials());
         assert!(quota.is_retryable());
+        assert!(!quota.invalidates_managed_credentials());
+        assert!(MqttTransportError::ManagedSessionExpired.invalidates_managed_credentials());
+
+        let write_ack = WriteAckError::from_error(&not_authorized);
+        assert!(write_ack.is_retryable());
+        assert!(write_ack.invalidates_managed_credentials());
     }
 }

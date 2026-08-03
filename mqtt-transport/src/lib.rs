@@ -36,6 +36,7 @@ pub use client_wasm::{connect, connect_ephemeral, connect_managed, connect_manag
 pub use config::{ManagedMqttConnectConfig, MqttConnectConfig, ParticipantRole};
 pub use error::{
     CounterViolation, CryptoError, FramingError, MqttTransportError, PublishRejection,
+    WriteAckError,
 };
 pub use protocol::BrokerUrl;
 pub use protocol::{

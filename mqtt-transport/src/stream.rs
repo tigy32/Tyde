@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc::Receiver, oneshot};
 
 use crate::chunking::{InboundPlaintext, OutboundPlaintext, next_write_len};
-use crate::error::MqttTransportError;
+use crate::error::{MqttTransportError, WriteAckError};
 
 #[derive(Debug)]
 pub(crate) enum InboundEvent {
@@ -22,13 +22,13 @@ pub(crate) enum InboundEvent {
 
 pub(crate) struct OutboundChunk {
     pub bytes: Vec<u8>,
-    pub ack: oneshot::Sender<Result<(), String>>,
+    pub ack: oneshot::Sender<Result<(), WriteAckError>>,
 }
 
 struct PendingChunk {
     bytes: Vec<u8>,
-    ack_tx: Option<oneshot::Sender<Result<(), String>>>,
-    ack_rx: Option<oneshot::Receiver<Result<(), String>>>,
+    ack_tx: Option<oneshot::Sender<Result<(), WriteAckError>>>,
+    ack_rx: Option<oneshot::Receiver<Result<(), WriteAckError>>>,
 }
 
 impl PendingChunk {
@@ -53,7 +53,7 @@ impl PendingChunk {
         })
     }
 
-    fn take_ack_rx(&mut self) -> io::Result<oneshot::Receiver<Result<(), String>>> {
+    fn take_ack_rx(&mut self) -> io::Result<oneshot::Receiver<Result<(), WriteAckError>>> {
         self.ack_rx
             .take()
             .ok_or_else(|| io::Error::other("pending outbound chunk missing ack receiver"))
@@ -66,7 +66,7 @@ pub struct EnvelopeStream {
     inbound: InboundPlaintext,
     outbound: OutboundPlaintext,
     pending_chunk: Option<PendingChunk>,
-    outstanding_acks: VecDeque<oneshot::Receiver<Result<(), String>>>,
+    outstanding_acks: VecDeque<oneshot::Receiver<Result<(), WriteAckError>>>,
     shutdown_started: bool,
     actor_abort: Option<AbortHandle>,
 }
@@ -144,9 +144,13 @@ impl EnvelopeStream {
                 Poll::Ready(Ok(Ok(()))) => {
                     self.outstanding_acks.pop_front();
                 }
-                Poll::Ready(Ok(Err(message))) => {
+                Poll::Ready(Ok(Err(ack_error))) => {
                     self.outstanding_acks.pop_front();
-                    return Poll::Ready(Err(io::Error::other(message)));
+                    // Carry the typed error through the io boundary so callers
+                    // can downcast for retryability instead of seeing a bare
+                    // string (which previously classified every write-path
+                    // failure as non-retryable).
+                    return Poll::Ready(Err(io::Error::other(ack_error)));
                 }
                 Poll::Ready(Err(_)) => {
                     self.outstanding_acks.pop_front();

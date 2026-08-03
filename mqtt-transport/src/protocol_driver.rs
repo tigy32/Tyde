@@ -33,7 +33,7 @@ use crate::time::{Instant, interval_at, sleep};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::{MqttConnectConfig, ParticipantRole};
-use crate::error::{FramingError, MqttTransportError};
+use crate::error::{FramingError, MqttTransportError, WriteAckError};
 use crate::framing::{
     SESSION_SALT_LEN, TransportFrame, decode_frame, encode_credit_frame, encode_data_frame,
     encode_handshake_frame,
@@ -54,10 +54,26 @@ const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
+/// PUBACK stall watchdog: fail the stream when publishes are outstanding and no
+/// PUBACK has arrived for this long. This is a *progress* deadline, not a
+/// per-publish age limit: AWS IoT throttles connections that burst past its
+/// 512 KiB/s per-connection cap by delaying acks, and a per-publish deadline
+/// measured from local enqueue turned that ordinary backpressure into a
+/// reconnect loop (each retry re-sending the full bootstrap and re-tripping the
+/// throttle). As long as acks keep arriving the deadline keeps extending; a
+/// dead link is still caught by MQTT keep-alive (10 s) well before this fires.
 #[cfg(not(test))]
-const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(200);
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(300);
+/// Outbound data budget: sustained rate and burst allowance for encrypted data
+/// publishes. AWS IoT enforces a fixed 512 KiB/s per-connection throughput cap
+/// (inbound + outbound) and delays traffic beyond it; publishing under the cap
+/// keeps PUBACKs flowing instead of relying on the stall watchdog. The budget
+/// is post-charged at whole-batch granularity, so a single batch may overshoot
+/// by up to one 64 KiB chunk before pacing kicks in.
+const OUTBOUND_BUDGET_BYTES_PER_SEC: f64 = 384.0 * 1024.0;
+const OUTBOUND_BUDGET_BURST_BYTES: f64 = 256.0 * 1024.0;
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RENDEZVOUS_CANDIDATES: usize = 3;
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
@@ -84,6 +100,7 @@ pub(crate) struct ProtocolDriver<L: MqttLink> {
     pub(crate) inbound_tx: mpsc::Sender<InboundEvent>,
     pub(crate) ready_tx: Option<oneshot::Sender<Result<(), MqttTransportError>>>,
     pub(crate) publish_pacer: PublishPacer,
+    pub(crate) outbound_budget: OutboundByteBudget,
     pub(crate) session_renewal_after: Option<Duration>,
     #[cfg(test)]
     pub(crate) subscribe_barrier: Option<Arc<Barrier>>,
@@ -288,6 +305,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         let mut in_flight = InflightPublishes::new();
         let mut outbound_closed = false;
         let mut credit_blocked_since: Option<Instant> = None;
+        let mut last_publish_ack_at: Option<Instant> = None;
         let session_renewal_timer = sleep(
             self.session_renewal_after
                 .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60)),
@@ -304,6 +322,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
             }
 
             if can_publish_data(&cipher, &in_flight)
+                && self.outbound_budget.is_ready()
                 && let Some(outbound) = deferred_outbound.take()
             {
                 credit_blocked_since = None;
@@ -345,15 +364,27 @@ impl<L: MqttLink> ProtocolDriver<L> {
             let credit_debounce_timer = sleep(credit_debounce_delay.unwrap_or(CREDIT_DEBOUNCE));
             tokio::pin!(credit_debounce_timer);
 
-            let publish_ack_delay = in_flight.next_ack_timeout_delay();
+            let publish_ack_delay = in_flight.next_ack_timeout_delay(last_publish_ack_at);
             let publish_ack_timer = sleep(publish_ack_delay.unwrap_or(PUBLISH_ACK_TIMEOUT));
             tokio::pin!(publish_ack_timer);
+
+            // Wake when the outbound byte budget refills so paced data resumes
+            // without waiting for an unrelated link event.
+            let budget_delay = (deferred_outbound.is_some()
+                && can_publish_data(&cipher, &in_flight))
+            .then(|| self.outbound_budget.delay_until_ready())
+            .filter(|delay| !delay.is_zero());
+            let budget_timer = sleep(budget_delay.unwrap_or(CREDIT_DEBOUNCE));
+            tokio::pin!(budget_timer);
 
             let can_accept_outbound = !outbound_closed
                 && deferred_outbound.is_none()
                 && in_flight.has_data_slot()
                 && in_flight.has_broker_capacity();
             tokio::select! {
+                _ = &mut budget_timer, if budget_delay.is_some() => {
+                    continue;
+                }
                 _ = &mut session_renewal_timer, if self.session_renewal_after.is_some() => {
                     let error = MqttTransportError::ManagedSessionExpired;
                     ack_deferred_outbound(&mut deferred_outbound, &error);
@@ -387,6 +418,9 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 event = self.link.poll() => {
                     match event {
                         Ok(event) => {
+                            if matches!(event, LinkEvent::PubAck(_)) {
+                                last_publish_ack_at = Some(Instant::now());
+                            }
                             if let Err(error) = self.handle_stream_event(
                                 event,
                                 &mut cipher,
@@ -409,7 +443,9 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 outbound = self.outbound_rx.next(), if can_accept_outbound => {
                     match outbound {
                         Some(outbound) => {
-                            if !can_publish_data(&cipher, &in_flight) {
+                            if !can_publish_data(&cipher, &in_flight)
+                                || !self.outbound_budget.is_ready()
+                            {
                                 deferred_outbound = Some(outbound);
                                 continue;
                             }
@@ -465,6 +501,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 return Err(PublishBatchFailure { batch, error });
             }
         };
+        self.outbound_budget.charge(published.frame.len());
         in_flight.insert(InflightPublish::Data {
             token: published.token,
             enqueued_at: Instant::now(),
@@ -545,6 +582,9 @@ impl<L: MqttLink> ProtocolDriver<L> {
         let encrypted = cipher.encrypt_credit(next_expected)?;
         let frame = encode_credit_frame(encrypted.counter, &encrypted.ciphertext_with_tag);
         let token = self.publish_frame(frame.clone()).await?;
+        // Credit frames are flow control and never wait on the byte budget, but
+        // their (tiny) cost still counts against it.
+        self.outbound_budget.charge(frame.len());
         credit.mark_published(next_expected);
         in_flight.insert(InflightPublish::Credit {
             token,
@@ -1038,15 +1078,24 @@ impl InflightPublishes {
             .map(InflightPublish::token)
     }
 
-    fn next_ack_timeout_delay(&self) -> Option<Duration> {
-        let enqueued_at = self
+    /// Remaining time before the PUBACK stall watchdog fires. The deadline is
+    /// anchored to whichever is later: the oldest outstanding publish or the
+    /// last PUBACK the link delivered — so a broker that is acking slowly (for
+    /// example while enforcing its per-connection throughput cap) extends the
+    /// deadline with every ack instead of being misread as dead.
+    fn next_ack_timeout_delay(&self, last_publish_ack_at: Option<Instant>) -> Option<Duration> {
+        let oldest_enqueued_at = self
             .by_token
             .values()
             .map(InflightPublish::enqueued_at)
             .min()?;
+        let anchor = match last_publish_ack_at {
+            Some(acked_at) => oldest_enqueued_at.max(acked_at),
+            None => oldest_enqueued_at,
+        };
         Some(
             PUBLISH_ACK_TIMEOUT
-                .checked_sub(Instant::now().duration_since(enqueued_at))
+                .checked_sub(Instant::now().duration_since(anchor))
                 .unwrap_or(Duration::ZERO),
         )
     }
@@ -1177,6 +1226,66 @@ impl PublishRetryBackoff {
     }
 }
 
+/// Token-bucket byte budget for outbound data publishes. Post-charged: a batch
+/// is allowed whenever the balance is positive and its full cost is deducted
+/// afterwards (possibly driving the balance negative), so pacing never splits a
+/// batch but bounds sustained throughput to the configured rate.
+pub(crate) struct OutboundByteBudget {
+    rate_bytes_per_sec: f64,
+    burst_bytes: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl OutboundByteBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_rate(OUTBOUND_BUDGET_BYTES_PER_SEC, OUTBOUND_BUDGET_BURST_BYTES)
+    }
+
+    fn with_rate(rate_bytes_per_sec: f64, burst_bytes: f64) -> Self {
+        Self {
+            rate_bytes_per_sec,
+            burst_bytes,
+            tokens: burst_bytes,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Effectively disables pacing; used by driver unit tests that assert on
+    /// windowing/credit behavior and would otherwise slow to the paced rate.
+    #[cfg(test)]
+    pub(crate) fn unlimited() -> Self {
+        Self::with_rate(1e12, 1e12)
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill);
+        self.last_refill = now;
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * self.rate_bytes_per_sec).min(self.burst_bytes);
+    }
+
+    fn is_ready(&mut self) -> bool {
+        self.refill();
+        self.tokens > 0.0
+    }
+
+    fn charge(&mut self, bytes: usize) {
+        self.refill();
+        self.tokens -= bytes as f64;
+    }
+
+    fn delay_until_ready(&mut self) -> Duration {
+        self.refill();
+        if self.tokens > 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64((1.0 - self.tokens) / self.rate_bytes_per_sec)
+        }
+    }
+}
+
 pub(crate) struct PublishPacer {
     next_publish_at: Option<Instant>,
     paced_delay: Option<Duration>,
@@ -1290,7 +1399,7 @@ fn retryable_publish_error(error: &MqttTransportError) -> bool {
 
 struct BoxcarBatch {
     plaintext: Vec<u8>,
-    acks: Vec<oneshot::Sender<Result<(), String>>>,
+    acks: Vec<oneshot::Sender<Result<(), WriteAckError>>>,
 }
 
 impl BoxcarBatch {
@@ -1308,9 +1417,9 @@ impl BoxcarBatch {
     }
 
     fn ack_error(self, error: &MqttTransportError) {
-        let message = error.to_string();
+        let ack_error = WriteAckError::from_error(error);
         for ack in self.acks {
-            let _send_result = ack.send(Err(message.clone()));
+            let _send_result = ack.send(Err(ack_error.clone()));
         }
     }
 }
@@ -1336,7 +1445,7 @@ fn ack_deferred_outbound(
     error: &MqttTransportError,
 ) {
     if let Some(outbound) = deferred_outbound.take() {
-        let _send_result = outbound.ack.send(Err(error.to_string()));
+        let _send_result = outbound.ack.send(Err(WriteAckError::from_error(error)));
     }
 }
 
@@ -1910,11 +2019,24 @@ mod tests {
     }
 
     fn spawn_stream_driver() -> Result<DriverHarness, MqttTransportError> {
-        spawn_stream_driver_with_renewal(None)
+        spawn_stream_driver_inner(None, OutboundByteBudget::unlimited())
     }
 
     fn spawn_stream_driver_with_renewal(
         session_renewal_after: Option<Duration>,
+    ) -> Result<DriverHarness, MqttTransportError> {
+        spawn_stream_driver_inner(session_renewal_after, OutboundByteBudget::unlimited())
+    }
+
+    fn spawn_stream_driver_with_budget(
+        outbound_budget: OutboundByteBudget,
+    ) -> Result<DriverHarness, MqttTransportError> {
+        spawn_stream_driver_inner(None, outbound_budget)
+    }
+
+    fn spawn_stream_driver_inner(
+        session_renewal_after: Option<Duration>,
+        outbound_budget: OutboundByteBudget,
     ) -> Result<DriverHarness, MqttTransportError> {
         let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(64);
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
@@ -1961,6 +2083,7 @@ mod tests {
             inbound_tx,
             ready_tx: None,
             publish_pacer: PublishPacer::new(),
+            outbound_budget,
             session_renewal_after,
             subscribe_barrier: None,
         };
@@ -2012,7 +2135,73 @@ mod tests {
         expect_ack_error(ack_rx, "timed out waiting for MQTT PUBACK").await;
     }
 
-    fn full_chunk(byte: u8) -> (OutboundChunk, oneshot::Receiver<Result<(), String>>) {
+    /// The stall watchdog is a progress deadline, not a per-publish age limit:
+    /// a broker acking slowly (e.g. enforcing its per-connection throughput
+    /// cap) extends the deadline with every PUBACK. Chunk A's ack arrives
+    /// after the un-anchored deadline for chunk B would have expired; the
+    /// stream must stay alive and complete once B's ack arrives.
+    #[tokio::test]
+    async fn puback_progress_extends_the_stall_watchdog() {
+        let mut harness = spawn_stream_driver().unwrap();
+        let ack_rx_a = send_full_chunk(&mut harness.outbound_tx, 1).await.unwrap();
+        let publish_a = next_data_publish(&mut harness.publish_rx).await;
+        let ack_rx_b = send_full_chunk(&mut harness.outbound_tx, 2).await.unwrap();
+        let publish_b = next_data_publish(&mut harness.publish_rx).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ack_success(&harness.poll_tx, publish_a.token);
+        timeout(Duration::from_secs(1), ack_rx_a)
+            .await
+            .expect("timed out waiting for ack A")
+            .expect("ack A sender dropped")
+            .expect("ack A failed");
+
+        // 150ms past the original enqueue-anchored deadline: the ack for A
+        // must have re-anchored the watchdog, so no error may surface yet.
+        assert!(
+            timeout(Duration::from_millis(250), harness.inbound_rx.recv())
+                .await
+                .is_err(),
+            "watchdog fired despite PUBACK progress"
+        );
+
+        ack_success(&harness.poll_tx, publish_b.token);
+        timeout(Duration::from_secs(1), ack_rx_b)
+            .await
+            .expect("timed out waiting for ack B")
+            .expect("ack B sender dropped")
+            .expect("ack B failed");
+    }
+
+    /// Data publishes are paced by the outbound byte budget: with a budget
+    /// smaller than one chunk, the second chunk must wait for refill instead
+    /// of bursting immediately.
+    #[tokio::test]
+    async fn outbound_budget_paces_data_publishes() {
+        let budget = OutboundByteBudget::with_rate(4.0 * MAX_PLAINTEXT_CHUNK_LEN as f64, 1.0);
+        let mut harness = spawn_stream_driver_with_budget(budget).unwrap();
+
+        let _ack_rx_a = send_full_chunk(&mut harness.outbound_tx, 1).await.unwrap();
+        let publish_a = next_data_publish(&mut harness.publish_rx).await;
+        ack_success(&harness.poll_tx, publish_a.token);
+
+        let _ack_rx_b = send_full_chunk(&mut harness.outbound_tx, 2).await.unwrap();
+        assert_no_publish_yet(
+            &mut harness.publish_rx,
+            "second chunk published before the byte budget refilled",
+        )
+        .await;
+
+        // Refill rate is 4 chunks/sec, so the ~64KiB debt clears in ~250ms.
+        let publish_b = timeout(Duration::from_secs(2), harness.publish_rx.recv())
+            .await
+            .expect("paced publish never arrived")
+            .expect("publish channel closed");
+        assert_eq!(data_publish_counter(&publish_b), 1);
+        ack_success(&harness.poll_tx, publish_b.token);
+    }
+
+    fn full_chunk(byte: u8) -> (OutboundChunk, oneshot::Receiver<Result<(), WriteAckError>>) {
         let (ack, ack_rx) = oneshot::channel();
         (
             OutboundChunk {
@@ -2026,7 +2215,7 @@ mod tests {
     async fn send_full_chunk(
         outbound_tx: &mut Sender<OutboundChunk>,
         byte: u8,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, Box<dyn Error>> {
+    ) -> Result<oneshot::Receiver<Result<(), WriteAckError>>, Box<dyn Error>> {
         let (chunk, ack_rx) = full_chunk(byte);
         outbound_tx.send(chunk).await?;
         Ok(ack_rx)
@@ -2132,12 +2321,16 @@ mod tests {
         }
     }
 
-    async fn expect_ack_error(ack_rx: oneshot::Receiver<Result<(), String>>, expected: &str) {
+    async fn expect_ack_error(
+        ack_rx: oneshot::Receiver<Result<(), WriteAckError>>,
+        expected: &str,
+    ) {
         let result = timeout(Duration::from_secs(1), ack_rx)
             .await
             .expect("timed out waiting for ack")
             .expect("ack sender dropped");
-        let message = result.expect_err("ack unexpectedly succeeded");
+        let error = result.expect_err("ack unexpectedly succeeded");
+        let message = error.to_string();
         assert!(
             message.contains(expected),
             "expected ack error to contain {expected:?}, got {message:?}"

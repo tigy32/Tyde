@@ -257,6 +257,22 @@ impl MqttLink for NativeMqttLink {
 
     async fn disconnect(&mut self) {
         let _disconnect_result = self.client.disconnect().await;
+        // `AsyncClient::disconnect` only enqueues the DISCONNECT request; if the
+        // event loop is dropped before writing it, the broker sees an abrupt
+        // socket close and keeps the client-ID session alive briefly — the next
+        // CONNECT with the same service-issued client ID then reads as
+        // SessionTakenOver. Drive the event loop until the DISCONNECT is on the
+        // wire (bounded, since a wedged connection must not stall teardown).
+        let flush = async {
+            loop {
+                match self.eventloop.poll().await {
+                    Ok(Event::Outgoing(Outgoing::Disconnect)) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        };
+        let _flush_result = tokio::time::timeout(Duration::from_secs(1), flush).await;
     }
 }
 

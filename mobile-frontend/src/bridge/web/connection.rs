@@ -1049,6 +1049,13 @@ fn handle_retryable_connect_failure(
     failures: &mut RepeatedFailures,
     error: &ConnectErr,
 ) -> bool {
+    if connect_error_invalidates_credentials(error) {
+        log::warn!(
+            "MQTT connection to {local_host_id} lost broker authorization ({error}); discarding \
+             cached credentials so the retry mints a fresh grant"
+        );
+        super::service::clear_cached_credentials(local_host_id);
+    }
     if !error.is_retryable() {
         manager.emit_final_failure(local_host_id, actor_instance_id, error);
         return false;
@@ -1375,6 +1382,9 @@ fn io_error_is_retryable(error: &std::io::Error) -> bool {
     if let Some(transport) = transport_error_from_io(error) {
         return transport.is_retryable();
     }
+    if let Some(write_ack) = write_ack_error_from_io(error) {
+        return write_ack.is_retryable();
+    }
     matches!(
         error.kind(),
         std::io::ErrorKind::UnexpectedEof
@@ -1389,6 +1399,34 @@ fn transport_error_from_io(error: &std::io::Error) -> Option<&MqttTransportError
     error
         .get_ref()
         .and_then(|source| source.downcast_ref::<MqttTransportError>())
+}
+
+/// Outbound write failures cross the io boundary as [`mqtt_transport::WriteAckError`]
+/// (the typed transport error itself is not cloneable across every ack); both
+/// carriers preserve retryability and credential classification.
+fn write_ack_error_from_io(error: &std::io::Error) -> Option<&mqtt_transport::WriteAckError> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<mqtt_transport::WriteAckError>())
+}
+
+/// True when the failure means the broker rejected this connection's grant
+/// (AWS IoT re-validates the CONNECT token via its custom authorizer roughly
+/// every 5 minutes) or the client's own renewal deadline passed. Reconnecting
+/// with the cached grant would just fail again, so the cache must be dropped
+/// before the retry mints credentials.
+fn connect_error_invalidates_credentials(error: &ConnectErr) -> bool {
+    match error {
+        ConnectErr::Transport(transport) => transport.invalidates_managed_credentials(),
+        ConnectErr::Io(io_error) => transport_error_from_io(io_error)
+            .map(MqttTransportError::invalidates_managed_credentials)
+            .or_else(|| {
+                write_ack_error_from_io(io_error)
+                    .map(mqtt_transport::WriteAckError::invalidates_managed_credentials)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {
@@ -2275,6 +2313,35 @@ mod tests {
             error.error_code(),
             MobileAccessErrorCode::BrokerConnectionFailed
         );
+    }
+
+    /// PUBACK NotAuthorized means AWS IoT's authorizer refresh rejected the
+    /// aging grant mid-session (observed in production ~10 minutes into every
+    /// managed connection). The actor must retry — but only after discarding
+    /// the cached grant, or the retry replays the same rejection.
+    #[test]
+    fn not_authorized_retries_with_fresh_credentials() {
+        let error = ConnectErr::Transport(MqttTransportError::PublishRejected {
+            reason: mqtt_transport::PublishRejection {
+                code: 0x87,
+                code_name: "NotAuthorized".to_owned(),
+                reason_string: None,
+            },
+        });
+        assert!(error.is_retryable());
+        assert!(connect_error_invalidates_credentials(&error));
+
+        let renewal = ConnectErr::Transport(MqttTransportError::ManagedSessionExpired);
+        assert!(renewal.is_retryable());
+        assert!(
+            connect_error_invalidates_credentials(&renewal),
+            "renewal-deadline reconnects must mint fresh credentials, not replay the cached grant"
+        );
+
+        let unrelated = ConnectErr::Transport(MqttTransportError::BrokerDisconnected {
+            reason: "broker closed the socket".to_owned(),
+        });
+        assert!(!connect_error_invalidates_credentials(&unrelated));
     }
 
     #[test]

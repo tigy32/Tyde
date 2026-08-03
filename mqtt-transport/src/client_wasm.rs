@@ -19,8 +19,8 @@ use crate::config::{ConnectionPlan, ManagedMqttConnectConfig, MqttConnectConfig}
 use crate::error::MqttTransportError;
 use crate::link_wasm::WasmMqttLink;
 use crate::protocol_driver::{
-    EphemeralDataRoom, ProtocolDriver, PublishPacer, accept_ephemeral_data_connections,
-    generate_session_salt, negotiate_ephemeral_data_room,
+    EphemeralDataRoom, OutboundByteBudget, ProtocolDriver, PublishPacer,
+    accept_ephemeral_data_connections, generate_session_salt, negotiate_ephemeral_data_room,
 };
 use crate::stream::{EnvelopeStream, InboundEvent, OutboundChunk};
 
@@ -85,6 +85,7 @@ async fn connect_plan(plan: ConnectionPlan) -> Result<EnvelopeStream, MqttTransp
         inbound_tx,
         ready_tx: Some(ready_tx),
         publish_pacer: PublishPacer::new(),
+        outbound_budget: OutboundByteBudget::new(),
         session_renewal_after,
     };
 
