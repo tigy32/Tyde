@@ -1,5 +1,5 @@
-use chacha20poly1305::ChaCha20Poly1305;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -165,12 +165,11 @@ fn encode_control_frame(
 ) -> Result<Vec<u8>, CryptoError> {
     let key = derive_rendezvous_key(main_room, psk)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::HkdfExpand)?;
-    let mut nonce = [0_u8; AEAD_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let aad = rendezvous_aad(main_room, tag, connection_id, &nonce);
     let ciphertext_with_tag = cipher
         .encrypt(
-            (&nonce).into(),
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -222,15 +221,14 @@ fn decode_control_frame(
     let connection_id = ConnectionId(id);
     let nonce_start = 2 + CONNECTION_ID_LEN;
     let ciphertext_start = nonce_start + AEAD_NONCE_LEN;
-    let mut nonce = [0_u8; AEAD_NONCE_LEN];
-    nonce.copy_from_slice(&payload[nonce_start..ciphertext_start]);
+    let nonce = Nonce::from_slice(&payload[nonce_start..ciphertext_start]);
     let key = derive_rendezvous_key(main_room, psk).map_err(FramingError::Crypto)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| FramingError::Crypto(CryptoError::HkdfExpand))?;
-    let aad = rendezvous_aad(main_room, tag, connection_id, &nonce);
+    let aad = rendezvous_aad(main_room, tag, connection_id, nonce);
     let plaintext = cipher
         .decrypt(
-            (&nonce).into(),
+            nonce,
             Payload {
                 msg: &payload[ciphertext_start..],
                 aad: &aad,
@@ -255,7 +253,7 @@ fn rendezvous_aad(
     main_room: &RoomId,
     tag: u8,
     connection_id: ConnectionId,
-    nonce: &[u8; AEAD_NONCE_LEN],
+    nonce: &[u8],
 ) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
         RENDEZVOUS_KEY_INFO.len()
