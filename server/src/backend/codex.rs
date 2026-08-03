@@ -11044,9 +11044,17 @@ impl CodexInner {
             )
             .await;
         } else {
+            // The emitted request owns the spawn item's identity; the parsed
+            // spawn metadata defaults its own alias (`spawnAgent`) while the
+            // request card for a tool-less collab item was emitted as
+            // `collab_tool`, so an unresolved name desyncs this frame.
+            let progress_tool_name = self
+                .emitter
+                .tool_request_name(&progress_tool_call_id)
+                .unwrap_or(spawn_tool_name);
             self.emitter.tool_progress(&ToolProgressData {
                 tool_call_id: progress_tool_call_id,
-                tool_name: spawn_tool_name,
+                tool_name: progress_tool_name,
                 update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                     progress_kind: AgentControlProgressKind::Spawn,
                     agents: vec![AgentControlAgentRef {

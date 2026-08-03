@@ -971,16 +971,36 @@ impl TurnEmitterState {
             );
             return None;
         }
+        // The emitted request owns this id's identity. Providers complete
+        // under drifting names — ACP re-titles tool calls mid-flight, collab
+        // spawn parsers default aliases differently — so a divergent
+        // completion adopts the request's name and completes the user's
+        // original card. The previous supersede-and-re-request dance was a
+        // silent no-op: the re-request always hit the duplicate guard, so
+        // the registry kept the old name and the spawn progress emitted
+        // below desynced into a user-visible identity-mismatch Error card.
+        let request_name = self.pending_tool_name(data.tool_call_id).cloned();
+        if let Some(request_name) = request_name.as_deref()
+            && request_name != data.tool_name
+        {
+            tracing::warn!(
+                tool_call_id = data.tool_call_id,
+                request_tool_name = request_name,
+                completion_tool_name = data.tool_name,
+                "Tool completion name diverged from its request; completing under the request's name"
+            );
+        }
+        let tool_name = request_name.as_deref().unwrap_or(data.tool_name);
         let mut spawn_progress = None;
         if data.success {
-            match tyde_tool_result(data.tool_name, &data.tool_result) {
+            match tyde_tool_result(tool_name, &data.tool_result) {
                 Ok(Some(typed)) => {
                     data.tool_result = serde_json::to_value(typed).expect("serialize tool result");
                 }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(
-                        tool = data.tool_name,
+                        tool = tool_name,
                         tool_call_id = data.tool_call_id,
                         detail = %error.detail,
                         "Canonical Tyde tool result normalization failed"
@@ -997,51 +1017,26 @@ impl TurnEmitterState {
             if normalization_failure.is_none() {
                 spawn_progress = spawn_progress_data_for_tool_result(
                     data.tool_call_id,
-                    data.tool_name,
+                    tool_name,
                     &data.tool_result,
                 );
             }
         }
         let mut opened_container = None;
-        match self.pending_tool_name(data.tool_call_id).cloned() {
-            Some(expected_name) if expected_name != data.tool_name => {
-                self.send_tool_completed(
-                    data.tool_call_id,
-                    &expected_name,
-                    cancelled_tool_result("Tool completion name mismatch was superseded"),
-                    false,
-                    Some("Tool completion name mismatch was superseded"),
-                );
-                opened_container = self.tool_request(
-                    data.tool_call_id,
-                    data.tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "synthetic": true,
-                            "reason": "tool completion arrived without a matching request",
-                        },
-                    }),
-                    None,
-                    true,
-                );
-            }
-            Some(_) => {}
-            None => {
-                opened_container = self.tool_request(
-                    data.tool_call_id,
-                    data.tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "synthetic": true,
-                            "reason": "tool completion arrived without a pending request",
-                        },
-                    }),
-                    None,
-                    true,
-                );
-            }
+        if request_name.is_none() {
+            opened_container = self.tool_request(
+                data.tool_call_id,
+                tool_name,
+                json!({
+                    "kind": "Other",
+                    "args": {
+                        "synthetic": true,
+                        "reason": "tool completion arrived without a pending request",
+                    },
+                }),
+                None,
+                true,
+            );
         }
         let normalization_failure = merge_normalization_failures(
             self.normalization_failures.remove(data.tool_call_id),
@@ -1057,7 +1052,7 @@ impl TurnEmitterState {
             .or_else(|| data.error.map(str::to_owned));
         self.send_tool_completed_with_normalization_failure(
             data.tool_call_id,
-            data.tool_name,
+            tool_name,
             data.tool_result,
             success,
             error.as_deref(),
@@ -1067,28 +1062,37 @@ impl TurnEmitterState {
     }
 
     fn send_tool_progress(&self, data: &protocol::ToolProgressData) {
+        let mut data = data.clone();
+        // The emitted request is the single authoritative identity for a
+        // tool_call_id; producers that cache a name (sub-agent streams,
+        // background tasks) can lag or guess wrong when the CLI anchors
+        // task frames to a differently-named call (e.g. a SendMessage
+        // continuation announced via a `task_started` frame). Stamp the
+        // request's name rather than surfacing a mid-chat Error card: the
+        // card punished the user for a producer bug and could trip
+        // error-ends-turn handling. A divergence is still a producer bug —
+        // debug builds fail loudly so tests and dev instances catch it.
         if let Some(request) = self
             .emitted_tool_requests
             .get(&data.tool_call_id)
             .or_else(|| self.detached_tool_requests.get(&data.tool_call_id))
-            && request.name != data.tool_name
         {
-            tracing::error!(
-                tool_call_id = data.tool_call_id,
-                request_tool_name = request.name,
-                progress_tool_name = data.tool_name,
-                "Rejecting tool progress with conflicting tool identity"
-            );
-            self.send(json!({
-                "kind": "Error",
-                "data": format!(
-                    "Tool progress identity mismatch for '{}': request is '{}', progress is '{}'",
+            if request.name != data.tool_name {
+                tracing::error!(
+                    tool_call_id = data.tool_call_id,
+                    request_tool_name = request.name,
+                    progress_tool_name = data.tool_name,
+                    "Tool progress carried a conflicting tool identity; stamping the request's name"
+                );
+                debug_assert!(
+                    false,
+                    "tool progress identity desync for '{}': request is '{}', progress is '{}'",
                     data.tool_call_id, request.name, data.tool_name
-                ),
-            }));
-            return;
+                );
+            }
+            data.tool_name = request.name.clone();
         }
-        let payload = match serde_json::to_value(data) {
+        let payload = match serde_json::to_value(&data) {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::warn!("failed to serialize ToolProgressData: {error}");
@@ -2527,9 +2531,22 @@ mod tests {
         );
     }
 
+    /// Contract correction (2026-08-03): this test previously asserted the
+    /// mismatch surfaced as a user-visible `Error` chat card with the frame
+    /// dropped. That card was itself the beta.51 regression — producer-side
+    /// naming gaps (a SendMessage-anchored local_agent task, collab spawn
+    /// alias defaults) punished the user mid-chat for bugs they could not
+    /// act on, and could trip error-ends-turn handling. The guarantee the
+    /// assertion was reaching for — progress must never impersonate a
+    /// different tool on someone else's card — is preserved and
+    /// strengthened: a conflicting frame now cannot reach the wire at all
+    /// in debug builds (loud failure below, catching the producer bug in
+    /// tests and dev instances), and in release builds it is stamped with
+    /// the emitted request's authoritative name before emission.
     #[test]
-    fn shared_emitter_rejects_progress_for_a_different_tool_identity() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+    #[should_panic(expected = "tool progress identity desync")]
+    fn shared_emitter_fails_loudly_on_progress_for_a_different_tool_identity() {
+        let (tx, _rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new_for_agent(tx, AgentName("provider"));
         emitter.tool_request("shared-id", "run_command", run_command_request());
         emitter.tool_progress(&protocol::ToolProgressData {
@@ -2543,18 +2560,6 @@ mod tests {
                 }],
             }),
         });
-        drop(emitter);
-
-        let events = recv_events(&mut rx);
-        assert_eq!(
-            event_kinds(&events),
-            vec!["StreamStart", "ToolRequest", "Error"]
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("ToolProgress") })
-        );
     }
 
     #[test]
@@ -2973,5 +2978,47 @@ mod tests {
         emitter.tool_progress(&sample_progress(""));
         drop(emitter);
         assert_eq!(recv_kinds(&mut rx), Vec::<String>::new());
+    }
+
+    fn emitted_progress_name(events: &[Value]) -> Option<String> {
+        events
+            .iter()
+            .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+            .and_then(|event| event["data"]["tool_name"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// Progress for an id with no emitted request keeps the producer's
+    /// name: background tasks legitimately emit before the request card
+    /// exists and after per-turn maps reset.
+    #[test]
+    fn tool_progress_without_request_keeps_producer_name() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_progress(&sample_progress("tool-orphan"));
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            emitted_progress_name(&events).as_deref(),
+            Some("Workflow"),
+            "producer name should pass through when no request owns the id"
+        );
+    }
+
+    /// Matching identities pass through stamped with the request's name.
+    #[test]
+    fn tool_progress_is_stamped_with_request_name() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-owned",
+            "Workflow",
+            json!({"kind": "Other", "args": {}}),
+        );
+        emitter.tool_progress(&sample_progress("tool-owned"));
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(emitted_progress_name(&events).as_deref(), Some("Workflow"));
     }
 }

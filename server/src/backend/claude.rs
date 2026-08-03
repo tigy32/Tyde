@@ -6286,7 +6286,19 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
 /// tool card while routing a sub-agent's events.
 const SUBAGENT_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 
-fn subagent_progress_data(stream: &SubAgentStream, completed: bool) -> ToolProgressData {
+fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolProgressData {
+    // The emitted request owns the card's identity. The cached name can be
+    // stale or a guess: lazy `task_started` registration may run before or
+    // after the tool_use block is seen, and the anchoring call is not always
+    // a Task/Agent spawn (a SendMessage continuation anchors local_agent
+    // frames to the SendMessage call). Re-resolve on every emission so the
+    // frame always matches the request card it decorates.
+    if let Some(name) = stream
+        .parent_emitter
+        .tool_request_name(&stream.parent_tool_use_id)
+    {
+        stream.parent_tool_name = name;
+    }
     ToolProgressData {
         tool_call_id: stream.parent_tool_use_id.clone(),
         tool_name: stream.parent_tool_name.clone(),
@@ -6305,9 +6317,8 @@ fn maybe_emit_subagent_progress(stream: &mut SubAgentStream) {
         return;
     }
     stream.last_progress_emit = std::time::Instant::now();
-    stream
-        .parent_emitter
-        .tool_progress(&subagent_progress_data(stream, false));
+    let progress = subagent_progress_data(stream, false);
+    stream.parent_emitter.tool_progress(&progress);
 }
 
 fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description: &str) {
@@ -6405,7 +6416,7 @@ async fn ensure_subagent_stream(
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
-    let stream = SubAgentStream {
+    let mut stream = SubAgentStream {
         summary: ClaudeStdoutSummary::default(),
         segment: SegmentState {
             awaiting_stream_start: true,
@@ -6415,7 +6426,14 @@ async fn ensure_subagent_stream(
         has_explicit_task_prompt: false,
         inner: sa_inner,
         parent_tool_use_id: tool_use_id.clone(),
-        parent_tool_name: parent_tool_name.unwrap_or_else(|| "Task".to_owned()),
+        // Prefer the caller-observed block name, then the emitted request
+        // (lazy task_started registration may anchor to any agent-control
+        // call, e.g. a SendMessage continuation). "Task" is only the seed
+        // for the request-not-yet-seen race; progress emission re-resolves
+        // it against the request registry every time.
+        parent_tool_name: parent_tool_name
+            .or_else(|| parent_emitter.tool_request_name(&tool_use_id))
+            .unwrap_or_else(|| "Task".to_owned()),
         agent_id: handle.agent_id,
         agent_name: name,
         name_update_tx: handle.name_update_tx,
@@ -6428,7 +6446,7 @@ async fn ensure_subagent_stream(
     };
     // Unthrottled spawn update: the Task card learns the sub-agent's id
     // (for its "Open agent" link) as soon as the agent exists.
-    parent_emitter.tool_progress(&subagent_progress_data(&stream, false));
+    parent_emitter.tool_progress(&subagent_progress_data(&mut stream, false));
     streams.insert(tool_use_id, stream);
 }
 
@@ -7638,9 +7656,8 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
     // the notification has no renderable text/usage).
     stream.inner.emitter.typing_status_changed(false);
     // Unthrottled final update with the closing stats.
-    stream
-        .parent_emitter
-        .tool_progress(&subagent_progress_data(&stream, true));
+    let progress = subagent_progress_data(&mut stream, true);
+    stream.parent_emitter.tool_progress(&progress);
 }
 
 fn close_current_subagent_phase(
@@ -17095,7 +17112,7 @@ for raw_line in sys.stdin:
         let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-agent", false);
         stream.parent_tool_name = "Agent".to_owned();
 
-        let progress = subagent_progress_data(&stream, false);
+        let progress = subagent_progress_data(&mut stream, false);
         assert_eq!(progress.tool_call_id, "toolu-agent");
         assert_eq!(progress.tool_name, "Agent");
     }
@@ -17219,7 +17236,7 @@ for raw_line in sys.stdin:
             stream.summary.tool_calls.is_empty(),
             "the phase-local tool list should have reset"
         );
-        let progress = subagent_progress_data(&stream, true);
+        let progress = subagent_progress_data(&mut stream, true);
         let ToolProgressUpdate::SubAgent(progress) = progress.update else {
             panic!("expected sub-agent progress");
         };
@@ -24089,6 +24106,187 @@ for raw_line in sys.stdin:
             streams.is_empty(),
             "sub-agent stream should be removed after tool_result completion"
         );
+    }
+
+    fn drain_parent_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn assert_no_error_events(events: &[Value]) {
+        let errors: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
+            .collect();
+        assert!(errors.is_empty(), "unexpected Error events: {errors:?}");
+    }
+
+    fn tool_progress_names(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+            .filter_map(|event| event["data"]["tool_name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Captured 2026-08-03 regression (beta.51, claude-fable-5): the model
+    /// continues an existing agent with the CLI-native SendMessage tool and
+    /// the CLI anchors the continuation's `task_started` local_agent frame
+    /// to the SendMessage call's tool_use_id. Lazy registration defaulted
+    /// the parent tool name to "Task", so every progress frame desynced
+    /// from the emitted SendMessage request and the emitter surfaced "Tool
+    /// progress identity mismatch" Error cards in the user's chat. The
+    /// emitted request is authoritative: registration and every emission
+    /// must adopt it, and this replay must produce no Error events.
+    #[tokio::test]
+    async fn sendmessage_continuation_adopts_request_identity_without_errors() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, mut parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+
+        // The SendMessage tool_use block reaches the emitter first: a
+        // request card named SendMessage owns the tool_use_id.
+        parent_emitter.tool_request(
+            "toolu_sendmsg",
+            "SendMessage",
+            json!({"kind": "Other", "args": {"agent_id": "aa62c69", "message": "keep going"}}),
+        );
+
+        detect_subagent_task_system_spawns(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "description": "Continue child agent",
+                "prompt": "keep going",
+                "session_id": "test-session",
+                "task_id": "task-send-1",
+                "task_type": "local_agent",
+                "tool_use_id": "toolu_sendmsg"
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+        )
+        .await;
+
+        let stream = streams
+            .get_mut("toolu_sendmsg")
+            .expect("continuation stream should register");
+        assert_eq!(stream.parent_tool_name, "SendMessage");
+
+        // A stale cached identity must not survive emission: progress
+        // re-resolves against the emitted request every time.
+        stream.parent_tool_name = "Task".to_owned();
+        let progress = subagent_progress_data(stream, false);
+        assert_eq!(progress.tool_name, "SendMessage");
+        parent_emitter.tool_progress(&progress);
+
+        let events = drain_parent_events(&mut parent_rx);
+        assert_no_error_events(&events);
+        let names = tool_progress_names(&events);
+        assert!(
+            !names.is_empty(),
+            "expected ToolProgress frames, got {events:?}"
+        );
+        assert!(
+            names.iter().all(|name| name == "SendMessage"),
+            "all progress must carry the request identity, got {names:?}"
+        );
+    }
+
+    /// Every agent-control call the CLI can anchor a local_agent task to
+    /// must keep progress identity aligned with its emitted request. The
+    /// beta.41 identity fix covered local_bash owners only; this table pins
+    /// the local_agent owners so extending to the CLI's next task anchor is
+    /// mechanical rather than a rediscovery.
+    #[tokio::test]
+    async fn local_agent_task_identity_follows_emitted_request_for_all_owners() {
+        for owner in ["Task", "Agent", "SendMessage"] {
+            let emitter = TestSubAgentEmitter::default();
+            let (parent_emitter, mut parent_rx) = test_parent_emitter();
+            let mut streams = HashMap::new();
+            let tool_use_id = format!("toolu_{}", owner.to_ascii_lowercase());
+
+            parent_emitter.tool_request(&tool_use_id, owner, json!({"kind": "Other", "args": {}}));
+
+            detect_subagent_task_system_spawns(
+                &json!({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "description": "child work",
+                    "prompt": "do the thing",
+                    "session_id": "test-session",
+                    "task_id": format!("task-{owner}"),
+                    "task_type": "local_agent",
+                    "tool_use_id": tool_use_id.clone()
+                }),
+                &emitter,
+                &parent_emitter,
+                &mut streams,
+            )
+            .await;
+
+            let stream = streams.get(&tool_use_id).expect("stream should register");
+            assert_eq!(stream.parent_tool_name, owner, "owner {owner}");
+
+            let events = drain_parent_events(&mut parent_rx);
+            assert_no_error_events(&events);
+            let names = tool_progress_names(&events);
+            assert!(
+                names.iter().all(|name| name == owner),
+                "owner {owner}: progress must match its request, got {names:?}"
+            );
+        }
+    }
+
+    /// Frame reordering: `task_started` can precede the owning tool_use
+    /// block (observed for background tasks; same seam). The stream seeds
+    /// with "Task", and the first post-request emission adopts the real
+    /// owner — never surfacing an Error event in between.
+    #[tokio::test]
+    async fn local_agent_task_without_request_seeds_task_then_adopts_owner() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, mut parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+
+        detect_subagent_task_system_spawns(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "description": "Continue child agent",
+                "prompt": "keep going",
+                "session_id": "test-session",
+                "task_id": "task-race",
+                "task_type": "local_agent",
+                "tool_use_id": "toolu_race"
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+        )
+        .await;
+
+        let stream = streams
+            .get_mut("toolu_race")
+            .expect("stream should register");
+        assert_eq!(stream.parent_tool_name, "Task");
+
+        // The SendMessage request card arrives late; the next emission
+        // adopts it.
+        parent_emitter.tool_request(
+            "toolu_race",
+            "SendMessage",
+            json!({"kind": "Other", "args": {}}),
+        );
+        let progress = subagent_progress_data(stream, false);
+        assert_eq!(progress.tool_name, "SendMessage");
+        parent_emitter.tool_progress(&progress);
+
+        let events = drain_parent_events(&mut parent_rx);
+        assert_no_error_events(&events);
     }
 
     #[tokio::test]
