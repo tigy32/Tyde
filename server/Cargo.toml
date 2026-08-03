@@ -32,6 +32,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 indexmap = "2"
+mdns-sd = { version = "0.20.3", default-features = false, features = ["async"] }
 regex = "1"
 notify = "8"
 opus = "0.3.0"
