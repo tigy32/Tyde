@@ -2649,7 +2649,6 @@ mod wasm_tests {
             m.insert(
                 host_id.to_owned(),
                 protocol::HostSettings {
-                    voice: Default::default(),
                     enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
                     default_backend: Some(BackendKind::Claude),
                     enable_mobile_connections: false,

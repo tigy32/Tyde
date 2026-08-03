@@ -40,13 +40,12 @@ always re-read the current `ETag` immediately before an `--if-match` update.
 The CSP mirrors the loader's `index.html` `<meta>` CSP **plus** `frame-ancestors
 'none'` (which `<meta>` cannot express). Load-bearing directives:
 `script-src 'self' 'wasm-unsafe-eval'` (same-origin JS + WASM compile, **no**
-general `unsafe-eval`), `webrtc 'allow'` (the audio-track media path),
+general `unsafe-eval`),
 `connect-src 'self' wss:` (broker over wss,
 same-origin manifest/bundle fetches, and the same-origin
 `/api/tyde/mobile/v1` managed-service API), `object-src 'none'`, `base-uri
 'none'`, `frame-ancestors 'none'`. HSTS is added here too (it cannot be set via
-`<meta>`). `Permissions-Policy` grants this same origin microphone access for
-voice and retains camera access for QR pairing. CORS is included so the loader's `crossorigin="anonymous"` + SRI
+`<meta>`). `Permissions-Policy` retains same-origin camera access for QR pairing. CORS is included so the loader's `crossorigin="anonymous"` + SRI
 fetches always succeed.
 
 Save this as `tyde-rhp.json`:
@@ -58,7 +57,7 @@ Save this as `tyde-rhp.json`:
   "SecurityHeadersConfig": {
     "ContentSecurityPolicy": {
       "Override": true,
-      "ContentSecurityPolicy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; webrtc 'allow'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+      "ContentSecurityPolicy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     },
     "StrictTransportSecurity": {
       "Override": true,
@@ -75,7 +74,7 @@ Save this as `tyde-rhp.json`:
     "Items": [
       {
         "Header": "Permissions-Policy",
-        "Value": "microphone=(self), camera=(self)",
+        "Value": "camera=(self)",
         "Override": true
       }
     ]
@@ -189,9 +188,8 @@ curl -sI https://tycode.dev/index.html | grep -i 'content-security-policy' || ec
   use; the header from this RHP is the authoritative one in production and adds
   `frame-ancestors` + HSTS. Keep the two in sync if you edit either — the header
   string above is the `<meta>` policy plus `frame-ancestors 'none'`.
-- **Microphone policy via header.** `Permissions-Policy` is an HTTP response
-  policy, not a supported `<meta>` substitute. Keep both `microphone=(self)`
-  for voice and `camera=(self)` for the existing QR scanner.
+- **Camera policy via header.** `Permissions-Policy` is an HTTP response
+  policy, not a supported `<meta>` substitute. Keep `camera=(self)` for the QR scanner.
 - **`connect-src 'self' wss:`** intentionally omits `https:`. The managed
   mobile service config must keep the API same-origin under
   `/api/tyde/mobile/v1`; if a future feature needs cross-origin HTTPS, add it in

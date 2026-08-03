@@ -21,8 +21,7 @@
       the broker over `wss://` and fetches the manifest/bundle plus the
       `tycode.dev` managed-service API from same-origin (`'self'`). `https:` is
       deliberately omitted — add it back only if a future feature needs
-      cross-origin HTTPS. `webrtc 'allow'` permits the direct audio-track media
-      path; no signaling or audio is routed around the typed MQTT/WebRTC split.
+      cross-origin HTTPS.
       `style-src` allows inline styles because the injected
       Leptos app styles itself with inline <style>/style= (not a
       script-execution vector). `frame-ancestors` cannot be set via <meta>; the
@@ -31,7 +30,7 @@
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; webrtc 'allow'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
     />
 
     <title>Tyde</title>

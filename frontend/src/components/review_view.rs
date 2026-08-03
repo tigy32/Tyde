@@ -2844,7 +2844,6 @@ mod wasm_tests {
             m.insert(
                 "h1".to_owned(),
                 protocol::HostSettings {
-                    voice: Default::default(),
                     enabled_backends: vec![BackendKind::Codex],
                     default_backend: Some(BackendKind::Codex),
                     enable_mobile_connections: false,
@@ -3273,7 +3272,6 @@ mod wasm_tests {
             m.insert(
                 "h1".to_owned(),
                 protocol::HostSettings {
-                    voice: Default::default(),
                     enabled_backends: enabled,
                     default_backend: default,
                     enable_mobile_connections: false,

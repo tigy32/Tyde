@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 45;
+pub const PROTOCOL_VERSION: u32 = 46;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1362,11 +1362,6 @@ pub enum FrameKind {
     MobileDeviceRename,
     ClientError,
     Heartbeat,
-    VoiceStart,
-    VoiceOffer,
-    VoiceIceCandidate,
-    VoiceIceCandidatesComplete,
-    VoiceStop,
 
     SetSessionSettings,
     TriggerWorkflow,
@@ -1453,10 +1448,6 @@ pub enum FrameKind {
     WorkflowNotify,
     WorkflowRunNotify,
     HeartbeatAck,
-    VoiceReady,
-    VoiceAnswer,
-    VoiceState,
-    VoiceError,
 }
 
 impl fmt::Display for FrameKind {
@@ -1548,11 +1539,6 @@ impl fmt::Display for FrameKind {
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
             Self::ClientError => f.write_str("client_error"),
             Self::Heartbeat => f.write_str("heartbeat"),
-            Self::VoiceStart => f.write_str("voice_start"),
-            Self::VoiceOffer => f.write_str("voice_offer"),
-            Self::VoiceIceCandidate => f.write_str("voice_ice_candidate"),
-            Self::VoiceIceCandidatesComplete => f.write_str("voice_ice_candidates_complete"),
-            Self::VoiceStop => f.write_str("voice_stop"),
             Self::TriggerWorkflow => f.write_str("trigger_workflow"),
             Self::CancelWorkflow => f.write_str("cancel_workflow"),
             Self::WorkflowRefresh => f.write_str("workflow_refresh"),
@@ -1638,10 +1624,6 @@ impl fmt::Display for FrameKind {
             Self::WorkflowNotify => f.write_str("workflow_notify"),
             Self::WorkflowRunNotify => f.write_str("workflow_run_notify"),
             Self::HeartbeatAck => f.write_str("heartbeat_ack"),
-            Self::VoiceReady => f.write_str("voice_ready"),
-            Self::VoiceAnswer => f.write_str("voice_answer"),
-            Self::VoiceState => f.write_str("voice_state"),
-            Self::VoiceError => f.write_str("voice_error"),
         }
     }
 }
@@ -2565,8 +2547,6 @@ pub struct HostSettings {
     /// a `hermes` session started outside Tyde still sees the provider.
     #[serde(default)]
     pub hermes_disabled_providers: HashMap<String, Vec<String>>,
-    #[serde(default)]
-    pub voice: VoiceSettings,
 }
 
 impl Default for HostSettings {
@@ -2586,21 +2566,8 @@ impl Default for HostSettings {
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: HashMap::new(),
-            voice: VoiceSettings::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoiceSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws_profile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws_region: Option<String>,
-    #[serde(default)]
-    pub availability: VoiceAvailability,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2900,15 +2867,6 @@ pub enum HostSettingValue {
         profile: String,
         providers: Vec<String>,
     },
-    VoiceEnabled {
-        enabled: bool,
-    },
-    VoiceAwsProfile {
-        profile: Option<String>,
-    },
-    VoiceAwsRegion {
-        region: Option<String>,
-    },
 }
 
 impl HostSettingValue {
@@ -2960,9 +2918,6 @@ impl HostSettingValue {
             Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
             Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
             Self::HermesDisabledProviders { .. } => HostSettingErrorTarget::HermesDisabledProviders,
-            Self::VoiceEnabled { .. } => HostSettingErrorTarget::VoiceEnabled,
-            Self::VoiceAwsProfile { .. } => HostSettingErrorTarget::VoiceAwsProfile,
-            Self::VoiceAwsRegion { .. } => HostSettingErrorTarget::VoiceAwsRegion,
         }
     }
 }
@@ -2998,9 +2953,6 @@ pub enum HostSettingErrorTarget {
     BackendNativeSettings,
     LaunchProfiles,
     HermesDisabledProviders,
-    VoiceEnabled,
-    VoiceAwsProfile,
-    VoiceAwsRegion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3780,6 +3732,7 @@ fn default_fork_access_mode() -> Option<BackendAccessMode> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessagePayload {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6902,264 +6855,6 @@ pub struct TerminalErrorPayload {
     pub fatal: bool,
 }
 
-pub const MAX_VOICE_SDP_BYTES: usize = 64 * 1024;
-pub const MAX_VOICE_ICE_CANDIDATE_BYTES: usize = 4 * 1024;
-pub const MAX_VOICE_ICE_CANDIDATES: usize = 64;
-pub const MAX_VOICE_TOOL_MESSAGE_BYTES: usize = 16 * 1024;
-pub const VOICE_SESSION_MAX_SECONDS: u64 = 450;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct VoiceSessionId(pub String);
-
-impl fmt::Display for VoiceSessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceTarget {
-    pub agent_id: AgentId,
-    pub instance_stream: StreamPath,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceAudioCodec {
-    Opus,
-    Pcmu,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceClientCapabilities {
-    pub audio_track: bool,
-    pub codecs: Vec<VoiceAudioCodec>,
-    pub echo_cancellation_requested: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceStartPayload {
-    pub session_id: VoiceSessionId,
-    pub target: VoiceTarget,
-    pub capabilities: VoiceClientCapabilities,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceOfferPayload {
-    pub session_id: VoiceSessionId,
-    pub sdp: String,
-}
-
-impl fmt::Debug for VoiceOfferPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VoiceOfferPayload")
-            .field("session_id", &self.session_id)
-            .field("sdp", &"[REDACTED]")
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceAnswerPayload {
-    pub session_id: VoiceSessionId,
-    pub sdp: String,
-}
-
-impl fmt::Debug for VoiceAnswerPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VoiceAnswerPayload")
-            .field("session_id", &self.session_id)
-            .field("sdp", &"[REDACTED]")
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceIceCandidate {
-    pub candidate: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sdp_mid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sdp_m_line_index: Option<u16>,
-}
-
-impl fmt::Debug for VoiceIceCandidate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VoiceIceCandidate")
-            .field("candidate", &"[REDACTED]")
-            .field("sdp_mid", &self.sdp_mid)
-            .field("sdp_m_line_index", &self.sdp_m_line_index)
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceIceCandidatePayload {
-    pub session_id: VoiceSessionId,
-    pub candidates: Vec<VoiceIceCandidate>,
-}
-
-impl fmt::Debug for VoiceIceCandidatePayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VoiceIceCandidatePayload")
-            .field("session_id", &self.session_id)
-            .field("candidate_count", &self.candidates.len())
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceIceCandidatesCompletePayload {
-    pub session_id: VoiceSessionId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceStopReason {
-    UserExited,
-    FocusChanged,
-    ClientBackgrounded,
-    PermissionLost,
-    MediaFailed,
-    ClientGone,
-    AgentClosed,
-    TimedOut,
-    ServerShutdown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceStopPayload {
-    pub session_id: VoiceSessionId,
-    pub reason: VoiceStopReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceUnavailableReason {
-    NotEnabled,
-    RegionNotConfigured,
-    ServerAdapterUnavailable,
-    NoReachableCandidate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VoiceAvailability {
-    Available { direct_connections_only: bool },
-    Unavailable { reason: VoiceUnavailableReason },
-}
-
-impl Default for VoiceAvailability {
-    fn default() -> Self {
-        Self::Unavailable {
-            reason: VoiceUnavailableReason::NotEnabled,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceReadyPayload {
-    pub session_id: VoiceSessionId,
-    pub target: VoiceTarget,
-    pub direct_connections_only: bool,
-    pub expires_after_seconds: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceSessionState {
-    Negotiating,
-    Connected,
-    Listening,
-    AgentWorking,
-    Speaking,
-    Ending,
-    Ended,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceAgentProgressKind {
-    ResponseStarted,
-    ToolStarted,
-    ToolProgressed,
-    TaskListChanged,
-    Retrying,
-    ResponseCompleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceAgentProgress {
-    pub source_seq: u64,
-    pub source_kind: VoiceAgentProgressKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceTranscriptSpeaker {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceTranscript {
-    pub speaker: VoiceTranscriptSpeaker,
-    pub text: String,
-    pub is_final: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceStatePayload {
-    pub session_id: VoiceSessionId,
-    pub state: VoiceSessionState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<VoiceAgentProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<VoiceTranscript>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_reason: Option<VoiceStopReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceErrorCode {
-    InvalidRequest,
-    AlreadyActive,
-    NotAvailable,
-    AgentUnavailable,
-    MediaNegotiationFailed,
-    ProviderUnavailable,
-    ToolBusy,
-    ToolDeliveryFailed,
-    TimedOut,
-    Internal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VoiceErrorPayload {
-    pub session_id: VoiceSessionId,
-    pub code: VoiceErrorCode,
-    pub message: String,
-    pub fatal: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandErrorCode {
@@ -8555,8 +8250,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_five() {
-        assert_eq!(PROTOCOL_VERSION, 45);
+    fn protocol_version_is_forty_six() {
+        assert_eq!(PROTOCOL_VERSION, 46);
     }
 
     #[test]
@@ -9116,7 +8811,6 @@ mod search_serde_tests {
                 backend_config: HashMap::new(),
                 launch_profiles: Vec::new(),
                 hermes_disabled_providers: Default::default(),
-                voice: Default::default(),
             },
             mobile_access: MobileAccessStatePayload {
                 broker_status: MobileBrokerStatus::Disabled,

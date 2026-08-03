@@ -16,10 +16,6 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Clipboard",
     "CaretPosition",
-    # `crypto.getRandomValues` mints the voice session id, which is the
-    # capability naming the /voice/<id> stream. `Math.random` is not a CSPRNG
-    # and is not acceptable for it.
-    "Crypto",
     "CssStyleDeclaration",
     "DataTransfer",
     "Document",
@@ -42,30 +38,6 @@ web-sys = { version = "0.3", features = [
     "MouseEventInit",
     "PointerEvent",
     "PointerEventInit",
-    # Voice layer: microphone capture, one bidirectional WebRTC audio track,
-    # and a hidden <audio> element for remote playback. Remote audio is played
-    # as a live WebRTC track rather than decoded through Web Audio, because
-    # platform echo cancellation only cancels far-end audio the media stack
-    # owns — which is why there is no AudioContext/AudioWorklet here.
-    "HtmlAudioElement",
-    "HtmlMediaElement",
-    "MediaDevices",
-    "MediaStream",
-    "MediaStreamConstraints",
-    "MediaStreamTrack",
-    "MediaTrackConstraints",
-    "MediaTrackSettings",
-    "RtcConfiguration",
-    "RtcIceCandidate",
-    "RtcIceCandidateInit",
-    "RtcPeerConnection",
-    "RtcPeerConnectionIceEvent",
-    "RtcPeerConnectionState",
-    # Required by `RtcPeerConnection::add_track`, which returns a sender.
-    "RtcRtpSender",
-    "RtcSdpType",
-    "RtcSessionDescriptionInit",
-    "RtcTrackEvent",
     "Navigator",
     "Node",
     "NodeList",

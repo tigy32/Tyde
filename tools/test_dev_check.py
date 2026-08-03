@@ -4,7 +4,6 @@ import hashlib
 import os
 import pathlib
 import platform
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -679,27 +678,67 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 linux_install.index("- name: Install repository Rust toolchain"),
             )
 
-    def test_release_build_supports_bundled_opus_with_cmake_four(self) -> None:
-        workflow = (
-            REPO_ROOT / ".github" / "workflows" / "release.yml"
-        ).read_text(encoding="utf-8")
-        build_job = workflow[workflow.index("  build:") :]
-
-        self.assertIn("      CMAKE_POLICY_VERSION_MINIMUM: '3.5'\n", build_job)
-        self.assertLess(
-            build_job.index("CMAKE_POLICY_VERSION_MINIMUM"),
-            build_job.index("- name: Install repository Rust toolchain"),
+    def test_removed_voice_transport_has_no_runtime_or_ui_capability(self) -> None:
+        removed_paths = (
+            "frontend/src/voice",
+            "frontend/src/components/voice_layer.rs",
+            "mobile-frontend/src/voice",
+            "mobile-frontend/src/components/voice_bar.rs",
+            "server/src/voice.rs",
+            "server/src/voice_aws.rs",
+            "server/src/voice_webrtc.rs",
+            "frontend/tauri-shell/Info.plist",
+            "frontend/tauri-shell/Entitlements.plist",
         )
+        for relative in removed_paths:
+            self.assertFalse((REPO_ROOT / relative).exists(), relative)
 
-    def test_macos_release_metadata_is_valid_plist_xml(self) -> None:
-        tauri_shell = REPO_ROOT / "frontend" / "tauri-shell"
-        entitlements = plistlib.loads(
-            (tauri_shell / "Entitlements.plist").read_bytes()
+        production_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in (
+                "client/src",
+                "dev-driver/src",
+                "frontend/src",
+                "frontend/tauri-shell/src",
+                "mobile-frontend/src",
+                "mqtt-transport/src",
+                "protocol/src",
+                "server/src",
+            )
+            for path in (REPO_ROOT / root).rglob("*.rs")
         )
-        info = plistlib.loads((tauri_shell / "Info.plist").read_bytes())
+        for forbidden in (
+            "UdpSocket",
+            "RtcPeerConnection",
+            "RtcIceCandidate",
+            "VoiceIceCandidate",
+            "VoiceStart",
+            'starts_with("/voice',
+        ):
+            self.assertNotIn(forbidden, production_sources)
 
-        self.assertIs(entitlements["com.apple.security.device.audio-input"], True)
-        self.assertTrue(info["NSMicrophoneUsageDescription"])
+        manifests = "\n".join(
+            (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for relative in (
+                "server/Cargo.toml",
+                "frontend/Cargo.toml",
+                "mobile-frontend/Cargo.toml",
+            )
+        )
+        for forbidden in ("str0m", "mdns-sd", 'opus =', "aws-sdk-bedrockruntime"):
+            self.assertNotIn(forbidden, manifests)
+        self.assertIn(
+            '"MediaDevices"',
+            (REPO_ROOT / "mobile-frontend/Cargo.toml").read_text(),
+        )
+        self.assertIn(
+            "VoiceOver/TalkBack",
+            (REPO_ROOT / "mobile-frontend/src/components/bottom_nav.rs").read_text(),
+        )
+        self.assertIn(
+            '"tts_providers": {}',
+            (REPO_ROOT / "tests/tests/settings.rs").read_text(),
+        )
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()

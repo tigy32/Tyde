@@ -401,10 +401,8 @@ impl HostSettingsStore {
     }
 
     fn save(path: &Path, settings: &HostSettings) -> Result<(), String> {
-        let mut persisted = settings.clone();
-        persisted.voice.availability = Default::default();
         let json = serde_json::to_string_pretty(&StoreFile {
-            settings: persisted,
+            settings: settings.clone(),
         })
         .map_err(|err| format!("Failed to serialize settings store: {err}"))?;
 
@@ -523,23 +521,6 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                     .hermes_disabled_providers
                     .insert(profile.to_owned(), slugs);
             }
-        }
-        HostSettingValue::VoiceEnabled { enabled } => {
-            settings.voice.enabled = enabled;
-        }
-        HostSettingValue::VoiceAwsProfile { profile } => {
-            settings.voice.aws_profile = normalize_voice_setting(profile, "AWS profile", 128)?;
-        }
-        HostSettingValue::VoiceAwsRegion { region } => {
-            let region = normalize_voice_setting(region, "AWS region", 64)?;
-            if region.as_ref().is_some_and(|region| {
-                !region
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }) {
-                return Err("AWS region may contain only letters, numbers, and hyphens".to_owned());
-            }
-            settings.voice.aws_region = region;
         }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
@@ -729,26 +710,7 @@ fn empty_settings() -> HostSettings {
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
         hermes_disabled_providers: std::collections::HashMap::new(),
-        voice: Default::default(),
     }
-}
-
-fn normalize_voice_setting(
-    value: Option<String>,
-    label: &str,
-    max_bytes: usize,
-) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if value.len() > max_bytes || value.chars().any(char::is_control) {
-        return Err(format!("{label} is malformed or exceeds {max_bytes} bytes"));
-    }
-    Ok(Some(value.to_owned()))
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
@@ -798,17 +760,6 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         ));
     }
 
-    let mut voice = settings.voice;
-    voice.aws_profile = normalize_voice_setting(voice.aws_profile, "AWS profile", 128)?;
-    voice.aws_region = normalize_voice_setting(voice.aws_region, "AWS region", 64)?;
-    if voice.aws_region.as_ref().is_some_and(|region| {
-        !region
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err("AWS region may contain only letters, numbers, and hyphens".to_owned());
-    }
-    voice.availability = Default::default();
     let code_intel = validate_code_intel_settings(settings.code_intel)?;
     let launch_profiles = validate_launch_profile_configs(settings.launch_profiles)?;
     // Normalize on load exactly as `apply_setting` does on write, so a
@@ -861,7 +812,6 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         backend_config,
         launch_profiles,
         hermes_disabled_providers,
-        voice,
     })
 }
 
@@ -1655,40 +1605,6 @@ mod tests {
         assert_eq!(
             settings.backend_tier_configs.get(&BackendKind::Claude),
             Some(&edited)
-        );
-    }
-
-    #[test]
-    fn voice_settings_store_only_non_secret_aws_selectors() {
-        let mut settings = empty_settings();
-        apply_setting(
-            &mut settings,
-            HostSettingValue::VoiceAwsProfile {
-                profile: Some("  personal  ".to_owned()),
-            },
-        )
-        .expect("valid AWS profile");
-        apply_setting(
-            &mut settings,
-            HostSettingValue::VoiceAwsRegion {
-                region: Some("us-west-2".to_owned()),
-            },
-        )
-        .expect("valid AWS region");
-        assert_eq!(settings.voice.aws_profile.as_deref(), Some("personal"));
-        assert_eq!(settings.voice.aws_region.as_deref(), Some("us-west-2"));
-        let encoded = serde_json::to_string(&settings).expect("serialize settings");
-        assert!(!encoded.contains("access_key"));
-        assert!(!encoded.contains("secret_key"));
-        assert!(!encoded.contains("session_token"));
-        assert!(
-            apply_setting(
-                &mut settings,
-                HostSettingValue::VoiceAwsRegion {
-                    region: Some("not/a/region".to_owned()),
-                },
-            )
-            .is_err()
         );
     }
 }

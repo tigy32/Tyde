@@ -227,7 +227,6 @@ fn write_host_settings_with_launch_profiles(
         backend_config: std::collections::HashMap::new(),
         launch_profiles,
         hermes_disabled_providers: Default::default(),
-        voice: Default::default(),
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(

@@ -32,41 +32,6 @@ use uuid::Uuid;
 const DEBUG_REPO_ROOT_ENV: &str = "TYDE_DEBUG_REPO_ROOT";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
 const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
-const DEV_VOICE_PROVIDER_ENV: &str = "TYDE_DEV_VOICE_PROVIDER";
-const DEV_VOICE_PROVIDER_MOCK: &str = "mock";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DevInstanceVoiceProvider {
-    Mock,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DevInstanceVoiceEnvironment {
-    provider: DevInstanceVoiceProvider,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DevInstanceVoiceEnvironmentAttestation {
-    provider: DevInstanceVoiceProvider,
-    mock_backend: bool,
-    media: &'static str,
-    provider_credentials_stripped: bool,
-}
-
-fn voice_environment_attestation(
-    voice: &DevInstanceVoiceEnvironment,
-) -> DevInstanceVoiceEnvironmentAttestation {
-    DevInstanceVoiceEnvironmentAttestation {
-        provider: voice.provider,
-        mock_backend: true,
-        media: "str0m",
-        provider_credentials_stripped: true,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DebugServerConfig {
     repo_root: PathBuf,
@@ -116,7 +81,6 @@ struct DevInstanceRecord {
     config_path: PathBuf,
     store_dir: PathBuf,
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
-    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     startup_output: Arc<StdMutex<BoundedDebugOutput>>,
     startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
@@ -133,8 +97,6 @@ struct DevInstanceSummary {
     stores_ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -275,8 +237,6 @@ struct StartInstanceToolInput {
     project_dir: String,
     #[serde(default)]
     hermes: Option<DisposableHermesEnvironment>,
-    #[serde(default)]
-    voice: Option<DevInstanceVoiceEnvironment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,8 +322,6 @@ struct StartInstanceResult {
     stores_ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    voice_environment: Option<DevInstanceVoiceEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -373,20 +331,12 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_dev_instance_start",
-            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input contains Hermes behind an IPv4 loopback stub. An optional voice.provider=mock input selects a mock chat backend and mocks only Nova while retaining real str0m WebRTC; provider credentials are stripped and provider proxy egress is denied. Returns canonical store and containment attestations.",
+            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input contains Hermes behind an IPv4 loopback stub. Returns canonical store and containment attestations.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string" },
                     "hermes": disposable_hermes_environment_json_schema(),
-                    "voice": {
-                        "type": "object",
-                        "properties": {
-                            "provider": { "type": "string", "enum": ["mock"] }
-                        },
-                        "required": ["provider"],
-                        "additionalProperties": false
-                    }
                 },
                 "required": ["project_dir"],
                 "additionalProperties": false
@@ -579,7 +529,6 @@ async fn start_instance(
         .zip(resolved_hermes_runtime.as_ref())
         .map(|(hermes, runtime)| prepare_disposable_hermes_environment(&store_dir, hermes, runtime))
         .transpose()?;
-    let voice_environment = input.voice.as_ref().map(voice_environment_attestation);
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
@@ -592,12 +541,7 @@ async fn start_instance(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    configure_dev_instance_environment(
-        &mut command,
-        &store_dir,
-        prepared_hermes.as_ref(),
-        input.voice.as_ref(),
-    )?;
+    configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
 
     let mut child = command
         .group_spawn()
@@ -630,7 +574,6 @@ async fn start_instance(
         config_path,
         store_dir,
         hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
-        voice_environment,
         startup_output,
         startup_capture_tasks,
         child,
@@ -650,7 +593,6 @@ async fn start_instance(
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
         hermes_environment: record.hermes_environment.clone(),
-        voice_environment: record.voice_environment.clone(),
         frontend_url: frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -667,12 +609,10 @@ fn configure_dev_instance_environment(
     command: &mut Command,
     store_dir: &Path,
     hermes: Option<&PreparedDisposableHermesEnvironment>,
-    voice: Option<&DevInstanceVoiceEnvironment>,
 ) -> Result<(), String> {
     for (env, path) in dev_instance_mutable_paths(store_dir) {
         command.env(env, path);
     }
-    command.env_remove(DEV_VOICE_PROVIDER_ENV);
     if let Some(hermes) = hermes {
         preserve_toolchain_homes(command, &hermes.home)?;
         command
@@ -684,18 +624,8 @@ fn configure_dev_instance_environment(
         if let Some(python) = &hermes.runtime.python {
             command.env(DEV_INSTANCE_HERMES_PYTHON_ENV, python);
         }
-    } else if voice.is_some() {
-        preserve_toolchain_homes(command, store_dir)?;
-        command.env(DEV_INSTANCE_HOME_ENV, store_dir);
     }
-    if let Some(voice) = voice {
-        match voice.provider {
-            DevInstanceVoiceProvider::Mock => {
-                command.env(DEV_VOICE_PROVIDER_ENV, DEV_VOICE_PROVIDER_MOCK);
-            }
-        }
-    }
-    if hermes.is_none() && voice.is_none() {
+    if hermes.is_none() {
         return Ok(());
     }
     for env in DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS {
@@ -1094,7 +1024,6 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
         hermes_environment: record.hermes_environment.clone(),
-        voice_environment: record.voice_environment.clone(),
         frontend_url: record.frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -1625,7 +1554,7 @@ mod tests {
     fn dev_instance_environment_isolates_every_mutable_path() {
         let store_dir = Path::new("/isolated/tyde-instance");
         let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store_dir, None, None)
+        configure_dev_instance_environment(&mut command, store_dir, None)
             .expect("configure default dev environment");
         let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
 
@@ -1643,99 +1572,6 @@ mod tests {
         }
         assert!(!configured.contains_key(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV)));
         assert!(!configured.contains_key(std::ffi::OsStr::new(DEV_INSTANCE_HERMES_HOME_ENV)));
-    }
-
-    #[test]
-    fn typed_voice_option_accepts_only_mock_provider() {
-        let parsed: StartInstanceToolInput = serde_json::from_value(json!({
-            "project_dir": "/repo",
-            "voice": {"provider": "mock"}
-        }))
-        .expect("typed mock voice option");
-        assert_eq!(
-            parsed.voice.expect("voice option").provider,
-            DevInstanceVoiceProvider::Mock
-        );
-        assert!(
-            serde_json::from_value::<StartInstanceToolInput>(json!({
-                "project_dir": "/repo",
-                "voice": {"provider": "mock", "endpoint": "https://example.invalid"}
-            }))
-            .is_err(),
-            "nested voice fields must fail closed"
-        );
-        assert!(
-            serde_json::from_value::<StartInstanceToolInput>(json!({
-                "project_dir": "/repo",
-                "voiceProvider": "mock"
-            }))
-            .is_err(),
-            "the duplicated launch contract must remain typed"
-        );
-    }
-
-    #[test]
-    fn mock_voice_environment_strips_providers_and_attests_real_media() {
-        let store = tempfile::tempdir().expect("store dir");
-        let voice = DevInstanceVoiceEnvironment {
-            provider: DevInstanceVoiceProvider::Mock,
-        };
-        let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store.path(), None, Some(&voice))
-            .expect("configure mock voice environment");
-        let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
-
-        assert_eq!(
-            configured
-                .get(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_ENV))
-                .copied()
-                .flatten(),
-            Some(std::ffi::OsStr::new(DEV_VOICE_PROVIDER_MOCK))
-        );
-        for key in [
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_PROFILE",
-            "AWS_BEARER_TOKEN_BEDROCK",
-            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        ] {
-            assert_eq!(
-                configured.get(std::ffi::OsStr::new(key)).copied(),
-                Some(None),
-                "{key} must not reach mock voice mode"
-            );
-        }
-        assert_eq!(
-            configured
-                .get(std::ffi::OsStr::new("AWS_EC2_METADATA_DISABLED"))
-                .copied()
-                .flatten(),
-            Some(std::ffi::OsStr::new("true"))
-        );
-        assert_eq!(
-            configured
-                .get(std::ffi::OsStr::new("HTTPS_PROXY"))
-                .copied()
-                .flatten(),
-            Some(std::ffi::OsStr::new(DEV_INSTANCE_DENY_PROXY_URL))
-        );
-        assert_eq!(
-            configured
-                .get(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV))
-                .copied()
-                .flatten(),
-            Some(store.path().as_os_str()),
-            "voice-only mode must not expose credential files from the parent home"
-        );
-        assert_eq!(
-            voice_environment_attestation(&voice),
-            DevInstanceVoiceEnvironmentAttestation {
-                provider: DevInstanceVoiceProvider::Mock,
-                mock_backend: true,
-                media: "str0m",
-                provider_credentials_stripped: true,
-            }
-        );
     }
 
     #[test]
@@ -1758,7 +1594,7 @@ mod tests {
         )
         .expect("prepare Hermes environment");
         let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store.path(), Some(&prepared), None)
+        configure_dev_instance_environment(&mut command, store.path(), Some(&prepared))
             .expect("configure Hermes environment");
         let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
 
@@ -1847,18 +1683,6 @@ mod tests {
             start.input_schema["required"],
             json!(["project_dir"]),
             "Hermes containment must remain opt in"
-        );
-        assert_eq!(
-            start.input_schema["properties"]["voice"]["additionalProperties"],
-            json!(false)
-        );
-        assert_eq!(
-            start.input_schema["properties"]["voice"]["properties"]["provider"]["enum"],
-            json!(["mock"])
-        );
-        assert_eq!(
-            start.input_schema["properties"]["voice"]["required"],
-            json!(["provider"])
         );
     }
 

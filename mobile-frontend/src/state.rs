@@ -898,9 +898,6 @@ pub struct AppState {
     // Agents & Chat
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub active_agent: RwSignal<Option<ActiveAgentRef>>,
-    /// Page-lifetime voice controller. Browser media handles remain inside its
-    /// opaque runtime; only its small reactive model is exposed to views.
-    pub voice: crate::voice::VoiceController,
     /// Agents whose `AgentBootstrap` has been requested or received on this
     /// frontend connection. Mobile asks for bootstraps lazily when a chat is
     /// opened instead of replaying every transcript on startup.
@@ -1065,7 +1062,6 @@ impl AppState {
 
             agents: RwSignal::new(Vec::new()),
             active_agent: RwSignal::new(None),
-            voice: crate::voice::VoiceController::new(),
             agent_load_requests: RwSignal::new(HashSet::new()),
             agent_loaded: RwSignal::new(HashSet::new()),
             agent_load_errors: RwSignal::new(HashMap::new()),

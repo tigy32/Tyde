@@ -22,33 +22,29 @@ use crate::{
     FetchSessionHistoryPayload, FrameKind, HeartbeatPayload, HostBootstrapPayload,
     HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload,
-    MAX_VOICE_ICE_CANDIDATE_BYTES, MAX_VOICE_ICE_CANDIDATES, MAX_VOICE_SDP_BYTES,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
-    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionHistoryPayload,
-    SessionListPayload, SessionSchemasPayload, SessionSummaryCountUpdatedPayload,
-    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingOfferPayload, MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
+    RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, VoiceAnswerPayload,
-    VoiceErrorPayload, VoiceIceCandidatePayload, VoiceIceCandidatesCompletePayload,
-    VoiceOfferPayload, VoiceReadyPayload, VoiceSessionId, VoiceSessionState, VoiceStartPayload,
-    VoiceStatePayload, VoiceStopPayload, WelcomePayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
     WorkflowRunNotifyPayload,
 };
 
@@ -64,7 +60,6 @@ pub struct ProtocolValidator {
     review_streams: HashMap<StreamPath, BootstrapStreamState>,
     browse_streams: HashMap<StreamPath, BootstrapStreamState>,
     terminal_streams: HashMap<StreamPath, BootstrapStreamState>,
-    voice_streams: HashMap<StreamPath, VoiceStreamState>,
 }
 
 impl Default for ProtocolValidator {
@@ -84,7 +79,6 @@ impl ProtocolValidator {
             review_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
-            voice_streams: HashMap::new(),
         }
     }
 
@@ -98,7 +92,6 @@ impl ProtocolValidator {
             review_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
-            voice_streams: HashMap::new(),
         }
     }
 
@@ -127,10 +120,6 @@ impl ProtocolValidator {
 
         if envelope.stream.0.starts_with("/terminal/") {
             return self.validate_terminal_envelope(envelope);
-        }
-
-        if envelope.stream.0.starts_with("/voice/") {
-            return self.validate_voice_envelope(envelope);
         }
 
         Ok(())
@@ -1198,256 +1187,6 @@ impl ProtocolValidator {
         }
     }
 
-    fn validate_voice_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
-        let path_id = voice_session_id_from_path(&envelope.stream).ok_or_else(|| {
-            self.violation(
-                envelope,
-                None,
-                format!("invalid voice stream path {}", envelope.stream),
-            )
-        })?;
-        let mut state = self.voice_streams.get(&envelope.stream).cloned();
-        if state.as_ref().is_some_and(|state| state.terminal) {
-            return Err(self.violation(
-                envelope,
-                None,
-                format!(
-                    "received frame after terminal voice state on {}",
-                    envelope.stream
-                ),
-            ));
-        }
-        if state.is_none() && envelope.seq != 0 {
-            return Err(self.violation(
-                envelope,
-                None,
-                format!("first voice frame must be seq 0 on {}", envelope.stream),
-            ));
-        }
-
-        let (session_id, target, terminal, candidate_count) = match envelope.kind {
-            FrameKind::VoiceStart => {
-                if state.as_ref().is_some_and(|state| state.saw_start) {
-                    return Err(self.violation(envelope, None, "duplicate VoiceStart".to_owned()));
-                }
-                let payload: VoiceStartPayload = parse_voice_payload(self, envelope, "VoiceStart")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                if payload.target.instance_stream.0.trim().is_empty()
-                    || !payload.target.instance_stream.0.starts_with("/agent/")
-                {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        "VoiceStart target must contain an agent instance stream".to_owned(),
-                    ));
-                }
-                if !payload.capabilities.audio_track
-                    || payload.capabilities.codecs.is_empty()
-                    || payload.capabilities.codecs.len() > 8
-                {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        "VoiceStart requires a bounded audio-track codec list".to_owned(),
-                    ));
-                }
-                (payload.session_id, Some(payload.target), false, 0)
-            }
-            FrameKind::VoiceReady => {
-                if state.as_ref().is_some_and(|state| state.saw_ready) {
-                    return Err(self.violation(envelope, None, "duplicate VoiceReady".to_owned()));
-                }
-                let payload: VoiceReadyPayload = parse_voice_payload(self, envelope, "VoiceReady")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                if payload.expires_after_seconds == 0
-                    || payload.expires_after_seconds > crate::VOICE_SESSION_MAX_SECONDS
-                    || !payload.target.instance_stream.0.starts_with("/agent/")
-                {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        "VoiceReady target or expiry is invalid".to_owned(),
-                    ));
-                }
-                (payload.session_id, Some(payload.target), false, 0)
-            }
-            FrameKind::VoiceOffer => {
-                let payload: VoiceOfferPayload = parse_voice_payload(self, envelope, "VoiceOffer")?;
-                validate_voice_sdp(
-                    self,
-                    envelope,
-                    &payload.session_id,
-                    &payload.sdp,
-                    &path_id,
-                    state.as_ref(),
-                )?;
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    false,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            FrameKind::VoiceAnswer => {
-                let payload: VoiceAnswerPayload =
-                    parse_voice_payload(self, envelope, "VoiceAnswer")?;
-                validate_voice_sdp(
-                    self,
-                    envelope,
-                    &payload.session_id,
-                    &payload.sdp,
-                    &path_id,
-                    state.as_ref(),
-                )?;
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    false,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            FrameKind::VoiceIceCandidate => {
-                let payload: VoiceIceCandidatePayload =
-                    parse_voice_payload(self, envelope, "VoiceIceCandidate")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                require_voice_started(self, envelope, state.as_ref(), &payload.session_id)?;
-                let previous = state.as_ref().map_or(0, |state| state.candidate_count);
-                let next = previous.saturating_add(payload.candidates.len());
-                if payload.candidates.is_empty() || next > MAX_VOICE_ICE_CANDIDATES {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        format!("voice ICE candidate count exceeds {MAX_VOICE_ICE_CANDIDATES}"),
-                    ));
-                }
-                for candidate in &payload.candidates {
-                    if !candidate.candidate.starts_with("candidate:")
-                        || candidate.candidate.len() > MAX_VOICE_ICE_CANDIDATE_BYTES
-                        || candidate.candidate.contains('\r')
-                        || candidate.candidate.contains('\n')
-                        || candidate
-                            .sdp_mid
-                            .as_ref()
-                            .is_some_and(|mid| mid.len() > 128)
-                    {
-                        return Err(self.violation(
-                            envelope,
-                            None,
-                            "voice ICE candidate is malformed or oversized".to_owned(),
-                        ));
-                    }
-                }
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    false,
-                    next,
-                )
-            }
-            FrameKind::VoiceIceCandidatesComplete => {
-                let payload: VoiceIceCandidatesCompletePayload =
-                    parse_voice_payload(self, envelope, "VoiceIceCandidatesComplete")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                require_voice_started(self, envelope, state.as_ref(), &payload.session_id)?;
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    false,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            FrameKind::VoiceStop => {
-                let payload: VoiceStopPayload = parse_voice_payload(self, envelope, "VoiceStop")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                require_voice_started(self, envelope, state.as_ref(), &payload.session_id)?;
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    true,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            FrameKind::VoiceState => {
-                let payload: VoiceStatePayload = parse_voice_payload(self, envelope, "VoiceState")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                require_voice_started(self, envelope, state.as_ref(), &payload.session_id)?;
-                let terminal = payload.state == VoiceSessionState::Ended;
-                if terminal != payload.ended_reason.is_some() {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        "VoiceState ended_reason must appear exactly for Ended".to_owned(),
-                    ));
-                }
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    terminal,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            FrameKind::VoiceError => {
-                let payload: VoiceErrorPayload = parse_voice_payload(self, envelope, "VoiceError")?;
-                validate_voice_session_id(self, envelope, &path_id, &payload.session_id)?;
-                if payload.message.is_empty() || payload.message.len() > 1024 {
-                    return Err(self.violation(
-                        envelope,
-                        None,
-                        "VoiceError message is empty or oversized".to_owned(),
-                    ));
-                }
-                if let Some(state) = state.as_ref() {
-                    require_voice_started(self, envelope, Some(state), &payload.session_id)?;
-                }
-                (
-                    payload.session_id,
-                    state.as_ref().and_then(|state| state.target.clone()),
-                    payload.fatal,
-                    state.as_ref().map_or(0, |state| state.candidate_count),
-                )
-            }
-            other => {
-                return Err(self.violation(
-                    envelope,
-                    None,
-                    format!(
-                        "unexpected frame kind {other} on voice stream {}",
-                        envelope.stream
-                    ),
-                ));
-            }
-        };
-        if let Some(existing) = state.as_ref() {
-            if existing.session_id != session_id {
-                return Err(self.violation(
-                    envelope,
-                    None,
-                    "voice session identity changed".to_owned(),
-                ));
-            }
-            if existing.target.is_some() && target != existing.target {
-                return Err(self.violation(
-                    envelope,
-                    None,
-                    "voice target identity changed".to_owned(),
-                ));
-            }
-        }
-        state = Some(VoiceStreamState {
-            session_id,
-            target,
-            candidate_count,
-            terminal,
-            saw_start: state.as_ref().is_some_and(|state| state.saw_start)
-                || envelope.kind == FrameKind::VoiceStart,
-            saw_ready: state.as_ref().is_some_and(|state| state.saw_ready)
-                || envelope.kind == FrameKind::VoiceReady,
-        });
-        self.voice_streams
-            .insert(envelope.stream.clone(), state.expect("voice state set"));
-        Ok(())
-    }
-
     fn record(&mut self, envelope: &Envelope) {
         let observed = ObservedFrame {
             stream: envelope.stream.clone(),
@@ -2235,16 +1974,6 @@ struct BootstrapStreamState {
 }
 
 #[derive(Debug, Clone)]
-struct VoiceStreamState {
-    session_id: VoiceSessionId,
-    target: Option<crate::VoiceTarget>,
-    candidate_count: usize,
-    terminal: bool,
-    saw_start: bool,
-    saw_ready: bool,
-}
-
-#[derive(Debug, Clone)]
 struct AgentStreamState {
     agent_id: crate::AgentId,
     backend_kind: BackendKind,
@@ -2269,93 +1998,6 @@ struct ActiveStreamState {
 enum KnownMessageKind {
     Assistant,
     Other,
-}
-
-fn voice_session_id_from_path(stream: &StreamPath) -> Option<VoiceSessionId> {
-    let value = stream.0.strip_prefix("/voice/")?;
-    if value.is_empty() || value.contains('/') || value.len() > 128 {
-        return None;
-    }
-    Some(VoiceSessionId(value.to_owned()))
-}
-
-fn parse_voice_payload<T: serde::de::DeserializeOwned>(
-    validator: &ProtocolValidator,
-    envelope: &Envelope,
-    name: &str,
-) -> Result<T, ProtocolViolation> {
-    envelope.parse_payload().map_err(|error| {
-        validator.violation(
-            envelope,
-            None,
-            format!("failed to parse {name} payload: {error}"),
-        )
-    })
-}
-
-fn validate_voice_session_id(
-    validator: &ProtocolValidator,
-    envelope: &Envelope,
-    path_id: &VoiceSessionId,
-    payload_id: &VoiceSessionId,
-) -> Result<(), ProtocolViolation> {
-    if path_id != payload_id {
-        return Err(validator.violation(
-            envelope,
-            None,
-            "voice payload session_id does not match stream path".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn require_voice_started(
-    validator: &ProtocolValidator,
-    envelope: &Envelope,
-    state: Option<&VoiceStreamState>,
-    session_id: &VoiceSessionId,
-) -> Result<(), ProtocolViolation> {
-    let Some(state) = state else {
-        return Err(validator.violation(
-            envelope,
-            None,
-            "voice signaling arrived before VoiceStart or VoiceReady".to_owned(),
-        ));
-    };
-    if &state.session_id != session_id {
-        return Err(validator.violation(
-            envelope,
-            None,
-            "voice session identity changed".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_voice_sdp(
-    validator: &ProtocolValidator,
-    envelope: &Envelope,
-    session_id: &VoiceSessionId,
-    sdp: &str,
-    path_id: &VoiceSessionId,
-    state: Option<&VoiceStreamState>,
-) -> Result<(), ProtocolViolation> {
-    validate_voice_session_id(validator, envelope, path_id, session_id)?;
-    require_voice_started(validator, envelope, state, session_id)?;
-    if sdp.is_empty()
-        || sdp.len() > MAX_VOICE_SDP_BYTES
-        || !sdp.contains("m=audio")
-        || sdp.contains("m=application")
-        || sdp.contains("m=video")
-        || sdp.contains('\0')
-    {
-        return Err(validator.violation(
-            envelope,
-            None,
-            format!("voice SDP is empty or exceeds {MAX_VOICE_SDP_BYTES} bytes"),
-        ));
-    }
-    Ok(())
 }
 
 fn summarize_envelope(envelope: &Envelope) -> String {
@@ -2525,7 +2167,6 @@ mod tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: crate::MobileBrokerStatus::Disabled,
@@ -3013,7 +2654,6 @@ mod tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
                 },
             },
         )
@@ -4225,174 +3865,5 @@ mod tests {
                 violation.message
             );
         }
-    }
-
-    fn voice_start(session: &str) -> Envelope {
-        Envelope::from_payload(
-            StreamPath(format!("/voice/{session}")),
-            FrameKind::VoiceStart,
-            0,
-            &crate::VoiceStartPayload {
-                session_id: crate::VoiceSessionId(session.to_owned()),
-                target: crate::VoiceTarget {
-                    agent_id: crate::AgentId("agent-1".to_owned()),
-                    instance_stream: StreamPath("/agent/instance-1".to_owned()),
-                },
-                capabilities: crate::VoiceClientCapabilities {
-                    audio_track: true,
-                    codecs: vec![crate::VoiceAudioCodec::Opus],
-                    echo_cancellation_requested: true,
-                },
-            },
-        )
-        .expect("serialize VoiceStart")
-    }
-
-    #[test]
-    fn voice_stream_enforces_bounds_identity_and_terminal_state() {
-        let mut validator = ProtocolValidator::new();
-        validator
-            .validate_envelope(&voice_start("session-1"))
-            .expect("valid voice start");
-        let oversized = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceOffer,
-            1,
-            &crate::VoiceOfferPayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-                sdp: "x".repeat(crate::MAX_VOICE_SDP_BYTES + 1),
-            },
-        )
-        .expect("serialize oversized offer");
-        assert!(validator.validate_envelope(&oversized).is_err());
-
-        let mut validator = ProtocolValidator::new();
-        validator
-            .validate_envelope(&voice_start("session-1"))
-            .expect("valid voice start");
-        let stop = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceStop,
-            1,
-            &crate::VoiceStopPayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-                reason: crate::VoiceStopReason::FocusChanged,
-            },
-        )
-        .expect("serialize stop");
-        validator.validate_envelope(&stop).expect("valid stop");
-        let late = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceIceCandidatesComplete,
-            2,
-            &crate::VoiceIceCandidatesCompletePayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-            },
-        )
-        .expect("serialize late candidate completion");
-        assert!(validator.validate_envelope(&late).is_err());
-    }
-
-    #[test]
-    fn voice_stream_accepts_bidirectional_start_ready_offer_answer() {
-        let mut validator = ProtocolValidator::new();
-        validator
-            .validate_envelope(&voice_start("session-1"))
-            .expect("VoiceStart");
-        let ready = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceReady,
-            0,
-            &crate::VoiceReadyPayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-                target: crate::VoiceTarget {
-                    agent_id: crate::AgentId("agent-1".to_owned()),
-                    instance_stream: StreamPath("/agent/instance-1".to_owned()),
-                },
-                direct_connections_only: true,
-                expires_after_seconds: crate::VOICE_SESSION_MAX_SECONDS,
-            },
-        )
-        .expect("serialize VoiceReady");
-        validator.validate_envelope(&ready).expect("VoiceReady");
-        for (kind, seq, sdp) in [
-            (
-                FrameKind::VoiceOffer,
-                1,
-                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n",
-            ),
-            (
-                FrameKind::VoiceAnswer,
-                1,
-                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n",
-            ),
-        ] {
-            let envelope = if kind == FrameKind::VoiceOffer {
-                Envelope::from_payload(
-                    StreamPath("/voice/session-1".to_owned()),
-                    kind,
-                    seq,
-                    &crate::VoiceOfferPayload {
-                        session_id: crate::VoiceSessionId("session-1".to_owned()),
-                        sdp: sdp.to_owned(),
-                    },
-                )
-            } else {
-                Envelope::from_payload(
-                    StreamPath("/voice/session-1".to_owned()),
-                    kind,
-                    seq,
-                    &crate::VoiceAnswerPayload {
-                        session_id: crate::VoiceSessionId("session-1".to_owned()),
-                        sdp: sdp.to_owned(),
-                    },
-                )
-            }
-            .expect("serialize voice SDP");
-            validator.validate_envelope(&envelope).expect("voice SDP");
-        }
-        let candidate = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceIceCandidate,
-            2,
-            &crate::VoiceIceCandidatePayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-                candidates: vec![crate::VoiceIceCandidate {
-                    candidate: "candidate:1 1 UDP 1 192.0.2.1 5000 typ host".to_owned(),
-                    sdp_mid: Some("0".to_owned()),
-                    sdp_m_line_index: Some(0),
-                }],
-            },
-        )
-        .expect("serialize ICE candidate");
-        validator
-            .validate_envelope(&candidate)
-            .expect("VoiceIceCandidate");
-        let state = Envelope::from_payload(
-            StreamPath("/voice/session-1".to_owned()),
-            FrameKind::VoiceState,
-            2,
-            &crate::VoiceStatePayload {
-                session_id: crate::VoiceSessionId("session-1".to_owned()),
-                state: crate::VoiceSessionState::Listening,
-                progress: None,
-                caption: None,
-                transcript: None,
-                ended_reason: None,
-            },
-        )
-        .expect("serialize VoiceState");
-        validator.validate_envelope(&state).expect("VoiceState");
-    }
-
-    #[test]
-    fn voice_signal_debug_output_redacts_session_descriptions() {
-        let offer = crate::VoiceOfferPayload {
-            session_id: crate::VoiceSessionId("session-1".to_owned()),
-            sdp: "secret-sdp".to_owned(),
-        };
-        let rendered = format!("{offer:?}");
-        assert!(rendered.contains("[REDACTED]"));
-        assert!(!rendered.contains("secret-sdp"));
     }
 }

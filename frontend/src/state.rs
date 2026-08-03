@@ -5041,22 +5041,6 @@ impl AppState {
             .unwrap_or(ConnectionStatus::Disconnected)
     }
 
-    /// The same read, without subscribing.
-    ///
-    /// For callers that either have no reactive context (a click handler, a
-    /// guard invoked directly) or already track `connection_statuses`
-    /// themselves. Reading the tracked form from those places produces a
-    /// Leptos "accessed outside a reactive tracking context" diagnostic on
-    /// every call, which is noise that hides real ones.
-    pub fn connection_status_for_host_untracked(&self, host_id: &str) -> ConnectionStatus {
-        self.connection_statuses.with_untracked(|statuses| {
-            statuses
-                .get(host_id)
-                .cloned()
-                .unwrap_or(ConnectionStatus::Disconnected)
-        })
-    }
-
     pub fn host_settings(&self, host_id: &str) -> Option<HostSettings> {
         self.host_settings_by_host.get().get(host_id).cloned()
     }
@@ -8818,7 +8802,6 @@ mod tests {
                 settings.insert(
                     "host-a".to_owned(),
                     HostSettings {
-                        voice: Default::default(),
                         enabled_backends: vec![BackendKind::Claude],
                         default_backend: Some(BackendKind::Claude),
                         enable_mobile_connections: false,
@@ -8838,7 +8821,6 @@ mod tests {
                 settings.insert(
                     "host-b".to_owned(),
                     HostSettings {
-                        voice: Default::default(),
                         enabled_backends: vec![BackendKind::Antigravity],
                         default_backend: Some(BackendKind::Antigravity),
                         enable_mobile_connections: false,

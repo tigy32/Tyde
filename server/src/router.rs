@@ -11,7 +11,6 @@ use protocol::{
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
     FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
-    MAX_VOICE_ICE_CANDIDATE_BYTES, MAX_VOICE_ICE_CANDIDATES, MAX_VOICE_SDP_BYTES,
     McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
     ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
@@ -31,9 +30,7 @@ use protocol::{
     TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
     TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
     TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
-    TriggerWorkflowPayload, VoiceIceCandidatePayload, VoiceIceCandidatesCompletePayload,
-    VoiceOfferPayload, VoiceSessionId, VoiceStartPayload, VoiceStopPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkflowRefreshPayload,
+    TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -650,108 +647,6 @@ pub(crate) async fn route_client_envelope(
                     format!(
                         "unexpected client frame kind {} on terminal stream {}",
                         other, envelope.stream
-                    ),
-                ));
-            }
-        }
-        return Ok(());
-    }
-
-    if envelope.stream.0.starts_with("/voice/") {
-        let stream_path = envelope.stream.clone();
-        let session_id = parse_voice_session_id(&stream_path)?;
-        let voice_output_stream = host_output_stream.with_path(stream_path);
-        match envelope.kind {
-            FrameKind::VoiceStart => {
-                let payload: VoiceStartPayload = parse_payload(&envelope, "voice_start")?;
-                ensure_voice_session_matches(&session_id, &payload.session_id, "voice_start")?;
-                if payload.target.agent_id.0.trim().is_empty()
-                    || !payload.target.instance_stream.0.starts_with("/agent/")
-                    || payload.capabilities.codecs.is_empty()
-                    || payload.capabilities.codecs.len() > 8
-                    || !payload.capabilities.audio_track
-                {
-                    return Err(AppError::invalid(
-                        "voice_start",
-                        "invalid voice target or capabilities",
-                    ));
-                }
-                host.start_voice_session(connection_host_stream, voice_output_stream, payload)
-                    .await?;
-            }
-            FrameKind::VoiceOffer => {
-                let payload: VoiceOfferPayload = parse_payload(&envelope, "voice_offer")?;
-                ensure_voice_session_matches(&session_id, &payload.session_id, "voice_offer")?;
-                if payload.sdp.is_empty()
-                    || payload.sdp.len() > MAX_VOICE_SDP_BYTES
-                    || !payload.sdp.contains("m=audio")
-                    || payload.sdp.contains("m=application")
-                    || payload.sdp.contains('\0')
-                {
-                    return Err(AppError::invalid(
-                        "voice_offer",
-                        "voice SDP is empty or oversized",
-                    ));
-                }
-                host.send_voice_offer(connection_host_stream, &session_id, payload.sdp)
-                    .await?;
-            }
-            FrameKind::VoiceIceCandidate => {
-                let payload: VoiceIceCandidatePayload =
-                    parse_payload(&envelope, "voice_ice_candidate")?;
-                ensure_voice_session_matches(
-                    &session_id,
-                    &payload.session_id,
-                    "voice_ice_candidate",
-                )?;
-                if payload.candidates.is_empty()
-                    || payload.candidates.len() > MAX_VOICE_ICE_CANDIDATES
-                    || payload.candidates.iter().any(|candidate| {
-                        !candidate.candidate.starts_with("candidate:")
-                            || candidate.candidate.len() > MAX_VOICE_ICE_CANDIDATE_BYTES
-                            || candidate.candidate.contains('\r')
-                            || candidate.candidate.contains('\n')
-                            || candidate
-                                .sdp_mid
-                                .as_ref()
-                                .is_some_and(|mid| mid.len() > 128)
-                    })
-                {
-                    return Err(AppError::invalid(
-                        "voice_ice_candidate",
-                        "voice ICE candidate batch is malformed or oversized",
-                    ));
-                }
-                host.send_voice_ice_candidates(
-                    connection_host_stream,
-                    &session_id,
-                    payload.candidates,
-                )
-                .await?;
-            }
-            FrameKind::VoiceIceCandidatesComplete => {
-                let payload: VoiceIceCandidatesCompletePayload =
-                    parse_payload(&envelope, "voice_ice_candidates_complete")?;
-                ensure_voice_session_matches(
-                    &session_id,
-                    &payload.session_id,
-                    "voice_ice_candidates_complete",
-                )?;
-                host.finish_voice_ice(connection_host_stream, &session_id)
-                    .await?;
-            }
-            FrameKind::VoiceStop => {
-                let payload: VoiceStopPayload = parse_payload(&envelope, "voice_stop")?;
-                ensure_voice_session_matches(&session_id, &payload.session_id, "voice_stop")?;
-                host.stop_voice_session(connection_host_stream, &session_id, payload.reason)
-                    .await?;
-            }
-            other => {
-                return Err(AppError::protocol(
-                    "route_client_envelope",
-                    format!(
-                        "unexpected client frame kind {other} on voice stream {}",
-                        envelope.stream
                     ),
                 ));
             }
@@ -1406,40 +1301,6 @@ fn parse_agent_id(stream: &StreamPath) -> AppResult<AgentId> {
     })?;
 
     Ok(AgentId(segments[2].to_owned()))
-}
-
-fn parse_voice_session_id(stream: &StreamPath) -> AppResult<VoiceSessionId> {
-    let segments: Vec<&str> = stream.0.split('/').collect();
-    if segments.len() != 3 || segments.first() != Some(&"") || segments[1] != "voice" {
-        return Err(AppError::protocol(
-            "parse_voice_stream",
-            format!("voice stream must have format /voice/<session_id>, got {stream}"),
-        ));
-    }
-    if segments[2].is_empty()
-        || segments[2].len() > 128
-        || segments[2].chars().any(|character| character.is_control())
-    {
-        return Err(AppError::protocol(
-            "parse_voice_stream",
-            format!("voice stream contains an invalid session id in {stream}"),
-        ));
-    }
-    Ok(VoiceSessionId(segments[2].to_owned()))
-}
-
-fn ensure_voice_session_matches(
-    stream_id: &VoiceSessionId,
-    payload_id: &VoiceSessionId,
-    operation: &'static str,
-) -> AppResult<()> {
-    if stream_id != payload_id {
-        return Err(AppError::invalid(
-            operation,
-            "voice payload session_id does not match its stream",
-        ));
-    }
-    Ok(())
 }
 
 fn parse_project_id(stream: &StreamPath) -> AppResult<ProjectId> {

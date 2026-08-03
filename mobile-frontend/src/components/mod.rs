@@ -20,7 +20,6 @@ pub mod settings_view;
 mod teams_view;
 mod tool_card;
 pub mod ui;
-mod voice_bar;
 
 pub use agents_view::AgentsView;
 pub use bottom_nav::BottomNav;
@@ -40,4 +39,3 @@ pub use pending_submissions::PendingSubmissions;
 pub use projects_view::ProjectsView;
 pub use sessions_view::SessionsView;
 pub use settings_view::SettingsView;
-pub use voice_bar::VoiceBar;

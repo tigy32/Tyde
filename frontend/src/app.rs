@@ -198,7 +198,6 @@ pub(crate) fn clear_app_listeners() {
 }
 
 pub(crate) fn cleanup_app_lifecycle() {
-    crate::voice::end_for_lifecycle(false);
     clear_app_listeners();
 }
 
@@ -434,11 +433,6 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
     let page_hide_state = state.clone();
     let page_hide_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
         page_hide_state.flush_composer_drafts();
-        // The page is going away and the media stack with it. End voice here
-        // so the microphone is released and the host is told, instead of
-        // leaving a session the server has to time out. The agent keeps
-        // running; only voice stops.
-        crate::voice::end_for_lifecycle(false);
         report_lifecycle("page_hide");
     });
     let _ = window
@@ -458,11 +452,6 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
         if document_for_callback.hidden() {
             visibility_state.flush_composer_drafts();
             visibility_state.cmd_held.set(false);
-            // Hidden means the webview is no longer presenting: end voice
-            // rather than keep an unattended microphone open. Window blur is
-            // deliberately *not* treated this way — hands-free voice while
-            // working in another window is the point of the feature.
-            crate::voice::end_for_lifecycle(true);
             report_lifecycle("hidden");
         } else {
             report_lifecycle("visible");
@@ -1038,6 +1027,14 @@ mod tests {
     }
 
     #[cfg(target_arch = "wasm32")]
+    fn rendered_user_error(container: &web_sys::HtmlElement) -> Option<String> {
+        container
+            .query_selector(".user-error-banner-message")
+            .expect("query user error message")
+            .and_then(|message| message.text_content())
+    }
+
+    #[cfg(target_arch = "wasm32")]
     struct UserErrorStateGuard {
         previous: Option<String>,
         container: web_sys::HtmlElement,
@@ -1048,7 +1045,7 @@ mod tests {
     impl UserErrorStateGuard {
         fn capture(container: web_sys::HtmlElement) -> Self {
             Self {
-                previous: crate::components::header::current_user_error(),
+                previous: rendered_user_error(&container),
                 container,
                 restored: false,
             }
@@ -1168,8 +1165,8 @@ mod tests {
             completed.get(),
             "connection attempt must finish after rejection"
         );
-        let banner = crate::components::header::current_user_error()
-            .expect("preparation failure must be user-visible");
+        let banner =
+            rendered_user_error(&container).expect("preparation failure must be user-visible");
         assert!(
             banner.contains("host “Offline QA”")
                 && banner.contains("release metadata unavailable")
@@ -1200,10 +1197,8 @@ mod tests {
             "reported user error must be dismissible before cleanup"
         );
         user_error_state.restore();
-        assert_eq!(
-            crate::components::header::current_user_error(),
-            user_error_state.previous
-        );
+        next_tick().await;
+        assert_eq!(rendered_user_error(&container), user_error_state.previous);
     }
 }
 
@@ -1217,20 +1212,6 @@ pub fn App() -> impl IntoView {
     // therefore has an executor, rather than inside the constructor.
     #[cfg(target_arch = "wasm32")]
     state.install_browser_effects();
-    // Voice: install the browser media backend and the target guard. The guard
-    // is what makes "changing the focused agent ends voice" a single rule
-    // rather than a teardown call in every dispatcher branch.
-    //
-    // Ungated. `install_browser_effects` above is gated because it reads
-    // browser storage at install time; these two only construct values, the
-    // same way the rest of this function installs web-sys listeners. Gating
-    // them made the entire media stack unreachable in a host build, which is
-    // an analysis artefact rather than a property of the code.
-    crate::voice::set_platform_factory(std::rc::Rc::new(|| {
-        std::rc::Rc::new(crate::voice::media_web::WebMediaPlatform::new())
-            as std::rc::Rc<dyn crate::voice::media::MediaPlatform>
-    }));
-    crate::voice::install_guard(&state);
     provide_context(state.clone());
     // One measurement of the center workspace, shared by the center zone (which
     // measures it), the command palette, and the global shortcuts (which gate

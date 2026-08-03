@@ -24,9 +24,6 @@ pub(crate) mod stream;
 pub(crate) mod sub_agent;
 pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
-pub(crate) mod voice;
-pub(crate) mod voice_aws;
-pub(crate) mod voice_webrtc;
 pub(crate) mod workflows;
 
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
@@ -37,7 +34,7 @@ pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use agent_control_mcp::AgentControlMcpCaller;
 pub use connection::{run_connection, run_mobile_connection};
 pub use host::{
-    HostHandle, HostRuntimeConfig, VoiceRuntimeMode, spawn_host, spawn_host_with_mock_backend,
+    HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,
     spawn_host_with_mock_backend_and_runtime_config, spawn_host_with_session_store,
     spawn_host_with_store_paths, spawn_host_with_store_paths_and_runtime_config,
 };

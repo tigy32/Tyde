@@ -42,7 +42,6 @@ pub fn App() -> impl IntoView {
     provide_context(state.clone());
 
     install_event_listeners(state.clone());
-    install_voice_focus_guard(state.clone());
     install_page_visibility_recovery(state.clone());
     spawn_initial_paired_hosts_load(state.clone());
     install_app_mode_effect(state.clone());
@@ -133,7 +132,6 @@ fn install_page_visibility_recovery(state: AppState) {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         if hidden {
-            end_voice_for_background(&state_for_callback);
             PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.set(Some(unix_time_ms())));
             return;
         }
@@ -159,59 +157,10 @@ fn install_page_visibility_recovery(state: AppState) {
         return;
     }
     callback.forget();
-
-    let state_for_pagehide = state.clone();
-    let pagehide = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-        end_voice_for_background(&state_for_pagehide);
-    });
-    if let Some(window) = web_sys::window()
-        && window
-            .add_event_listener_with_callback("pagehide", pagehide.as_ref().unchecked_ref())
-            .is_ok()
-    {
-        pagehide.forget();
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn install_page_visibility_recovery(_state: AppState) {}
-
-#[cfg(target_arch = "wasm32")]
-fn end_voice_for_background(state: &AppState) {
-    state.voice.end("backgrounded");
-}
-
-fn install_voice_focus_guard(state: AppState) {
-    Effect::new(move |_| {
-        let focused_host = state.active_local_host_id.get();
-        let active = state.active_agent.get();
-        let agents = state.agents.get();
-        let connection_statuses = state.connection_statuses.get();
-        let target = active
-            .filter(|active| {
-                focused_host.as_ref() == Some(&active.local_host_id)
-                    && matches!(
-                        connection_statuses.get(&active.local_host_id),
-                        Some(ConnectionStatus::Connected)
-                    )
-            })
-            .and_then(|active| {
-                agents
-                    .iter()
-                    .find(|agent| {
-                        agent.local_host_id == active.local_host_id
-                            && agent.agent_id == active.agent_id
-                    })
-                    .map(|agent| crate::voice::VoiceTarget {
-                        local_host_id: agent.local_host_id.clone(),
-                        agent_id: agent.agent_id.clone(),
-                        instance_stream: agent.instance_stream.clone(),
-                        agent_name: agent.name.clone(),
-                    })
-            });
-        state.voice.terminate_if_target_changed(target);
-    });
-}
 
 #[cfg(target_arch = "wasm32")]
 async fn recover_after_foreground(state: &AppState, background_ms: u64) {
@@ -347,7 +296,6 @@ fn ActiveHostShell() -> impl IntoView {
         // under, and the client will not guess one. Above the content (and so
         // above the composer) it stays reachable with the keyboard open.
         <components::PendingSubmissions />
-        <components::VoiceBar />
         <div class="mobile-content">
             {move || {
                 let viewing_chat = state.viewing_chat.get();
@@ -1232,16 +1180,9 @@ mod native_tests {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
 
     use super::*;
     use crate::state::PairedHostSummary;
-    use crate::voice::{
-        AudioProcessingReport, IceCandidate, MediaCallbacks, PreparedMedia, VoiceController,
-        VoiceFuture, VoiceMediaFactory, VoiceMediaSession, VoiceModel, VoicePhase, VoiceSession,
-        VoiceSignaling, VoiceTarget,
-    };
     use leptos::mount::mount_to;
     use mobile_shell_types::{
         BrokerAuthSummary as BrokerAuth, BrokerEndpointSummary as BrokerEndpoint,
@@ -1271,160 +1212,6 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    struct ScopedPagehideVoiceGuard {
-        target: web_sys::EventTarget,
-        callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
-    }
-
-    impl ScopedPagehideVoiceGuard {
-        fn install(target: web_sys::EventTarget, state: AppState) -> Self {
-            let callback =
-                wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                    end_voice_for_background(&state)
-                });
-            target
-                .add_event_listener_with_callback("pagehide", callback.as_ref().unchecked_ref())
-                .unwrap();
-            Self { target, callback }
-        }
-    }
-
-    impl Drop for ScopedPagehideVoiceGuard {
-        fn drop(&mut self) {
-            self.target
-                .remove_event_listener_with_callback(
-                    "pagehide",
-                    self.callback.as_ref().unchecked_ref(),
-                )
-                .unwrap();
-        }
-    }
-
-    struct LifecycleMediaSession {
-        close_count: Rc<Cell<usize>>,
-    }
-
-    impl VoiceMediaSession for LifecycleMediaSession {
-        fn apply_answer(&self, _sdp: String) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn add_remote_candidate(
-            &self,
-            _candidate: IceCandidate,
-        ) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn finish_remote_candidates(&self) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn set_muted(&self, _muted: bool) {}
-
-        fn interrupt_playback(&self) {}
-
-        fn resume_playback(&self) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn close_now(&self) {
-            self.close_count.set(self.close_count.get() + 1);
-        }
-    }
-
-    struct LifecycleMediaFactory {
-        close_count: Rc<Cell<usize>>,
-    }
-
-    impl VoiceMediaFactory for LifecycleMediaFactory {
-        fn prepare(
-            &self,
-            _callbacks: MediaCallbacks,
-        ) -> VoiceFuture<Result<PreparedMedia, String>> {
-            let close_count = self.close_count.clone();
-            Box::pin(async move {
-                Ok(PreparedMedia {
-                    offer_sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111".to_owned(),
-                    processing: AudioProcessingReport::default(),
-                    session: Rc::new(LifecycleMediaSession { close_count }),
-                })
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct LifecycleSignaling;
-
-    impl VoiceSignaling for LifecycleSignaling {
-        fn start(
-            &self,
-            _target: VoiceTarget,
-            _session: VoiceSession,
-            _offer_sdp: String,
-        ) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn ice(
-            &self,
-            _target: VoiceTarget,
-            _session: VoiceSession,
-            _candidates: Vec<IceCandidate>,
-            _complete: bool,
-        ) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn stop(
-            &self,
-            _target: VoiceTarget,
-            _session: VoiceSession,
-            _reason: &'static str,
-        ) -> VoiceFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    fn lifecycle_controller() -> (VoiceController, Rc<Cell<usize>>) {
-        let close_count = Rc::new(Cell::new(0));
-        let controller = VoiceController::with_dependencies(
-            Rc::new(LifecycleMediaFactory {
-                close_count: close_count.clone(),
-            }),
-            Rc::new(LifecycleSignaling),
-        );
-        (controller, close_count)
-    }
-
-    fn voice_agent(host: &LocalHostId, id: &str) -> crate::state::AgentInfo {
-        crate::state::AgentInfo {
-            local_host_id: host.clone(),
-            agent_id: protocol::AgentId(id.to_owned()),
-            name: id.to_owned(),
-            origin: protocol::AgentOrigin::User,
-            backend_kind: protocol::BackendKind::Codex,
-            workspace_roots: Vec::new(),
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            custom_agent_id: None,
-            created_at_ms: 0,
-            instance_stream: protocol::StreamPath(format!("/agent/{id}/instance")),
-            started: true,
-            fatal_error: None,
-        }
-    }
-
-    fn voice_target(agent: &crate::state::AgentInfo) -> VoiceTarget {
-        VoiceTarget {
-            local_host_id: agent.local_host_id.clone(),
-            agent_id: agent.agent_id.clone(),
-            instance_stream: agent.instance_stream.clone(),
-            agent_name: agent.name.clone(),
-        }
-    }
-
     fn empty_host_settings() -> protocol::HostSettings {
         protocol::HostSettings {
             enabled_backends: Vec::new(),
@@ -1441,7 +1228,6 @@ mod wasm_tests {
             backend_config: Default::default(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
-            voice: Default::default(),
         }
     }
 
@@ -1461,193 +1247,41 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn voice_lifecycle_guards_focus_disconnect_and_background_in_one_mount() {
+    async fn one_chat_mount_preserves_transcript_and_composer_draft() {
         let container = make_container();
-        let host = LocalHostId("voice-guard-host".to_owned());
-        let first = voice_agent(&host, "first");
-        let second = voice_agent(&host, "second");
-        let third = voice_agent(&host, "third");
-        let (controller, close_count) = lifecycle_controller();
-        let mut state = AppState::new();
-        state.voice = controller.clone();
-        state.active_local_host_id.set(Some(host.clone()));
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host.clone(), ConnectionStatus::Connected);
-        });
-        state.agents.set(vec![first.clone(), second.clone()]);
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host.clone(),
-            agent_id: first.agent_id.clone(),
-        }));
-        let state_for_mount = state.clone();
-        let mount = mount_to(container.clone(), move || {
-            install_voice_focus_guard(state_for_mount.clone());
-            view! { <div></div> }
-        });
-        let pagehide_target = web_sys::EventTarget::new().unwrap();
-        let pagehide_guard =
-            ScopedPagehideVoiceGuard::install(pagehide_target.clone(), state.clone());
-        next_tick().await;
-
-        controller.start(voice_target(&first));
-        next_tick().await;
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host.clone(),
-            agent_id: second.agent_id.clone(),
-        }));
-        next_tick().await;
-        assert_eq!(close_count.get(), 1, "a user focus change closes voice");
-
-        controller.start(voice_target(&second));
-        next_tick().await;
-        reset_inbound_seq_for_host(&host);
-        dispatch_envelope(
-            &state,
-            &host,
-            protocol::Envelope::from_payload(
-                protocol::StreamPath("/host/voice-guard-host".to_owned()),
-                FrameKind::NewAgent,
-                0,
-                &protocol::NewAgentPayload {
-                    agent_id: third.agent_id.clone(),
-                    name: third.name.clone(),
-                    origin: protocol::AgentOrigin::User,
-                    backend_kind: third.backend_kind,
-                    launch_profile_id: None,
-                    workspace_roots: Vec::new(),
-                    custom_agent_id: None,
-                    team_id: None,
-                    team_member_id: None,
-                    project_id: None,
-                    parent_agent_id: None,
-                    session_id: None,
-                    workflow: None,
-                    created_at_ms: 1,
-                    instance_stream: third.instance_stream.clone(),
-                    activity_summary: Default::default(),
-                },
-            )
-            .unwrap(),
-        );
-        next_tick().await;
-        assert_eq!(
-            close_count.get(),
-            2,
-            "server-driven NewAgent auto-focus closes voice"
-        );
-
-        controller.start(voice_target(&third));
-        next_tick().await;
-        dispatch_envelope(
-            &state,
-            &host,
-            protocol::Envelope::from_payload(
-                protocol::StreamPath("/host/voice-guard-host".to_owned()),
-                FrameKind::AgentClosed,
-                1,
-                &protocol::AgentClosedPayload {
-                    agent_id: third.agent_id,
-                },
-            )
-            .unwrap(),
-        );
-        next_tick().await;
-        assert_eq!(
-            close_count.get(),
-            3,
-            "server-driven AgentClosed focus removal closes voice"
-        );
-
-        let retained = voice_agent(&host, "retained-agent");
-        state.agents.set(vec![retained.clone()]);
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host.clone(),
-            agent_id: retained.agent_id.clone(),
-        }));
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host.clone(), ConnectionStatus::Connected);
-        });
-        next_tick().await;
-        controller.start(voice_target(&retained));
-        next_tick().await;
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
-        });
-        next_tick().await;
-        assert_eq!(close_count.get(), 4);
-        assert_eq!(
-            state.agents.get_untracked().len(),
-            1,
-            "connection status must independently guard a live microphone"
-        );
-
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host, ConnectionStatus::Connected);
-        });
-        next_tick().await;
-        controller.start(voice_target(&retained));
-        next_tick().await;
-        pagehide_target
-            .dispatch_event(&web_sys::Event::new("pagehide").unwrap())
-            .unwrap();
-        assert_eq!(
-            close_count.get(),
-            5,
-            "pagehide closes capture synchronously"
-        );
-
-        controller.start(voice_target(&retained));
-        next_tick().await;
-        end_voice_for_background(&state);
-        assert_eq!(
-            close_count.get(),
-            6,
-            "the visibility-hidden handler closes capture synchronously"
-        );
-        drop(pagehide_guard);
-        controller.start(voice_target(&retained));
-        next_tick().await;
-        pagehide_target
-            .dispatch_event(&web_sys::Event::new("pagehide").unwrap())
-            .unwrap();
-        assert_eq!(
-            close_count.get(),
-            6,
-            "dropping the scoped listener must isolate later browser tests"
-        );
-        controller.end("user-done");
-        assert_eq!(close_count.get(), 7);
-        drop(mount);
-        container.remove();
-    }
-
-    #[wasm_bindgen_test]
-    async fn one_chat_mount_preserves_composer_and_gates_unavailable_voice() {
-        let container = make_container();
-        let host = LocalHostId("voice-chat-host".to_owned());
-        let agent = voice_agent(&host, "chat-agent");
+        let host = LocalHostId("composer-host".to_owned());
+        let agent_id = protocol::AgentId("composer-agent".to_owned());
         let agent_ref = crate::state::AgentRef {
             local_host_id: host.clone(),
-            agent_id: agent.agent_id.clone(),
+            agent_id: agent_id.clone(),
         };
-        let (controller, close_count) = lifecycle_controller();
-        let mut state = AppState::new();
-        state.voice = controller.clone();
+        let state = AppState::new();
         state.active_local_host_id.set(Some(host.clone()));
         state.connection_statuses.update(|statuses| {
             statuses.insert(host.clone(), ConnectionStatus::Connected);
         });
-        let mut settings = empty_host_settings();
-        settings.voice.availability = protocol::VoiceAvailability::Available {
-            direct_connections_only: true,
-        };
-        state.host_settings_by_host.update(|all| {
-            all.insert(host.clone(), settings);
+        state.host_settings_by_host.update(|settings| {
+            settings.insert(host.clone(), empty_host_settings());
         });
-        state.agents.set(vec![agent.clone()]);
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+        state.agents.set(vec![crate::state::AgentInfo {
             local_host_id: host.clone(),
-            agent_id: agent.agent_id.clone(),
+            agent_id: agent_id.clone(),
+            name: "Composer agent".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: protocol::StreamPath("/agent/composer-agent/instance".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host,
+            agent_id,
         }));
         state.agent_loaded.update(|loaded| {
             loaded.insert(agent_ref.clone());
@@ -1659,7 +1293,7 @@ mod wasm_tests {
                     message_id: None,
                     timestamp: 0,
                     sender: protocol::MessageSender::User,
-                    content: "Voice must preserve this transcript".to_owned(),
+                    content: "Preserve this transcript".to_owned(),
                     reasoning: None,
                     tool_calls: Vec::new(),
                     model_info: None,
@@ -1672,17 +1306,6 @@ mod wasm_tests {
         );
         state.viewing_chat.set(true);
         state.chat_input.set("preserved draft".to_owned());
-        state.voice.model().set(VoiceModel::Live {
-            generation: 1,
-            target: voice_target(&agent),
-            session: None,
-            phase: VoicePhase::Listening,
-            muted: false,
-            processing: AudioProcessingReport::default(),
-            playback_blocked: false,
-            caption: None,
-            transcript: None,
-        });
         let state_for_mount = state.clone();
         let mount = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
@@ -1690,209 +1313,24 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        for selector in [
-            "[data-mobile-test='voice-bar']",
-            "[data-mobile-test='chat-transcript']",
-            "[data-mobile-test='chat-input']",
-        ] {
-            assert!(
-                container.query_selector(selector).unwrap().is_some(),
-                "voice must remain a sibling of the existing chat surface: {selector}"
-            );
-        }
+        let transcript = container
+            .query_selector("[data-mobile-test='chat-transcript']")
+            .unwrap()
+            .expect("one chat mount keeps the transcript visible");
         assert!(
-            container
-                .query_selector("[data-mobile-test='chat-transcript']")
-                .unwrap()
-                .unwrap()
+            transcript
                 .text_content()
                 .unwrap_or_default()
-                .contains("Voice must preserve this transcript"),
-            "the mounted voice surface must preserve existing transcript content"
+                .contains("Preserve this transcript")
         );
         let input = container
             .query_selector("[data-mobile-test='chat-input']")
             .unwrap()
-            .unwrap()
+            .expect("one chat mount keeps the composer visible")
             .dyn_into::<web_sys::HtmlTextAreaElement>()
             .unwrap();
         assert_eq!(input.value(), "preserved draft");
 
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
-                reason: protocol::VoiceUnavailableReason::NotEnabled,
-            };
-        });
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-voice']")
-                .unwrap()
-                .is_none(),
-            "NotEnabled removes the mobile voice entry even while voice is live"
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='voice-done']")
-                .unwrap()
-                .is_some(),
-            "the active session keeps its visible Done control"
-        );
-
-        state.voice.model().set(VoiceModel::Idle);
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
-                reason: protocol::VoiceUnavailableReason::NoReachableCandidate,
-            };
-        });
-        next_tick().await;
-
-        let button = container
-            .query_selector("[data-mobile-test='chat-voice']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlElement>()
-            .unwrap();
-        assert!(button.has_attribute("disabled"));
-        let reason = container
-            .query_selector("[data-mobile-test='chat-voice-unavailable']")
-            .unwrap()
-            .expect("unavailable reason must be visible beside the disabled control");
-        assert_eq!(
-            reason.text_content().as_deref(),
-            Some("Same LAN or VPN required for voice.")
-        );
-
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
-                reason: protocol::VoiceUnavailableReason::NotEnabled,
-            };
-        });
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
-        });
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-voice']")
-                .unwrap()
-                .is_none(),
-            "NotEnabled removes the idle voice control even while the host is disconnected"
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-voice-unavailable']")
-                .unwrap()
-                .is_none(),
-            "NotEnabled takes precedence over the disconnected reason for the entire entry"
-        );
-
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(host.clone(), ConnectionStatus::Connected);
-        });
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Available {
-                direct_connections_only: true,
-            };
-        });
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-voice']")
-                .unwrap()
-                .is_some(),
-            "the real reactive entry returns when voice is enabled"
-        );
-
-        state.active_agent.set(None);
-        next_tick().await;
-        assert_eq!(
-            container
-                .query_selector("[data-mobile-test='chat-title']")
-                .unwrap()
-                .and_then(|title| title.text_content())
-                .as_deref(),
-            Some("New Chat")
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-voice']")
-                .unwrap()
-                .is_some(),
-            "an available selected host keeps the New Chat voice state visible"
-        );
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Unavailable {
-                reason: protocol::VoiceUnavailableReason::NotEnabled,
-            };
-        });
-        next_tick().await;
-        assert!(
-            container
-                .query_selector(".chat-voice-entry")
-                .unwrap()
-                .is_none(),
-            "a New Chat composer must render no voice entry when its selected host disables voice"
-        );
-
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host.clone(),
-            agent_id: agent.agent_id.clone(),
-        }));
-        state.host_settings_by_host.update(|all| {
-            let settings = all.get_mut(&host).expect("active host settings");
-            settings.voice.availability = protocol::VoiceAvailability::Available {
-                direct_connections_only: true,
-            };
-        });
-        next_tick().await;
-
-        controller.start(voice_target(&agent));
-        next_tick().await;
-        next_tick().await;
-        let session = controller.model().with_untracked(|model| match model {
-            VoiceModel::Live {
-                session: Some(session),
-                ..
-            } => session.clone(),
-            other => panic!("voice start must create a signaling session, got {other:?}"),
-        });
-        let provider_message = "The connection to Amazon Bedrock was interrupted.";
-        controller.apply_error(
-            &host,
-            &session.stream,
-            protocol::VoiceErrorPayload {
-                session_id: protocol::VoiceSessionId(session.id.clone()),
-                code: protocol::VoiceErrorCode::ProviderUnavailable,
-                message: provider_message.to_owned(),
-                fatal: true,
-            },
-        );
-        next_tick().await;
-        let error_text = container
-            .query_selector("[data-mobile-test='voice-error']")
-            .unwrap()
-            .expect("the mounted voice surface must render the provider failure")
-            .text_content()
-            .unwrap_or_default();
-        assert!(
-            error_text.contains(provider_message),
-            "mobile must preserve the host-supplied provider message, got {error_text:?}"
-        );
-        assert!(
-            !error_text.contains("not configured"),
-            "a provider transport failure must not be rewritten as configuration failure"
-        );
-        assert_eq!(
-            close_count.get(),
-            1,
-            "the real fatal-error path must close the mounted session's media"
-        );
         drop(mount);
         container.remove();
     }

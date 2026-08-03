@@ -33,11 +33,6 @@ fn user_facing_error_signal() -> ArcRwSignal<Option<UserFacingError>> {
     USER_FACING_ERROR.with(Clone::clone)
 }
 
-#[cfg(test)]
-pub(crate) fn current_user_error() -> Option<String> {
-    USER_FACING_ERROR.with(|error| error.get_untracked().map(|error| error.message))
-}
-
 #[component]
 pub fn Header() -> impl IntoView {
     let state = expect_context::<AppState>();

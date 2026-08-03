@@ -1859,47 +1859,6 @@ impl AgentHandle {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn voice_test_handle(
-    start: AgentStartPayload,
-    bootstrap: AgentBootstrapPayload,
-) -> AgentHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let accepting_input = Arc::new(AtomicBool::new(true));
-    let closing = Arc::new(AtomicBool::new(false));
-    let (_, start_rx) = watch::channel(start);
-    tokio::spawn(async move {
-        let mut attached_streams = Vec::new();
-        while let Some(command) = rx.recv().await {
-            match command {
-                AgentCommand::Attach { stream, reply } => {
-                    let sent = serde_json::to_value(&bootstrap).ok().is_some_and(|value| {
-                        stream.send_value(FrameKind::AgentBootstrap, value).is_ok()
-                    });
-                    if sent {
-                        attached_streams.push(stream);
-                    }
-                    let _ = reply.send(sent);
-                }
-                AgentCommand::DeliverMessage { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-                AgentCommand::Close { reply } => {
-                    let _ = reply.send(());
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-    AgentHandle {
-        tx,
-        accepting_input,
-        closing,
-        start: start_rx,
-    }
-}
-
 #[cfg(feature = "test-support")]
 type StartupCompletionTestGates =
     std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;

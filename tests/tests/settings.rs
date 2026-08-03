@@ -990,7 +990,6 @@ fn expected_empty_settings() -> HostSettings {
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
         hermes_disabled_providers: Default::default(),
-        voice: Default::default(),
     }
 }
 
@@ -1030,6 +1029,34 @@ fn persisted_empty_settings_are_valid() {
 
     assert_eq!(
         store.get().expect("read empty settings"),
+        expected_empty_settings()
+    );
+}
+
+#[test]
+fn persisted_removed_voice_settings_are_ignored() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{
+  "settings": {
+    "enabled_backends": [],
+    "default_backend": null,
+    "voice": {
+      "enabled": true,
+      "aws_profile": "legacy-profile",
+      "aws_region": "us-west-2"
+    }
+  }
+}"#,
+    )
+    .expect("write settings with removed voice fields");
+
+    let store = HostSettingsStore::load(path).expect("ignore removed voice settings");
+
+    assert_eq!(
+        store.get().expect("read settings"),
         expected_empty_settings()
     );
 }
@@ -1126,7 +1153,6 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
-            voice: Default::default(),
         }
     );
 }

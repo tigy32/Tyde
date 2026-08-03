@@ -123,7 +123,7 @@ test("CSP permits the external config without inline script or cross-origin conn
   assert.match(csp[1], /script-src 'self' 'wasm-unsafe-eval'/);
   assert.doesNotMatch(csp[1], /script-src[^;]*'unsafe-inline'/);
   assert.match(csp[1], /connect-src 'self' wss:/);
-  assert.match(csp[1], /webrtc 'allow'/);
+  assert.doesNotMatch(csp[1], /webrtc/);
   const deployed = cloudfrontSetup.match(
     /"ContentSecurityPolicy": "([^"]+frame-ancestors 'none')"/,
   );
@@ -131,6 +131,6 @@ test("CSP permits the external config without inline script or cross-origin conn
   assert.equal(deployed[1], `${csp[1]}; frame-ancestors 'none'`);
   assert.match(
     cloudfrontSetup,
-    /"Value": "microphone=\(self\), camera=\(self\)"/,
+    /"Value": "camera=\(self\)"/,
   );
 });

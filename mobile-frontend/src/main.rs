@@ -8,7 +8,6 @@ mod fixtures;
 mod markdown;
 mod send;
 pub mod state;
-mod voice;
 
 use wasm_bindgen::JsCast;
 

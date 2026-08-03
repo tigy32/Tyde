@@ -919,7 +919,10 @@ pub async fn team_draft_discard(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use leptos::mount::mount_to;
+    use leptos::prelude::{provide_context, view};
     use std::rc::Rc;
+    use wasm_bindgen::JsCast;
 
     async fn settle() {
         for _ in 0..2 {
@@ -1056,6 +1059,17 @@ mod wasm_tests {
     async fn rejected_send_does_not_consume_protocol_sequence() {
         let host_id = "host-sequence";
         let stream = StreamPath("/host/sequence".to_owned());
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let header = mount_to(container.clone(), move || {
+            provide_context(crate::state::AppState::new());
+            view! { <crate::components::header::Header /> }
+        });
         clear_host_seqs(host_id);
         install_reject_once_send_stub();
 
@@ -1068,7 +1082,11 @@ mod wasm_tests {
         .await;
         assert!(rejected.is_err());
         assert_eq!(current_seq(host_id, &stream), 0);
-        let visible_error = crate::components::header::current_user_error()
+        settle().await;
+        let visible_error = container
+            .query_selector(".user-error-banner-message")
+            .unwrap()
+            .and_then(|message| message.text_content())
             .expect("transport rejection must produce visible feedback");
         assert!(
             visible_error.contains("client error")
@@ -1091,6 +1109,15 @@ mod wasm_tests {
         assert_eq!(envelopes[0].seq, 0);
         assert_eq!(envelopes[1].seq, 0);
         assert_eq!(current_seq(host_id, &stream), 1);
+        container
+            .query_selector(".user-error-banner-dismiss")
+            .unwrap()
+            .expect("reported transport error must be dismissible")
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap()
+            .click();
+        drop(header);
+        container.remove();
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test]

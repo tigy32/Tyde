@@ -140,7 +140,6 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
     };
     let bootstrap = BootstrapHostPayload {
         settings: BootstrapHostSettings {
-            voice: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
@@ -304,16 +303,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 .borrow_mut()
                 .forget_host_except_stream(host_id, &envelope.stream);
         });
-    }
-
-    // Voice runs on its own `/voice/<session>` stream family with independent
-    // sequencing, so it is routed before the main frame match rather than
-    // threaded through the agent/host arms. That separation is the point: a
-    // voice frame can never disturb an agent stream's ordering, and the agent
-    // protocol gains no voice arms.
-    if envelope.stream.0.starts_with("/voice/") && crate::voice::handle_inbound(host_id, &envelope)
-    {
-        return;
     }
 
     match envelope.kind {
@@ -507,20 +496,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.code,
                     payload.message
                 );
-                // A voice frame the host rejected before it had a voice
-                // session to answer on — a malformed stream path, for
-                // instance — comes back here on the *host* stream, not as a
-                // typed `VoiceError` on `/voice/<id>`. Correlate it so the
-                // session fails visibly instead of hanging until its own
-                // negotiation deadline with nothing shown.
-                if crate::voice::handle_command_error(
-                    host_id,
-                    &payload.stream,
-                    payload.request_kind,
-                    &payload.message,
-                ) {
-                    return;
-                }
                 crate::components::header::report_user_error(message.clone());
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
@@ -6764,7 +6739,6 @@ mod restore_fixtures {
             seq,
             &HostBootstrapPayload {
                 settings: protocol::HostSettings {
-                    voice: Default::default(),
                     enabled_backends: Vec::new(),
                     default_backend: None,
                     enable_mobile_connections: false,

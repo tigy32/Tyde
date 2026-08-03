@@ -163,12 +163,12 @@ impl EnvelopeStream {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ProductionBoundaryProbe {
     outbound_rx: futures_channel::mpsc::Receiver<OutboundChunk>,
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 impl ProductionBoundaryProbe {
     pub async fn next_bytes(&mut self) -> Option<Vec<u8>> {
         use futures_util::StreamExt;
@@ -180,7 +180,7 @@ impl ProductionBoundaryProbe {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub fn production_boundary_probe() -> (EnvelopeStream, ProductionBoundaryProbe) {
     let (outbound_tx, outbound_rx) = futures_channel::mpsc::channel(16);
     let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
@@ -327,40 +327,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_stream_boundary_carries_voice_signaling_without_audio() {
-        let (outbound_tx, mut outbound_rx) = channel(1);
-        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
-        let mut stream = EnvelopeStream::new(outbound_tx, inbound_rx);
+    async fn production_stream_boundary_rejects_audio_fields_from_typed_payloads() {
+        let (mut stream, mut probe) = production_boundary_probe();
+        let payload = protocol::SendMessagePayload {
+            message: "review the attached screenshot".to_owned(),
+            images: Some(vec![protocol::ImageData {
+                media_type: "image/png".to_owned(),
+                data: "iVBORw0KGgo=".to_owned(),
+            }]),
+            origin: Some(protocol::MessageOrigin::User),
+            tool_response: None,
+        };
         let envelope = protocol::Envelope::from_payload(
-            protocol::StreamPath("/voice/session-1".to_owned()),
-            protocol::FrameKind::VoiceStart,
+            protocol::StreamPath("/agent/agent-a/instance-a".to_owned()),
+            protocol::FrameKind::SendMessage,
             0,
-            &protocol::VoiceStartPayload {
-                session_id: protocol::VoiceSessionId("session-1".to_owned()),
-                target: protocol::VoiceTarget {
-                    agent_id: protocol::AgentId("agent-1".to_owned()),
-                    instance_stream: protocol::StreamPath("/agent/agent-1/instance-1".to_owned()),
-                },
-                capabilities: protocol::VoiceClientCapabilities {
-                    audio_track: true,
-                    codecs: vec![protocol::VoiceAudioCodec::Opus],
-                    echo_cancellation_requested: true,
-                },
-            },
+            &payload,
         )
         .unwrap();
         let mut wire = serde_json::to_vec(&envelope).unwrap();
         wire.push(b'\n');
 
         stream.write_all(&wire).await.unwrap();
-        let (flushed, bytes) = tokio::join!(stream.flush(), async {
-            let chunk = outbound_rx.next().await.unwrap();
-            let bytes = chunk.bytes;
-            chunk.ack.send(Ok(())).unwrap();
-            bytes
-        });
+        let (flushed, bytes) = tokio::join!(stream.flush(), probe.next_bytes());
         flushed.unwrap();
+        let bytes = bytes.expect("production boundary emitted the typed frame");
         assert_eq!(bytes, wire);
-        assert!(!bytes.windows(9).any(|window| window == b"audioInput"));
+
+        let encoded_payload = serde_json::to_value(&payload).unwrap();
+        for field in ["audio", "audio_input", "pcm", "media_payload"] {
+            let mut attempted_payload = encoded_payload.clone();
+            attempted_payload
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), serde_json::json!("AAECAwQFBgcICQ=="));
+            let attempted_envelope = protocol::Envelope {
+                stream: envelope.stream.clone(),
+                kind: envelope.kind,
+                seq: envelope.seq,
+                payload: attempted_payload,
+            };
+            assert!(
+                attempted_envelope
+                    .parse_payload::<protocol::SendMessagePayload>()
+                    .is_err(),
+                "typed MQTT payloads must reject unknown audio field {field:?}"
+            );
+        }
     }
 }
