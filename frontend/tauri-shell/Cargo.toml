@@ -9,6 +9,9 @@ name = "tauri_shell"
 crate-type = ["lib", "cdylib", "staticlib"]
 doctest = false
 
+[features]
+default = []
+
 [[bin]]
 name = "tyde"
 path = "src/main.rs"
@@ -19,7 +22,7 @@ tauri-build = { version = "2.6.2", features = [] }
 [dependencies]
 devtools-protocol = { path = "../../devtools-protocol" }
 host-config = { path = "../../host-config" }
-protocol = { path = "../../protocol", default-features = false }
+protocol = { path = "../../protocol" }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json.workspace = true
 serde.workspace = true
@@ -36,9 +39,15 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 server = { path = "../../server" }
+cpal = "0.15.3"
+opus = "0.3.1"
+webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tauri = { version = "2.11.5", features = ["test"] }

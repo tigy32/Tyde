@@ -98,8 +98,13 @@ sign_and_notarize() {
     fi
 
     log "Signing $target"
-    codesign --force --options runtime --deep --sign "$SIGNING_IDENTITY" "$target"
+    codesign --force --options runtime --deep \
+        --entitlements "$SCRIPT_DIR/frontend/tauri-shell/Entitlements.plist" \
+        --sign "$SIGNING_IDENTITY" "$target"
     codesign --verify --verbose --strict "$target"
+    codesign -d --entitlements :- "$target" 2>&1 \
+        | grep -q "com.apple.security.device.audio-input" \
+        || { log "Signed app is missing microphone entitlement"; return 1; }
 
     local zip="${target}.zip"
     log "Zipping for notarization"

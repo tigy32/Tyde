@@ -3465,7 +3465,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Envelope, HostSettings};
+    use protocol::HostSettings;
 
     struct TestActor {
         actor: MobileAccessActor,
@@ -3532,6 +3532,7 @@ mod tests {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         }
     }
 
@@ -3666,12 +3667,12 @@ mod tests {
         }
     }
 
-    fn stream(path: &str) -> (Stream, mpsc::UnboundedReceiver<Envelope>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn stream(path: &str) -> (Stream, crate::stream::OutputReceiver) {
+        let (tx, rx) = crate::stream::output_channel();
         (Stream::new(StreamPath(path.to_owned()), tx), rx)
     }
 
-    async fn recv_kind(rx: &mut mpsc::UnboundedReceiver<Envelope>) -> FrameKind {
+    async fn recv_kind(rx: &mut crate::stream::OutputReceiver) -> FrameKind {
         rx.recv().await.expect("event").kind
     }
 

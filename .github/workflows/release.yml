@@ -114,11 +114,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
             curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev libdbus-1-dev pkg-config patchelf musl-tools zip
+            librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config \
+            patchelf musl-tools zip
 
       - name: Install macOS tools
         if: startsWith(matrix.platform, 'macos')
         run: brew install create-dmg
+
+      - name: Provision native audio build tools
+        shell: bash
+        run: |
+          python tools/provision-native-build-tools.py \
+            --root "$RUNNER_TEMP/tyde-native-build-tools" \
+            --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
 
       - name: Verify runner Node.js
         run: node --version && npm --version

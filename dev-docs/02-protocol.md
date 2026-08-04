@@ -10,13 +10,21 @@ See `01-philosophy.md` for the design decisions that shaped this spec.
 ## 1. Transport Assumptions
 
 - A single bidirectional channel per connection (WebSocket, SSH stream, etc.).
-- All messages are UTF-8 JSON, one JSON object per message.
-- Framing is **newline-delimited JSON (NDJSON)**: each message is serialized as
-  compact JSON (no pretty-printing) followed by `\n`. The receiver splits on
-  `\n` to get individual messages. This works over any byte stream — WebSocket,
-  raw TCP, SSH, stdio pipes.
-- serde_json's compact serializer already escapes `\n` inside strings to `\\n`,
-  so the only bare `\n` in the output is the delimiter.
+- Every transport exposes an ordered, reliable byte stream. SSH, UDS, stdio,
+  in-process duplex, and encrypted MQTT retain their existing interfaces.
+- Protocol version 47 replaces NDJSON with the `TYD2` binary record format.
+  A 20-byte fixed header contains magic, record version, kind, reserved flags,
+  JSON-header length, binary-body length, and CRC-32. Lengths are checked before
+  allocation and CRC is checked before JSON parsing.
+- Physical JSON headers are at most 1 MiB and binary bodies at most 64 KiB.
+  Logical JSON envelopes are at most 16 MiB. Large non-binary envelopes are
+  divided into ordered 48 KiB fragment records and reassembled with limits of
+  16 concurrent messages and 32 MiB total reserved bytes. EOF, corruption,
+  duplicate/out-of-order fragments, unknown versions, and oversize declarations
+  close the connection.
+- Binary bodies are first-class but only typed `voice_audio` uses them. They are
+  never base64-wrapped at the Tyde protocol layer. Large binary bodies are
+  rejected rather than fragmented.
 
 ### Mobile MQTT transport
 
@@ -30,7 +38,7 @@ The long-lived paired MQTT room is only a rendezvous channel:
 4. the normal Tyde `hello` / `welcome` / replay protocol runs over the
    ephemeral data room.
 
-The paired room must not carry Tyde NDJSON frames. It exists only to negotiate a
+The paired room must not carry Tyde protocol records. It exists only to negotiate a
 fresh data room so stale MQTT clients cannot inject old data into a new app
 connection.
 
@@ -55,7 +63,7 @@ wire stream: any Tyde-visible mobile state still has to be modeled in Rust in
 
 ## 2. Message Envelope
 
-Every message on the wire is a JSON object with this shape:
+Every logical message has a JSON envelope in the record header with this shape:
 
 ```json
 {
@@ -138,7 +146,7 @@ are valid until the handshake completes.
   "kind": "hello",
   "seq": 0,
   "payload": {
-    "protocol_version": 6,
+    "protocol_version": 47,
     "tyde_version": { "major": 2, "minor": 0, "patch": 0 },
     "client_name": "tyde-desktop",
     "platform": "macos"
@@ -154,7 +162,7 @@ are valid until the handshake completes.
   "kind": "welcome",
   "seq": 0,
   "payload": {
-    "protocol_version": 6,
+    "protocol_version": 47,
     "tyde_version": { "major": 2, "minor": 1, "patch": 0 }
   }
 }
@@ -296,7 +304,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The current protocol version. Bump when the wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 47;
 
 // ── Primitives ──────────────────────────────────────────────────────
 

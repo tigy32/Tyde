@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -16,6 +16,28 @@ use crate::remote_bootstrap::{current_app_release_version, shell_quote};
 use host_config::TydeReleaseVersion;
 
 const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
+pub const HOST_VOICE_FRAME_EVENT: &str = "tyde://host-voice-frame";
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostVoiceFrameEvent {
+    host_id: String,
+    envelope: String,
+    opus: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum Outbound {
+    Line(String),
+    Frame(protocol::ProtocolFrame, Option<AudioPermit>),
+}
+#[derive(Debug)]
+struct AudioPermit(Arc<AtomicUsize>);
+impl Drop for AudioPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Routes Tauri commands to per-connection writer tasks and tracks the live
 /// connections.
@@ -47,7 +69,7 @@ struct Connection {
     /// Outbound frames are enqueued here; the writer task owns the receiver.
     /// Dropping every sender (i.e. removing this entry) makes the writer task
     /// finish on its own.
-    outbound_tx: mpsc::UnboundedSender<String>,
+    outbound_tx: mpsc::UnboundedSender<Outbound>,
     /// SSH child process, owned here so teardown can reap it. `None` for the
     /// in-process embedded transport.
     child: Option<Child>,
@@ -57,6 +79,7 @@ struct Connection {
     /// instead of leaking late frames/errors into a newer connection that
     /// reused the same host id.
     live: Arc<AtomicBool>,
+    audio_pending: Arc<AtomicUsize>,
 }
 
 impl ProxyRouterHandle {
@@ -90,6 +113,13 @@ impl ProxyRouterHandle {
         if let Some(existing) = existing {
             tracing::info!(host_id, "replacing existing host connection");
             existing.live.store(false, Ordering::Relaxed);
+            if let Err(error) = app
+                .state::<crate::ShellState>()
+                .voice_media
+                .stop_for_host(&host_id)
+            {
+                let _ = emit_error(&app, &host_id, error);
+            }
             reap_child(existing.child).await;
         }
 
@@ -105,7 +135,8 @@ impl ProxyRouterHandle {
             setup_connection_transport(&host_id, app.clone(), transport, host, live.clone())
                 .await?;
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<String>();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        let audio_pending = Arc::new(AtomicUsize::new(0));
 
         // Register before spawning so that an immediate reader EOF can find the
         // entry (and thus reap the child / emit disconnect) instead of racing.
@@ -118,6 +149,7 @@ impl ProxyRouterHandle {
                     outbound_tx,
                     child: setup.child,
                     live: live.clone(),
+                    audio_pending,
                 },
             );
         }
@@ -182,8 +214,47 @@ impl ProxyRouterHandle {
         // has already exited (dead connection), the send fails and we surface
         // an explicit error rather than silently dropping the frame.
         outbound_tx
-            .send(line)
+            .send(Outbound::Line(line))
             .map_err(|_| format!("host {host_id} connection is no longer available"))
+    }
+
+    pub fn send_frame(
+        &self,
+        host_id: String,
+        envelope: protocol::Envelope,
+        binary: Vec<u8>,
+    ) -> Result<(), String> {
+        if binary.is_empty() || envelope.kind != protocol::FrameKind::VoiceAudio {
+            return Err("desktop binary IPC only accepts typed voice audio".into());
+        }
+        let payload: protocol::VoiceAudioPayload = envelope
+            .parse_payload()
+            .map_err(|_| "invalid desktop voice audio payload")?;
+        payload.validate_body(binary.len()).map_err(str::to_owned)?;
+        if payload.direction != protocol::VoiceDirection::Input
+            || envelope.stream != protocol::StreamPath(format!("/voice/{}", payload.session_id.0))
+        {
+            return Err("desktop voice audio session routing mismatch".into());
+        }
+        let (tx, audio_pending) = self
+            .state
+            .lock()
+            .expect("router state poisoned")
+            .hosts
+            .get(&host_id)
+            .map(|c| (c.outbound_tx.clone(), c.audio_pending.clone()))
+            .ok_or_else(|| format!("host {host_id} is not connected"))?;
+        let previous = audio_pending.fetch_add(1, Ordering::AcqRel);
+        if previous >= 8 {
+            audio_pending.fetch_sub(1, Ordering::AcqRel);
+            return Err("desktop voice audio queue is full".into());
+        }
+        let permit = Some(AudioPermit(audio_pending));
+        tx.send(Outbound::Frame(
+            protocol::ProtocolFrame { envelope, binary },
+            permit,
+        ))
+        .map_err(|_| format!("host {host_id} connection is no longer available"))
     }
 }
 
@@ -195,14 +266,14 @@ async fn reader_task(
     app: AppHandle,
     host_id: String,
     connection_id: u64,
-    mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    reader: Box<dyn AsyncBufRead + Unpin + Send>,
     live: Arc<AtomicBool>,
 ) {
+    let mut reader = protocol::FrameReader::new(reader);
     loop {
-        let mut incoming = String::new();
-        match reader.read_line(&mut incoming).await {
-            Ok(0) => break,
-            Ok(_) => {
+        match reader.read_frame().await {
+            Ok(None) => break,
+            Ok(Some(frame)) => {
                 // Non-blocking liveness check (no lock, no await): if this
                 // connection was superseded/torn down while we were parked in
                 // read_line, stop so we never leak a late frame into a newer
@@ -210,7 +281,85 @@ async fn reader_task(
                 if !live.load(Ordering::Relaxed) {
                     break;
                 }
-                let line = trim_line_ending(incoming);
+                if !frame.binary.is_empty() {
+                    if frame.envelope.kind != protocol::FrameKind::VoiceAudio {
+                        let _ = emit_error(
+                            &app,
+                            &host_id,
+                            "host sent an unauthorized binary frame".into(),
+                        );
+                        break;
+                    }
+                    let payload = match frame
+                        .envelope
+                        .parse_payload::<protocol::VoiceAudioPayload>()
+                    {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            let _ = emit_error(
+                                &app,
+                                &host_id,
+                                "host sent invalid voice audio metadata".into(),
+                            );
+                            break;
+                        }
+                    };
+                    if payload.direction != protocol::VoiceDirection::Output {
+                        let _ =
+                            emit_error(&app, &host_id, "host voice audio routing mismatch".into());
+                        break;
+                    }
+                    if payload.validate_body(frame.binary.len()).is_err()
+                        || frame.envelope.stream
+                            != protocol::StreamPath(format!("/voice/{}", payload.session_id.0))
+                    {
+                        let _ =
+                            emit_error(&app, &host_id, "host voice audio routing mismatch".into());
+                        break;
+                    }
+                    let envelope = match serde_json::to_string(&frame.envelope) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = emit_error(
+                                &app,
+                                &host_id,
+                                format!("failed to encode voice frame: {error}"),
+                            );
+                            break;
+                        }
+                    };
+                    let _ = app.emit(
+                        HOST_VOICE_FRAME_EVENT,
+                        HostVoiceFrameEvent {
+                            host_id: host_id.clone(),
+                            envelope,
+                            opus: frame.binary,
+                        },
+                    );
+                    continue;
+                }
+                let line = match serde_json::to_string(&frame.envelope) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = emit_error(
+                            &app,
+                            &host_id,
+                            format!("failed to serialize host frame: {error}"),
+                        );
+                        break;
+                    }
+                };
+                if frame.envelope.kind == protocol::FrameKind::VoiceAccepted
+                    && let Ok(accepted) = frame
+                        .envelope
+                        .parse_payload::<protocol::VoiceAcceptedPayload>()
+                    && let Err(error) = app
+                        .state::<crate::ShellState>()
+                        .voice_media
+                        .authorize(host_id.clone(), accepted.generation)
+                {
+                    let _ = emit_error(&app, &host_id, error);
+                }
                 tracing::info!(
                     host_id,
                     connection_id,
@@ -256,11 +405,21 @@ async fn writer_task(
     host_id: String,
     connection_id: u64,
     mut writer: Box<dyn AsyncWrite + Unpin + Send>,
-    mut outbound_rx: mpsc::UnboundedReceiver<String>,
+    mut outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     live: Arc<AtomicBool>,
 ) {
-    while let Some(line) = outbound_rx.recv().await {
-        if let Err(error) = write_line(&mut writer, line).await {
+    while let Some(outbound) = outbound_rx.recv().await {
+        let result = match outbound {
+            Outbound::Line(line) => write_line(&mut writer, line).await,
+            Outbound::Frame(frame, permit) => {
+                let result = protocol::write_frame(&mut writer, &frame)
+                    .await
+                    .map_err(|e| format!("failed to write host voice frame: {e}"));
+                drop(permit);
+                result
+            }
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 host_id,
                 connection_id,
@@ -305,6 +464,13 @@ async fn close_connection(
     };
 
     connection.live.store(false, Ordering::Relaxed);
+    if let Err(error) = app
+        .state::<crate::ShellState>()
+        .voice_media
+        .stop_for_host(host_id)
+    {
+        let _ = emit_error(app, host_id, error);
+    }
     reap_child(connection.child).await;
     tracing::info!(host_id, connection_id, "connection closed");
     let _ = app.emit(
@@ -339,19 +505,11 @@ struct ConnectionSetup {
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> Result<(), String> {
     tracing::info!(line_len = line.len(), "proxy router sending line to host");
 
-    writer
-        .write_all(line.as_bytes())
+    let envelope: protocol::Envelope = serde_json::from_str(&line)
+        .map_err(|error| format!("failed to parse host envelope: {error}"))?;
+    protocol::write_envelope(writer, &envelope)
         .await
-        .map_err(|error| format!("failed to write host line: {error}"))?;
-    writer
-        .write_all(b"\n")
-        .await
-        .map_err(|error| format!("failed to terminate host line: {error}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|error| format!("failed to flush host line: {error}"))?;
-    Ok(())
+        .map_err(|error| format!("failed to write host frame: {error}"))
 }
 
 fn emit_error(app: &AppHandle, host_id: &str, message: String) -> tauri::Result<()> {
@@ -563,6 +721,7 @@ mod tests {
                 outbound_tx: tx,
                 child: None,
                 live: Arc::new(AtomicBool::new(true)),
+                audio_pending: Arc::new(AtomicUsize::new(0)),
             },
         );
 
@@ -586,6 +745,7 @@ mod tests {
                 outbound_tx: tx,
                 child: None,
                 live: Arc::new(AtomicBool::new(true)),
+                audio_pending: Arc::new(AtomicUsize::new(0)),
             },
         );
 
@@ -593,13 +753,16 @@ mod tests {
             .send_line("host".to_string(), "frame".to_string())
             .await
             .unwrap();
-        assert_eq!(rx.recv().await.unwrap(), "frame");
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            Outbound::Line(line) if line == "frame"
+        ));
     }
 
     #[tokio::test]
     async fn send_line_errors_when_writer_gone() {
         let router = router();
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = mpsc::unbounded_channel::<Outbound>();
         router.state.lock().unwrap().hosts.insert(
             "host".to_string(),
             Connection {
@@ -607,6 +770,7 @@ mod tests {
                 outbound_tx: tx,
                 child: None,
                 live: Arc::new(AtomicBool::new(true)),
+                audio_pending: Arc::new(AtomicUsize::new(0)),
             },
         );
         // Simulate the writer task having exited: its receiver is dropped.
@@ -638,6 +802,7 @@ mod tests {
                 outbound_tx: tx,
                 child: None,
                 live: live.clone(),
+                audio_pending: Arc::new(AtomicUsize::new(0)),
             },
         );
 

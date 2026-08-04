@@ -34,6 +34,40 @@ fn codex_rate_limits_notification(used_percent: u8) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn runtime_surfaces_typed_server_voice_capabilities() {
+    let directory = tempfile::tempdir().expect("create voice capability tempdir");
+    let host = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("initialize voice-capable host");
+    let HostEndpoint {
+        mut events,
+        commands: _,
+    } = connect_runtime(host).await;
+
+    let capabilities = timeout(Duration::from_secs(5), async {
+        loop {
+            if let HostEvent::Voice(client::VoiceEvent::Capabilities(capabilities)) =
+                events.recv().await.expect("host event stream")
+            {
+                return capabilities;
+            }
+        }
+    })
+    .await
+    .expect("typed VoiceCapabilities event");
+    assert_eq!(capabilities.protocol, protocol::VOICE_PROTOCOL_VERSION);
+    assert!(
+        capabilities
+            .formats
+            .iter()
+            .all(|pair| pair.uplink.valid() && pair.downlink.valid())
+    );
+}
+
+#[tokio::test]
 async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     init_tracing();
     let directory = tempfile::tempdir().expect("create capacity tempdir");
@@ -429,7 +463,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::TeamPresetCatalogNotify(_)
                 | HostEvent::TeamDraftNotify(_)
                 | HostEvent::TeamContextCompactionNotify(_)
-                | HostEvent::TeamMemberShuffleSuggestionNotify(_) => {}
+                | HostEvent::TeamMemberShuffleSuggestionNotify(_)
+                | HostEvent::Voice(_) => {}
             }
         }
         let _ = host_loop_result_tx.send(saw_second_count);
@@ -688,10 +723,19 @@ async fn connect_runtime(host: server::HostHandle) -> HostEndpoint {
 }
 
 async fn next_host_event(events: &mut client::HostEvents, context: &str) -> HostEvent {
-    timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for host event: {context}"))
-        .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"))
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"));
+            if !matches!(event, HostEvent::Voice(_)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for host event: {context}"))
 }
 
 async fn next_session_count(

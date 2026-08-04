@@ -42,6 +42,11 @@ tokio-util = "0.7"
 url = "2"
 tracing.workspace = true
 uuid.workspace = true
+opus = "0.3"
+aws-config = "1"
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 
 [dev-dependencies]
 mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }

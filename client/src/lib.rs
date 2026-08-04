@@ -18,28 +18,30 @@ use protocol::{
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
-    FetchSessionHistoryPayload, FrameError, FrameKind, HelloPayload, HostBootstrapPayload,
-    HostBrowseStartPayload, HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    FetchSessionHistoryPayload, FrameError, FrameKind, FrameReader, HelloPayload,
+    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
-    ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
-    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
-    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SessionSummaryCountUpdatedPayload, SetAgentNamePayload, SetSessionSettingsPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
-    TaskTokenUsagePayload, TeamContextCompactionNotifyPayload, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProtocolFrame, QueuedMessagesPayload,
+    RejectPayload, ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload,
+    ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SeqValidator, SessionHistoryPayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SessionSummaryCountUpdatedPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload,
+    TeamContextCompactionNotifyPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
     TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
@@ -81,14 +83,15 @@ impl ClientConfig {
 }
 
 pub struct Connection {
-    pub reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    pub reader: FrameReader<Box<dyn AsyncBufRead + Unpin + Send>>,
     pub writer: Box<dyn AsyncWrite + Unpin + Send>,
     pub incoming_seq: SeqValidator,
     pub outgoing_seq: HashMap<StreamPath, u64>,
+    voice_state: ServerVoiceState,
 }
 
 pub(crate) struct ConnectedParts {
-    pub(crate) reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    pub(crate) reader: FrameReader<Box<dyn AsyncBufRead + Unpin + Send>>,
     pub(crate) writer: Box<dyn AsyncWrite + Unpin + Send>,
     pub(crate) incoming_seq: SeqValidator,
     pub(crate) outgoing_seq: HashMap<StreamPath, u64>,
@@ -98,6 +101,215 @@ pub(crate) struct ConnectedParts {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Stream {
     path: StreamPath,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceEvent {
+    Capabilities(protocol::VoiceCapabilitiesPayload),
+    Accepted(protocol::VoiceAcceptedPayload),
+    Audio {
+        payload: protocol::VoiceAudioPayload,
+        opus: Vec<u8>,
+    },
+    Transcript(protocol::VoiceTranscriptPayload),
+    State(protocol::VoiceStatePayload),
+    Output(protocol::VoiceSessionPayload),
+    Stop(protocol::VoiceStopPayload),
+    Error(protocol::VoiceErrorPayload),
+}
+
+#[derive(Default)]
+struct ServerVoiceState {
+    active: Option<ServerVoiceSession>,
+    last_generation: u64,
+}
+
+struct ServerVoiceSession {
+    session_id: protocol::VoiceSessionId,
+    generation: u64,
+    next_output_media_seq: u64,
+}
+
+fn is_voice_frame(frame: &ProtocolFrame) -> bool {
+    frame.envelope.stream.0.starts_with("/voice")
+        || matches!(
+            frame.envelope.kind,
+            FrameKind::VoiceCapabilities
+                | FrameKind::VoiceAccepted
+                | FrameKind::VoiceAudio
+                | FrameKind::VoiceTranscript
+                | FrameKind::VoiceState
+                | FrameKind::VoiceOutput
+                | FrameKind::VoiceStop
+                | FrameKind::VoiceError
+        )
+}
+
+fn reject_voice(message: impl Into<String>) -> FrameError {
+    FrameError::Protocol(message.into())
+}
+
+fn validate_capabilities(
+    capabilities: &protocol::VoiceCapabilitiesPayload,
+) -> Result<(), FrameError> {
+    if !capabilities.valid() {
+        return Err(reject_voice("invalid server voice capabilities"));
+    }
+    Ok(())
+}
+
+fn parse_voice_payload<T: serde::de::DeserializeOwned>(
+    frame: &ProtocolFrame,
+    name: &str,
+) -> Result<T, FrameError> {
+    frame
+        .envelope
+        .parse_payload()
+        .map_err(|error| reject_voice(format!("invalid {name}: {error}")))
+}
+
+fn require_empty_voice_body(frame: &ProtocolFrame) -> Result<(), FrameError> {
+    if frame.binary.is_empty() {
+        Ok(())
+    } else {
+        Err(reject_voice(format!(
+            "{} must not carry binary data",
+            frame.envelope.kind
+        )))
+    }
+}
+
+fn require_active_voice<'a>(
+    state: &'a ServerVoiceState,
+    frame: &ProtocolFrame,
+    session_id: &protocol::VoiceSessionId,
+    generation: u64,
+) -> Result<&'a ServerVoiceSession, FrameError> {
+    let expected_stream = StreamPath(format!("/voice/{}", session_id.0));
+    state
+        .active
+        .as_ref()
+        .filter(|active| {
+            active.session_id == *session_id
+                && active.generation == generation
+                && frame.envelope.stream == expected_stream
+        })
+        .ok_or_else(|| reject_voice("stale, foreign, or misrouted server voice frame"))
+}
+
+fn accept_server_voice_frame(
+    state: &mut ServerVoiceState,
+    host_stream: &StreamPath,
+    frame: &ProtocolFrame,
+) -> Result<Option<VoiceEvent>, FrameError> {
+    if !is_voice_frame(frame) {
+        return Ok(None);
+    }
+    match frame.envelope.kind {
+        FrameKind::VoiceCapabilities => {
+            require_empty_voice_body(frame)?;
+            if &frame.envelope.stream != host_stream {
+                return Err(reject_voice(
+                    "server VoiceCapabilities must use the connected host stream",
+                ));
+            }
+            let payload = parse_voice_payload(frame, "VoiceCapabilities")?;
+            validate_capabilities(&payload)?;
+            Ok(Some(VoiceEvent::Capabilities(payload)))
+        }
+        FrameKind::VoiceAccepted => {
+            require_empty_voice_body(frame)?;
+            if frame.envelope.stream.0 != "/voice" {
+                return Err(reject_voice("server VoiceAccepted must use /voice"));
+            }
+            let payload: protocol::VoiceAcceptedPayload =
+                parse_voice_payload(frame, "VoiceAccepted")?;
+            if payload.session_id.0.is_empty()
+                || payload.generation <= state.last_generation
+                || !payload.uplink.valid()
+                || !payload.downlink.valid()
+            {
+                return Err(reject_voice("invalid server VoiceAccepted session"));
+            }
+            state.last_generation = payload.generation;
+            state.active = Some(ServerVoiceSession {
+                session_id: payload.session_id.clone(),
+                generation: payload.generation,
+                next_output_media_seq: 0,
+            });
+            Ok(Some(VoiceEvent::Accepted(payload)))
+        }
+        FrameKind::VoiceAudio => {
+            let payload: protocol::VoiceAudioPayload = parse_voice_payload(frame, "VoiceAudio")?;
+            payload
+                .validate_body(frame.binary.len())
+                .map_err(reject_voice)?;
+            if payload.direction != protocol::VoiceDirection::Output
+                || payload.timestamp_samples_48k != payload.first_media_seq.saturating_mul(960)
+            {
+                return Err(reject_voice(
+                    "invalid server VoiceAudio direction or timestamp",
+                ));
+            }
+            let active =
+                require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            if payload.first_media_seq < active.next_output_media_seq {
+                return Err(reject_voice("server voice media sequence moved backwards"));
+            }
+            let next = payload.first_media_seq + payload.packet_lengths.len() as u64;
+            state
+                .active
+                .as_mut()
+                .expect("validated active voice session")
+                .next_output_media_seq = next;
+            Ok(Some(VoiceEvent::Audio {
+                payload,
+                opus: frame.binary.clone(),
+            }))
+        }
+        FrameKind::VoiceTranscript => {
+            require_empty_voice_body(frame)?;
+            let payload: protocol::VoiceTranscriptPayload =
+                parse_voice_payload(frame, "VoiceTranscript")?;
+            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            Ok(Some(VoiceEvent::Transcript(payload)))
+        }
+        FrameKind::VoiceState => {
+            require_empty_voice_body(frame)?;
+            let payload: protocol::VoiceStatePayload = parse_voice_payload(frame, "VoiceState")?;
+            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            Ok(Some(VoiceEvent::State(payload)))
+        }
+        FrameKind::VoiceOutput => {
+            require_empty_voice_body(frame)?;
+            let payload: protocol::VoiceSessionPayload = parse_voice_payload(frame, "VoiceOutput")?;
+            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            Ok(Some(VoiceEvent::Output(payload)))
+        }
+        FrameKind::VoiceStop => {
+            require_empty_voice_body(frame)?;
+            let payload: protocol::VoiceStopPayload = parse_voice_payload(frame, "VoiceStop")?;
+            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            state.active = None;
+            Ok(Some(VoiceEvent::Stop(payload)))
+        }
+        FrameKind::VoiceError => {
+            require_empty_voice_body(frame)?;
+            let payload: protocol::VoiceErrorPayload = parse_voice_payload(frame, "VoiceError")?;
+            if let Some(session_id) = &payload.session_id {
+                require_active_voice(state, frame, session_id, payload.generation)?;
+                if payload.fatal {
+                    state.active = None;
+                }
+            } else if frame.envelope.stream.0 != "/voice" {
+                return Err(reject_voice("pre-session VoiceError must use /voice"));
+            }
+            Ok(Some(VoiceEvent::Error(payload)))
+        }
+        other => Err(reject_voice(format!(
+            "unexpected {other} on server voice stream"
+        ))),
+    }
 }
 
 impl Stream {
@@ -805,12 +1017,41 @@ impl Connection {
     }
 
     pub async fn next_event(&mut self) -> Result<Option<Envelope>, FrameError> {
-        let Some(envelope) = read_envelope(&mut self.reader).await? else {
+        loop {
+            let Some(frame) = self.next_frame().await? else {
+                return Ok(None);
+            };
+            if is_voice_frame(&frame) {
+                continue;
+            }
+            if !frame.binary.is_empty() {
+                return Err(FrameError::Protocol(
+                    "binary frame requires next_frame".into(),
+                ));
+            }
+            return Ok(Some(frame.envelope));
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Option<ProtocolFrame>, FrameError> {
+        let Some(frame) = self.reader.read_frame().await? else {
             return Ok(None);
         };
+        let envelope = &frame.envelope;
 
         self.incoming_seq
             .validate(&envelope.stream, envelope.seq, envelope.kind)?;
+
+        let host_stream = self.host_stream();
+        if accept_server_voice_frame(&mut self.voice_state, &host_stream, &frame)?.is_some() {
+            return Ok(Some(frame));
+        }
+        if !frame.binary.is_empty() {
+            return Err(FrameError::Protocol(format!(
+                "unexpected binary data on {}",
+                envelope.kind
+            )));
+        }
 
         if envelope.stream.0.starts_with("/host/") {
             match envelope.kind {
@@ -1363,7 +1604,7 @@ impl Connection {
             }
         }
 
-        Ok(Some(envelope))
+        Ok(Some(frame))
     }
 
     fn host_stream(&self) -> StreamPath {
@@ -1579,6 +1820,7 @@ where
         writer: parts.writer,
         incoming_seq: parts.incoming_seq,
         outgoing_seq: parts.outgoing_seq,
+        voice_state: ServerVoiceState::default(),
     })
 }
 
@@ -1663,7 +1905,7 @@ where
             outgoing_seq.insert(stream_path.clone(), 1);
 
             Ok(ConnectedParts {
-                reader: Box::new(reader),
+                reader: FrameReader::new(Box::new(reader)),
                 writer: Box::new(write_half),
                 incoming_seq,
                 outgoing_seq,
@@ -1680,5 +1922,296 @@ where
             expected: FrameKind::Welcome,
             got,
         }),
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    fn frame<T: serde::Serialize>(
+        stream: &str,
+        kind: FrameKind,
+        payload: &T,
+        binary: Vec<u8>,
+    ) -> ProtocolFrame {
+        ProtocolFrame {
+            envelope: Envelope::from_payload(StreamPath(stream.into()), kind, 0, payload).unwrap(),
+            binary,
+        }
+    }
+
+    fn capabilities() -> protocol::VoiceCapabilitiesPayload {
+        protocol::VoiceCapabilitiesPayload {
+            protocol: protocol::VOICE_PROTOCOL_VERSION,
+            formats: vec![protocol::VoiceFormatPair {
+                uplink: protocol::VoiceAudioFormat::opus(48_000),
+                downlink: protocol::VoiceAudioFormat::opus(24_000),
+            }],
+            max_batch_packets: protocol::MAX_VOICE_PACKETS_PER_FRAME as u8,
+            max_sessions_per_connection: 1,
+            nova_available: true,
+            native_capture: true,
+            native_aec: true,
+            browser_capture: true,
+            browser_aec: protocol::BrowserAecStatus::Requested,
+            foreground_only: true,
+        }
+    }
+
+    fn accepted() -> protocol::VoiceAcceptedPayload {
+        protocol::VoiceAcceptedPayload {
+            session_id: protocol::VoiceSessionId("session-a".into()),
+            generation: 7,
+            target: protocol::VoiceTarget {
+                agent_id: AgentId("agent-a".into()),
+                instance_stream: StreamPath("/agent/agent-a/instance-a".into()),
+            },
+            uplink: protocol::VoiceAudioFormat::opus(48_000),
+            downlink: protocol::VoiceAudioFormat::opus(24_000),
+        }
+    }
+
+    fn accept(
+        state: &mut ServerVoiceState,
+        host: &StreamPath,
+        frame: ProtocolFrame,
+    ) -> Result<Option<VoiceEvent>, FrameError> {
+        accept_server_voice_frame(state, host, &frame)
+    }
+
+    #[test]
+    fn server_voice_frames_require_typed_host_and_session_routes() {
+        let host = StreamPath("/host/client-a".into());
+        let mut state = ServerVoiceState::default();
+        assert!(matches!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    &host.0,
+                    FrameKind::VoiceCapabilities,
+                    &capabilities(),
+                    Vec::new(),
+                ),
+            )
+            .unwrap(),
+            Some(VoiceEvent::Capabilities(_))
+        ));
+
+        let accepted = accepted();
+        assert!(matches!(
+            accept(
+                &mut state,
+                &host,
+                frame("/voice", FrameKind::VoiceAccepted, &accepted, Vec::new(),),
+            )
+            .unwrap(),
+            Some(VoiceEvent::Accepted(_))
+        ));
+        let stream = format!("/voice/{}", accepted.session_id.0);
+        let session = protocol::VoiceSessionPayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+        };
+        let transcript = protocol::VoiceTranscriptPayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+            speaker: protocol::VoiceTranscriptSpeaker::Assistant,
+            text: "hello".into(),
+            is_final: true,
+            message_id: None,
+        };
+        let state_payload = protocol::VoiceStatePayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+            state: protocol::VoiceSessionState::Speaking,
+            model_turn_id: None,
+        };
+        let error = protocol::VoiceErrorPayload {
+            session_id: Some(accepted.session_id.clone()),
+            generation: accepted.generation,
+            code: protocol::VoiceErrorCode::ToolBusy,
+            retryable: true,
+            fatal: false,
+        };
+        for valid in [
+            frame(&stream, FrameKind::VoiceTranscript, &transcript, Vec::new()),
+            frame(&stream, FrameKind::VoiceState, &state_payload, Vec::new()),
+            frame(&stream, FrameKind::VoiceOutput, &session, Vec::new()),
+            frame(&stream, FrameKind::VoiceError, &error, Vec::new()),
+        ] {
+            assert!(accept(&mut state, &host, valid).unwrap().is_some());
+        }
+        let audio = protocol::VoiceAudioPayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+            direction: protocol::VoiceDirection::Output,
+            first_media_seq: 0,
+            timestamp_samples_48k: 0,
+            packet_lengths: vec![3],
+        };
+        assert!(matches!(
+            accept(
+                &mut state,
+                &host,
+                frame(&stream, FrameKind::VoiceAudio, &audio, vec![1, 2, 3]),
+            )
+            .unwrap(),
+            Some(VoiceEvent::Audio { .. })
+        ));
+        let stop = protocol::VoiceStopPayload {
+            session_id: accepted.session_id,
+            generation: accepted.generation,
+            reason: protocol::VoiceStopReason::ProviderCompleted,
+            stats: Default::default(),
+        };
+        assert!(matches!(
+            accept(
+                &mut state,
+                &host,
+                frame(&stream, FrameKind::VoiceStop, &stop, Vec::new()),
+            )
+            .unwrap(),
+            Some(VoiceEvent::Stop(_))
+        ));
+    }
+
+    #[test]
+    fn server_voice_rejects_wrong_routes_binary_and_input_audio() {
+        let host = StreamPath("/host/client-a".into());
+        let mut state = ServerVoiceState::default();
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    "/voice",
+                    FrameKind::VoiceCapabilities,
+                    &capabilities(),
+                    Vec::new(),
+                ),
+            )
+            .is_err()
+        );
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    &host.0,
+                    FrameKind::VoiceCapabilities,
+                    &capabilities(),
+                    vec![1],
+                ),
+            )
+            .is_err()
+        );
+        let accepted = accepted();
+        accept(
+            &mut state,
+            &host,
+            frame("/voice", FrameKind::VoiceAccepted, &accepted, Vec::new()),
+        )
+        .unwrap();
+        let input = protocol::VoiceAudioPayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+            direction: protocol::VoiceDirection::Input,
+            first_media_seq: 0,
+            timestamp_samples_48k: 0,
+            packet_lengths: vec![3],
+        };
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    "/voice/session-a",
+                    FrameKind::VoiceAudio,
+                    &input,
+                    vec![1, 2, 3],
+                ),
+            )
+            .is_err()
+        );
+        let mut output = input;
+        output.direction = protocol::VoiceDirection::Output;
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    "/voice/foreign",
+                    FrameKind::VoiceAudio,
+                    &output,
+                    vec![1, 2, 3],
+                ),
+            )
+            .is_err()
+        );
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    "/voice/session-a",
+                    FrameKind::VoiceTranscript,
+                    &serde_json::json!({"unexpected": true}),
+                    Vec::new(),
+                ),
+            )
+            .is_err()
+        );
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(
+                    "/voice/session-a",
+                    FrameKind::ChatEvent,
+                    &serde_json::json!({}),
+                    Vec::new(),
+                ),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_only_api_validates_and_skips_typed_voice_events() {
+        let host = StreamPath("/host/client-a".into());
+        let (mut server, client) = tokio::io::duplex(16 * 1024);
+        let mut incoming_seq = SeqValidator::new();
+        incoming_seq.validate(&host, 0, FrameKind::Welcome).unwrap();
+        let mut connection = Connection {
+            reader: FrameReader::new(Box::new(BufReader::new(client))),
+            writer: Box::new(tokio::io::sink()),
+            incoming_seq,
+            outgoing_seq: HashMap::from([(host.clone(), 1)]),
+            voice_state: ServerVoiceState::default(),
+        };
+        let mut capability = frame(
+            &host.0,
+            FrameKind::VoiceCapabilities,
+            &capabilities(),
+            Vec::new(),
+        );
+        capability.envelope.seq = 1;
+        protocol::write_frame(&mut server, &capability)
+            .await
+            .unwrap();
+        let settings = protocol::HostSettingsPayload {
+            settings: protocol::HostSettings::default(),
+        };
+        let mut host_settings = frame(&host.0, FrameKind::HostSettings, &settings, Vec::new());
+        host_settings.envelope.seq = 2;
+        protocol::write_frame(&mut server, &host_settings)
+            .await
+            .unwrap();
+
+        let event = connection.next_event().await.unwrap().unwrap();
+        assert_eq!(event.kind, FrameKind::HostSettings);
+        assert_eq!(event.seq, 2);
     }
 }

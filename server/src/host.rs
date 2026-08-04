@@ -206,6 +206,7 @@ use crate::workflows::watch::{WorkflowCatalogSignal, WorkflowWatcherHandle};
 
 struct HostSubscriber {
     stream: Stream,
+    voice_desktop: Option<bool>,
     bootstrapped: bool,
     agent_replay: AgentReplayMode,
     session_list_replay: SessionListReplayMode,
@@ -989,7 +990,7 @@ struct TeamCompactTarget {
 struct TeamAgentCompaction {
     target: TeamCompactTarget,
     compaction: AgentCompaction,
-    rx: mpsc::UnboundedReceiver<protocol::Envelope>,
+    rx: crate::stream::OutputReceiver,
 }
 
 struct AgentCompaction {
@@ -2963,10 +2964,31 @@ impl SubAgentEmitter for HostSubAgentEmitter {
 }
 
 impl HostHandle {
+    #[cfg(test)]
     pub(crate) async fn register_host_stream(
         &self,
         host_stream: Stream,
         agent_replay: AgentReplayMode,
+    ) -> Vec<DeferredAgentAttachment> {
+        self.register_host_stream_inner(host_stream, agent_replay, None)
+            .await
+    }
+
+    pub(crate) async fn register_connection_host_stream(
+        &self,
+        host_stream: Stream,
+        agent_replay: AgentReplayMode,
+        desktop: bool,
+    ) -> Vec<DeferredAgentAttachment> {
+        self.register_host_stream_inner(host_stream, agent_replay, Some(desktop))
+            .await
+    }
+
+    async fn register_host_stream_inner(
+        &self,
+        host_stream: Stream,
+        agent_replay: AgentReplayMode,
+        voice_desktop: Option<bool>,
     ) -> Vec<DeferredAgentAttachment> {
         let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
@@ -2977,6 +2999,7 @@ impl HostHandle {
             host_path.clone(),
             HostSubscriber {
                 stream: host_stream,
+                voice_desktop,
                 bootstrapped: false,
                 agent_replay,
                 session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
@@ -3357,10 +3380,18 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&host_path);
                 return Vec::new();
             }
+            subscriber.bootstrapped = true;
+            if subscriber.voice_desktop.is_some()
+                && emit_voice_capabilities_for_subscriber(&bootstrap.settings, subscriber).is_err()
+            {
+                state.mobile_access.unregister_subscriber(host_path.clone());
+                state.host_streams.remove(&host_path);
+                state.agent_visibility.remove_host_stream(&host_path);
+                return Vec::new();
+            }
             for agent in &bootstrap.agents {
                 agent_visibility.record_new_agent(agent.agent_id.clone(), host_path.clone());
             }
-            subscriber.bootstrapped = true;
             subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
             subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
             subscriber.last_backend_config_snapshots =
@@ -3831,7 +3862,7 @@ impl HostHandle {
         let mut compactions = Vec::with_capacity(targets.len());
         let mut results = Vec::new();
         for target in targets {
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = crate::stream::output_channel();
             let target_agent_id = target.agent_id.clone();
             let agent_stream = Stream::new(
                 StreamPath(format!("/agent/{}/team-compact", target_agent_id)),
@@ -3919,7 +3950,7 @@ impl HostHandle {
         );
         let mut receivers = Vec::with_capacity(targets_with_sessions.len());
         for (target, handle, logical_session_id) in targets_with_sessions {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = crate::stream::output_channel();
             let agent_stream = Stream::new(
                 StreamPath(format!("/agent/{}/team-context-compact", target.agent_id)),
                 tx,
@@ -8261,13 +8292,18 @@ impl HostHandle {
                     ..
                 }
         );
+        let refresh_voice_capabilities = matches!(
+            &payload.setting,
+            protocol::HostSettingValue::VoiceEnabled { .. }
+                | protocol::HostSettingValue::VoiceAwsRegion { .. }
+        );
         let settings = state
             .settings_store
             .lock()
             .await
             .apply(payload.setting)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        fan_out_host_settings(&mut state, settings.clone()).await;
+        fan_out_host_settings(&mut state, settings.clone(), refresh_voice_capabilities).await;
         apply_agent_activity_summary_setting(&mut state, &settings).await;
         apply_agent_supervisor_setting(&mut state, &settings);
         state.mobile_access.settings_changed(settings);
@@ -9156,6 +9192,24 @@ impl HostHandle {
 
     pub(crate) async fn agent_handle(&self, agent_id: &AgentId) -> Option<AgentHandle> {
         self.state.lock().await.registry.agent_handle(agent_id)
+    }
+
+    pub(crate) async fn agent_handle_for_instance(
+        &self,
+        connection_host_stream: &StreamPath,
+        target: &protocol::VoiceTarget,
+    ) -> Option<AgentHandle> {
+        let state = self.state.lock().await;
+        let subscriber = state.host_streams.get(connection_host_stream)?;
+        let prefix = format!("/agent/{}/", target.agent_id);
+        if !target.instance_stream.0.starts_with(&prefix)
+            || !subscriber
+                .known_agent_streams
+                .contains(&target.instance_stream)
+        {
+            return None;
+        }
+        state.registry.agent_handle(&target.agent_id)
     }
 
     pub(crate) async fn load_agent_stream(
@@ -15989,7 +16043,7 @@ async fn supervisor_auto_compact(
     expected_supervisor_settings_epoch: u64,
     task_tx: mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = crate::stream::output_channel();
     let stream = Stream::new(
         StreamPath(format!("/agent/{}/supervisor-compact", agent_id)),
         tx,
@@ -19076,7 +19130,11 @@ async fn emit_review_list_changed_for_project(
         .await
 }
 
-async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
+async fn fan_out_host_settings(
+    state: &mut HostState,
+    settings: protocol::HostSettings,
+    refresh_voice_capabilities: bool,
+) {
     if let Err(error) = sync_code_intel_router_roots(state).await {
         tracing::warn!(
             error = %error,
@@ -19094,10 +19152,13 @@ async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSe
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_host_settings_for_subscriber(&settings, subscriber)
-            .await
-            .is_err()
-        {
+        let result = emit_host_settings_for_subscriber(&settings, subscriber).await;
+        let result = if refresh_voice_capabilities {
+            result.and_then(|()| emit_voice_capabilities_for_subscriber(&settings, subscriber))
+        } else {
+            result
+        };
+        if result.is_err() {
             dead_paths.push(path);
         }
     }
@@ -19786,6 +19847,21 @@ async fn emit_host_settings_for_subscriber(
     })
     .expect("failed to serialize HostSettings payload for host stream fanout");
     emit_or_queue_host_frame(subscriber, FrameKind::HostSettings, payload)
+}
+
+fn emit_voice_capabilities_for_subscriber(
+    settings: &protocol::HostSettings,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let Some(desktop) = subscriber.voice_desktop else {
+        return Ok(());
+    };
+    let available = settings.voice.enabled && settings.voice.aws_region.is_some();
+    let payload = serde_json::to_value(protocol::VoiceCapabilitiesPayload::for_connection(
+        available, desktop,
+    ))
+    .expect("failed to serialize VoiceCapabilities payload for host stream fanout");
+    emit_or_queue_host_frame(subscriber, FrameKind::VoiceCapabilities, payload)
 }
 
 async fn emit_agent_activity_summary_for_subscriber(
@@ -20498,7 +20574,7 @@ fn send_agent_compact_notify(stream: &Stream, payload: AgentCompactNotifyPayload
 
 fn drain_final_agent_compact_notify(
     old_agent_id: &AgentId,
-    rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+    rx: &mut crate::stream::OutputReceiver,
 ) -> AgentCompactNotifyPayload {
     let mut final_notify = None;
     while let Ok(envelope) = rx.try_recv() {
@@ -20797,7 +20873,7 @@ mod tests {
     use protocol::{
         BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
         BackendNativeSettingsSnapshot, CompactionMetrics, CompactionTrigger, CustomAgentId,
-        DiffContextMode, Envelope, HostSettingValue, ProjectDiffScope, ProjectGitDiffFile,
+        DiffContextMode, HostSettingValue, ProjectDiffScope, ProjectGitDiffFile,
         ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
         ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
     };
@@ -20886,7 +20962,7 @@ mod tests {
     }
 
     async fn recv_session_summary_count(
-        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         context: &str,
     ) -> SessionSummaryCountUpdatedPayload {
         timeout(Duration::from_secs(1), async {
@@ -20907,7 +20983,7 @@ mod tests {
     }
 
     async fn assert_no_session_summary_count(
-        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         context: &str,
     ) {
         let received = timeout(Duration::from_millis(50), async {
@@ -21382,7 +21458,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn early_visible_native_child_closes_without_exposing_its_parent() {
         let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -21393,7 +21469,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 AgentReplayMode::Lazy,
             )
             .await;
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -21610,7 +21686,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         .expect("early child relay");
         let child_agent_id = child.agent_id.clone();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -21740,7 +21816,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn cancelled_spawn_cleans_unpublished_session_registration() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_stream = Stream::new(
             StreamPath(format!("/host/cancelled-unpublished-{}", Uuid::new_v4())),
             tx,
@@ -21855,7 +21931,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn startup_failure_cleans_unpublished_session_registration() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_stream = Stream::new(
             StreamPath(format!("/host/failed-unpublished-{}", Uuid::new_v4())),
             tx,
@@ -21954,7 +22030,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn simultaneous_startup_failure_and_fanout_publish_one_terminal_agent() {
         let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/failed-fanout-race-{}", Uuid::new_v4()));
         fixture
             .host
@@ -22065,7 +22141,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn simultaneous_startup_failure_claim_prevents_unpublished_fanout() {
         let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22153,7 +22229,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn synchronous_parent_fanout_closes_every_advertised_subscriber() {
         let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = crate::stream::output_channel();
         let first_stream = Stream::new(
             StreamPath(format!("/host/partial-first-{}", Uuid::new_v4())),
             first_tx,
@@ -22162,7 +22238,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .host
             .register_host_stream(first_stream, AgentReplayMode::Lazy)
             .await;
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = crate::stream::output_channel();
         let second_stream = Stream::new(
             StreamPath(format!("/host/partial-second-{}", Uuid::new_v4())),
             second_tx,
@@ -22295,7 +22371,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn fanout_uncovered_bootstrap_is_exactly_once_and_closes() {
         let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22341,7 +22417,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("agent paused after NewAgent fanout")
         };
 
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22455,7 +22531,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
         let fixture = compact_fixture().await;
         let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
-        let (operation_tx, mut operation_rx) = mpsc::unbounded_channel();
+        let (operation_tx, mut operation_rx) = crate::stream::output_channel();
         fixture
             .host
             .start_spawn_agent_operation(
@@ -22493,7 +22569,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("bootstrap-first operation agent")
         };
 
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22635,7 +22711,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             );
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22774,7 +22850,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
         cancelled_hook.wait_until_reached().await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         fixture
             .host
             .register_host_stream(
@@ -22846,7 +22922,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn session_publication_follows_new_agent_fanout() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_stream = Stream::new(
             StreamPath(format!(
                 "/host/session-publication-order-{}",
@@ -23112,6 +23188,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle::disabled();
@@ -23426,13 +23503,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn summary_from_same_session_agent_waits_for_other_agent_new_agent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(
             StreamPath(format!("/host/cross-agent-order-{}", Uuid::new_v4())),
             tx,
         );
         let mut subscriber = HostSubscriber {
             stream: stream.clone(),
+            voice_desktop: None,
             bootstrapped: true,
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
@@ -23531,7 +23609,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn dropped_fanout_batch_releases_subscriber_count_hold() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/dropped-fanout-{}", Uuid::new_v4()));
         assert!(
             fixture
@@ -24823,7 +24901,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn response_end_fans_out_targeted_assistant_response_count() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
@@ -24890,7 +24968,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             "spawn must publish NewAgent to the subscriber"
         );
 
-        let (bootstrap_tx, mut bootstrap_rx) = mpsc::unbounded_channel();
+        let (bootstrap_tx, mut bootstrap_rx) = crate::stream::output_channel();
         let bootstrap_path =
             StreamPath(format!("/host/session-count-bootstrap-{}", Uuid::new_v4()));
         let bootstrap_stream = Stream::new(bootstrap_path, bootstrap_tx);
@@ -24987,10 +25065,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn explicit_session_list_delivery_subscribes_each_host_stream() {
         let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = crate::stream::output_channel();
         let first_path = StreamPath(format!("/host/session-list-first-{}", Uuid::new_v4()));
         let first_stream = Stream::new(first_path.clone(), first_tx);
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = crate::stream::output_channel();
         let second_path = StreamPath(format!("/host/session-list-second-{}", Uuid::new_v4()));
         let second_stream = Stream::new(second_path.clone(), second_tx);
         for stream in [first_stream.clone(), second_stream.clone()] {
@@ -25048,7 +25126,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             }
         }
 
-        let (unlisted_tx, mut unlisted_rx) = mpsc::unbounded_channel();
+        let (unlisted_tx, mut unlisted_rx) = crate::stream::output_channel();
         let unlisted_path = StreamPath(format!("/host/session-list-unlisted-{}", Uuid::new_v4()));
         {
             let mut state = fixture.host.state.lock().await;
@@ -25056,6 +25134,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 unlisted_path.clone(),
                 HostSubscriber {
                     stream: Stream::new(unlisted_path.clone(), unlisted_tx),
+                    voice_desktop: None,
                     bootstrapped: true,
                     agent_replay: AgentReplayMode::Lazy,
                     session_list_replay: SessionListReplayMode::Paged {
@@ -25171,7 +25250,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let fixture = compact_fixture().await;
         let (_, session_id) =
             spawn_idle_user_agent(&fixture.host, "persist a response before subscribing").await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
@@ -25188,7 +25267,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
         while rx.try_recv().is_ok() {}
 
-        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
+        let (observer_tx, mut observer_rx) = crate::stream::output_channel();
         let observer_path = StreamPath(format!("/host/session-count-observer-{}", Uuid::new_v4()));
         let observer_stream = Stream::new(observer_path.clone(), observer_tx);
         assert!(
@@ -25332,7 +25411,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn empty_session_snapshot_delivers_each_count_and_unsubscribe_discards() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
@@ -25498,7 +25577,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let fixture = compact_fixture().await;
         let (agent_id, _) =
             spawn_idle_user_agent(&fixture.host, "remember lazy mobile startup").await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/lazy-agents-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
 
@@ -25569,7 +25648,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let fixture = compact_fixture().await;
         let (agent_id, _) =
             spawn_idle_user_agent(&fixture.host, "remember unavailable live agent").await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/unavailable-agent-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path, tx);
 
@@ -25636,7 +25715,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn unchanged_task_token_usage_is_not_resent_after_bootstrap() {
         let fixture = compact_fixture().await;
         spawn_idle_user_agent(&fixture.host, "deduplicate token usage").await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/token-usage-dedup-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path, tx);
 
@@ -25681,11 +25760,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("live registry handle")
         };
         let start = handle.snapshot();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/bootstrap-pending-{}", Uuid::new_v4()));
         let stream = Stream::new(host_path, tx);
         let mut subscriber = HostSubscriber {
             stream: stream.clone(),
+            voice_desktop: None,
             bootstrapped: false,
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
@@ -25758,11 +25838,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn forced_backend_config_snapshot_fanout_reemits_unchanged_native_settings() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/backend-config-{}", Uuid::new_v4()));
         let stream = Stream::new(host_path, tx);
         let mut subscriber = HostSubscriber {
             stream,
+            voice_desktop: None,
             bootstrapped: true,
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
@@ -25837,11 +25918,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn forced_session_schema_fanout_reemits_unchanged_snapshot() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/session-schema-{}", Uuid::new_v4()));
         let stream = Stream::new(host_path, tx);
         let mut subscriber = HostSubscriber {
             stream,
+            voice_desktop: None,
             bootstrapped: true,
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
@@ -25920,7 +26002,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .set_session_schema_ready_for_test(BackendKind::Hermes)
             .await;
         let before = fixture.host.session_schema_probe_count_for_test().await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = crate::stream::output_channel();
 
         fixture
             .host
@@ -26035,8 +26117,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
         }
     }
 
-    fn compact_stream(agent_id: &AgentId) -> (Stream, mpsc::UnboundedReceiver<protocol::Envelope>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn compact_stream(agent_id: &AgentId) -> (Stream, crate::stream::OutputReceiver) {
+        let (tx, rx) = crate::stream::output_channel();
         (
             Stream::new(StreamPath(format!("/agent/{}", agent_id)), tx),
             rx,
@@ -26045,7 +26127,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     fn drain_validated_events(
         validator: &mut ProtocolValidator,
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         context: &str,
     ) -> Vec<protocol::Envelope> {
         let mut envelopes = Vec::new();
@@ -26064,7 +26146,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     fn drain_compact_notifies(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
     ) -> Vec<AgentCompactNotifyPayload> {
         let mut notifies = Vec::new();
         while let Ok(envelope) = rx.try_recv() {
@@ -26100,7 +26182,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("start deterministic active turn");
         wait_for_agent_active(&fixture.host, &old_agent_id).await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
         assert!(
             handle
@@ -26193,7 +26275,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn native_agent_compaction_route_orders_later_input_after_terminal() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/compact-ordering-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
@@ -26328,7 +26410,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_path = StreamPath(format!("/host/legacy-compact-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         let deferred_attachments = fixture
@@ -26726,7 +26808,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn agent_compaction_completed_validates_before_old_agent_closed_on_instance_stream() {
         let fixture = compact_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let host_stream = Stream::new(
             StreamPath(format!("/host/compact-order-{}", Uuid::new_v4())),
             tx.clone(),
@@ -27063,7 +27145,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("activate busy manager");
         assert_native_context_compaction_route(&fixture.host, &manager.agent_id).await;
         wait_for_agent_active(&fixture.host, &manager.agent_id).await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(
             StreamPath(format!("/host/team-compact-busy-{}", Uuid::new_v4())),
             tx,
@@ -27143,7 +27225,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_native_context_compaction_route(&fixture.host, &report.agent_id).await;
         let old_agent_ids = HashSet::from([manager.agent_id.clone(), report.agent_id.clone()]);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(
             StreamPath(format!("/host/team-compact-{}", Uuid::new_v4())),
             tx,

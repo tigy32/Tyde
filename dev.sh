@@ -660,7 +660,7 @@ check() {
     local repetitions=1
     local cache_state="miss"
     local inputs key record_path refreshed_inputs refreshed_key
-    local name wasm_environment
+    local name native_environment wasm_environment
 
     if [[ $# -gt 1 ]]; then
         check_usage >&2
@@ -708,6 +708,16 @@ check() {
     prepare_rust_toolchain
     set_sccache_environment
     configure_sccache
+    native_environment="$RUN_DIR/native-build-tools.env"
+    run_stage "Provision native build tools" 1 \
+        python3 tools/provision-native-build-tools.py --prepare "$native_environment"
+    [[ -f "$native_environment" ]] ||
+        die "native build-tool provisioning did not write $native_environment"
+    source "$native_environment"
+    command -v meson >/dev/null 2>&1 ||
+        die "native build-tool provisioning did not provide Meson"
+    command -v ninja >/dev/null 2>&1 ||
+        die "native build-tool provisioning did not provide Ninja"
     wasm_environment="$RUN_DIR/wasm-tools.env"
     run_stage "Provision wasm test tools" 1 \
         tools/run-wasm-tests.sh --prepare "$wasm_environment"

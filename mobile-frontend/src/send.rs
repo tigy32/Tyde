@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use protocol::{Envelope, FrameKind, StreamPath};
+use protocol::{Envelope, FrameKind, ProtocolFrame, StreamPath};
 use serde::Serialize;
 
 use crate::bridge::{self, Accepted, SendRejected};
@@ -84,6 +84,24 @@ pub async fn send_frame<T: Serialize>(
         .map_err(SendFrameError::Rejected)?;
     commit_seq(host, &sequence_stream, seq);
     Ok(accepted)
+}
+
+pub async fn send_binary_frame<T: Serialize>(
+    host: &LocalHostId,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+    binary: Vec<u8>,
+) -> Result<(), SendFrameError> {
+    let seq = current_seq(host, &stream);
+    let sequence_stream = stream.clone();
+    let envelope = Envelope::from_payload(stream, kind, seq, payload)
+        .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
+    crate::bridge::web::send_voice_frame(host, ProtocolFrame { envelope, binary })
+        .await
+        .map_err(SendFrameError::Rejected)?;
+    commit_seq(host, &sequence_stream, seq);
+    Ok(())
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

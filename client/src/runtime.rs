@@ -11,7 +11,7 @@ use protocol::{
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
-    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind, HostBootstrapPayload,
+    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind, FrameReader, HostBootstrapPayload,
     HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
     NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
@@ -29,8 +29,7 @@ use protocol::{
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
     TerminalStartPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope,
-    write_envelope,
+    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -38,7 +37,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
-    ClientConfig, ConnectedParts, HandshakeError, connect_parts, parse_agent_stream,
+    ClientConfig, ConnectedParts, HandshakeError, ServerVoiceState, VoiceEvent,
+    accept_server_voice_frame, connect_parts, is_voice_frame, parse_agent_stream,
     parse_terminal_stream,
 };
 
@@ -163,6 +163,7 @@ pub enum HostEvent {
     AgentClosed(AgentClosedPayload),
     NewAgent(AgentEndpoint),
     NewTerminal(TerminalEndpoint),
+    Voice(VoiceEvent),
 }
 
 pub enum AgentEvent {
@@ -790,13 +791,15 @@ enum RouteRef {
 }
 
 async fn read_pump(
-    mut reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
+    mut reader: FrameReader<Box<dyn tokio::io::AsyncBufRead + Unpin + Send>>,
     mut incoming_seq: protocol::SeqValidator,
     host_stream: StreamPath,
     host_tx: mpsc::Sender<HostEvent>,
     shared: std::sync::Weak<Shared>,
 ) {
-    while let Ok(Some(envelope)) = read_envelope(&mut reader).await {
+    let mut voice_state = ServerVoiceState::default();
+    while let Ok(Some(frame)) = reader.read_frame().await {
+        let envelope = &frame.envelope;
         if incoming_seq
             .validate(&envelope.stream, envelope.seq, envelope.kind)
             .is_err()
@@ -807,6 +810,21 @@ async fn read_pump(
         let Some(shared) = shared.upgrade() else {
             break;
         };
+
+        if is_voice_frame(&frame) {
+            let event = match accept_server_voice_frame(&mut voice_state, &host_stream, &frame) {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(_) => break,
+            };
+            if host_tx.send(HostEvent::Voice(event)).await.is_err() {
+                break;
+            }
+            continue;
+        }
+        if !frame.binary.is_empty() {
+            break;
+        }
+        let envelope = frame.envelope;
 
         if envelope.stream == host_stream {
             if !handle_host_envelope(envelope, host_tx.clone(), shared).await {

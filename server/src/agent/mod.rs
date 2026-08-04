@@ -12493,7 +12493,7 @@ mod tests {
                 .await
                 .expect("actor must enter delayed backend startup")
                 .expect("actor must signal delayed backend startup");
-            let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+            let (output_tx, mut output_rx) = crate::stream::output_channel();
             let (attach_reply, attach_response) = tokio::sync::oneshot::channel();
             handle
                 .tx
@@ -12645,7 +12645,7 @@ mod tests {
             .await
             .expect("actor must enter delayed backend startup");
 
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         let (attach_reply, attach_rx) = tokio::sync::oneshot::channel();
         handle
             .tx
@@ -12654,7 +12654,7 @@ mod tests {
                 reply: attach_reply,
             })
             .expect("queue pending startup attachment");
-        let (dead_output_tx, dead_output_rx) = mpsc::unbounded_channel();
+        let (dead_output_tx, dead_output_rx) = crate::stream::output_channel();
         drop(dead_output_rx);
         let (dead_attach_reply, dead_attach_rx) = tokio::sync::oneshot::channel();
         handle
@@ -12944,7 +12944,7 @@ mod tests {
             .message = crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned();
         let (handle, startup_rx) =
             spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(output_tx)).await);
         startup_rx
             .await
@@ -13136,7 +13136,7 @@ mod tests {
             .await
             .expect("actor must enter delayed failing startup");
 
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         let (attach_reply, attach_rx) = tokio::sync::oneshot::channel();
         handle
             .tx
@@ -13605,7 +13605,7 @@ mod tests {
         assert!(!surfaces.contains("Initialization"), "{surfaces}");
         assert!(!surfaces.contains("Deployment"), "{surfaces}");
 
-        let (fresh_tx, mut fresh_rx) = mpsc::unbounded_channel();
+        let (fresh_tx, mut fresh_rx) = crate::stream::output_channel();
         assert!(attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -13628,7 +13628,7 @@ mod tests {
         let mut resumed_stats = AgentActivityStatsTracker::for_backend(BackendKind::Tycode);
         let mut resumed_text = String::new();
         let mut resumed_seq = 0;
-        let (gated_tx, mut gated_rx) = mpsc::unbounded_channel();
+        let (gated_tx, mut gated_rx) = crate::stream::output_channel();
         let mut resumed_subscribers = vec![replay_stream(gated_tx)];
         for mut event in tycode_terminal_events() {
             apply_runtime_session_updates(&store, &session_id, &event).await;
@@ -13652,7 +13652,7 @@ mod tests {
                 "resume history and input remain gated until SessionsList"
             );
         }
-        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        let (resume_tx, mut resume_rx) = crate::stream::output_channel();
         assert!(attach_subscriber(
             &resumed_log,
             Some(&resumed_replay),
@@ -13755,7 +13755,7 @@ mod tests {
         let mut resumed_stats = AgentActivityStatsTracker::for_backend(BackendKind::Tycode);
         let mut resumed_text = String::new();
         let mut resumed_seq = 0;
-        let (gated_tx, mut gated_rx) = mpsc::unbounded_channel();
+        let (gated_tx, mut gated_rx) = crate::stream::output_channel();
         let mut resumed_subscribers = vec![replay_stream(gated_tx)];
         for tasks in [&started, &advanced, &completed] {
             let mut event = ChatEvent::TaskUpdate(tasks.clone());
@@ -13779,7 +13779,7 @@ mod tests {
                 "provider history must remain gated until SessionsList"
             );
         }
-        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        let (resume_tx, mut resume_rx) = crate::stream::output_channel();
         assert!(attach_subscriber(
             &resumed_log,
             Some(&resumed_replay),
@@ -15190,7 +15190,7 @@ mod tests {
             SessionId("relay-session".to_owned()),
             status_handle,
         );
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(output_tx)).await);
         let _ = recv_agent_bootstrap_events(&mut output_rx, "relay stats bootstrap").await;
 
@@ -15307,7 +15307,7 @@ mod tests {
             SessionId("relay-codex-session".to_owned()),
             status_handle,
         );
-        let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+        let (live_tx, mut live_rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(live_tx)).await);
         let _ = recv_agent_bootstrap_events(&mut live_rx, "Codex relay bootstrap").await;
 
@@ -15391,7 +15391,7 @@ mod tests {
             TaskTokenUsageScope::Known { ref usage } if usage.total_tokens == 11
         ));
 
-        let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+        let (replay_tx, mut replay_rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(replay_tx)).await);
         let replay = recv_agent_bootstrap_events(&mut replay_rx, "Codex usage replay").await;
         let replay_stats = replay
@@ -15453,7 +15453,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(&event_log, None, &mut subscribers, replay_stream(tx));
 
         let events = recv_agent_bootstrap_events(&mut rx, "agent activity stats bootstrap").await;
@@ -15540,7 +15540,7 @@ mod tests {
     }
 
     async fn recv_agent_bootstrap_events(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         context: &str,
     ) -> Vec<AgentBootstrapEvent> {
         let env = timeout(Duration::from_secs(1), rx.recv())
@@ -15553,7 +15553,7 @@ mod tests {
             .events
     }
 
-    fn replay_stream(tx: mpsc::UnboundedSender<protocol::Envelope>) -> Stream {
+    fn replay_stream(tx: crate::stream::OutputQueue) -> Stream {
         Stream::new(StreamPath("/agent/replay-instance".to_owned()), tx)
     }
 
@@ -15615,7 +15615,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -15695,7 +15695,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -15808,7 +15808,7 @@ mod tests {
         let (start_tx, _start_rx) = watch::channel(current_start.clone());
         let mut pending_alias = None;
         let mut event_log = Vec::new();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = crate::stream::output_channel();
         let mut subscribers = vec![Stream::new(
             StreamPath("/agent/name-timeout-agent".to_owned()),
             event_tx,
@@ -16186,7 +16186,7 @@ mod tests {
             .await;
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16359,7 +16359,7 @@ mod tests {
         )
         .await;
 
-        let (active_tx, mut active_rx) = mpsc::unbounded_channel();
+        let (active_tx, mut active_rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16401,7 +16401,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16508,7 +16508,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16705,7 +16705,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16809,7 +16809,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -16941,7 +16941,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17121,7 +17121,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17173,7 +17173,7 @@ mod tests {
         .await;
         assert!(replay_state.active_background_progress.is_empty());
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17373,7 +17373,7 @@ mod tests {
             .await;
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17444,7 +17444,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17762,7 +17762,7 @@ mod tests {
             )
         }));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17834,7 +17834,7 @@ mod tests {
         let mut event_log = Vec::new();
         let mut replay_state = AgentReplayState::default();
         let mut subscribers = Vec::new();
-        let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+        let (live_tx, mut live_rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17904,7 +17904,7 @@ mod tests {
                     .expect("typed live chat event"),
             );
         }
-        let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+        let (replay_tx, mut replay_rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -17973,7 +17973,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -18049,7 +18049,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -18118,7 +18118,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -18227,7 +18227,7 @@ mod tests {
         )
         .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         attach_subscriber(
             &event_log,
             Some(&replay_state),
@@ -18307,7 +18307,7 @@ mod tests {
         assert_eq!(snapshot.agent_id.0, "agent-failed");
         assert_eq!(snapshot.name, "Chat");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/agent/agent-failed".to_string()), tx);
         assert!(handle.attach(stream).await);
         let events = recv_agent_bootstrap_events(&mut rx, "AgentBootstrap").await;
@@ -18365,7 +18365,7 @@ mod tests {
             status_handle.clone(),
         );
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "terminal delivery bootstrap").await;
         let before = status_handle.snapshot().await;
@@ -18470,7 +18470,7 @@ mod tests {
             SessionId("relay-delivery-session".to_owned()),
             status_handle.clone(),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "relay delivery bootstrap").await;
         let before = status_handle.snapshot().await;
@@ -18520,7 +18520,7 @@ mod tests {
         .await
         .expect("held mock turn opens");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "queued delivery bootstrap").await;
 
@@ -18559,7 +18559,7 @@ mod tests {
 
     /// Waits for a `QueuedMessages` frame carrying exactly `expected` messages.
     async fn expect_queued_message_count(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         expected: usize,
         context: &str,
     ) {
@@ -18701,7 +18701,7 @@ mod tests {
         // Waiting on that snapshot is what makes this test deterministic —
         // without it the interrupt could be answered by the still-`Running`
         // actor and pass vacuously.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "interrupt-while-closing bootstrap").await;
         assert_eq!(
@@ -18765,7 +18765,7 @@ mod tests {
         .await
         .expect("held mock turn opens");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "input-after-close bootstrap").await;
         assert_eq!(
@@ -18844,7 +18844,7 @@ mod tests {
         // barrier completion itself. Its bootstrap is a snapshot taken at that
         // exact point, which is what makes the assertion below durable rather
         // than a race against the queue drain that follows.
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         let attach_rx = handle
             .begin_attach(replay_stream(output_tx))
             .expect("queue a resume-gated attachment");
@@ -19423,7 +19423,7 @@ mod tests {
     }
 
     async fn recv_context_terminal(
-        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
     ) -> (ContextCompactionNotifyPayload, usize) {
         timeout(Duration::from_secs(5), async {
             let mut terminal_count = 0;
@@ -19462,7 +19462,7 @@ mod tests {
             metrics: CompactionMetrics::default(),
             message: None,
         };
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let mut subscribers = vec![Stream::new(
             protocol::StreamPath("/agent/session-stamp/test".to_owned()),
             tx,
@@ -19493,7 +19493,7 @@ mod tests {
 
     async fn assert_follow_up_reaches_backend(
         handle: &AgentHandle,
-        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         path: &str,
         mut terminal_count: usize,
         release_held_turn: bool,
@@ -19562,7 +19562,7 @@ mod tests {
             .expect("rejected-terminal actor startup reply")
             .expect("rejected-terminal actor startup");
         wait_for_idle_actor(&status_handle).await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         assert!(handle.attach(replay_stream(tx)).await);
         let _ = recv_agent_bootstrap_events(&mut rx, "rejected-terminal bootstrap").await;
         assert_eq!(
@@ -19715,7 +19715,7 @@ mod tests {
             } else {
                 wait_for_idle_actor(&status_handle).await;
             }
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = crate::stream::output_channel();
             assert!(handle.attach(replay_stream(tx)).await);
             let _ = recv_agent_bootstrap_events(&mut rx, "compaction terminal bootstrap").await;
             let preserved_token_count = 42_424;

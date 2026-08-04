@@ -154,6 +154,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -655,6 +656,28 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_settings payload: {error}"),
             ),
         },
+        FrameKind::VoiceCapabilities => {
+            match envelope.parse_payload::<protocol::VoiceCapabilitiesPayload>() {
+                Ok(payload) => state.voice_capabilities_by_host.update(|values| {
+                    values.insert(host_id.to_owned(), payload);
+                }),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse voice capabilities: {error}"),
+                ),
+            }
+        }
+        FrameKind::VoiceAccepted
+        | FrameKind::VoiceTranscript
+        | FrameKind::VoiceState
+        | FrameKind::VoiceOutput
+        | FrameKind::VoiceStop
+        | FrameKind::VoiceError => {
+            crate::voice::handle_control(state, host_id, &envelope);
+        }
         FrameKind::AgentActivitySummary => {
             match envelope.parse_payload::<AgentActivitySummaryPayload>() {
                 Ok(payload) => apply_agent_activity_summary(state, host_id, payload),
@@ -6752,6 +6775,7 @@ mod restore_fixtures {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

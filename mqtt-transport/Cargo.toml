@@ -66,6 +66,7 @@ getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 mqttbytes = "0.6"
 bytes = "1"
 serde_json.workspace = true
+protocol = { path = "../protocol", features = ["framing"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rcgen = "0.14.7"

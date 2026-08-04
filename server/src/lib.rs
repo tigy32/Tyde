@@ -24,6 +24,8 @@ pub(crate) mod stream;
 pub(crate) mod sub_agent;
 pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
+pub(crate) mod voice;
+pub(crate) mod voice_aws;
 pub(crate) mod workflows;
 
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
@@ -32,6 +34,10 @@ pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 pub use acceptor::{BoundUdsListener, bind_uds, serve_uds};
 pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use agent_control_mcp::AgentControlMcpCaller;
+#[cfg(feature = "test-support")]
+pub use connection::run_connection_with_synthetic_voice;
+#[cfg(feature = "test-support")]
+pub use connection::{ProductionWriterProbe, start_production_writer_probe};
 pub use connection::{run_connection, run_mobile_connection};
 pub use host::{
     HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,

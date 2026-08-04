@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 46;
+pub const PROTOCOL_VERSION: u32 = 47;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1355,6 +1355,11 @@ pub enum FrameKind {
     MobileDeviceRename,
     ClientError,
     Heartbeat,
+    VoiceStart,
+    VoiceAudio,
+    VoiceInputEnd,
+    VoiceInterrupt,
+    VoiceStop,
 
     SetSessionSettings,
     TriggerWorkflow,
@@ -1441,6 +1446,12 @@ pub enum FrameKind {
     WorkflowNotify,
     WorkflowRunNotify,
     HeartbeatAck,
+    VoiceCapabilities,
+    VoiceAccepted,
+    VoiceTranscript,
+    VoiceState,
+    VoiceOutput,
+    VoiceError,
 }
 
 impl fmt::Display for FrameKind {
@@ -1532,6 +1543,11 @@ impl fmt::Display for FrameKind {
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
             Self::ClientError => f.write_str("client_error"),
             Self::Heartbeat => f.write_str("heartbeat"),
+            Self::VoiceStart => f.write_str("voice_start"),
+            Self::VoiceAudio => f.write_str("voice_audio"),
+            Self::VoiceInputEnd => f.write_str("voice_input_end"),
+            Self::VoiceInterrupt => f.write_str("voice_interrupt"),
+            Self::VoiceStop => f.write_str("voice_stop"),
             Self::TriggerWorkflow => f.write_str("trigger_workflow"),
             Self::CancelWorkflow => f.write_str("cancel_workflow"),
             Self::WorkflowRefresh => f.write_str("workflow_refresh"),
@@ -1617,6 +1633,12 @@ impl fmt::Display for FrameKind {
             Self::WorkflowNotify => f.write_str("workflow_notify"),
             Self::WorkflowRunNotify => f.write_str("workflow_run_notify"),
             Self::HeartbeatAck => f.write_str("heartbeat_ack"),
+            Self::VoiceCapabilities => f.write_str("voice_capabilities"),
+            Self::VoiceAccepted => f.write_str("voice_accepted"),
+            Self::VoiceTranscript => f.write_str("voice_transcript"),
+            Self::VoiceState => f.write_str("voice_state"),
+            Self::VoiceOutput => f.write_str("voice_output"),
+            Self::VoiceError => f.write_str("voice_error"),
         }
     }
 }
@@ -2540,6 +2562,8 @@ pub struct HostSettings {
     /// a `hermes` session started outside Tyde still sees the provider.
     #[serde(default)]
     pub hermes_disabled_providers: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub voice: VoiceSettings,
 }
 
 impl Default for HostSettings {
@@ -2559,6 +2583,37 @@ impl Default for HostSettings {
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: HashMap::new(),
+            voice: VoiceSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+    #[serde(default = "default_voice_nova_model")]
+    pub nova_model: String,
+    #[serde(default)]
+    pub availability: VoiceAvailability,
+}
+
+fn default_voice_nova_model() -> String {
+    "amazon.nova-2-sonic-v1:0".into()
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            aws_profile: None,
+            aws_region: None,
+            nova_model: default_voice_nova_model(),
+            availability: VoiceAvailability::default(),
         }
     }
 }
@@ -2860,6 +2915,18 @@ pub enum HostSettingValue {
         profile: String,
         providers: Vec<String>,
     },
+    VoiceEnabled {
+        enabled: bool,
+    },
+    VoiceAwsProfile {
+        profile: Option<String>,
+    },
+    VoiceAwsRegion {
+        region: Option<String>,
+    },
+    VoiceNovaModel {
+        model: String,
+    },
 }
 
 impl HostSettingValue {
@@ -2911,6 +2978,10 @@ impl HostSettingValue {
             Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
             Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
             Self::HermesDisabledProviders { .. } => HostSettingErrorTarget::HermesDisabledProviders,
+            Self::VoiceEnabled { .. } => HostSettingErrorTarget::VoiceEnabled,
+            Self::VoiceAwsProfile { .. } => HostSettingErrorTarget::VoiceAwsProfile,
+            Self::VoiceAwsRegion { .. } => HostSettingErrorTarget::VoiceAwsRegion,
+            Self::VoiceNovaModel { .. } => HostSettingErrorTarget::VoiceNovaModel,
         }
     }
 }
@@ -2946,6 +3017,10 @@ pub enum HostSettingErrorTarget {
     BackendNativeSettings,
     LaunchProfiles,
     HermesDisabledProviders,
+    VoiceEnabled,
+    VoiceAwsProfile,
+    VoiceAwsRegion,
+    VoiceNovaModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6825,6 +6900,325 @@ pub struct TerminalErrorPayload {
     pub fatal: bool,
 }
 
+pub const VOICE_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_VOICE_PACKETS_PER_FRAME: usize = 3;
+pub const MAX_VOICE_AUDIO_BYTES: usize = 8 * 1024;
+pub const VOICE_SESSION_MAX_SECONDS: u64 = 450;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VoiceSessionId(pub String);
+
+impl fmt::Display for VoiceSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceTarget {
+    pub agent_id: AgentId,
+    pub instance_stream: StreamPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceAudioCodec {
+    Opus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceAudioFormat {
+    pub codec: VoiceAudioCodec,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub frame_duration_ms: u16,
+    pub target_bitrate_bps: u32,
+}
+
+impl VoiceAudioFormat {
+    pub fn opus(sample_rate_hz: u32) -> Self {
+        Self {
+            codec: VoiceAudioCodec::Opus,
+            sample_rate_hz,
+            channels: 1,
+            frame_duration_ms: 20,
+            target_bitrate_bps: 24_000,
+        }
+    }
+    pub fn valid(&self) -> bool {
+        matches!(
+            self.sample_rate_hz,
+            8_000 | 12_000 | 16_000 | 24_000 | 48_000
+        ) && self.channels == 1
+            && self.frame_duration_ms == 20
+            && (6_000..=64_000).contains(&self.target_bitrate_bps)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserAecStatus {
+    Requested,
+    Effective,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceFormatPair {
+    pub uplink: VoiceAudioFormat,
+    pub downlink: VoiceAudioFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceCapabilitiesPayload {
+    pub protocol: u16,
+    pub formats: Vec<VoiceFormatPair>,
+    pub max_batch_packets: u8,
+    pub max_sessions_per_connection: u8,
+    pub nova_available: bool,
+    pub native_capture: bool,
+    pub native_aec: bool,
+    pub browser_capture: bool,
+    pub browser_aec: BrowserAecStatus,
+    pub foreground_only: bool,
+}
+
+impl VoiceCapabilitiesPayload {
+    pub fn for_connection(available: bool, desktop: bool) -> Self {
+        Self {
+            protocol: VOICE_PROTOCOL_VERSION,
+            formats: vec![VoiceFormatPair {
+                uplink: VoiceAudioFormat::opus(48_000),
+                downlink: VoiceAudioFormat::opus(24_000),
+            }],
+            max_batch_packets: 1,
+            max_sessions_per_connection: 1,
+            nova_available: available,
+            native_capture: desktop,
+            native_aec: desktop,
+            browser_capture: !desktop,
+            browser_aec: if desktop {
+                BrowserAecStatus::Unavailable
+            } else {
+                BrowserAecStatus::Requested
+            },
+            foreground_only: !desktop,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.protocol == VOICE_PROTOCOL_VERSION
+            && !self.formats.is_empty()
+            && self
+                .formats
+                .iter()
+                .all(|pair| pair.uplink.valid() && pair.downlink.valid())
+            && (1..=MAX_VOICE_PACKETS_PER_FRAME as u8).contains(&self.max_batch_packets)
+            && self.max_sessions_per_connection == 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceStartPayload {
+    pub generation: u64,
+    pub target: VoiceTarget,
+    pub formats: Vec<VoiceFormatPair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceAcceptedPayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+    pub target: VoiceTarget,
+    pub uplink: VoiceAudioFormat,
+    pub downlink: VoiceAudioFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceDirection {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceAudioPayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+    pub direction: VoiceDirection,
+    pub first_media_seq: u64,
+    pub timestamp_samples_48k: u64,
+    pub packet_lengths: Vec<u16>,
+}
+
+impl VoiceAudioPayload {
+    pub fn validate_body(&self, body_len: usize) -> Result<(), &'static str> {
+        if self.packet_lengths.is_empty() || self.packet_lengths.len() > MAX_VOICE_PACKETS_PER_FRAME
+        {
+            return Err("voice packet count out of range");
+        }
+        if body_len > MAX_VOICE_AUDIO_BYTES
+            || self
+                .packet_lengths
+                .iter()
+                .map(|v| usize::from(*v))
+                .sum::<usize>()
+                != body_len
+        {
+            return Err("voice body length mismatch");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSessionPayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceTranscriptSpeaker {
+    User,
+    Assistant,
+    Progress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceTranscriptPayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+    pub speaker: VoiceTranscriptSpeaker,
+    pub text: String,
+    pub is_final: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<ChatMessageId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionState {
+    Starting,
+    Listening,
+    AgentWorking,
+    Speaking,
+    Interrupting,
+    Ending,
+    Ended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceStatePayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+    pub state: VoiceSessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_turn_id: Option<ModelTurnId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceFlowStats {
+    pub admitted_packets: u64,
+    pub dropped_packets: u64,
+    pub admitted_bytes: u64,
+    pub dropped_bytes: u64,
+    pub queue_high_water_packets: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceStopReason {
+    UserExited,
+    TargetChanged,
+    ClientBackgrounded,
+    PermissionLost,
+    MediaFailed,
+    TransportLost,
+    AgentClosed,
+    Inactivity,
+    ServerShutdown,
+    ProviderCompleted,
+    ProviderFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceStopPayload {
+    pub session_id: VoiceSessionId,
+    pub generation: u64,
+    pub reason: VoiceStopReason,
+    #[serde(default)]
+    pub stats: VoiceFlowStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceUnavailableReason {
+    NotEnabled,
+    MissingCredentials,
+    CredentialsExpired,
+    RegionNotConfigured,
+    ModelUnsupported,
+    ServerAdapterUnavailable,
+    ClientMediaUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VoiceAvailability {
+    Available,
+    Unavailable { reason: VoiceUnavailableReason },
+}
+
+impl Default for VoiceAvailability {
+    fn default() -> Self {
+        Self::Unavailable {
+            reason: VoiceUnavailableReason::NotEnabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceErrorCode {
+    InvalidRequest,
+    AlreadyActive,
+    NotAvailable,
+    StaleGeneration,
+    WrongTarget,
+    InvalidAudio,
+    ProviderUnavailable,
+    CredentialsExpired,
+    ToolBusy,
+    ToolDeliveryFailed,
+    Inactivity,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceErrorPayload {
+    pub session_id: Option<VoiceSessionId>,
+    pub generation: u64,
+    pub code: VoiceErrorCode,
+    pub retryable: bool,
+    pub fatal: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandErrorCode {
@@ -8221,7 +8615,7 @@ mod search_serde_tests {
 
     #[test]
     fn protocol_version_is_forty_six() {
-        assert_eq!(PROTOCOL_VERSION, 46);
+        assert_eq!(PROTOCOL_VERSION, 47);
     }
 
     #[test]
@@ -8781,6 +9175,7 @@ mod search_serde_tests {
                 backend_config: HashMap::new(),
                 launch_profiles: Vec::new(),
                 hermes_disabled_providers: Default::default(),
+                voice: Default::default(),
             },
             mobile_access: MobileAccessStatePayload {
                 broker_status: MobileBrokerStatus::Disabled,

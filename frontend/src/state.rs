@@ -3747,6 +3747,9 @@ pub struct AppState {
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
     pub host_lifecycle_statuses: RwSignal<HashMap<String, RemoteHostLifecycleStatus>>,
     pub command_errors_by_host: RwSignal<HashMap<String, String>>,
+    pub voice_capabilities_by_host: RwSignal<HashMap<String, protocol::VoiceCapabilitiesPayload>>,
+    pub voice_ui: RwSignal<crate::voice::VoiceUiState>,
+    pub voice_generation: RwSignal<u64>,
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
@@ -4314,6 +4317,9 @@ impl AppState {
             connection_statuses: RwSignal::new(HashMap::new()),
             host_lifecycle_statuses: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
+            voice_capabilities_by_host: RwSignal::new(HashMap::new()),
+            voice_ui: RwSignal::new(crate::voice::VoiceUiState::Idle),
+            voice_generation: RwSignal::new(0),
             projects: RwSignal::new(Vec::new()),
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),
@@ -8815,6 +8821,7 @@ mod tests {
                         backend_config: std::collections::HashMap::new(),
                         launch_profiles: Vec::new(),
                         hermes_disabled_providers: Default::default(),
+                        voice: Default::default(),
                     },
                 );
                 settings.insert(
@@ -8834,6 +8841,7 @@ mod tests {
                         backend_config: std::collections::HashMap::new(),
                         launch_profiles: Vec::new(),
                         hermes_disabled_providers: Default::default(),
+                        voice: Default::default(),
                     },
                 );
             });

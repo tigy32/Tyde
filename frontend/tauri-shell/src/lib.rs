@@ -8,6 +8,7 @@ mod host_uds;
 mod logging;
 mod remote_bootstrap;
 mod router;
+mod voice_media;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -166,6 +167,7 @@ struct ShellState {
     host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
     web_content_recovery: Arc<Mutex<WebContentRecoveryPolicies>>,
+    voice_media: voice_media::NativeVoiceMedia,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -867,7 +869,10 @@ async fn disconnect_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<(), String> {
-    state.router.disconnect(host_id).await
+    let media_result = state.voice_media.stop_for_host(&host_id);
+    let disconnect_result = state.router.disconnect(host_id).await;
+    media_result?;
+    disconnect_result
 }
 
 #[tauri::command]
@@ -877,6 +882,52 @@ async fn send_host_line(
     line: String,
 ) -> Result<(), String> {
     state.router.send_line(host_id, line).await
+}
+
+#[tauri::command]
+async fn send_host_frame(
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+    envelope: String,
+    binary: Vec<u8>,
+) -> Result<(), String> {
+    let envelope: protocol::Envelope =
+        serde_json::from_str(&envelope).map_err(|error| format!("invalid host frame: {error}"))?;
+    state.router.send_frame(host_id, envelope, binary)
+}
+
+#[tauri::command]
+async fn voice_media_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+    generation: u64,
+) -> Result<(), String> {
+    state.voice_media.start(app, host_id, generation)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn voice_media_push_output(
+    state: tauri::State<'_, voice_media::NativeVoiceMedia>,
+    generation: u64,
+    media_seq: u64,
+    timestamp_samples_48k: u64,
+    opus: Vec<u8>,
+) -> Result<(), String> {
+    state.push_output(generation, media_seq, timestamp_samples_48k, opus)
+}
+
+#[tauri::command]
+async fn voice_media_flush_output(
+    state: tauri::State<'_, ShellState>,
+    generation: u64,
+) -> Result<(), String> {
+    state.voice_media.flush_output(generation)
+}
+
+#[tauri::command]
+async fn voice_media_stop(state: tauri::State<'_, ShellState>) -> Result<(), String> {
+    state.voice_media.stop()
 }
 
 #[tauri::command]
@@ -938,7 +989,9 @@ async fn remove_configured_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<ConfiguredHostStore, String> {
+    let media_result = state.voice_media.stop_for_host(&host_id);
     let _ = state.router.disconnect(host_id.clone()).await;
+    media_result?;
     state.host_store.remove(&host_id)
 }
 
@@ -1052,6 +1105,51 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to send feedback: {e}"))?;
     Ok(())
+}
+
+fn production_invoke_handler<R, F>(
+    other_handler: F,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
+where
+    R: tauri::Runtime,
+    F: Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
+{
+    let voice_output_handler: Box<dyn Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync> =
+        Box::new(tauri::generate_handler![voice_media_push_output]);
+    move |invoke| {
+        if invoke.message.command() == "voice_media_push_output" {
+            voice_output_handler(invoke)
+        } else {
+            other_handler(invoke)
+        }
+    }
+}
+
+macro_rules! other_production_invoke_handler {
+    () => {
+        tauri::generate_handler![
+            connect_host,
+            disconnect_host,
+            send_host_line,
+            send_host_frame,
+            voice_media_start,
+            voice_media_flush_output,
+            voice_media_stop,
+            probe_configured_host_lifecycle,
+            ensure_configured_host_ready,
+            force_upgrade_managed_host,
+            list_configured_hosts,
+            upsert_configured_host,
+            remove_configured_host,
+            set_selected_host,
+            mark_ui_debug_ready,
+            mark_frontend_ready,
+            report_frontend_lifecycle,
+            submit_ui_debug_response,
+            submit_feedback,
+            open_external_url
+        ]
+    };
 }
 
 pub fn run() {
@@ -1276,38 +1374,30 @@ pub fn run() {
                 tracing::info!("dev host listener ready at {addr}");
             }
 
+            let voice_media =
+                voice_media::NativeVoiceMedia::new().map_err(std::io::Error::other)?;
+            app.manage(voice_media.clone());
             app.manage(ShellState {
                 router,
                 host,
                 host_store,
                 ui_debug,
                 web_content_recovery: recovery_for_setup,
+                voice_media,
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            connect_host,
-            disconnect_host,
-            send_host_line,
-            probe_configured_host_lifecycle,
-            ensure_configured_host_ready,
-            force_upgrade_managed_host,
-            list_configured_hosts,
-            upsert_configured_host,
-            remove_configured_host,
-            set_selected_host,
-            mark_ui_debug_ready,
-            mark_frontend_ready,
-            report_frontend_lifecycle,
-            submit_ui_debug_response,
-            submit_feedback,
-            open_external_url
-        ])
+        .invoke_handler(production_invoke_handler::<tauri::Wry, _>(
+            other_production_invoke_handler!(),
+        ))
         .build(tauri::generate_context!())
         .expect("failed to build desktop shell");
 
     app.run(move |app, event| {
         if let RunEvent::ExitRequested { code, api, .. } = event {
+            if let Err(error) = app.state::<ShellState>().voice_media.stop() {
+                tracing::error!(%error, "native audio teardown was not acknowledged");
+            }
             if code == Some(tauri::RESTART_EXIT_CODE)
                 || quit_confirmation_for_run.consume_confirmed_exit()
             {
@@ -1339,6 +1429,85 @@ pub fn run_host_launch_uds() -> Result<(), String> {
 
 pub fn run_host_bridge_uds() -> Result<(), String> {
     host_bridge_uds::run()
+}
+
+#[cfg(test)]
+mod voice_media_command_contract_tests {
+    use super::*;
+    use tauri::Manager;
+
+    fn invoke_request(body: serde_json::Value) -> tauri::webview::InvokeRequest {
+        tauri::webview::InvokeRequest {
+            cmd: "voice_media_push_output".into(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: if cfg!(windows) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .expect("valid Tauri URL"),
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+        }
+    }
+
+    #[test]
+    fn production_handler_dispatches_camel_case_output_and_rejects_snake_case() {
+        let media = voice_media::NativeVoiceMedia::new().expect("start native audio thread");
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::new(voice_media::TestSinkObservation::default());
+        media.authorize("ipc-test-host".into(), 7).unwrap();
+        media
+            .activate_test_with_sink("ipc-test-host", 7, opened, dropped, sink.clone())
+            .unwrap();
+        let app = tauri::test::mock_builder()
+            .invoke_handler(production_invoke_handler::<tauri::test::MockRuntime, _>(
+                tauri::generate_handler![],
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build production-handler mock app");
+        assert!(app.manage(media.clone()));
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build mock webview");
+
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            invoke_request(serde_json::json!({
+                "generation": 7,
+                "mediaSeq": 9,
+                "timestampSamples48k": 8_640,
+                "opus": [1, 2, 255]
+            })),
+        )
+        .expect("camel-case command must dispatch");
+        assert_eq!(
+            response.deserialize::<serde_json::Value>().unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(sink.received_packets.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.last_media_seq.load(Ordering::SeqCst), 9);
+
+        assert!(
+            tauri::test::get_ipc_response(
+                &webview,
+                invoke_request(serde_json::json!({
+                    "generation": 7,
+                    "media_seq": 10,
+                    "timestamp_samples_48k": 9_600,
+                    "opus": [4, 5, 6]
+                })),
+            )
+            .is_err()
+        );
+        assert_eq!(sink.received_packets.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.last_media_seq.load(Ordering::SeqCst), 9);
+        media.stop().unwrap();
+    }
 }
 
 #[cfg(test)]

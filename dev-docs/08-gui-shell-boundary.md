@@ -31,32 +31,38 @@ itself.
 
 The `tauri-shell` crate is a Tauri transport shell nested under `frontend/`.
 
-It owns only:
+It owns:
 
 - opening connections to hosts
 - closing connections to hosts
-- forwarding raw newline-delimited JSON lines from the GUI to a host
-- forwarding raw newline-delimited JSON lines from a host back to the GUI
+- forwarding ordinary control envelopes between the GUI and a host
+- native microphone/output device lifetime for accepted voice sessions
+- native echo cancellation, 20 ms Opus encoding, and Opus decoding/playback
 
-It does **not** own:
+It does **not** own ordinary application semantics. Its only protocol-aware
+exception is the shared record codec and the narrow `VoiceAudio` validation
+needed to keep raw PCM out of IPC. It does not own:
 
-- `FrameKind`
-- `Envelope`
+- non-voice `FrameKind` branching
+- non-voice payload interpretation
 - payload structs
 - sequence counters
 - agent/project/session state
 - protocol branching
 - backend semantics
 
-The shell is a byte/line proxy with host connection ownership.
+The shell is otherwise a byte proxy with host connection ownership. Voice is
+the deliberate media exception: raw PCM never crosses WebView IPC.
 
 ## API Shape
 
-The shell API is intentionally protocol-agnostic:
+The shell API is protocol-agnostic except for the native voice media boundary:
 
 - `connect_host`
 - `disconnect_host`
 - `send_host_line`
+- `send_host_frame` for a typed envelope plus a bounded Opus body
+- `voice_media_start`, `voice_media_push_output`, `voice_media_stop`
 - emit `tyde://host-line`
 - emit `tyde://host-disconnected`
 - emit `tyde://host-error`
@@ -65,10 +71,15 @@ The payload crossing the shell boundary is just:
 
 - host identity
 - transport config
-- raw NDJSON line text
+- ordinary envelope JSON text, or a bounded Opus packet with its typed envelope
 
-That is the whole point. If the shell can understand a Tyde protocol frame,
-the boundary has already been violated.
+Tauri managed state holds only the native-audio thread's bounded control
+handle. CPAL streams, device state, AEC, Opus codecs, and active media identity
+never enter managed state or WebView IPC. Lifecycle commands are acknowledged
+after resource drop and use bounded fail-closed waits.
+
+The shell may inspect only the voice media envelope needed to bind Opus to a
+session and generation. It must not own agent behavior or expose PCM arrays.
 
 ## Consequence
 

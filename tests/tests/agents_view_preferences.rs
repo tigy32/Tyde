@@ -16,8 +16,7 @@ use protocol::{
     HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload,
     ProjectNotifyPayload, SessionId, SetAgentGroupsPayload, SetAgentPinsPayload,
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SmartView,
-    SmartViewId, SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, read_envelope,
-    write_envelope,
+    SmartViewId, SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, write_envelope,
 };
 
 async fn connect_host(host: server::HostHandle) -> (client::Connection, HostBootstrapPayload) {
@@ -184,8 +183,7 @@ async fn expect_raw_kind(
 ) -> Envelope {
     loop {
         let envelope =
-            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
-                .await
+            match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope()).await
             {
                 Ok(Ok(Some(envelope))) => envelope,
                 Ok(Ok(None)) => panic!("connection closed before {context}"),
@@ -517,15 +515,14 @@ async fn expect_client_kind_any_agent_start(
     context: &str,
 ) -> Envelope {
     loop {
-        let env =
-            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
-                .await
-            {
-                Ok(Ok(Some(env))) => env,
-                Ok(Ok(None)) => panic!("connection closed before {context}"),
-                Ok(Err(err)) => panic!("read envelope failed before {context}: {err:?}"),
-                Err(_) => panic!("timed out waiting for {context}"),
-            };
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
+            .await
+        {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("read envelope failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
         client
             .incoming_seq
             .validate(&env.stream, env.seq, env.kind)
@@ -556,15 +553,14 @@ async fn expect_promoted_manual_assignment(
     let mut session_id = None;
     let mut latest_notify = None;
     loop {
-        let env =
-            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
-                .await
-            {
-                Ok(Ok(Some(env))) => env,
-                Ok(Ok(None)) => panic!("connection closed before promoted assignment"),
-                Ok(Err(err)) => panic!("read envelope failed before promoted assignment: {err:?}"),
-                Err(_) => panic!("timed out waiting for promoted assignment"),
-            };
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
+            .await
+        {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before promoted assignment"),
+            Ok(Err(err)) => panic!("read envelope failed before promoted assignment: {err:?}"),
+            Err(_) => panic!("timed out waiting for promoted assignment"),
+        };
         client
             .incoming_seq
             .validate(&env.stream, env.seq, env.kind)
@@ -625,17 +621,16 @@ async fn expect_promoted_group_assignment(
     let mut session_id = None;
     let mut latest_notify = None;
     loop {
-        let env =
-            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
-                .await
-            {
-                Ok(Ok(Some(env))) => env,
-                Ok(Ok(None)) => panic!("connection closed before promoted group assignment"),
-                Ok(Err(err)) => {
-                    panic!("read envelope failed before promoted group assignment: {err:?}")
-                }
-                Err(_) => panic!("timed out waiting for promoted group assignment"),
-            };
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
+            .await
+        {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before promoted group assignment"),
+            Ok(Err(err)) => {
+                panic!("read envelope failed before promoted group assignment: {err:?}")
+            }
+            Err(_) => panic!("timed out waiting for promoted group assignment"),
+        };
         client
             .incoming_seq
             .validate(&env.stream, env.seq, env.kind)

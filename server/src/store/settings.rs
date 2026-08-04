@@ -522,6 +522,16 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                     .insert(profile.to_owned(), slugs);
             }
         }
+        HostSettingValue::VoiceEnabled { enabled } => settings.voice.enabled = enabled,
+        HostSettingValue::VoiceAwsProfile { profile } => {
+            settings.voice.aws_profile = normalize_optional_voice_setting(profile, "AWS profile")?;
+        }
+        HostSettingValue::VoiceAwsRegion { region } => {
+            settings.voice.aws_region = normalize_optional_voice_setting(region, "AWS region")?;
+        }
+        HostSettingValue::VoiceNovaModel { model } => {
+            settings.voice.nova_model = validate_voice_model(&model)?.to_owned();
+        }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
                 settings.background_agent_features.auto_generate_agent_names = enabled;
@@ -710,6 +720,7 @@ fn empty_settings() -> HostSettings {
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
         hermes_disabled_providers: std::collections::HashMap::new(),
+        voice: Default::default(),
     }
 }
 
@@ -797,6 +808,23 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         })
         .collect();
 
+    let mut voice = settings.voice;
+    voice.aws_profile = normalize_optional_voice_setting(voice.aws_profile, "AWS profile")?;
+    voice.aws_region = normalize_optional_voice_setting(voice.aws_region, "AWS region")?;
+    voice.nova_model = validate_voice_model(&voice.nova_model)?.to_owned();
+    // Availability is runtime-derived and must never be trusted from disk.
+    voice.availability = if !voice.enabled {
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::NotEnabled,
+        }
+    } else if voice.aws_region.is_none() {
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+        }
+    } else {
+        protocol::VoiceAvailability::Available
+    };
+
     Ok(HostSettings {
         enabled_backends,
         default_backend: settings.default_backend,
@@ -812,7 +840,30 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         backend_config,
         launch_profiles,
         hermes_disabled_providers,
+        voice,
     })
+}
+
+fn normalize_optional_voice_setting(
+    value: Option<String>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(format!("{name} is invalid"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn validate_voice_model(model: &str) -> Result<&str, String> {
+    match model.trim() {
+        "amazon.nova-2-sonic-v1:0" | "amazon.nova-sonic-v1:0" => Ok(model.trim()),
+        _ => Err("unsupported Nova Sonic model".to_owned()),
+    }
 }
 
 fn validate_code_intel_settings(settings: CodeIntelSettings) -> Result<CodeIntelSettings, String> {
@@ -1605,6 +1656,29 @@ mod tests {
         assert_eq!(
             settings.backend_tier_configs.get(&BackendKind::Claude),
             Some(&edited)
+        );
+    }
+
+    #[test]
+    fn voice_settings_validate_exact_model_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HostSettingsStore::load(dir.path().join("settings.json")).unwrap();
+        let settings = store
+            .apply(HostSettingValue::VoiceNovaModel {
+                model: "amazon.nova-2-sonic-v1:0".into(),
+            })
+            .unwrap();
+        assert_eq!(settings.voice.nova_model, "amazon.nova-2-sonic-v1:0");
+        assert!(
+            store
+                .apply(HostSettingValue::VoiceNovaModel {
+                    model: "amazon.unknown".into()
+                })
+                .is_err()
+        );
+        assert_eq!(
+            store.get().unwrap().voice.nova_model,
+            "amazon.nova-2-sonic-v1:0"
         );
     }
 }

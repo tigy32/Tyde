@@ -126,6 +126,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -357,6 +358,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 });
             }
         }
+        FrameKind::VoiceCapabilities => {
+            if let Ok(payload) = envelope.parse_payload::<protocol::VoiceCapabilitiesPayload>() {
+                state.voice_capabilities_by_host.update(|caps| {
+                    caps.insert(host.clone(), payload);
+                });
+            }
+        }
+        FrameKind::VoiceAccepted
+        | FrameKind::VoiceTranscript
+        | FrameKind::VoiceState
+        | FrameKind::VoiceOutput
+        | FrameKind::VoiceStop
+        | FrameKind::VoiceError => crate::voice::handle_control(state, host, &envelope),
         FrameKind::AgentActivitySummary => {
             match envelope.parse_payload::<AgentActivitySummaryPayload>() {
                 Ok(_payload) => {}
@@ -5021,6 +5035,7 @@ mod wasm_tests {
                 backend_config: std::collections::HashMap::new(),
                 launch_profiles: Vec::new(),
                 hermes_disabled_providers: Default::default(),
+                voice: Default::default(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,

@@ -66,12 +66,13 @@ const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
 const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(300);
-/// Outbound data budget: sustained rate and burst allowance for encrypted data
-/// publishes. AWS IoT enforces a fixed 512 KiB/s per-connection throughput cap
-/// (inbound + outbound) and delays traffic beyond it; publishing under the cap
-/// keeps PUBACKs flowing instead of relying on the stall watchdog. The budget
-/// is post-charged at whole-batch granularity, so a single batch may overshoot
-/// by up to one 64 KiB chunk before pacing kicks in.
+/// Outbound managed-service data budget: sustained rate and burst allowance for
+/// encrypted data publishes. AWS IoT enforces a fixed 512 KiB/s per-connection
+/// throughput cap (inbound + outbound) and delays traffic beyond it; publishing
+/// under the cap keeps PUBACKs flowing instead of relying on the stall watchdog.
+/// Loopback brokers have no managed-service quota and bypass this budget. The
+/// budget is post-charged at whole-batch granularity, so a single batch may
+/// overshoot by up to one 64 KiB chunk before pacing kicks in.
 const OUTBOUND_BUDGET_BYTES_PER_SEC: f64 = 384.0 * 1024.0;
 const OUTBOUND_BUDGET_BURST_BYTES: f64 = 256.0 * 1024.0;
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -1242,6 +1243,23 @@ impl OutboundByteBudget {
         Self::with_rate(OUTBOUND_BUDGET_BYTES_PER_SEC, OUTBOUND_BUDGET_BURST_BYTES)
     }
 
+    pub(crate) fn for_endpoint(endpoint: &protocol::BrokerUrl) -> Self {
+        let is_loopback = url::Url::parse(endpoint.as_str())
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+        if is_loopback {
+            Self::with_rate(1e12, 1e12)
+        } else {
+            Self::new()
+        }
+    }
+
     fn with_rate(rate_bytes_per_sec: f64, burst_bytes: f64) -> Self {
         Self {
             rate_bytes_per_sec,
@@ -2171,6 +2189,19 @@ mod tests {
             .expect("timed out waiting for ack B")
             .expect("ack B sender dropped")
             .expect("ack B failed");
+    }
+
+    #[test]
+    fn loopback_brokers_are_not_subject_to_managed_service_pacing() {
+        let loopback = BrokerUrl::new("mqtt://127.0.0.1:1883").unwrap();
+        let mut local = OutboundByteBudget::for_endpoint(&loopback);
+        local.charge(4 * 1024 * 1024);
+        assert_eq!(local.delay_until_ready(), Duration::ZERO);
+
+        let remote = BrokerUrl::new("wss://broker.example.test/mqtt").unwrap();
+        let mut managed = OutboundByteBudget::for_endpoint(&remote);
+        managed.charge(4 * 1024 * 1024);
+        assert!(managed.delay_until_ready() > Duration::ZERO);
     }
 
     /// Data publishes are paced by the outbound byte budget: with a budget

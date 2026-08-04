@@ -21,8 +21,12 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = "invoke", catch)]
     async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = "listen")]
-    fn tauri_listen(event: &str, handler: &Closure<dyn Fn(JsValue)>) -> js_sys::Promise;
+    #[wasm_bindgen(
+        js_namespace = ["window", "__TAURI__", "event"],
+        js_name = "listen",
+        catch
+    )]
+    fn tauri_listen(event: &str, handler: &Closure<dyn Fn(JsValue)>) -> Result<JsValue, JsValue>;
 }
 
 // --- Request/response types (owned by frontend, matching tauri-shell's bridge) ---
@@ -144,6 +148,92 @@ pub async fn send_host_line(request: SendHostLineRequest) -> Result<(), String> 
     tauri_invoke("send_host_line", args)
         .await
         .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendHostFrameArgs<'a> {
+    host_id: &'a str,
+    envelope: &'a str,
+    binary: &'a [u8],
+}
+
+pub async fn send_host_frame(host_id: &str, envelope: &str, binary: &[u8]) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SendHostFrameArgs {
+        host_id,
+        envelope,
+        binary,
+    })
+    .map_err(|error| error.to_string())?;
+    tauri_invoke("send_host_frame", args)
+        .await
+        .map_err(|error| tauri_error_message("send_host_frame", error))?;
+    Ok(())
+}
+
+pub async fn voice_media_start(host_id: &str, generation: u64) -> Result<(), String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args<'a> {
+        host_id: &'a str,
+        generation: u64,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args {
+        host_id,
+        generation,
+    })
+    .map_err(|error| error.to_string())?;
+    tauri_invoke("voice_media_start", args)
+        .await
+        .map_err(|error| tauri_error_message("voice_media_start", error))?;
+    Ok(())
+}
+
+pub async fn voice_media_push_output(
+    generation: u64,
+    media_seq: u64,
+    timestamp_samples_48k: u64,
+    opus: &[u8],
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args<'a> {
+        generation: u64,
+        media_seq: u64,
+        timestamp_samples_48k: u64,
+        opus: &'a [u8],
+    }
+    let args = serde_wasm_bindgen::to_value(&Args {
+        generation,
+        media_seq,
+        timestamp_samples_48k,
+        opus,
+    })
+    .map_err(|error| error.to_string())?;
+    tauri_invoke("voice_media_push_output", args)
+        .await
+        .map_err(|error| tauri_error_message("voice_media_push_output", error))?;
+    Ok(())
+}
+
+pub async fn voice_media_flush_output(generation: u64) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Args {
+        generation: u64,
+    }
+    let args =
+        serde_wasm_bindgen::to_value(&Args { generation }).map_err(|error| error.to_string())?;
+    tauri_invoke("voice_media_flush_output", args)
+        .await
+        .map_err(|error| tauri_error_message("voice_media_flush_output", error))?;
+    Ok(())
+}
+
+pub async fn voice_media_stop() -> Result<(), String> {
+    tauri_invoke("voice_media_stop", JsValue::NULL)
+        .await
+        .map_err(|error| tauri_error_message("voice_media_stop", error))?;
     Ok(())
 }
 
@@ -302,6 +392,80 @@ pub struct UnlistenHandle {
     unlisten: JsValue,
 }
 
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostVoiceFrameEvent {
+    pub host_id: String,
+    pub envelope: String,
+    pub opus: Vec<u8>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceOpusPacketEvent {
+    pub generation: u64,
+    pub media_seq: u64,
+    pub timestamp_samples_48k: u64,
+    pub opus: Vec<u8>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceMediaStateEvent {
+    pub generation: u64,
+    pub state: String,
+    pub native_aec: bool,
+}
+
+pub async fn listen_host_voice_frame(
+    callback: impl Fn(HostVoiceFrameEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://host-voice-frame",
+        move |value| match serde_wasm_bindgen::from_value::<TauriEvent<HostVoiceFrameEvent>>(value)
+        {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host voice frame: {error}"),
+        },
+    )
+    .await
+}
+
+pub async fn listen_voice_opus_packet(
+    callback: impl Fn(VoiceOpusPacketEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://voice-opus-packet",
+        move |value| match decode_voice_opus_packet_event(value) {
+            Ok(event) => callback(event),
+            Err(error) => log::error!("failed to parse native Opus packet: {error}"),
+        },
+    )
+    .await
+}
+
+pub(crate) fn decode_voice_opus_packet_event(
+    value: JsValue,
+) -> Result<VoiceOpusPacketEvent, String> {
+    let event = serde_wasm_bindgen::from_value::<TauriEvent<VoiceOpusPacketEvent>>(value)
+        .map_err(|error| error.to_string())?;
+    Ok(event.payload)
+}
+
+pub async fn listen_voice_media_state(
+    callback: impl Fn(VoiceMediaStateEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://voice-media-state",
+        move |value| match serde_wasm_bindgen::from_value::<TauriEvent<VoiceMediaStateEvent>>(value)
+        {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse native voice media state: {error}"),
+        },
+    )
+    .await
+}
+
 impl UnlistenHandle {
     pub fn remove(self) {
         if let Ok(callback) = self.unlisten.dyn_into::<Function>() {
@@ -384,10 +548,15 @@ async fn listen_event(
     handler: impl Fn(JsValue) + 'static,
 ) -> Result<UnlistenHandle, String> {
     let closure = Closure::new(handler);
-    let promise = tauri_listen(event_name, &closure);
+    let promise = tauri_listen(event_name, &closure)
+        .map_err(|_| format!("failed to register {event_name}: Tauri event API unavailable"))?
+        .dyn_into::<js_sys::Promise>()
+        .map_err(|_| {
+            format!("failed to register {event_name}: listener did not return a promise")
+        })?;
     let unlisten = JsFuture::from(promise)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|_| format!("failed to register {event_name}: listener promise rejected"))?;
     Ok(UnlistenHandle {
         _closure: closure,
         unlisten,
@@ -400,6 +569,54 @@ mod wasm_tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    struct WindowPropertyGuard {
+        name: &'static str,
+        existed: bool,
+        value: JsValue,
+    }
+
+    impl WindowPropertyGuard {
+        fn remove(name: &'static str) -> Self {
+            let window = web_sys::window().expect("window");
+            let key = JsValue::from_str(name);
+            let existed = js_sys::Reflect::has(&window, &key).unwrap_or(false);
+            let value = js_sys::Reflect::get(&window, &key).unwrap_or(JsValue::UNDEFINED);
+            let target: &js_sys::Object = window.unchecked_ref();
+            js_sys::Reflect::delete_property(target, &key).expect("remove window property");
+            Self {
+                name,
+                existed,
+                value,
+            }
+        }
+    }
+
+    impl Drop for WindowPropertyGuard {
+        fn drop(&mut self) {
+            let window = web_sys::window().expect("window");
+            let key = JsValue::from_str(self.name);
+            if self.existed {
+                let _ = js_sys::Reflect::set(&window, &key, &self.value);
+            } else {
+                let target: &js_sys::Object = window.unchecked_ref();
+                let _ = js_sys::Reflect::delete_property(target, &key);
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn absent_tauri_event_runtime_rejects_listener_without_throwing() {
+        let _guard = WindowPropertyGuard::remove("__TAURI__");
+        let error = match listen_voice_opus_packet(|_| {}).await {
+            Ok(_) => panic!("listener registration unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "failed to register tyde://voice-opus-packet: Tauri event API unavailable"
+        );
+    }
 
     #[wasm_bindgen_test]
     fn host_rejection_uses_plain_string_or_exception_safe_message() {

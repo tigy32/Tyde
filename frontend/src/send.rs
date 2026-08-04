@@ -38,6 +38,27 @@ struct SequenceReservation {
     host_epoch: u64,
 }
 
+pub async fn send_binary_frame<T: serde::Serialize>(
+    host_id: &str,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+    binary: &[u8],
+) -> Result<(), String> {
+    let _send_lock = acquire_send_lock(host_id, &stream).await;
+    let reservation = reserve_seq(host_id, &stream);
+    let envelope = Envelope::from_payload(stream.clone(), kind, reservation.seq, payload)
+        .map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+    match bridge::send_host_frame(host_id, &encoded, binary).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            release_seq_if_last(host_id, &stream, reservation);
+            Err(error)
+        }
+    }
+}
+
 struct SequenceCursor {
     next: u64,
     host_epoch: u64,

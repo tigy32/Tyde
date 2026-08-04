@@ -70,6 +70,7 @@ async fn connect_plan(plan: ConnectionPlan) -> Result<EnvelopeStream, MqttTransp
     let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(OUTBOUND_CHUNK_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(INBOUND_EVENT_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), MqttTransportError>>();
+    let outbound_budget = OutboundByteBudget::for_endpoint(&config.endpoint.url);
 
     let actor = ProtocolDriver {
         config,
@@ -85,7 +86,7 @@ async fn connect_plan(plan: ConnectionPlan) -> Result<EnvelopeStream, MqttTransp
         inbound_tx,
         ready_tx: Some(ready_tx),
         publish_pacer: PublishPacer::new(),
-        outbound_budget: OutboundByteBudget::new(),
+        outbound_budget,
         session_renewal_after,
     };
 

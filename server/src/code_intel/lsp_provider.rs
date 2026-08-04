@@ -3399,12 +3399,12 @@ mod tests {
     fn add_subscribed_file(
         actor: &mut RaActor,
         relative_path: &str,
-    ) -> (ProjectPath, mpsc::UnboundedReceiver<protocol::Envelope>) {
+    ) -> (ProjectPath, crate::stream::OutputReceiver) {
         let path = ProjectPath {
             root: actor.root.clone(),
             relative_path: relative_path.to_owned(),
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         actor.files.insert(
             path.clone(),
@@ -3420,9 +3420,7 @@ mod tests {
         (path, rx)
     }
 
-    fn drain_status_frames(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
-    ) -> Vec<CodeIntelStatusPayload> {
+    fn drain_status_frames(rx: &mut crate::stream::OutputReceiver) -> Vec<CodeIntelStatusPayload> {
         let mut statuses = Vec::new();
         while let Ok(envelope) = rx.try_recv() {
             if envelope.kind == FrameKind::CodeIntelStatus {
@@ -3588,7 +3586,7 @@ mod tests {
     /// output so the test can prove the *re-subscribe* stream is the one that
     /// receives diagnostics.
     fn dead_stream() -> Stream {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::stream::output_channel();
         drop(rx);
         Stream::new(StreamPath("/project/dead".to_owned()), tx)
     }
@@ -3622,7 +3620,7 @@ mod tests {
         actor.opened.insert(path.clone());
 
         // Re-subscribe with a fresh output stream.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         actor
             .handle_command(RaCommand::Subscribe {
@@ -3666,7 +3664,7 @@ mod tests {
     }
 
     fn drain_diagnostics_frames(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
     ) -> Vec<CodeIntelDiagnosticsPayload> {
         let mut payloads = Vec::new();
         while let Ok(envelope) = rx.try_recv() {
@@ -3732,7 +3730,7 @@ mod tests {
         actor.phase = Phase::Ready;
         actor.client = Some(client);
         let absolute = absolute_path(&path);
-        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        let (old_tx, _old_rx) = crate::stream::output_channel();
         actor.files.insert(
             path.clone(),
             SubscribedFile {
@@ -3766,7 +3764,7 @@ mod tests {
         wait_for_captured_method(&captured, "textDocument/didClose").await;
 
         // Tab reopened at the same version, on a fresh output stream.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         actor
             .handle_command(RaCommand::Subscribe {
                 path: path.clone(),
@@ -3817,7 +3815,7 @@ mod tests {
             }],
         }));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         actor
             .handle_command(RaCommand::Subscribe {
                 path: path.clone(),
@@ -3869,7 +3867,7 @@ mod tests {
         actor.phase = Phase::Ready;
         actor.client = Some(client);
         let absolute = absolute_path(&path);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         actor.files.insert(
             path.clone(),
             SubscribedFile {
@@ -4191,7 +4189,7 @@ mod tests {
         RaActor,
         CapturedRequests,
         Stream,
-        mpsc::UnboundedReceiver<protocol::Envelope>,
+        crate::stream::OutputReceiver,
     );
 
     /// Build an `RaActor` in the `Ready` phase with a single subscribed +
@@ -4213,7 +4211,7 @@ mod tests {
         actor.phase = Phase::Ready;
         actor.client = Some(client);
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         actor.files.insert(
             path.clone(),
@@ -4306,7 +4304,7 @@ mod tests {
             },
         );
 
-        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let (new_tx, mut new_rx) = crate::stream::output_channel();
         let new_stream = Stream::new(StreamPath("/project/p".to_owned()), new_tx);
         actor
             .handle_command(RaCommand::Subscribe {
@@ -4339,7 +4337,7 @@ mod tests {
 
     /// Drain the receiver for the first frame of `kind`, deserializing it.
     async fn recv_frame<T: serde::de::DeserializeOwned>(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
         kind: FrameKind,
     ) -> T {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -4621,7 +4619,7 @@ mod tests {
         actor.phase = Phase::Ready;
         actor.client = Some(client);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let version_cell = Arc::new(AtomicU64::new(1));
         actor.files.insert(
@@ -4706,7 +4704,7 @@ mod tests {
 
     /// Latest `CodeIntelStatus` and `CodeIntelError` frames currently queued.
     fn drain_status_and_error(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
     ) -> (
         Option<CodeIntelStatusPayload>,
         Option<CodeIntelErrorPayload>,
@@ -4912,7 +4910,7 @@ while True:
             root.clone(),
             CodeIntelResourceMode::Full,
         );
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         provider.subscribe(path, ProjectFileVersion(1), stream);
 
@@ -5011,7 +5009,7 @@ while True:
         let mut actor = test_actor(root.clone(), CodeIntelResourceMode::Full);
         actor.phase = Phase::Ready;
         actor.client = Some(client);
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         actor.files.insert(
             path.clone(),
@@ -5165,9 +5163,7 @@ while True:
     }
 
     /// Collect every `CodeIntelFileModel` frame currently queued on `rx`.
-    fn drain_models(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
-    ) -> Vec<CodeIntelFileModelPayload> {
+    fn drain_models(rx: &mut crate::stream::OutputReceiver) -> Vec<CodeIntelFileModelPayload> {
         let mut out = Vec::new();
         while let Ok(envelope) = rx.try_recv() {
             if envelope.kind == FrameKind::CodeIntelFileModel {
@@ -5193,7 +5189,7 @@ while True:
             relative_path: "main.rs".to_owned(),
         };
         let uri = file_uri(&dir.path().join("main.rs")).unwrap();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), output_tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = oneshot::channel();
@@ -5271,7 +5267,7 @@ while True:
             relative_path: "main.rs".to_owned(),
         };
         let mut actor = test_actor(root, CodeIntelResourceMode::Full);
-        let (output_tx, _output_rx) = mpsc::unbounded_channel();
+        let (output_tx, _output_rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), output_tx);
         actor.files.insert(
             path.clone(),
@@ -5345,7 +5341,7 @@ while True:
         );
         let (requester, captured) = fake_requester(responses);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = oneshot::channel();
@@ -5439,7 +5435,7 @@ while True:
         };
         let uri = file_uri(&dir.path().join("main.rs")).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -5661,7 +5657,7 @@ while True:
         let requester = client.requester();
         std::mem::forget(client);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -5791,7 +5787,7 @@ while True:
         actor.client = Some(client);
         actor.legend = legend(&["function"], &[]);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
         actor.files.insert(
             main_path.clone(),
@@ -5965,7 +5961,7 @@ while True:
 
     /// Collect every references frame currently queued on `rx`.
     fn drain_references(
-        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        rx: &mut crate::stream::OutputReceiver,
     ) -> (
         Vec<CodeIntelReferencesResultsPayload>,
         Option<CodeIntelReferencesCompletePayload>,
@@ -6034,10 +6030,10 @@ while True:
     ) -> (
         FindReferencesJob,
         CapturedRequests,
-        mpsc::UnboundedReceiver<protocol::Envelope>,
+        crate::stream::OutputReceiver,
     ) {
         let (requester, captured) = fake_requester(responses);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let job = FindReferencesJob {
             requester,
@@ -6192,7 +6188,7 @@ while True:
         let (root, a_uri, a_text, _response, _dir, _outside) = references_fixture();
         let (requester, captured) = hanging_references_requester();
         let active = std::sync::Arc::new(AtomicU64::new(1));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let job = FindReferencesJob {
             requester,
@@ -6244,7 +6240,7 @@ while True:
         let (root, a_uri, a_text, _response, _dir, _outside) = references_fixture();
         let (requester, captured) = hanging_references_requester();
         let active = std::sync::Arc::new(AtomicU64::new(1));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let job = FindReferencesJob {
             requester,
@@ -6329,7 +6325,7 @@ while True:
         let requester = client.requester();
         std::mem::forget(client);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let job = FindReferencesJob {
             requester,
@@ -6564,7 +6560,7 @@ while True:
         responses.insert("textDocument/definition".to_owned(), Value::Null);
         let (requester, _captured) = fake_requester(responses);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = oneshot::channel();
@@ -6681,7 +6677,7 @@ while True:
         );
         let (requester, _captured) = fake_requester(responses);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = oneshot::channel();
@@ -6758,7 +6754,7 @@ while True:
         let requester = client.requester();
         std::mem::forget(client);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let output = Stream::new(StreamPath("/project/p".to_owned()), tx);
         let (_visible_tx, visible_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();

@@ -72,8 +72,10 @@ new layer of business logic in Tauri.**
 - Keep `server` single-host. Do not turn one `HostHandle` into a multi-host
   registry.
 - Keep host/product state server-owned on each host.
-- Keep Tauri protocol-agnostic. It may store transport config and own transport
-  lifetimes, but it must not parse Tyde frames or cache project/session state.
+- Keep Tauri free of application semantics. It may store transport config, own
+  transport lifetimes, decode shared `TYD2` records, and validate typed
+  `VoiceAudio` at the native-media boundary, but it must not interpret other
+  Tyde payloads or cache project/session state.
 - Do not use `ssh://...` roots as the primary abstraction for remote hosts.
   A remote Tyde server should expose its own native paths and its own stores.
 
@@ -179,7 +181,7 @@ The shell owns only:
 - the configured-host store
 - transport configuration
 - opening and closing host byte streams
-- proxying raw NDJSON lines between frontend and host
+- proxying framed Tyde byte records between frontend and host
 - per-host connection lifecycle
 
 It may know:

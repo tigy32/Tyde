@@ -143,7 +143,7 @@ or pass proofs.
    the redeemed pairing plus its host pairing secret.
 10. Host and phone use AWS IoT Core only with `tycode.dev`-signed, scoped
     broker credentials. The existing Tyde MQTT rendezvous/data-room protocol
-    then carries the normal Tyde NDJSON stream.
+    then carries the normal framed Tyde byte stream.
 
 ### Subsequent reconnects
 
@@ -836,7 +836,7 @@ AWS authorizes MQTT connections and sees metadata such as client ids, topic
 names, timing, and payload sizes. Tyde's MQTT transport must continue to encrypt
 Tyde protocol bytes end-to-end with pairing/data-room keys before publishing.
 AWS IoT Core and `tycode.dev` broker infrastructure must not need plaintext
-Tyde NDJSON frames.
+Tyde binary protocol records.
 
 ---
 

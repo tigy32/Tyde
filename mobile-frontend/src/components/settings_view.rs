@@ -236,6 +236,23 @@ pub fn SettingsView() -> impl IntoView {
                 <SkillsSection />
                 <HostToolsSection />
 
+                <div class="settings-section" data-mobile-test="settings-native-voice">
+                    <h2 class="settings-section-title">"Native Voice"</h2>
+                    {move || {
+                        let settings=state.active_local_host_id.get().and_then(|host|state.host_settings_by_host.with(|values|values.get(&host).cloned()));
+                        match settings {
+                            Some(settings) => view! {
+                                <div class="settings-info">
+                                    <div class="settings-row"><span class="settings-label">"Status"</span><span class="settings-value">{if settings.voice.enabled {"Enabled"} else {"Disabled"}}</span></div>
+                                    <div class="settings-row"><span class="settings-label">"Model"</span><span class="settings-value">{settings.voice.nova_model}</span></div>
+                                    <p class="settings-muted">"Voice capture is foreground-only and uses this device’s echo cancellation, noise suppression, and gain control. Configure AWS profile and region on the desktop host."</p>
+                                </div>
+                            }.into_any(),
+                            None => view! { <span class="settings-muted">"Connect a host to see voice availability."</span> }.into_any(),
+                        }
+                    }}
+                </div>
+
                 <div class="settings-section">
                     <h2 class="settings-section-title">"About"</h2>
                     <div class="settings-info">

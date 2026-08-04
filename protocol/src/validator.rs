@@ -48,7 +48,7 @@ use crate::{
     WorkflowRunNotifyPayload,
 };
 
-const DEFAULT_HISTORY_LIMIT: usize = 32;
+const DEFAULT_HISTORY_LIMIT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ProtocolValidator {
@@ -60,6 +60,30 @@ pub struct ProtocolValidator {
     review_streams: HashMap<StreamPath, BootstrapStreamState>,
     browse_streams: HashMap<StreamPath, BootstrapStreamState>,
     terminal_streams: HashMap<StreamPath, BootstrapStreamState>,
+    voice_streams: HashMap<StreamPath, VoiceStreamState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VoiceStreamState {
+    generation: u64,
+    session_id: Option<crate::VoiceSessionId>,
+    last_input_media_seq: Option<u64>,
+    last_output_media_seq: Option<u64>,
+    stopped: bool,
+}
+
+fn validate_voice_identity(
+    validator: &ProtocolValidator,
+    envelope: &Envelope,
+    state: &VoiceStreamState,
+    id: &crate::VoiceSessionId,
+    generation: u64,
+) -> Result<(), ProtocolViolation> {
+    if state.stopped || state.generation != generation || state.session_id.as_ref() != Some(id) {
+        Err(validator.violation(envelope, None, "stale or foreign voice session".into()))
+    } else {
+        Ok(())
+    }
 }
 
 impl Default for ProtocolValidator {
@@ -79,6 +103,7 @@ impl ProtocolValidator {
             review_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
+            voice_streams: HashMap::new(),
         }
     }
 
@@ -92,6 +117,7 @@ impl ProtocolValidator {
             review_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
+            voice_streams: HashMap::new(),
         }
     }
 
@@ -121,8 +147,212 @@ impl ProtocolValidator {
         if envelope.stream.0.starts_with("/terminal/") {
             return self.validate_terminal_envelope(envelope);
         }
+        if envelope.stream.0.starts_with("/voice") {
+            return self.validate_voice_envelope(envelope);
+        }
 
         Ok(())
+    }
+
+    fn validate_voice_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        let current = self
+            .voice_streams
+            .get(&envelope.stream)
+            .cloned()
+            .unwrap_or_default();
+        match envelope.kind {
+            FrameKind::VoiceCapabilities => {
+                if envelope.stream.0 != "/voice" {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "VoiceCapabilities must use /voice".into(),
+                    ));
+                }
+                let payload: crate::VoiceCapabilitiesPayload =
+                    envelope.parse_payload().map_err(|e| {
+                        self.violation(envelope, None, format!("invalid VoiceCapabilities: {e}"))
+                    })?;
+                if !payload.valid() {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "invalid VoiceCapabilities values".into(),
+                    ));
+                }
+                Ok(())
+            }
+            FrameKind::VoiceStart => {
+                if envelope.stream.0 != "/voice" {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "VoiceStart must use /voice".into(),
+                    ));
+                }
+                let payload: crate::VoiceStartPayload = envelope.parse_payload().map_err(|e| {
+                    self.violation(envelope, None, format!("invalid VoiceStart: {e}"))
+                })?;
+                if payload.generation <= current.generation {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "voice generation did not advance".into(),
+                    ));
+                }
+                self.voice_streams.insert(
+                    envelope.stream.clone(),
+                    VoiceStreamState {
+                        generation: payload.generation,
+                        session_id: None,
+                        last_input_media_seq: None,
+                        last_output_media_seq: None,
+                        stopped: false,
+                    },
+                );
+                Ok(())
+            }
+            FrameKind::VoiceAccepted => {
+                if envelope.stream.0 != "/voice" {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "VoiceAccepted must use /voice".into(),
+                    ));
+                }
+                let payload: crate::VoiceAcceptedPayload =
+                    envelope.parse_payload().map_err(|e| {
+                        self.violation(envelope, None, format!("invalid VoiceAccepted: {e}"))
+                    })?;
+                if !payload.uplink.valid() || !payload.downlink.valid() {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "invalid accepted voice format".into(),
+                    ));
+                }
+                let state = VoiceStreamState {
+                    generation: payload.generation,
+                    session_id: Some(payload.session_id.clone()),
+                    last_input_media_seq: None,
+                    last_output_media_seq: None,
+                    stopped: false,
+                };
+                self.voice_streams
+                    .insert(envelope.stream.clone(), state.clone());
+                self.voice_streams.insert(
+                    StreamPath(format!("/voice/{}", payload.session_id.0)),
+                    state,
+                );
+                Ok(())
+            }
+            FrameKind::VoiceAudio => {
+                let payload: crate::VoiceAudioPayload = envelope.parse_payload().map_err(|e| {
+                    self.violation(envelope, None, format!("invalid VoiceAudio: {e}"))
+                })?;
+                validate_voice_identity(
+                    self,
+                    envelope,
+                    &current,
+                    &payload.session_id,
+                    payload.generation,
+                )?;
+                let last = match payload.direction {
+                    crate::VoiceDirection::Input => current.last_input_media_seq,
+                    crate::VoiceDirection::Output => current.last_output_media_seq,
+                };
+                if last.is_some_and(|last| payload.first_media_seq < last) {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "voice media sequence moved backwards".into(),
+                    ));
+                }
+                let mut next = current;
+                let end = payload.first_media_seq + payload.packet_lengths.len() as u64;
+                match payload.direction {
+                    crate::VoiceDirection::Input => next.last_input_media_seq = Some(end),
+                    crate::VoiceDirection::Output => next.last_output_media_seq = Some(end),
+                };
+                self.voice_streams.insert(envelope.stream.clone(), next);
+                Ok(())
+            }
+            FrameKind::VoiceInputEnd | FrameKind::VoiceInterrupt | FrameKind::VoiceOutput => {
+                let payload: crate::VoiceSessionPayload =
+                    envelope.parse_payload().map_err(|e| {
+                        self.violation(envelope, None, format!("invalid voice control: {e}"))
+                    })?;
+                validate_voice_identity(
+                    self,
+                    envelope,
+                    &current,
+                    &payload.session_id,
+                    payload.generation,
+                )
+            }
+            FrameKind::VoiceTranscript => {
+                let payload: crate::VoiceTranscriptPayload =
+                    envelope.parse_payload().map_err(|e| {
+                        self.violation(envelope, None, format!("invalid VoiceTranscript: {e}"))
+                    })?;
+                validate_voice_identity(
+                    self,
+                    envelope,
+                    &current,
+                    &payload.session_id,
+                    payload.generation,
+                )
+            }
+            FrameKind::VoiceState => {
+                let payload: crate::VoiceStatePayload = envelope.parse_payload().map_err(|e| {
+                    self.violation(envelope, None, format!("invalid VoiceState: {e}"))
+                })?;
+                validate_voice_identity(
+                    self,
+                    envelope,
+                    &current,
+                    &payload.session_id,
+                    payload.generation,
+                )
+            }
+            FrameKind::VoiceStop => {
+                let payload: crate::VoiceStopPayload = envelope.parse_payload().map_err(|e| {
+                    self.violation(envelope, None, format!("invalid VoiceStop: {e}"))
+                })?;
+                validate_voice_identity(
+                    self,
+                    envelope,
+                    &current,
+                    &payload.session_id,
+                    payload.generation,
+                )?;
+                let mut next = current;
+                next.stopped = true;
+                self.voice_streams.insert(envelope.stream.clone(), next);
+                Ok(())
+            }
+            FrameKind::VoiceError => {
+                let payload: crate::VoiceErrorPayload = envelope.parse_payload().map_err(|e| {
+                    self.violation(envelope, None, format!("invalid VoiceError: {e}"))
+                })?;
+                if let Some(id) = &payload.session_id {
+                    validate_voice_identity(self, envelope, &current, id, payload.generation)
+                } else if envelope.stream.0 == "/voice" {
+                    Ok(())
+                } else {
+                    Err(self.violation(
+                        envelope,
+                        None,
+                        "pre-session VoiceError must use /voice".into(),
+                    ))
+                }
+            }
+            other => Err(self.violation(
+                envelope,
+                None,
+                format!("unexpected {other} on voice stream"),
+            )),
+        }
     }
 
     /// Applies the backend-native `ConversationCleared` boundary for an agent
@@ -273,6 +503,21 @@ impl ProtocolValidator {
             }
             FrameKind::HostSettings => {
                 parse_host_payload::<HostSettingsPayload>(self, envelope, "HostSettings")
+            }
+            FrameKind::VoiceCapabilities => {
+                let payload: crate::VoiceCapabilitiesPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        self.violation(
+                            envelope,
+                            None,
+                            format!("failed to parse VoiceCapabilities payload: {error}"),
+                        )
+                    })?;
+                if payload.valid() {
+                    Ok(())
+                } else {
+                    Err(self.violation(envelope, None, "invalid VoiceCapabilities values".into()))
+                }
             }
             FrameKind::AgentActivitySummary => parse_host_payload::<AgentActivitySummaryPayload>(
                 self,
@@ -1188,6 +1433,9 @@ impl ProtocolValidator {
     }
 
     fn record(&mut self, envelope: &Envelope) {
+        if envelope.kind == FrameKind::VoiceAudio {
+            return;
+        }
         let observed = ObservedFrame {
             stream: envelope.stream.clone(),
             seq: envelope.seq,
@@ -2167,6 +2415,7 @@ mod tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: crate::MobileBrokerStatus::Disabled,
@@ -2653,6 +2902,7 @@ mod tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
             },
         )
@@ -3864,5 +4114,80 @@ mod tests {
                 violation.message
             );
         }
+    }
+
+    #[test]
+    fn voice_audio_requires_an_accepted_typed_session() {
+        let session_id = crate::VoiceSessionId("session-a".into());
+        let stream = StreamPath(format!("/voice/{}", session_id.0));
+        let payload = crate::VoiceAudioPayload {
+            session_id: session_id.clone(),
+            generation: 4,
+            direction: crate::VoiceDirection::Output,
+            first_media_seq: 0,
+            timestamp_samples_48k: 0,
+            packet_lengths: vec![12],
+        };
+        let audio = Envelope::from_payload(stream, FrameKind::VoiceAudio, 0, &payload).unwrap();
+        let mut validator = ProtocolValidator::new();
+        assert!(validator.validate_envelope(&audio).is_err());
+
+        let target = crate::VoiceTarget {
+            agent_id: crate::AgentId("agent-a".into()),
+            instance_stream: StreamPath("/agent/agent-a/instance-a".into()),
+        };
+        let accepted = crate::VoiceAcceptedPayload {
+            session_id,
+            generation: 4,
+            target,
+            uplink: crate::VoiceAudioFormat::opus(48_000),
+            downlink: crate::VoiceAudioFormat::opus(24_000),
+        };
+        validator
+            .validate_envelope(
+                &Envelope::from_payload(
+                    StreamPath("/voice".into()),
+                    FrameKind::VoiceAccepted,
+                    0,
+                    &accepted,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        validator.validate_envelope(&audio).unwrap();
+    }
+
+    #[test]
+    fn host_voice_capabilities_require_current_bounded_values() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(Vec::new()))
+            .unwrap();
+        let mut payload = crate::VoiceCapabilitiesPayload {
+            protocol: crate::VOICE_PROTOCOL_VERSION,
+            formats: vec![crate::VoiceFormatPair {
+                uplink: crate::VoiceAudioFormat::opus(48_000),
+                downlink: crate::VoiceAudioFormat::opus(24_000),
+            }],
+            max_batch_packets: crate::MAX_VOICE_PACKETS_PER_FRAME as u8,
+            max_sessions_per_connection: 1,
+            nova_available: true,
+            native_capture: true,
+            native_aec: true,
+            browser_capture: true,
+            browser_aec: crate::BrowserAecStatus::Requested,
+            foreground_only: true,
+        };
+        let envelope = |payload: &crate::VoiceCapabilitiesPayload| {
+            Envelope::from_payload(host_stream(), FrameKind::VoiceCapabilities, 1, payload).unwrap()
+        };
+        validator.validate_envelope(&envelope(&payload)).unwrap();
+
+        payload.protocol = crate::VOICE_PROTOCOL_VERSION + 1;
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(Vec::new()))
+            .unwrap();
+        assert!(validator.validate_envelope(&envelope(&payload)).is_err());
     }
 }

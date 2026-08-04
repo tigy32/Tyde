@@ -7,7 +7,7 @@ default = []
 ui-fixtures = []
 
 [dependencies]
-protocol = { path = "../protocol", default-features = false }
+protocol = { path = "../protocol" }
 host-config = { path = "../host-config" }
 mobile-shell-types = { path = "../mobile-shell-types" }
 # Direct-to-wasm MQTT transport for the browser (PWA) backend. The native
@@ -51,6 +51,11 @@ web-sys = { version = "0.3", features = [
     "MediaStreamTrack",
     "MediaStreamConstraints",
     "MediaDevices",
+    "MediaTrackConstraints",
+    "MediaTrackSettings",
+    "AudioContext",
+    "AudioWorklet",
+    "AudioWorkletNode",
     "Navigator",
     "Node",
     "NodeList",

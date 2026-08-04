@@ -2,7 +2,6 @@ use protocol::{
     AgentErrorPayload, AgentId, ChatEvent, FrameKind, ReviewAnchorStatus, ReviewLocation,
     ReviewSeverity, ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ToolPolicy,
 };
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::now_ms;
@@ -39,7 +38,7 @@ impl ReviewerToolBridge {
         agent_handle: crate::agent::AgentHandle,
         review_handle: ReviewHandle,
     ) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let bridge_stream_path = protocol::StreamPath(format!(
             "/agent/{}/review-bridge-{}",
             reviewer_agent_id.0,

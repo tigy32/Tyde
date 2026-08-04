@@ -280,6 +280,15 @@ pub async fn send_host_line(
         .await
 }
 
+pub async fn send_voice_frame(
+    local_host_id: &LocalHostId,
+    frame: protocol::ProtocolFrame,
+) -> Result<(), SendRejected> {
+    connection::manager()
+        .send_frame(local_host_id.clone(), frame)
+        .await
+}
+
 pub fn invalidate_host_connection(
     local_host_id: &LocalHostId,
     reason: ConnectionInvalidation,

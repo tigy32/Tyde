@@ -291,6 +291,7 @@ fn ActiveHostShell() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
         <components::ConnectionBanner />
+        <crate::voice::MobileVoiceBar />
         // Host-scoped, so a new-chat submission the transport lost stays
         // recoverable wherever the user navigates — it has no agent to live
         // under, and the client will not guess one. Above the content (and so
@@ -987,6 +988,7 @@ fn apply_host_error(state: &AppState, host: LocalHostId, message: String) {
 }
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
+    crate::voice::transport_lost(state, host);
     state.active_connection_instance_ids.update(|m| {
         m.remove(host);
     });
@@ -1020,6 +1022,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
         m.remove(host);
     });
     state.host_settings_by_host.update(|m| {
+        m.remove(host);
+    });
+    state.voice_capabilities_by_host.update(|m| {
         m.remove(host);
     });
     state.command_errors_by_host.update(|m| {
@@ -1228,6 +1233,7 @@ mod wasm_tests {
             backend_config: Default::default(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         }
     }
 

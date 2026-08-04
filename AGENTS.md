@@ -82,7 +82,9 @@ check logs, obsolete check cache records, and regenerable nextest test-binary
 clones for the same repository. It must never recursively scan or automatically
 clean shared Cargo targets.
 
-Before cache evaluation, the wrapper provisions Chrome, chromedriver, and the
+Before cache evaluation, the wrapper provisions repository-local pinned Meson
+and Ninja through `tools/provision-native-build-tools.py` for bundled native
+audio DSP builds. It also provisions Chrome, chromedriver, and the
 lockfile-pinned wasm-bindgen runner once through `tools/run-wasm-tests.sh` and
 then uses those exact paths for the wasm stage. Explicit `CHROME` and
 `CHROMEDRIVER` overrides are authoritative and invalid overrides fail. Cache

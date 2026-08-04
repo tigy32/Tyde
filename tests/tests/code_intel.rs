@@ -14,7 +14,7 @@ use protocol::{
     CodeIntelSubscribeFilePayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue,
     HostSettingsPayload, Project, ProjectCreatePayload, ProjectFileVersion, ProjectId,
     ProjectNotifyPayload, ProjectPath, ProjectRootPath, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, read_envelope, write_envelope,
+    SpawnAgentPayload, StreamPath, write_envelope,
 };
 
 #[cfg(unix)]
@@ -179,14 +179,13 @@ async fn send_code_intel_subscribe(
 }
 
 async fn next_raw_event(client: &mut client::Connection, context: &str) -> Envelope {
-    let env = match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
-        .await
-    {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("read_envelope failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
-    };
+    let env =
+        match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("read_envelope failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
     client
         .incoming_seq
         .validate(&env.stream, env.seq, env.kind)
@@ -471,6 +470,18 @@ async fn wait_for_code_intel_status_matching(
                     return payload;
                 }
             }
+            FrameKind::VoiceCapabilities => {
+                let capabilities: protocol::VoiceCapabilitiesPayload = env
+                    .parse_payload()
+                    .expect("parse VoiceCapabilities while waiting for code-intel status");
+                let host_stream = client
+                    .outgoing_seq
+                    .keys()
+                    .find(|stream| stream.0.starts_with("/host/"))
+                    .expect("connected host stream");
+                assert_eq!(&env.stream, host_stream);
+                assert!(capabilities.valid());
+            }
             FrameKind::ProjectFileList
             | FrameKind::ProjectGitStatus
             | FrameKind::CodeIntelOverview
@@ -538,11 +549,7 @@ async fn wait_for_code_intel_overview_matching(
 
 async fn assert_no_code_intel_warm_events(client: &mut client::Connection, context: &str) {
     loop {
-        match tokio::time::timeout(
-            Duration::from_millis(250),
-            read_envelope(&mut client.reader),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_millis(250), client.reader.read_envelope()).await
         {
             Err(_) => return,
             Ok(Ok(None)) => return,
@@ -573,11 +580,7 @@ async fn assert_no_code_intel_warm_events(client: &mut client::Connection, conte
 
 async fn assert_no_direct_code_intel_warm_frames(client: &mut client::Connection, context: &str) {
     loop {
-        match tokio::time::timeout(
-            Duration::from_millis(250),
-            read_envelope(&mut client.reader),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_millis(250), client.reader.read_envelope()).await
         {
             Err(_) => return,
             Ok(Ok(None)) => return,

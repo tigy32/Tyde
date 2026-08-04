@@ -13839,3 +13839,4 @@ pre.tool-error-pre {
         animation: none;
     }
 }
+.voice-strip{position:fixed;left:50%;bottom:24px;z-index:1200;transform:translateX(-50%);display:flex;align-items:center;gap:10px;max-width:min(720px,calc(100vw - 32px));padding:10px 14px;border:1px solid var(--border-color);border-radius:999px;background:color-mix(in srgb,var(--bg-primary) 92%,transparent);box-shadow:0 12px 32px rgba(0,0,0,.24);animation:voice-pop .18s ease-out}.voice-icon,.voice-strip button{border:0;border-radius:999px;padding:7px 12px}.voice-pulse{color:var(--accent-color)}.voice-transcript{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@keyframes voice-pop{from{opacity:0;transform:translate(-50%,8px) scale(.96)}to{opacity:1;transform:translate(-50%,0) scale(1)}}

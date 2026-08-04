@@ -23309,6 +23309,7 @@ for line in sys.stdin:
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: MobileBrokerStatus::Disabled,

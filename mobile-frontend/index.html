@@ -9,6 +9,10 @@
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
     <link data-trunk rel="css" href="styles.css" />
     <link data-trunk rel="copy-file" href="vendor/jsqr.js" />
+    <link data-trunk rel="copy-file" href="voice-media.js" />
+    <link data-trunk rel="copy-file" href="voice-codec-worker.js" />
+    <link data-trunk rel="copy-file" href="voice-capture-worklet.js" />
+    <link data-trunk rel="copy-file" href="voice-playback-worklet.js" />
     <style>
         html, body {
             margin: 0;
@@ -96,5 +100,6 @@
          The loader copy is the source of truth; this classic script installs
          window.jsQR before the WASM scanner can request a camera. -->
     <script src="jsqr.js"></script>
+  <script src="voice-media.js"></script>
 </body>
 </html>

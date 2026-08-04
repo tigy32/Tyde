@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSMicrophoneUsageDescription</key>
+<string>Tyde uses your microphone only during an active voice session with the selected agent. Audio is sent to your selected Tyde server and is not retained.</string>
+</dict></plist>

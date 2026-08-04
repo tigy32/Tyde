@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 TOOLS_DIR = pathlib.Path(__file__).resolve().parent
@@ -20,6 +24,531 @@ TOOLCHAIN_INSTALL_LOG = "rustup toolchain install toolchain=unset"
 # that is the exact domain tools/run-wasm-tests.sh must accept and reject.
 U64_MAX = 2**64 - 1
 U64_MAX_SECONDS = str(U64_MAX)
+
+
+def raw_pcm_desktop_ipc_signatures(source: str) -> list[str]:
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    source = re.sub(r"//[^\n]*", "", source)
+    signatures = []
+    command_pattern = re.compile(
+        r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+\w+\s*\((.*?)\)",
+        re.DOTALL,
+    )
+    bridge_pattern = re.compile(
+        r"pub\s+(?:async\s+)?fn\s+(?:voice_media_\w+|send_host_frame)\s*\((.*?)\)",
+        re.DOTALL,
+    )
+    serde_struct_pattern = re.compile(
+        r"#\[derive\([^\]]*(?:Serialize|Deserialize)[^\]]*\)\]"
+        r"(?:\s*#\[[^\]]+\])*\s*(?:pub\s+)?struct\s+\w+\s*\{(.*?)\}",
+        re.DOTALL,
+    )
+    boundaries = (
+        *command_pattern.finditer(source),
+        *bridge_pattern.finditer(source),
+        *serde_struct_pattern.finditer(source),
+    )
+    for match in boundaries:
+        signature = match.group(1)
+        if re.search(
+            r"(?:(?:Vec|VecDeque)\s*<|(?:Box|Arc)\s*<\s*\[|&\s*\[|\[)"
+            r"\s*(?:f32|f64|i16|i32)\s*(?:>|\]|;)",
+            signature,
+        ):
+            signatures.append(signature.strip())
+            continue
+        if re.search(
+            r"\b(?:pcm|raw_pcm|pcm_samples|samples|raw_audio)\b\s*:\s*(?:Vec\s*<\s*u8\s*>|&\s*\[\s*u8\s*\])",
+            signature,
+        ):
+            signatures.append(signature.strip())
+    return signatures
+
+
+def native_voice_authorization_is_validated(source: str) -> bool:
+    production = source.split("#[cfg(test)]", maxsplit=1)[0]
+    production = re.sub(r"/\*.*?\*/", "", production, flags=re.DOTALL)
+    production = re.sub(r"//[^\n]*", "", production)
+    reader_start = production.find("async fn reader_task(")
+    reader_end = production.find("\nasync fn writer_task(", reader_start)
+    if reader_start < 0 or reader_end < 0:
+        return False
+    production = production[reader_start:reader_end]
+    authorization_pattern = re.compile(
+        r"\.\s*voice_media\s*\.\s*authorize\s*\(", re.DOTALL
+    )
+    authorizations = list(authorization_pattern.finditer(production))
+    if len(authorizations) != 1:
+        return False
+
+    authorization = authorizations[0]
+    condition_pattern = re.compile(r"\bif\b(?P<condition>[^{};]+)\{", re.DOTALL)
+    for conditional in condition_pattern.finditer(production):
+        condition_start = conditional.start("condition")
+        condition_end = conditional.end("condition")
+        if not condition_start <= authorization.start() < condition_end:
+            continue
+        condition = conditional.group("condition")
+        kind = re.search(
+            r"(?P<frame>[A-Za-z_]\w*)\s*\.\s*envelope\s*\.\s*kind\s*==\s*"
+            r"protocol\s*::\s*FrameKind\s*::\s*VoiceAccepted",
+            condition,
+        )
+        if kind is None:
+            return False
+        frame = re.escape(kind.group("frame"))
+        payload = re.search(
+            r"let\s+Ok\s*\(\s*(?P<payload>[A-Za-z_]\w*)\s*\)\s*=\s*"
+            rf"{frame}\s*\.\s*envelope\s*\.\s*parse_payload\s*::\s*<\s*"
+            r"protocol\s*::\s*VoiceAcceptedPayload\s*>\s*\(\s*\)",
+            condition,
+        )
+        call = re.search(
+            r"\.\s*voice_media\s*\.\s*authorize\s*\(\s*host_id\s*\.\s*"
+            r"clone\s*\(\s*\)\s*,\s*(?P<payload>[A-Za-z_]\w*)\s*\.\s*"
+            r"generation\s*\)",
+            condition,
+        )
+        if payload is None or call is None:
+            return False
+        if payload.group("payload") != call.group("payload"):
+            return False
+        if not kind.end() < payload.start() < call.start():
+            return False
+        return (
+            "&&" in condition[kind.end() : payload.start()]
+            and "&&" in condition[payload.end() : call.start()]
+        )
+    return False
+
+
+NATIVE_VOICE_AEC_VENDOR = "vendor/webrtc-audio-processing-sys"
+NATIVE_VOICE_AEC_PATCH = (
+    'webrtc-audio-processing-sys = { path = '
+    '"vendor/webrtc-audio-processing-sys" }'
+)
+NATIVE_VOICE_ABSEIL_CACHE = {
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/subprojects/packagecache/abseil-cpp-20240722.0.tar.gz": (
+        "f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3",
+        2_242_861,
+    ),
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/subprojects/packagecache/abseil-cpp_20240722.0-3_patch.zip": (
+        "12dd8df1488a314c53e3751abd2750cf233b830651d168b6a9f15e7d0cf71f7b",
+        5_929,
+    ),
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/subprojects/packagecache/ABSEIL-LICENSE": (
+        "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747",
+        11_361,
+    ),
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/subprojects/packagecache/WRAPDB-LICENSE": (
+        "7939f4c45423cec4a18236ad0a88570e33508dd7462e07b1038001f90ece65fb",
+        1_070,
+    ),
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/subprojects/packagecache/PROVENANCE.md": (
+        "9b7a1f87ca75fba86903b4f5804ed1940efdffb6b585f548d23051720e12966b",
+        1_266,
+    ),
+}
+NATIVE_VOICE_ABSEIL_WRAP = (
+    f"{NATIVE_VOICE_AEC_VENDOR}/webrtc-audio-processing/"
+    "subprojects/abseil-cpp.wrap"
+)
+NATIVE_VOICE_ABSEIL_FORCE_FALLBACK = (
+    "--force-fallback-for=absl_base,absl_flags,absl_strings,absl_numeric,"
+    "absl_synchronization,absl_bad_optional_access"
+)
+NATIVE_VOICE_ABSEIL_WRAP_LINES = (
+    "directory = abseil-cpp-20240722.0",
+    "source_filename = abseil-cpp-20240722.0.tar.gz",
+    "source_hash = f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3",
+    "patch_filename = abseil-cpp_20240722.0-3_patch.zip",
+    "patch_hash = 12dd8df1488a314c53e3751abd2750cf233b830651d168b6a9f15e7d0cf71f7b",
+    "wrapdb_version = 20240722.0-3",
+)
+
+
+def toml_without_comment(line: str) -> str:
+    quote = None
+    escaped = False
+    for index, character in enumerate(line):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character == "#":
+            return line[:index]
+    return line
+
+
+def toml_split_top_level(text: str, delimiter: str) -> list[str] | None:
+    parts = []
+    start = 0
+    depth = 0
+    quote = None
+    escaped = False
+    for index, character in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif character == delimiter and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    if quote is not None or depth != 0:
+        return None
+    parts.append(text[start:])
+    return parts
+
+
+def parse_toml_quoted_key(text: str) -> str | None:
+    if len(text) < 2 or text[0] != text[-1] or text[0] not in ('"', "'"):
+        return None
+    if text[0] == "'":
+        return text[1:-1]
+    value = []
+    index = 1
+    while index < len(text) - 1:
+        character = text[index]
+        if character == "\\":
+            index += 1
+            if index >= len(text) - 1 or text[index] not in ('"', "\\"):
+                return None
+            character = text[index]
+        elif character == text[0]:
+            return None
+        value.append(character)
+        index += 1
+    return "".join(value)
+
+
+def parse_toml_dotted_key(text: str) -> list[str] | None:
+    parts = toml_split_top_level(text.strip(), ".")
+    if parts is None or not parts:
+        return None
+    parsed = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            return None
+        if part[0] in ('"', "'"):
+            value = parse_toml_quoted_key(part)
+            if value is None:
+                return None
+            parsed.append(value)
+        elif re.fullmatch(r"[A-Za-z0-9_-]+", part):
+            parsed.append(part)
+        else:
+            return None
+    return parsed
+
+
+def insert_toml_value(target: dict, path: list[str], value: object) -> bool:
+    if not path:
+        return False
+    current = target
+    for component in path[:-1]:
+        existing = current.get(component)
+        if existing is None:
+            existing = {}
+            current[component] = existing
+        if not isinstance(existing, dict):
+            return False
+        current = existing
+    if path[-1] in current:
+        return False
+    current[path[-1]] = value
+    return True
+
+
+def parse_toml_patch_value(text: str) -> object | None:
+    text = text.strip()
+    if not text:
+        return None
+    if text[0] in ('"', "'"):
+        return parse_toml_quoted_key(text)
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    result = {}
+    body = text[1:-1].strip()
+    if not body:
+        return result
+    assignments = toml_split_top_level(body, ",")
+    if assignments is None:
+        return None
+    for assignment in assignments:
+        pieces = toml_split_top_level(assignment, "=")
+        if pieces is None or len(pieces) != 2:
+            return None
+        key = parse_toml_dotted_key(pieces[0])
+        value = parse_toml_patch_value(pieces[1])
+        if key is None or value is None or not insert_toml_value(result, key, value):
+            return None
+    return result
+
+
+def expected_native_voice_patch_surface(root_manifest: str) -> bool:
+    patch = {}
+    section = []
+    saw_patch = False
+    for raw_line in root_manifest.splitlines():
+        line = toml_without_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if line.startswith("[["):
+                if not line.endswith("]]"):
+                    return False
+                array_section = parse_toml_dotted_key(line[2:-2])
+                if array_section is None or array_section[:1] == ["patch"]:
+                    return False
+                section = []
+                continue
+            if not line.endswith("]"):
+                return False
+            section = parse_toml_dotted_key(line[1:-1])
+            if section is None:
+                return False
+            if section[:1] == ["patch"]:
+                saw_patch = True
+            continue
+        pieces = toml_split_top_level(line, "=")
+        if pieces is None or len(pieces) != 2:
+            if section[:1] == ["patch"]:
+                return False
+            continue
+        key = parse_toml_dotted_key(pieces[0])
+        if section[:1] == ["patch"] and key is None:
+            return False
+        patch_path = section[1:] + key if section[:1] == ["patch"] and key else None
+        if not section and key and key[:1] == ["patch"]:
+            patch_path = key[1:]
+        if patch_path is None:
+            continue
+        saw_patch = True
+        value = parse_toml_patch_value(pieces[1])
+        if value is None or not insert_toml_value(patch, patch_path, value):
+            return False
+    return saw_patch and patch == {
+        "crates-io": {
+            "webrtc-audio-processing-sys": {
+                "path": "vendor/webrtc-audio-processing-sys"
+            }
+        }
+    }
+
+
+def native_voice_vendor_surface_violations(
+    root_manifest: str,
+    vendor_files: dict[str, str],
+) -> list[str]:
+    violations = []
+    if not expected_native_voice_patch_surface(root_manifest):
+        violations.append("root [patch.crates-io] must contain only the pinned AEC DSP")
+
+    vendor_roots = {
+        "/".join(pathlib.PurePosixPath(path).parts[:2])
+        for path in vendor_files
+        if pathlib.PurePosixPath(path).parts[:1] == ("vendor",)
+    }
+    if vendor_roots != {NATIVE_VOICE_AEC_VENDOR}:
+        violations.append("vendor surface contains a dependency other than the pinned AEC DSP")
+
+    manifest_path = f"{NATIVE_VOICE_AEC_VENDOR}/Cargo.toml"
+    manifest = vendor_files.get(manifest_path)
+    if manifest is None or re.search(
+        r'(?m)^name\s*=\s*"webrtc-audio-processing-sys"\s*$', manifest
+    ) is None:
+        violations.append("vendored AEC manifest provenance is missing")
+
+    for path, (digest, size) in NATIVE_VOICE_ABSEIL_CACHE.items():
+        expected = f"sha256:{digest}:bytes:{size}"
+        if vendor_files.get(path) != expected:
+            violations.append(f"{path} is missing or does not match its pinned checksum")
+
+    wrap = vendor_files.get(NATIVE_VOICE_ABSEIL_WRAP, "")
+    if any(line not in wrap.splitlines() for line in NATIVE_VOICE_ABSEIL_WRAP_LINES):
+        violations.append("vendored Abseil wrap does not match the pinned package cache")
+
+    build_script = vendor_files.get(f"{NATIVE_VOICE_AEC_VENDOR}/build.rs", "")
+    force_fallback_literal = f'"{NATIVE_VOICE_ABSEIL_FORCE_FALLBACK}"'
+    if (
+        build_script.count('arg("--wrap-mode=nodownload")') != 1
+        or build_script.count(force_fallback_literal) != 1
+        or build_script.count("arg(ABSEIL_FORCE_FALLBACK)") != 1
+        or 'probe("absl_base")' in build_script
+        or "remove_materialized_abseil" not in build_script
+        or "removing incomplete AEC build directory" not in build_script
+    ):
+        violations.append("vendored AEC build is not offline and self-recovering")
+
+    dependency_section = re.compile(
+        r"^(?:target\..+\.)?(?:build-)?dependencies(?:\..+)?$"
+    )
+    executable_network_symbol = re.compile(
+        r"\b(?:UdpSocket|RtcPeerConnection|RtcIceCandidate|IceCandidate|"
+        r"StunServer|TurnServer|AF_INET|AF_INET6|SOCK_DGRAM)\b|"
+        r"\b(?:std|tokio|async_std)::net::|\b(?:sendto|recvfrom)\s*\(",
+        re.IGNORECASE,
+    )
+    for path, source in vendor_files.items():
+        if pathlib.PurePosixPath(path).name == "Cargo.toml":
+            section = ""
+            for line in source.splitlines():
+                header = re.match(r"\s*\[([^]]+)\]\s*$", line)
+                if header is not None:
+                    section = header.group(1)
+                    continue
+                assignment = re.match(r'\s*["\']?([^"\'\s=]+)["\']?\s*=', line)
+                if (
+                    assignment is not None
+                    and dependency_section.match(section)
+                    and rejected_network_name(assignment.group(1))
+                ):
+                    violations.append(
+                        f"{path} contains rejected network dependency "
+                        f"{assignment.group(1)}"
+                    )
+            continue
+        is_meson = pathlib.PurePosixPath(path).name == "meson.build"
+        executable_without_literals, literals = lex_executable_source(
+            source, hash_comments=is_meson
+        )
+        meson_network = is_meson and any(
+            re.search(r"\b(?:dependency|subproject)\s*\(\s*$", context)
+            and rejected_network_name(value)
+            for context, value in literals
+        )
+        if (
+            executable_network_symbol.search(executable_without_literals) is not None
+            or any(re.search(r"(?:stun|turn)://", value, re.IGNORECASE) for _, value in literals)
+            or meson_network
+        ):
+            violations.append(f"{path} contains executable network transport code")
+    return violations
+
+
+def rejected_network_name(name: str) -> bool:
+    tokens = [token for token in re.split(r"[^a-z0-9]+", name.lower()) if token]
+    return any(
+        token in {"udp", "ice", "stun", "turn", "network", "socket", "str0m", "mdns"}
+        for token in tokens
+    )
+
+
+def lex_executable_source(
+    source: str, *, hash_comments: bool = False
+) -> tuple[str, list[tuple[str, str]]]:
+    code = []
+    literals = []
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            index = len(source) if end < 0 else end + 2
+            continue
+        if hash_comments and source[index] == "#":
+            newline = source.find("\n", index + 1)
+            index = len(source) if newline < 0 else newline
+            continue
+        quote = source[index]
+        if (
+            not hash_comments
+            and quote == "'"
+            and re.match(r"'(?:\\.|[^'\\\n])'", source[index:]) is None
+        ):
+            code.append(quote)
+            index += 1
+            continue
+        if quote in ('"', "'"):
+            context = "".join(code[-128:])
+            index += 1
+            value = []
+            while index < len(source):
+                character = source[index]
+                if character == "\\" and index + 1 < len(source):
+                    value.extend(source[index : index + 2])
+                    index += 2
+                    continue
+                if character == quote:
+                    index += 1
+                    break
+                value.append(character)
+                index += 1
+            literals.append((context, "".join(value)))
+            code.append(" ")
+            continue
+        code.append(source[index])
+        index += 1
+    return "".join(code), literals
+
+
+def native_voice_vendor_surfaces(repo_root: pathlib.Path) -> dict[str, str]:
+    vendor_root = repo_root / "vendor"
+    paths = []
+    for package in sorted(vendor_root.iterdir()):
+        if not package.is_dir():
+            continue
+        for path in package.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(repo_root).as_posix()
+            if relative in NATIVE_VOICE_ABSEIL_CACHE:
+                paths.append(path)
+                continue
+            if path.name in (
+                "Cargo.toml",
+                "build.rs",
+                "meson.build",
+                "abseil-cpp.wrap",
+            ) or path.suffix in (
+                ".rs",
+                ".c",
+                ".cc",
+                ".cpp",
+                ".h",
+                ".hpp",
+            ):
+                paths.append(path)
+    if len(paths) > 10_000:
+        return {"vendor/__scan_limit__/Cargo.toml": ""}
+    surfaces = {}
+    for path in paths:
+        relative = path.relative_to(repo_root).as_posix()
+        if relative in NATIVE_VOICE_ABSEIL_CACHE:
+            data = path.read_bytes()
+            surfaces[relative] = (
+                f"sha256:{hashlib.sha256(data).hexdigest()}:bytes:{len(data)}"
+            )
+            continue
+        if path.stat().st_size > 1_048_576:
+            surfaces[relative] = "UdpSocket"
+            continue
+        surfaces[relative] = path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    return surfaces
 
 
 class TrunkCommandTests(unittest.TestCase):
@@ -62,6 +591,148 @@ class TrunkCommandTests(unittest.TestCase):
             self.assertTrue(alias.is_symlink())
             self.assertEqual(alias.readlink().resolve(), (root / "target").resolve())
             alias.unlink()
+
+
+class NativeBuildToolsContractTests(unittest.TestCase):
+    def test_prepared_environment_quotes_paths_and_runtime_path(self) -> None:
+        module_path = REPO_ROOT / "tools" / "provision-native-build-tools.py"
+        spec = importlib.util.spec_from_file_location("native_build_tools", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "root dir;$(touch root-injection)'"
+            directory = root / "bin dir;&$(touch path-injection)'"
+            environment_file = pathlib.Path(temp) / "native tools.env"
+            environment_file.write_text(
+                module.prepared_environment(root, directory), encoding="utf-8"
+            )
+            runtime_path = (
+                "/existing path:$HOME:$(touch runtime-injection):"
+                "semi;colon:amp&ersand:glob*"
+            )
+            env = os.environ.copy()
+            env["PATH"] = runtime_path
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    'set -eu; source "$1"; printf "%s\\n%s\\n" '
+                    '"$PATH" "$TYDE_NATIVE_BUILD_TOOLS_ROOT"',
+                    "bash",
+                    str(environment_file),
+                ],
+                cwd=temp,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [f"{directory}:{runtime_path}", str(root.resolve())],
+            )
+            self.assertIn('"${PATH-}"', environment_file.read_text(encoding="utf-8"))
+            self.assertFalse((pathlib.Path(temp) / "root-injection").exists())
+            self.assertFalse((pathlib.Path(temp) / "path-injection").exists())
+            self.assertFalse((pathlib.Path(temp) / "runtime-injection").exists())
+
+    def test_offline_native_tools_fail_without_attempting_install(self) -> None:
+        module_path = REPO_ROOT / "tools" / "provision-native-build-tools.py"
+        spec = importlib.util.spec_from_file_location("offline_native_tools", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "native-tools"
+            with mock.patch.object(module, "ready", return_value=False), mock.patch.object(
+                module.subprocess, "run"
+            ) as run:
+                with self.assertRaisesRegex(RuntimeError, "run ./dev.sh check first"):
+                    module.require_cached(root)
+                run.assert_not_called()
+
+    def test_cargo_build_uses_lazy_pinned_native_tool_wrapper(self) -> None:
+        workspace = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        build_script = (
+            REPO_ROOT / "vendor/webrtc-audio-processing-sys/build.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }',
+            workspace,
+        )
+        self.assertEqual(build_script.count('repository_native_tool("meson")'), 1)
+        self.assertEqual(build_script.count('repository_native_tool("ninja")'), 2)
+        self.assertNotIn('Command::new("meson")', build_script)
+        self.assertNotIn('Command::new("ninja")', build_script)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "cached tools;$(touch injection)"
+            directory = root / "bin"
+            directory.mkdir(parents=True)
+            capture = pathlib.Path(temp) / "meson-arguments"
+            python_capture = pathlib.Path(temp) / "python-arguments"
+            path_capture = pathlib.Path(temp) / "tool-path"
+            python = directory / "python"
+            python.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$TYDE_NATIVE_PYTHON_CAPTURE"\n'
+                "printf '1.11.2\\n1.11.1.4\\n'\n",
+                encoding="utf-8",
+            )
+            meson = directory / "meson"
+            meson.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "--version" ]; then printf "1.11.2\\n"; exit 0; fi\n'
+                'printf "%s\\n" "$@" > "$TYDE_NATIVE_TOOL_CAPTURE"\n'
+                'printf "%s\\n" "$PATH" > "$TYDE_NATIVE_PATH_CAPTURE"\n',
+                encoding="utf-8",
+            )
+            ninja = directory / "ninja"
+            ninja.write_text(
+                "#!/bin/sh\nprintf '1.11.1\\n'\n", encoding="utf-8"
+            )
+            for executable in (python, meson, ninja):
+                executable.chmod(0o755)
+            env = os.environ.copy()
+            env["TYDE_NATIVE_BUILD_TOOLS_ROOT"] = str(root)
+            env["TYDE_NATIVE_TOOL_CAPTURE"] = str(capture)
+            env["TYDE_NATIVE_PYTHON_CAPTURE"] = str(python_capture)
+            env["TYDE_NATIVE_PATH_CAPTURE"] = str(path_capture)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools/native-build-tool.py"),
+                    "meson",
+                    "--",
+                    "setup",
+                    "path with spaces",
+                ],
+                cwd=temp,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(capture.read_text(encoding="utf-8"), "setup\npath with spaces\n")
+            self.assertNotIn("-m pip", python_capture.read_text(encoding="utf-8"))
+            self.assertEqual(
+                pathlib.Path(
+                    path_capture.read_text(encoding="utf-8").split(os.pathsep)[0]
+                ).resolve(),
+                directory.resolve(),
+            )
+            self.assertFalse((pathlib.Path(temp) / "injection").exists())
 
 
 class DevCheckCacheTests(unittest.TestCase):
@@ -127,6 +798,21 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
             encoding="utf-8",
         )
         wasm_script.chmod(0o755)
+        native_script = self.root / "tools" / "provision-native-build-tools.py"
+        native_script.write_text(
+            """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[sys.argv.index("--prepare") + 1])
+output.write_text('export PATH="${PATH-}"\\n', encoding="utf-8")
+with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
+    log.write("native-tools-prepare\\n")
+""",
+            encoding="utf-8",
+        )
+        native_script.chmod(0o755)
         (self.root / "web" / "loader" / "test").mkdir(parents=True)
         (self.root / "web" / "loader" / "test" / "loader.test.js").write_text(
             "", encoding="utf-8"
@@ -297,6 +983,8 @@ esac
             "wasm-bindgen-test-runner",
             "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
         )
+        self._write("meson", "#!/usr/bin/env bash\necho '1.11.2'\n")
+        self._write("ninja", "#!/usr/bin/env bash\necho '1.11.1'\n")
         self._write(
             "python3",
             """#!/usr/bin/env bash
@@ -365,6 +1053,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
+        self.assertEqual(lines.count("native-tools-prepare"), 1)
+        self.assertEqual(lines.count("wasm-prepare"), 1)
+        self.assertLess(
+            lines.index("native-tools-prepare"), lines.index("wasm-prepare")
+        )
         self.assertEqual(lines.count("wasm"), 1)
         self.assertEqual(sum(line.startswith("node --test ") for line in lines), 1)
         self.assertTrue(
@@ -410,7 +1103,13 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertIn("PRIOR PASS  cargo nextest run (1/1", second.stdout)
         self.assertEqual(
             self._log_lines(),
-            before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG, "wasm-prepare"],
+            before
+            + [
+                TOOLCHAIN_UPDATE_LOG,
+                TOOLCHAIN_INSTALL_LOG,
+                "native-tools-prepare",
+                "wasm-prepare",
+            ],
         )
 
     def test_fingerprint_tracks_commit_and_worktree_content(self) -> None:
@@ -596,12 +1295,27 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             full_log.index("first_independent_failure"),
             full_log.index("second_independent_failure"),
         )
-        repetition_log = run_dir / ".repetition-10-1.log"
+        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+        metadata_values = dict(
+            line.split("=", maxsplit=1)
+            for line in metadata.splitlines()
+            if "=" in line
+        )
+        native_stage = next(
+            key.removesuffix(".label")
+            for key, value in metadata_values.items()
+            if key.endswith(".label") and value == "cargo nextest run"
+        )
+        self.assertEqual(metadata_values[f"{native_stage}.result"], "FAIL")
+        repetition_log = pathlib.Path(
+            metadata_values[f"{native_stage}.failure_log"]
+        )
+        self.assertEqual(repetition_log.parent, run_dir)
+        self.assertRegex(repetition_log.name, r"^\.repetition-\d+-1\.log$")
         repetition_output = repetition_log.read_text(encoding="utf-8")
         self.assertIn("first_independent_failure", repetition_output)
         self.assertIn("second_independent_failure", repetition_output)
-        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
-        self.assertIn(f"failure_log={repetition_log}", metadata)
+        self.assertIn(f"{native_stage}.failure_log={repetition_log}", metadata)
 
     def test_toolchain_update_failure_precedes_cache_evaluation_and_checks(self) -> None:
         self._run()
@@ -660,6 +1374,18 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             check_workflow.index(install),
             check_workflow.index("run: ./dev.sh check"),
         )
+        for workflow in (check_workflow, release_workflow):
+            self.assertIn("Provision native audio build tools", workflow)
+            self.assertIn("tools/provision-native-build-tools.py", workflow)
+            self.assertIn('--github-path "$GITHUB_PATH"', workflow)
+            self.assertIn('--github-env "$GITHUB_ENV"', workflow)
+        provisioner = (
+            REPO_ROOT / "tools" / "provision-native-build-tools.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('MESON_VERSION = "1.11.2"', provisioner)
+        self.assertIn('NINJA_PACKAGE_VERSION = "1.11.1.4"', provisioner)
+        self.assertIn('f"meson=={MESON_VERSION}"', provisioner)
+        self.assertIn('f"ninja=={NINJA_PACKAGE_VERSION}"', provisioner)
 
     def test_linux_gui_workflows_install_tauri_dbus_build_dependencies(
         self,
@@ -672,27 +1398,18 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 workflow.index("- name: Install Linux dependencies") :
             ]
             self.assertIn("libdbus-1-dev", linux_install)
+            self.assertIn("libasound2-dev", linux_install)
+            self.assertIn("clang", linux_install)
             self.assertIn("pkg-config", linux_install)
+            self.assertNotIn("autoconf", linux_install)
+            self.assertNotIn("automake", linux_install)
+            self.assertNotIn("libtool", linux_install)
             self.assertLess(
                 linux_install.index("libdbus-1-dev"),
                 linux_install.index("- name: Install repository Rust toolchain"),
             )
 
-    def test_removed_voice_transport_has_no_runtime_or_ui_capability(self) -> None:
-        removed_paths = (
-            "frontend/src/voice",
-            "frontend/src/components/voice_layer.rs",
-            "mobile-frontend/src/voice",
-            "mobile-frontend/src/components/voice_bar.rs",
-            "server/src/voice.rs",
-            "server/src/voice_aws.rs",
-            "server/src/voice_webrtc.rs",
-            "frontend/tauri-shell/Info.plist",
-            "frontend/tauri-shell/Entitlements.plist",
-        )
-        for relative in removed_paths:
-            self.assertFalse((REPO_ROOT / relative).exists(), relative)
-
+    def test_native_voice_architecture_and_contract_guards(self) -> None:
         production_sources = "\n".join(
             path.read_text(encoding="utf-8")
             for root in (
@@ -707,26 +1424,208 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             )
             for path in (REPO_ROOT / root).rglob("*.rs")
         )
-        for forbidden in (
-            "UdpSocket",
-            "RtcPeerConnection",
-            "RtcIceCandidate",
-            "VoiceIceCandidate",
-            "VoiceStart",
-            'starts_with("/voice',
-        ):
+        for forbidden in ("UdpSocket", "RtcPeerConnection", "RtcIceCandidate",
+                          "RTCIceCandidate", "StunServer", "TurnServer", "stun://", "turn://", "mdns-sd",
+                          "VoiceIceCandidate"):
             self.assertNotIn(forbidden, production_sources)
 
         manifests = "\n".join(
             (REPO_ROOT / relative).read_text(encoding="utf-8")
             for relative in (
+                "Cargo.toml",
                 "server/Cargo.toml",
                 "frontend/Cargo.toml",
+                "frontend/tauri-shell/Cargo.toml",
                 "mobile-frontend/Cargo.toml",
             )
         )
-        for forbidden in ("str0m", "mdns-sd", 'opus =', "aws-sdk-bedrockruntime"):
+        for forbidden in ("str0m", "mdns-sd", "webrtc =", "webrtc-ice",
+                          "webrtc-dtls", "webrtc-sctp"):
             self.assertNotIn(forbidden, manifests)
+        self.assertEqual(
+            native_voice_vendor_surface_violations(
+                (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+                native_voice_vendor_surfaces(REPO_ROOT),
+            ),
+            [],
+            "only the pinned local AEC DSP may occupy vendored build surfaces",
+        )
+
+        shell_sources = [
+            (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for relative in (
+                "frontend/tauri-shell/src/lib.rs",
+                "frontend/tauri-shell/src/router.rs",
+                "frontend/src/bridge.rs",
+            )
+        ]
+        shell_bridge = "\n".join(shell_sources)
+        self.assertEqual(
+            [
+                signature
+                for source in shell_sources
+                for signature in raw_pcm_desktop_ipc_signatures(source)
+            ],
+            [],
+            "raw PCM buffers must not appear in desktop Tauri command or bridge signatures",
+        )
+        self.assertIn("opus: Vec<u8>", shell_bridge)
+
+        protocol_source = (REPO_ROOT / "protocol/src/framing.rs").read_text()
+        for required in ("RECORD_MAGIC", "MAX_RECORD_BODY", "FrameReader",
+                         "checksum mismatch", "fragment reassembly"):
+            self.assertIn(required, protocol_source)
+        scheduler = (REPO_ROOT / "server/src/stream.rs").read_text()
+        for required in ("CONTROL_LIMIT", "CHAT_LIMIT", "BULK_LIMIT",
+                         "AUDIO_PACKET_LIMIT: usize = 8", "discard_voice_audio"):
+            self.assertIn(required, scheduler)
+        voice_tests = (REPO_ROOT / "tests/tests/native_voice.rs").read_text()
+        for required in ("run_connection_with_synthetic_voice", "start_production_writer_probe",
+                         "start_plain_mqtt_broker", "FrameKind::VoiceInterrupt",
+                         "FrameKind::ProjectFileContents", "4 * 1024 * 1024",
+                         "voice_settings_refresh_capabilities_for_every_live_connection"):
+            self.assertIn(required, voice_tests)
+        server_voice = (REPO_ROOT / "server/src/voice.rs").read_text()
+        server_connection = (REPO_ROOT / "server/src/connection.rs").read_text()
+        server_host = (REPO_ROOT / "server/src/host.rs").read_text()
+        for required in ("NovaInput::Interrupt", "output_generation", "discard_voice_audio",
+                         "agent_handle_for_instance", "ObserverGuard"):
+            self.assertIn(required, server_voice)
+        shell_media = (REPO_ROOT / "frontend/tauri-shell/src/voice_media.rs").read_text()
+        shell_router = (REPO_ROOT / "frontend/tauri-shell/src/router.rs").read_text()
+        devtools_manifest = (REPO_ROOT / "devtools-protocol/Cargo.toml").read_text()
+        server_manifest = (REPO_ROOT / "server/Cargo.toml").read_text()
+        shell_manifest = (REPO_ROOT / "frontend/tauri-shell/Cargo.toml").read_text()
+        frontend_manifest = (REPO_ROOT / "frontend/Cargo.toml").read_text()
+        devtools_source = (REPO_ROOT / "devtools-protocol/src/lib.rs").read_text()
+        shell_lib = (REPO_ROOT / "frontend/tauri-shell/src/lib.rs").read_text()
+        removed_debug_feature = "voice-" + "debug-pipeline"
+        manifest_paths = [REPO_ROOT / "Cargo.toml"]
+        manifest_paths.extend(REPO_ROOT.glob("*/Cargo.toml"))
+        manifest_paths.extend(REPO_ROOT.glob("*/*/Cargo.toml"))
+        for manifest_path in manifest_paths:
+            self.assertNotIn(
+                removed_debug_feature,
+                manifest_path.read_text(encoding="utf-8"),
+                f"removed voice instrumentation feature returned in {manifest_path}",
+            )
+        self.assertIn('default = ["launcher"]', devtools_manifest)
+        self.assertIn("default = []", server_manifest)
+        self.assertIn("default = []", shell_manifest)
+        for cargo_surface in (
+            devtools_manifest,
+            server_manifest,
+            shell_manifest,
+            frontend_manifest,
+        ):
+            self.assertNotIn(removed_debug_feature, cargo_surface)
+        for rust_surface in (
+            devtools_source,
+            server_connection,
+            server_host,
+            server_voice,
+            shell_media,
+            shell_router,
+            shell_lib,
+        ):
+            self.assertNotIn(removed_debug_feature, rust_surface)
+        self.assertFalse((REPO_ROOT / "tools/run-branch-debug-voice.sh").exists())
+        self.assertNotIn("debug-voice-smoke", (REPO_ROOT / "dev.sh").read_text())
+        for removed_scaffold in (
+            "record_dev_instance_voice_pipeline",
+            "record_dev_instance_voice_connection",
+            "DevInstanceVoicePipeline",
+            "voice_debug_connection_snapshot",
+            "record_voice_webview_outcome",
+        ):
+            self.assertNotIn(
+                removed_scaffold,
+                devtools_source
+                + server_connection
+                + server_host
+                + server_voice
+                + shell_media
+                + shell_router
+                + shell_lib,
+            )
+        for production_entry in (
+            "build.sh",
+            ".github/workflows/check.yml",
+            ".github/workflows/release.yml",
+        ):
+            production_source = (REPO_ROOT / production_entry).read_text()
+            self.assertNotIn(
+                removed_debug_feature,
+                production_source,
+                f"{production_entry} must not enable dev-instance audio instrumentation",
+            )
+            self.assertNotIn(
+                "debug-assertions=yes",
+                production_source,
+                f"{production_entry} must preserve release instrumentation exclusion",
+            )
+        self.assertIn("authorized by VoiceAccepted", shell_media)
+        self.assertTrue(
+            native_voice_authorization_is_validated(shell_router),
+            "native media must be authorized by a parsed server VoiceAccepted payload",
+        )
+        self.assertFalse(
+            native_voice_authorization_is_validated(
+                shell_router.replace(
+                    "protocol::FrameKind::VoiceAccepted",
+                    "protocol::FrameKind::VoiceStart",
+                    1,
+                )
+            ),
+            "authorization on unvalidated client input must fail the guard",
+        )
+        self.assertFalse(
+            native_voice_authorization_is_validated(
+                shell_router.replace(
+                    ".parse_payload::<protocol::VoiceAcceptedPayload>()",
+                    ".parse_payload()",
+                    1,
+                )
+            ),
+            "authorization without typed payload validation must fail the guard",
+        )
+        self.assertFalse(
+            native_voice_authorization_is_validated(
+                shell_router.replace(".authorize(host_id.clone(), accepted.generation)", "", 1)
+            ),
+            "removing native media authorization must fail the guard",
+        )
+        self.assertIn('name("tyde-native-audio"', shell_media)
+        self.assertIn("ControlCommand::Shutdown", shell_media)
+        self.assertIn("acknowledgement timed out; media is fail-closed", shell_media)
+        self.assertNotIn("Mutex<Option<(String, u64, Session)>>", shell_media)
+
+        self.assertIn("playback_epoch", shell_media)
+        mobile_media = (REPO_ROOT / "mobile-frontend/voice-media.js").read_text()
+        mobile_codec = (REPO_ROOT / "mobile-frontend/voice-codec-worker.js").read_text()
+        self.assertLess(mobile_media.index("startWait.promise"), mobile_media.index("getUserMedia"))
+        self.assertIn("AudioEncoder.isConfigSupported", mobile_codec)
+        self.assertIn("frame.sampleRate", mobile_codec)
+        self.assertIn("TOOL_INACTIVITY", server_voice)
+        self.assertIn("Decoder::new(16_000", server_voice)
+        self.assertIn("fatal_overflow", scheduler)
+        self.assertIn("categorize_start_failure", (REPO_ROOT / "server/src/voice_aws.rs").read_text())
+
+        entitlements = (REPO_ROOT / "frontend/tauri-shell/Entitlements.plist").read_text()
+        info = (REPO_ROOT / "frontend/tauri-shell/Info.plist").read_text()
+        import xml.etree.ElementTree as ET
+        ET.parse(REPO_ROOT / "frontend/tauri-shell/Entitlements.plist")
+        ET.parse(REPO_ROOT / "frontend/tauri-shell/Info.plist")
+        build = (REPO_ROOT / "build.sh").read_text()
+        tauri_config = (REPO_ROOT / "frontend/tauri-shell/tauri.conf.json").read_text()
+        self.assertIn("com.apple.security.device.audio-input", entitlements)
+        self.assertIn("NSMicrophoneUsageDescription", info)
+        self.assertIn('--entitlements "$SCRIPT_DIR/frontend/tauri-shell/Entitlements.plist"', build)
+        self.assertIn('codesign -d --entitlements :- "$target"', build)
+        self.assertIn('"infoPlist": "Info.plist"', tauri_config)
+        for backend in ("server/src/backend/codex.rs", "server/src/backend/acp/mod.rs"):
+            source = (REPO_ROOT / backend).read_text()
+            self.assertIn("serde_json::from_str::<Value>(&line)", source)
         self.assertIn(
             '"MediaDevices"',
             (REPO_ROOT / "mobile-frontend/Cargo.toml").read_text(),
@@ -735,10 +1634,204 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             "VoiceOver/TalkBack",
             (REPO_ROOT / "mobile-frontend/src/components/bottom_nav.rs").read_text(),
         )
-        self.assertIn(
-            '"tts_providers": {}',
-            (REPO_ROOT / "tests/tests/settings.rs").read_text(),
+
+    def test_native_voice_vendor_guard_rejects_network_mutations(self) -> None:
+        manifest = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        surfaces = native_voice_vendor_surfaces(REPO_ROOT)
+        self.assertEqual(native_voice_vendor_surface_violations(manifest, surfaces), [])
+
+        patched = manifest.replace(
+            NATIVE_VOICE_AEC_PATCH,
+            f'{NATIVE_VOICE_AEC_PATCH}\nstr0m = {{ path = "vendor/str0m" }}',
         )
+        self.assertTrue(native_voice_vendor_surface_violations(patched, surfaces))
+        subtable_patch = (
+            f'{manifest}\n[patch.crates-io.transport-shim]\n'
+            'git = "https://example.invalid/network-transport"\n'
+        )
+        self.assertTrue(
+            native_voice_vendor_surface_violations(subtable_patch, surfaces)
+        )
+        source_patch = (
+            f'{manifest}\n[patch."https://example.invalid/index"]\n'
+            'transport-shim = { git = "https://example.invalid/transport" }\n'
+        )
+        self.assertTrue(native_voice_vendor_surface_violations(source_patch, surfaces))
+
+        mutations = {
+            "udp dependency": (
+                "vendor/webrtc-audio-processing-sys/Cargo.toml",
+                '\n[dependencies]\nudp-network = "1"\n',
+            ),
+            "ICE source": (
+                "vendor/webrtc-audio-processing-sys/src/lib.rs",
+                "\nstruct IceCandidate;\n",
+            ),
+            "STUN source": (
+                "vendor/webrtc-audio-processing-sys/src/lib.rs",
+                '\nconst ENDPOINT: &str = "stun://127.0.0.1";\n',
+            ),
+            "TURN source": (
+                "vendor/webrtc-audio-processing-sys/src/lib.rs",
+                '\nconst ENDPOINT: &str = "turn://127.0.0.1";\n',
+            ),
+            "literal comment marker cannot hide code": (
+                "vendor/webrtc-audio-processing-sys/src/lib.rs",
+                '\nconst TEXT: &str = "https://safe.invalid"; struct IceCandidate;\n',
+            ),
+        }
+        for label, (path, addition) in mutations.items():
+            mutated = dict(surfaces)
+            mutated[path] += addition
+            self.assertTrue(
+                native_voice_vendor_surface_violations(manifest, mutated), label
+            )
+
+        extra_vendor = dict(surfaces)
+        extra_vendor["vendor/network-stack/Cargo.toml"] = (
+            '[package]\nname = "network-stack"\nversion = "1.0.0"\n'
+        )
+        self.assertTrue(
+            native_voice_vendor_surface_violations(manifest, extra_vendor)
+        )
+
+    def test_native_voice_vendor_guard_pins_offline_abseil_cache(self) -> None:
+        manifest = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        surfaces = native_voice_vendor_surfaces(REPO_ROOT)
+        self.assertEqual(native_voice_vendor_surface_violations(manifest, surfaces), [])
+
+        for path in NATIVE_VOICE_ABSEIL_CACHE:
+            missing = dict(surfaces)
+            del missing[path]
+            self.assertTrue(
+                native_voice_vendor_surface_violations(manifest, missing), path
+            )
+
+            with tempfile.TemporaryDirectory() as temp:
+                artifact = pathlib.Path(temp) / pathlib.PurePosixPath(path).name
+                artifact.write_bytes((REPO_ROOT / path).read_bytes() + b"tampered")
+                data = artifact.read_bytes()
+                tampered = dict(surfaces)
+                tampered[path] = (
+                    f"sha256:{hashlib.sha256(data).hexdigest()}:bytes:{len(data)}"
+                )
+                self.assertTrue(
+                    native_voice_vendor_surface_violations(manifest, tampered), path
+                )
+
+        for wrap_line in NATIVE_VOICE_ABSEIL_WRAP_LINES:
+            wrap_drift = dict(surfaces)
+            wrap_drift[NATIVE_VOICE_ABSEIL_WRAP] = wrap_drift[
+                NATIVE_VOICE_ABSEIL_WRAP
+            ].replace(wrap_line, f"{wrap_line}-tampered")
+            self.assertTrue(
+                native_voice_vendor_surface_violations(manifest, wrap_drift),
+                wrap_line,
+            )
+
+        downloadable = dict(surfaces)
+        build_path = f"{NATIVE_VOICE_AEC_VENDOR}/build.rs"
+        downloadable[build_path] = downloadable[build_path].replace(
+            '.arg("--wrap-mode=nodownload")', ""
+        )
+        self.assertTrue(native_voice_vendor_surface_violations(manifest, downloadable))
+
+        partial_fallback = dict(surfaces)
+        partial_fallback[build_path] = partial_fallback[build_path].replace(
+            NATIVE_VOICE_ABSEIL_FORCE_FALLBACK,
+            "--force-fallback-for=absl_base",
+        )
+        self.assertTrue(native_voice_vendor_surface_violations(manifest, partial_fallback))
+
+        system_abseil = dict(surfaces)
+        system_abseil[build_path] += '\npkg_config::Config::new().probe("absl_base");\n'
+        self.assertTrue(native_voice_vendor_surface_violations(manifest, system_abseil))
+
+        no_recovery = dict(surfaces)
+        no_recovery[build_path] = no_recovery[build_path].replace(
+            "remove_materialized_abseil", "leave_materialized_abseil"
+        )
+        self.assertTrue(native_voice_vendor_surface_violations(manifest, no_recovery))
+
+    def test_native_voice_patch_reader_is_python39_and_dependency_free(self) -> None:
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        self.assertNotIn("toml" + "lib", source)
+        equivalents = (
+            """
+            [patch.crates-io] # semantic source
+            webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" } # pinned
+            """,
+            """
+            [patch.crates-io.webrtc-audio-processing-sys]
+            path = "vendor/webrtc-audio-processing-sys"
+            """,
+            """
+            [patch."crates-io"]
+            "webrtc-audio-processing-sys" = { path = "vendor/webrtc-audio-processing-sys" }
+            """,
+            """
+            [patch]
+            crates-io = { webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" } }
+            """,
+        )
+        escapes = (
+            """
+            [patch.crates-io]
+            webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }
+            [patch.crates-io.transport-shim]
+            git = "https://example.invalid/network"
+            """,
+            """
+            [patch.crates-io]
+            webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }
+            [patch."https://example.invalid/index"]
+            transport-shim = { git = "https://example.invalid/network" }
+            """,
+        )
+        malformed = (
+            '[patch.crates-io]\nwebrtc-audio-processing-sys = { path = "unterminated"\n',
+            '[[patch.crates-io]]\nname = "ambiguous"\n',
+        )
+        with mock.patch.dict(sys.modules, {"toml" + "lib": None}):
+            for equivalent in equivalents:
+                self.assertTrue(expected_native_voice_patch_surface(equivalent))
+            for escape in escapes:
+                self.assertFalse(expected_native_voice_patch_surface(escape))
+            for invalid in malformed:
+                self.assertFalse(expected_native_voice_patch_surface(invalid))
+
+    def test_native_voice_vendor_guard_tokenizes_meson_names(self) -> None:
+        manifest = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        surfaces = native_voice_vendor_surfaces(REPO_ROOT)
+        path = "vendor/webrtc-audio-processing-sys/meson.build"
+        for safe_name in ("device", "service", "notice", "return"):
+            mutated = dict(surfaces)
+            mutated[path] = f"dependency('{safe_name}')\n"
+            self.assertEqual(
+                native_voice_vendor_surface_violations(manifest, mutated), [], safe_name
+            )
+        for rejected_name in ("lib-ice", "udp-transport", "mdns-sd"):
+            mutated = dict(surfaces)
+            mutated[path] = f"subproject('{rejected_name}')\n"
+            self.assertTrue(
+                native_voice_vendor_surface_violations(manifest, mutated), rejected_name
+            )
+
+    def test_raw_pcm_guard_inspects_ipc_signatures_not_prose(self) -> None:
+        safe = """
+        // PCM is intentionally confined to the native audio engine.
+        #[tauri::command]
+        async fn voice_media_push(opus: Vec<u8>, pcm_clock: u64) {}
+        """
+        self.assertEqual(raw_pcm_desktop_ipc_signatures(safe), [])
+        for unsafe in (
+            "#[tauri::command] fn leak(samples: Vec<i16>) {}",
+            "pub async fn voice_media_push(raw_audio: Vec<u8>) {}",
+            "pub fn send_host_frame(pcm: &[f32]) {}",
+            "#[derive(Serialize)] struct Event { pcm_samples: Vec<u8> }",
+            "#[derive(Serialize)] struct Event { audio: [i16; 480] }",
+        ):
+            self.assertTrue(raw_pcm_desktop_ipc_signatures(unsafe), unsafe)
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
@@ -840,7 +1933,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(self._log_lines(), [])
         self.assertEqual(list(logs.glob("run-20*")), [])
 
-    def test_cold_wasm_tools_provision_before_cache_identity_once(self) -> None:
+    def test_cold_build_tools_provision_before_cache_identity_once(self) -> None:
         env = self.env.copy()
         env.pop("CHROME")
         env.pop("CHROMEDRIVER")
@@ -848,7 +1941,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         result = self._run(env=env)
 
+        self.assertIn("PASS  Provision native build tools", result.stdout)
         self.assertIn("PASS  Provision wasm test tools", result.stdout)
+        self.assertEqual(self._log_lines().count("native-tools-prepare"), 1)
         self.assertEqual(self._log_lines().count("wasm-prepare"), 1)
         self.assertEqual(self._log_lines().count("wasm"), 1)
         self.assertEqual(

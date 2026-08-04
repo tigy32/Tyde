@@ -26,7 +26,7 @@ const _: () = assert!(DATA_CREDIT_WINDOW as u64 <= RECEIVE_REORDER_WINDOW);
 /// Reassembles the ordered byte stream from data frames.
 ///
 /// This is transport-layer reassembly (like TCP), not "fixing up" the Tyde
-/// protocol sequence: the NDJSON `seq` above this layer is still validated
+/// protocol sequence: the Tyde envelope `seq` above this layer is still validated
 /// strictly. Broker PUBACK is not Tyde receiver credit, so the sender is
 /// serialized separately; the receiver still tolerates bounded MQTT reordering
 /// and fails loudly for beyond-window gaps.

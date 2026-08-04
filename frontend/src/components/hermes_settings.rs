@@ -3303,6 +3303,7 @@ mod wasm_tests {
                     code_intel: Default::default(),
                     backend_config: HashMap::new(),
                     launch_profiles: Vec::new(),
+                    voice: Default::default(),
                     hermes_disabled_providers: HashMap::from([(
                         HERMES_DEFAULT_PROFILE.to_owned(),
                         disabled.clone(),

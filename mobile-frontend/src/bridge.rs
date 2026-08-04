@@ -2,7 +2,7 @@
 //! dialogs. The browser talks directly to hosts over MQTT-over-WebSocket,
 //! persists pairing data in IndexedDB, and delivers events in process.
 
-mod web;
+pub(crate) mod web;
 
 use serde::{Deserialize, Serialize};
 

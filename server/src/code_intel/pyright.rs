@@ -113,7 +113,6 @@ mod tests {
         CodeIntelState, CodeIntelStatusPayload, FrameKind, HostExecutablePath, ProjectFileVersion,
         ProjectPath, ProjectRootPath, StreamPath,
     };
-    use tokio::sync::mpsc;
 
     use super::super::language_server::ServerDiscovery;
     use super::super::lsp_provider::LspProvider;
@@ -258,7 +257,7 @@ mod tests {
             CodeIntelResourceMode::Full,
         );
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::stream::output_channel();
         let stream = Stream::new(StreamPath("/project/ci".to_owned()), tx);
         let path = ProjectPath {
             root: root_path,

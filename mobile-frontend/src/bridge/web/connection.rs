@@ -1,7 +1,7 @@
 //! Browser (PWA) connection manager.
 //!
 //! This is the surviving wasm single-context implementation of the mobile
-//! connection contract. Behaviour preserved: connect → run the newline-delimited host-line
+//! connection contract. Behaviour preserved: connect → run the framed host-record
 //! loop → reconnect with [`MqttReconnectBackoff`] on retryable drops, surfacing
 //! the same `host-line` / `host-disconnected` / `host-error` /
 //! connection-status events consumed by the mobile frontend.
@@ -22,15 +22,12 @@
 //! the native buffer would have protected. The connection-instance-id handshake
 //! the app uses to drop stale lines within a live session is still kept.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
-
-#[cfg(all(test, target_arch = "wasm32"))]
-use std::cell::Cell;
 
 use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
 use mobile_shell_types::{
@@ -41,7 +38,7 @@ use mqtt_transport::{
     PreSharedKey,
 };
 use protocol::MobileAccessErrorCode;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -329,6 +326,14 @@ struct ActiveConnection {
     control: watch::Sender<ConnectionControl>,
     actor_instance_id: u64,
     connection_instance_id: Option<u64>,
+    audio_pending: Rc<Cell<u8>>,
+}
+
+struct AudioPermit(Rc<Cell<u8>>);
+impl Drop for AudioPermit {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 enum ConnectionCommand {
@@ -336,6 +341,12 @@ enum ConnectionCommand {
         line: String,
         connection_instance_id: u64,
         local_submission_id: LocalSubmissionId,
+    },
+    SendFrame {
+        frame: protocol::ProtocolFrame,
+        connection_instance_id: u64,
+        local_submission_id: LocalSubmissionId,
+        permit: Option<AudioPermit>,
     },
 }
 
@@ -500,6 +511,46 @@ impl ConnectionManager {
         }
     }
 
+    pub async fn send_frame(
+        &self,
+        local_host_id: LocalHostId,
+        frame: protocol::ProtocolFrame,
+    ) -> Result<(), SendRejected> {
+        let (tx, connection_instance_id, local_submission_id, permit) = {
+            let mut inner = self.inner.borrow_mut();
+            let active = inner
+                .active
+                .get(&local_host_id)
+                .ok_or(SendRejected::NotConnected)?;
+            let id = active
+                .connection_instance_id
+                .ok_or(SendRejected::NotConnected)?;
+            let permit = if frame.binary.is_empty() {
+                None
+            } else {
+                if active.audio_pending.get() >= 8 {
+                    return Err(SendRejected::QueueFull);
+                }
+                active.audio_pending.set(active.audio_pending.get() + 1);
+                Some(AudioPermit(active.audio_pending.clone()))
+            };
+            let tx = active.tx.clone();
+            let submission = LocalSubmissionId(inner.next_local_submission_id);
+            inner.next_local_submission_id = inner.next_local_submission_id.wrapping_add(1);
+            (tx, id, submission, permit)
+        };
+        tx.try_send(ConnectionCommand::SendFrame {
+            frame,
+            connection_instance_id,
+            local_submission_id,
+            permit,
+        })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => SendRejected::QueueFull,
+            mpsc::error::TrySendError::Closed(_) => SendRejected::ConnectionClosed,
+        })
+    }
+
     pub fn connection_statuses(&self) -> Vec<PairedHostConnectionStatusEvent> {
         self.inner
             .borrow()
@@ -545,6 +596,7 @@ impl ConnectionManager {
                 control: control.clone(),
                 actor_instance_id,
                 connection_instance_id: None,
+                audio_pending: Rc::new(Cell::new(0)),
             },
         );
         self.set_status_and_emit(
@@ -1151,7 +1203,7 @@ where
         writer_deadline,
     } = context;
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut lines = BufReader::new(read_half).lines();
+    let mut frames = protocol::FrameReader::new(BufReader::new(read_half));
     let mut write_half = Some(write_half);
     let mut in_flight = None;
     let mut write_future: Option<PendingWrite<S>> = None;
@@ -1235,7 +1287,7 @@ where
                     }
                 }
             }
-            read_result = lines.next_line() => {
+            read_result = frames.read_frame() => {
                 match read_result {
                     Ok(None) => {
                         settle_connected_teardown(local_host_id, in_flight.take(), rx);
@@ -1244,31 +1296,40 @@ where
                             "MQTT Tyde byte stream closed",
                         )));
                     }
-                    Ok(Some(line)) => {
-                        if !line.is_empty() {
+                    Ok(Some(frame)) => {
+                        if frame.binary.is_empty() {
+                            let line = match serde_json::to_string(&frame.envelope) {
+                                Ok(line) => line,
+                                Err(error) => {
+                                    settle_connected_teardown(local_host_id, in_flight.take(), rx);
+                                    return ConnectedOutcome::Disconnected(ConnectErr::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)));
+                                }
+                            };
                             manager.emit_host_line(
                                 local_host_id,
                                 actor_instance_id,
                                 connection_instance_id,
                                 line,
                             );
+                        } else if let Err(error) = crate::voice::handle_binary_frame(frame) {
+                            settle_connected_teardown(local_host_id, in_flight.take(), rx);
+                            return ConnectedOutcome::Disconnected(ConnectErr::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)));
                         }
                     }
                     Err(error) => {
                         settle_connected_teardown(local_host_id, in_flight.take(), rx);
-                        return ConnectedOutcome::Disconnected(ConnectErr::Io(error));
+                        return ConnectedOutcome::Disconnected(ConnectErr::Io(
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                        ));
                     }
                 }
             }
             command = rx.recv(), if write_future.is_none() => {
-                let Some(ConnectionCommand::SendLine {
-                    line,
-                    connection_instance_id: submission_connection_id,
-                    local_submission_id,
-                }) = command else {
+                let Some(command) = command else {
                     settle_connected_teardown(local_host_id, None, rx);
                     return ConnectedOutcome::StopRequested;
                 };
+                let (submission_connection_id,local_submission_id)=match &command { ConnectionCommand::SendLine{connection_instance_id,local_submission_id,..}|ConnectionCommand::SendFrame{connection_instance_id,local_submission_id,..}=>(*connection_instance_id,*local_submission_id) };
                 if submission_connection_id != connection_instance_id {
                     emit_submission_transport_outcome(SubmissionTransportOutcomeEvent {
                         local_host_id: local_host_id.clone(),
@@ -1294,7 +1355,8 @@ where
                 // Do not batch mobile writes. One logical line per write+flush is
                 // what makes BrokerAcknowledged attributable to this submission.
                 write_future = Some(Box::pin(async move {
-                    let result = match timeout(writer_deadline, write_host_line(&mut writer, &line)).await {
+                    let write = async { match command { ConnectionCommand::SendLine{line,..}=>write_host_line(&mut writer,&line).await, ConnectionCommand::SendFrame{frame,permit,..}=>{let result=protocol::write_frame(&mut writer,&frame).await.map_err(|error|std::io::Error::new(std::io::ErrorKind::InvalidData,error));drop(permit);result} } };
+                    let result = match timeout(writer_deadline, write).await {
                         Ok(result) => result.map_err(WriteAttemptFailure::Io),
                         Err(_) => Err(WriteAttemptFailure::Deadline),
                     };
@@ -1321,12 +1383,19 @@ fn settle_connected_teardown(
     }
 
     let mut not_sent_count = 0;
-    while let Ok(ConnectionCommand::SendLine {
-        connection_instance_id,
-        local_submission_id,
-        ..
-    }) = rx.try_recv()
-    {
+    while let Ok(command) = rx.try_recv() {
+        let (connection_instance_id, local_submission_id) = match command {
+            ConnectionCommand::SendLine {
+                connection_instance_id,
+                local_submission_id,
+                ..
+            }
+            | ConnectionCommand::SendFrame {
+                connection_instance_id,
+                local_submission_id,
+                ..
+            } => (connection_instance_id, local_submission_id),
+        };
         not_sent_count += 1;
         emit_submission_transport_outcome(SubmissionTransportOutcomeEvent {
             local_host_id: local_host_id.clone(),
@@ -1346,9 +1415,11 @@ async fn write_host_line<W>(writer: &mut W, line: &str) -> Result<(), std::io::E
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await
+    let envelope: protocol::Envelope = serde_json::from_str(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    protocol::write_envelope(writer, &envelope)
+        .await
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 async fn next_control(control_rx: &mut watch::Receiver<ConnectionControl>) -> ConnectionControl {
@@ -1493,9 +1564,32 @@ mod tests {
                 control,
                 actor_instance_id: 1,
                 connection_instance_id,
+                audio_pending: Rc::new(Cell::new(0)),
             },
         );
         (manager, host, rx, control_rx)
+    }
+
+    fn test_host_line(label: &str, seq: u64) -> String {
+        serde_json::to_string(
+            &protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/test".into()),
+                protocol::FrameKind::HeartbeatAck,
+                seq,
+                &serde_json::json!({"label": label}),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn framed_host_line(line: &str) -> Vec<u8> {
+        let envelope = serde_json::from_str(line).unwrap();
+        protocol::encode_frame(&protocol::ProtocolFrame::json(envelope), 1)
+            .unwrap()
+            .into_iter()
+            .flat_map(|record| record.bytes)
+            .collect()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1513,7 +1607,10 @@ mod tests {
         let ConnectionCommand::SendLine {
             local_submission_id,
             ..
-        } = command;
+        } = command
+        else {
+            panic!("ordinary send queued a binary frame")
+        };
         assert_eq!(accepted.local_submission_id, local_submission_id);
         drop(control_rx);
     }
@@ -1728,7 +1825,7 @@ mod tests {
     struct TestStream {
         state: Rc<TestStreamState>,
         flush_ready: bool,
-        inbound_after_flush: Option<&'static [u8]>,
+        inbound_after_flush: Option<Vec<u8>>,
         continuous_inbound: bool,
     }
 
@@ -1738,7 +1835,7 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            let Some(inbound) = self.inbound_after_flush else {
+            let Some(inbound) = self.inbound_after_flush.as_deref() else {
                 return std::task::Poll::Pending;
             };
             let inbound_reads = self.state.inbound_reads.get();
@@ -1785,17 +1882,22 @@ mod tests {
     async fn assert_continuous_pressure_stop_is_prioritized() {
         let (manager, host, mut rx, mut control_rx) = active_manager(3, Some(77));
         let mut accepted = Vec::new();
-        for line in ["dequeued", "queued one", "queued two"] {
+        let lines = [
+            test_host_line("dequeued", 1),
+            test_host_line("queued one", 2),
+            test_host_line("queued two", 3),
+        ];
+        for line in &lines {
             accepted.push(
                 manager
-                    .send_line(host.clone(), line.to_owned())
+                    .send_line(host.clone(), line.clone())
                     .await
                     .expect("production admission must accept available capacity"),
             );
         }
         assert_eq!(
             manager
-                .send_line(host.clone(), "queue full".to_owned())
+                .send_line(host.clone(), test_host_line("queue full", 4))
                 .await,
             Err(SendRejected::QueueFull)
         );
@@ -1808,7 +1910,7 @@ mod tests {
         let stream = TestStream {
             state: state.clone(),
             flush_ready: false,
-            inbound_after_flush: Some(b"inbound while flush is pending\n"),
+            inbound_after_flush: Some(framed_host_line(&test_host_line("inbound", 5))),
             continuous_inbound: true,
         };
         let host_for_listener = host.clone();
@@ -1852,7 +1954,7 @@ mod tests {
             1,
             "Stop must win the next poll despite continuously ready inbound data"
         );
-        assert_eq!(&*state.written.borrow(), b"dequeued\n");
+        assert_eq!(&*state.written.borrow(), &framed_host_line(&lines[0]));
         assert_eq!(
             &*outcomes.borrow(),
             &[
@@ -1880,6 +1982,13 @@ mod tests {
                 ..
             }) => panic!(
                 "Stop left local submission {} queued instead of settling NotSent",
+                local_submission_id.0
+            ),
+            Ok(ConnectionCommand::SendFrame {
+                local_submission_id,
+                ..
+            }) => panic!(
+                "Stop left binary local submission {} queued instead of settling NotSent",
                 local_submission_id.0
             ),
         }
@@ -1914,7 +2023,7 @@ mod tests {
             .control
             .clone();
         let accepted = manager
-            .send_line(host.clone(), "one logical line".to_owned())
+            .send_line(host.clone(), test_host_line("one logical line", 1))
             .await
             .expect("production admission accepts the logical line");
         let state = Rc::new(TestStreamState {
@@ -1954,7 +2063,10 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ConnectedOutcome::StopRequested));
-        assert_eq!(&*state.written.borrow(), b"one logical line\n");
+        assert_eq!(
+            &*state.written.borrow(),
+            &framed_host_line(&test_host_line("one logical line", 1))
+        );
         assert_eq!(
             &*observed.borrow(),
             &[SubmissionTransportOutcome::BrokerAcknowledged,]
@@ -1967,10 +2079,11 @@ mod tests {
     async fn writer_deadline_cancels_session_without_resending_queue() {
         let (manager, host, mut rx, mut control_rx) = active_manager(2, Some(31));
         let mut accepted = Vec::new();
-        for line in ["dequeued", "queued"] {
+        let lines = [test_host_line("dequeued", 1), test_host_line("queued", 2)];
+        for line in &lines {
             accepted.push(
                 manager
-                    .send_line(host.clone(), line.to_owned())
+                    .send_line(host.clone(), line.clone())
                     .await
                     .expect("production admission accepts available capacity"),
             );
@@ -2029,7 +2142,7 @@ mod tests {
             ]
         );
         assert!(state.flush_polled.get(), "the writer stalled at flush");
-        assert_eq!(&*state.written.borrow(), b"dequeued\n");
+        assert_eq!(&*state.written.borrow(), &framed_host_line(&lines[0]));
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -2276,6 +2389,7 @@ mod tests {
                 control,
                 actor_instance_id: 7,
                 connection_instance_id: None,
+                audio_pending: Rc::new(Cell::new(0)),
             },
         );
 

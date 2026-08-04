@@ -13,6 +13,7 @@ mod send;
 mod state;
 mod syntax_highlight;
 mod term_bridge;
+mod voice;
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_test_support {

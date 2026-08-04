@@ -4288,3 +4288,4 @@ input, textarea, select {
     opacity: 0.6;
     cursor: default;
 }
+.mobile-voice-bar{position:fixed;z-index:90;left:12px;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));display:flex;gap:10px;align-items:center;padding:10px 14px;border-radius:18px;background:var(--surface-raised,#20232b);box-shadow:0 10px 30px rgba(0,0,0,.3)}.mobile-voice-bar span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mobile-voice-bar button{margin-left:auto;border-radius:999px;padding:8px 14px}

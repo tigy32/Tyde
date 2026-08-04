@@ -327,34 +327,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_stream_boundary_rejects_audio_fields_from_typed_payloads() {
+    async fn production_stream_boundary_allows_only_typed_voice_audio() {
         let (mut stream, mut probe) = production_boundary_probe();
-        let payload = protocol::SendMessagePayload {
-            message: "review the attached screenshot".to_owned(),
-            images: Some(vec![protocol::ImageData {
-                media_type: "image/png".to_owned(),
-                data: "iVBORw0KGgo=".to_owned(),
-            }]),
-            origin: Some(protocol::MessageOrigin::User),
-            tool_response: None,
+        let payload = protocol::VoiceAudioPayload {
+            session_id: protocol::VoiceSessionId("session-a".into()),
+            generation: 3,
+            direction: protocol::VoiceDirection::Input,
+            first_media_seq: 7,
+            timestamp_samples_48k: 7 * 960,
+            packet_lengths: vec![3],
         };
         let envelope = protocol::Envelope::from_payload(
-            protocol::StreamPath("/agent/agent-a/instance-a".to_owned()),
-            protocol::FrameKind::SendMessage,
+            protocol::StreamPath("/voice/session-a".to_owned()),
+            protocol::FrameKind::VoiceAudio,
             0,
             &payload,
         )
         .unwrap();
-        let mut wire = serde_json::to_vec(&envelope).unwrap();
-        wire.push(b'\n');
+        let frame = protocol::ProtocolFrame {
+            envelope,
+            binary: vec![1, 2, 3],
+        };
+        let wire = protocol::encode_frame(&frame, 1).unwrap().remove(0).bytes;
 
         stream.write_all(&wire).await.unwrap();
         let (flushed, bytes) = tokio::join!(stream.flush(), probe.next_bytes());
         flushed.unwrap();
         let bytes = bytes.expect("production boundary emitted the typed frame");
-        assert_eq!(bytes, wire);
+        assert_eq!(
+            bytes, wire,
+            "the byte transport must not reinterpret protocol records"
+        );
 
-        let encoded_payload = serde_json::to_value(&payload).unwrap();
+        let ordinary = protocol::SendMessagePayload {
+            message: "review this".to_owned(),
+            images: None,
+            origin: Some(protocol::MessageOrigin::User),
+            tool_response: None,
+        };
+        let encoded_payload = serde_json::to_value(&ordinary).unwrap();
         for field in ["audio", "audio_input", "pcm", "media_payload"] {
             let mut attempted_payload = encoded_payload.clone();
             attempted_payload
@@ -362,9 +373,9 @@ mod tests {
                 .unwrap()
                 .insert(field.to_owned(), serde_json::json!("AAECAwQFBgcICQ=="));
             let attempted_envelope = protocol::Envelope {
-                stream: envelope.stream.clone(),
-                kind: envelope.kind,
-                seq: envelope.seq,
+                stream: protocol::StreamPath("/agent/a/i".into()),
+                kind: protocol::FrameKind::SendMessage,
+                seq: 0,
                 payload: attempted_payload,
             };
             assert!(

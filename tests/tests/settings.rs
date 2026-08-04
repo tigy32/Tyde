@@ -990,6 +990,7 @@ fn expected_empty_settings() -> HostSettings {
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
         hermes_disabled_providers: Default::default(),
+        voice: Default::default(),
     }
 }
 
@@ -1034,7 +1035,7 @@ fn persisted_empty_settings_are_valid() {
 }
 
 #[test]
-fn persisted_removed_voice_settings_are_ignored() {
+fn persisted_native_voice_settings_migrate_without_legacy_network_fields() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("settings.json");
     fs::write(
@@ -1045,20 +1046,43 @@ fn persisted_removed_voice_settings_are_ignored() {
     "default_backend": null,
     "voice": {
       "enabled": true,
-      "aws_profile": "legacy-profile",
-      "aws_region": "us-west-2"
+      "aws_profile": "production-profile",
+      "aws_region": "us-west-2",
+      "nova_model": "amazon.nova-2-sonic-v1:0",
+      "availability": {"kind": "unavailable", "reason": "credentials_expired"},
+      "webrtc_url": "wss://legacy.invalid",
+      "udp_port": 3478,
+      "stun_servers": ["stun:legacy.invalid"],
+      "turn_servers": ["turn:legacy.invalid"]
     }
   }
 }"#,
     )
-    .expect("write settings with removed voice fields");
+    .expect("write current voice settings with rejected legacy network fields");
 
-    let store = HostSettingsStore::load(path).expect("ignore removed voice settings");
+    let store = HostSettingsStore::load(path).expect("load native voice settings migration");
+    let settings = store.get().expect("read migrated native voice settings");
 
+    assert!(settings.voice.enabled);
     assert_eq!(
-        store.get().expect("read settings"),
-        expected_empty_settings()
+        settings.voice.aws_profile.as_deref(),
+        Some("production-profile")
     );
+    assert_eq!(settings.voice.aws_region.as_deref(), Some("us-west-2"));
+    assert_eq!(settings.voice.nova_model, "amazon.nova-2-sonic-v1:0");
+    assert_eq!(
+        settings.voice.availability,
+        protocol::VoiceAvailability::Available,
+        "persisted availability is untrusted and recomputed from current native settings"
+    );
+    let migrated = serde_json::to_value(settings).expect("serialize migrated settings");
+    let voice = migrated.get("voice").expect("serialized voice settings");
+    for removed in ["webrtc_url", "udp_port", "stun_servers", "turn_servers"] {
+        assert!(
+            voice.get(removed).is_none(),
+            "rejected legacy network field {removed} must not enter current settings"
+        );
+    }
 }
 
 #[test]
@@ -1153,6 +1177,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         }
     );
 }

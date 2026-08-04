@@ -5672,6 +5672,15 @@ fn MobileTab() -> impl IntoView {
     let state_for_start_pending = state.clone();
     let state_for_start_click = state.clone();
     let state_for_cancel_click = state.clone();
+    let state_for_voice_enabled = state.clone();
+    let state_for_voice_profile = state.clone();
+    let state_for_voice_region = state.clone();
+    let state_for_voice_model = state.clone();
+    let state_for_voice_enabled_commit = state.clone();
+    let state_for_voice_profile_commit = state.clone();
+    let state_for_voice_region_commit = state.clone();
+    let state_for_voice_model_commit = state.clone();
+    let state_for_voice_disabled = state.clone();
 
     // Inline error surfaced when the user types something the server
     // would reject. Cleared when the user types again, when the field
@@ -5917,6 +5926,35 @@ fn MobileTab() -> impl IntoView {
         <p class="settings-description settings-panel-intro">
             "Pair the Tyde mobile app with this host over tycode.dev managed access. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection — there is no public or free MQTT broker. Your mobile device signs in with a Tyggs Pass to complete pairing; this host is never asked for Tyggs credentials."
         </p>
+
+        <div class="settings-field" data-testid="native-voice-settings">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Native voice with Amazon Nova Sonic"</label>
+                    <p class="settings-description">"Uses the selected server AWS profile and region. Tyde never sends AWS credentials to desktop or mobile clients and never downgrades to another model."</p>
+                </div>
+                <label class="settings-toggle"><input type="checkbox"
+                    prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
+                    disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_setting(&state_for_voice_enabled_commit,HostSettingValue::VoiceEnabled{enabled:input.checked()}); }
+                /><span class="settings-toggle-slider"></span></label>
+            </div>
+            <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
+            <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
+                prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
+                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_profile_commit,HostSettingValue::VoiceAwsProfile{profile:(!value.is_empty()).then_some(value)}); }
+            />
+            <label class="settings-label" for="voice-aws-region">"AWS region"</label>
+            <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
+                prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
+                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_region_commit,HostSettingValue::VoiceAwsRegion{region:(!value.is_empty()).then_some(value)}); }
+            />
+            <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
+            <select id="voice-nova-model" class="settings-select"
+                prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
+                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_setting(&state_for_voice_model_commit,HostSettingValue::VoiceNovaModel{model:input.value()}); }
+            ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
+        </div>
 
         <div class="settings-field">
             <div class="settings-toggle-row">
@@ -8398,6 +8436,7 @@ mod wasm_tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
             );
         });
@@ -8843,19 +8882,13 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
-        // The enable toggle is the only checkbox inside the Mobile tab.
-        let toggles = container
-            .query_selector_all("input[type='checkbox']")
-            .unwrap();
+        // Voice settings share this tab, so resolve the control by the label
+        // the user sees rather than by its position among checkboxes.
+        let toggle = toggle_for_label(&container, "Enable mobile connections");
         assert!(
-            toggles.length() >= 1,
-            "Mobile tab must render at least one checkbox"
+            !toggle.checked(),
+            "mobile connections start disabled in this fixture"
         );
-        let toggle: web_sys::HtmlInputElement = toggles
-            .item(0)
-            .unwrap()
-            .dyn_into()
-            .expect("checkbox element");
         toggle.set_checked(true);
         dispatch_change(&toggle);
         for _ in 0..4 {
@@ -8871,6 +8904,59 @@ mod wasm_tests {
             enable.get("enabled").and_then(|v| v.as_bool()),
             Some(true),
             "EnableMobileConnections payload must carry enabled=true after toggle on"
+        );
+        assert!(
+            !settings.iter().any(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str()) == Some("voice_enabled")
+            }),
+            "the mobile toggle must not commit the neighboring voice setting: {settings:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_tab_voice_toggle_commits_only_voice_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let toggle = toggle_for_label(&container, "Native voice with Amazon Nova Sonic");
+        assert!(
+            !toggle.checked(),
+            "native voice starts disabled in this fixture"
+        );
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let voice = settings
+            .iter()
+            .find(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str()) == Some("voice_enabled")
+            })
+            .expect("the native voice toggle must emit a VoiceEnabled SetSetting frame");
+        assert_eq!(
+            voice.get("enabled").and_then(|value| value.as_bool()),
+            Some(true),
+            "VoiceEnabled must carry enabled=true after toggle on"
+        );
+        assert!(
+            !settings.iter().any(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str())
+                    == Some("enable_mobile_connections")
+            }),
+            "the voice toggle must not commit the neighboring mobile setting: {settings:?}"
         );
     }
 
@@ -9658,6 +9744,7 @@ mod wasm_tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
             );
         });
@@ -10292,6 +10379,7 @@ mod wasm_tests {
             backend_config,
             launch_profiles: Vec::new(),
             hermes_disabled_providers: Default::default(),
+            voice: Default::default(),
         }
     }
 
@@ -11137,6 +11225,7 @@ mod wasm_tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
             );
         });
@@ -11782,6 +11871,7 @@ mod wasm_tests {
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: profiles,
                     hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
                 },
             );
         });

@@ -18,6 +18,7 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 rumqttd = "0.20.0"
+opus = "0.3.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

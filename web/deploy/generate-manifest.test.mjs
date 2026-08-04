@@ -20,6 +20,9 @@ function writeDist(root) {
   );
   writeFileSync(join(dist, "mobile-frontend-test.js"), "export default function init() {}\n");
   writeFileSync(join(dist, "mobile-frontend-test_bg.wasm"), "wasm bytes\n");
+  for (const asset of ["voice-media.js", "voice-codec-worker.js", "voice-capture-worklet.js", "voice-playback-worklet.js"]) {
+    writeFileSync(join(dist, asset), `// ${asset}\n`);
+  }
   return dist;
 }
 
@@ -76,6 +79,9 @@ test("generator stamps protocolVersion from Rust protocol source", () => {
   assert.equal(entry.entry, "/tyde/v0.8.19-beta.16/mobile-frontend-test.js");
   assert.ok(entry.integrity.startsWith("sha384-"));
   assert.ok(entry.artifacts["/tyde/v0.8.19-beta.16/mobile-frontend-test_bg.wasm"]);
+  for (const asset of ["voice-media.js", "voice-codec-worker.js", "voice-capture-worklet.js", "voice-playback-worklet.js"]) {
+    assert.ok(entry.artifacts[`/tyde/v0.8.19-beta.16/${asset}`], `${asset} must be integrity-manifested`);
+  }
 });
 
 test("generator raises minSupported past entries without protocolVersion", () => {

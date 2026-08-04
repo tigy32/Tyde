@@ -40,6 +40,7 @@ The persisted host-settings document covers:
 
 - `enabled_backends`
 - `default_backend`
+- native voice enablement, AWS profile/region selectors, and exact Nova model
 
 These are host-level settings, not per-session settings or frontend
 preferences. Backend-native settings are also exposed on the host stream, but
@@ -66,6 +67,7 @@ Host settings are strongly typed in `protocol/src/types.rs`.
 pub struct HostSettings {
     pub enabled_backends: Vec<BackendKind>,
     pub default_backend: Option<BackendKind>,
+    pub voice: VoiceSettings,
 }
 ```
 
@@ -93,6 +95,10 @@ pub struct SetSettingPayload {
 pub enum HostSettingValue {
     EnabledBackends { enabled_backends: Vec<BackendKind> },
     DefaultBackend { default_backend: Option<BackendKind> },
+    VoiceEnabled { enabled: bool },
+    VoiceAwsProfile { profile: Option<String> },
+    VoiceAwsRegion { region: Option<String> },
+    VoiceNovaModel { model: String },
 }
 ```
 
