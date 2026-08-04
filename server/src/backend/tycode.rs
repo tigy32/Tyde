@@ -3185,6 +3185,7 @@ fn is_known_tycode_typed_chat_event_kind(kind: &str) -> bool {
             | "StreamReasoningDelta"
             | "StreamEnd"
             | "ToolRequest"
+            | "ToolProgress"
             | "ToolExecutionCompleted"
             | "OperationCancelled"
             | "RetryAttempt"
@@ -4116,6 +4117,46 @@ mod tests {
         assert!(
             !stream_state.open,
             "malformed StreamEnd must not leave cursor active"
+        );
+    }
+
+    #[test]
+    fn tycode_malformed_tool_progress_surfaces_error_message() {
+        let events = map_tycode_value_to_chat_events(&serde_json::json!({
+            "kind": "ToolProgress",
+            "data": {
+                "tool_call_id": 42
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        let ChatEvent::MessageAdded(message) = &events[0] else {
+            panic!("expected visible error message, got {:?}", events[0]);
+        };
+        assert!(matches!(&message.sender, MessageSender::Error));
+        assert!(
+            message
+                .content
+                .contains("Malformed Tycode ToolProgress event"),
+            "unexpected error content: {}",
+            message.content
+        );
+
+        let well_formed = map_tycode_value_to_chat_events(&serde_json::json!({
+            "kind": "ToolProgress",
+            "data": {
+                "tool_call_id": "tool-1",
+                "tool_name": "terminal",
+                "update": {
+                    "kind": "other",
+                    "payload": {}
+                }
+            }
+        }));
+        assert!(
+            matches!(well_formed.as_slice(), [ChatEvent::ToolProgress(progress)]
+                if progress.tool_call_id == "tool-1" && progress.tool_name == "terminal"),
+            "well-formed ToolProgress must still map, got {well_formed:?}"
         );
     }
 

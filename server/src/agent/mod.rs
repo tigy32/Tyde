@@ -9545,6 +9545,14 @@ async fn ingest_gated_replay_event(
 ) {
     project_legacy_native_collaboration_event(event);
     if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
+        // The rejected candidate reaches only the in-memory event log (the
+        // visible Error card), never the journal — without this WARN the
+        // incident leaves zero durable trace to debug from.
+        tracing::warn!(
+            agent_id = %agent_id.0,
+            violation = ?violation,
+            "Replay-gated chat event rejected for stream identity violation"
+        );
         let error = stream_identity_violation_event(violation);
         record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
             .expect("identity violation error is a non-stream event");

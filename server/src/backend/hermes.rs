@@ -614,6 +614,10 @@ struct HermesSessionActor {
     gateway_events_rx: mpsc::UnboundedReceiver<HermesGatewayEvent>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     native_subagents: HashMap<String, HermesNativeSubagent>,
+    /// Base synthetic id → (current issued id, generation) for id-less native
+    /// children, so a reissued base never hands a new child a finished
+    /// child's identity.
+    synthetic_subagent_ids: HashMap<String, (String, u64)>,
     /// Bounded tail of the most recent Hermes stderr lines for the current turn.
     /// Stderr is normally diagnostic-only (logged at debug), but if a turn dies
     /// without a protocol-level message (e.g. the gateway exits mid-call after
@@ -625,7 +629,10 @@ struct HermesSessionActor {
 struct HermesNativeSubagent {
     handle: SubAgentHandle,
     agent_name: String,
-    parent_tool_call_id: String,
+    /// `None` when no delegation card could be attributed unambiguously; the
+    /// child's progress then stays unanchored instead of landing on another
+    /// tool's card.
+    parent_anchor: Option<HermesDelegationAnchor>,
     tool_calls: u64,
 }
 
@@ -664,12 +671,33 @@ struct HermesEventMapper {
 #[derive(Clone)]
 struct HermesDelegationTool {
     tool_call_id: String,
+    /// Raw gateway name from the emitted `ToolRequest` (the authority for
+    /// this `tool_call_id`), carried into every progress frame.
+    tool_name: String,
     goals: Vec<String>,
+}
+
+impl HermesDelegationTool {
+    fn anchor(&self) -> HermesDelegationAnchor {
+        HermesDelegationAnchor {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HermesDelegationAnchor {
+    tool_call_id: String,
+    tool_name: String,
 }
 
 #[derive(Clone)]
 struct HermesBackgroundTask {
     tool_call_id: String,
+    /// Raw gateway name from the emitted `ToolRequest` (the authority for
+    /// this `tool_call_id`), carried into every progress frame.
+    tool_name: String,
     command: Option<String>,
 }
 
@@ -825,6 +853,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
         tokio::spawn(actor.run(Some(initial_input), None, startup_gateway_events));
@@ -929,6 +958,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
         tokio::spawn(actor.run(
@@ -2347,14 +2377,22 @@ impl HermesSessionActor {
             self.emit_error(format!("Hermes {event_type} omitted its payload"));
             return;
         };
-        let subagent_id = optional_string_any(&payload, &["subagent_id", "child_session_id"])
-            .unwrap_or_else(|| {
+        let subagent_id = match optional_string_any(&payload, &["subagent_id", "child_session_id"])
+        {
+            Some(id) => id,
+            None => {
                 let task_index = payload
                     .get("task_index")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
-                format!("hermes-subagent-{task_index}")
-            });
+                let live = &self.native_subagents;
+                resolve_synthetic_subagent_id(
+                    &format!("hermes-subagent-{task_index}"),
+                    |id| live.contains_key(id),
+                    &mut self.synthetic_subagent_ids,
+                )
+            }
+        };
         let description = optional_string_any(&payload, &["goal", "text"]).unwrap_or_default();
 
         if !self.native_subagents.contains_key(&subagent_id) {
@@ -2364,17 +2402,16 @@ impl HermesSessionActor {
                 ));
                 return;
             };
-            let parent_tool_call_id = self
+            let parent_anchor = self
                 .mapper
-                .delegation_tools
-                .iter()
-                .rev()
-                .find(|tool| {
-                    !description.is_empty() && tool.goals.iter().any(|goal| goal == &description)
-                })
-                .or_else(|| self.mapper.delegation_tools.back())
-                .map(|tool| tool.tool_call_id.clone())
-                .unwrap_or_else(|| subagent_id.clone());
+                .resolve_delegation_anchor(&payload, &description);
+            if parent_anchor.is_none() {
+                tracing::debug!(
+                    subagent_id = %subagent_id,
+                    event_type,
+                    "Hermes native child has no unambiguous delegation card; its progress stays unanchored"
+                );
+            }
             let task_index = payload
                 .get("task_index")
                 .and_then(Value::as_u64)
@@ -2405,7 +2442,7 @@ impl HermesSessionActor {
                 HermesNativeSubagent {
                     handle,
                     agent_name,
-                    parent_tool_call_id,
+                    parent_anchor,
                     tool_calls: 0,
                 },
             );
@@ -2418,13 +2455,15 @@ impl HermesSessionActor {
                 child.tool_calls = child.tool_calls.saturating_add(1);
             }
             let completed = event_type == "subagent.complete";
-            parent_progress = Some(hermes_subagent_progress(
-                &child.handle,
-                &child.agent_name,
-                &child.parent_tool_call_id,
-                child.tool_calls,
-                completed,
-            ));
+            parent_progress = child.parent_anchor.as_ref().map(|anchor| {
+                hermes_subagent_progress(
+                    &child.handle,
+                    &child.agent_name,
+                    anchor,
+                    child.tool_calls,
+                    completed,
+                )
+            });
             if completed {
                 let content = optional_string_any(&payload, &["summary", "text"])
                     .unwrap_or_else(|| "Hermes child completed.".to_string());
@@ -3727,11 +3766,10 @@ impl HermesEventMapper {
         tasks.sort_by(|(left, _), (right, _)| left.cmp(right));
         tasks
             .into_iter()
-            .map(|(task_id, background)| {
-                hermes_background_progress(
-                    &background.tool_call_id,
+            .filter_map(|(task_id, background)| {
+                self.background_progress_event(
+                    &background,
                     &task_id,
-                    background.command,
                     BackgroundTaskStatus::Stopped,
                     Some(
                         "Hermes gateway owner exited before the background command reported completion"
@@ -4151,6 +4189,7 @@ impl HermesEventMapper {
             }
             self.delegation_tools.push_back(HermesDelegationTool {
                 tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
                 goals: hermes_delegation_goals(&arguments),
             });
         }
@@ -4170,13 +4209,18 @@ impl HermesEventMapper {
         let payload = required_payload(payload, "tool.progress")?;
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.progress")?;
-        let tool_name = optional_string_any(&payload, &["name", "tool_name"])
-            .or_else(|| self.pending_tools.get(&tool_call_id).cloned())
+        // The registered request name is the authority for this id; the
+        // payload name is consulted only for ids the registry never saw.
+        let tool_name = self
+            .pending_tools
+            .get(&tool_call_id)
+            .cloned()
             .or_else(|| {
                 self.turn_tools
                     .get(&tool_call_id)
                     .map(|tool| tool.name.clone())
             })
+            .or_else(|| optional_string_any(&payload, &["name", "tool_name"]))
             .ok_or_else(|| {
                 format!("Hermes tool.progress missing name for unknown tool_id {tool_call_id}")
             })?;
@@ -4242,20 +4286,18 @@ impl HermesEventMapper {
                 .get("command")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            self.background_tasks.insert(
-                task_id.clone(),
-                HermesBackgroundTask {
-                    tool_call_id: completion_tool_call_id.clone(),
-                    command: command.clone(),
-                },
-            );
-            events.push(hermes_background_progress(
-                &completion_tool_call_id,
-                &task_id,
+            let background = HermesBackgroundTask {
+                tool_call_id: completion_tool_call_id.clone(),
+                tool_name: tool_name.clone(),
                 command,
+            };
+            events.extend(self.background_progress_event(
+                &background,
+                &task_id,
                 BackgroundTaskStatus::Running,
                 None,
             ));
+            self.background_tasks.insert(task_id, background);
         }
         if normalized_hermes_tool_name(&tool_name) == "process"
             && arguments.get("action").and_then(Value::as_str) == Some("wait")
@@ -4269,13 +4311,7 @@ impl HermesEventMapper {
                 BackgroundTaskStatus::Failed
             };
             let summary = exit_code.map(|code| format!("Exited with code {code}"));
-            events.push(hermes_background_progress(
-                &background.tool_call_id,
-                &task_id,
-                background.command,
-                status,
-                summary,
-            ));
+            events.extend(self.background_progress_event(&background, &task_id, status, summary));
         }
         if success
             && is_hermes_todo_tool(&tool_name)
@@ -4311,13 +4347,95 @@ impl HermesEventMapper {
         let Some(background) = self.background_tasks.get(&task_id) else {
             return Ok(Vec::new());
         };
-        Ok(vec![hermes_background_progress(
-            &background.tool_call_id,
-            &task_id,
-            background.command.clone(),
-            BackgroundTaskStatus::Running,
-            None,
-        )])
+        Ok(self
+            .background_progress_event(background, &task_id, BackgroundTaskStatus::Running, None)
+            .into_iter()
+            .collect())
+    }
+
+    /// Background anchors outlive turn resets, so a later turn may reuse the
+    /// recorded `tool_call_id` for a different tool. A frame is emitted only
+    /// while the id is either unknown to the current turn (the anchor is a
+    /// prior turn's card of the recorded name) or still names the recorded
+    /// tool; otherwise it is dropped rather than attached to another tool's
+    /// card.
+    fn background_progress_event(
+        &self,
+        background: &HermesBackgroundTask,
+        task_id: &str,
+        status: BackgroundTaskStatus,
+        summary: Option<String>,
+    ) -> Option<ChatEvent> {
+        let current_name = self
+            .pending_tools
+            .get(&background.tool_call_id)
+            .or_else(|| {
+                self.turn_tools
+                    .get(&background.tool_call_id)
+                    .map(|tool| &tool.name)
+            });
+        if let Some(current_name) = current_name
+            && *current_name != background.tool_name
+        {
+            tracing::debug!(
+                tool_call_id = %background.tool_call_id,
+                task_id,
+                recorded_tool = %background.tool_name,
+                current_tool = %current_name,
+                "Dropping Hermes background progress: tool_call_id now names a different tool"
+            );
+            return None;
+        }
+        Some(ChatEvent::ToolProgress(ToolProgressData {
+            tool_call_id: background.tool_call_id.clone(),
+            tool_name: background.tool_name.clone(),
+            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                task_id: task_id.to_owned(),
+                description: background.command.clone(),
+                status,
+                summary,
+                output_unavailable: None,
+            }),
+        }))
+    }
+
+    /// Resolves the delegation card a native child anchors to: an explicit
+    /// parent id wins, then goal text, then being the only still-pending
+    /// candidate. With several candidates and no match the child stays
+    /// unanchored — guessing would attribute one delegation's children to
+    /// another's card.
+    fn resolve_delegation_anchor(
+        &self,
+        payload: &Value,
+        description: &str,
+    ) -> Option<HermesDelegationAnchor> {
+        if let Some(explicit) =
+            optional_string_any(payload, &["parent_tool_call_id", "parent_tool_id"])
+        {
+            return self
+                .delegation_tools
+                .iter()
+                .rev()
+                .find(|tool| tool.tool_call_id == explicit)
+                .map(HermesDelegationTool::anchor);
+        }
+        if !description.is_empty()
+            && let Some(tool) = self
+                .delegation_tools
+                .iter()
+                .rev()
+                .find(|tool| tool.goals.iter().any(|goal| goal == description))
+        {
+            return Some(tool.anchor());
+        }
+        let mut outstanding = self
+            .delegation_tools
+            .iter()
+            .filter(|tool| self.pending_tools.contains_key(&tool.tool_call_id));
+        match (outstanding.next(), outstanding.next()) {
+            (Some(only), None) => Some(only.anchor()),
+            _ => None,
+        }
     }
 
     fn map_approval_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -4518,6 +4636,7 @@ impl HermesEventMapper {
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
         self.pending_approval_tool_id = None;
+        self.delegation_tools.clear();
     }
 }
 
@@ -4718,36 +4837,43 @@ fn hermes_mcp_error_text(result: &Value) -> Option<String> {
         })
 }
 
-fn hermes_background_progress(
-    tool_call_id: &str,
-    task_id: &str,
-    command: Option<String>,
-    status: BackgroundTaskStatus,
-    summary: Option<String>,
-) -> ChatEvent {
-    ChatEvent::ToolProgress(ToolProgressData {
-        tool_call_id: tool_call_id.to_owned(),
-        tool_name: "terminal".to_owned(),
-        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-            task_id: task_id.to_owned(),
-            description: command,
-            status,
-            summary,
-            output_unavailable: None,
-        }),
-    })
+/// Synthetic ids stand in for children the gateway never names. The base id
+/// (derived from `task_index`) can be reissued by a later delegate call, so
+/// reusing it verbatim would hand a new child a finished child's identity;
+/// each new child under a base gets a fresh generation suffix instead.
+fn resolve_synthetic_subagent_id(
+    base: &str,
+    is_live: impl Fn(&str) -> bool,
+    issued: &mut HashMap<String, (String, u64)>,
+) -> String {
+    if let Some((current, _)) = issued.get(base)
+        && is_live(current)
+    {
+        return current.clone();
+    }
+    let generation = issued
+        .get(base)
+        .map(|(_, generation)| generation.saturating_add(1))
+        .unwrap_or(1);
+    let id = if generation == 1 {
+        base.to_owned()
+    } else {
+        format!("{base}-{generation}")
+    };
+    issued.insert(base.to_owned(), (id.clone(), generation));
+    id
 }
 
 fn hermes_subagent_progress(
     handle: &SubAgentHandle,
     agent_name: &str,
-    parent_tool_call_id: &str,
+    anchor: &HermesDelegationAnchor,
     tool_calls: u64,
     completed: bool,
 ) -> ToolProgressData {
     ToolProgressData {
-        tool_call_id: parent_tool_call_id.to_string(),
-        tool_name: "delegate_task".to_string(),
+        tool_call_id: anchor.tool_call_id.clone(),
+        tool_name: anchor.tool_name.clone(),
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: handle.agent_id.clone(),
             agent_name: agent_name.to_string(),
@@ -5323,6 +5449,9 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
     let mut events = Vec::new();
     let mut task_ids = HashMap::new();
     let mut next_task_id = 0;
+    // The assistant record's tool_calls become the replayed ToolRequests, so
+    // their names are the authority for each tool_call_id's completion.
+    let mut requested_tool_names: HashMap<String, String> = HashMap::new();
     for message in messages {
         let role = required_string(message, &["role"], "session.history message")?;
         let text = message
@@ -5332,6 +5461,9 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             .unwrap_or_default()
             .to_string();
         let tool_calls = hermes_history_tool_calls(message)?;
+        for tool_call in &tool_calls {
+            requested_tool_names.insert(tool_call.id.clone(), tool_call.name.clone());
+        }
         let sender = match role.as_str() {
             "user" => MessageSender::User,
             "assistant" => MessageSender::Assistant {
@@ -5351,7 +5483,10 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                     events.push(ChatEvent::MessageAdded(system_message(content)));
                     continue;
                 };
-                let tool_name = optional_string_any(message, &["tool_name", "name"])
+                let tool_name = requested_tool_names
+                    .get(&tool_call_id)
+                    .cloned()
+                    .or_else(|| optional_string_any(message, &["tool_name", "name"]))
                     .unwrap_or_else(|| "tool".to_string());
                 let result =
                     serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
@@ -9450,6 +9585,322 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn hermes_background_progress_carries_the_raw_request_name() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "Terminal",
+                "args": {
+                    "command": "sleep 8",
+                    "background": true
+                }
+            })),
+        );
+        let launched = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "Terminal",
+                "result": {
+                    "session_id": "proc-1",
+                    "exit_code": 0
+                }
+            })),
+        );
+        assert!(
+            launched.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                        status: BackgroundTaskStatus::Running,
+                        ..
+                    }),
+                }) if tool_call_id == "terminal-1" && tool_name == "Terminal"
+            )),
+            "background progress must carry the emitted request's raw name: {launched:?}"
+        );
+
+        let output = mapper.map_event(
+            "agent.terminal.output",
+            Some(json!({ "process_id": "proc-1", "text": "tick" })),
+        );
+        assert!(
+            output.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "terminal-1" && tool_name == "Terminal"
+            )),
+            "terminal output frames must carry the emitted request's raw name: {output:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_background_progress_never_attaches_to_a_reused_tool_id() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "Terminal",
+                "args": {
+                    "command": "sleep 8",
+                    "background": true
+                }
+            })),
+        );
+        let _ = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "Terminal",
+                "result": {
+                    "session_id": "proc-1",
+                    "exit_code": 0
+                }
+            })),
+        );
+        let _ = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "launched", "status": "complete" })),
+        );
+
+        let cross_turn = mapper.map_event(
+            "agent.terminal.output",
+            Some(json!({ "process_id": "proc-1", "text": "tick" })),
+        );
+        assert!(
+            cross_turn.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "tool-1" && tool_name == "Terminal"
+            )),
+            "the anchor survives a turn reset while the id is unclaimed: {cross_turn:?}"
+        );
+
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "read_file",
+                "args": { "path": "/tmp/x" }
+            })),
+        );
+        assert!(
+            mapper
+                .map_event(
+                    "agent.terminal.output",
+                    Some(json!({ "process_id": "proc-1", "text": "tick" })),
+                )
+                .is_empty(),
+            "a reused tool_call_id must not receive the stale task's frames"
+        );
+
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "process-1",
+                "name": "process",
+                "args": {
+                    "action": "wait",
+                    "session_id": "proc-1"
+                }
+            })),
+        );
+        let waited = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "process-1",
+                "name": "process",
+                "result": { "exit_code": 0 }
+            })),
+        );
+        assert!(
+            waited.iter().all(|event| !matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    update: ToolProgressUpdate::BackgroundTask(_),
+                    ..
+                })
+            )),
+            "wait completion must not attach the stale task to the reused id: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_tool_progress_uses_the_registered_request_name_first() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "Terminal",
+                "args": { "command": "pwd" }
+            })),
+        );
+        let progress = mapper.map_event(
+            "tool.progress",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "terminal",
+                "output": "tick"
+            })),
+        );
+        assert!(
+            progress.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "tool-1" && tool_name == "Terminal"
+            )),
+            "the registered request name wins over the payload name: {progress:?}"
+        );
+
+        let unknown = mapper.map_event(
+            "tool.progress",
+            Some(json!({
+                "tool_id": "ghost-1",
+                "name": "custom_probe",
+                "output": "tick"
+            })),
+        );
+        assert!(
+            unknown.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "ghost-1" && tool_name == "custom_probe"
+            )),
+            "ids the registry never saw still use the payload name: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_delegation_anchors_are_never_guessed_across_candidates() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "delegate-1",
+                "name": "mcp_tyde_tyde_delegate_task",
+                "args": { "goals": ["Goal A"] }
+            })),
+        );
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "delegate-2",
+                "name": "delegate_task",
+                "args": { "goals": ["Goal B"] }
+            })),
+        );
+
+        let by_goal = mapper
+            .resolve_delegation_anchor(&json!({}), "Goal A")
+            .expect("goal match");
+        assert_eq!(by_goal.tool_call_id, "delegate-1");
+        assert_eq!(by_goal.tool_name, "mcp_tyde_tyde_delegate_task");
+
+        let by_id = mapper
+            .resolve_delegation_anchor(&json!({ "parent_tool_call_id": "delegate-2" }), "")
+            .expect("explicit id match");
+        assert_eq!(by_id.tool_call_id, "delegate-2");
+        assert_eq!(by_id.tool_name, "delegate_task");
+
+        assert!(
+            mapper
+                .resolve_delegation_anchor(&json!({ "parent_tool_call_id": "delegate-9" }), "")
+                .is_none(),
+            "an unknown explicit parent id must not fall back to another card"
+        );
+        assert!(
+            mapper.resolve_delegation_anchor(&json!({}), "").is_none(),
+            "two outstanding delegations with no goal match are ambiguous"
+        );
+
+        let _ = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "delegate-1",
+                "name": "mcp_tyde_tyde_delegate_task",
+                "result": { "summary": "done" }
+            })),
+        );
+        let only_outstanding = mapper
+            .resolve_delegation_anchor(&json!({}), "")
+            .expect("single outstanding candidate is unambiguous");
+        assert_eq!(only_outstanding.tool_call_id, "delegate-2");
+
+        mapper.clear_turn_tool_state();
+        assert!(mapper.delegation_tools.is_empty());
+        assert!(
+            mapper
+                .resolve_delegation_anchor(&json!({}), "Goal B")
+                .is_none(),
+            "a prior turn's delegation card must not adopt a new turn's children"
+        );
+    }
+
+    #[test]
+    fn hermes_idless_children_never_share_a_synthetic_identity() {
+        let mut issued = HashMap::new();
+        let mut live: HashSet<String> = HashSet::new();
+
+        let first =
+            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
+        assert_eq!(first, "hermes-subagent-0");
+        live.insert(first.clone());
+
+        let same =
+            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
+        assert_eq!(same, first, "events for the live child keep its id");
+
+        live.remove(&first);
+        let second =
+            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
+        assert_ne!(
+            second, first,
+            "a new id-less child must not inherit a finished child's identity"
+        );
+        live.insert(second.clone());
+        let same_second =
+            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
+        assert_eq!(same_second, second);
+    }
+
+    #[test]
+    fn hermes_subagent_progress_carries_the_delegation_request_name() {
+        let handle = SubAgentHandle {
+            event_tx: mpsc::unbounded_channel().0,
+            model_usage_tx: mpsc::unbounded_channel().0,
+            total_usage_tx: mpsc::unbounded_channel().0,
+            agent_id: protocol::AgentId("agent-1".to_string()),
+            name_update_tx: None,
+        };
+        let anchor = HermesDelegationAnchor {
+            tool_call_id: "delegate-1".to_string(),
+            tool_name: "mcp_tyde_tyde_delegate_task".to_string(),
+        };
+        let progress = hermes_subagent_progress(&handle, "Hermes Agent 1", &anchor, 3, false);
+        assert_eq!(progress.tool_call_id, "delegate-1");
+        assert_eq!(progress.tool_name, "mcp_tyde_tyde_delegate_task");
+    }
+
+    #[test]
     fn hermes_native_title_does_not_override_tyde_naming() {
         let mut mapper = HermesEventMapper::default();
         assert!(
@@ -10587,6 +11038,76 @@ for line in sys.stdin:
                 if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
         )));
     }
+
+    #[test]
+    fn history_tool_completions_take_names_from_the_assistant_request() {
+        let events = hermes_history_to_chat_events(&json!({"messages": [
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "todo",
+                            "arguments": "{}"
+                        }
+                    },
+                    {
+                        "id": "call-2",
+                        "function": {
+                            "name": "Terminal",
+                            "arguments": "{\"command\":\"pwd\"}"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "tool",
+                "content": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"completed\"}]}",
+                "tool_call_id": "call-1"
+            },
+            {
+                "role": "tool",
+                "content": "/tmp",
+                "tool_call_id": "call-2",
+                "tool_name": "terminal"
+            }
+        ]}))
+        .expect("history mapping");
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "call-1" && tool_name == "todo"
+            )),
+            "a nameless tool record must resolve its request's name: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::TaskUpdate(tasks)
+                    if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
+            )),
+            "todo reconstruction must survive a nameless tool record: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                }) if tool_call_id == "call-2" && tool_name == "Terminal"
+            )),
+            "the replayed request name is the authority over the record's own name: {events:?}"
+        );
+    }
+
     fn skill_resolved_config(selection: SkillSelection) -> ResolvedSpawnConfig {
         ResolvedSpawnConfig {
             skills: vec![

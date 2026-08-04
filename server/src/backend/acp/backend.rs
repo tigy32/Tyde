@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -540,6 +540,8 @@ impl KiroSession {
                 active_stream_tool_calls: Vec::new(),
                 active_tool_contexts: HashMap::new(),
                 tool_call_aliases: HashMap::new(),
+                completed_tool_call_ids: HashSet::new(),
+                tool_call_occurrences: HashMap::new(),
                 cancelled: false,
                 provider_turn_quarantined: false,
                 replaying_history: false,
@@ -599,6 +601,15 @@ struct KiroState {
     active_stream_tool_calls: Vec<Value>,
     active_tool_contexts: HashMap<String, KiroToolContext>,
     tool_call_aliases: HashMap<String, String>,
+    /// Canonical ids whose call already reached a terminal completion.
+    /// Providers reuse short ids (`T1`, `call_1`) across sequential calls;
+    /// merging a reused id into the finished call's identity would silently
+    /// swallow the new call's request and completion downstream, so a new
+    /// `tool_call` for a completed id mints a fresh occurrence id instead.
+    completed_tool_call_ids: HashSet<String>,
+    /// Occurrences seen per reused canonical id; monotonic for the life of
+    /// the session so minted ids never collide with earlier occurrences.
+    tool_call_occurrences: HashMap<String, u64>,
     cancelled: bool,
     provider_turn_quarantined: bool,
     replaying_history: bool,
@@ -1920,6 +1931,12 @@ impl KiroInner {
             );
 
             state.active_tool_contexts.remove(&completion.tool_call_id);
+            // Recorded so a live call after replay that reuses a replayed id
+            // mints a fresh occurrence instead of colliding with the retired
+            // replayed identity.
+            state
+                .completed_tool_call_ids
+                .insert(completion.tool_call_id.clone());
             remove_tool_call_aliases(
                 &mut state.tool_call_aliases,
                 &completion.tool_call_id,
@@ -1998,9 +2015,18 @@ impl KiroInner {
             if duplicate_request && request_already_emitted {
                 let changed = prev_tool_type != tool_type;
                 if changed {
+                    // The re-emitted request advances the emitted identity, so
+                    // the stored context must advance with it: a titleless
+                    // completion later falls back to `context.tool_name`, which
+                    // has to name the card the user is actually looking at.
+                    // "tool" is the parser's missing-title placeholder and must
+                    // not overwrite a real name.
+                    if request.tool_name != "tool" {
+                        context.tool_name = request.tool_name.clone();
+                    }
                     refresh_tool_request = Some((
                         canonical_id.clone(),
-                        request.tool_name.clone(),
+                        context.tool_name.clone(),
                         tool_type.clone(),
                     ));
                 }
@@ -2199,6 +2225,9 @@ impl KiroInner {
 
             if emit_completion_now.is_some() {
                 state.active_tool_contexts.remove(&completion.tool_call_id);
+                state
+                    .completed_tool_call_ids
+                    .insert(completion.tool_call_id.clone());
                 remove_tool_call_aliases(
                     &mut state.tool_call_aliases,
                     &completion.tool_call_id,
@@ -2534,6 +2563,7 @@ impl KiroInner {
 
             for (tool_call_id, _, _, _, _) in &completions_to_emit {
                 state.active_tool_contexts.remove(tool_call_id);
+                state.completed_tool_call_ids.insert(tool_call_id.clone());
                 remove_tool_call_aliases(&mut state.tool_call_aliases, tool_call_id, None, None);
             }
         }
@@ -2733,11 +2763,31 @@ fn tool_alias_message_key(message_id: &str, raw_tool_call_id: &str) -> String {
 }
 
 fn build_canonical_tool_call_id(
-    _state: &mut KiroState,
+    state: &mut KiroState,
     _message_id: &str,
     raw_tool_call_id: &str,
 ) -> String {
-    normalize_tool_call_id_fragment(raw_tool_call_id)
+    let base = normalize_tool_call_id_fragment(raw_tool_call_id);
+    // Progressive `tool_call` frames for a live call keep merging into its
+    // context — that refresh flow is intentional.
+    if state.active_tool_contexts.contains_key(&base) {
+        return base;
+    }
+    if let Some(canonical) = state.tool_call_aliases.get(&tool_alias_raw_key(&base))
+        && state.active_tool_contexts.contains_key(canonical)
+    {
+        return canonical.clone();
+    }
+    // The id was already used by a call that completed: this frame starts a
+    // new logical call, so mint a distinct occurrence id (mirroring Codex's
+    // reused-provider-id disambiguation) rather than merging it into the
+    // dead identity, which downstream would treat as a duplicate and drop.
+    if state.completed_tool_call_ids.contains(&base) {
+        let occurrence = state.tool_call_occurrences.entry(base.clone()).or_insert(1);
+        *occurrence = occurrence.saturating_add(1);
+        return format!("{base}:occurrence-{occurrence}");
+    }
+    base
 }
 
 fn resolve_tool_call_id_alias(
@@ -6170,6 +6220,359 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 }]
             }
         );
+
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    fn write_fake_kiro_tool_identity_program() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-kiro-tool-identity-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake Kiro tool identity tempdir");
+        let path = dir.join("fake-kiro-tool-identity-acp");
+        // Handshake only: the tests drive tool frames straight through
+        // KiroInner, so fixture timing cannot race the assertions.
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-tool-identity-session","models":{"currentModelId":"auto"}}}'
+while read _; do :; done
+"#;
+        std::fs::write(&path, script).expect("write fake Kiro tool identity program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake Kiro tool identity program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro tool identity program");
+        }
+        path
+    }
+
+    async fn spawn_tool_identity_session() -> (
+        KiroSession,
+        mpsc::UnboundedReceiver<Value>,
+        PathBuf,
+        PathBuf,
+    ) {
+        let workspace = auth_lifecycle_workspace();
+        let program = write_fake_kiro_tool_identity_program();
+        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
+        let (session, raw_events) = KiroSession::spawn_for_agent(
+            &[workspace.to_string_lossy().to_string()],
+            Some(&agent),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("spawn fake Kiro tool identity session");
+        (session, raw_events, program, workspace)
+    }
+
+    fn drain_tool_identity_events(
+        raw_events: &mut mpsc::UnboundedReceiver<Value>,
+    ) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+        while let Ok(value) = raw_events.try_recv() {
+            if let Ok(event) = serde_json::from_value::<ChatEvent>(value) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// The emitted tool request is the single authority for an id's
+    /// identity: identity churn — a "superseded" pseudo-completion or a
+    /// synthetic replacement request — means two halves of the pipeline
+    /// disagreed about who a tool call is.
+    fn assert_no_tool_identity_churn(events: &[ChatEvent]) {
+        for event in events {
+            match event {
+                ChatEvent::ToolExecutionCompleted(completion) => {
+                    assert!(
+                        !completion
+                            .error
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("superseded"),
+                        "supersede churn reached the user: {completion:?}"
+                    );
+                }
+                ChatEvent::ToolRequest(request) => {
+                    let tool_type = serde_json::to_value(&request.tool_type)
+                        .expect("serialize tool request type");
+                    assert!(
+                        tool_type.pointer("/args/synthetic").is_none(),
+                        "synthetic request card reached the user: {request:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_refreshed_title_stays_authoritative_for_titleless_completion() {
+        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
+
+        session
+            .inner
+            .handle_tool_call(&json!({
+                "sessionUpdate": "tool_call",
+                "messageId": "kiro-refresh-msg",
+                "toolCallId": "T-refresh",
+                "kind": "execute",
+                "title": "Running: python3 hello.py",
+                "rawInput": {"command": "python3 hello.py", "working_dir": "."},
+            }))
+            .await;
+        session
+            .inner
+            .handle_tool_call(&json!({
+                "sessionUpdate": "tool_call",
+                "messageId": "kiro-refresh-msg",
+                "toolCallId": "T-refresh",
+                "kind": "execute",
+                "title": "Running: python3 hello.py --verbose",
+                "rawInput": {"command": "python3 hello.py --verbose", "working_dir": "."},
+            }))
+            .await;
+
+        {
+            let state = session.inner.state.lock().await;
+            let context = state
+                .active_tool_contexts
+                .get("T-refresh")
+                .expect("live context for T-refresh");
+            assert_eq!(
+                context.tool_name, "Running: python3 hello.py --verbose",
+                "stored context must advance with the re-emitted request"
+            );
+        }
+
+        session
+            .inner
+            .handle_tool_call_update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "T-refresh",
+                "kind": "execute",
+                "status": "completed",
+                "rawOutput": {"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "ok\n", "stderr": ""}}]},
+            }))
+            .await;
+
+        let events = drain_tool_identity_events(&mut raw_events);
+        assert_no_tool_identity_churn(&events);
+
+        let requests = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let last_request = requests.last().expect("emitted request");
+        assert_eq!(last_request.tool_call_id, "T-refresh");
+        assert_eq!(
+            last_request.tool_name,
+            "Running: python3 hello.py --verbose"
+        );
+
+        let completions = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1, "{events:?}");
+        assert_eq!(completions[0].tool_call_id, "T-refresh");
+        assert_eq!(
+            completions[0].tool_name, "Running: python3 hello.py --verbose",
+            "titleless completion must land under the last emitted name"
+        );
+        assert!(completions[0].success, "{events:?}");
+
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn kiro_after_backfill_reemits_under_the_current_tool_name() {
+        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
+        std::fs::write(workspace.join("hello.py"), "new content from disk\n")
+            .expect("write backfill fixture file");
+
+        session
+            .inner
+            .handle_tool_call(&json!({
+                "sessionUpdate": "tool_call",
+                "messageId": "kiro-edit-msg",
+                "toolCallId": "T-edit",
+                "kind": "edit",
+                "title": "Editing",
+                "rawInput": {"path": "hello.py", "oldStr": "old content"},
+            }))
+            .await;
+        session
+            .inner
+            .handle_tool_call(&json!({
+                "sessionUpdate": "tool_call",
+                "messageId": "kiro-edit-msg",
+                "toolCallId": "T-edit",
+                "kind": "edit",
+                "title": "Editing hello.py",
+                "rawInput": {"path": "hello.py", "oldStr": "old content v2"},
+            }))
+            .await;
+        session
+            .inner
+            .handle_tool_call_update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "T-edit",
+                "kind": "edit",
+                "status": "completed",
+                "rawOutput": {"items": [{"Text": ""}]},
+            }))
+            .await;
+
+        let events = drain_tool_identity_events(&mut raw_events);
+        assert_no_tool_identity_churn(&events);
+
+        let requests = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ChatEvent::ToolRequest(request) => Some((index, request)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests.first().expect("initial request").1.tool_name,
+            "Editing"
+        );
+        let (last_request_index, last_request) = requests.last().expect("backfill re-emit");
+        assert_eq!(last_request.tool_call_id, "T-edit");
+        assert_eq!(
+            last_request.tool_name, "Editing hello.py",
+            "backfill must re-emit under the current name, not the first title"
+        );
+        let protocol::ToolRequestType::ModifyFile { after, .. } = &last_request.tool_type else {
+            panic!("backfill re-emit must stay a typed edit: {events:?}");
+        };
+        assert_eq!(after, "new content from disk\n");
+
+        let (completion_index, completion) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ChatEvent::ToolExecutionCompleted(completion) => Some((index, completion)),
+                _ => None,
+            })
+            .expect("edit completion");
+        assert!(
+            *last_request_index < completion_index,
+            "backfilled request must precede its completion: {events:?}"
+        );
+        assert_eq!(completion.tool_call_id, "T-edit");
+        assert_eq!(completion.tool_name, "Editing hello.py");
+        assert!(completion.success, "{events:?}");
+        assert!(
+            matches!(
+                completion.tool_result,
+                protocol::ToolExecutionResult::ModifyFile { .. }
+            ),
+            "{events:?}"
+        );
+
+        session.shutdown().await;
+        cleanup_auth_lifecycle_fixture(&program, &workspace);
+    }
+
+    #[tokio::test]
+    async fn kiro_reused_tool_call_id_yields_distinct_card_pairs() {
+        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
+
+        for (message_id, command) in [
+            ("kiro-reuse-msg-1", "python3 one.py"),
+            ("kiro-reuse-msg-2", "python3 two.py"),
+        ] {
+            session
+                .inner
+                .handle_tool_call(&json!({
+                    "sessionUpdate": "tool_call",
+                    "messageId": message_id,
+                    "toolCallId": "T1",
+                    "kind": "execute",
+                    "title": format!("Running: {command}"),
+                    "rawInput": {"command": command, "working_dir": "."},
+                }))
+                .await;
+            session
+                .inner
+                .handle_tool_call_update(&json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "T1",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawOutput": {"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "", "stderr": ""}}]},
+                }))
+                .await;
+        }
+
+        let events = drain_tool_identity_events(&mut raw_events);
+        assert_no_tool_identity_churn(&events);
+
+        let requests = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2, "{events:?}");
+        assert_eq!(requests[0].tool_call_id, "T1");
+        assert_eq!(
+            requests[1].tool_call_id, "T1:occurrence-2",
+            "a reused id must mint a distinct deterministic identity"
+        );
+        assert_eq!(requests[0].tool_name, "Running: python3 one.py");
+        assert_eq!(requests[1].tool_name, "Running: python3 two.py");
+        assert_eq!(
+            requests[0].tool_type,
+            protocol::ToolRequestType::RunCommand {
+                command: "python3 one.py".to_string(),
+                working_directory: ".".to_string(),
+            }
+        );
+        assert_eq!(
+            requests[1].tool_type,
+            protocol::ToolRequestType::RunCommand {
+                command: "python3 two.py".to_string(),
+                working_directory: ".".to_string(),
+            }
+        );
+
+        let completions = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 2, "{events:?}");
+        for (completion, request) in completions.iter().zip(&requests) {
+            assert_eq!(completion.tool_call_id, request.tool_call_id);
+            assert_eq!(completion.tool_name, request.tool_name);
+            assert!(completion.success, "{events:?}");
+        }
 
         session.shutdown().await;
         cleanup_auth_lifecycle_fixture(&program, &workspace);

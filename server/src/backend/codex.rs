@@ -2961,6 +2961,7 @@ enum CodexProviderOpenCause {
 enum CodexProviderItemDisposition {
     Superseded,
     TurnTerminated,
+    Completed,
 }
 
 struct CodexProviderItemTombstone {
@@ -3024,13 +3025,26 @@ fn push_codex_provider_item_tombstone(
     tombstones.push_back(tombstone);
     while tombstones.len() > MAX_CODEX_PROVIDER_ITEM_TOMBSTONES {
         if let Some(evicted) = tombstones.pop_front() {
-            tracing::warn!(
-                owner_thread_id = evicted.owner_thread_id,
-                turn_id = evicted.turn_id,
-                provider_item_id = evicted.message_id.0,
-                disposition = ?evicted.disposition,
-                "Evicted bounded Codex provider-item tombstone"
-            );
+            // Completed tombstones are pushed on every normal finalize, so
+            // their eviction is routine churn; the loss-recording dispositions
+            // stay loud.
+            if evicted.disposition == CodexProviderItemDisposition::Completed {
+                tracing::debug!(
+                    owner_thread_id = evicted.owner_thread_id,
+                    turn_id = evicted.turn_id,
+                    provider_item_id = evicted.message_id.0,
+                    disposition = ?evicted.disposition,
+                    "Evicted bounded Codex provider-item tombstone"
+                );
+            } else {
+                tracing::warn!(
+                    owner_thread_id = evicted.owner_thread_id,
+                    turn_id = evicted.turn_id,
+                    provider_item_id = evicted.message_id.0,
+                    disposition = ?evicted.disposition,
+                    "Evicted bounded Codex provider-item tombstone"
+                );
+            }
         }
     }
 }
@@ -3058,6 +3072,15 @@ fn classify_codex_late_provider_event(
     }) else {
         return CodexLateProviderEventOutcome::NotFound;
     };
+    // Duplicate completions of a normally-completed item stay with the
+    // completed_agent_messages replay check: it still holds the reported
+    // payload variants a tombstone does not retain, so idempotent replays
+    // stay quiet and conflicting ones stay loud.
+    if tombstone.disposition == CodexProviderItemDisposition::Completed
+        && matches!(event, CodexLateProviderEvent::Completion { .. })
+    {
+        return CodexLateProviderEventOutcome::NotFound;
+    }
     let (kind, event_bytes, compatible) = match event {
         CodexLateProviderEvent::Delta { kind, content } => {
             (*kind, content.len(), *kind == tombstone.kind)
@@ -3084,7 +3107,15 @@ fn classify_codex_late_provider_event(
                 compatible,
             )
         }
-        CodexLateProviderEvent::Started { kind } => (*kind, 0, false),
+        CodexLateProviderEvent::Started { kind } => (
+            *kind,
+            0,
+            // A replayed start of a normally-completed item is a benign
+            // straggler; for loss-recording dispositions a restart still
+            // contradicts the recorded loss.
+            *kind == tombstone.kind
+                && tombstone.disposition == CodexProviderItemDisposition::Completed,
+        ),
     };
     let affected_turn_is_live = active_turn_id == Some(tombstone.turn_id.as_str());
     let would_exceed_bounds = tombstone.late_event_count >= MAX_CODEX_LATE_SUPERSEDED_EVENTS
@@ -4672,6 +4703,10 @@ impl CodexInner {
         } else {
             CodexProviderItemKind::AgentMessage
         };
+        let provider_completed = matches!(
+            &finalization,
+            CodexProviderStreamFinalization::Completed { .. }
+        );
         let (reported_text, reported_reasoning, content, reasoning) = match (kind, finalization) {
             (
                 CodexProviderItemKind::AgentMessage,
@@ -4770,6 +4805,29 @@ impl CodexInner {
             state
                 .completed_agent_messages
                 .insert(stream.message_id.clone(), completion);
+            // The Superseded/TurnAborted callers install their own tombstones;
+            // normal completion installs one here so delayed starts and deltas
+            // for this id are absorbed instead of tripping the duplicate-
+            // terminal violation against an unrelated live turn.
+            if provider_completed {
+                let owner_thread_id = state.thread_id.clone();
+                push_codex_provider_item_tombstone(
+                    &mut state.provider_item_tombstones,
+                    CodexProviderItemTombstone {
+                        owner_thread_id,
+                        turn_id: stream.turn_id.clone(),
+                        message_id: stream.message_id.clone(),
+                        kind,
+                        disposition: CodexProviderItemDisposition::Completed,
+                        accepted_text: content.clone(),
+                        accepted_reasoning: reasoning.clone().unwrap_or_default(),
+                        late_text: String::new(),
+                        late_reasoning: String::new(),
+                        late_event_count: 0,
+                        late_bytes: 0,
+                    },
+                );
+            }
             model
         };
         if !renderable && !stream.stream_published {
@@ -4931,7 +4989,7 @@ impl CodexInner {
                 turn_id,
                 disposition,
             } => {
-                if first {
+                if first && disposition != CodexProviderItemDisposition::Completed {
                     tracing::warn!(
                         thread_id,
                         turn_id,
@@ -4981,7 +5039,9 @@ impl CodexInner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_subagent_provider_stream(
+        stream_key: &str,
         stream: &mut CodexSubAgentStream,
         turn_id_from_params: Option<String>,
         message_id: ChatMessageId,
@@ -5067,6 +5127,27 @@ impl CodexInner {
         stream
             .completed_agent_messages
             .insert(message_id.clone(), completion);
+        // Mirrors the root finalize: the Superseded/TurnAborted callers push
+        // their own tombstones, while normal completion records one here so
+        // delayed starts and deltas do not terminate a live child turn.
+        if provider_completed {
+            push_codex_provider_item_tombstone(
+                &mut stream.provider_item_tombstones,
+                CodexProviderItemTombstone {
+                    owner_thread_id: stream_key.to_string(),
+                    turn_id: turn_id.clone(),
+                    message_id: message_id.clone(),
+                    kind,
+                    disposition: CodexProviderItemDisposition::Completed,
+                    accepted_text: content.clone(),
+                    accepted_reasoning: reasoning.clone().unwrap_or_default(),
+                    late_text: String::new(),
+                    late_reasoning: String::new(),
+                    late_event_count: 0,
+                    late_bytes: 0,
+                },
+            );
+        }
         if !renderable && !stream_published {
             match kind {
                 CodexProviderItemKind::AgentMessage => tracing::debug!(
@@ -5258,7 +5339,7 @@ impl CodexInner {
                 turn_id,
                 disposition,
             } => {
-                if first {
+                if first && disposition != CodexProviderItemDisposition::Completed {
                     tracing::warn!(
                         child_thread_id = stream_key,
                         turn_id,
@@ -5403,6 +5484,7 @@ impl CodexInner {
                 };
                 let generated_identity = stream.current_generated_identity.clone();
                 let finalized = Self::finalize_subagent_provider_stream(
+                    stream_key,
                     stream,
                     None,
                     previous_message_id,
@@ -6479,11 +6561,15 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .or_else(|| params.get("itemId").and_then(Value::as_str))
                 .or_else(|| params.get("item_id").and_then(Value::as_str));
+            // Only loss-recording tombstones may bypass the post-violation
+            // quiet window; a routine Completed tombstone re-routing events
+            // here would let a repeated conflicting completion target
+            // "<no-active-turn>" and emit a fresh cancellation.
             let is_tombstoned_item = provider_item_id.is_some_and(|message_id| {
-                state
-                    .provider_item_tombstones
-                    .iter()
-                    .any(|tombstone| tombstone.message_id.0 == message_id)
+                state.provider_item_tombstones.iter().any(|tombstone| {
+                    tombstone.message_id.0 == message_id
+                        && tombstone.disposition != CodexProviderItemDisposition::Completed
+                })
             });
             let is_explicitly_terminated_turn =
                 notification_turn_id.as_ref().is_some_and(|turn_id| {
@@ -7162,11 +7248,14 @@ impl CodexInner {
                             .and_then(Value::as_str)
                             .or_else(|| params.get("itemId").and_then(Value::as_str))
                             .or_else(|| params.get("item_id").and_then(Value::as_str));
+                        // Mirrors the root gate: only loss-recording
+                        // tombstones bypass the post-violation quiet window.
                         let is_tombstoned_item = provider_item_id.is_some_and(|message_id| {
-                            stream
-                                .provider_item_tombstones
-                                .iter()
-                                .any(|tombstone| tombstone.message_id.0 == message_id)
+                            stream.provider_item_tombstones.iter().any(|tombstone| {
+                                tombstone.message_id.0 == message_id
+                                    && tombstone.disposition
+                                        != CodexProviderItemDisposition::Completed
+                            })
                         });
                         let notification_turn_id = extract_turn_id(params);
                         let is_explicitly_terminated_turn =
@@ -8136,6 +8225,7 @@ impl CodexInner {
                     };
                     let generated_identity = stream.current_generated_identity.clone();
                     Self::finalize_subagent_provider_stream(
+                        stream_key,
                         stream,
                         None,
                         message_id,
@@ -8596,6 +8686,24 @@ impl CodexInner {
                     Some("File changes were not applied")
                 };
                 if file_changes.is_empty() {
+                    let request_was_emitted = {
+                        let state = self.state.lock().await;
+                        state
+                            .subagent_streams
+                            .get(stream_key)
+                            .is_some_and(|stream| stream.pending_tool_call_ids.contains(&item_id))
+                    };
+                    if !request_was_emitted {
+                        // An empty fileChange never emitted a request at
+                        // item/started; completing it here would fabricate a
+                        // "completion without a pending request" card.
+                        tracing::debug!(
+                            child_thread_id = stream_key,
+                            tool_call_id = item_id.as_str(),
+                            "Skipping Codex child fileChange completion with no changes and no emitted request"
+                        );
+                        return;
+                    }
                     let container = emitter.tool_completed(ToolCompletedPayload {
                         tool_call_id: &item_id,
                         tool_name: "file_change",
@@ -8671,10 +8779,14 @@ impl CodexInner {
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
+                // The started side registered this identity under the item
+                // type when no `tool` field was present; a different default
+                // here would miss the pending occurrence and mint a phantom
+                // occurrence-2 id.
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
-                    .unwrap_or("collab_tool");
+                    .unwrap_or(item_type);
                 let item_id = self
                     .tool_call_completed_id(params, provider_item_id, tool_name)
                     .await;
@@ -8817,6 +8929,7 @@ impl CodexInner {
             } else {
                 let generated_identity = stream.current_generated_identity.clone();
                 Ok(Some(Self::finalize_subagent_provider_stream(
+                    stream_key,
                     stream,
                     turn_id_from_params,
                     message_id,
@@ -8922,6 +9035,7 @@ impl CodexInner {
                         Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
                     } else {
                         Ok(Some(Self::finalize_subagent_provider_stream(
+                            stream_key,
                             stream,
                             turn_id_from_params,
                             message_id,
@@ -10565,6 +10679,20 @@ impl CodexInner {
                     return;
                 }
 
+                let request_was_emitted = {
+                    let state = self.state.lock().await;
+                    state.pending_tool_call_ids.contains(&item_id)
+                };
+                if !request_was_emitted {
+                    // An empty fileChange never emitted a request at
+                    // item/started; completing it here would fabricate a
+                    // "completion without a pending request" card.
+                    tracing::debug!(
+                        tool_call_id = item_id.as_str(),
+                        "Skipping Codex fileChange completion with no changes and no emitted request"
+                    );
+                    return;
+                }
                 self.emit_tool_execution_completed(
                     &item_id,
                     "file_change",
@@ -25699,6 +25827,251 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn child_collab_completion_without_tool_field_completes_original_request() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, child_tx, "thread-sub-collab").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-collab",
+                        "turn": { "id": "turn-sub-collab" }
+                    }),
+                )
+                .await;
+            drain_events(&mut child_rx);
+
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-sub-collab",
+                        "item": { "type": "collabToolCall", "id": "collab-child-1" }
+                    }),
+                )
+                .await;
+            let started = drain_events(&mut child_rx);
+            let requests = started
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1, "one request card: {started:?}");
+            assert_eq!(
+                requests[0]
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str),
+                Some("collab-child-1")
+            );
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-collab",
+                        "item": {
+                            "type": "collabToolCall",
+                            "id": "collab-child-1",
+                            "status": "completed"
+                        }
+                    }),
+                )
+                .await;
+            let completed = drain_events(&mut child_rx);
+            let completions = completed
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completions.len(),
+                1,
+                "the completion must land exactly once: {completed:?}"
+            );
+            assert_eq!(
+                completions[0]
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str),
+                Some("collab-child-1"),
+                "the completion must land on the emitted request id"
+            );
+            assert!(
+                completed.iter().all(|event| {
+                    !matches!(
+                        event.get("kind").and_then(Value::as_str),
+                        Some("ToolRequest" | "OperationCancelled" | "Error")
+                    )
+                }),
+                "no synthetic request card and no identity violation: {completed:?}"
+            );
+            for event in started.iter().chain(completed.iter()) {
+                let encoded = serde_json::to_string(event).expect("serialize child event");
+                assert!(
+                    !encoded.contains(":occurrence-"),
+                    "no phantom occurrence id: {encoded}"
+                );
+            }
+            {
+                let state = inner.state.lock().await;
+                let stream = state
+                    .subagent_streams
+                    .get("thread-sub-collab")
+                    .expect("child stream stays owned");
+                assert!(stream.pending_tool_call_ids.is_empty());
+            }
+            assert!(drain_events(&mut parent_rx).is_empty());
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn child_late_delta_after_completed_item_absorbs_quietly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, child_tx, "thread-sub-late").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-late",
+                        "turn": { "id": "turn-sub-late" }
+                    }),
+                )
+                .await;
+            drain_events(&mut child_rx);
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-sub-late",
+                Some("child-msg-done"),
+                CodexProviderItemKind::AgentMessage,
+                "Hello",
+            )
+            .await;
+            drain_events(&mut child_rx);
+            complete_test_codex_provider_item(
+                &inner,
+                "thread-sub-late",
+                "child-msg-done",
+                CodexProviderItemKind::AgentMessage,
+                "Hello",
+            )
+            .await;
+            drain_events(&mut child_rx);
+
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-sub-late",
+                Some("child-msg-done"),
+                CodexProviderItemKind::AgentMessage,
+                " straggler",
+            )
+            .await;
+            start_test_codex_provider_item(
+                &inner,
+                "thread-sub-late",
+                Some("child-msg-done"),
+                CodexProviderItemKind::AgentMessage,
+            )
+            .await;
+            assert!(
+                drain_events(&mut child_rx).is_empty(),
+                "late events for the completed child item absorb quietly"
+            );
+            {
+                let state = inner.state.lock().await;
+                let stream = state
+                    .subagent_streams
+                    .get("thread-sub-late")
+                    .expect("child stream stays owned");
+                assert_eq!(stream.active_turn_id.as_deref(), Some("turn-sub-late"));
+                assert!(stream.terminated_turns.is_empty());
+                let tombstone = stream
+                    .provider_item_tombstones
+                    .iter()
+                    .find(|tombstone| tombstone.message_id.0 == "child-msg-done")
+                    .expect("completed child tombstone");
+                assert_eq!(
+                    tombstone.disposition,
+                    CodexProviderItemDisposition::Completed
+                );
+            }
+            assert!(drain_events(&mut parent_rx).is_empty());
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn child_empty_file_change_completion_without_request_is_skipped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, child_tx, "thread-sub-empty-fc").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-empty-fc",
+                        "turn": { "id": "turn-sub-empty-fc" }
+                    }),
+                )
+                .await;
+            drain_events(&mut child_rx);
+
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-sub-empty-fc",
+                        "item": { "type": "fileChange", "id": "fc-empty", "changes": [] }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut child_rx).is_empty(),
+                "an empty fileChange start emits no request"
+            );
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-empty-fc",
+                        "item": {
+                            "type": "fileChange",
+                            "id": "fc-empty",
+                            "status": "completed",
+                            "changes": []
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut child_rx).is_empty(),
+                "an empty fileChange completion without an emitted request is skipped"
+            );
+            assert!(drain_events(&mut parent_rx).is_empty());
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
     fn parent_interruption_does_not_cancel_idle_completed_child_turn() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -30213,6 +30586,257 @@ Do not describe the tool, and do not skip the tool call."#;
                 .map(|tombstone| tombstone.message_id.0.as_str()),
             Some("bounded-item-8")
         );
+    }
+
+    #[test]
+    fn late_started_and_delta_after_completed_item_absorb_quietly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-done" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("done-item"),
+                CodexProviderItemKind::AgentMessage,
+                "Hello",
+            )
+            .await;
+            complete_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                "done-item",
+                CodexProviderItemKind::AgentMessage,
+                "Hello",
+            )
+            .await;
+            drain_events(&mut rx);
+
+            start_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("done-item"),
+                CodexProviderItemKind::AgentMessage,
+            )
+            .await;
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("done-item"),
+                CodexProviderItemKind::AgentMessage,
+                " straggler",
+            )
+            .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "late started/delta for a completed item absorb quietly"
+            );
+            {
+                let state = inner.state.lock().await;
+                let tombstone = state
+                    .provider_item_tombstones
+                    .iter()
+                    .find(|tombstone| tombstone.message_id.0 == "done-item")
+                    .expect("completed-item tombstone");
+                assert_eq!(
+                    tombstone.disposition,
+                    CodexProviderItemDisposition::Completed
+                );
+                assert_eq!(tombstone.late_event_count, 2);
+                assert_eq!(tombstone.accepted_text, "Hello");
+                assert!(state.terminated_turns.is_empty());
+                assert_eq!(state.active_turn_id.as_deref(), Some("turn-done"));
+            }
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn late_old_turn_events_leave_new_turn_untouched() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-old" } }),
+                )
+                .await;
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("old-item"),
+                CodexProviderItemKind::AgentMessage,
+                "Old turn text",
+            )
+            .await;
+            complete_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                "old-item",
+                CodexProviderItemKind::AgentMessage,
+                "Old turn text",
+            )
+            .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-old", "status": "completed" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-new" } }),
+                )
+                .await;
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("new-item"),
+                CodexProviderItemKind::AgentMessage,
+                "New",
+            )
+            .await;
+            drain_events(&mut rx);
+
+            start_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("old-item"),
+                CodexProviderItemKind::AgentMessage,
+            )
+            .await;
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("old-item"),
+                CodexProviderItemKind::AgentMessage,
+                " late",
+            )
+            .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "late old-turn events must not touch the new turn"
+            );
+
+            delta_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                Some("new-item"),
+                CodexProviderItemKind::AgentMessage,
+                " turn",
+            )
+            .await;
+            assert_eq!(
+                event_kinds(&drain_events(&mut rx)),
+                vec!["StreamDelta"],
+                "the new turn's stream keeps flowing"
+            );
+            complete_test_codex_provider_item(
+                &inner,
+                "thread-test",
+                "new-item",
+                CodexProviderItemKind::AgentMessage,
+                "New turn",
+            )
+            .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str),
+                Some("New turn")
+            );
+            assert_eq!(
+                inner.state.lock().await.active_turn_id.as_deref(),
+                Some("turn-new"),
+                "the new turn stays live after the late old-turn events"
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn empty_file_change_completion_without_request_is_skipped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-fc" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "fileChange", "id": "fc-empty-root", "changes": [] }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "an empty fileChange start emits no request"
+            );
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "fileChange",
+                            "id": "fc-empty-root",
+                            "status": "completed",
+                            "changes": []
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "an empty fileChange completion without an emitted request is skipped"
+            );
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]

@@ -31,6 +31,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexSet;
+
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -66,8 +68,19 @@ struct TurnEmitterState {
     emitted_tool_requests: IndexMap<String, EmittedToolRequest>,
     detached_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashSet<String>,
+    /// Completed ids carried across `reset_turn_state`. Terminal message
+    /// ids are remembered forever and a synthetic container's message id
+    /// IS its tool call id, so completion memory must survive on the same
+    /// clock: a late duplicate completion after a reset would otherwise
+    /// re-synthesize a container over a terminal id and surface a lone
+    /// "duplicate terminal message id" Error card. Bounded FIFO.
+    retired_tool_call_ids: IndexSet<String>,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
 }
+
+/// Bounds `retired_tool_call_ids` so an arbitrarily long session cannot
+/// grow the ledger unboundedly; old entries evict first-in-first-out.
+const RETIRED_TOOL_CALL_LEDGER_CAP: usize = 1024;
 
 #[derive(Clone)]
 struct PendingToolNormalizationFailure {
@@ -170,6 +183,7 @@ impl TurnEmitter {
                 emitted_tool_requests: IndexMap::new(),
                 detached_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashSet::new(),
+                retired_tool_call_ids: IndexSet::new(),
                 normalization_failures: HashMap::new(),
             }),
         }
@@ -627,6 +641,9 @@ impl TurnEmitter {
         state.reset_turn_state();
         state.detached_tool_requests.clear();
         state.terminal_stream_message_ids.clear();
+        // Terminal ids and retired ids live on the same clock: a cleared
+        // conversation forgets both together.
+        state.retired_tool_call_ids.clear();
         state.identity_violation_reported = false;
         state.send(json!({ "kind": "ConversationCleared" }));
     }
@@ -875,6 +892,14 @@ impl TurnEmitterState {
                 provider_tool_type
             }
         };
+        if self.retired_tool_call_ids.contains(tool_call_id) {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                "Ignoring tool request for a retired tool id"
+            );
+            return None;
+        }
         if let Some(request) = self
             .emitted_tool_requests
             .get(tool_call_id)
@@ -896,18 +921,18 @@ impl TurnEmitterState {
         } else {
             None
         };
+        // A re-emitted request for a still-pending id is a refresh: ACP
+        // agents legitimately re-title and re-argue a streaming tool call.
+        // The old behavior completed the pending card as a "superseded"
+        // failure before re-emitting, so every refresh shipped a failed
+        // card. The frontend keys cards by tool_call_id, so re-emitting
+        // the request below updates the card in place and the eventual
+        // completion still pairs one-to-one with one card.
         if self.is_tool_pending(tool_call_id) {
-            let existing_name = self
-                .emitted_tool_requests
-                .get(tool_call_id)
-                .map(|request| request.name.clone())
-                .unwrap_or_else(|| tool_name.to_string());
-            self.send_tool_completed(
+            tracing::debug!(
                 tool_call_id,
-                &existing_name,
-                cancelled_tool_result("Duplicate tool request was superseded"),
-                false,
-                Some("Duplicate tool request was superseded"),
+                tool_name,
+                "Refreshing a pending tool request in place"
             );
         }
         self.completed_tool_requests.remove(tool_call_id);
@@ -968,6 +993,19 @@ impl TurnEmitterState {
                 tool_call_id = data.tool_call_id,
                 tool_name = data.tool_name,
                 "Ignoring duplicate terminal tool completion"
+            );
+            return None;
+        }
+        // A retired id completed in an earlier turn epoch. Its container's
+        // message id is terminal forever, so synthesizing a request for a
+        // late duplicate completion would run stream_start against a
+        // terminal id and surface "duplicate terminal message id" as a
+        // lone mid-chat Error card.
+        if self.retired_tool_call_ids.contains(data.tool_call_id) {
+            tracing::debug!(
+                tool_call_id = data.tool_call_id,
+                tool_name = data.tool_name,
+                "Ignoring late completion for a retired tool id"
             );
             return None;
         }
@@ -1262,6 +1300,12 @@ impl TurnEmitterState {
             return;
         }
         self.identity_violation_reported = true;
+        // The idle path emits only the Error card (no cancellation tail),
+        // so without this WARN the incident leaves no host-log trace at all.
+        tracing::warn!(
+            violation = stream_identity_violation_message(violation),
+            "Stream identity violation reported while emitter is idle"
+        );
         self.send(json!({
             "kind": "Error",
             "data": stream_identity_violation_message(violation),
@@ -1273,6 +1317,10 @@ impl TurnEmitterState {
             return;
         }
         self.identity_violation_reported = true;
+        tracing::warn!(
+            violation = stream_identity_violation_message(violation),
+            "Stream identity violation discarded an open stream"
+        );
         if let Some(message_id) = self.current_stream_message_id.take() {
             self.terminal_stream_message_ids.insert(message_id);
         }
@@ -1381,7 +1429,15 @@ impl TurnEmitterState {
         self.synthetic_tool_container_id = None;
         self.synthetic_tool_call_ids.clear();
         self.emitted_tool_requests.clear();
-        self.completed_tool_requests.clear();
+        // Retire rather than erase: terminal message ids survive this
+        // reset, so completion memory must survive with them or a late
+        // duplicate completion re-opens a terminal container id.
+        for tool_call_id in self.completed_tool_requests.drain() {
+            self.retired_tool_call_ids.insert(tool_call_id);
+        }
+        while self.retired_tool_call_ids.len() > RETIRED_TOOL_CALL_LEDGER_CAP {
+            self.retired_tool_call_ids.shift_remove_index(0);
+        }
         self.normalization_failures.clear();
     }
 }
@@ -3020,5 +3076,207 @@ mod tests {
         let events = recv_events(&mut rx);
         assert_protocol_valid(&events);
         assert_eq!(emitted_progress_name(&events).as_deref(), Some("Workflow"));
+    }
+
+    /// Captured beta.51 defect: completion memory and terminal-identity
+    /// memory were cleared on different lifecycle clocks. `reset_turn_state`
+    /// erased `completed_tool_requests` while `terminal_stream_message_ids`
+    /// persisted — and a synthetic container's message id IS its tool call
+    /// id — so a delayed duplicate completion after a cancellation
+    /// re-synthesized a container over a terminal id and surfaced a lone
+    /// "Stream identity violation: duplicate terminal message id" Error
+    /// card in an idle chat. Retired ids must absorb late duplicates with
+    /// no emitted events at all.
+    #[test]
+    fn late_duplicate_completion_after_reset_is_absorbed_without_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-t",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-t",
+            tool_name: "run_command",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        // Interruption resets per-turn emitter state.
+        emitter.operation_cancelled("interrupted");
+        let lifecycle = recv_events(&mut rx);
+        assert_protocol_valid(&lifecycle);
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                .count(),
+            1,
+            "the tool container must open exactly once, got {lifecycle:?}"
+        );
+
+        // Delayed duplicate completion and request replay for the retired id.
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-t",
+            tool_name: "run_command",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        emitter.tool_request(
+            "tool-t",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        drop(emitter);
+        let late = recv_events(&mut rx);
+        assert!(
+            late.is_empty(),
+            "late duplicates for a retired id must be absorbed silently, got {late:?}"
+        );
+    }
+
+    /// The retired ledger must not block genuinely new tool ids after a
+    /// reset: only ids that already completed are retired.
+    #[test]
+    fn new_tool_ids_after_reset_open_normally() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-old",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-old",
+            tool_name: "run_command",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        emitter.operation_cancelled("interrupted");
+        let _ = recv_events(&mut rx);
+
+        emitter.tool_request(
+            "tool-new",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-new",
+            tool_name: "run_command",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        let kinds = event_kinds(&events);
+        assert!(
+            kinds.contains(&"ToolRequest".to_string())
+                && kinds.contains(&"ToolExecutionCompleted".to_string()),
+            "a fresh id must run a full lifecycle after reset, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"Error".to_string()),
+            "no identity violations expected for fresh ids, got {events:?}"
+        );
+    }
+
+    /// A cleared conversation forgets terminal and retired ids together,
+    /// so a reused id after clearing runs a full fresh lifecycle.
+    #[test]
+    fn conversation_clear_releases_retired_ids() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-r",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-r",
+            tool_name: "run_command",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        emitter.operation_cancelled("interrupted");
+        emitter.conversation_cleared();
+        let _ = recv_events(&mut rx);
+
+        emitter.tool_request(
+            "tool-r",
+            "run_command",
+            json!({"kind": "Other", "args": {}}),
+        );
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        let kinds = event_kinds(&events);
+        assert!(
+            kinds.contains(&"ToolRequest".to_string()),
+            "a cleared conversation must accept the id again, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"Error".to_string()),
+            "no identity violations expected after clearing, got {events:?}"
+        );
+    }
+
+    /// Progressive providers (ACP) re-emit a pending tool request as its
+    /// title/arguments evolve. A refresh must update the card in place —
+    /// the old behavior completed the pending card as a "superseded"
+    /// failure first, shipping a failed card for every legitimate refresh.
+    #[test]
+    fn pending_tool_request_refreshes_in_place_without_failure_card() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-r",
+            "Running: python3 hello.py",
+            json!({"kind": "Other", "args": {"step": 1}}),
+        );
+        emitter.tool_request(
+            "tool-r",
+            "Ran python3 hello.py",
+            json!({"kind": "Other", "args": {"step": 2}}),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-r",
+            tool_name: "Ran python3 hello.py",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "ToolRequest",
+                "ToolRequest",
+                "ToolExecutionCompleted"
+            ],
+            "a refresh re-emits the request without completing the old card, got {events:?}"
+        );
+        let completion = events
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .expect("completion event");
+        assert_eq!(
+            completion["data"]["success"].as_bool(),
+            Some(true),
+            "the single completion must be the real one, not a synthetic failure"
+        );
+        assert_eq!(
+            completion["data"]["tool_name"].as_str(),
+            Some("Ran python3 hello.py"),
+            "the completion carries the refreshed request name"
+        );
     }
 }
