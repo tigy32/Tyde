@@ -509,6 +509,8 @@ def native_voice_vendor_surface_violations(
         or "pub(crate) fn wrapper_library_filename(" not in production_specs
         or "pub(crate) fn discover_bundled_archive(" not in production_specs
         or "pub(crate) fn stage_bundled_archive(" not in production_specs
+        or "fn archive_magic(" not in production_specs
+        or "fn materialize_thin_archive(" not in production_specs
         or "pub(crate) fn stage_and_prepare_bundled_archive" not in production_specs
         or "pub(crate) fn replace_with_prefixed_archive(" not in production_specs
         or "pub(crate) fn static_link_directive(" not in production_specs
@@ -520,11 +522,17 @@ def native_voice_vendor_surface_violations(
         or "remove_materialized_abseil" not in build_script
         or "removing incomplete AEC build directory" not in build_script
         or 'Command::new("nm")' in build_script
-        or "required Rust LLVM symbol tools are unavailable" not in build_script
+        or "required Rust LLVM archive/symbol tools are unavailable" not in build_script
         or 'BUNDLED_ABSEIL_LINK_LIBRARIES: [&str; 1] = ["absl_strings"]' not in build_script
         or 'cargo:rustc-link-lib=absl_strings' in build_script
+        or "static:-bundle" in build_script + production_specs
         or "prefix_archive_symbols(&archive.source" in build_script
-        or 'out_dir().join("bundled-link")' not in build_script
+        or 'BUNDLED_SOURCE_DIRECTORY: &str = "src"' not in production_specs
+        or 'BUNDLED_BUILD_DIRECTORY: &str = "build"' not in production_specs
+        or 'BUNDLED_LINK_DIRECTORY: &str = "link"' not in production_specs
+        or "out_dir().join(build_support::BUNDLED_SOURCE_DIRECTORY)" not in build_script
+        or "out_dir().join(build_support::BUNDLED_BUILD_DIRECTORY)" not in build_script
+        or "out_dir().join(build_support::BUNDLED_LINK_DIRECTORY)" not in build_script
     ):
         violations.append("vendored AEC build is not offline and self-recovering")
 
@@ -1010,6 +1018,15 @@ class NativeBuildToolsContractTests(unittest.TestCase):
         self.assertIn("build_support::discover_bundled_archive", build_script)
         self.assertIn("build_support::stage_bundled_archive", build_script)
         self.assertIn("build_support::stage_and_prepare_bundled_archive", build_script)
+        self.assertIn("fn archive_magic(", production_specs)
+        self.assertIn("fn materialize_thin_archive(", production_specs)
+        self.assertIn('b"!<arch>\\n"', production_specs)
+        self.assertIn('b"!<thin>\\n"', production_specs)
+        self.assertIn('.arg("crsD")', production_specs)
+        self.assertIn(".current_dir(source_dir)", production_specs)
+        self.assertIn(
+            'archive: directory.join(format!("llvm-ar{suffix}"))', production_specs
+        )
         self.assertNotIn("prefix_archive_symbols(&archive.source", build_script)
         self.assertIn("build_support::replace_with_prefixed_archive", build_script)
         self.assertIn("build_support::static_link_directive", build_script)
@@ -1024,6 +1041,28 @@ class NativeBuildToolsContractTests(unittest.TestCase):
             build_script,
         )
         self.assertNotIn("cargo:rustc-link-lib=absl_strings", build_script)
+        self.assertNotIn("static:-bundle", build_script + production_specs)
+        self.assertIn(
+            'pub(crate) const BUNDLED_SOURCE_DIRECTORY: &str = "src";',
+            production_specs,
+        )
+        self.assertIn(
+            'pub(crate) const BUNDLED_BUILD_DIRECTORY: &str = "build";',
+            production_specs,
+        )
+        self.assertIn(
+            'pub(crate) const BUNDLED_LINK_DIRECTORY: &str = "link";',
+            production_specs,
+        )
+        self.assertIn(
+            "out_dir().join(build_support::BUNDLED_SOURCE_DIRECTORY)", build_script
+        )
+        self.assertIn(
+            "out_dir().join(build_support::BUNDLED_BUILD_DIRECTORY)", build_script
+        )
+        self.assertIn(
+            "out_dir().join(build_support::BUNDLED_LINK_DIRECTORY)", build_script
+        )
 
         workspace_test = (
             REPO_ROOT / "tests/tests/webrtc_build_support.rs"

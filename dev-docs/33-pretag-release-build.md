@@ -32,6 +32,14 @@ checkout credentials, and has no secrets, signing, packaging, artifact upload,
 release, deploy, or mobile steps. Inputs are passed as action arguments or
 environment values rather than interpolated into a shell program.
 
+The vendored WebRTC build keeps its portability behavior in the shared Cargo
+build script rather than in workflow-only environment overrides. GNU thin
+Abseil archives are materialized into self-contained staged archives before
+Rust links them, and short target-local Meson directory components keep the
+longest known MSVC object path below `MAX_PATH`. The pre-tag and release
+workflows therefore exercise the same archive and path contracts without a
+separate Windows `CARGO_TARGET_DIR`.
+
 The workflow creates only Actions logs. It creates no artifacts or release
 state, and its Rust cache is restore-only (`save-if: false`), so there is no
 release cleanup. If a temporary remote branch supplied

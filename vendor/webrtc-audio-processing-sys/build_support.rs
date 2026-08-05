@@ -1,7 +1,16 @@
 use std::{
     ffi::OsString,
+    io::Read,
     path::{Path, PathBuf},
+    process::Command,
 };
+
+pub(crate) const BUNDLED_SOURCE_DIRECTORY: &str = "src";
+pub(crate) const BUNDLED_BUILD_DIRECTORY: &str = "build";
+pub(crate) const BUNDLED_LINK_DIRECTORY: &str = "link";
+
+const REGULAR_ARCHIVE_MAGIC: &[u8; 8] = b"!<arch>\n";
+const THIN_ARCHIVE_MAGIC: &[u8; 8] = b"!<thin>\n";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CommandSpec {
@@ -18,6 +27,7 @@ pub(crate) struct ToolCommandSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SymbolTools {
+    pub(crate) archive: PathBuf,
     pub(crate) nm: PathBuf,
     pub(crate) objcopy: PathBuf,
 }
@@ -91,6 +101,7 @@ pub(crate) fn discover_bundled_archive(
 pub(crate) fn stage_bundled_archive(
     archive: &BundledArchive,
     staging_dir: &Path,
+    llvm_ar: &Path,
 ) -> Result<StagedArchive, String> {
     std::fs::create_dir_all(staging_dir).map_err(|error| {
         format!(
@@ -108,28 +119,163 @@ pub(crate) fn stage_bundled_archive(
             path.display()
         ));
     }
-    std::fs::copy(&archive.source, &path).map_err(|error| {
-        format!(
-            "staging bundled archive {} as {}: {error}",
-            archive.source.display(),
-            path.display()
-        )
-    })?;
+    match archive_magic(&archive.source)? {
+        magic if &magic == REGULAR_ARCHIVE_MAGIC => {
+            std::fs::copy(&archive.source, &path).map_err(|error| {
+                format!(
+                    "staging regular bundled archive {} as {}: {error}",
+                    archive.source.display(),
+                    path.display()
+                )
+            })?;
+        }
+        magic if &magic == THIN_ARCHIVE_MAGIC => {
+            materialize_thin_archive(llvm_ar, &archive.source, &path)?;
+        }
+        magic => {
+            return Err(format!(
+                "bundled archive {} has unsupported magic {:?}; expected regular {:?} or thin {:?}",
+                archive.source.display(),
+                magic,
+                REGULAR_ARCHIVE_MAGIC,
+                THIN_ARCHIVE_MAGIC
+            ));
+        }
+    }
     Ok(StagedArchive {
         path,
         link_name: archive.link_name.clone(),
     })
 }
 
+fn archive_magic(path: &Path) -> Result<[u8; 8], String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("opening bundled archive {}: {error}", path.display()))?;
+    let mut magic = [0_u8; 8];
+    file.read_exact(&mut magic).map_err(|error| {
+        format!(
+            "reading bundled archive magic from {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(magic)
+}
+
+fn materialize_thin_archive(
+    llvm_ar: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    if !llvm_ar.is_absolute() || !llvm_ar.is_file() {
+        return Err(format!(
+            "thin bundled archive {} requires the active Rust llvm-tools-preview llvm-ar at an absolute existing path; resolved {}. Run `rustup component add llvm-tools-preview --toolchain stable`",
+            source.display(),
+            llvm_ar.display()
+        ));
+    }
+    let source_dir = source.parent().ok_or_else(|| {
+        format!(
+            "thin bundled archive has no source directory: {}",
+            source.display()
+        )
+    })?;
+    let listing = Command::new(llvm_ar)
+        .arg("t")
+        .arg(source)
+        .current_dir(source_dir)
+        .output()
+        .map_err(|error| {
+            format!(
+                "listing thin bundled archive {} with {}: {error}",
+                source.display(),
+                llvm_ar.display()
+            )
+        })?;
+    if !listing.status.success() {
+        return Err(format!(
+            "listing thin bundled archive {} with {} failed with status {}: {}",
+            source.display(),
+            llvm_ar.display(),
+            listing.status,
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
+    let listing = std::str::from_utf8(&listing.stdout).map_err(|error| {
+        format!(
+            "thin bundled archive {} has a non-UTF-8 member listing from {}: {error}",
+            source.display(),
+            llvm_ar.display()
+        )
+    })?;
+    let members = listing
+        .lines()
+        .map(|member| {
+            let member = PathBuf::from(member.trim_end_matches('\r'));
+            if member.is_absolute() {
+                member
+            } else {
+                source_dir.join(member)
+            }
+        })
+        .collect::<Vec<_>>();
+    for member in &members {
+        if !member.is_file() {
+            return Err(format!(
+                "thin bundled archive {} references missing member {} relative to {}",
+                source.display(),
+                member.display(),
+                source_dir.display()
+            ));
+        }
+    }
+    let status = Command::new(llvm_ar)
+        .arg("crsD")
+        .arg(destination)
+        .args(&members)
+        .current_dir(source_dir)
+        .status()
+        .map_err(|error| {
+            format!(
+                "materializing thin bundled archive {} as {} with {}: {error}",
+                source.display(),
+                destination.display(),
+                llvm_ar.display()
+            )
+        })?;
+    if !status.success() {
+        let _ = std::fs::remove_file(destination);
+        return Err(format!(
+            "materializing thin bundled archive {} as {} with {} failed with status {}",
+            source.display(),
+            destination.display(),
+            llvm_ar.display(),
+            status
+        ));
+    }
+    let magic = archive_magic(destination)?;
+    if &magic != REGULAR_ARCHIVE_MAGIC {
+        let _ = std::fs::remove_file(destination);
+        return Err(format!(
+            "materialized bundled archive {} has non-regular magic {:?}; llvm-ar {} must produce {:?}",
+            destination.display(),
+            magic,
+            llvm_ar.display(),
+            REGULAR_ARCHIVE_MAGIC
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_and_prepare_bundled_archive<F>(
     archive: &BundledArchive,
     staging_dir: &Path,
+    llvm_ar: &Path,
     prepare: F,
 ) -> Result<StagedArchive, String>
 where
     F: FnOnce(&Path) -> Result<(), String>,
 {
-    let staged = stage_bundled_archive(archive, staging_dir)?;
+    let staged = stage_bundled_archive(archive, staging_dir, llvm_ar)?;
     prepare(&staged.path)?;
     Ok(staged)
 }
@@ -184,6 +330,7 @@ pub(crate) fn llvm_symbol_tool_candidates(sysroot: &Path, host: &str) -> Vec<Sym
     };
     let directory = sysroot.join("lib").join("rustlib").join(host).join("bin");
     vec![SymbolTools {
+        archive: directory.join(format!("llvm-ar{suffix}")),
         nm: directory.join(format!("llvm-nm{suffix}")),
         objcopy: directory.join(format!("llvm-objcopy{suffix}")),
     }]
@@ -501,6 +648,7 @@ mod tests {
     fn windows_symbol_specs_use_llvm_tools_and_target_archives() {
         let target = "x86_64-pc-windows-msvc";
         let tools = SymbolTools {
+            archive: PathBuf::from("C:/Rust/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-ar.exe"),
             nm: PathBuf::from("C:/Rust/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-nm.exe"),
             objcopy: PathBuf::from(
                 "C:/Rust/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objcopy.exe",
@@ -571,6 +719,174 @@ mod tests {
         root
     }
 
+    fn regular_archive(contents: &[u8]) -> Vec<u8> {
+        let mut archive = REGULAR_ARCHIVE_MAGIC.to_vec();
+        archive.extend_from_slice(contents);
+        archive
+    }
+
+    fn test_llvm_ar() -> PathBuf {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        assert!(sysroot.status.success());
+        let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim());
+        let version = Command::new(rustc).arg("-vV").output().unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let candidates = llvm_symbol_tool_candidates(&sysroot, host);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].archive.is_file());
+        candidates[0].archive.clone()
+    }
+
+    fn create_thin_archive(llvm_ar: &Path, source_dir: &Path, payload: &[u8]) -> PathBuf {
+        let object_dir = source_dir.join("objects");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        let member = object_dir.join("absl-string-member.o");
+        std::fs::write(&member, payload).unwrap();
+        let archive = source_dir.join("libabsl_strings.a");
+        if archive.exists() {
+            std::fs::remove_file(&archive).unwrap();
+        }
+        let status = Command::new(llvm_ar)
+            .args(["crsDT", "libabsl_strings.a", "objects/absl-string-member.o"])
+            .current_dir(source_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(archive_magic(&archive).unwrap(), *THIN_ARCHIVE_MAGIC);
+        archive
+    }
+
+    #[test]
+    fn thin_archive_staging_materializes_members_and_is_idempotent() {
+        let llvm_ar = test_llvm_ar();
+        let root = archive_fixture("thin-materialization");
+        let source_dir = root.join("meson");
+        let staging_dir = root.join("stage");
+        let payload = b"tyde-thin-archive-member";
+
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first_source = create_thin_archive(&llvm_ar, &source_dir, payload);
+        let first = discover_bundled_archive(
+            "x86_64-unknown-linux-gnu",
+            "absl_strings",
+            std::slice::from_ref(&source_dir),
+        )
+        .unwrap();
+        assert_eq!(first.source, first_source);
+        let first = stage_bundled_archive(&first, &staging_dir, &llvm_ar).unwrap();
+        assert_eq!(archive_magic(&first.path).unwrap(), *REGULAR_ARCHIVE_MAGIC);
+        let first_contents = std::fs::read(&first.path).unwrap();
+        assert!(
+            first_contents
+                .windows(payload.len())
+                .any(|window| window == payload)
+        );
+
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        assert_eq!(archive_magic(&first.path).unwrap(), *REGULAR_ARCHIVE_MAGIC);
+        assert!(
+            std::fs::read(&first.path)
+                .unwrap()
+                .windows(payload.len())
+                .any(|window| window == payload)
+        );
+
+        std::fs::create_dir_all(&source_dir).unwrap();
+        create_thin_archive(&llvm_ar, &source_dir, payload);
+        let second = discover_bundled_archive(
+            "x86_64-unknown-linux-gnu",
+            "absl_strings",
+            std::slice::from_ref(&source_dir),
+        )
+        .unwrap();
+        let second = stage_bundled_archive(&second, &staging_dir, &llvm_ar).unwrap();
+        assert_eq!(std::fs::read(&second.path).unwrap(), first_contents);
+
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        assert_eq!(archive_magic(&second.path).unwrap(), *REGULAR_ARCHIVE_MAGIC);
+        assert!(
+            std::fs::read(&second.path)
+                .unwrap()
+                .windows(payload.len())
+                .any(|window| window == payload)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn thin_archive_staging_fails_closed_without_resolved_llvm_ar() {
+        let root = archive_fixture("thin-missing-tool");
+        let source_dir = root.join("meson");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("libabsl_strings.a");
+        std::fs::write(&source, THIN_ARCHIVE_MAGIC).unwrap();
+        let archive = discover_bundled_archive(
+            "x86_64-unknown-linux-gnu",
+            "absl_strings",
+            std::slice::from_ref(&source_dir),
+        )
+        .unwrap();
+        let error =
+            stage_bundled_archive(&archive, &root.join("stage"), Path::new("missing-llvm-ar"))
+                .unwrap_err();
+        assert!(error.contains("requires the active Rust llvm-tools-preview llvm-ar"));
+        assert!(error.contains("rustup component add llvm-tools-preview"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_staging_rejects_unknown_magic() {
+        let root = archive_fixture("unknown-archive");
+        let source_dir = root.join("meson");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("libabsl_strings.a");
+        std::fs::write(&source, b"not-an-a").unwrap();
+        let archive = discover_bundled_archive(
+            "x86_64-unknown-linux-gnu",
+            "absl_strings",
+            std::slice::from_ref(&source_dir),
+        )
+        .unwrap();
+        let error =
+            stage_bundled_archive(&archive, &root.join("stage"), Path::new("unused")).unwrap_err();
+        assert!(error.contains("has unsupported magic"));
+        assert!(error.contains("expected regular"));
+        assert!(!root.join("stage/libabsl_strings.a").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_owned_native_paths_remain_below_max_path() {
+        let out_dir = concat!(
+            r"D:\a\Tyde\Tyde\target\x86_64-pc-windows-msvc\release\build\",
+            r"webrtc-audio-processing-sys-30e8f0a2335871c9\out"
+        );
+        let longest_object = concat!(
+            r"subprojects\abseil-cpp-20240722.0\libabsl_container.a.p\",
+            r"absl_container_internal_hashtablez_sampler_force_weak_definition.cc.obj"
+        );
+        let object_path = format!(r"{out_dir}\{}\{longest_object}", BUNDLED_BUILD_DIRECTORY);
+        let source_path = format!(
+            concat!(
+                r"{}\{}\subprojects\abseil-cpp-20240722.0\absl\container\internal\",
+                r"hashtablez_sampler_force_weak_definition.cc"
+            ),
+            out_dir, BUNDLED_SOURCE_DIRECTORY
+        );
+        assert!(object_path.len() < 260, "MSVC object path: {object_path}");
+        assert!(source_path.len() < 260, "MSVC source path: {source_path}");
+        assert_eq!(BUNDLED_LINK_DIRECTORY, "link");
+    }
+
     #[test]
     fn windows_archive_discovery_stages_for_rustc_linking() {
         let target = "x86_64-pc-windows-msvc";
@@ -580,21 +896,22 @@ mod tests {
         let direct_stage = direct_root.join("stage");
         std::fs::create_dir_all(&direct_source).unwrap();
         let direct_path = direct_source.join(format!("{name}.lib"));
-        std::fs::write(&direct_path, b"archive").unwrap();
+        let direct_contents = regular_archive(b"archive");
+        std::fs::write(&direct_path, &direct_contents).unwrap();
         let direct = discover_bundled_archive(target, name, &[direct_source]).unwrap();
         assert_eq!(direct.source, direct_path);
-        let staged = stage_bundled_archive(&direct, &direct_stage).unwrap();
+        let staged = stage_bundled_archive(&direct, &direct_stage, Path::new("unused")).unwrap();
         assert_eq!(staged.path, direct_stage.join(format!("{name}.lib")));
         assert_eq!(
             static_link_directive(&staged),
             "cargo:rustc-link-lib=static=webrtc-audio-processing-2"
         );
-        assert_eq!(std::fs::read(&direct_path).unwrap(), b"archive");
-        assert_eq!(std::fs::read(&staged.path).unwrap(), b"archive");
+        assert_eq!(std::fs::read(&direct_path).unwrap(), direct_contents);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), direct_contents);
         let prefixed = prefixed_archive_path(target, &staged.path);
         std::fs::write(&prefixed, b"prefixed").unwrap();
         replace_with_prefixed_archive(target, &prefixed, &staged.path).unwrap();
-        assert_eq!(std::fs::read(&direct_path).unwrap(), b"archive");
+        assert_eq!(std::fs::read(&direct_path).unwrap(), direct_contents);
         assert_eq!(std::fs::read(&staged.path).unwrap(), b"prefixed");
         std::fs::remove_dir_all(direct_root).unwrap();
 
@@ -603,13 +920,15 @@ mod tests {
         let fallback_stage = fallback_root.join("stage");
         std::fs::create_dir_all(&fallback_source).unwrap();
         let fallback_path = fallback_source.join(format!("lib{name}.a"));
-        std::fs::write(&fallback_path, b"archive").unwrap();
+        let fallback_contents = regular_archive(b"archive");
+        std::fs::write(&fallback_path, &fallback_contents).unwrap();
         let fallback = discover_bundled_archive(target, name, &[fallback_source]).unwrap();
         assert_eq!(fallback.source, fallback_path);
-        let staged = stage_bundled_archive(&fallback, &fallback_stage).unwrap();
+        let staged =
+            stage_bundled_archive(&fallback, &fallback_stage, Path::new("unused")).unwrap();
         assert_eq!(staged.path, fallback_stage.join(format!("{name}.lib")));
-        assert_eq!(std::fs::read(&fallback_path).unwrap(), b"archive");
-        assert_eq!(std::fs::read(&staged.path).unwrap(), b"archive");
+        assert_eq!(std::fs::read(&fallback_path).unwrap(), fallback_contents);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), fallback_contents);
         assert_eq!(
             static_link_directive(&staged),
             "cargo:rustc-link-lib=static=webrtc-audio-processing-2"
@@ -631,15 +950,21 @@ mod tests {
         let operations = Cell::new(0);
 
         for expected_operations in 1..=2 {
-            std::fs::write(&source, b"meson-output").unwrap();
+            let source_contents = regular_archive(b"meson-output");
+            std::fs::write(&source, &source_contents).unwrap();
             let discovered =
                 discover_bundled_archive(target, name, std::slice::from_ref(&meson)).unwrap();
-            let staged = stage_and_prepare_bundled_archive(&discovered, &staging, |staged_path| {
-                operations.set(operations.get() + 1);
-                std::fs::write(staged_path, b"prefixed-once").map_err(|error| error.to_string())
-            })
+            let staged = stage_and_prepare_bundled_archive(
+                &discovered,
+                &staging,
+                Path::new("unused"),
+                |staged_path| {
+                    operations.set(operations.get() + 1);
+                    std::fs::write(staged_path, b"prefixed-once").map_err(|error| error.to_string())
+                },
+            )
             .unwrap();
-            assert_eq!(std::fs::read(&source).unwrap(), b"meson-output");
+            assert_eq!(std::fs::read(&source).unwrap(), source_contents);
             assert_eq!(std::fs::read(&staged.path).unwrap(), b"prefixed-once");
             assert_eq!(operations.get(), expected_operations);
         }
@@ -679,17 +1004,18 @@ mod tests {
         let direct_stage = direct_root.join("stage");
         std::fs::create_dir_all(&direct_source).unwrap();
         let direct_path = direct_source.join("absl_strings.lib");
-        std::fs::write(&direct_path, b"direct").unwrap();
+        let direct_contents = regular_archive(b"direct");
+        std::fs::write(&direct_path, &direct_contents).unwrap();
         let direct = discover_bundled_archive(target, name, &[direct_source]).unwrap();
-        let staged = stage_bundled_archive(&direct, &direct_stage).unwrap();
+        let staged = stage_bundled_archive(&direct, &direct_stage, Path::new("unused")).unwrap();
         assert_eq!(direct.source, direct_path);
         assert_eq!(staged.path, direct_stage.join("absl_strings.lib"));
         assert_eq!(
             static_link_directive(&staged),
             "cargo:rustc-link-lib=static=absl_strings"
         );
-        assert_eq!(std::fs::read(&direct_path).unwrap(), b"direct");
-        assert_eq!(std::fs::read(&staged.path).unwrap(), b"direct");
+        assert_eq!(std::fs::read(&direct_path).unwrap(), direct_contents);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), direct_contents);
         std::fs::remove_dir_all(direct_root).unwrap();
 
         let fallback_root = archive_fixture("windows-absl-fallback");
@@ -697,11 +1023,13 @@ mod tests {
         let fallback_stage = fallback_root.join("stage");
         std::fs::create_dir_all(&fallback_source).unwrap();
         let fallback_path = fallback_source.join("libabsl_strings.a");
-        std::fs::write(&fallback_path, b"fallback").unwrap();
+        let fallback_contents = regular_archive(b"fallback");
+        std::fs::write(&fallback_path, &fallback_contents).unwrap();
         let fallback = discover_bundled_archive(target, name, &[fallback_source]).unwrap();
-        let staged = stage_bundled_archive(&fallback, &fallback_stage).unwrap();
-        assert_eq!(std::fs::read(&fallback_path).unwrap(), b"fallback");
-        assert_eq!(std::fs::read(&staged.path).unwrap(), b"fallback");
+        let staged =
+            stage_bundled_archive(&fallback, &fallback_stage, Path::new("unused")).unwrap();
+        assert_eq!(std::fs::read(&fallback_path).unwrap(), fallback_contents);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), fallback_contents);
         assert_eq!(
             static_link_directive(&staged),
             "cargo:rustc-link-lib=static=absl_strings"
@@ -744,15 +1072,17 @@ mod tests {
                 ("absl_strings", "cargo:rustc-link-lib=static=absl_strings"),
             ] {
                 let source = meson.join(format!("lib{name}.a"));
-                std::fs::write(&source, name.as_bytes()).unwrap();
+                let source_contents = regular_archive(name.as_bytes());
+                std::fs::write(&source, &source_contents).unwrap();
                 let discovered =
                     discover_bundled_archive(target, name, std::slice::from_ref(&meson)).unwrap();
-                let staged = stage_bundled_archive(&discovered, &staging).unwrap();
+                let staged =
+                    stage_bundled_archive(&discovered, &staging, Path::new("unused")).unwrap();
                 assert_eq!(discovered.source, source);
                 assert_eq!(staged.path, staging.join(format!("lib{name}.a")));
                 assert_eq!(static_link_directive(&staged), directive);
-                assert_eq!(std::fs::read(&source).unwrap(), name.as_bytes());
-                assert_eq!(std::fs::read(&staged.path).unwrap(), name.as_bytes());
+                assert_eq!(std::fs::read(&source).unwrap(), source_contents);
+                assert_eq!(std::fs::read(&staged.path).unwrap(), source_contents);
             }
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -763,6 +1093,7 @@ mod tests {
         let sysroot = Path::new("/rust");
         let unix = llvm_symbol_tool_candidates(sysroot, "x86_64-unknown-linux-gnu");
         let unix_bin = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/bin");
+        assert_eq!(unix[0].archive, unix_bin.join("llvm-ar"));
         assert_eq!(unix[0].nm, unix_bin.join("llvm-nm"));
         assert_eq!(unix[0].objcopy, unix_bin.join("llvm-objcopy"));
         let cross = symbol_list_spec(
@@ -775,6 +1106,7 @@ mod tests {
 
         let windows = llvm_symbol_tool_candidates(sysroot, "x86_64-pc-windows-msvc");
         let windows_bin = sysroot.join("lib/rustlib/x86_64-pc-windows-msvc/bin");
+        assert_eq!(windows[0].archive, windows_bin.join("llvm-ar.exe"));
         assert_eq!(windows[0].nm, windows_bin.join("llvm-nm.exe"));
         assert_eq!(windows[0].objcopy, windows_bin.join("llvm-objcopy.exe"));
     }
@@ -786,7 +1118,8 @@ mod tests {
         let wrapper = Path::new("/out/libwebrtc_audio_processing_wrapper.a");
         let root = archive_fixture("unix-archive");
         let bundled_path = root.join("libwebrtc-audio-processing-2.a");
-        std::fs::write(&bundled_path, b"archive").unwrap();
+        let bundled_contents = regular_archive(b"archive");
+        std::fs::write(&bundled_path, &bundled_contents).unwrap();
         let archive = discover_bundled_archive(
             target,
             "webrtc-audio-processing-2",
@@ -795,7 +1128,7 @@ mod tests {
         .unwrap();
         assert_eq!(archive.source, bundled_path);
         let staging = root.join("stage");
-        let staged = stage_bundled_archive(&archive, &staging).unwrap();
+        let staged = stage_bundled_archive(&archive, &staging, Path::new("unused")).unwrap();
         assert_eq!(staged.path, staging.join("libwebrtc-audio-processing-2.a"));
         assert_eq!(
             static_link_directive(&staged),

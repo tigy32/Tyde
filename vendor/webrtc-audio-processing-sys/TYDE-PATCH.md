@@ -33,7 +33,7 @@ link. After Meson install, target-aware discovery accepts either its canonical
 MSVC `webrtc-audio-processing-2.lib` output or the documented Meson
 `libwebrtc-audio-processing-2.a` fallback, requires exactly one existing
 archive, and never modifies that Meson-owned source. The build script copies it
-to `OUT_DIR/bundled-link` under the target-canonical name and prefixes only that
+to `OUT_DIR/link` under the target-canonical name and prefixes only that
 staged copy. Rust's MSVC `static=webrtc-audio-processing-2` directive consumes
 the staged `.lib`. `cc` emits
 `webrtc_audio_processing_wrapper.lib`, which receives the same symbol rewrite.
@@ -49,21 +49,35 @@ links the staged `absl_strings.lib`; Unix and macOS stage
 `libabsl_strings.a`. All use `static=absl_strings`. Missing or ambiguous Meson
 candidates fail before cargo link emission.
 
-The staging directory is emitted first as a native link-search path. Each run
-removes and overwrites only the exact canonical files owned there, recopies
-fresh Meson outputs, and prefixes the staged WebRTC archive once. It never
-scans, renames, deletes, or prefixes Meson install/build/subproject files, so
-Ninja can recreate its outputs without producing ambiguity or double-prefixing.
+The staging directory is emitted first as a native link-search path. Archive
+magic distinguishes regular `!<arch>` outputs from GNU thin `!<thin>` outputs.
+Regular macOS, Unix, and MSVC archives are copied byte-for-byte. Thin archives
+are listed from their Meson source directory and rebuilt as deterministic,
+self-contained regular archives with the active Rust toolchain's absolute
+`llvm-ar` before linking. Missing members, unknown magic, an unresolved tool,
+and a non-regular result fail closed. Each run removes and overwrites only the
+exact canonical files owned in staging, recopies or rematerializes fresh Meson
+outputs, and prefixes the staged WebRTC archive once. It never scans, renames,
+deletes, or prefixes Meson install/build/subproject files, so Ninja can recreate
+its outputs without producing ambiguity, stranded thin members, or
+double-prefixing.
 
-MSVC symbol operations use the active Rust toolchain's absolute `llvm-nm` and
-`llvm-objcopy` paths. Executable suffixes come from `HOST`, so Unix-hosted MSVC
-cross compilation does not incorrectly request `.exe`; a Windows host does.
-Resolution searches only the `llvm-tools-preview` directory under the active
-host rustlib and fails with the exact rustup remedy unless both tools exist.
-Unix keeps the upstream bare `nm` and `rust-objcopy` command paths. The
+The copied Meson source, Meson build tree, and staged link archives use the
+short build-script-owned `OUT_DIR/src`, `OUT_DIR/build`, and `OUT_DIR/link`
+components. These names keep the longest evidenced Abseil MSVC object path
+below `MAX_PATH` without workflow-specific `CARGO_TARGET_DIR` overrides, while
+retaining target-local ownership, recovery, and cache behavior on every host.
+
+Archive materialization and MSVC symbol operations use the active Rust
+toolchain's absolute `llvm-ar`, `llvm-nm`, and `llvm-objcopy` paths. Executable
+suffixes come from `HOST`, so Unix-hosted MSVC cross compilation does not
+incorrectly request `.exe`; a Windows host does. Resolution searches only the
+`llvm-tools-preview` directory under the active host rustlib and fails with the
+exact rustup remedy unless all three tools exist. Unix symbol listing and
+prefixing keep the upstream bare `nm` and `rust-objcopy` command paths. The
 production helpers are `bundled_library_candidates`,
 `discover_bundled_archive`, `stage_bundled_archive`,
-`stage_and_prepare_bundled_archive`,
+`archive_magic`, `materialize_thin_archive`, `stage_and_prepare_bundled_archive`,
 `static_link_directive`, `wrapper_library_filename`, `prefixed_archive_path`,
 `replace_with_prefixed_archive`, `llvm_symbol_tool_candidates`,
 `symbol_list_spec`, and `symbol_prefix_spec`.

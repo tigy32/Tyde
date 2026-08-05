@@ -452,6 +452,9 @@ mod webrtc {
         let staged = build_support::stage_and_prepare_bundled_archive(
             &archive,
             staging_dir,
+            &llvm_tools
+                .context("bundled archive staging requires resolved Rust LLVM tools")?
+                .archive,
             |staged_path| {
                 prefix_archive_symbols(staged_path, &symbols, prefix, &target, llvm_tools)
                     .map_err(|error| error.to_string())
@@ -462,11 +465,11 @@ mod webrtc {
     }
 
     fn webrtc_source_dir() -> PathBuf {
-        out_dir().join("webrtc-audio-processing")
+        out_dir().join(build_support::BUNDLED_SOURCE_DIRECTORY)
     }
 
     fn webrtc_build_dir() -> PathBuf {
-        out_dir().join("webrtc-audio-processing-build")
+        out_dir().join(build_support::BUNDLED_BUILD_DIRECTORY)
     }
 
     /// Extract defined (non-external) symbols from a static library using nm.
@@ -542,14 +545,10 @@ fn main() -> Result<()> {
     webrtc::build_if_necessary()?;
     let (include_dirs, lib_dirs) = webrtc::get_build_paths()?;
     #[cfg(feature = "bundled")]
-    let staging_dir = out_dir().join("bundled-link");
+    let staging_dir = out_dir().join(build_support::BUNDLED_LINK_DIRECTORY);
 
     #[cfg(feature = "bundled")]
-    let llvm_tools = if build_support::is_msvc_target(&target) {
-        Some(determine_llvm_symbol_tools()?)
-    } else {
-        None
-    };
+    let llvm_tools = Some(determine_llvm_tools()?);
     #[cfg(not(feature = "bundled"))]
     let llvm_tools: Option<SymbolTools> = None;
 
@@ -570,8 +569,15 @@ fn main() -> Result<()> {
         .map(|name| {
             let archive = build_support::discover_bundled_archive(&target, name, &lib_dirs)
                 .map_err(anyhow::Error::msg)?;
-            build_support::stage_bundled_archive(&archive, &staging_dir)
-                .map_err(anyhow::Error::msg)
+            build_support::stage_bundled_archive(
+                &archive,
+                &staging_dir,
+                &llvm_tools
+                    .as_ref()
+                    .context("bundled archive staging requires resolved Rust LLVM tools")?
+                    .archive,
+            )
+            .map_err(anyhow::Error::msg)
         })
         .collect::<Result<Vec<_>>>()?;
     #[cfg(not(feature = "bundled"))]
@@ -724,18 +730,20 @@ fn determine_rustlib_bin() -> Result<PathBuf> {
     Ok(sysroot.join("lib").join("rustlib").join(host).join("bin"))
 }
 
-fn determine_llvm_symbol_tools() -> Result<SymbolTools> {
+fn determine_llvm_tools() -> Result<SymbolTools> {
     let sysroot = determine_rust_sysroot()?;
     let host = env::var("HOST").context("HOST env var not found")?;
     let candidates = build_support::llvm_symbol_tool_candidates(&sysroot, &host);
     let found = candidates
         .iter()
-        .filter(|tools| tools.nm.is_file() && tools.objcopy.is_file())
+        .filter(|tools| {
+            tools.archive.is_file() && tools.nm.is_file() && tools.objcopy.is_file()
+        })
         .cloned()
         .collect::<Vec<_>>();
     if found.len() != 1 {
         bail!(
-            "required Rust LLVM symbol tools are unavailable for host {host}; searched {candidates:?}; run `rustup component add llvm-tools-preview --toolchain stable`"
+            "required Rust LLVM archive/symbol tools are unavailable for host {host}; searched {candidates:?}; run `rustup component add llvm-tools-preview --toolchain stable`"
         );
     }
     Ok(found.into_iter().next().unwrap())
