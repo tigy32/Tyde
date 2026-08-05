@@ -1,3 +1,15 @@
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Bundled libopus.a is last among the native libraries, so fully static musl
+# links need musl libc repeated afterward. Keep the linker in static mode: the
+# self-contained musl sysroot has no libm, and -lm can resolve to glibc.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-Wl,-Bstatic", "-C", "link-arg=-lc"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-Wl,-Bstatic", "-C", "link-arg=-lc"]
+
 # getrandom 0.3 has no default RNG backend on wasm32-unknown-unknown; it must be
 # told to use the JS/WebCrypto backend via this cfg (in addition to the crate's
 # `wasm_js` feature). mqtt-transport pulls getrandom 0.3 (reconnect jitter), so

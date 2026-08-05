@@ -239,6 +239,112 @@ def parse_toml_quoted_key(text: str) -> str | None:
     return "".join(value)
 
 
+def parse_toml_string_array(text: str) -> list[str] | None:
+    text = text.strip()
+    if not text.startswith("[") or not text.endswith("]"):
+        return None
+    body = text[1:-1].strip()
+    if not body:
+        return []
+    parts = toml_split_top_level(body, ",")
+    if parts is None:
+        return None
+    values = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        value = parse_toml_quoted_key(part)
+        if value is None:
+            return None
+        values.append(value)
+    return values
+
+
+def parse_cargo_config(source: str) -> dict[tuple[str, ...], object]:
+    settings = {}
+    section = []
+    lines = iter(source.splitlines())
+    for raw_line in lines:
+        line = toml_without_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if not line.endswith("]") or line.startswith("[["):
+                raise ValueError(f"unsupported Cargo config table: {line}")
+            parsed_section = parse_toml_dotted_key(line[1:-1])
+            if parsed_section is None:
+                raise ValueError(f"invalid Cargo config table: {line}")
+            section = parsed_section
+            continue
+        pieces = toml_split_top_level(line, "=")
+        if pieces is None or len(pieces) != 2:
+            raise ValueError(f"invalid Cargo config setting: {line}")
+        key = parse_toml_dotted_key(pieces[0])
+        if key is None:
+            raise ValueError(f"invalid Cargo config key: {pieces[0]}")
+        value_source = pieces[1].strip()
+        if value_source.startswith("["):
+            while not value_source.endswith("]"):
+                try:
+                    continuation = toml_without_comment(next(lines)).strip()
+                except StopIteration as error:
+                    raise ValueError("unterminated Cargo config array") from error
+                if continuation:
+                    value_source += " " + continuation
+            value = parse_toml_string_array(value_source)
+        else:
+            value = parse_toml_quoted_key(value_source)
+        if value is None:
+            raise ValueError(f"unsupported Cargo config value: {value_source}")
+        path = tuple(section + key)
+        if path in settings:
+            raise ValueError(f"duplicate Cargo config setting: {'.'.join(path)}")
+        settings[path] = value
+    return settings
+
+
+def cargo_config_discovery_paths(
+    repository_root: pathlib.Path, working_directory: pathlib.Path
+) -> list[pathlib.Path]:
+    repository_root = repository_root.resolve()
+    current = working_directory.resolve()
+    if current != repository_root and repository_root not in current.parents:
+        raise ValueError("Cargo working directory is outside the repository")
+    configs = []
+    while True:
+        cargo_directory = current / ".cargo"
+        for filename in ("config.toml", "config"):
+            candidate = cargo_directory / filename
+            if candidate.is_file():
+                configs.append(candidate)
+        if current == repository_root:
+            return configs
+        current = current.parent
+
+
+def workflow_env_mapping_keys(source: str) -> set[str]:
+    keys = set()
+    lines = source.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = toml_without_comment(raw_line).rstrip()
+        mapping = re.match(r"^(?P<indent>\s*)env:\s*$", line)
+        if mapping is None:
+            continue
+        mapping_indent = len(mapping.group("indent"))
+        for child_raw_line in lines[index + 1 :]:
+            child = toml_without_comment(child_raw_line).rstrip()
+            if not child.strip():
+                continue
+            child_indent = len(child) - len(child.lstrip())
+            if child_indent <= mapping_indent:
+                break
+            key = re.match(r"^\s*['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?\s*:", child)
+            if key is not None:
+                keys.add(key.group(1))
+    return keys
+
+
 def parse_toml_dotted_key(text: str) -> list[str] | None:
     parts = toml_split_top_level(text.strip(), ".")
     if parts is None or not parts:
@@ -549,6 +655,89 @@ def native_voice_vendor_surfaces(repo_root: pathlib.Path) -> dict[str, str]:
             encoding="utf-8", errors="replace"
         )
     return surfaces
+
+
+class ReleaseBuildConfigContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root_config_path = REPO_ROOT / ".cargo/config.toml"
+        cls.root_config = parse_cargo_config(
+            cls.root_config_path.read_text(encoding="utf-8")
+        )
+
+    def test_cmake_policy_floor_is_shared(self) -> None:
+        self.assertEqual(
+            self.root_config[("env", "CMAKE_POLICY_VERSION_MINIMUM")], "3.5"
+        )
+
+    def test_musl_targets_have_exact_static_libc_tail(self) -> None:
+        expected = ["-C", "link-arg=-Wl,-Bstatic", "-C", "link-arg=-lc"]
+
+        for target in (
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ):
+            with self.subTest(target=target):
+                flags = self.root_config[("target", target, "rustflags")]
+                self.assertEqual(flags, expected)
+                self.assertNotIn("-lm", flags)
+
+    def test_wasm_rustflags_remain_intact(self) -> None:
+        self.assertEqual(
+            self.root_config[
+                ("target", "wasm32-unknown-unknown", "rustflags")
+            ],
+            [
+                "--cfg",
+                'getrandom_backend="wasm_js"',
+                "-C",
+                "link-arg=-zstack-size=16777216",
+            ],
+        )
+
+    def test_release_workflow_has_no_global_rustflags_mapping(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        keys = workflow_env_mapping_keys(workflow)
+
+        self.assertIn("RELEASE_TAG", keys)
+        self.assertIn("GITHUB_TOKEN", keys)
+        self.assertNotIn("RUSTFLAGS", keys)
+        self.assertNotIn(
+            "RUSTFLAGS",
+            workflow_env_mapping_keys(
+                "# RUSTFLAGS must stay unset\nenv:\n  SAFE_SETTING: value\n"
+            ),
+        )
+
+    def test_cargo_discovers_unshadowed_config_from_release_build_paths(
+        self,
+    ) -> None:
+        root_config = self.root_config_path.resolve()
+        headless_configs = cargo_config_discovery_paths(REPO_ROOT, REPO_ROOT)
+        tauri_configs = cargo_config_discovery_paths(
+            REPO_ROOT, REPO_ROOT / "frontend/tauri-shell"
+        )
+
+        self.assertEqual(headless_configs, [root_config])
+        self.assertEqual(
+            tauri_configs,
+            [(REPO_ROOT / "frontend/.cargo/config.toml").resolve(), root_config],
+        )
+        protected_settings = {
+            ("env", "CMAKE_POLICY_VERSION_MINIMUM"),
+            ("target", "x86_64-unknown-linux-musl", "rustflags"),
+            ("target", "aarch64-unknown-linux-musl", "rustflags"),
+        }
+        for nested_config in tauri_configs[:-1]:
+            nested_settings = parse_cargo_config(
+                nested_config.read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                protected_settings.isdisjoint(nested_settings),
+                f"{nested_config} shadows root release-build settings",
+            )
 
 
 class TrunkCommandTests(unittest.TestCase):
