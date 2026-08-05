@@ -844,8 +844,8 @@ Authenticated control-surface callers can use `tyde_list_workbenches`,
 `tyde_create_workbench`, and `tyde_remove_workbench`. Listing is read-only and
 is limited to the caller's canonical standalone project plus that project's
 workbenches. Creation and removal are limited to that same standalone parent
-and are rejected for read-only callers. Removal defaults to safe dirty-root
-rejection; `force: true` is the explicit destructive override.
+regardless of access mode. Removal defaults to safe dirty-root rejection;
+`force: true` is the explicit destructive override.
 
 Creation accepts an optional `base_ref`. When omitted, every parent root uses
 its current `HEAD`. Before any worktree is added, the server resolves the base

@@ -471,8 +471,8 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
     let child_initial =
         collect_turn_delta_text(&mut fixture.client, &child.instance_stream, "child turn").await;
     assert!(
-        child_initial.contains("[access_mode: ReadOnly]"),
-        "child initial response did not show read-only access mode: {child_initial}"
+        !child_initial.contains("[access_mode: ReadOnly]"),
+        "child fork unexpectedly used read-only access mode: {child_initial}"
     );
     assert!(child_initial.contains("mock backend response to: child prompt"));
 

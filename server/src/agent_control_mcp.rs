@@ -626,15 +626,6 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
-        if let Err(error) = reject_mutating_tool_for_read_only_caller(
-            &self.host,
-            Some(&caller),
-            "tyde_create_workbench",
-        )
-        .await
-        {
-            return Ok(err_text(error));
-        }
         match do_create_workbench(&self.host, &caller, input).await {
             Ok(result) => ok_json(result),
             Err(error) => Ok(err_text(error)),
@@ -673,15 +664,6 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
-        if let Err(error) = reject_mutating_tool_for_read_only_caller(
-            &self.host,
-            Some(&caller),
-            "tyde_remove_workbench",
-        )
-        .await
-        {
-            return Ok(err_text(error));
-        }
         let project_id = input.project_id.clone();
         match do_remove_workbench(&self.host, &caller, input).await {
             Ok(()) => ok_json(json!({ "project_id": project_id, "removed": true })),
@@ -816,7 +798,7 @@ impl TydeAgentControlMcpServer {
         {
             return Ok(err_text(error));
         }
-        match do_send_message(&self.host, &agent_id, input.message, Some(request_agent_id)).await {
+        match do_send_message(&self.host, &agent_id, input.message).await {
             Ok(()) => ok_json(json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
@@ -854,15 +836,6 @@ impl TydeAgentControlMcpServer {
                 Ok(agent_id) => agent_id,
                 Err(err) => return Ok(err_text(err)),
             };
-        if let Err(err) = reject_mutating_tool_for_read_only_caller(
-            &self.host,
-            Some(&request_agent_id),
-            "tyde_team_message_member",
-        )
-        .await
-        {
-            return Ok(err_text(err));
-        }
         match do_team_message_member(&self.host, request_agent_id, input).await {
             Ok(result) => ok_json(result),
             Err(err) if err.starts_with("authorization:") => err_json(TeamToolError {
@@ -901,18 +874,9 @@ impl TydeAgentControlMcpServer {
         Parameters(input): Parameters<WorkflowSaveRequest>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match authenticated_caller_from_parts(&self.credentials, &parts) {
-            Ok(agent_id) => agent_id,
+        match authenticated_caller_from_parts(&self.credentials, &parts) {
+            Ok(_) => {}
             Err(err) => return Ok(err_text(err)),
-        };
-        if let Err(err) = reject_mutating_tool_for_read_only_caller(
-            &self.host,
-            request_agent_id.as_ref(),
-            "tyde_workflow_save",
-        )
-        .await
-        {
-            return Ok(err_text(err));
         }
         match do_workflow_save(&self.host, input).await {
             Ok(result) => ok_json(result),
@@ -1113,9 +1077,6 @@ async fn do_spawn_agent(
     input: SpawnRequestInput,
     request_agent_id: Option<AgentId>,
 ) -> Result<SpawnAgentResult, String> {
-    reject_mutating_tool_for_read_only_caller(host, request_agent_id.as_ref(), "tyde_spawn_agent")
-        .await?;
-
     if input.workspace_roots.iter().any(|r| r.trim().is_empty()) {
         return Err("workspace_roots must not contain empty values".to_string());
     }
@@ -1415,15 +1376,7 @@ async fn do_send_message(
     host: &HostHandle,
     agent_id: &AgentId,
     message: String,
-    request_agent_id: Option<AgentId>,
 ) -> Result<(), String> {
-    reject_mutating_tool_for_read_only_caller(
-        host,
-        request_agent_id.as_ref(),
-        "tyde_send_agent_message",
-    )
-    .await?;
-
     let handle = host
         .agent_handle(agent_id)
         .await
@@ -1437,22 +1390,6 @@ async fn do_send_message(
             tool_response: None,
         })
         .await
-}
-
-async fn reject_mutating_tool_for_read_only_caller(
-    host: &HostHandle,
-    request_agent_id: Option<&AgentId>,
-    tool_name: &'static str,
-) -> Result<(), String> {
-    let Some(agent_id) = request_agent_id else {
-        return Ok(());
-    };
-    if host.agent_access_mode(agent_id).await == Some(BackendAccessMode::ReadOnly) {
-        return Err(format!(
-            "BackendAccessMode::ReadOnly rejects mutating MCP tool '{tool_name}'"
-        ));
-    }
-    Ok(())
 }
 
 async fn do_team_describe(
@@ -2325,6 +2262,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_guidance_mode_allows_child_spawns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let mut caller_input = mock_spawn_input("read-only-caller", None);
+        caller_input.access_mode = Some(BackendAccessModeInput::ReadOnly);
+        let caller = do_spawn_agent(&host, caller_input, None)
+            .await
+            .expect("spawn read-only caller");
+
+        let child = do_spawn_agent(
+            &host,
+            mock_spawn_input("child", None),
+            Some(AgentId(caller.agent_id)),
+        )
+        .await
+        .expect("read-only guidance mode should not block child spawn");
+
+        assert!(!child.agent_id.is_empty());
+    }
+
+    #[tokio::test]
     async fn caller_cannot_assign_a_different_parent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = crate::host::spawn_host_with_mock_backend(
@@ -2605,7 +2568,6 @@ mod tests {
             &host,
             &agent_id,
             crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL.to_owned(),
-            None,
         )
         .await
         .expect("actor accepts fatal follow-up before backend closure");
@@ -2656,7 +2618,6 @@ mod tests {
             &host,
             &agent_id,
             crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
-            None,
         )
         .await
         .expect("checked delivery succeeds");
@@ -2699,7 +2660,6 @@ mod tests {
             &host,
             &agent_id,
             crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL.to_owned(),
-            None,
         )
         .await
         .expect("actor accepts fatal follow-up");
@@ -2725,14 +2685,9 @@ mod tests {
         .await
         .expect("fatal output is appended after terminal status");
 
-        let rejection = do_send_message(
-            &host,
-            &agent_id,
-            "rejected terminal follow-up".to_owned(),
-            None,
-        )
-        .await
-        .expect_err("parked terminal actor must reject checked delivery");
+        let rejection = do_send_message(&host, &agent_id, "rejected terminal follow-up".to_owned())
+            .await
+            .expect_err("parked terminal actor must reject checked delivery");
         assert_eq!(rejection, "agent not running");
 
         let status = host
@@ -2790,7 +2745,6 @@ mod tests {
             &host,
             &agent_id,
             "must not enter compacted actor".to_owned(),
-            None,
         )
         .await
         .expect_err("blocked compaction must reject checked delivery");

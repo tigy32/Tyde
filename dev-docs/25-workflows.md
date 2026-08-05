@@ -114,18 +114,12 @@ and UI/error polish.
 - The workflow MCP server is loopback-only and mounted under `/mcp`
   (`server/src/workflows/mcp.rs:137-193`).
 
-### 3.5 Agent-control MCP has the guard pattern we need
+### 3.5 Agent-control MCP authorization
 
 - Agent-control MCP tools are ordinary MCP tools on the agent-control surface
   (`server/src/agent_control_mcp.rs:343-500`).
-- Mutating agent-control tools reject read-only callers through
-  `reject_mutating_tool_for_read_only_caller`, which checks the caller's
-  `BackendAccessMode` and emits a clear tool error
-  (`server/src/agent_control_mcp.rs:467-475`,
-  `server/src/agent_control_mcp.rs:623-629`,
-  `server/src/agent_control_mcp.rs:748-760`).
-- Phase 1 workflow save must use the same guard. Workflow targets is read-only
-  and must not use the mutating guard.
+- Agent-control tools apply authentication, ownership, and scope checks.
+- `BackendAccessMode::ReadOnly` is guidance only and does not reject operations.
 
 ### 3.6 Project file watching has the reusable pattern
 
@@ -378,15 +372,14 @@ Behavior:
 
 #### `tyde_workflow_save`
 
-Mutating. Rejects read-only callers by reusing
-`reject_mutating_tool_for_read_only_caller`.
+Mutating. Access mode does not change availability; authentication and target
+validation still apply.
 
 Input: `WorkflowSaveRequest`.
 
 Validation and save behavior:
 
-1. Validate the caller access mode first.
-2. Resolve the target directory server-side.
+1. Resolve the target directory server-side.
    - `global` resolves to the same global directory discovery uses.
    - `project` resolves only when `project_id` exists and `root` exactly equals
      one of that project's roots.
@@ -682,11 +675,10 @@ E2E tests:
      must still include the saved workflow; no stale empty/old catalog notify may
      appear after the save notify.
 
-2. **Read-only save rejection**
+2. **Read-only guidance mode save**
    - Spawn a read-only agent.
    - Call `tyde_workflow_save`.
-   - Assert MCP error contains the read-only mutating-tool rejection.
-   - Assert no file was written and no catalog update contains the workflow.
+   - Assert the file is written and the catalog contains the workflow.
 
 3. **Collision and replace semantics**
    - `create` fails when the filename already exists.
@@ -965,7 +957,7 @@ Again, do not run `tests/tests/backend.rs` real-AI tests for this work.
 5. Add the host-owned serialized `reload_workflows_and_notify` path and route
    every `WorkflowNotify` emission through it.
 6. Add `tyde_workflow_targets` and `tyde_workflow_save` on agent-control MCP,
-   with read-only save rejection.
+   with authenticated target validation independent of access mode.
 7. Wire save success, manual refresh, project-root changes, and watcher rescans
    into the serialized reload path.
 8. Add workflow filesystem watcher and project-root target updates.

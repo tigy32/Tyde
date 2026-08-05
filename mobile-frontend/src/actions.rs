@@ -109,8 +109,7 @@ pub async fn spawn_new_chat(
 /// the desktop `spawn_side_question`: the child is a first-class interactive
 /// `AgentOrigin::SideQuestion` agent whose backend session forks the parent's,
 /// leaving the parent transcript untouched. `access_mode` is left `None` so
-/// the server applies its read-only fork default (see
-/// `dev-docs/23-side-questions.md`).
+/// the server applies the normal unrestricted default.
 pub async fn spawn_side_question(
     state: &AppState,
     prompt: String,

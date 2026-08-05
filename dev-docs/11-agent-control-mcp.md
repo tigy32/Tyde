@@ -641,9 +641,8 @@ philosophy and the proven debug MCP pattern.
 ## Workbench Tools
 
 The control endpoint also exposes `tyde_list_workbenches` and
-`tyde_create_workbench`. Both require an authenticated, active caller. Listing
-is permitted for read-only callers; creation is mutating and is rejected for
-`BackendAccessMode::ReadOnly`.
+`tyde_create_workbench`. Both require an authenticated, active caller. Access
+mode is advisory and does not change tool availability.
 
 These tools are deliberately least-privilege scoped. The caller must be
 assigned to a project. The server resolves that assignment to its canonical

@@ -1,16 +1,14 @@
 # Backend Access Mode
 
-`BackendAccessMode` is the protocol-level switch that tells a backend whether a
-new session should be treated as allowed to mutate state. It is separate from
-`ToolPolicy`: tool policy is a backend-specific allow-list when a backend can
-express one, while access mode is the cross-backend read/write intent.
+`BackendAccessMode` is the protocol-level switch that adds read/write guidance
+to a new session. It is separate from `ToolPolicy`: tool policy is a
+backend-specific allow-list when a backend can express one, while access mode
+changes instructions only.
 
-Read-only mode is best-effort guidance. Tyde advises the agent not to mutate
-source or external state, but it does **not** enforce an OS-level read-only
-workspace. The backend is allowed to use writable workspace sandboxes or normal
-tool permissions so build/test tools can write outputs such as `target/`. The
-tradeoff is explicit: a read-only agent can technically write the workspace; it
-is instructed not to create, edit, or delete source files.
+Read-only mode is guidance only. Tyde advises the agent not to mutate source or
+external state, but it does not reduce sandbox permissions, remove tools, or
+reject MCP operations. A read-only agent has the same effective capabilities as
+an unrestricted agent and is instructed not to use them for mutation.
 
 ## Protocol flow
 
@@ -45,84 +43,52 @@ commands such as `git status`, `git log`, `git diff`, `grep`/`rg`, `cat`, `ls`,
 and `find`, while forbidding file creation, edits, deletes, state-changing
 commands, and write/edit/apply-patch tools.
 
-Backend sandbox/permission choices are deliberately looser than that advisory so
-build/test commands can run. The advisory is the model-facing control; the
-sandbox is not a hard source-write blocker.
+Backend sandbox, permission, and tool choices are identical to unrestricted
+mode. The advisory is the only behavior access mode changes.
 
 ## Enforcement model
 
-Read-only mode is advisory plus targeted Tyde-side rejection, not a universal
-fail-closed contract:
+Read-only mode is entirely advisory:
 
 - The shared advisory tells the model what is permitted and what is forbidden.
-- Backend-native modes are chosen to allow workspace build/test writes rather
-  than to hard-block every write.
-- Tool allow-lists may still be used when a backend needs one to expose the
-  right read/build tools.
-- MCP tools are not globally classified by Tyde. For the AI reviewer, the Tyde
-  agent-control MCP endpoint rejects mutating calls from read-only agents. Other
-  MCP endpoints must reject unsafe mutation themselves or be omitted from a
-  read-only configuration.
+- Backend-native permissions and sandboxes are the same as unrestricted mode.
+- Access mode does not add a tool allow-list or remove tools.
+- Tyde MCP endpoints do not reject operations based on access mode.
 
-The important tradeoff is that read-only sessions can technically write inside
-the workspace. Tyde relies on the advisory and the agent-control MCP rejection,
-not an OS write-block, to keep the mode best-effort.
+Independent authorization, ownership, and `ToolPolicy` checks still apply; they
+are not read-only enforcement.
 
 ## Backend implementations
 
 ### Claude
 
-Claude read-only uses a permissive non-plan mode plus the shared advisory:
+Claude read-only uses unrestricted permissions plus the shared advisory:
 
-- `BackendAccessMode::ReadOnly` maps to `--permission-mode acceptEdits` so Bash
-  and build/test commands are not blocked by Claude plan mode.
+- `BackendAccessMode::ReadOnly` maps to `--permission-mode bypassPermissions`,
+  exactly like unrestricted mode.
 - Tyde appends the shared read-only advisory to Claude's system prompt.
 - The existing reviewer `ToolPolicy::AllowList` is still translated to Claude's
   `--allowedTools` flags.
 
-Claude `plan` mode is not used for Tyde read-only because plan mode restricts
-Bash to read-only exploration commands and blocks commands such as `cargo check`
-that need to write build outputs. Unrestricted Claude sessions keep
-`--permission-mode bypassPermissions` and the existing
-`--dangerously-skip-permissions` behavior.
+Claude `plan` mode is not used for Tyde read-only because access mode must not
+change actual capabilities.
 
 ### Codex
 
-Codex receives writable workspace mode everywhere the app-server protocol
-exposes a sandbox knob:
+Codex receives unrestricted mode everywhere the app-server protocol exposes a
+sandbox knob:
 
-- The subprocess is started as `codex --sandbox workspace-write app-server ...`.
-- `thread/start` uses sandbox `workspace-write`.
-- Turn requests use sandbox policy `{ "type": "workspaceWrite", ... }`.
+- The subprocess is started as `codex --sandbox danger-full-access app-server ...`.
+- `thread/start` and turn requests use `dangerFullAccess`.
 
-Tyde also keeps the forced approval policy and prepends the shared read-only
-advisory. This intentionally replaces Codex's hard `read-only` sandbox with a
-workspace-write sandbox so commands such as `cargo check`, `cargo test`, and
-`cargo clippy` can populate `target/`. It does not relax to Codex
-`danger-full-access`; unrestricted mode remains the only path that uses that
-sandbox.
+Tyde keeps the forced approval policy and prepends the shared read-only
+advisory. The advisory is the only difference from unrestricted mode.
 
 ### Tycode
 
-Tycode is launched with a generated custom-agent spec in read-only mode. The
-spec uses the shared read-only advisory and exposes read/build-oriented native
-tools:
-
-- `set_tracked_files`
-- `search_types`
-- `get_type_docs`
-- `run_build_test`
-
-`run_build_test` lets read-only agents run validation commands that write build
-outputs. The generated read-only agent still omits direct source mutation tools
-such as `write_file`, `modify_file`, and `delete_file`; Tyde relies on the
-advisory for source-mutation behavior and on agent-control MCP rejection for
-mutating Tyde MCP calls.
-
-Tycode still exposes configured MCP tools through its MCP module. For the AI
-reviewer, the Tyde agent-control MCP endpoint rejects mutating calls from
-read-only agents, so only the reviewer read/list/await/comment tools remain
-usable.
+Tycode receives the shared advisory through its projected steering file. It
+keeps the same root-agent selection, native tools, and configured MCP tools as
+an unrestricted session.
 
 ### ACP
 
@@ -135,10 +101,7 @@ ACP read-only uses ACP advisory behavior rather than ACP hard blocking:
 - `session/request_permission` follows the normal permission selection path in
   read-only mode.
 
-This lets ACP-backed agents run build/test commands and tools that need
-workspace writes. The tradeoff is the same as the rest of read-only mode: ACP can
-technically write the workspace, and Tyde relies on the advisory and MCP
-mutating-tool rejection rather than a hard ACP write block.
+The shared advisory is the only access-mode difference.
 
 ### Antigravity
 
@@ -155,13 +118,9 @@ for read-only is the advisory, not an Antigravity sandbox.
 ### Hermes
 
 Hermes read-only uses the shared advisory seeded into `session.create` as a
-system history message. Startup and custom MCP servers are loaded through the
-Hermes process-local native-config overlay described in
-`hermes-integration.md`; loading those servers is not a hard read-only sandbox
-or a Hermes-side mutating-tool filter. Tyde-owned MCP endpoints still enforce
-the calling agent's access mode at the server boundary. A non-default custom
-tool policy remains unsupported and fails visibly instead of pretending the
-policy was applied.
+system history message. Startup and custom MCP servers are loaded normally. A
+non-default custom tool policy remains unsupported and fails visibly instead of
+pretending the policy was applied.
 
 ### Mock
 
@@ -176,6 +135,5 @@ The AI reviewer sets:
 - the existing reviewer `ToolPolicy::AllowList`
 
 The server does not reject non-Claude reviewer backends. Any enabled backend may
-be selected; the backend then applies its available best-effort read-only
-advisory behavior. The Tyde agent-control MCP endpoint still rejects mutating
-calls from read-only agents.
+be selected; the backend adds the read-only advisory. The reviewer's separate
+`ToolPolicy::AllowList` remains independently enforced where supported.

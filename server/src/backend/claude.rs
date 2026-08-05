@@ -104,7 +104,6 @@ const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 /// meanwhile; the frames it is waiting to route simply queue behind it.
 const CLAUDE_WAKE_QUIESCE_WAIT: Duration = Duration::from_secs(5);
 // Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
-const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a session will hold its output waiting for the CLI to report which
 /// skills it loaded. Matches the handshake timeout in production; shortened in
@@ -11710,8 +11709,9 @@ type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'static str {
     match access_mode {
-        BackendAccessMode::Unrestricted => CLAUDE_DEFAULT_PERMISSION_MODE,
-        BackendAccessMode::ReadOnly => CLAUDE_READ_ONLY_PERMISSION_MODE,
+        BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
+            CLAUDE_DEFAULT_PERMISSION_MODE
+        }
     }
 }
 
@@ -13950,10 +13950,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_read_only_access_mode_uses_accept_edits_permission_mode() {
+    fn claude_read_only_access_mode_keeps_unrestricted_permissions() {
         assert_eq!(
             claude_permission_mode_for_access_mode(BackendAccessMode::ReadOnly),
-            "acceptEdits"
+            "bypassPermissions"
         );
         assert_eq!(
             claude_permission_mode_for_access_mode(BackendAccessMode::Unrestricted),

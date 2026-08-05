@@ -16,7 +16,7 @@ use protocol::tycode_config::{
     TycodeProfileSettings,
 };
 use protocol::{
-    AgentInput, BackendAccessMode, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
+    AgentInput, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
     BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsSnapshot,
     ChatEvent, ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageSender, ModelInfo,
     OrchestrationEvent, ReasoningData, SelectOption, SessionId, SessionSettingField,
@@ -790,31 +790,6 @@ fn tycode_degraded_notice(refusals: &[SkillRefusal]) -> String {
     lines.join("\n")
 }
 
-fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
-    if config.resolved_spawn_config.access_mode != BackendAccessMode::ReadOnly {
-        return None;
-    }
-    let system_prompt = render_combined_spawn_instructions(&config.resolved_spawn_config)
-        .unwrap_or_else(|| {
-            "Backend access mode is read-only: inspect files and call configured MCP tools only."
-                .to_string()
-        });
-    Some(
-        serde_json::json!({
-            "name": "tyde-read-only",
-            "description": "Tyde read-only agent",
-            "systemPrompt": system_prompt,
-            "tools": [
-                "set_tracked_files",
-                "search_types",
-                "get_type_docs",
-                "run_build_test"
-            ]
-        })
-        .to_string(),
-    )
-}
-
 fn tycode_session_settings_schema() -> SessionSettingsSchema {
     let mut fields = Vec::new();
     if tycode_set_root_agent_supported() {
@@ -1142,7 +1117,6 @@ enum TycodeStartupObservation {
 enum TycodeRootAgentOverridePolicy {
     Supported,
     UnsupportedPinnedVersion,
-    DisabledForReadOnly,
 }
 
 fn tycode_set_root_agent_supported() -> bool {
@@ -1157,10 +1131,7 @@ fn tycode_set_root_agent_supported() -> bool {
     true
 }
 
-fn tycode_root_agent_override_policy(config: &BackendSpawnConfig) -> TycodeRootAgentOverridePolicy {
-    if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
-        return TycodeRootAgentOverridePolicy::DisabledForReadOnly;
-    }
+fn tycode_root_agent_override_policy() -> TycodeRootAgentOverridePolicy {
     if tycode_set_root_agent_supported() {
         TycodeRootAgentOverridePolicy::Supported
     } else {
@@ -1343,11 +1314,6 @@ impl TycodeStartupController {
                          the selected tycode-subprocess does not support that protocol; Tyde \
                          requires Tycode {TYCODE_VERSION}"
                     )),
-                    TycodeRootAgentOverridePolicy::DisabledForReadOnly => Err(
-                        "Tycode default_agent session setting cannot be used with read-only \
-                         Tycode sessions because it would replace Tyde's read-only root agent"
-                            .to_string(),
-                    ),
                 }
             }
             Some(SessionSettingValue::String(agent)) => Err(format!(
@@ -1952,9 +1918,6 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
-            if let Some(agent_json) = tycode_read_only_agent_json(&config) {
-                command.arg("--agent").arg(agent_json);
-            }
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
             }
@@ -2020,7 +1983,7 @@ impl Backend for TycodeBackend {
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
                 resolve_session_settings(&config),
-                tycode_root_agent_override_policy(&config),
+                tycode_root_agent_override_policy(),
                 TycodeStartupFollowUp::InitialUserInput(initial_message),
                 false,
             );
@@ -2251,9 +2214,6 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
-            if let Some(agent_json) = tycode_read_only_agent_json(&config) {
-                command.arg("--agent").arg(agent_json);
-            }
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
             }
@@ -2318,7 +2278,7 @@ impl Backend for TycodeBackend {
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
                 resolve_session_settings(&config),
-                tycode_root_agent_override_policy(&config),
+                tycode_root_agent_override_policy(),
                 TycodeStartupFollowUp::ResumeSession {
                     session_id: session_id.0.clone(),
                 },
@@ -3557,8 +3517,8 @@ mod tests {
 
     use super::*;
     use protocol::{
-        OrchestrationAgentOrigin, OrchestrationPayload, SendMessagePayload, TokenUsageScope,
-        TokenUsageUnavailableReason,
+        BackendAccessMode, OrchestrationAgentOrigin, OrchestrationPayload, SendMessagePayload,
+        TokenUsageScope, TokenUsageUnavailableReason,
     };
     use tempfile::TempDir;
 
@@ -5402,7 +5362,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fake_tycode_spawn_rejects_root_agent_for_read_only_session() {
+    async fn fake_tycode_read_only_spawn_keeps_root_agent_override() {
         let dir = TempDir::new().expect("tempdir");
         let settings = serde_json::json!({
             "active_provider": "default",
@@ -5430,27 +5390,24 @@ mod tests {
             ..Default::default()
         };
 
-        let err = match TycodeBackend::spawn(Vec::new(), config, payload("must not send")).await {
-            Ok(_) => panic!("read-only root override should fail startup"),
-            Err(err) => err,
-        };
-        assert!(err.contains("cannot be used with read-only Tycode sessions"));
+        let (backend, mut events) =
+            TycodeBackend::spawn(Vec::new(), config, payload("hello read-only Tycode"))
+                .await
+                .expect("spawn read-only fake Tycode");
+        wait_for_fake_done(&mut events).await;
+        backend.shutdown().await;
 
         let commands = read_fake_commands(&log);
-        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
+        assert_eq!(commands.len(), 5, "commands: {commands:#?}");
         assert_eq!(commands[0], Value::String("GetSettings".to_string()));
         assert_eq!(commands[2], Value::String("GetSettings".to_string()));
-        assert!(
-            commands
-                .iter()
-                .all(|command| command.get("SetRootAgent").is_none()),
-            "read-only Tycode must not receive SetRootAgent: {commands:#?}"
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "SetRootAgent": { "agent": "swarm" } })
         );
-        assert!(
-            commands
-                .iter()
-                .all(|command| command.get("UserInput").is_none()),
-            "prompt must not be sent after read-only root-agent rejection: {commands:#?}"
+        assert_eq!(
+            commands[4],
+            serde_json::json!({ "UserInput": "hello read-only Tycode" })
         );
     }
 
@@ -7160,31 +7117,26 @@ for raw_line in sys.stdin:
     }
 
     #[test]
-    fn tycode_read_only_access_mode_uses_read_only_agent_tools() {
-        let agent_json = tycode_read_only_agent_json(&BackendSpawnConfig {
+    fn tycode_read_only_access_mode_materializes_guidance() {
+        let customization = materialize_tycode_customization(&BackendSpawnConfig {
             resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
                 access_mode: BackendAccessMode::ReadOnly,
                 ..Default::default()
             },
             ..Default::default()
         })
-        .expect("read-only agent json");
-        let value: Value = serde_json::from_str(&agent_json).expect("valid agent json");
-        let tools = value
-            .get("tools")
-            .and_then(Value::as_array)
-            .expect("tools")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-
-        assert!(tools.contains(&"set_tracked_files"));
-        assert!(
-            tools.contains(&"run_build_test"),
-            "read-only is advisory, so build/test commands must still be available"
-        );
-        assert!(!tools.contains(&"write_file"));
-        assert!(!tools.contains(&"modify_file"));
+        .expect("materialize guidance")
+        .expect("read-only guidance root");
+        let steering = fs::read_to_string(
+            customization
+                .root
+                .path
+                .join(".tycode")
+                .join("tyde_steering.md"),
+        )
+        .expect("read-only steering");
+        assert!(steering.contains("Backend access mode is read-only (best effort)"));
+        assert!(steering.contains("do not create, edit, or delete files"));
     }
 
     #[test]

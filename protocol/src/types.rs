@@ -1025,12 +1025,9 @@ pub struct HostLaunchProfileConfig {
 pub enum BackendAccessMode {
     #[default]
     Unrestricted,
-    /// Backend MUST refuse to execute any tool that mutates the
-    /// filesystem, runs shell commands, or otherwise changes state
-    /// outside the agent's own message stream. Read-only filesystem
-    /// access (read files, list directories, glob, grep) and
-    /// configured MCP tool calls are still allowed. The exact
-    /// implementation depends on the backend's available knobs.
+    /// Adds guidance telling the agent not to mutate files or external state.
+    /// This does not reduce backend permissions, remove tools, or reject MCP
+    /// operations.
     ReadOnly,
 }
 
@@ -3713,18 +3710,9 @@ pub enum SpawnAgentParams {
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<ImageData>>,
-        // Deserializing a missing field applies the side-question default
-        // (`read_only`), while serializing omits only an explicit `None`.
-        #[serde(
-            default = "default_fork_access_mode",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         access_mode: Option<BackendAccessMode>,
     },
-}
-
-fn default_fork_access_mode() -> Option<BackendAccessMode> {
-    Some(BackendAccessMode::ReadOnly)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

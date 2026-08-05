@@ -5342,7 +5342,7 @@ impl HostHandle {
                         },
                     });
                     let resolved_spawn_config = ResolvedSpawnConfig {
-                        access_mode: access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly),
+                        access_mode: access_mode.unwrap_or_default(),
                         ..Default::default()
                     };
                     return Ok(self
@@ -5533,8 +5533,7 @@ impl HostHandle {
                         ),
                     }
                 };
-                resolved_spawn_config.access_mode =
-                    access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly);
+                resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let (session_settings_schema, schema_failure) =
@@ -9545,13 +9544,6 @@ impl HostHandle {
             .await
             .registry
             .agent_status_handle(agent_id)
-    }
-
-    pub(crate) async fn agent_access_mode(
-        &self,
-        agent_id: &AgentId,
-    ) -> Option<protocol::BackendAccessMode> {
-        self.state.lock().await.registry.agent_access_mode(agent_id)
     }
 
     pub(crate) async fn agent_status_snapshot(

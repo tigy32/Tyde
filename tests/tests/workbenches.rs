@@ -1510,9 +1510,12 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     let other = create_project(&mut fixture.client, vec![other_repo.path()]).await;
     let removable = create_workbench(&mut fixture.client, &parent, "feature/mcp-remove").await;
+    let readonly_removable =
+        create_workbench(&mut fixture.client, &parent, "feature/read-only-remove").await;
     let other_workbench =
         create_workbench(&mut fixture.client, &other, "feature/out-of-scope-remove").await;
     let removable_root = PathBuf::from(project_roots(&removable)[0].clone());
+    let readonly_removable_root = PathBuf::from(project_roots(&readonly_removable)[0].clone());
     fs::write(removable_root.join("uncommitted.txt"), "discard me\n")
         .expect("write dirty MCP workbench file");
 
@@ -1556,18 +1559,20 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         json!({"parent_project_id": parent.id.0, "branch": "feature/read-only"}),
     )
     .await;
-    assert!(is_error, "read-only create succeeded: {body}");
-    assert!(body.contains("ReadOnly"));
-    assert!(!expected_worktree_path(repo.path(), "feature-read-only").exists());
+    assert!(!is_error, "read-only guidance mode create failed: {body}");
+    assert!(expected_worktree_path(repo.path(), "feature-read-only").exists());
     let (is_error, body) = call_agent_control(
         &fixture,
         &read_only.agent_id,
         "tyde_remove_workbench",
-        json!({"project_id": removable.id.0}),
+        json!({"project_id": readonly_removable.id.0}),
     )
     .await;
-    assert!(is_error, "read-only remove succeeded: {body}");
-    assert!(body.contains("ReadOnly"));
+    assert!(!is_error, "read-only guidance mode remove failed: {body}");
+    assert!(
+        !readonly_removable_root.exists(),
+        "workbench was not removed"
+    );
 
     let caller = spawn_project_caller(
         &mut fixture.client,

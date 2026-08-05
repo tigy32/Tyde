@@ -58,7 +58,8 @@ pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "anything — read files, list directories, and run read-only shell commands ",
     "such as `git status`/`log`/`diff`, `grep`/`rg`, `cat`, `ls`, and ",
     "`find` — to investigate the code. Prefer read/inspection tools; do not ",
-    "use write/edit/apply-patch tools."
+    "use write/edit/apply-patch tools. Agent orchestration, including spawning ",
+    "and messaging other agents, is allowed."
 );
 
 pub(crate) fn protocol_images_to_attachments(
@@ -1559,6 +1560,7 @@ mod tests {
         assert!(instructions.contains("`ls`"));
         assert!(instructions.contains("`find`"));
         assert!(instructions.contains("do not create, edit, or delete files"));
+        assert!(instructions.contains("spawning and messaging other agents, is allowed"));
         assert!(
             instructions
                 .contains("do not run commands that modify files, processes, or external state")

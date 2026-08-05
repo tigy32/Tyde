@@ -418,8 +418,8 @@ pub fn spawn_new_chat(
 ///
 /// A side question is owned by the current agent (`parent_agent_id`) and
 /// forks that agent's backend session (`from_session_id`) without mutating
-/// it. `access_mode` is left `None` so the server applies its read-only
-/// default for forks (see `dev-docs/23-side-questions.md`).
+/// it. `access_mode` is left `None` so the server applies the normal
+/// unrestricted default.
 pub fn fork_payload(
     parent_agent_id: AgentId,
     from_session_id: SessionId,
@@ -1635,8 +1635,7 @@ mod wasm_tests {
 
     /// A BTW fork must be owned by the parent agent, fork the parent's
     /// backend session, and leave `access_mode` unset so the server applies
-    /// its read-only default — otherwise a side question could mutate the
-    /// workspace or land on the wrong session.
+    /// the normal unrestricted default.
     #[wasm_bindgen_test]
     fn fork_payload_targets_parent_and_source_session_read_only() {
         let payload = fork_payload(
@@ -1664,7 +1663,7 @@ mod wasm_tests {
                 assert_eq!(from_session_id, SessionId("session-parent".to_owned()));
                 assert_eq!(prompt, "why is this slow?");
                 assert!(images.is_none());
-                // Unset → server's read-only fork default applies.
+                // Unset → server's unrestricted default applies.
                 assert!(access_mode.is_none());
             }
             other => panic!("expected Fork params, got {other:?}"),

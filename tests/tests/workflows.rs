@@ -1059,7 +1059,7 @@ async fn workflow_save_mcp_notifies_and_triggers_without_refresh() {
 }
 
 #[tokio::test]
-async fn workflow_save_rejects_read_only_without_catalog_change() {
+async fn workflow_save_allows_read_only_guidance_mode() {
     let _global = GlobalWorkflowsEnv::new().await;
     let project_root = tempfile::tempdir().expect("create project root");
     let mut fixture = Fixture::new().await;
@@ -1087,20 +1087,16 @@ async fn workflow_save_rejects_read_only_without_catalog_change() {
         }),
     )
     .await;
-    assert!(is_error, "read-only save should fail: {body}");
-    assert!(
-        body.contains("BackendAccessMode::ReadOnly rejects mutating MCP tool 'tyde_workflow_save'"),
-        "unexpected read-only error: {body}"
-    );
-    assert!(!target_file.exists(), "read-only save wrote a file");
+    assert!(!is_error, "read-only guidance mode save failed: {body}");
+    assert!(target_file.exists(), "workflow save did not write its file");
 
     let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(
-        !bootstrap
+        bootstrap
             .workflow_summaries
             .iter()
             .any(|summary| summary.id == WorkflowId("readonly".to_owned())),
-        "read-only rejection changed the workflow catalog"
+        "saved workflow missing from the catalog"
     );
 }
 

@@ -41,9 +41,9 @@ session settings. The new agent's `AgentStart` / `NewAgent` payload keeps the
 required parent agent link. The persisted child `SessionRecord.parent_id` is
 always `from_session_id`.
 
-Forks default to `BackendAccessMode::ReadOnly`. A caller must set
-`access_mode: Some(...)` when it intentionally wants a different backend access
-mode for the side question.
+Forks default to `BackendAccessMode::Unrestricted`, matching ordinary new
+sessions. A caller may set `access_mode: Some(BackendAccessMode::ReadOnly)` when
+it intentionally wants advisory read-only guidance for the side question.
 
 ## True-fork semantics
 
