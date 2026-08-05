@@ -278,60 +278,9 @@ jobs:
       - name: Build headless Tyde Server binary
         run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
 
-      # Smoke-test the freshly built binary before signing/packaging. beta 20
-      # built cleanly but panicked on startup ("No provider set"), so a build
-      # that never runs the binary shipped a 100%-broken release. This runs it.
-      - name: Smoke test headless binary (Unix)
-        if: matrix.platform != 'windows-latest'
-        shell: bash
-        run: |
-          BIN="target/${{ matrix.server-target }}/release/tyde-server"
-          EXPECTED="${RELEASE_TAG#v}"
-
-          # 1. The binary must load and report the version compiled into it.
-          VERSION="$("$BIN" --version)"
-          echo "tyde-server --version -> $VERSION"
-          if [[ "$VERSION" != "$EXPECTED" ]]; then
-            echo "::error::version mismatch: binary=$VERSION expected=$EXPECTED"
-            exit 1
-          fi
-
-          # 2. The host must actually start and open its UDS socket. This is the
-          #    exact path that panicked in beta 20: startup builds the mobile
-          #    reqwest client, which needs a rustls crypto provider installed.
-          SOCK="/tmp/tyde-smoke-$$.sock"
-          rm -f "$SOCK"
-          TYDE_SOCKET_PATH="$SOCK" "$BIN" host --uds &
-          SRV_PID=$!
-          ready=0
-          for _ in $(seq 1 100); do
-            if [[ -S "$SOCK" ]]; then ready=1; break; fi
-            if ! kill -0 "$SRV_PID" 2>/dev/null; then break; fi
-            sleep 0.2
-          done
-          kill "$SRV_PID" 2>/dev/null || true
-          wait "$SRV_PID" 2>/dev/null || true
-          rm -f "$SOCK"
-          if [[ "$ready" != "1" ]]; then
-            echo "::error::tyde-server host --uds never opened its socket — startup crash?"
-            exit 1
-          fi
-          echo "headless host opened its socket — startup smoke passed"
-
-      - name: Smoke test headless binary (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: |
-          # Windows has no UDS host mode, so verify the binary loads and reports
-          # the right version (catches a link/startup panic in the CLI path).
-          $bin = "target/${{ matrix.server-target }}/release/tyde-server.exe"
-          $version = (& $bin --version).Trim()
-          Write-Host "tyde-server --version -> $version"
-          $expected = "${{ env.RELEASE_TAG }}".TrimStart('v')
-          if ($version -ne $expected) {
-            Write-Error "version mismatch: binary=$version expected=$expected"
-            exit 1
-          }
+      # This shared smoke path is also used by the non-publishing pre-tag matrix.
+      - name: Smoke test headless binary
+        run: python tools/smoke_headless_release.py --target ${{ matrix.server-target }} --expected-version "${{ env.RELEASE_TAG }}"
 
       - name: Build macOS app with Tauri
         if: startsWith(matrix.platform, 'macos')

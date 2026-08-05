@@ -19,6 +19,17 @@ def load_provisioner():
     return module
 
 
+def child_exit_status(returncode: int) -> int:
+    if returncode < 0:
+        return 128 - returncode
+    return returncode
+
+
+def run_tool(executable: pathlib.Path, arguments: list[str]) -> int:
+    completed = subprocess.run([str(executable), *arguments], check=False)
+    return child_exit_status(completed.returncode)
+
+
 def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] not in {"meson", "ninja"}:
         print("usage: native-build-tool.py {meson|ninja} [--] [arguments...]", file=sys.stderr)
@@ -50,8 +61,7 @@ def main() -> int:
         if not current_path
         else os.pathsep.join((str(directory), current_path))
     )
-    os.execv(executable, [str(executable), *arguments])
-    return 127
+    return run_tool(executable, arguments)
 
 
 if __name__ == "__main__":

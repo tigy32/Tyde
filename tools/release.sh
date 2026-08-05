@@ -48,6 +48,9 @@ Usage:
   ./dev.sh release wait vX.Y.Z [--timeout 90m] [--interval 30]
   ./dev.sh release verify vX.Y.Z
   ./dev.sh release publish vX.Y.Z --confirm
+  ./dev.sh release pretag dispatch SOURCE_REF --confirm
+  ./dev.sh release pretag status RUN_ID
+  ./dev.sh release pretag wait RUN_ID [--timeout SECONDS] [--interval SECONDS]
 
 wait/status exit codes: 0 success, 1 failed, 3 not found, 4 still running,
 5 network/tool error. Usage errors exit 2.
@@ -831,6 +834,10 @@ command_publish() {
 }
 
 case "${1:-}" in
+    pretag)
+        shift
+        exec python3 -B "$SCRIPT_DIR/pretag_release_build.py" "$@"
+        ;;
     prepare)
         shift
         command_prepare "$@"

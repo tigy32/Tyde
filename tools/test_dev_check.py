@@ -504,12 +504,27 @@ def native_voice_vendor_surface_violations(
         or production_specs.count(force_fallback_literal) != 1
         or "pub(crate) fn meson_spec(" not in production_specs
         or "pub(crate) fn ninja_spec(" not in production_specs
+        or "pub(crate) fn symbol_list_spec(" not in production_specs
+        or "pub(crate) fn symbol_prefix_spec(" not in production_specs
+        or "pub(crate) fn wrapper_library_filename(" not in production_specs
+        or "pub(crate) fn discover_bundled_archive(" not in production_specs
+        or "pub(crate) fn stage_bundled_archive(" not in production_specs
+        or "pub(crate) fn stage_and_prepare_bundled_archive" not in production_specs
+        or "pub(crate) fn replace_with_prefixed_archive(" not in production_specs
+        or "pub(crate) fn static_link_directive(" not in production_specs
+        or "pub(crate) fn llvm_symbol_tool_candidates(" not in production_specs
         or build_script.count('repository_native_command("meson", &spec)') != 1
         or build_script.count('repository_native_command("ninja", &ninja_spec)') != 1
         or build_script.count('repository_native_command("ninja", &install_spec)') != 1
         or 'probe("absl_base")' in build_script + production_specs
         or "remove_materialized_abseil" not in build_script
         or "removing incomplete AEC build directory" not in build_script
+        or 'Command::new("nm")' in build_script
+        or "required Rust LLVM symbol tools are unavailable" not in build_script
+        or 'BUNDLED_ABSEIL_LINK_LIBRARIES: [&str; 1] = ["absl_strings"]' not in build_script
+        or 'cargo:rustc-link-lib=absl_strings' in build_script
+        or "prefix_archive_symbols(&archive.source" in build_script
+        or 'out_dir().join("bundled-link")' not in build_script
     ):
         violations.append("vendored AEC build is not offline and self-recovering")
 
@@ -748,6 +763,108 @@ class ReleaseBuildConfigContractTests(unittest.TestCase):
             )
 
 
+class PreTagReleaseBuildContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = (
+            REPO_ROOT / ".github/workflows/pretag-release-build.yml"
+        ).read_text(encoding="utf-8")
+        cls.release_workflow = (
+            REPO_ROOT / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_is_manual_read_only_and_cannot_publish(self) -> None:
+        trigger = self.workflow.split("on:\n", 1)[1].split("\npermissions:\n", 1)[0]
+        permissions = self.workflow.split("permissions:\n", 1)[1].split(
+            "\njobs:\n", 1
+        )[0]
+        self.assertIn("  workflow_dispatch:\n", trigger)
+        for forbidden_trigger in ("push:", "pull_request:", "schedule:"):
+            self.assertNotIn(forbidden_trigger, trigger)
+        self.assertEqual(permissions.strip(), "contents: read")
+        self.assertIn("save-if: false", self.workflow)
+
+        lowered = self.workflow.lower()
+        for forbidden in (
+            "secrets.",
+            "github_token",
+            "contents: write",
+            "id-token:",
+            "actions/upload-artifact",
+            "tauri-apps/tauri-action",
+            "gh release",
+            "notarytool",
+            "codesign",
+            "deploy-mobile",
+            "aws-actions/",
+        ):
+            self.assertNotIn(forbidden, lowered)
+
+    def test_checks_out_and_verifies_the_exact_untrusted_ref(self) -> None:
+        self.assertEqual(self.workflow.count("${{ inputs.source_ref }}"), 2)
+        self.assertIn("ref: ${{ inputs.source_ref }}", self.workflow)
+        self.assertIn("persist-credentials: false", self.workflow)
+        self.assertIn("SOURCE_REF: ${{ inputs.source_ref }}", self.workflow)
+        self.assertIn(
+            'git rev-parse --verify --end-of-options "${SOURCE_REF}^{commit}"',
+            self.workflow,
+        )
+        self.assertIn("actual_sha=$(git rev-parse HEAD)", self.workflow)
+        self.assertIn('[[ "$actual_sha" != "$requested_sha" ]]', self.workflow)
+        self.assertNotIn("${{ inputs.source_ref }}", self.workflow.split("run: |", 1)[1])
+
+    def test_matrix_has_exact_release_runner_target_pairs(self) -> None:
+        entries = re.findall(
+            r"          - platform: ([^\n]+)\n"
+            r"            rust-target: ([^\n]+)\n"
+            r"            server-target: ([^\n]+)",
+            self.workflow,
+        )
+        self.assertEqual(
+            entries,
+            [
+                ("macos-15", "aarch64-apple-darwin", "aarch64-apple-darwin"),
+                ("macos-15-intel", "x86_64-apple-darwin", "x86_64-apple-darwin"),
+                ("ubuntu-22.04", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"),
+                ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"),
+                ("windows-latest", "x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+            ],
+        )
+
+    def test_uses_release_equivalent_build_setup_and_shared_smoke(self) -> None:
+        shared_fragments = (
+            "tools/provision-native-build-tools.py",
+            '--github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"',
+            "run: npm ci",
+            "run: ./dev.sh rust-toolchain",
+            "uses: swatinem/rust-cache@v2",
+            "uses: taiki-e/install-action@v2",
+            "tool: trunk@0.21.14",
+            "cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server",
+            "python tools/smoke_headless_release.py --target ${{ matrix.server-target }}",
+        )
+        for fragment in shared_fragments:
+            self.assertIn(fragment, self.workflow)
+            self.assertIn(fragment, self.release_workflow)
+        self.assertIn(
+            "npx --prefix ../.. tauri build --target ${{ matrix.rust-target }} --no-bundle",
+            self.workflow,
+        )
+        self.assertIn("working-directory: frontend/tauri-shell", self.workflow)
+
+    def test_release_tool_exposes_bounded_dispatch_status_and_wait(self) -> None:
+        release_shell = (REPO_ROOT / "tools/release.sh").read_text(encoding="utf-8")
+        tool = (REPO_ROOT / "tools/pretag_release_build.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('exec python3 -B "$SCRIPT_DIR/pretag_release_build.py"', release_shell)
+        self.assertIn('["gh", *args]', tool)
+        self.assertIn('"run", "watch"', tool)
+        self.assertIn("timeout=timeout", tool)
+        self.assertIn('"--workflow",\n                WORKFLOW', tool)
+        self.assertNotIn("shell=True", tool)
+
+
 class TrunkCommandTests(unittest.TestCase):
     def test_percent_encoded_checkout_uses_safe_wasm_target_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -887,6 +1004,26 @@ class NativeBuildToolsContractTests(unittest.TestCase):
         )
         self.assertNotIn('Command::new("meson")', build_script + build_support)
         self.assertNotIn('Command::new("ninja")', build_script + build_support)
+        self.assertNotIn('Command::new("nm")', build_script)
+        self.assertIn("build_support::symbol_list_spec", build_script)
+        self.assertIn("build_support::symbol_prefix_spec", build_script)
+        self.assertIn("build_support::discover_bundled_archive", build_script)
+        self.assertIn("build_support::stage_bundled_archive", build_script)
+        self.assertIn("build_support::stage_and_prepare_bundled_archive", build_script)
+        self.assertNotIn("prefix_archive_symbols(&archive.source", build_script)
+        self.assertIn("build_support::replace_with_prefixed_archive", build_script)
+        self.assertIn("build_support::static_link_directive", build_script)
+        self.assertLess(
+            build_script.index(
+                'println!("cargo:rustc-link-search=native={}", staging_dir.display())'
+            ),
+            build_script.index("for dir in &lib_dirs"),
+        )
+        self.assertIn(
+            'BUNDLED_ABSEIL_LINK_LIBRARIES: [&str; 1] = ["absl_strings"]',
+            build_script,
+        )
+        self.assertNotIn("cargo:rustc-link-lib=absl_strings", build_script)
 
         workspace_test = (
             REPO_ROOT / "tests/tests/webrtc_build_support.rs"
@@ -960,6 +1097,46 @@ class NativeBuildToolsContractTests(unittest.TestCase):
                 directory.resolve(),
             )
             self.assertFalse((pathlib.Path(temp) / "injection").exists())
+
+    def test_native_tool_wrapper_waits_and_propagates_child_status(self) -> None:
+        module_path = REPO_ROOT / "tools" / "native-build-tool.py"
+        source = module_path.read_text(encoding="utf-8")
+        self.assertNotIn("os.exec" + "v", source)
+        self.assertIn(
+            "subprocess.run([str(executable), *arguments], check=False)", source
+        )
+        spec = importlib.util.spec_from_file_location("native_tool_wrapper", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temp:
+            sentinel = pathlib.Path(temp) / "child-finished"
+            env_name = "TYDE_NATIVE_WRAPPER_SENTINEL"
+            prior = os.environ.get(env_name)
+            os.environ[env_name] = str(sentinel)
+            try:
+                status = module.run_tool(
+                    pathlib.Path(sys.executable),
+                    [
+                        "-c",
+                        "import os, pathlib, sys, time; "
+                        "time.sleep(0.05); "
+                        f"pathlib.Path(os.environ[{env_name!r}]).write_text('done'); "
+                        "sys.exit(23)",
+                    ],
+                )
+            finally:
+                if prior is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = prior
+
+            self.assertEqual(status, 23)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "done")
+        self.assertEqual(module.child_exit_status(-15), 143)
+        self.assertEqual(module.child_exit_status(0), 0)
 
 
 class DevCheckCacheTests(unittest.TestCase):
@@ -2960,7 +3137,7 @@ class RustToolchainParityTests(unittest.TestCase):
             (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"),
             """[toolchain]
 channel = "stable"
-components = ["clippy", "rustfmt"]
+components = ["clippy", "llvm-tools-preview", "rustfmt"]
 targets = ["wasm32-unknown-unknown"]
 profile = "minimal"
 """,

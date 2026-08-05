@@ -9,7 +9,7 @@ use std::{
 };
 
 mod build_support;
-use build_support::CommandSpec;
+use build_support::{CommandSpec, SymbolTools};
 
 /// Name and minimum version of the library that we are binding to.
 const LIB_NAME: &str = "webrtc-audio-processing-2";
@@ -20,6 +20,8 @@ const MACOSX_DEPLOYMENT_TARGET_VAR: &str = "MACOSX_DEPLOYMENT_TARGET";
 
 /// Symbol prefix for the webrtc-audio-processing library to allow multiple versions to coexist.
 const SYMBOL_PREFIX: &str = "v2_";
+#[cfg(feature = "bundled")]
+const BUNDLED_ABSEIL_LINK_LIBRARIES: [&str; 1] = ["absl_strings"];
 
 fn out_dir() -> PathBuf {
     std::env::var("OUT_DIR").expect("OUT_DIR environment var not set.").into()
@@ -65,6 +67,8 @@ fn prefix_archive_symbols(
     archive_path: &std::path::Path,
     symbols: &[String],
     prefix: &str,
+    target: &str,
+    llvm_tools: Option<&SymbolTools>,
 ) -> Result<()> {
     if symbols.is_empty() {
         return Ok(());
@@ -77,12 +81,31 @@ fn prefix_archive_symbols(
         prefix
     );
 
-    let temp_path = archive_path.with_extension("prefixed.a");
-
-    let objcopy = determine_objcopy_path()?;
+    let temp_path = build_support::prefixed_archive_path(target, archive_path);
+    let args_path = archive_path.with_extension("args");
+    if temp_path.is_file() {
+        std::fs::remove_file(&temp_path).with_context(|| {
+            format!("removing stale prefixed archive {}", temp_path.display())
+        })?;
+    } else if temp_path.exists() {
+        bail!("prefixed archive path is not a file: {}", temp_path.display());
+    }
+    let unix_objcopy = if build_support::is_msvc_target(target) {
+        None
+    } else {
+        Some(determine_objcopy_path()?)
+    };
+    let spec = build_support::symbol_prefix_spec(
+        target,
+        llvm_tools,
+        unix_objcopy.as_deref(),
+        &args_path,
+        archive_path,
+        &temp_path,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // Write arguments to a temp file to avoid "Argument list too long" errors.
-    let args_path = archive_path.with_extension("args");
     let mut writer = BufWriter::new(File::create(&args_path)?);
     for symbol in symbols {
         writeln!(writer, "--redefine-sym={}={}{}", symbol, prefix, symbol)?;
@@ -90,21 +113,22 @@ fn prefix_archive_symbols(
     writer.flush()?;
     drop(writer);
 
-    let mut cmd = Command::new(&objcopy);
-    cmd.arg(format!("@{}", args_path.display()));
-    cmd.arg(archive_path);
-    cmd.arg(&temp_path);
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args);
 
     eprintln!("Running {cmd:?}");
-    let status = cmd.status().context(format!("Failed to execute {:?}", objcopy))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to execute {:?}", spec.program))?;
 
     if !status.success() {
-        anyhow::bail!("{:?} failed with status: {}", objcopy, status);
+        anyhow::bail!("{:?} failed with status: {}", spec.program, status);
     }
 
-    std::fs::rename(&temp_path, archive_path).with_context(|| {
-        format!("Failed to rename {} to {}", temp_path.display(), archive_path.display())
-    })?;
+    build_support::replace_with_prefixed_archive(target, &temp_path, archive_path)
+        .map_err(anyhow::Error::msg)?;
+    std::fs::remove_file(&args_path)
+        .with_context(|| format!("removing symbol-prefix arguments {}", args_path.display()))?;
 
     Ok(())
 }
@@ -159,6 +183,7 @@ mod webrtc {
     pub(super) fn prefix_library_symbols(
         _lib_dirs: &[PathBuf],
         _prefix: &str,
+        _llvm_tools: Option<&SymbolTools>,
     ) -> Result<Vec<String>> {
         // For non-bundled builds, we can't prefix symbols in the system library.
         // Users would need to build with bundled feature for multi-version support.
@@ -413,23 +438,27 @@ mod webrtc {
     }
 
     /// Prefix symbols in the built webrtc-audio-processing static library.
-    /// Returns the list of symbols that were renamed.
+    /// Returns the renamed symbols and the staged archive link contract.
     pub(super) fn prefix_library_symbols(
         lib_dirs: &[PathBuf],
         prefix: &str,
-    ) -> Result<Vec<String>> {
-        let static_lib_filename = format!("lib{LIB_NAME}.a");
-
-        for lib_dir in lib_dirs {
-            let lib_path = lib_dir.join(&static_lib_filename);
-            if lib_path.exists() {
-                let symbols = get_defined_symbols(&lib_path)?;
-                prefix_archive_symbols(&lib_path, &symbols, prefix)?;
-                return Ok(symbols);
-            }
-        }
-
-        bail!("Cannot find {static_lib_filename} in {lib_dirs:?} to prefix its symbols.");
+        llvm_tools: Option<&SymbolTools>,
+        staging_dir: &Path,
+    ) -> Result<(Vec<String>, build_support::StagedArchive)> {
+        let target = env::var("TARGET").context("TARGET environment variable is not set")?;
+        let archive = build_support::discover_bundled_archive(&target, LIB_NAME, lib_dirs)
+            .map_err(anyhow::Error::msg)?;
+        let symbols = get_defined_symbols(&archive.source, &target, llvm_tools)?;
+        let staged = build_support::stage_and_prepare_bundled_archive(
+            &archive,
+            staging_dir,
+            |staged_path| {
+                prefix_archive_symbols(staged_path, &symbols, prefix, &target, llvm_tools)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok((symbols, staged))
     }
 
     fn webrtc_source_dir() -> PathBuf {
@@ -441,16 +470,24 @@ mod webrtc {
     }
 
     /// Extract defined (non-external) symbols from a static library using nm.
-    fn get_defined_symbols(archive_path: &std::path::Path) -> Result<Vec<String>> {
-        let output = Command::new("nm")
-            .arg("--defined-only")
-            .arg("--format=posix")
-            .arg(archive_path)
+    fn get_defined_symbols(
+        archive_path: &std::path::Path,
+        target: &str,
+        llvm_tools: Option<&SymbolTools>,
+    ) -> Result<Vec<String>> {
+        let spec = build_support::symbol_list_spec(target, llvm_tools, archive_path)
+            .map_err(anyhow::Error::msg)?;
+        let output = Command::new(&spec.program)
+            .args(&spec.args)
             .output()
-            .context("Failed to execute nm")?;
+            .with_context(|| format!("Failed to execute {:?}", spec.program))?;
 
         if !output.status.success() {
-            anyhow::bail!("nm failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "{:?} failed: {}",
+                spec.program,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -501,13 +538,48 @@ impl ParseCallbacks for CustomDeriveCallbacks {
 }
 
 fn main() -> Result<()> {
+    let target = env::var("TARGET").context("TARGET environment variable is not set")?;
     webrtc::build_if_necessary()?;
     let (include_dirs, lib_dirs) = webrtc::get_build_paths()?;
+    #[cfg(feature = "bundled")]
+    let staging_dir = out_dir().join("bundled-link");
+
+    #[cfg(feature = "bundled")]
+    let llvm_tools = if build_support::is_msvc_target(&target) {
+        Some(determine_llvm_symbol_tools()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "bundled"))]
+    let llvm_tools: Option<SymbolTools> = None;
 
     // Prefix defined symbols in the webrtc library (bundled builds only)
     // Returns the list of renamed symbols to update wrapper references later
-    let renamed_symbols = webrtc::prefix_library_symbols(&lib_dirs, SYMBOL_PREFIX)?;
+    #[cfg(feature = "bundled")]
+    let (renamed_symbols, bundled_archive) =
+        webrtc::prefix_library_symbols(
+            &lib_dirs,
+            SYMBOL_PREFIX,
+            llvm_tools.as_ref(),
+            &staging_dir,
+        )?;
+    #[cfg(feature = "bundled")]
+    let bundled_abseil_archives = BUNDLED_ABSEIL_LINK_LIBRARIES
+        .iter()
+        .copied()
+        .map(|name| {
+            let archive = build_support::discover_bundled_archive(&target, name, &lib_dirs)
+                .map_err(anyhow::Error::msg)?;
+            build_support::stage_bundled_archive(&archive, &staging_dir)
+                .map_err(anyhow::Error::msg)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(feature = "bundled"))]
+    let renamed_symbols =
+        webrtc::prefix_library_symbols(&lib_dirs, SYMBOL_PREFIX, llvm_tools.as_ref())?;
 
+    #[cfg(feature = "bundled")]
+    println!("cargo:rustc-link-search=native={}", staging_dir.display());
     for dir in &lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
@@ -567,15 +639,34 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/wrapper.cpp");
 
     // Prefix the wrapper library's references to webrtc symbols to match the renamed webrtc library.
-    let wrapper_lib = out_dir().join("libwebrtc_audio_processing_wrapper.a");
+    let wrapper_lib = out_dir().join(build_support::wrapper_library_filename(
+        &target,
+        "webrtc_audio_processing_wrapper",
+    ));
     if wrapper_lib.exists() {
-        prefix_archive_symbols(&wrapper_lib, &renamed_symbols, SYMBOL_PREFIX)?;
+        prefix_archive_symbols(
+            &wrapper_lib,
+            &renamed_symbols,
+            SYMBOL_PREFIX,
+            &target,
+            llvm_tools.as_ref(),
+        )?;
+    } else if build_support::is_msvc_target(&target) && !renamed_symbols.is_empty() {
+        bail!(
+            "required MSVC wrapper archive is missing after cc build: {}",
+            wrapper_lib.display()
+        );
     }
 
-    if cfg!(feature = "bundled") {
-        println!("cargo:rustc-link-lib=static={LIB_NAME}");
-        println!("cargo:rustc-link-lib=absl_strings");
-    } else {
+    #[cfg(feature = "bundled")]
+    {
+        println!("{}", build_support::static_link_directive(&bundled_archive));
+        for archive in &bundled_abseil_archives {
+            println!("{}", build_support::static_link_directive(archive));
+        }
+    }
+    #[cfg(not(feature = "bundled"))]
+    {
         println!("cargo:rustc-link-lib=dylib={LIB_NAME}");
     }
 
@@ -608,8 +699,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Reliably determine a path to objcopy binary bundled with the active Rust toolchain (rust-objcopy)
-fn determine_objcopy_path() -> Result<PathBuf> {
+fn determine_rust_sysroot() -> Result<PathBuf> {
     // 1. Get the rustc command (this might be a path or just "rustc")
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
 
@@ -625,13 +715,37 @@ fn determine_objcopy_path() -> Result<PathBuf> {
     }
 
     let sysroot_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in sysroot")?;
-    let sysroot = PathBuf::from(sysroot_str.trim());
+    Ok(PathBuf::from(sysroot_str.trim()))
+}
 
-    // 3. Construct the path: <sysroot>/lib/rustlib/<HOST_TRIPLE>/bin/rust-objcopy
-    // We use HOST because that is where the compiler (and tools) are running.
+fn determine_rustlib_bin() -> Result<PathBuf> {
+    let sysroot = determine_rust_sysroot()?;
     let host = env::var("HOST").context("HOST env var not found")?;
+    Ok(sysroot.join("lib").join("rustlib").join(host).join("bin"))
+}
 
-    let objcopy = sysroot.join("lib").join("rustlib").join(host).join("bin").join("rust-objcopy");
+fn determine_llvm_symbol_tools() -> Result<SymbolTools> {
+    let sysroot = determine_rust_sysroot()?;
+    let host = env::var("HOST").context("HOST env var not found")?;
+    let candidates = build_support::llvm_symbol_tool_candidates(&sysroot, &host);
+    let found = candidates
+        .iter()
+        .filter(|tools| tools.nm.is_file() && tools.objcopy.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    if found.len() != 1 {
+        bail!(
+            "required Rust LLVM symbol tools are unavailable for host {host}; searched {candidates:?}; run `rustup component add llvm-tools-preview --toolchain stable`"
+        );
+    }
+    Ok(found.into_iter().next().unwrap())
+}
+
+/// Reliably determine a path to objcopy binary bundled with the active Rust toolchain (rust-objcopy)
+fn determine_objcopy_path() -> Result<PathBuf> {
+    let rustlib_bin = determine_rustlib_bin()?;
+
+    let objcopy = rustlib_bin.join("rust-objcopy");
 
     // Optional: verification
     if !objcopy.exists() {

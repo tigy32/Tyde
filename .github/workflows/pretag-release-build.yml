@@ -1,0 +1,113 @@
+name: Pre-tag release build
+run-name: Pre-tag release build ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Pushed branch, tag, or commit SHA to validate'
+        required: true
+      request_id:
+        description: 'Unique correlation ID (the release tool supplies this)'
+        required: false
+        default: manual
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-15
+            rust-target: aarch64-apple-darwin
+            server-target: aarch64-apple-darwin
+          - platform: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            server-target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            server-target: x86_64-unknown-linux-musl
+          - platform: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            server-target: aarch64-unknown-linux-musl
+          - platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            server-target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Verify exact source commit
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          requested_sha=$(git rev-parse --verify --end-of-options "${SOURCE_REF}^{commit}")
+          actual_sha=$(git rev-parse HEAD)
+          if [[ "$actual_sha" != "$requested_sha" ]]; then
+            echo "::error::checkout mismatch: HEAD=$actual_sha requested=$requested_sha"
+            exit 1
+          fi
+          git diff --exit-code
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
+            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config \
+            patchelf musl-tools zip
+
+      - name: Provision native audio build tools
+        shell: bash
+        run: |
+          python tools/provision-native-build-tools.py \
+            --root "$RUNNER_TEMP/tyde-native-build-tools" \
+            --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
+
+      - name: Verify runner Node.js
+        run: node --version && npm --version
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install repository Rust toolchain
+        run: ./dev.sh rust-toolchain
+
+      - name: Install build Rust targets
+        run: rustup target add ${{ matrix.rust-target }} ${{ matrix.server-target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          save-if: false
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Build headless Tyde Server binary
+        run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
+
+      - name: Smoke test headless binary
+        run: python tools/smoke_headless_release.py --target ${{ matrix.server-target }}
+
+      - name: Compile and link native Tauri frontend
+        working-directory: frontend/tauri-shell
+        run: npx --prefix ../.. tauri build --target ${{ matrix.rust-target }} --no-bundle
