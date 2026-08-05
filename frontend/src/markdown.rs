@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd, html};
 
 use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 
@@ -12,6 +12,11 @@ use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 ///   image is dropped to its alt text. This runs in the shared render path so
 ///   every consumer (chat, code-intel hover) is protected — RA hover docs can
 ///   carry `[x](javascript:…)` or `data:`/remote image beacons.
+/// - **Bare `http(s)://` URLs in plain text are autolinked** (pulldown-cmark
+///   has no GFM autolink extension). This runs at the event level, so text
+///   inside code blocks, inline code, existing links, and image alt text is
+///   never rewritten. Trailing punctuation is excluded per the GFM autolink
+///   rules (a closing `)`/`]`/`}` is kept only while balanced in the URL).
 /// - Fenced code blocks are wrapped in `.md-code-block` with a language label
 ///   and a copy button; the inner `<code>` body is pre-tokenized by syntect
 ///   into colored `<span>`s emitted directly into the HTML, so no client-side
@@ -112,8 +117,45 @@ pub fn render_markdown(input: &str) -> String {
         other => Some(other),
     });
 
+    // Autolink bare URLs. Code-block text was consumed above and inline code
+    // is a separate `Event::Code`, so only genuine prose `Text` events reach
+    // this stage; `wrap_depth` additionally skips text nested in a surviving
+    // link (nested <a> is invalid) or image (it becomes the alt attribute).
+    //
+    // pulldown-cmark splits `Text` at emphasis-delimiter candidates (`_`,
+    // `*`, `~`) even when they end up staying literal, so consecutive `Text`
+    // events must be merged before scanning — otherwise a URL such as
+    // `…/wiki/Foo_(bar)` arrives in pieces and only `…/Foo` gets linked.
+    let mut linked: Vec<Event> = Vec::new();
+    let mut text_buf = String::new();
+    let mut wrap_depth = 0usize;
+    fn flush<'a>(buf: &mut String, out: &mut Vec<Event<'a>>) {
+        if !buf.is_empty() {
+            let merged = CowStr::Boxed(std::mem::take(buf).into_boxed_str());
+            out.extend(linkify_text(merged));
+        }
+    }
+    for ev in events {
+        match &ev {
+            Event::Text(t) if wrap_depth == 0 => {
+                text_buf.push_str(t);
+                continue;
+            }
+            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {
+                flush(&mut text_buf, &mut linked);
+                wrap_depth += 1;
+            }
+            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
+                wrap_depth = wrap_depth.saturating_sub(1);
+            }
+            _ => flush(&mut text_buf, &mut linked),
+        }
+        linked.push(ev);
+    }
+    flush(&mut text_buf, &mut linked);
+
     let mut out = String::with_capacity(input.len() * 2);
-    html::push_html(&mut out, events);
+    html::push_html(&mut out, linked.into_iter());
     out
 }
 
@@ -135,6 +177,110 @@ fn is_safe_url(url: &str) -> bool {
     }
     // No ':' at all → relative reference.
     true
+}
+
+/// Split a prose text event into text/link/text… events, wrapping each bare
+/// `http://`/`https://` URL in a real link so it renders clickable. Only these
+/// two schemes are recognized, so every produced destination is safe by
+/// construction under [`is_safe_url`].
+fn linkify_text(text: CowStr<'_>) -> Vec<Event<'_>> {
+    if !text.contains("http") {
+        return vec![Event::Text(text)];
+    }
+
+    let s: &str = &text;
+    let mut events: Vec<Event> = Vec::new();
+    let mut cursor = 0; // start of not-yet-emitted plain text
+    let mut search = 0;
+    while let Some(rel) = s[search..].find("http") {
+        let start = search + rel;
+        let rest = &s[start..];
+        let scheme_len = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            search = start + 4;
+            continue;
+        };
+        // Must begin a word: an alphanumeric right before means this is the
+        // tail of some other token, not a URL.
+        let mid_word = s[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        if mid_word {
+            search = start + scheme_len;
+            continue;
+        }
+        // The URL runs to the first whitespace/control char (or angle
+        // bracket, which cannot appear raw in a URL), then sheds trailing
+        // punctuation that is almost certainly sentence text.
+        let end_rel = rest
+            .find(|c: char| c.is_whitespace() || c.is_control() || c == '<' || c == '>')
+            .unwrap_or(rest.len());
+        let url = trim_url_tail(&rest[..end_rel]);
+        if url.len() <= scheme_len {
+            // Just a scheme with nothing after it — leave as text.
+            search = start + scheme_len;
+            continue;
+        }
+        if cursor < start {
+            events.push(owned_text(&s[cursor..start]));
+        }
+        events.push(Event::Start(Tag::Link {
+            link_type: LinkType::Autolink,
+            dest_url: CowStr::Boxed(url.to_owned().into_boxed_str()),
+            title: CowStr::Borrowed(""),
+            id: CowStr::Borrowed(""),
+        }));
+        events.push(owned_text(url));
+        events.push(Event::End(TagEnd::Link));
+        cursor = start + url.len();
+        search = cursor;
+    }
+
+    if events.is_empty() {
+        return vec![Event::Text(text)];
+    }
+    if cursor < s.len() {
+        events.push(owned_text(&s[cursor..]));
+    }
+    events
+}
+
+fn owned_text(s: &str) -> Event<'static> {
+    Event::Text(CowStr::Boxed(s.to_owned().into_boxed_str()))
+}
+
+/// Trim trailing sentence punctuation off a candidate bare URL, following the
+/// GFM autolink extension: `.,:;!?'"*_~` never end a URL, and a closing
+/// bracket is kept only while the URL contains at least as many opening ones
+/// (so `…/Foo_(bar)` keeps its `)` but `(see https://x.com/y)` does not).
+fn trim_url_tail(mut url: &str) -> &str {
+    loop {
+        let Some(last) = url.chars().next_back() else {
+            return url;
+        };
+        match last {
+            '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '"' | '*' | '_' | '~' => {
+                url = &url[..url.len() - last.len_utf8()];
+            }
+            ')' | ']' | '}' => {
+                let open = match last {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                if url.matches(last).count() > url.matches(open).count() {
+                    url = &url[..url.len() - last.len_utf8()];
+                } else {
+                    return url;
+                }
+            }
+            _ => return url,
+        }
+    }
 }
 
 fn build_code_block(lang: &str, code: &str) -> String {
@@ -284,6 +430,102 @@ mod tests {
         assert!(!is_safe_url("  javascript:alert(1)"));
         assert!(!is_safe_url("java\tscript:alert(1)"));
         assert!(!is_safe_url("JavaScript:alert(1)"));
+    }
+
+    #[test]
+    fn bare_url_is_autolinked() {
+        let html = render_markdown(
+            "Fixed in revision 2:\n\nhttps://reviews.example.com/reviews/CR-123456/revisions/2\n",
+        );
+        assert!(
+            html.contains(
+                "<a href=\"https://reviews.example.com/reviews/CR-123456/revisions/2\">\
+                 https://reviews.example.com/reviews/CR-123456/revisions/2</a>"
+            ),
+            "bare url should become a link: {html}"
+        );
+    }
+
+    #[test]
+    fn bare_url_mid_sentence_sheds_trailing_punctuation() {
+        let html = render_markdown("see https://example.com/x. Then http://a.io/y, done");
+        assert!(
+            html.contains("<a href=\"https://example.com/x\">https://example.com/x</a>. Then"),
+            "trailing period must stay outside the link: {html}"
+        );
+        assert!(
+            html.contains("<a href=\"http://a.io/y\">http://a.io/y</a>, done"),
+            "trailing comma must stay outside the link: {html}"
+        );
+    }
+
+    #[test]
+    fn bare_url_paren_handling_follows_gfm() {
+        // Balanced parens are part of the URL…
+        let html = render_markdown("wiki https://en.wikipedia.org/wiki/Foo_(bar) end");
+        assert!(
+            html.contains("href=\"https://en.wikipedia.org/wiki/Foo_(bar)\""),
+            "balanced paren belongs to the url: {html}"
+        );
+        // …an unbalanced closer is sentence punctuation.
+        let html = render_markdown("(see https://example.com/x)");
+        assert!(
+            html.contains("<a href=\"https://example.com/x\">https://example.com/x</a>)"),
+            "unbalanced paren must stay outside the link: {html}"
+        );
+    }
+
+    #[test]
+    fn url_with_underscores_is_linked_whole() {
+        // pulldown-cmark splits text at `_` delimiter candidates; the merge
+        // pass must reassemble the URL before linkifying.
+        let html = render_markdown("doc https://example.com/a_b_c end");
+        assert!(
+            html.contains("<a href=\"https://example.com/a_b_c\">https://example.com/a_b_c</a>"),
+            "underscored url must link as one piece: {html}"
+        );
+    }
+
+    #[test]
+    fn urls_in_code_are_not_autolinked() {
+        let inline = render_markdown("run `curl https://example.com` now");
+        assert!(
+            !inline.contains("<a "),
+            "inline code must not be linkified: {inline}"
+        );
+        let fenced = render_markdown("```\nhttps://example.com\n```\n");
+        assert!(
+            !fenced.contains("<a "),
+            "code block must not be linkified: {fenced}"
+        );
+    }
+
+    #[test]
+    fn url_as_existing_link_text_is_not_double_linked() {
+        let html = render_markdown("[https://example.com](https://example.com)");
+        assert_eq!(
+            html.matches("<a ").count(),
+            1,
+            "must not nest a link inside a link: {html}"
+        );
+    }
+
+    #[test]
+    fn url_in_image_alt_is_not_linkified() {
+        let html = render_markdown("![https://example.com](https://example.com/i.png)");
+        assert!(
+            !html.contains("<a "),
+            "alt text must not grow a link: {html}"
+        );
+    }
+
+    #[test]
+    fn scheme_glued_to_a_word_is_left_alone() {
+        let html = render_markdown("notaurlhttps://example.com and bare https:// too");
+        assert!(
+            !html.contains("<a "),
+            "mid-word scheme and empty url must stay plain text: {html}"
+        );
     }
 
     #[test]
