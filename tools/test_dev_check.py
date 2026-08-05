@@ -494,12 +494,20 @@ def native_voice_vendor_surface_violations(
         violations.append("vendored Abseil wrap does not match the pinned package cache")
 
     build_script = vendor_files.get(f"{NATIVE_VOICE_AEC_VENDOR}/build.rs", "")
+    build_support = vendor_files.get(
+        f"{NATIVE_VOICE_AEC_VENDOR}/build_support.rs", ""
+    )
+    production_specs = build_support.split("#[cfg(test)]", 1)[0]
     force_fallback_literal = f'"{NATIVE_VOICE_ABSEIL_FORCE_FALLBACK}"'
     if (
-        build_script.count('arg("--wrap-mode=nodownload")') != 1
-        or build_script.count(force_fallback_literal) != 1
-        or build_script.count("arg(ABSEIL_FORCE_FALLBACK)") != 1
-        or 'probe("absl_base")' in build_script
+        production_specs.count('OsString::from("--wrap-mode=nodownload")') != 1
+        or production_specs.count(force_fallback_literal) != 1
+        or "pub(crate) fn meson_spec(" not in production_specs
+        or "pub(crate) fn ninja_spec(" not in production_specs
+        or build_script.count('repository_native_command("meson", &spec)') != 1
+        or build_script.count('repository_native_command("ninja", &ninja_spec)') != 1
+        or build_script.count('repository_native_command("ninja", &install_spec)') != 1
+        or 'probe("absl_base")' in build_script + production_specs
         or "remove_materialized_abseil" not in build_script
         or "removing incomplete AEC build directory" not in build_script
     ):
@@ -853,14 +861,44 @@ class NativeBuildToolsContractTests(unittest.TestCase):
         build_script = (
             REPO_ROOT / "vendor/webrtc-audio-processing-sys/build.rs"
         ).read_text(encoding="utf-8")
+        build_support = (
+            REPO_ROOT / "vendor/webrtc-audio-processing-sys/build_support.rs"
+        ).read_text(encoding="utf-8")
+        production_specs = build_support.split("#[cfg(test)]", 1)[0]
         self.assertIn(
             'webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }',
             workspace,
         )
-        self.assertEqual(build_script.count('repository_native_tool("meson")'), 1)
-        self.assertEqual(build_script.count('repository_native_tool("ninja")'), 2)
-        self.assertNotIn('Command::new("meson")', build_script)
-        self.assertNotIn('Command::new("ninja")', build_script)
+        self.assertIn("let mut command = repository_native_tool(name);", build_script)
+        self.assertEqual(
+            build_script.count('repository_native_command("meson", &spec)'), 1
+        )
+        self.assertEqual(
+            build_script.count('repository_native_command("ninja", &ninja_spec)'), 1
+        )
+        self.assertEqual(
+            build_script.count('repository_native_command("ninja", &install_spec)'), 1
+        )
+        self.assertEqual(
+            production_specs.count('OsString::from("--wrap-mode=nodownload")'), 1
+        )
+        self.assertEqual(
+            production_specs.count(f'"{NATIVE_VOICE_ABSEIL_FORCE_FALLBACK}"'), 1
+        )
+        self.assertNotIn('Command::new("meson")', build_script + build_support)
+        self.assertNotIn('Command::new("ninja")', build_script + build_support)
+
+        workspace_test = (
+            REPO_ROOT / "tests/tests/webrtc_build_support.rs"
+        ).read_text(encoding="utf-8")
+        tests_manifest = (REPO_ROOT / "tests/Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn('"tests",', workspace)
+        self.assertNotIn("autotests = false", tests_manifest)
+        self.assertIn(
+            '../../vendor/webrtc-audio-processing-sys/build_support.rs',
+            workspace_test,
+        )
+        self.assertIn("#[cfg(test)]\nmod tests", build_support)
 
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp) / "cached tools;$(touch injection)"
@@ -1920,13 +1958,15 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         downloadable = dict(surfaces)
         build_path = f"{NATIVE_VOICE_AEC_VENDOR}/build.rs"
-        downloadable[build_path] = downloadable[build_path].replace(
-            '.arg("--wrap-mode=nodownload")', ""
+        support_path = f"{NATIVE_VOICE_AEC_VENDOR}/build_support.rs"
+        downloadable[support_path] = downloadable[support_path].replace(
+            'OsString::from("--wrap-mode=nodownload")',
+            'OsString::from("--wrap-mode=default")',
         )
         self.assertTrue(native_voice_vendor_surface_violations(manifest, downloadable))
 
         partial_fallback = dict(surfaces)
-        partial_fallback[build_path] = partial_fallback[build_path].replace(
+        partial_fallback[support_path] = partial_fallback[support_path].replace(
             NATIVE_VOICE_ABSEIL_FORCE_FALLBACK,
             "--force-fallback-for=absl_base",
         )

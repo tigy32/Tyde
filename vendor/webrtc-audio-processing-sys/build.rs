@@ -8,6 +8,9 @@ use std::{
     process::Command,
 };
 
+mod build_support;
+use build_support::CommandSpec;
+
 /// Name and minimum version of the library that we are binding to.
 const LIB_NAME: &str = "webrtc-audio-processing-2";
 #[cfg(not(feature = "bundled"))]
@@ -45,6 +48,15 @@ fn repository_native_tool(name: &str) -> Command {
     });
     let mut command = Command::new(python);
     command.arg(wrapper).arg(name).arg("--");
+    command
+}
+
+fn repository_native_command(name: &str, spec: &CommandSpec) -> Command {
+    let mut command = repository_native_tool(name);
+    command.args(&spec.args).envs(spec.env.iter().cloned());
+    if let Some(current_dir) = &spec.current_dir {
+        command.current_dir(current_dir);
+    }
     command
 }
 
@@ -162,12 +174,11 @@ mod webrtc {
 #[cfg(feature = "bundled")]
 mod webrtc {
     use super::*;
+    use crate::build_support::MsvcTools;
     use std::{collections::HashSet, fs, path::Path};
 
     const BUNDLED_SOURCE_PATH: &str = "./webrtc-audio-processing";
     const ABSEIL_SUBPROJECT_DIRECTORY: &str = "abseil-cpp-20240722.0";
-    const ABSEIL_FORCE_FALLBACK: &str =
-        "--force-fallback-for=absl_base,absl_flags,absl_strings,absl_numeric,absl_synchronization,absl_bad_optional_access";
     const ABSEIL_PACKAGE_FILES: [&str; 6] = [
         "subprojects/abseil-cpp.wrap",
         "subprojects/packagecache/abseil-cpp-20240722.0.tar.gz",
@@ -232,6 +243,8 @@ mod webrtc {
 
         let webrtc_source_dir = webrtc_source_dir();
         let webrtc_build_dir = webrtc_build_dir();
+        let target = env::var("TARGET").context("TARGET environment variable is not set")?;
+        let msvc = resolve_msvc_tools(&target)?;
         eprintln!(
             "Copying webrtc-audio-processing to {} and building it in {}",
             webrtc_source_dir.display(),
@@ -260,7 +273,13 @@ mod webrtc {
         }
         remove_materialized_abseil(&webrtc_source_dir)?;
         let reconfigure = coredata.is_file();
-        if !run_meson_setup(&webrtc_build_dir, &webrtc_source_dir, reconfigure)? {
+        if !run_meson_setup(
+            &webrtc_build_dir,
+            &webrtc_source_dir,
+            reconfigure,
+            &target,
+            msvc.as_ref(),
+        )? {
             eprintln!("AEC Meson reconfigure failed; retrying once from clean target state");
             if webrtc_build_dir.exists() {
                 fs::remove_dir_all(&webrtc_build_dir).with_context(|| {
@@ -271,22 +290,28 @@ mod webrtc {
                 })?;
             }
             remove_materialized_abseil(&webrtc_source_dir)?;
-            if !run_meson_setup(&webrtc_build_dir, &webrtc_source_dir, false)? {
+            if !run_meson_setup(
+                &webrtc_build_dir,
+                &webrtc_source_dir,
+                false,
+                &target,
+                msvc.as_ref(),
+            )? {
                 bail!("Meson could not configure the bundled AEC from its offline package cache");
             }
         }
 
-        let mut ninja = repository_native_tool("ninja");
+        let msvc_env = msvc.as_ref().map(|tools| tools.env.as_slice());
+        let ninja_spec = build_support::ninja_spec(&webrtc_build_dir, false, msvc_env);
+        let mut ninja = repository_native_command("ninja", &ninja_spec);
         let status = ninja
-            .current_dir(&webrtc_build_dir)
             .status()
             .context("Failed to execute ninja. Do you have it installed?")?;
         assert!(status.success(), "Command failed: {:?}", &ninja);
 
-        let mut install = repository_native_tool("ninja");
+        let install_spec = build_support::ninja_spec(&webrtc_build_dir, true, msvc_env);
+        let mut install = repository_native_command("ninja", &install_spec);
         let status = install
-            .current_dir(&webrtc_build_dir)
-            .arg("install")
             .status()
             .context("Failed to execute ninja install")?;
         assert!(status.success(), "Command failed: {:?}", &install);
@@ -309,29 +334,64 @@ mod webrtc {
         Ok(())
     }
 
-    fn run_meson_setup(build_dir: &Path, source_dir: &Path, reconfigure: bool) -> Result<bool> {
-        let mut meson = repository_native_tool("meson");
-        meson
-            .arg("setup")
-            .arg("--wrap-mode=nodownload")
-            .arg(ABSEIL_FORCE_FALLBACK)
-            .arg("--prefix")
-            .arg(out_dir().as_os_str());
-        if reconfigure {
-            meson.arg("--reconfigure");
-        }
-        if cfg!(target_os = "macos") {
-            let link_args = "['-framework', 'CoreFoundation', '-framework', 'Foundation']";
-            meson.arg(format!("-Dc_link_args={}", link_args));
-            meson.arg(format!("-Dcpp_link_args={}", link_args));
-        }
+    fn run_meson_setup(
+        build_dir: &Path,
+        source_dir: &Path,
+        reconfigure: bool,
+        target: &str,
+        msvc: Option<&MsvcTools>,
+    ) -> Result<bool> {
+        let native_file = if let Some(tools) = msvc {
+            let path = out_dir().join("webrtc-msvc-native.ini");
+            fs::write(&path, build_support::msvc_native_file(tools))
+                .with_context(|| format!("writing MSVC Meson native file {}", path.display()))?;
+            Some(path)
+        } else {
+            None
+        };
+        let msvc_config = native_file
+            .as_deref()
+            .zip(msvc.map(|tools| tools.env.as_slice()));
+        let spec = build_support::meson_spec(
+            build_dir,
+            source_dir,
+            &out_dir(),
+            reconfigure,
+            target.contains("-apple-darwin"),
+            msvc_config,
+        );
+        let mut meson = repository_native_command("meson", &spec);
         let status = meson
-            .arg("-Ddefault_library=static")
-            .arg(build_dir.as_os_str())
-            .arg(source_dir.as_os_str())
             .status()
             .context("Failed to execute Meson for the bundled AEC")?;
         Ok(status.success())
+    }
+
+    fn resolve_msvc_tools(target: &str) -> Result<Option<MsvcTools>> {
+        if !target.ends_with("-pc-windows-msvc") {
+            return Ok(None);
+        }
+
+        fn find(target: &str, name: &str) -> Result<cc::Tool> {
+            cc::windows_registry::find_tool(target, name).with_context(|| {
+                format!("could not resolve {name} for Rust MSVC target {target}")
+            })
+        }
+
+        let compiler = find(target, "cl.exe")?;
+        anyhow::ensure!(
+            compiler.is_like_msvc(),
+            "resolved compiler for {target} is not MSVC: {}",
+            compiler.path().display()
+        );
+        let linker = find(target, "link.exe")?;
+        let librarian = find(target, "lib.exe")?;
+        Ok(Some(MsvcTools {
+            compiler: compiler.path().to_owned(),
+            linker: linker.path().to_owned(),
+            librarian: librarian.path().to_owned(),
+            env: build_support::msvc_command_env(compiler.env()),
+        }))
     }
 
     // Patch with `patch`.
