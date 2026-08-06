@@ -304,6 +304,37 @@ def parse_cargo_config(source: str) -> dict[tuple[str, ...], object]:
     return settings
 
 
+def parse_cargo_dependency_tables(source: str) -> dict[tuple[str, ...], set[str]]:
+    tables: dict[tuple[str, ...], set[str]] = {}
+    section: tuple[str, ...] = ()
+    for raw_line in source.splitlines():
+        line = toml_without_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if not line.endswith("]") or line.startswith("[["):
+                continue
+            parsed = parse_toml_dotted_key(line[1:-1])
+            if parsed is None:
+                raise ValueError(f"invalid Cargo manifest table: {line}")
+            section = tuple(parsed)
+            continue
+        if not section or section[-1] not in {
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+        }:
+            continue
+        pieces = toml_split_top_level(line, "=")
+        if pieces is None or len(pieces) != 2:
+            raise ValueError(f"invalid dependency declaration: {line}")
+        key = parse_toml_dotted_key(pieces[0])
+        if not key:
+            raise ValueError(f"invalid dependency name: {pieces[0]}")
+        tables.setdefault(section, set()).add(key[0])
+    return tables
+
+
 def cargo_config_discovery_paths(
     repository_root: pathlib.Path, working_directory: pathlib.Path
 ) -> list[pathlib.Path]:
@@ -783,6 +814,34 @@ class ReleaseBuildConfigContractTests(unittest.TestCase):
                 protected_settings.isdisjoint(nested_settings),
                 f"{nested_config} shadows root release-build settings",
             )
+
+
+class CargoManifestGuardTests(unittest.TestCase):
+    def test_dependency_parser_includes_every_dependency_kind(self) -> None:
+        self.assertEqual(
+            parse_cargo_dependency_tables(
+                """
+[dependencies]
+runtime.workspace = true
+[dev-dependencies]
+test-only = "1"
+[build-dependencies]
+build-only = { version = "2" }
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+native-only = "3"
+"""
+            ),
+            {
+                ("dependencies",): {"runtime"},
+                ("dev-dependencies",): {"test-only"},
+                ("build-dependencies",): {"build-only"},
+                (
+                    "target",
+                    'cfg(not(target_os = "windows"))',
+                    "dependencies",
+                ): {"native-only"},
+            },
+        )
 
 
 class PreTagReleaseBuildContractTests(unittest.TestCase):
@@ -1979,6 +2038,72 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         frontend_manifest = (REPO_ROOT / "frontend/Cargo.toml").read_text()
         devtools_source = (REPO_ROOT / "devtools-protocol/src/lib.rs").read_text()
         shell_lib = (REPO_ROOT / "frontend/tauri-shell/src/lib.rs").read_text()
+        dependency_tables = parse_cargo_dependency_tables(shell_manifest)
+        native_audio_dependencies = {"cpal", "opus", "webrtc-audio-processing"}
+        non_windows_dependencies = (
+            "target",
+            'cfg(not(target_os = "windows"))',
+            "dependencies",
+        )
+        self.assertTrue(
+            native_audio_dependencies
+            <= dependency_tables.get(non_windows_dependencies, set()),
+            "desktop native audio dependencies must be target-conditioned off Windows",
+        )
+        for table, dependencies in dependency_tables.items():
+            if table != non_windows_dependencies:
+                self.assertTrue(
+                    native_audio_dependencies.isdisjoint(dependencies),
+                    f"native audio dependencies escaped the non-Windows target table: {table}",
+                )
+        non_windows_cfg = r'#\[cfg\(not\(target_os = "windows"\)\)\]'
+        self.assertRegex(shell_lib, non_windows_cfg + r"\s*mod voice_media;")
+        self.assertRegex(
+            shell_lib,
+            non_windows_cfg
+            + r"\s*voice_media: voice_media::NativeVoiceMedia,",
+        )
+        for command in (
+            "voice_media_start",
+            "voice_media_push_output",
+            "voice_media_flush_output",
+            "voice_media_stop",
+        ):
+            self.assertRegex(
+                shell_lib,
+                non_windows_cfg
+                + r"\s*#\[tauri::command(?:\([^\n]*\))?\]\s*async fn "
+                + command,
+            )
+        self.assertRegex(
+            shell_lib,
+            non_windows_cfg
+            + r"\s*let voice_media =\s*voice_media::NativeVoiceMedia::new",
+        )
+        self.assertEqual(
+            len(re.findall(non_windows_cfg + r"\s*(?:let media_result|if let Err\(error\))", shell_lib)),
+            3,
+            "all native media teardown call sites must be absent on Windows",
+        )
+        self.assertEqual(
+            len(re.findall(non_windows_cfg + r"\s*if ", shell_router)),
+            3,
+            "router native-media authorization and teardown must be absent on Windows",
+        )
+        windows_handler = re.search(
+            r'#\[cfg\(target_os = "windows"\)\]\s*macro_rules! other_production_invoke_handler \{(.*?)\n\}',
+            shell_lib,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(windows_handler)
+        for command in (
+            "voice_media_start",
+            "voice_media_push_output",
+            "voice_media_flush_output",
+            "voice_media_stop",
+        ):
+            self.assertNotIn(command, windows_handler.group(1))
+        self.assertIn("voice_media_supported", windows_handler.group(1))
         removed_debug_feature = "voice-" + "debug-pipeline"
         manifest_paths = [REPO_ROOT / "Cargo.toml"]
         manifest_paths.extend(REPO_ROOT.glob("*/Cargo.toml"))

@@ -39,6 +39,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 server = { path = "../../server" }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 cpal = "0.15.3"
 opus = "0.3.1"
 webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }

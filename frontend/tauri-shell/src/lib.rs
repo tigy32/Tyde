@@ -8,6 +8,7 @@ mod host_uds;
 mod logging;
 mod remote_bootstrap;
 mod router;
+#[cfg(not(target_os = "windows"))]
 mod voice_media;
 
 use std::{
@@ -167,6 +168,7 @@ struct ShellState {
     host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
     web_content_recovery: Arc<Mutex<WebContentRecoveryPolicies>>,
+    #[cfg(not(target_os = "windows"))]
     voice_media: voice_media::NativeVoiceMedia,
 }
 
@@ -869,8 +871,10 @@ async fn disconnect_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
     let media_result = state.voice_media.stop_for_host(&host_id);
     let disconnect_result = state.router.disconnect(host_id).await;
+    #[cfg(not(target_os = "windows"))]
     media_result?;
     disconnect_result
 }
@@ -896,6 +900,7 @@ async fn send_host_frame(
     state.router.send_frame(host_id, envelope, binary)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn voice_media_start(
     app: tauri::AppHandle,
@@ -906,6 +911,7 @@ async fn voice_media_start(
     state.voice_media.start(app, host_id, generation)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command(rename_all = "camelCase")]
 async fn voice_media_push_output(
     state: tauri::State<'_, voice_media::NativeVoiceMedia>,
@@ -917,6 +923,7 @@ async fn voice_media_push_output(
     state.push_output(generation, media_seq, timestamp_samples_48k, opus)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn voice_media_flush_output(
     state: tauri::State<'_, ShellState>,
@@ -925,9 +932,37 @@ async fn voice_media_flush_output(
     state.voice_media.flush_output(generation)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn voice_media_stop(state: tauri::State<'_, ShellState>) -> Result<(), String> {
     state.voice_media.stop()
+}
+
+fn native_voice_supported(target_os: &str) -> bool {
+    target_os != "windows"
+}
+
+#[tauri::command]
+async fn voice_media_supported() -> Result<bool, String> {
+    Ok(native_voice_supported(std::env::consts::OS))
+}
+
+#[cfg(test)]
+mod native_voice_support_tests {
+    use super::native_voice_supported;
+
+    #[test]
+    fn native_voice_support_is_target_specific() {
+        for (target_os, expected) in [
+            ("windows", false),
+            ("macos", true),
+            ("linux", true),
+            ("ios", true),
+            ("android", true),
+        ] {
+            assert_eq!(native_voice_supported(target_os), expected, "{target_os}");
+        }
+    }
 }
 
 #[tauri::command]
@@ -989,8 +1024,10 @@ async fn remove_configured_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<ConfiguredHostStore, String> {
+    #[cfg(not(target_os = "windows"))]
     let media_result = state.voice_media.stop_for_host(&host_id);
     let _ = state.router.disconnect(host_id.clone()).await;
+    #[cfg(not(target_os = "windows"))]
     media_result?;
     state.host_store.remove(&host_id)
 }
@@ -1107,6 +1144,7 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn production_invoke_handler<R, F>(
     other_handler: F,
 ) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
@@ -1125,6 +1163,18 @@ where
     }
 }
 
+#[cfg(target_os = "windows")]
+fn production_invoke_handler<R, F>(
+    other_handler: F,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
+where
+    R: tauri::Runtime,
+    F: Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
+{
+    other_handler
+}
+
+#[cfg(not(target_os = "windows"))]
 macro_rules! other_production_invoke_handler {
     () => {
         tauri::generate_handler![
@@ -1135,6 +1185,33 @@ macro_rules! other_production_invoke_handler {
             voice_media_start,
             voice_media_flush_output,
             voice_media_stop,
+            voice_media_supported,
+            probe_configured_host_lifecycle,
+            ensure_configured_host_ready,
+            force_upgrade_managed_host,
+            list_configured_hosts,
+            upsert_configured_host,
+            remove_configured_host,
+            set_selected_host,
+            mark_ui_debug_ready,
+            mark_frontend_ready,
+            report_frontend_lifecycle,
+            submit_ui_debug_response,
+            submit_feedback,
+            open_external_url
+        ]
+    };
+}
+
+#[cfg(target_os = "windows")]
+macro_rules! other_production_invoke_handler {
+    () => {
+        tauri::generate_handler![
+            connect_host,
+            disconnect_host,
+            send_host_line,
+            send_host_frame,
+            voice_media_supported,
             probe_configured_host_lifecycle,
             ensure_configured_host_ready,
             force_upgrade_managed_host,
@@ -1374,8 +1451,10 @@ pub fn run() {
                 tracing::info!("dev host listener ready at {addr}");
             }
 
+            #[cfg(not(target_os = "windows"))]
             let voice_media =
                 voice_media::NativeVoiceMedia::new().map_err(std::io::Error::other)?;
+            #[cfg(not(target_os = "windows"))]
             app.manage(voice_media.clone());
             app.manage(ShellState {
                 router,
@@ -1383,6 +1462,7 @@ pub fn run() {
                 host_store,
                 ui_debug,
                 web_content_recovery: recovery_for_setup,
+                #[cfg(not(target_os = "windows"))]
                 voice_media,
             });
             Ok(())
@@ -1395,6 +1475,7 @@ pub fn run() {
 
     app.run(move |app, event| {
         if let RunEvent::ExitRequested { code, api, .. } = event {
+            #[cfg(not(target_os = "windows"))]
             if let Err(error) = app.state::<ShellState>().voice_media.stop() {
                 tracing::error!(%error, "native audio teardown was not acknowledged");
             }
@@ -1431,7 +1512,7 @@ pub fn run_host_bridge_uds() -> Result<(), String> {
     host_bridge_uds::run()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod voice_media_command_contract_tests {
     use super::*;
     use tauri::Manager;

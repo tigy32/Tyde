@@ -237,6 +237,13 @@ pub async fn voice_media_stop() -> Result<(), String> {
     Ok(())
 }
 
+pub async fn voice_media_supported() -> Result<bool, String> {
+    let value = tauri_invoke("voice_media_supported", JsValue::NULL)
+        .await
+        .map_err(|error| tauri_error_message("voice_media_supported", error))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
+}
+
 pub async fn ensure_configured_host_ready(
     host_id: String,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {

@@ -113,6 +113,7 @@ impl ProxyRouterHandle {
         if let Some(existing) = existing {
             tracing::info!(host_id, "replacing existing host connection");
             existing.live.store(false, Ordering::Relaxed);
+            #[cfg(not(target_os = "windows"))]
             if let Err(error) = app
                 .state::<crate::ShellState>()
                 .voice_media
@@ -349,6 +350,7 @@ async fn reader_task(
                         break;
                     }
                 };
+                #[cfg(not(target_os = "windows"))]
                 if frame.envelope.kind == protocol::FrameKind::VoiceAccepted
                     && let Ok(accepted) = frame
                         .envelope
@@ -464,6 +466,7 @@ async fn close_connection(
     };
 
     connection.live.store(false, Ordering::Relaxed);
+    #[cfg(not(target_os = "windows"))]
     if let Err(error) = app
         .state::<crate::ShellState>()
         .voice_media

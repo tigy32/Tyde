@@ -1213,6 +1213,14 @@ pub fn App() -> impl IntoView {
     #[cfg(target_arch = "wasm32")]
     state.install_browser_effects();
     provide_context(state.clone());
+    let voice_support_state = state.clone();
+    spawn_local(async move {
+        let supported = voice_support_after_probe(
+            voice_support_state.native_voice_supported.get_untracked(),
+            bridge::voice_media_supported().await,
+        );
+        voice_support_state.native_voice_supported.set(supported);
+    });
     // One measurement of the center workspace, shared by the center zone (which
     // measures it), the command palette, and the global shortcuts (which gate
     // split availability on it). The handle carries no signal of its own — it
@@ -1369,6 +1377,28 @@ pub fn App() -> impl IntoView {
             <HoverPopover />
             <crate::voice::VoiceOverlay />
         </div>
+    }
+}
+
+fn voice_support_after_probe(current: bool, probe: Result<bool, String>) -> bool {
+    match probe {
+        Ok(false) => false,
+        Ok(true) | Err(_) => current,
+    }
+}
+
+#[cfg(test)]
+mod native_voice_probe_tests {
+    use super::voice_support_after_probe;
+
+    #[test]
+    fn native_voice_probe_disables_only_on_explicit_false() {
+        assert!(!voice_support_after_probe(true, Ok(false)));
+        assert!(voice_support_after_probe(true, Ok(true)));
+        assert!(voice_support_after_probe(
+            true,
+            Err("no desktop host".into())
+        ));
     }
 }
 

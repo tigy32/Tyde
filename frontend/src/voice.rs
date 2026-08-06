@@ -135,8 +135,10 @@ fn voice_gate_state(
     target: TargetResolutionState,
     voice_enabled: bool,
     nova_available: bool,
+    native_voice_supported: bool,
 ) -> VoiceGateState {
-    let gate_available = target.target_resolvable && voice_enabled && nova_available;
+    let gate_available =
+        target.target_resolvable && voice_enabled && nova_available && native_voice_supported;
     VoiceGateState { gate_available }
 }
 
@@ -778,7 +780,7 @@ pub fn VoiceOverlay() -> impl IntoView {
         let (target_resolution, resolved_target) =
             target_with_resolution_tracked(&gate_state_source);
         let Some((host, _)) = resolved_target else {
-            return voice_gate_state(target_resolution, false, false);
+            return voice_gate_state(target_resolution, false, false, false);
         };
         let voice_enabled = gate_state_source
             .host_settings_by_host
@@ -792,6 +794,7 @@ pub fn VoiceOverlay() -> impl IntoView {
             capability
                 .as_ref()
                 .is_some_and(|value| value.nova_available),
+            gate_state_source.native_voice_supported.get(),
         )
     });
     let available = Memo::new(move |_| gate.get().gate_available);
@@ -869,11 +872,12 @@ mod gate_tests {
     fn voice_gate_reports_each_false_conjunct_and_available() {
         let unresolved = target_resolution_state(false, false, false, false);
         let resolved = target_resolution_state(true, true, true, false);
-        assert!(!voice_gate_state(unresolved, true, true).gate_available);
-        assert!(!voice_gate_state(resolved, false, true).gate_available);
-        assert!(!voice_gate_state(resolved, true, false).gate_available);
+        assert!(!voice_gate_state(unresolved, true, true, true).gate_available);
+        assert!(!voice_gate_state(resolved, false, true, true).gate_available);
+        assert!(!voice_gate_state(resolved, true, false, true).gate_available);
+        assert!(!voice_gate_state(resolved, true, true, false).gate_available);
         assert_eq!(
-            voice_gate_state(resolved, true, true),
+            voice_gate_state(resolved, true, true, true),
             VoiceGateState {
                 gate_available: true,
             }
@@ -1569,6 +1573,24 @@ mod wasm_tests {
         next_tick().await;
 
         state.agents.update(|agents| agents[0].started = true);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-testid='voice-strip'] .voice-icon")
+                .unwrap()
+                .is_some()
+        );
+
+        state.native_voice_supported.set(false);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-testid='voice-strip']")
+                .unwrap()
+                .is_none()
+        );
+
+        state.native_voice_supported.set(true);
         next_tick().await;
         assert!(
             container
