@@ -319,30 +319,6 @@ pub fn ChatView(
     let agent_backend =
         move || -> Option<BackendKind> { current_agent.get().map(|a| a.backend_kind) };
 
-    let current_context_usage: Signal<Option<protocol::CurrentContextUsage>> =
-        Signal::derive(move || {
-            let active = agent_ref.get()?;
-            if !current_agent
-                .get()
-                .is_some_and(|agent| agent.backend_kind == BackendKind::Codex)
-            {
-                return None;
-            }
-            Some(
-                state
-                    .agent_activity_stats
-                    .with(|stats| {
-                        stats
-                            .get(&crate::state::ActiveAgentRef {
-                                host_id: active.host_id,
-                                agent_id: active.agent_id,
-                            })
-                            .and_then(|stats| stats.current_context_usage.clone())
-                    })
-                    .unwrap_or(protocol::CurrentContextUsage::Unknown),
-            )
-        });
-
     let context_breakdown: Memo<Option<protocol::ContextBreakdown>> = Memo::new(move |_| {
         let active = agent_ref.get()?;
         if current_agent
@@ -382,6 +358,60 @@ pub fn ChatView(
             None
         })
     });
+
+    // Has this session ever reported its context occupancy? A session that
+    // reported one and now doesn't has a *gap* worth naming: the reader had a
+    // figure a moment ago and it went missing. A session that has never
+    // reported one has nothing to be unavailable about, and must not grow a
+    // context panel whose only content would be the word "Unavailable".
+    let context_was_ever_reported = Memo::new(move |_| {
+        let Some(active) = agent_ref.get() else {
+            return false;
+        };
+        state.chat_rows.with(|rows_by_agent| {
+            rows_by_agent.get(&active.agent_id).is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row.message_entry()
+                        .is_some_and(|entry| entry.get().message.context_breakdown.is_some())
+                })
+            })
+        })
+    });
+
+    let current_context_usage: Signal<Option<protocol::CurrentContextUsage>> =
+        Signal::derive(move || {
+            let active = agent_ref.get()?;
+            if current_agent
+                .get()
+                .is_some_and(|agent| agent.backend_kind == BackendKind::Codex)
+            {
+                return Some(
+                    state
+                        .agent_activity_stats
+                        .with(|stats| {
+                            stats
+                                .get(&crate::state::ActiveAgentRef {
+                                    host_id: active.host_id,
+                                    agent_id: active.agent_id,
+                                })
+                                .and_then(|stats| stats.current_context_usage.clone())
+                        })
+                        .unwrap_or(protocol::CurrentContextUsage::Unknown),
+                );
+            }
+
+            // Backends that report occupancy per message have ordinary gaps —
+            // an interrupted turn, a phase emitted without usage. Report the
+            // gap as `Unknown`, the same as Codex does, rather than as "this
+            // agent has no context": the latter unmounts the whole summary
+            // panel, taking the control that switches back to it along with
+            // it. A session that never reported occupancy has no gap to
+            // report, so it stays silent.
+            if context_breakdown.get().is_none() && context_was_ever_reported.get() {
+                return Some(protocol::CurrentContextUsage::Unknown);
+            }
+            None
+        });
 
     let agent_initializing = move || -> bool {
         current_agent
@@ -3139,6 +3169,81 @@ mod wasm_tests {
             next_tick().await;
             assert_constructor_only_terminal_render(&container, phase);
         }
+        drop(handle);
+        container.remove();
+    }
+
+    /// A reported-then-missing context keeps its panel, and says so.
+    ///
+    /// The regression: only the terminal message of a turn carries a
+    /// breakdown, so a later assistant message without one made the derivation
+    /// report "this agent has no context". That unmounted the whole summary
+    /// panel — and with it the only control that switches back to the context
+    /// view — leaving a reader stranded on the task list. A gap is `Unknown`,
+    /// not absence. Contrast `constructor_only_terminal_replay_has_no_task_panel`,
+    /// where occupancy was never reported and the panel must stay hidden.
+    #[wasm_bindgen_test]
+    async fn a_context_gap_keeps_the_panel_and_names_itself() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let agent_id = AgentId("claude-context-gap".to_owned());
+        let agent_id_for_mount = agent_id.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut agent = make_target_agent("tycode-render-host", &agent_id_for_mount.0, None);
+            agent.backend_kind = BackendKind::Claude;
+            state.agents.set(vec![agent]);
+            // A turn that reported occupancy, then a later message that did
+            // not — exactly what a multi-phase Claude turn emits.
+            let mut reported = tycode_terminal_message();
+            reported.context_breakdown = Some(protocol::ContextBreakdown {
+                system_prompt_bytes: 400,
+                tool_io_bytes: 0,
+                conversation_history_bytes: 0,
+                reasoning_bytes: 0,
+                context_injection_bytes: 0,
+                input_tokens: 4_000,
+                context_window: 200_000,
+            });
+            state.chat_rows.update(|rows| {
+                rows.insert(
+                    agent_id_for_mount.clone(),
+                    vec![
+                        crate::state::ChatRowHandle::new(ChatMessageEntry {
+                            message: reported,
+                            tool_requests: Vec::new(),
+                        }),
+                        tycode_terminal_row(),
+                    ],
+                );
+            });
+            provide_context(state);
+            let bound = ActiveAgentRef {
+                host_id: "tycode-render-host".to_owned(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active = Signal::derive(|| false);
+            view! { <ChatView tab_id=TabId(27_013) agent_ref=agent_ref is_active=is_active /> }
+        });
+        next_tick().await;
+
+        let panel = query(&container, ".task-list-panel").expect("task panel shell");
+        assert!(
+            !panel
+                .get_attribute("class")
+                .is_some_and(|classes| classes.split_whitespace().any(|class| class == "hidden")),
+            "a gap in reported occupancy must not unmount the summary panel"
+        );
+        let context_text = query(&container, ".summary-context-view")
+            .expect("context panel")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            context_text.contains("Unavailable"),
+            "a gap must name itself rather than draw an empty bar; got {context_text:?}"
+        );
+
         drop(handle);
         container.remove();
     }

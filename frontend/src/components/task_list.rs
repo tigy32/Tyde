@@ -20,9 +20,9 @@ struct ContextCategory {
 
 struct TaskViewContext {
     breakdown: Option<ContextBreakdown>,
-    is_unknown: bool,
+    is_unavailable: bool,
     is_available: bool,
-    preferred_view: RwSignal<SummaryView>,
+    preferred_view: RwSignal<Option<SummaryView>>,
     panel_id: String,
 }
 
@@ -33,7 +33,10 @@ pub fn TaskListView(
     context_breakdown: Memo<Option<ContextBreakdown>>,
     current_context_usage: Signal<Option<CurrentContextUsage>>,
 ) -> impl IntoView {
-    let preferred_view = RwSignal::new(SummaryView::Context);
+    // `None` is "the user has not chosen", not "Context". The distinction is
+    // the whole point: an unchosen view may follow what data exists, a chosen
+    // one may not be taken away from the user by arriving or departing data.
+    let preferred_view = RwSignal::new(None::<SummaryView>);
     let collapsed = RwSignal::new(false);
     let last_agent_id = RwSignal::new(agent_id.get_untracked());
     let summary_id = NEXT_SUMMARY_ID.fetch_add(1, Ordering::Relaxed);
@@ -58,7 +61,7 @@ pub fn TaskListView(
         let current_agent_id = agent_id.get();
         if current_agent_id != last_agent_id.get_untracked() {
             last_agent_id.set(current_agent_id);
-            preferred_view.set(SummaryView::Context);
+            preferred_view.set(None);
             collapsed.set(false);
         }
     });
@@ -73,11 +76,20 @@ pub fn TaskListView(
                 let has_tasks_now = has_tasks.get();
                 let preferred = preferred_view.get();
                 let view_mode = match preferred {
-                    SummaryView::Context if has_context_now => SummaryView::Context,
-                    SummaryView::Tasks if has_tasks_now => SummaryView::Tasks,
-                    SummaryView::Context if has_tasks_now => SummaryView::Tasks,
-                    SummaryView::Tasks if has_context_now => SummaryView::Context,
-                    _ => preferred,
+                    // A context reader stays a context reader. Occupancy that
+                    // stops being reported mid-session is a gap in the data,
+                    // not a request to go read the task list — and because the
+                    // control that switches back lives *inside* the context
+                    // view, flipping away on a data gap stranded the user with
+                    // no way back at all.
+                    Some(SummaryView::Context) => SummaryView::Context,
+                    Some(SummaryView::Tasks) if has_tasks_now => SummaryView::Tasks,
+                    Some(SummaryView::Tasks) => SummaryView::Context,
+                    // Unchosen: open on whichever view can actually say
+                    // something, preferring context.
+                    None if has_context_now => SummaryView::Context,
+                    None if has_tasks_now => SummaryView::Tasks,
+                    None => SummaryView::Context,
                 };
 
                 let task_list_now = task_list.get();
@@ -87,15 +99,11 @@ pub fn TaskListView(
                     current_context_usage_now.as_ref(),
                     context_breakdown_now.as_ref(),
                 ).filter(|_| has_context_now);
-                let context_is_unknown = matches!(
-                    current_context_usage_now,
-                    Some(CurrentContextUsage::Unknown)
-                );
+                let context_is_unavailable = breakdown.is_none();
 
                 view! {
                     <div class="summary-panel">
                         {render_context_view(
-                            current_context_usage_now.clone().filter(|_| has_context_now),
                             breakdown.clone(),
                             task_list_now.clone().filter(|tasks| !tasks.tasks.is_empty()),
                             preferred_view,
@@ -113,7 +121,7 @@ pub fn TaskListView(
                                     view_mode != SummaryView::Tasks,
                                     TaskViewContext {
                                         breakdown,
-                                        is_unknown: context_is_unknown,
+                                        is_unavailable: context_is_unavailable,
                                         is_available: has_context_now,
                                         preferred_view,
                                         panel_id: context_panel_id.clone(),
@@ -133,17 +141,21 @@ pub fn TaskListView(
 }
 
 fn render_context_view(
-    current_context_usage: Option<CurrentContextUsage>,
     breakdown: Option<ContextBreakdown>,
     task_list: Option<TaskList>,
-    preferred_view: RwSignal<SummaryView>,
+    preferred_view: RwSignal<Option<SummaryView>>,
     panel_id: String,
     tasks_panel_id: String,
     hidden: bool,
 ) -> impl IntoView {
     let metrics = breakdown.as_ref().map(compute_context_metrics);
     let has_detailed_breakdown = breakdown.as_ref().is_some_and(has_detailed_breakdown);
-    let context_is_unknown = matches!(current_context_usage, Some(CurrentContextUsage::Unknown));
+    // Unavailable covers every reason the panel has no figure to draw: the
+    // backend reported `Unknown`, or no request has reported occupancy yet.
+    // Since the view now stays put when the user pinned it, this panel can be
+    // the visible one with nothing to show, and an empty bar with no figure
+    // beside it reads as "the context is empty" — the opposite of the truth.
+    let context_is_unavailable = metrics.is_none();
 
     view! {
         <div
@@ -183,7 +195,7 @@ fn render_context_view(
                             </span>
                         }
                     })}
-                    {context_is_unknown.then(|| {
+                    {context_is_unavailable.then(|| {
                         view! {
                             <span
                                 class="summary-context-usage context-unknown"
@@ -195,7 +207,7 @@ fn render_context_view(
                     })}
                 </div>
                 <div
-                    class=if context_is_unknown {
+                    class=if context_is_unavailable {
                         "summary-context-bar context-unknown"
                     } else {
                         "summary-context-bar"
@@ -205,7 +217,7 @@ fn render_context_view(
                     aria-label="Context utilization"
                     aria-valuemin="0"
                     aria-valuemax="100"
-                    aria-valuenow=(!context_is_unknown).then(|| {
+                    aria-valuenow=(!context_is_unavailable).then(|| {
                         metrics
                             .as_ref()
                             .map(|m| format!("{}", m.utilization_pct.round() as i32))
@@ -253,7 +265,7 @@ fn render_context_view(
                                 class="context-task-hint"
                                 data-summary-action="tasks"
                                 aria-controls=tasks_panel_id
-                                on:click=move |_| preferred_view.set(SummaryView::Tasks)
+                                on:click=move |_| preferred_view.set(Some(SummaryView::Tasks))
                             >
                                 {build_task_hint_text(&tasks.tasks)}
                             </button>
@@ -361,7 +373,7 @@ fn render_task_view(
             {context.is_available.then(|| view! {
                 <button
                     type="button"
-                    class=if context.is_unknown {
+                    class=if context.is_unavailable {
                         "context-mini-bar context-unknown"
                     } else {
                         "context-mini-bar"
@@ -369,7 +381,7 @@ fn render_task_view(
                     data-summary-action="context"
                     aria-label="View current context"
                     aria-controls=context.panel_id
-                    on:click=move |_| context.preferred_view.set(SummaryView::Context)
+                    on:click=move |_| context.preferred_view.set(Some(SummaryView::Context))
                 >
                     {metrics.as_ref().map(|m| {
                         m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
@@ -1128,6 +1140,54 @@ mod wasm_tests {
                 .text_content()
                 .unwrap_or_default()
                 .contains("Task after gap")
+        );
+    }
+
+    /// A context gap must never move a reader who chose the context view.
+    ///
+    /// The regression this pins: occupancy stopped being reported mid-session,
+    /// the panel silently swapped itself to the task list, and because the
+    /// control that switches back lives inside the context view, there was no
+    /// control left anywhere to undo it.
+    #[wasm_bindgen_test]
+    async fn a_context_gap_never_moves_a_chosen_context_view() {
+        let container = make_container();
+        let slots = Rc::new(RefCell::new(None));
+        let _handle = mount_summary(&container, slots.clone());
+        next_tick().await;
+        button(&container, "[data-summary-action='tasks']").click();
+        next_tick().await;
+        button(&container, "[data-summary-action='context']").click();
+        next_tick().await;
+        assert!(panel_is_active(&container, ".summary-context-view"));
+
+        signals(&slots).breakdown.set(None);
+        next_tick().await;
+
+        assert!(
+            panel_is_active(&container, ".summary-context-view"),
+            "a chosen context view must survive a gap in reported occupancy"
+        );
+        assert!(
+            !panel_is_active(&container, ".summary-task-view"),
+            "a data gap must not hand the panel to the task list unasked"
+        );
+        let context_text = container
+            .query_selector(".summary-context-view")
+            .unwrap()
+            .expect("mounted context panel")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            context_text.contains("Unavailable"),
+            "a context view with no figure must say so, not draw an empty bar; got {context_text:?}"
+        );
+        assert!(
+            container
+                .query_selector("[data-summary-action='tasks']")
+                .unwrap()
+                .is_some(),
+            "the chosen view must keep its control back to the task list"
         );
     }
 
