@@ -533,4 +533,143 @@ mod tests {
                 .contains("64 KiB")
         );
     }
+
+    // ------------------------------------------------------------------
+    // Handshake wire-compatibility guards.
+    //
+    // The `hello` -> `welcome`/`reject` exchange is not just a handshake: it
+    // is the ONLY cross-version negotiation surface between a Tyde host and
+    // a mobile/web client. The mobile loader ships every published bundle
+    // version and relies on `RejectPayload::release_version` (delivered over
+    // this framing) to reboot into the bundle matching the host — see
+    // `apply_reject` in mobile-frontend/src/dispatch.rs and `onRepairVersion`
+    // in web/loader/loader.js.
+    //
+    // That means records produced by TODAY's writer must remain readable by
+    // every FUTURE reader: a peer one version ahead or behind must still be
+    // able to complete hello -> reject to learn the other side's version.
+    // When the line-delimited JSON framing was replaced with TYD2 records
+    // (beta.52) without a compatibility bridge, mismatched pairs could not
+    // exchange the reject and wedged forever on "Loading host…"
+    // (2026-08-06 incident).
+    //
+    // These tests pin literal v1 record bytes. If a framing change breaks
+    // them, DO NOT regenerate the golden bytes to make them pass: keep the
+    // reader able to decode v1 records (and answer with a v1-framed reject)
+    // alongside the new format, then add NEW golden bytes for the new
+    // format. See AGENTS.md ("Frontend UI tests are load-bearing") — the
+    // same policy applies here.
+    // ------------------------------------------------------------------
+
+    /// A `hello` envelope encoded as a v1 TYD2 JSON record, byte-for-byte as
+    /// a beta.51-era peer would produce it (fixed header + JSON envelope,
+    /// empty body).
+    const GOLDEN_V1_HELLO_RECORD: &str = "5459443201010000000000d1000000007046c4a37b2273747265616d223a222f\
+         686f73742f31663064356333612d396232652d346334372d386134352d366131\
+         633262336434653566222c226b696e64223a2268656c6c6f222c22736571223a\
+         302c227061796c6f6164223a7b2270726f746f636f6c5f76657273696f6e223a\
+         34352c22747964655f76657273696f6e223a7b226d616a6f72223a302c226d69\
+         6e6f72223a382c227061746368223a31397d2c22636c69656e745f6e616d6522\
+         3a22747964652d6d6f62696c652d776562222c22706c6174666f726d223a2277\
+         6562227d7d";
+
+    /// A version-mismatch `reject` envelope encoded as a v1 TYD2 JSON
+    /// record, carrying the `release_version` a rejected client uses to
+    /// self-heal into the host's published bundle.
+    const GOLDEN_V1_REJECT_RECORD: &str = "545944320101000000000131000000008194d5097b2273747265616d223a222f\
+         686f73742f31663064356333612d396232652d346334372d386134352d366131\
+         633262336434653566222c226b696e64223a2272656a656374222c2273657122\
+         3a302c227061796c6f6164223a7b22636f6465223a22696e636f6d7061746962\
+         6c655f70726f746f636f6c222c226d657373616765223a227365727665722072\
+         657175697265732070726f746f636f6c2076657273696f6e2034372c20636c69\
+         656e742073656e74203435222c227365727665725f70726f746f636f6c5f7665\
+         7273696f6e223a34372c227365727665725f747964655f76657273696f6e223a\
+         7b226d616a6f72223a302c226d696e6f72223a382c227061746368223a31397d\
+         2c2272656c656173655f76657273696f6e223a22302e382e31392d626574612e\
+         3535227d7d";
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        let compact: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        compact
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .expect("golden constant is valid hex")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn golden_v1_hello_record_remains_readable() {
+        let bytes = decode_hex(GOLDEN_V1_HELLO_RECORD);
+        let envelope = read_envelope(&mut bytes.as_slice())
+            .await
+            .expect("a v1 hello record must stay decodable by every future reader")
+            .expect("golden record holds one envelope");
+        assert_eq!(envelope.kind, FrameKind::Hello);
+        assert_eq!(
+            envelope.stream,
+            StreamPath("/host/1f0d5c3a-9b2e-4c47-8a45-6a1c2b3d4e5f".into())
+        );
+        assert_eq!(envelope.seq, 0);
+        let hello: crate::HelloPayload = envelope
+            .parse_payload()
+            .expect("v1 hello payload must keep parsing");
+        assert_eq!(hello.protocol_version, 45);
+        assert_eq!(hello.client_name, "tyde-mobile-web");
+        assert_eq!(hello.platform, "web");
+    }
+
+    #[tokio::test]
+    async fn golden_v1_reject_record_remains_readable() {
+        let bytes = decode_hex(GOLDEN_V1_REJECT_RECORD);
+        let envelope = read_envelope(&mut bytes.as_slice())
+            .await
+            .expect("a v1 reject record must stay decodable by every future reader")
+            .expect("golden record holds one envelope");
+        assert_eq!(envelope.kind, FrameKind::Reject);
+        let reject: crate::RejectPayload = envelope
+            .parse_payload()
+            .expect("v1 reject payload must keep parsing");
+        assert_eq!(reject.code, crate::RejectCode::IncompatibleProtocol);
+        assert_eq!(reject.server_protocol_version, 47);
+        // The self-heal key: a client that cannot speak this host's protocol
+        // learns which published bundle to boot from this field alone.
+        assert_eq!(
+            reject
+                .release_version
+                .expect("version-mismatch rejects must carry release_version")
+                .as_str(),
+            "0.8.19-beta.55"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_writer_still_emits_v1_records() {
+        let hello = Envelope {
+            stream: StreamPath("/host/writer-pin".into()),
+            kind: FrameKind::Hello,
+            seq: 0,
+            payload: serde_json::json!({"protocol_version": 45}),
+        };
+        let records = encode_frame(&ProtocolFrame::json(hello.clone()), 0).unwrap();
+        assert_eq!(records.len(), 1, "a hello must never fragment");
+        let bytes = &records[0].bytes;
+
+        // Pin the v1 fixed header layout a peer of any version depends on.
+        assert_eq!(&bytes[..4], &RECORD_MAGIC);
+        assert_eq!(bytes[4], RECORD_VERSION);
+        assert_eq!(bytes[5], RecordKind::Json as u8);
+        assert_eq!(&bytes[6..8], &[0, 0], "reserved flags must stay zero");
+        let header_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let body_len = u32::from_be_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(body_len, 0);
+        assert_eq!(bytes.len(), FIXED_HEADER_LEN + header_len);
+        let checksum = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        assert_eq!(checksum, crc32(&[&bytes[FIXED_HEADER_LEN..]]));
+
+        let decoded: Envelope = serde_json::from_slice(&bytes[FIXED_HEADER_LEN..]).unwrap();
+        assert_eq!(decoded, hello);
+    }
 }

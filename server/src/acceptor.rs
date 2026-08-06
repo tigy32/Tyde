@@ -305,6 +305,96 @@ impl Drop for UdsPathCleanup {
     }
 }
 
+#[cfg(test)]
+mod handshake_contract_tests {
+    use super::{HandshakeError, accept};
+    use crate::ServerConfig;
+    use protocol::{
+        Envelope, FrameKind, HelloPayload, RejectCode, RejectPayload, StreamPath, Version,
+        read_envelope, write_envelope,
+    };
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // The hello -> reject exchange is the only way a version-mismatched
+    // mobile/web client learns which host version it is talking to: the
+    // reject's `release_version` drives the PWA loader's self-heal reboot
+    // into the host's published bundle (mobile-frontend `apply_reject`,
+    // web/loader `onRepairVersion`). This test pins that contract at the
+    // `accept()` level: a mismatched hello must be ANSWERED with a parseable
+    // reject carrying the host release version — promptly, never left to
+    // hang. When the beta.52 framing change silently broke this exchange
+    // between adjacent versions, mismatched pairs wedged forever on
+    // "Loading host…" (2026-08-06 incident). If this test fails, restore the
+    // answer path; do not relax the assertions.
+    #[tokio::test]
+    async fn version_mismatch_is_answered_with_a_reject_carrying_release_version() {
+        crate::set_host_release_version("0.8.19-beta.55");
+
+        let tyde_version = Version {
+            major: 0,
+            minor: 8,
+            patch: 19,
+        };
+        let config = ServerConfig {
+            protocol_version: 47,
+            tyde_version,
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move { accept(&config, server).await });
+
+        let hello = HelloPayload {
+            protocol_version: 45,
+            tyde_version,
+            client_name: "handshake-contract-test".to_owned(),
+            platform: "test".to_owned(),
+        };
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/11111111-1111-1111-1111-111111111111".into()),
+            FrameKind::Hello,
+            0,
+            &hello,
+        )
+        .unwrap();
+
+        let exchange = async {
+            write_envelope(&mut client, &envelope).await.unwrap();
+            read_envelope(&mut client)
+                .await
+                .expect("the reject must arrive in a framing this client can decode")
+                .expect("host must answer a mismatched hello, not close silently")
+        };
+        let reject = timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("a version-mismatched hello must be answered, never left to hang");
+
+        assert_eq!(reject.kind, FrameKind::Reject);
+        let payload: RejectPayload = reject.parse_payload().unwrap();
+        assert_eq!(payload.code, RejectCode::IncompatibleProtocol);
+        assert_eq!(payload.server_protocol_version, 47);
+        let advertised = payload
+            .release_version
+            .expect("version-mismatch rejects must carry the host release version");
+        assert_eq!(
+            advertised,
+            crate::host_release_version().expect("recorded above"),
+            "the reject must advertise the recorded host release version"
+        );
+
+        let error = server_task
+            .await
+            .unwrap()
+            .expect_err("accept must fail after rejecting a mismatched client");
+        assert!(matches!(
+            error,
+            HandshakeError::IncompatibleProtocol {
+                client: 45,
+                server: 47
+            }
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::bind_uds;
