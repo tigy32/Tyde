@@ -17,6 +17,10 @@ const html = readFileSync(
   fileURLToPath(new URL("../index.html", import.meta.url)),
   "utf8",
 );
+const standaloneMobileHtml = readFileSync(
+  fileURLToPath(new URL("../../../mobile-frontend/index.html", import.meta.url)),
+  "utf8",
+);
 const loaderJs = readFileSync(
   fileURLToPath(new URL("../loader.js", import.meta.url)),
   "utf8",
@@ -33,6 +37,23 @@ const cloudfrontSetup = readFileSync(
   fileURLToPath(new URL("../../deploy/cloudfront-setup.md", import.meta.url)),
   "utf8",
 );
+
+test("both mobile entrypoints resize layout for the keyboard", () => {
+  for (const [entrypoint, source] of [
+    ["deployed loader", html],
+    ["standalone mobile app", standaloneMobileHtml],
+  ]) {
+    const viewport = source.match(
+      /<meta\s+name="viewport"\s+content="([^"]+)"\s*\/>/,
+    );
+    assert.ok(viewport, `${entrypoint} must declare its viewport policy`);
+    assert.match(
+      viewport[1],
+      /(?:^|,\s*)interactive-widget=resizes-content(?:\s*,|$)/,
+      `${entrypoint} must shrink the layout viewport when the keyboard opens`,
+    );
+  }
+});
 
 test("index.html has BOTH a loader shell and a distinct app mount target", () => {
   assert.match(html, /id="loader-shell"/, "expected the loader chrome container");
