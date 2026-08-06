@@ -628,7 +628,7 @@ fn main() -> Result<()> {
         .cpp(true)
         .file("src/wrapper.cpp")
         .includes(&include_dirs)
-        .flag("-std=c++17")
+        .std(build_support::wrapper_cpp_standard(&target))
         .flag("-Wno-unused-parameter")
         .out_dir(out_dir());
 

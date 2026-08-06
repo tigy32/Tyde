@@ -503,6 +503,8 @@ def native_voice_vendor_surface_violations(
         production_specs.count('OsString::from("--wrap-mode=nodownload")') != 1
         or production_specs.count(force_fallback_literal) != 1
         or "pub(crate) fn meson_spec(" not in production_specs
+        or production_specs.count('OsString::from("-Dcpp_std=c++20")') != 1
+        or "pub(crate) fn wrapper_cpp_standard(" not in production_specs
         or "pub(crate) fn ninja_spec(" not in production_specs
         or "pub(crate) fn symbol_list_spec(" not in production_specs
         or "pub(crate) fn symbol_prefix_spec(" not in production_specs
@@ -524,6 +526,13 @@ def native_voice_vendor_surface_violations(
         or 'Command::new("nm")' in build_script
         or "required Rust LLVM archive/symbol tools are unavailable" not in build_script
         or 'BUNDLED_ABSEIL_LINK_LIBRARIES: [&str; 1] = ["absl_strings"]' not in build_script
+        or build_script.count(
+            ".std(build_support::wrapper_cpp_standard(&target))"
+        ) != 1
+        or '.flag("-std=' in build_script
+        or build_script.count(
+            '.clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])'
+        ) != 1
         or 'cargo:rustc-link-lib=absl_strings' in build_script
         or "static:-bundle" in build_script + production_specs
         or "prefix_archive_symbols(&archive.source" in build_script
@@ -1009,6 +1018,22 @@ class NativeBuildToolsContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_specs.count(f'"{NATIVE_VOICE_ABSEIL_FORCE_FALLBACK}"'), 1
+        )
+        self.assertEqual(
+            production_specs.count('OsString::from("-Dcpp_std=c++20")'), 1
+        )
+        self.assertEqual(
+            build_script.count(
+                ".std(build_support::wrapper_cpp_standard(&target))"
+            ),
+            1,
+        )
+        self.assertNotIn('.flag("-std=', build_script)
+        self.assertEqual(
+            build_script.count(
+                '.clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])'
+            ),
+            1,
         )
         self.assertNotIn('Command::new("meson")', build_script + build_support)
         self.assertNotIn('Command::new("ninja")', build_script + build_support)

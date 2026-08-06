@@ -57,6 +57,14 @@ pub(crate) fn is_msvc_target(target: &str) -> bool {
     target.ends_with("-pc-windows-msvc")
 }
 
+pub(crate) fn wrapper_cpp_standard(target: &str) -> &'static str {
+    if is_msvc_target(target) {
+        "c++20"
+    } else {
+        "c++17"
+    }
+}
+
 pub(crate) fn bundled_library_candidates(target: &str, name: &str) -> Vec<String> {
     if is_msvc_target(target) {
         vec![format!("{name}.lib"), format!("lib{name}.a")]
@@ -445,6 +453,7 @@ pub(crate) fn meson_spec(
     let env = if let Some((native_file, env)) = msvc {
         args.push(OsString::from("--native-file"));
         args.push(native_file.as_os_str().to_owned());
+        args.push(OsString::from("-Dcpp_std=c++20"));
         env.to_vec()
     } else {
         Vec::new()
@@ -561,6 +570,22 @@ mod tests {
         assert!(spec.args.windows(2).any(|args| {
             args[0] == OsStr::new("--native-file") && args[1] == OsStr::new("C:/out/msvc.ini")
         }));
+        assert_eq!(
+            spec.args,
+            os(&[
+                "setup",
+                "--wrap-mode=nodownload",
+                "--force-fallback-for=absl_base,absl_flags,absl_strings,absl_numeric,absl_synchronization,absl_bad_optional_access",
+                "--prefix",
+                "C:/out",
+                "--native-file",
+                "C:/out/msvc.ini",
+                "-Dcpp_std=c++20",
+                "-Ddefault_library=static",
+                "C:/out/build",
+                "C:/out/source",
+            ])
+        );
         assert_eq!(spec.current_dir, None);
 
         let build = ninja_spec(Path::new("C:/out/build"), false, Some(&tools.env));
@@ -571,6 +596,14 @@ mod tests {
             build.env.last(),
             Some(&(OsString::from("CCACHE_DISABLE"), OsString::from("1")))
         );
+    }
+
+    #[test]
+    fn wrapper_cpp_standard_matches_target_meson_standard() {
+        assert_eq!(wrapper_cpp_standard("x86_64-pc-windows-msvc"), "c++20");
+        assert_eq!(wrapper_cpp_standard("aarch64-pc-windows-msvc"), "c++20");
+        assert_eq!(wrapper_cpp_standard("x86_64-unknown-linux-gnu"), "c++17");
+        assert_eq!(wrapper_cpp_standard("aarch64-apple-darwin"), "c++17");
     }
 
     #[test]

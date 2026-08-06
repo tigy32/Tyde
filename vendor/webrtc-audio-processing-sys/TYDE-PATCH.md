@@ -24,7 +24,14 @@ toolchain environment. `msvc_command_env` adds `CCACHE_DISABLE=1`, and both the
 Meson and Ninja specs inherit that complete environment. `msvc_native_file`
 generates a Meson native file containing the resolved compiler, linker, and
 librarian paths. Other targets receive the original Meson environment and
-arguments.
+arguments. The MSVC Meson spec also overrides the main project's C++ standard
+to C++20 because its WebRTC sources use designated initializers that MSVC
+rejects in C++17 mode. Meson's normal subproject option scoping remains intact;
+Unix and macOS retain their original C++17 Meson vectors. The production
+wrapper uses `cc::Build::std` with the matching target standard, which emits
+MSVC's `/std:c++20` rather than an ignored GCC-style flag while retaining C++17
+for Unix and macOS. Bindgen's distinct C ABI header parse remains at C++17
+because its input requires no C++20 syntax.
 
 The bundled library's symbols must still be prefixed on MSVC: the wrapper
 archive contains unresolved C++ references to those definitions, and both
@@ -106,4 +113,8 @@ nonzero child status is propagated. The normal workspace integration target
 `tests/tests/webrtc_build_support.rs` imports the
 production module so `./dev.sh check` executes its Meson, Ninja, MSVC
 environment, machine-file quoting, symbol-tool/artifact, owned-staging
-idempotency, Unix, and macOS contract tests.
+idempotency, Unix, and macOS contract tests. The MSVC test pins the target-only
+C++20 Meson option, the Unix and macOS tests pin their complete unchanged
+argument vectors, and the production wrapper-standard test pins C++20 for MSVC
+and C++17 elsewhere. The dev-check guard rejects a raw `-std=` wrapper flag and
+pins both the portable `cc::Build::std` selection and bindgen's C++17 parse.
