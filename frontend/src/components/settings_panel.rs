@@ -624,13 +624,17 @@ pub fn restore_appearance(state: &AppState) {
 enum SettingsTab {
     Hosts,
     Appearance,
-    General,
+    Display,
+    AiSummaries,
     Supervisor,
+    Subagents,
     Backends,
     CustomAgents,
     McpServers,
     Steering,
     Skills,
+    CodeIntelligence,
+    Voice,
     Mobile,
     Debug,
 }
@@ -649,31 +653,38 @@ impl SettingsTab {
         match self {
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
-            Self::General => "General",
+            Self::Display => "Code & Output Display",
+            Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
+            Self::Subagents => "Subagents",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
             Self::McpServers => "MCP Servers",
             Self::Steering => "Steering",
             Self::Skills => "Skills",
+            Self::CodeIntelligence => "Code Intelligence",
+            Self::Voice => "Voice",
             Self::Mobile => "Mobile",
             Self::Debug => "Debug",
         }
     }
 
-    /// Which host's settings this tab edits, if any. Every tab except the two
+    /// Which host's settings this tab edits, if any. Every tab except the
     /// device-local ones reads `selected_host_settings()`, so the scope bar has
     /// to say so.
     fn scope(self) -> SettingsScope {
         match self {
-            Self::Hosts | Self::Appearance => SettingsScope::Device,
-            Self::General
+            Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
+            Self::AiSummaries
             | Self::Supervisor
+            | Self::Subagents
             | Self::Backends
             | Self::CustomAgents
             | Self::McpServers
             | Self::Steering
             | Self::Skills
+            | Self::CodeIntelligence
+            | Self::Voice
             | Self::Mobile
             | Self::Debug => SettingsScope::Host,
         }
@@ -711,6 +722,14 @@ impl SettingsTab {
                 "Monospace",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
+            ],
+            Self::Display => &[
+                "Code & Output Display",
+                "Display",
+                "Syntax Theme",
+                "Syntax highlighting",
+                "Code blocks",
+                "File viewer",
                 "Diff Layout",
                 "Unified",
                 "Side by Side",
@@ -722,14 +741,49 @@ impl SettingsTab {
                 "Compact",
                 "Full",
             ],
-            Self::General => &[
-                "General",
-                "Auto-connect on Launch",
-                "Automatically connect to the host server when the application starts",
-                "Connection",
-                "Code intelligence",
+            Self::AiSummaries => &[
+                "AI Summaries",
+                "Auto-generate agent names",
+                "Agent activity summaries",
+                "Naming",
+                "Summarize",
+                "Background model call",
+                "Costs money",
+            ],
+            Self::Subagents => &[
+                "Subagents",
+                "Sub-agents",
+                "Tyde sub-agents",
+                "Spawn",
+                "Orchestrate",
+                "Agent control",
+                "Task complexity tiers",
+                "Low tier",
+                "High tier",
+                "Cheaper faster setup",
+                "Most capable setup",
+            ],
+            Self::CodeIntelligence => &[
+                "Code Intelligence",
+                "Language server",
+                "LSP",
                 "rust-analyzer binary path",
+                "Go to definition",
+                "Find references",
                 "custom toolchain",
+            ],
+            Self::Voice => &[
+                "Voice",
+                "Native voice",
+                "Amazon Nova Sonic",
+                "Nova Sonic model",
+                "Speech",
+                "Audio",
+                "Microphone",
+                "Talk",
+                "AWS profile",
+                "AWS region",
+                "Bedrock",
             ],
             Self::Supervisor => &[
                 "Supervisor",
@@ -820,6 +874,7 @@ impl SettingsTab {
                 "Metadata",
                 "QR",
                 "Pairing",
+                "Phone",
             ],
             Self::Debug => &[
                 "Debug",
@@ -843,33 +898,49 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 11] = [
+const ALL_TABS: [SettingsTab; 15] = [
     SettingsTab::Hosts,
     SettingsTab::Appearance,
-    SettingsTab::General,
+    SettingsTab::Display,
+    SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
+    SettingsTab::Subagents,
     SettingsTab::Backends,
     SettingsTab::CustomAgents,
     SettingsTab::McpServers,
     SettingsTab::Steering,
     SettingsTab::Skills,
+    SettingsTab::CodeIntelligence,
+    SettingsTab::Voice,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
 
 /// Device-local tabs, listed under the "This Device" sidebar group.
-const DEVICE_GROUP_TABS: [SettingsTab; 2] = [SettingsTab::Hosts, SettingsTab::Appearance];
+const DEVICE_GROUP_TABS: [SettingsTab; 3] = [
+    SettingsTab::Hosts,
+    SettingsTab::Appearance,
+    SettingsTab::Display,
+];
 
 /// Host-scoped tabs, listed under a sidebar group titled with the selected
 /// host. `SettingsTab::Backends` is deliberately absent: it renders as the
 /// stable "Overview" entry of the dedicated Backends group.
-const HOST_GROUP_TABS: [SettingsTab; 8] = [
-    SettingsTab::General,
+///
+/// Ordered so neighbouring entries answer neighbouring questions: what Tyde
+/// does on its own (summaries, supervisor, subagents), what an agent is given
+/// (custom agents, steering, skills, MCP), what the host machine can do (code
+/// intelligence, voice), then reach and diagnostics (mobile, debug).
+const HOST_GROUP_TABS: [SettingsTab; 11] = [
+    SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
+    SettingsTab::Subagents,
     SettingsTab::CustomAgents,
-    SettingsTab::McpServers,
     SettingsTab::Steering,
     SettingsTab::Skills,
+    SettingsTab::McpServers,
+    SettingsTab::CodeIntelligence,
+    SettingsTab::Voice,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
@@ -879,7 +950,7 @@ const HOST_GROUP_TABS: [SettingsTab; 8] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Tab(SettingsTab),
-    Complexity,
+    LaunchProfiles,
     Backend(BackendKind),
 }
 
@@ -888,7 +959,7 @@ impl SettingsPage {
         match self {
             Self::Tab(tab) => tab.scope(),
             // Both are derived from the selected host's server-owned catalog.
-            Self::Complexity | Self::Backend(_) => SettingsScope::Host,
+            Self::LaunchProfiles | Self::Backend(_) => SettingsScope::Host,
         }
     }
 }
@@ -1054,21 +1125,25 @@ pub fn SettingsPanel() -> impl IntoView {
                                 SettingsPage::Tab(tab) => match tab {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
-                                    SettingsTab::General => view! { <GeneralTab /> }.into_any(),
+                                    SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
+                                    SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
+                                    SettingsTab::Subagents => view! { <SubagentsTab /> }.into_any(),
                                     SettingsTab::Backends => view! { <BackendsTab active_page /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
                                     SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
                                     SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
+                                    SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
+                                    SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
                                     SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
                                     SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
                                 },
                                 SettingsPage::Backend(kind) => {
                                     view! { <BackendSettingsPage kind /> }.into_any()
                                 }
-                                SettingsPage::Complexity => {
-                                    view! { <TaskComplexityPage /> }.into_any()
+                                SettingsPage::LaunchProfiles => {
+                                    view! { <LaunchProfilesPage /> }.into_any()
                                 }
                             }}
                         </div>
@@ -1349,7 +1424,7 @@ fn BackendsNavGroup(
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
-            || complexity_page_matches_query(&query)
+            || launch_profiles_page_matches_query(&query)
             || schema_backends(&state)
                 .into_iter()
                 .any(|kind| backend_page_matches_query(&state, kind, &query))
@@ -1372,13 +1447,13 @@ fn BackendsNavGroup(
                             "Overview"
                         </button>
                     </Show>
-                    <Show when=move || complexity_page_matches_query(&search_query.get())>
+                    <Show when=move || launch_profiles_page_matches_query(&search_query.get())>
                         <button
                             class="settings-nav-item"
-                            class:active=move || active_page.get() == SettingsPage::Complexity
-                            on:click=move |_| active_page.set(SettingsPage::Complexity)
+                            class:active=move || active_page.get() == SettingsPage::LaunchProfiles
+                            on:click=move |_| active_page.set(SettingsPage::LaunchProfiles)
                         >
-                            "Task Complexity"
+                            "Launch Profiles"
                         </button>
                     </Show>
                     <BackendNavItems active_page search_query />
@@ -1894,24 +1969,16 @@ fn AppearanceTab() -> impl IntoView {
         apply_font_family(&key);
     };
 
-    let on_syntax_theme = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let el: web_sys::HtmlSelectElement = target.unchecked_into();
-        let name = el.value();
-        if crate::syntax_highlight::set_selected_theme(&name) {
-            state.syntax_theme.set(name.clone());
-            persist_syntax_theme(&name);
-        }
-    };
-
-    let syntax_themes: Vec<String> = crate::syntax_highlight::available_themes();
-
     view! {
         <h2 class="settings-panel-title">"Appearance"</h2>
 
+        <p class="settings-description settings-panel-intro">
+            "How the Tyde window itself looks: colors, text size, and whether the center area is tabbed. These are stored in this installation's local storage, so they follow the app on this machine and are the same no matter which host you are connected to."
+        </p>
+
         <div class="settings-field">
             <label class="settings-label">"Color Theme"</label>
-            <p class="settings-description">"Choose the color scheme for the interface."</p>
+            <p class="settings-description">"The color scheme for the whole interface. Changes apply immediately and are remembered the next time you open Tyde."</p>
             <div class="settings-segmented-control">
                 <button class=theme_class("dark") on:click=set_theme("dark")>"Dark"</button>
                 <button class=theme_class("light") on:click=set_theme("light")>"Light"</button>
@@ -1920,7 +1987,7 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Font Size"</label>
-            <p class="settings-description">"Adjust the base font size used throughout the interface."</p>
+            <p class="settings-description">"The base text size everything else scales from — chat, file contents, and panel labels all grow and shrink together. Raise it if you read Tyde from a distance; lower it to fit more of a long transcript on screen."</p>
             <div class="settings-inline-control">
                 <input
                     type="range"
@@ -1936,7 +2003,7 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Font Family"</label>
-            <p class="settings-description">"Select the font family for UI text."</p>
+            <p class="settings-description">"The typeface for interface text and chat prose. Code, diffs, and terminal output always use a monospace font regardless of this choice, so picking a proportional face here will not misalign a diff."</p>
             <select
                 class="settings-select"
                 prop:value=move || state.font_family.get()
@@ -1949,25 +2016,10 @@ fn AppearanceTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Syntax Theme"</label>
-            <p class="settings-description">"Color scheme for syntax highlighting in the file viewer, diff viewer, and chat code blocks. Reopen a file to see the change."</p>
-            <select
-                class="settings-select"
-                prop:value=move || state.syntax_theme.get()
-                on:change=on_syntax_theme
-            >
-                {syntax_themes.into_iter().map(|name| {
-                    let label = name.clone();
-                    view! { <option value=name>{label}</option> }
-                }).collect::<Vec<_>>()}
-            </select>
-        </div>
-
-        <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label">"Tab Bar"</label>
-                    <p class="settings-description">"Show a tab bar for managing multiple open views. When disabled, the center zone shows one view at a time."</p>
+                    <p class="settings-description">"Show a tab bar across the top of the center zone so several chats, files, and diffs can stay open at once and you can switch between them. When off, the center zone shows a single view and opening something new replaces what was there."</p>
                 </div>
                 <label class="settings-toggle">
                     <input
@@ -1987,10 +2039,55 @@ fn AppearanceTab() -> impl IntoView {
                 </label>
             </div>
         </div>
+    }
+}
+
+/// How code, diffs, and tool output are rendered. Split out of
+/// [`AppearanceTab`] because these are reading-defaults for content an agent
+/// produced, not chrome: the questions they answer ("how much of this diff do I
+/// want to see?") are asked at a different time than "what font do I like?".
+/// Every value here is device-local and persisted through `local_storage`.
+#[component]
+fn DisplayTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let on_syntax_theme = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let el: web_sys::HtmlSelectElement = target.unchecked_into();
+        let name = el.value();
+        if crate::syntax_highlight::set_selected_theme(&name) {
+            state.syntax_theme.set(name.clone());
+            persist_syntax_theme(&name);
+        }
+    };
+
+    let syntax_themes: Vec<String> = crate::syntax_highlight::available_themes();
+
+    view! {
+        <h2 class="settings-panel-title">"Code & Output Display"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "Defaults for how Tyde renders the things agents produce: source files, diffs, and tool results. These are starting points, not locks — an individual diff or tool card can still be expanded in place. Like Appearance, they are stored on this device and apply to every host."
+        </p>
+
+        <div class="settings-field">
+            <label class="settings-label">"Syntax Theme"</label>
+            <p class="settings-description">"The palette used to color code in the file viewer, the diff viewer, and code blocks inside chat. This is independent of the interface Color Theme, so you can run a light UI with a dark code palette or the reverse. Already-open files keep their old colors until you reopen them."</p>
+            <select
+                class="settings-select"
+                prop:value=move || state.syntax_theme.get()
+                on:change=on_syntax_theme
+            >
+                {syntax_themes.into_iter().map(|name| {
+                    let label = name.clone();
+                    view! { <option value=name>{label}</option> }
+                }).collect::<Vec<_>>()}
+            </select>
+        </div>
 
         <div class="settings-field">
             <label class="settings-label">"Diff Layout"</label>
-            <p class="settings-description">"Choose how git diffs are displayed: a single column (Unified) or side by side."</p>
+            <p class="settings-description">"How a diff is arranged. Unified stacks removals and additions in one column, which reads well in a narrow panel and for small edits. Side by Side puts the old file and the new file in parallel columns, which makes it far easier to see what a line was rewritten into — at the cost of horizontal room."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.diff_view_mode.get() == DiffViewMode::Unified { "segment active" } else { "segment" }
@@ -2011,7 +2108,7 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Diff Context"</label>
-            <p class="settings-description">"Show only changed hunks with surrounding context, or the full file."</p>
+            <p class="settings-description">"How much of the file surrounds a change. Hunks shows only the edited regions plus a few lines on either side, so a one-line fix in a large file stays one screen. Full File renders the entire file with the changes highlighted in place, which is slower on big files but the only way to judge an edit against code that did not change."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.diff_context_mode.get() == DiffContextMode::Hunks { "segment active" } else { "segment" }
@@ -2032,7 +2129,7 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Tool Output"</label>
-            <p class="settings-description">"Choose how much of each tool call is shown in chat: a header-only summary, a compact preview with caps, or the full output."</p>
+            <p class="settings-description">"How much of each tool call an agent makes is shown in the transcript. Summary prints just the header line — what ran, and whether it worked — which keeps a long agent session readable. Compact adds a short preview with a length cap. Full prints everything the tool returned, which is what you want when debugging why an agent drew the wrong conclusion, and overwhelming otherwise."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.tool_output_mode.get() == ToolOutputMode::Summary { "segment active" } else { "segment" }
@@ -2060,25 +2157,18 @@ fn AppearanceTab() -> impl IntoView {
     }
 }
 
+/// Language-server settings for the selected host. Previously a section on the
+/// old grab-bag "General" tab; promoted to its own page so additional language
+/// servers have somewhere to land.
 #[component]
-fn GeneralTab() -> impl IntoView {
+fn CodeIntelligenceTab() -> impl IntoView {
     view! {
-        <h2 class="settings-panel-title">"General"</h2>
+        <h2 class="settings-panel-title">"Code Intelligence"</h2>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Auto-connect on Launch"</label>
-                    <p class="settings-description">"Automatically connect to the host server when the application starts."</p>
-                </div>
-                <label class="settings-toggle">
-                    <input type="checkbox" checked=true disabled=true />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
+        <p class="settings-description settings-panel-intro">
+            "Tyde runs language servers on the host to power go-to-definition, find-references, hover types, and diagnostics in the file and diff viewers. A language server is found on the host's PATH automatically; the settings here are for telling Tyde where to look when that is not good enough."
+        </p>
 
-        <BackgroundAgentFeaturesSection />
         <CodeIntelSettingsSection />
     }
 }
@@ -2165,12 +2255,12 @@ fn CodeIntelSettingsSection() -> impl IntoView {
     };
 
     view! {
-        <h3 class="settings-section-title">"Code intelligence"</h3>
+        <h3 class="settings-section-title">"Rust"</h3>
 
         <div class="settings-field">
             <label class="settings-label">"rust-analyzer binary path"</label>
             <p class="settings-description">
-                "Optional absolute path to a standalone rust-analyzer binary. Use this for custom toolchains where the rustup proxy in ~/.cargo/bin cannot install rust-analyzer."
+                "Where to find rust-analyzer, the language server that provides Rust navigation and diagnostics. Leave this empty and Tyde uses the rustup proxy in ~/.cargo/bin, which is correct for almost every setup. Set an absolute path when you are on a custom toolchain that rustup cannot install rust-analyzer for, or when you need a specific build. The path is checked on the host, not on this device, so it must be valid there."
             </p>
             <div class="settings-mobile-broker-row">
                 <input
@@ -2201,13 +2291,19 @@ fn CodeIntelSettingsSection() -> impl IntoView {
     }
 }
 
-/// "Background agent features" — opt-in background model calls that enhance the
-/// agent UI. Both toggles spend money because they run extra model calls, so
-/// the copy is explicit about cost and the activity-summaries toggle defaults
-/// off. Values are reflected from `HostSettings.background_agent_features` and
-/// each change is sent as a typed `BackgroundAgentFeatureEnabled` setting.
+/// "AI Summaries" — opt-in background model calls whose entire product is a
+/// short piece of text *about* an agent: its name, and what it is up to. Both
+/// spend money because each runs an extra model call, so the copy is explicit
+/// about cost and activity summaries default off. Values are reflected from
+/// `HostSettings.background_agent_features` and each change is sent as a typed
+/// `BackgroundAgentFeatureEnabled` setting.
+///
+/// These used to live on the old "General" tab. They are grouped here because
+/// they answer one question — "may Tyde spend a little money to label things
+/// for me?" — which is distinct from the supervisor (which spends money to
+/// *act*) and from subagents (which spend money to *work*).
 #[component]
-fn BackgroundAgentFeaturesSection() -> impl IntoView {
+fn AiSummariesTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_names_checked = state.clone();
     let state_for_summaries_checked = state.clone();
@@ -2262,14 +2358,18 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
     };
 
     view! {
-        <h3 class="settings-section-title">"Background agent features"</h3>
+        <h2 class="settings-panel-title">"AI Summaries"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "Short pieces of text Tyde writes about your agents so lists and cards are readable at a glance. Each one is produced by a background model call, so both settings here cost money — small amounts, but spent on your behalf without you asking. Turning them off never affects what an agent can do; you just get plainer labels."
+        </p>
 
         <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label">"Auto-generate agent names"</label>
                     <p class="settings-description">
-                        "When an agent is started without a name, Tyde asks a cheap model to name it from the opening prompt. This makes an extra background model call that costs money. When off, the agent keeps a simple name derived from its prompt and no model is called."
+                        "When an agent is started without a name, ask a cheap model to read its opening prompt and write a short title, so the agent list reads like \"Fix pairing timeout\" instead of a truncated prompt. Costs one small model call per unnamed agent, once, at creation. When off, Tyde derives a simple name from the prompt text and calls no model at all."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2289,7 +2389,7 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Agent activity summaries"</label>
                     <p class="settings-description">
-                        "Periodically summarize what each active agent is doing so a short \"what is this agent doing?\" line can appear in agent views. This runs a model in the background on a schedule and costs money for as long as agents stay active. Off by default."
+                        "Periodically summarize what each running agent is currently doing, so agent views can show a live \"what is this working on?\" line instead of only the last message. Useful when several agents run at once and you want to triage without opening each one. Unlike naming, this repeats on a schedule for as long as an agent stays active, so the cost scales with how many agents you run and for how long. Off by default."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2561,7 +2661,15 @@ fn SupervisorTab() -> impl IntoView {
     view! {
         <h2 class="settings-panel-title">"Supervisor"</h2>
 
-        <SupervisorToggleField
+        <p class="settings-description settings-panel-intro">
+            "The supervisor is a second model that watches your agents. Every time an agent goes idle it reads the last thing you asked for, the task list, and the agent's closing message, then decides one of three things: the work is genuinely done, the agent is waiting on you, or the agent quit early and should be told to keep going. If it decides the last one, it sends the agent a follow-up message on your behalf."
+        </p>
+
+        <p class="settings-description settings-panel-intro">
+            "That means the supervisor spends money in two ways: the verdict call itself, once per idle transition, and any follow-up turns it triggers. It is off by default for exactly that reason. The kick limit below is the safety rail that stops a supervisor and an agent from pushing each other in circles on a task that cannot be finished."
+        </p>
+
+        <SettingsToggleField
             label="Enable agent supervisor"
             description="When an agent goes idle, a background model call checks whether it actually finished the last request. If the agent stopped on an error or quit mid-task, the supervisor sends it a follow-up message to keep it working. This runs an extra model call per idle transition and costs money. Off by default."
             checked=enabled_toggle.0
@@ -2569,7 +2677,7 @@ fn SupervisorTab() -> impl IntoView {
             on_toggle=enabled_toggle.2
         />
 
-        <SupervisorToggleField
+        <SettingsToggleField
             label="Supervise restored agents"
             description="Reopening a saved session replays its transcript, which looks exactly like an agent that just went idle. Off by default, the supervisor leaves that history alone and waits for the agent's first live turn. Turn this on to have it judge — and possibly follow up on — sessions as soon as they are restored."
             checked=restored_toggle.0
@@ -2577,7 +2685,7 @@ fn SupervisorTab() -> impl IntoView {
             on_toggle=restored_toggle.2
         />
 
-        <SupervisorToggleField
+        <SettingsToggleField
             label="Interrupt stalled turns"
             description="Cancel a running turn that has produced nothing at all for the stall timeout below, then let the supervisor decide how to make progress. Any output — text, a tool call, a status change — resets the timer, so a slow agent that is still working is never cut off. This cancels real work, so it is off by default, and it only fires while a supervisor follow-up is still available under the kick limit."
             checked=stall_toggle.0
@@ -2598,7 +2706,7 @@ fn SupervisorTab() -> impl IntoView {
             on_change=stall_seconds.2
         />
 
-        <SupervisorToggleField
+        <SettingsToggleField
             label="Auto-compact on success"
             description="After the supervisor confirms the requested work is truly complete, automatically compact only after the inactivity delay has elapsed and the latest completed assistant turn reports a known current context strictly above the configured minimum."
             checked=compact_toggle.0
@@ -2678,11 +2786,15 @@ fn SupervisorTab() -> impl IntoView {
     }
 }
 
-/// One labelled supervisor toggle. Every field on the tab funnels through this
-/// and [`SupervisorNumberField`] with erased signal/callback props, so the tab
-/// compiles to two field view types instead of one per field.
+/// One labelled toggle with explanatory sub-text. Shared by the Supervisor,
+/// Subagents, and Debug tabs: every caller funnels through this and
+/// [`SupervisorNumberField`] with erased signal/callback props, so each tab
+/// compiles to a couple of field view types instead of one per field. That
+/// matters here — the settings panel's wasm test module mounts every one of
+/// these in a single browser instance, and each distinct nested view type costs
+/// module size against that ceiling.
 #[component]
-fn SupervisorToggleField(
+fn SettingsToggleField(
     label: &'static str,
     description: &'static str,
     checked: Signal<bool>,
@@ -2777,12 +2889,12 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
         </div>
 
         <p class="settings-description settings-panel-intro">
-            "Toggle backends, install them on the selected host, and run sign-in when available. Install and sign-in commands run in the host terminal so output stays visible. Backend-specific settings live on each backend's own page in the sidebar."
+            "A backend is the coding agent Tyde drives — Claude Code, Codex, Tycode, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page is where you decide which of them exist on this host: toggle them on, install them, and sign in. Install and sign-in run in the host terminal so you can watch the output and answer prompts. Each backend's own configuration lives on its page in the sidebar."
         </p>
 
         <div class="settings-field">
             <label class="settings-label">"Default Backend"</label>
-            <p class="settings-description">"The backend to use by default when creating new agents."</p>
+            <p class="settings-description">"Which backend a new agent uses when you do not pick one explicitly. Only backends you have enabled below can be chosen here."</p>
             {move || match state.selected_host_settings() {
                 Some(settings) => {
                     let state_for_change = state.clone();
@@ -2837,7 +2949,7 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Enabled Backends"</label>
-            <p class="settings-description">"Toggle which backends are available for creating agents, then use the setup commands below to install them on the selected host."</p>
+            <p class="settings-description">"Which backends are offered when creating an agent. A backend has to be installed on this host before it can do anything — the card shows its setup state and offers the install or sign-in command when one is available."</p>
             <div class="settings-backend-list settings-backend-list-rich">
                 {all_backends()
                     .into_iter()
@@ -2845,38 +2957,40 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
                     .collect::<Vec<_>>()}
             </div>
         </div>
-
-        <LaunchProfilesSection />
     }
 }
 
-fn complexity_page_matches_query(query: &str) -> bool {
+fn launch_profiles_page_matches_query(query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let query = query.to_lowercase();
     [
-        "Task Complexity",
-        "Task complexity tiers",
-        "Low tier",
-        "High tier",
-        "Cheaper faster setup",
-        "Most capable setup",
+        "Launch Profiles",
+        "Launch profile",
+        "Preset",
+        "Model",
+        "Reasoning effort",
+        "ACP command",
+        "Spawn",
     ]
     .iter()
     .any(|text| text.to_lowercase().contains(&query))
 }
 
+/// Launch profiles, split off the Backends overview. A profile is the unit an
+/// agent is actually started from, so it earns a page rather than a trailing
+/// section under the install cards.
 #[component]
-fn TaskComplexityPage() -> impl IntoView {
+fn LaunchProfilesPage() -> impl IntoView {
     view! {
         <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Task Complexity"</h2>
+            <h2 class="settings-panel-title">"Launch Profiles"</h2>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Choose whether agent and spawn flows can request low- or high-complexity backend configurations."
+            "A launch profile is a saved way to start an agent: a backend plus the settings it should run with, under a name you choose. Rather than picking a backend and re-selecting a model and reasoning effort every time, you pick \"Deep review\" or \"Quick fix\" and get the same configuration each time. Profiles are what the new-agent and spawn dialogs list, and what agents choose between when they start children of their own."
         </p>
-        <ComplexityTiersSection />
+        <LaunchProfilesSection />
     }
 }
 
@@ -3043,9 +3157,8 @@ fn LaunchProfilesSection() -> impl IntoView {
 
     view! {
         <div class="settings-field">
-            <label class="settings-label">"Launch Profiles"</label>
             <p class="settings-description">
-                "Named backend + session-settings presets that appear as ready entries in the New Chat menu. Saved on the selected host."
+                "Profiles are saved on the selected host, so every device that connects to it sees the same list."
             </p>
             <div class="settings-form-footer">
                 <button
@@ -3421,6 +3534,66 @@ fn LaunchProfileEditor(
 /// per-backend Low/High tier mappings. The rows are generated from each
 /// backend's session settings schema, so they show exactly the fields
 /// (model, effort, ...) that backend supports.
+/// Sub-agents: whether an agent may start and drive other agents, and what
+/// configuration those children get.
+///
+/// The master toggle is the host-scoped `tyde_agent_control_mcp_enabled`
+/// setting. Turning it on is what injects the `tyde-agent-control` and
+/// `tyde-agent-await` MCP servers into newly created chats — that pair of
+/// servers *is* Tyde's sub-agent mechanism, so this switch decides whether
+/// agents can delegate at all. It is labelled for what it does rather than for
+/// the servers it happens to install.
+///
+/// Complexity tiers sit on the same page because they answer the immediate
+/// follow-up question: given that an agent can spawn a child, what does the
+/// child run as. They are deliberately *not* gated behind the master toggle —
+/// tiers also apply to agents you spawn yourself from the UI, so hiding them
+/// when agent-initiated spawning is off would hide a setting that is still
+/// live.
+#[component]
+fn SubagentsTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_checked = state.clone();
+    let state_for_disabled = state.clone();
+
+    let checked = Signal::derive(move || {
+        state_for_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.tyde_agent_control_mcp_enabled)
+    });
+    let disabled = Signal::derive(move || state_for_disabled.selected_host_settings().is_none());
+    let on_toggle = Callback::new(move |enabled: bool| {
+        send_host_setting(
+            &state,
+            HostSettingValue::TydeAgentControlMcpEnabled { enabled },
+        );
+    });
+
+    view! {
+        <h2 class="settings-panel-title">"Subagents"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "A sub-agent is an agent started by another agent rather than by you. Given a large job, an agent can split it up — one child per file to migrate, per subsystem to review, per approach to try — run them in parallel, wait for their results, and use them to finish its own work. You see them in the agent tree as children of the agent that spawned them, and you can open and message any of them directly."
+        </p>
+
+        <p class="settings-description settings-panel-intro">
+            "This is the biggest single lever on what a request costs. A parent that spawns eight children is running nine agents' worth of model calls. It is also what makes broad work finish in one pass instead of ten. The settings below control whether delegation is allowed at all, and how expensively each child runs."
+        </p>
+
+        <SettingsToggleField
+            label="Tyde sub-agents"
+            description="Allow agents to spawn, message, and await other agents. New chats are started with Tyde's agent-control tools, which let an agent create a child agent, send it follow-up messages, read what it produced, and block until it finishes. Turning this off does not affect agents you create yourself from the UI, and it does not touch a backend's own built-in sub-agent feature — it only removes Tyde's cross-agent orchestration tools from the chats started after the change. On by default."
+            checked=checked
+            disabled=disabled
+            on_toggle=on_toggle
+        />
+
+        <h3 class="settings-section-title">"How sub-agents are configured"</h3>
+
+        <ComplexityTiersSection />
+    }
+}
+
 #[component]
 fn ComplexityTiersSection() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -3452,7 +3625,7 @@ fn ComplexityTiersSection() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Task complexity tiers"</label>
                     <p class="settings-description">
-                        "Let agents and spawn dialogs request a cheaper, faster setup for trivial tasks (low) or the most capable one for extremely complex tasks (high). When disabled, every spawn uses the backend's own defaults and agents are never offered the choice."
+                        "Let a sub-agent be started at a cheaper, faster configuration for trivial work (low) or the most capable one for genuinely hard work (high), instead of every child running the same setup as its parent. Spawn dialogs offer the choice to you, and agents may request a tier for the children they start — a parent that knows it is delegating a mechanical rename can ask for the cheap tier and save real money. When off, every spawn uses the backend's own defaults and neither you nor an agent is offered the choice."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -5546,98 +5719,68 @@ fn native_json_field_control(
     .into_any()
 }
 
+/// Diagnostic tooling for working on Tyde itself. The agent-control toggle that
+/// used to sit here now leads the Subagents tab, where it reads as the feature
+/// switch it actually is rather than as a debug knob.
 #[component]
 fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_debug_checked = state.clone();
-    let state_for_debug_disabled = state.clone();
-    let state_for_ac_checked = state.clone();
-    let state_for_ac_disabled = state.clone();
+    let state_for_checked = state.clone();
+    let state_for_disabled = state.clone();
 
-    let debug_checked = move || {
-        state_for_debug_checked
+    let checked = Signal::derive(move || {
+        state_for_checked
             .selected_host_settings()
             .is_some_and(|settings| settings.tyde_debug_mcp_enabled)
-    };
-    let debug_disabled = move || state_for_debug_disabled.selected_host_settings().is_none();
-
-    let debug_on_toggle = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
-                &state,
-                HostSettingValue::TydeDebugMcpEnabled {
-                    enabled: input.checked(),
-                },
-            );
-        }
-    };
-
-    let ac_checked = move || {
-        state_for_ac_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.tyde_agent_control_mcp_enabled)
-    };
-    let ac_disabled = move || state_for_ac_disabled.selected_host_settings().is_none();
-
-    let ac_on_toggle = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
-                &state,
-                HostSettingValue::TydeAgentControlMcpEnabled {
-                    enabled: input.checked(),
-                },
-            );
-        }
-    };
+    });
+    let disabled = Signal::derive(move || state_for_disabled.selected_host_settings().is_none());
+    let on_toggle = Callback::new(move |enabled: bool| {
+        send_host_setting(&state, HostSettingValue::TydeDebugMcpEnabled { enabled });
+    });
 
     view! {
         <h2 class="settings-panel-title">"Debug"</h2>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Tyde Debug MCP"</label>
-                    <p class="settings-description">
-                        "When enabled, newly created chats are started with the Tyde debug MCP server so agents can inspect and drive the frontend through JavaScript."
-                    </p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=debug_checked
-                        disabled=debug_disabled
-                        on:change=debug_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
+        <p class="settings-description settings-panel-intro">
+            "Tools for developing Tyde itself. These are aimed at people working on the app, not at people using it to write code — everything here is off by default and safe to leave alone."
+        </p>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Agent Control MCP"</label>
-                    <p class="settings-description">
-                        "When enabled, newly created chats are started with the agent control MCP server so agents can spawn, message, and orchestrate other agents."
-                    </p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=ac_checked
-                        disabled=ac_disabled
-                        on:change=ac_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
+        <SettingsToggleField
+            label="Tyde Debug MCP"
+            description="Start new chats with the Tyde debug MCP server attached, giving agents tools to inspect and drive Tyde's own frontend: read the rendered DOM, evaluate JavaScript in the running window, take non-visual state snapshots, and launch a child dev instance. This is how an agent can test a UI change it just made. It also means an agent can execute arbitrary JavaScript inside your Tyde window, so leave it off unless you are working on Tyde's interface. Off by default; existing chats are unaffected until they are restarted."
+            checked=checked
+            disabled=disabled
+            on_toggle=on_toggle
+        />
+    }
+}
+
+/// Server-side speech settings. Lifted out of the Mobile tab, where it was the
+/// first thing on a page otherwise entirely about pairing: voice runs on the
+/// host against Bedrock and is equally available to the desktop app, so it was
+/// only ever adjacent to mobile by accident of when it shipped.
+#[component]
+fn VoiceTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_support = state.clone();
+
+    view! {
+        <h2 class="settings-panel-title">"Voice"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "Talk to an agent instead of typing. Speech is transcribed and spoken by Amazon Nova Sonic, which runs through the host's own AWS credentials — audio goes from the client to this host and from the host to Bedrock. Tyde never sends AWS credentials to a desktop or mobile client, and never quietly falls back to a different model or provider if the configured one is unavailable."
+        </p>
+
+        <Show
+            when=move || state_for_support.native_voice_supported.get()
+            fallback=|| view! {
+                <p class="settings-description">
+                    "This host reports that it cannot run native voice, so there is nothing to configure here. Voice needs a host build with native audio support."
+                </p>
+            }
+        >
+            <NativeVoiceSettings state=state.clone() />
+        </Show>
     }
 }
 
@@ -5658,7 +5801,7 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label">"Native voice with Amazon Nova Sonic"</label>
-                    <p class="settings-description">"Uses the selected server AWS profile and region. Tyde never sends AWS credentials to desktop or mobile clients and never downgrades to another model."</p>
+                    <p class="settings-description">"Turn on speech input and output for chats on this host. When enabled, a microphone control appears in the composer on both desktop and mobile. Audio is streamed to Nova Sonic using the AWS profile and region below; if those credentials do not work, voice reports the failure rather than silently downgrading to another model."</p>
                 </div>
                 <label class="settings-toggle"><input type="checkbox"
                     prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
@@ -5667,16 +5810,19 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
                 /><span class="settings-toggle-slider"></span></label>
             </div>
             <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
+            <p class="settings-description">"Which named profile from the host's AWS credentials file to use for Bedrock. Leave empty to use the profile named \"default\". The profile is read on the host, so it has to exist there — not on the device you are reading this on."</p>
             <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
                 prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
                 on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_profile_commit,HostSettingValue::VoiceAwsProfile{profile:(!value.is_empty()).then_some(value)}); }
             />
             <label class="settings-label" for="voice-aws-region">"AWS region"</label>
+            <p class="settings-description">"The AWS region to call Bedrock in. Nova Sonic is not offered in every region, and picking a region far from the host adds audible delay to a conversation, so prefer the nearest region that carries the model. Leave empty to use us-east-1."</p>
             <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
                 prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
                 on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_region_commit,HostSettingValue::VoiceAwsRegion{region:(!value.is_empty()).then_some(value)}); }
             />
             <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
+            <p class="settings-description">"Which Nova Sonic version handles speech. Nova 2 Sonic is the current model and the right choice unless your account or region only carries the older one. If the selected model is unavailable, voice fails with that error rather than switching models behind your back."</p>
             <select id="voice-nova-model" class="settings-select"
                 prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
                 on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_setting(&state_for_voice_model_commit,HostSettingValue::VoiceNovaModel{model:input.value()}); }
@@ -5716,8 +5862,6 @@ fn MobileTab() -> impl IntoView {
     let state_for_start_pending = state.clone();
     let state_for_start_click = state.clone();
     let state_for_cancel_click = state.clone();
-    let state_for_voice_support = state.clone();
-    let state_for_native_voice_settings = state.clone();
 
     // Inline error surfaced when the user types something the server
     // would reject. Cleared when the user types again, when the field
@@ -5961,19 +6105,15 @@ fn MobileTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Mobile"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Pair the Tyde mobile app with this host over tycode.dev managed access. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection — there is no public or free MQTT broker. Your mobile device signs in with a Tyggs Pass to complete pairing; this host is never asked for Tyggs credentials."
+            "Reach this host from the Tyde mobile app, so you can read what your agents are doing and reply to them away from your desk. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection for the two devices — there is no public or free MQTT broker involved, and traffic is not relayed through a shared server. Your phone signs in with a Tyggs Pass to complete pairing; this host is never asked for your Tyggs credentials."
         </p>
-
-        <Show when=move || state_for_voice_support.native_voice_supported.get()>
-            <NativeVoiceSettings state=state_for_native_voice_settings.clone() />
-        </Show>
 
         <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label">"Enable mobile connections"</label>
                     <p class="settings-description">
-                        "When enabled, this host can accept pairing requests from the Tyde mobile app and connect through tycode.dev-managed AWS IoT access."
+                        "Allow this host to accept pairing requests and mobile connections. This is the master switch: with it off, an already-paired phone cannot connect and no new pairing can be started, without you having to revoke devices one by one."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -8372,6 +8512,10 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
+        // Syntax highlighting is a code-rendering default, so it lives on the
+        // Display tab rather than with the interface chrome on Appearance.
+        click_tab(&container, "Code & Output Display");
+        next_tick().await;
 
         let select =
             find_syntax_theme_select(&container).expect("syntax theme dropdown should be present");
@@ -8926,7 +9070,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn mobile_tab_voice_toggle_commits_only_voice_setting() {
+    async fn voice_tab_voice_toggle_commits_only_voice_setting() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -8937,7 +9081,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Mobile");
+        click_tab(&container, "Voice");
         next_tick().await;
 
         let toggle = toggle_for_label(&container, "Native voice with Amazon Nova Sonic");
@@ -8963,17 +9107,15 @@ mod wasm_tests {
             Some(true),
             "VoiceEnabled must carry enabled=true after toggle on"
         );
-        assert!(
-            !settings.iter().any(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str())
-                    == Some("enable_mobile_connections")
-            }),
-            "the voice toggle must not commit the neighboring mobile setting: {settings:?}"
+        assert_eq!(
+            settings.len(),
+            1,
+            "the voice toggle must commit exactly one setting and nothing else: {settings:?}"
         );
     }
 
     #[wasm_bindgen_test]
-    async fn mobile_tab_hides_native_voice_when_host_reports_unsupported() {
+    async fn voice_tab_hides_native_voice_when_host_reports_unsupported() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -8984,7 +9126,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Mobile");
+        click_tab(&container, "Voice");
         next_tick().await;
 
         assert!(
@@ -9819,7 +9961,7 @@ mod wasm_tests {
     /// paid opt-in: if the toggle silently became a no-op nothing else
     /// would notice.
     #[wasm_bindgen_test]
-    async fn general_tab_activity_summaries_toggle_commits_setting() {
+    async fn ai_summaries_tab_activity_summaries_toggle_commits_setting() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -9830,7 +9972,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "General");
+        click_tab(&container, "AI Summaries");
         next_tick().await;
 
         let toggle = toggle_for_label(&container, "Agent activity summaries");
@@ -10293,7 +10435,7 @@ mod wasm_tests {
     /// `background_agent_features` values (checked/unchecked) and tell the
     /// user the summaries feature costs money.
     #[wasm_bindgen_test]
-    async fn general_tab_background_features_reflect_current_settings() {
+    async fn ai_summaries_tab_background_features_reflect_current_settings() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -10303,7 +10445,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "General");
+        click_tab(&container, "AI Summaries");
         next_tick().await;
 
         let names = toggle_for_label(&container, "Auto-generate agent names");
@@ -10328,13 +10470,13 @@ mod wasm_tests {
         container
             .query_selector("input[aria-label='rust-analyzer binary path']")
             .unwrap()
-            .expect("rust-analyzer binary path input must render on the General tab")
+            .expect("rust-analyzer binary path input must render on the Code Intelligence tab")
             .dyn_into()
             .unwrap()
     }
 
     #[wasm_bindgen_test]
-    async fn general_tab_rust_analyzer_path_commits_set_and_clear() {
+    async fn code_intelligence_tab_rust_analyzer_path_commits_set_and_clear() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -10345,7 +10487,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "General");
+        click_tab(&container, "Code Intelligence");
         next_tick().await;
 
         let input = rust_analyzer_path_input(&container);
@@ -10947,10 +11089,64 @@ mod wasm_tests {
             .unwrap_or_default()
     }
 
-    /// The sidebar has a dedicated Backends group: a stable Overview entry plus
-    /// one schema-derived item per configurable backend. The overview page no
-    /// longer renders any backend config fields; the configurable backend's
-    /// card links to its own settings page instead.
+    /// The Subagents tab owns both halves of the delegation story: whether an
+    /// agent may spawn children at all, and what those children run as. The
+    /// master toggle is `tyde_agent_control_mcp_enabled` under a name that says
+    /// what it does, so this pins the label to the wire setting — a rename that
+    /// silently pointed the switch at a different setting would leave the UI
+    /// looking correct while agent-control stayed on.
+    #[wasm_bindgen_test]
+    async fn subagents_tab_master_toggle_commits_agent_control_and_carries_tiers() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false, None);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Subagents");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Task complexity tiers"),
+            "complexity tiers must live with the subagent switch they configure: {text:?}"
+        );
+
+        let toggle = toggle_for_label(&container, "Tyde sub-agents");
+        assert!(
+            toggle.checked(),
+            "the fixture host has agent control enabled, so the master toggle must read on"
+        );
+        toggle.set_checked(false);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let frame = settings
+            .iter()
+            .find(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str())
+                    == Some("tyde_agent_control_mcp_enabled")
+            })
+            .expect("the sub-agents toggle must commit TydeAgentControlMcpEnabled");
+        assert_eq!(
+            frame.get("enabled").and_then(|value| value.as_bool()),
+            Some(false),
+            "turning sub-agents off must carry enabled=false: {frame:?}"
+        );
+    }
+
+    /// The sidebar has a dedicated Backends group: a stable Overview entry, a
+    /// Launch Profiles page, plus one schema-derived item per configurable
+    /// backend. The overview page no longer renders any backend config fields
+    /// or the launch-profile editor; the configurable backend's card links to
+    /// its own settings page instead.
     #[wasm_bindgen_test]
     async fn backends_group_lists_schema_pages_and_overview_has_no_config_fields() {
         let container = make_container();
@@ -10973,8 +11169,8 @@ mod wasm_tests {
             find_button_by_text(&container, "Hermes").is_some(),
             "a backend in the host's schema catalog must get its own nav item"
         );
-        let task_complexity = find_button_by_text(&container, "Task Complexity")
-            .expect("Task Complexity must have its own Backends nav item");
+        let launch_profiles = find_button_by_text(&container, "Launch Profiles")
+            .expect("Launch Profiles must have its own Backends nav item");
         assert!(
             find_button_by_text(&container, "Claude").is_none(),
             "a backend without a schema must not get a nav item"
@@ -11001,14 +11197,18 @@ mod wasm_tests {
             !text.contains("Task complexity tiers"),
             "complexity controls must not remain on the Backends overview: {text:?}"
         );
+        assert!(
+            !text.contains("+ New launch profile"),
+            "launch profiles moved to their own page and must not remain on the overview: {text:?}"
+        );
 
-        task_complexity.click();
+        launch_profiles.click();
         next_tick().await;
         let text = container.text_content().unwrap_or_default();
-        assert_eq!(panel_title(&container), "Task Complexity");
+        assert_eq!(panel_title(&container), "Launch Profiles");
         assert!(
-            text.contains("Task complexity tiers"),
-            "the dedicated page must contain the existing complexity controls: {text:?}"
+            text.contains("+ New launch profile"),
+            "the dedicated page must contain the launch-profile controls: {text:?}"
         );
 
         overview.click();
@@ -13653,7 +13853,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Overview");
+        click_tab(&container, "Launch Profiles");
         next_tick().await;
 
         let delete = find_button_by_text(&container, "Delete").expect("Delete button");
