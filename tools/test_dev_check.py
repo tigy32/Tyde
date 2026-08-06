@@ -505,6 +505,7 @@ def native_voice_vendor_surface_violations(
         or "pub(crate) fn meson_spec(" not in production_specs
         or production_specs.count('OsString::from("-Dcpp_std=c++20")') != 1
         or "pub(crate) fn wrapper_cpp_standard(" not in production_specs
+        or "pub(crate) fn wrapper_unused_parameter_flag(" not in production_specs
         or "pub(crate) fn ninja_spec(" not in production_specs
         or "pub(crate) fn symbol_list_spec(" not in production_specs
         or "pub(crate) fn symbol_prefix_spec(" not in production_specs
@@ -530,6 +531,10 @@ def native_voice_vendor_surface_violations(
             ".std(build_support::wrapper_cpp_standard(&target))"
         ) != 1
         or '.flag("-std=' in build_script
+        or build_script.count(
+            ".flag(build_support::wrapper_unused_parameter_flag(&target))"
+        ) != 1
+        or '.flag("-Wno-unused-parameter")' in build_script
         or build_script.count(
             '.clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])'
         ) != 1
@@ -1029,6 +1034,13 @@ class NativeBuildToolsContractTests(unittest.TestCase):
             1,
         )
         self.assertNotIn('.flag("-std=', build_script)
+        self.assertEqual(
+            build_script.count(
+                ".flag(build_support::wrapper_unused_parameter_flag(&target))"
+            ),
+            1,
+        )
+        self.assertNotIn('.flag("-Wno-unused-parameter")', build_script)
         self.assertEqual(
             build_script.count(
                 '.clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])'

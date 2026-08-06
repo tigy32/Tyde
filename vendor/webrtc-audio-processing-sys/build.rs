@@ -629,7 +629,7 @@ fn main() -> Result<()> {
         .file("src/wrapper.cpp")
         .includes(&include_dirs)
         .std(build_support::wrapper_cpp_standard(&target))
-        .flag("-Wno-unused-parameter")
+        .flag(build_support::wrapper_unused_parameter_flag(&target))
         .out_dir(out_dir());
 
     // Inform wrapper code that headers for internal classes (ResidualEchoDetector) are available.

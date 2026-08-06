@@ -30,8 +30,10 @@ rejects in C++17 mode. Meson's normal subproject option scoping remains intact;
 Unix and macOS retain their original C++17 Meson vectors. The production
 wrapper uses `cc::Build::std` with the matching target standard, which emits
 MSVC's `/std:c++20` rather than an ignored GCC-style flag while retaining C++17
-for Unix and macOS. Bindgen's distinct C ABI header parse remains at C++17
-because its input requires no C++20 syntax.
+for Unix and macOS. The target-selected wrapper warning flag suppresses unused
+parameters with MSVC's narrow `/wd4100` and preserves the original
+`-Wno-unused-parameter` byte-for-byte for GNU and Clang. Bindgen's distinct C
+ABI header parse remains at C++17 because its input requires no C++20 syntax.
 
 The bundled library's symbols must still be prefixed on MSVC: the wrapper
 archive contains unresolved C++ references to those definitions, and both
@@ -118,3 +120,6 @@ C++20 Meson option, the Unix and macOS tests pin their complete unchanged
 argument vectors, and the production wrapper-standard test pins C++20 for MSVC
 and C++17 elsewhere. The dev-check guard rejects a raw `-std=` wrapper flag and
 pins both the portable `cc::Build::std` selection and bindgen's C++17 parse.
+The production warning-flag test pins `/wd4100` for both MSVC targets and the
+unchanged GNU/Clang spelling for Linux and macOS; the guard requires that
+target-selected call site and rejects a raw GNU warning flag in `build.rs`.

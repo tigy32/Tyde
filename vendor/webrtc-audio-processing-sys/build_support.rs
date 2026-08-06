@@ -65,6 +65,14 @@ pub(crate) fn wrapper_cpp_standard(target: &str) -> &'static str {
     }
 }
 
+pub(crate) fn wrapper_unused_parameter_flag(target: &str) -> &'static str {
+    if is_msvc_target(target) {
+        "/wd4100"
+    } else {
+        "-Wno-unused-parameter"
+    }
+}
+
 pub(crate) fn bundled_library_candidates(target: &str, name: &str) -> Vec<String> {
     if is_msvc_target(target) {
         vec![format!("{name}.lib"), format!("lib{name}.a")]
@@ -604,6 +612,26 @@ mod tests {
         assert_eq!(wrapper_cpp_standard("aarch64-pc-windows-msvc"), "c++20");
         assert_eq!(wrapper_cpp_standard("x86_64-unknown-linux-gnu"), "c++17");
         assert_eq!(wrapper_cpp_standard("aarch64-apple-darwin"), "c++17");
+    }
+
+    #[test]
+    fn wrapper_unused_parameter_flag_matches_target_toolchain() {
+        assert_eq!(
+            wrapper_unused_parameter_flag("x86_64-pc-windows-msvc"),
+            "/wd4100"
+        );
+        assert_eq!(
+            wrapper_unused_parameter_flag("aarch64-pc-windows-msvc"),
+            "/wd4100"
+        );
+        assert_eq!(
+            wrapper_unused_parameter_flag("x86_64-unknown-linux-gnu"),
+            "-Wno-unused-parameter"
+        );
+        assert_eq!(
+            wrapper_unused_parameter_flag("aarch64-apple-darwin"),
+            "-Wno-unused-parameter"
+        );
     }
 
     #[test]
