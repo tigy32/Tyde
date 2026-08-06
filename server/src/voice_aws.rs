@@ -292,11 +292,11 @@ async fn run_stream(context: StreamContext) {
         Err(error) => {
             let detail = format!("{error:?}");
             let failure = categorize_start_failure(&detail);
-            tracing::debug!(provider_error=%detail,"Nova stream startup detail");
             let _ = ready.send(Err(failure.clone()));
             if !closing.load(Ordering::Acquire) {
                 tracing::warn!(
                     category = failure.category,
+                    provider_error = %detail,
                     "Nova stream failed before acceptance"
                 );
             }
@@ -312,7 +312,11 @@ async fn run_stream(context: StreamContext) {
             Ok(Some(v)) => v,
             Ok(None) => break,
             Err(error) => {
-                tracing::debug!(provider_error=?error,"Nova stream receive detail");
+                if closing.load(Ordering::Acquire) {
+                    tracing::debug!(provider_error=?error,"Nova stream receive failed during close");
+                } else {
+                    tracing::warn!(provider_error=?error,"Nova stream receive failed mid-session");
+                }
                 let _ = output_tx
                     .send(NovaOutput::ProviderError {
                         code: protocol::VoiceErrorCode::ProviderUnavailable,
@@ -389,6 +393,7 @@ impl Parser {
             || event.get("internalServerException").is_some()
             || event.get("throttlingException").is_some()
         {
+            tracing::warn!(provider_event = %event, "Nova stream reported an error event");
             return vec![NovaOutput::ProviderError {
                 code: protocol::VoiceErrorCode::ProviderUnavailable,
                 retryable: true,

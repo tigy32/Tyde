@@ -13839,4 +13839,54 @@ pre.tool-error-pre {
         animation: none;
     }
 }
-.voice-strip{position:fixed;left:50%;bottom:24px;z-index:1200;transform:translateX(-50%);display:flex;align-items:center;gap:10px;max-width:min(720px,calc(100vw - 32px));padding:10px 14px;border:1px solid var(--border-color);border-radius:999px;background:color-mix(in srgb,var(--bg-primary) 92%,transparent);box-shadow:0 12px 32px rgba(0,0,0,.24);animation:voice-pop .18s ease-out}.voice-icon,.voice-strip button{border:0;border-radius:999px;padding:7px 12px}.voice-pulse{color:var(--accent-color)}.voice-transcript{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@keyframes voice-pop{from{opacity:0;transform:translate(-50%,8px) scale(.96)}to{opacity:1;transform:translate(-50%,0) scale(1)}}
+/* Voice lives in the composer, not in a floating overlay. The previous
+   `.voice-strip` was `position: fixed; left: 50%; bottom: 24px`, which is
+   exactly where the composer sits — so the idle "Voice" chip painted on top of
+   the textarea and looked like a button inside the text input. Both surfaces
+   below are in normal flow: the session bar sits above the input row (pushing
+   it down), the start button sits beside Send. */
+.chat-voice-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+    padding: 6px var(--space-3);
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    background: var(--surface-2);
+    font-size: 0.923rem;
+    position: relative;
+    z-index: 1;
+}
+
+.chat-voice-btn {
+    min-width: 56px;
+}
+
+.voice-pulse {
+    color: var(--accent-primary);
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.voice-transcript {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.voice-action {
+    flex-shrink: 0;
+}
+
+.voice-error {
+    flex: 1;
+    min-width: 0;
+    color: var(--error);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}

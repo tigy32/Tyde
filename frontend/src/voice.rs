@@ -472,7 +472,9 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     _ => false,
                 };
                 if applies {
-                    state.voice_ui.set(VoiceUiState::Idle);
+                    state
+                        .voice_ui
+                        .set(VoiceUiState::Failed(voice_error_message(&payload)));
                     spawn_local(async {
                         let _ = bridge::voice_media_stop().await;
                     });
@@ -480,6 +482,36 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
             }
         }
         _ => {}
+    }
+}
+
+/// User-facing description of a session-ending voice error. The wire payload
+/// carries only a category code — the provider detail is in the host log — so
+/// this names the failure and whether retrying is worthwhile.
+fn voice_error_message(payload: &protocol::VoiceErrorPayload) -> String {
+    let cause = match payload.code {
+        protocol::VoiceErrorCode::CredentialsExpired => {
+            "AWS credentials expired — refresh them and try again"
+        }
+        protocol::VoiceErrorCode::NotAvailable => "voice is not available for this host",
+        protocol::VoiceErrorCode::ProviderUnavailable => {
+            "the speech provider (Amazon Bedrock) dropped the session"
+        }
+        protocol::VoiceErrorCode::Inactivity => "the session ended after inactivity",
+        protocol::VoiceErrorCode::ToolBusy | protocol::VoiceErrorCode::ToolDeliveryFailed => {
+            "the message could not be delivered to the agent"
+        }
+        protocol::VoiceErrorCode::InvalidAudio => "the microphone audio was rejected",
+        protocol::VoiceErrorCode::InvalidRequest
+        | protocol::VoiceErrorCode::AlreadyActive
+        | protocol::VoiceErrorCode::StaleGeneration
+        | protocol::VoiceErrorCode::WrongTarget
+        | protocol::VoiceErrorCode::Internal => "an internal voice error occurred",
+    };
+    if payload.retryable {
+        format!("Voice ended: {cause}. You can retry.")
+    } else {
+        format!("Voice ended: {cause}.")
     }
 }
 
@@ -714,23 +746,18 @@ pub fn install_media_listeners(state: AppState) {
     });
 }
 
+/// The live-session surface: connecting, the transcript with its phase pulse,
+/// and the two session actions. Idle is deliberately absent — starting voice
+/// is offered by [`VoiceComposerButton`] in the composer row, so this renders
+/// only once a session exists.
 #[component]
-fn VoiceControls(state: AppState) -> impl IntoView {
+fn VoiceSessionControls(state: AppState) -> impl IntoView {
     move || {
-        let start_state = state.clone();
         let stop_state = state.clone();
         let interrupt_state = state.clone();
+        let dismiss_state = state.clone();
         match state.voice_ui.get() {
-            VoiceUiState::Idle => view! {
-                <button
-                    class="voice-icon"
-                    on:click=move |_| start(start_state.clone())
-                    aria-label="Start voice"
-                >
-                    "Voice"
-                </button>
-            }
-            .into_any(),
+            VoiceUiState::Idle => ().into_any(),
             VoiceUiState::Starting { .. } => view! { <span>"Connecting voice…"</span> }.into_any(),
             VoiceUiState::Active {
                 state: phase,
@@ -741,30 +768,142 @@ fn VoiceControls(state: AppState) -> impl IntoView {
                 <span class="voice-transcript">
                     {transcript.map(|value| value.text).unwrap_or_default()}
                 </span>
-                <button on:click=move |_| interrupt(interrupt_state.clone())>
+                <button
+                    class="chat-send-btn voice-action"
+                    on:click=move |_| interrupt(interrupt_state.clone())
+                >
                     "Interrupt"
                 </button>
-                <button on:click=move |_| {
-                    stop(
-                        stop_state.clone(),
-                        protocol::VoiceStopReason::UserExited,
-                    )
-                }>
+                <button
+                    class="chat-send-btn voice-action"
+                    on:click=move |_| {
+                        stop(
+                            stop_state.clone(),
+                            protocol::VoiceStopReason::UserExited,
+                        )
+                    }
+                >
                     "Done"
                 </button>
             }
             .into_any(),
-            VoiceUiState::Failed(error) => view! { <span>{error}</span> }.into_any(),
+            VoiceUiState::Failed(error) => view! {
+                <span class="voice-error" data-testid="voice-error">{error}</span>
+                <button
+                    class="chat-send-btn voice-action"
+                    on:click=move |_| dismiss_state.voice_ui.set(VoiceUiState::Idle)
+                >
+                    "Dismiss"
+                </button>
+            }
+            .into_any(),
         }
     }
 }
 
+/// Whether voice may be offered at all for the currently active agent: the
+/// target resolves, the host has voice enabled, Nova is reachable, and this
+/// build supports native voice.
+fn gate_available(state: &AppState) -> Memo<bool> {
+    let state = state.clone();
+    Memo::new(move |_| {
+        let (target_resolution, resolved_target) = target_with_resolution_tracked(&state);
+        let Some((host, _)) = resolved_target else {
+            return voice_gate_state(target_resolution, false, false, false).gate_available;
+        };
+        let voice_enabled = state
+            .host_settings_by_host
+            .with(|settings| settings.get(&host).is_some_and(|value| value.voice.enabled));
+        let nova_available = state.voice_capabilities_by_host.with(|capabilities| {
+            capabilities
+                .get(&host)
+                .is_some_and(|value| value.nova_available)
+        });
+        voice_gate_state(
+            target_resolution,
+            voice_enabled,
+            nova_available,
+            state.native_voice_supported.get(),
+        )
+        .gate_available
+    })
+}
+
+/// The gate, narrowed to the one composer that owns the voice target. Voice
+/// always acts on the *active* agent, so a split pane showing a different chat
+/// must not render controls that would start or stop someone else's session.
+fn composer_voice_available(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> Memo<bool> {
+    let available = gate_available(state);
+    let state = state.clone();
+    Memo::new(move |_| {
+        let active = state.active_agent.get();
+        available.get() && active.is_some() && agent_ref.get() == active
+    })
+}
+
+/// Start-voice affordance, rendered in the composer's button row beside Send.
+///
+/// It lives here rather than in a floating overlay because the overlay was
+/// `position: fixed` at the bottom-centre of the viewport — exactly where the
+/// composer sits — so it painted on top of the textarea and read as a button
+/// inside the text input.
 #[component]
-pub fn VoiceOverlay() -> impl IntoView {
+pub fn VoiceComposerButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let available = composer_voice_available(&state, agent_ref);
+    let idle_state = state.clone();
+    let show = Memo::new(move |_| {
+        available.get() && matches!(idle_state.voice_ui.get(), VoiceUiState::Idle)
+    });
+    let start_state = StoredValue::new(state);
+    view! {
+        <Show when=move || show.get()>
+            <button
+                type="button"
+                class="chat-send-btn chat-voice-btn"
+                data-test="chat-voice-start"
+                aria-label="Start voice"
+                title="Start voice"
+                on:click=move |_| start(start_state.get_value())
+            >
+                "Voice"
+            </button>
+        </Show>
+    }
+}
+
+/// Live-session strip, rendered in the composer stack above the input row (with
+/// the other composer notices) so it shifts the textarea down instead of
+/// covering it.
+#[component]
+pub fn VoiceComposerBar(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let available = composer_voice_available(&state, agent_ref);
+    let session_state = state.clone();
+    let in_session =
+        Memo::new(move |_| !matches!(session_state.voice_ui.get(), VoiceUiState::Idle));
+    let render_state = StoredValue::new(state);
+    view! {
+        <Show when=move || available.get() && in_session.get()>
+            <div class="chat-voice-bar" data-testid="voice-session-bar">
+                <VoiceSessionControls state=render_state.get_value() />
+            </div>
+        </Show>
+    }
+}
+
+/// Root-mounted and renders nothing: it owns the native media listeners and the
+/// stop-on-target-change effect for the whole app. Every visible voice control
+/// lives in the composer ([`VoiceComposerButton`], [`VoiceComposerBar`]).
+#[component]
+pub fn VoiceRuntime() -> impl IntoView {
     let state = expect_context::<AppState>();
     install_media_listeners(state.clone());
     let previous = StoredValue::new(None::<ActiveAgentRef>);
-    let switch_state = state.clone();
+    let switch_state = state;
     Effect::new(move |_| {
         let active = switch_state.active_agent.get();
         if previous.get_value().is_some() && previous.get_value() != active {
@@ -775,37 +914,6 @@ pub fn VoiceOverlay() -> impl IntoView {
         }
         previous.set_value(active);
     });
-    let gate_state_source = state.clone();
-    let gate = Memo::new(move |_| {
-        let (target_resolution, resolved_target) =
-            target_with_resolution_tracked(&gate_state_source);
-        let Some((host, _)) = resolved_target else {
-            return voice_gate_state(target_resolution, false, false, false);
-        };
-        let voice_enabled = gate_state_source
-            .host_settings_by_host
-            .with(|settings| settings.get(&host).is_some_and(|value| value.voice.enabled));
-        let capability = gate_state_source
-            .voice_capabilities_by_host
-            .with(|capabilities| capabilities.get(&host).cloned());
-        voice_gate_state(
-            target_resolution,
-            voice_enabled,
-            capability
-                .as_ref()
-                .is_some_and(|value| value.nova_available),
-            gate_state_source.native_voice_supported.get(),
-        )
-    });
-    let available = Memo::new(move |_| gate.get().gate_available);
-    let render_state = StoredValue::new(state);
-    view! {
-        <Show when=move || available.get()>
-            <aside class="voice-strip" data-testid="voice-strip">
-                <VoiceControls state=render_state.get_value() />
-            </aside>
-        </Show>
-    }
 }
 
 #[cfg(test)]
@@ -1360,7 +1468,7 @@ mod wasm_tests {
         let render_state = state.clone();
         let mount = mount_to(container.clone(), move || {
             provide_context(render_state.clone());
-            view! { <VoiceOverlay /> }
+            view! { <VoiceRuntime /> }
         });
         wait_for_voice_listener_attempts(4).await;
         next_tick().await;
@@ -1436,7 +1544,7 @@ mod wasm_tests {
         let state = AppState::new();
         let mount = mount_to(container.clone(), move || {
             provide_context(state.clone());
-            view! { <VoiceOverlay /> }
+            view! { <VoiceRuntime /> }
         });
 
         wait_for_voice_listener_attempts(3).await;
@@ -1466,7 +1574,7 @@ mod wasm_tests {
         let state = AppState::new();
         let mount = mount_to(container.clone(), move || {
             provide_context(state.clone());
-            view! { <VoiceOverlay /> }
+            view! { <VoiceRuntime /> }
         });
 
         wait_for_voice_listener_attempts(4).await;
@@ -1501,16 +1609,83 @@ mod wasm_tests {
         container.remove();
     }
 
+    fn start_button(container: &HtmlElement) -> Option<web_sys::Element> {
+        container
+            .query_selector("[data-test='chat-voice-start']")
+            .unwrap()
+    }
+
+    fn session_bar(container: &HtmlElement) -> Option<web_sys::Element> {
+        container
+            .query_selector("[data-testid='voice-session-bar']")
+            .unwrap()
+    }
+
+    /// Focus a chat on a started, voice-capable agent — the state in which the
+    /// gate is open and the composer may offer voice.
+    fn open_voice_gate(state: &AppState) {
+        state.host_settings_by_host.update(|settings| {
+            let mut host = protocol::HostSettings::default();
+            host.voice.enabled = true;
+            settings.insert("local".to_owned(), host);
+        });
+        state.voice_capabilities_by_host.update(|capabilities| {
+            capabilities.insert(
+                "local".to_owned(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, true),
+            );
+        });
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: "local".to_owned(),
+                agent_id: AgentId("voice-agent".to_owned()),
+            }),
+            "Voice agent".to_owned(),
+            true,
+        );
+        state.agents.set(vec![gate_test_agent(true)]);
+    }
+
+    /// The composer's two voice surfaces are mutually exclusive and both stay
+    /// reactive across repeated state changes: idle offers the start button and
+    /// nothing else, a live session replaces it with the session bar, and
+    /// returning to idle restores the button.
     #[wasm_bindgen_test]
-    async fn controls_react_across_repeated_renders() {
+    async fn composer_voice_surfaces_swap_between_idle_and_session() {
         let container = container();
         let state = AppState::new();
+        open_voice_gate(&state);
         let render_state = state.clone();
         let mount = mount_to(container.clone(), move || {
-            view! { <VoiceControls state=render_state.clone() /> }
+            let state = render_state.clone();
+            provide_context(state.clone());
+            let agent_ref = Signal::derive(move || state.active_agent.get());
+            view! {
+                <VoiceComposerBar agent_ref=agent_ref />
+                <VoiceComposerButton agent_ref=agent_ref />
+            }
         });
         next_tick().await;
-        assert!(container.query_selector(".voice-icon").unwrap().is_some());
+        assert!(
+            start_button(&container).is_some(),
+            "idle must offer the start button"
+        );
+        assert!(session_bar(&container).is_none());
+
+        state.voice_ui.set(active_voice_state(1));
+        next_tick().await;
+        assert!(
+            start_button(&container).is_none(),
+            "a live session must replace the start button, not sit beside it"
+        );
+        assert!(
+            session_bar(&container)
+                .expect("session bar")
+                .text_content()
+                .unwrap()
+                .contains("Listening"),
+            "the session bar must report the live phase"
+        );
 
         state
             .voice_ui
@@ -1522,16 +1697,102 @@ mod wasm_tests {
                 .unwrap()
                 .contains("voice unavailable")
         );
+        assert!(start_button(&container).is_none());
 
         state.voice_ui.set(VoiceUiState::Idle);
         next_tick().await;
-        assert!(container.query_selector(".voice-icon").unwrap().is_some());
+        assert!(
+            start_button(&container).is_some(),
+            "returning to idle must restore the start button"
+        );
+        assert!(session_bar(&container).is_none());
         drop(mount);
         container.remove();
     }
 
+    /// A server-sent voice_error must leave a visible explanation in the
+    /// composer. This pins the fix for the "voice connects then just vanishes"
+    /// report: the error frame used to reset the UI straight to Idle,
+    /// discarding the error payload, so the session surface disappeared with
+    /// no trace of what went wrong.
     #[wasm_bindgen_test]
-    async fn overlay_reacts_from_unresolved_target_to_available_and_fatal() {
+    async fn voice_error_frame_is_surfaced_and_dismissable() {
+        let _stub = install_voice_listener_stub(None, None);
+        let container = container();
+        let state = AppState::new();
+        open_voice_gate(&state);
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            let state = render_state.clone();
+            provide_context(state.clone());
+            let agent_ref = Signal::derive(move || state.active_agent.get());
+            view! {
+                <VoiceComposerBar agent_ref=agent_ref />
+                <VoiceComposerButton agent_ref=agent_ref />
+            }
+        });
+        next_tick().await;
+
+        state.voice_ui.set(active_voice_state(1));
+        next_tick().await;
+        assert!(session_bar(&container).is_some());
+
+        let envelope = protocol::Envelope::from_payload(
+            StreamPath("/voice/voice-session".to_owned()),
+            FrameKind::VoiceError,
+            1,
+            &protocol::VoiceErrorPayload {
+                session_id: Some(protocol::VoiceSessionId("voice-session".to_owned())),
+                generation: 1,
+                code: protocol::VoiceErrorCode::ProviderUnavailable,
+                retryable: true,
+                fatal: true,
+            },
+        )
+        .expect("encode voice_error envelope");
+        handle_control(&state, "local", &envelope);
+        next_tick().await;
+
+        let bar = session_bar(&container)
+            .expect("a voice error must keep the session surface visible, not vanish");
+        let text = bar.text_content().unwrap();
+        assert!(
+            text.contains("Amazon Bedrock"),
+            "the error must name what failed, got: {text}"
+        );
+        assert!(
+            text.contains("retry"),
+            "a retryable error must invite a retry, got: {text}"
+        );
+        assert!(
+            start_button(&container).is_none(),
+            "the start button must not sit beside an undismissed error"
+        );
+
+        let dismiss: HtmlElement = bar
+            .query_selector("button")
+            .unwrap()
+            .expect("the error surface must offer a dismiss action")
+            .dyn_into()
+            .unwrap();
+        dismiss.click();
+        next_tick().await;
+        assert!(session_bar(&container).is_none());
+        assert!(
+            start_button(&container).is_some(),
+            "dismissing the error must restore the start button"
+        );
+
+        drop(mount);
+        container.remove();
+    }
+
+    /// The gate walk that used to be asserted on the floating strip. Same
+    /// contract — unresolved target, unstarted agent, unsupported build and
+    /// fatal agent each withhold the affordance — now asserted on the composer
+    /// button that replaced it.
+    #[wasm_bindgen_test]
+    async fn composer_button_reacts_from_unresolved_target_to_available_and_fatal() {
         let container = container();
         let state = AppState::new();
         state.host_settings_by_host.update(|settings| {
@@ -1547,17 +1808,14 @@ mod wasm_tests {
         });
         let render_state = state.clone();
         let mount = mount_to(container.clone(), move || {
-            provide_context(render_state.clone());
-            view! { <VoiceOverlay /> }
+            let state = render_state.clone();
+            provide_context(state.clone());
+            let agent_ref = Signal::derive(move || state.active_agent.get());
+            view! { <VoiceComposerButton agent_ref=agent_ref /> }
         });
         next_tick().await;
 
-        assert!(
-            container
-                .query_selector("[data-testid='voice-strip']")
-                .unwrap()
-                .is_none()
-        );
+        assert!(start_button(&container).is_none());
 
         state.open_tab(
             TabContent::chat_with_agent(ActiveAgentRef {
@@ -1571,45 +1829,54 @@ mod wasm_tests {
 
         state.agents.set(vec![gate_test_agent(false)]);
         next_tick().await;
+        assert!(
+            start_button(&container).is_none(),
+            "an unstarted agent has no voice target"
+        );
 
         state.agents.update(|agents| agents[0].started = true);
         next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-testid='voice-strip'] .voice-icon")
-                .unwrap()
-                .is_some()
-        );
+        assert!(start_button(&container).is_some());
 
         state.native_voice_supported.set(false);
         next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-testid='voice-strip']")
-                .unwrap()
-                .is_none()
-        );
+        assert!(start_button(&container).is_none());
 
         state.native_voice_supported.set(true);
         next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-testid='voice-strip'] .voice-icon")
-                .unwrap()
-                .is_some()
-        );
+        assert!(start_button(&container).is_some());
 
         state.agents.update(|agents| {
             agents[0].fatal_error = Some("not exposed".to_owned());
         });
         next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-testid='voice-strip']")
-                .unwrap()
-                .is_none()
-        );
+        assert!(start_button(&container).is_none());
 
+        drop(mount);
+        container.remove();
+    }
+
+    /// A composer showing a chat other than the active one must not render
+    /// voice controls: voice always acts on the active agent, so a split-pane
+    /// button there would start a session against a different chat.
+    #[wasm_bindgen_test]
+    async fn composer_button_is_withheld_from_non_active_chats() {
+        let container = container();
+        let state = AppState::new();
+        open_voice_gate(&state);
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(render_state.clone());
+            let other = Signal::derive(|| {
+                Some(ActiveAgentRef {
+                    host_id: "local".to_owned(),
+                    agent_id: AgentId("other-agent".to_owned()),
+                })
+            });
+            view! { <VoiceComposerButton agent_ref=other /> }
+        });
+        next_tick().await;
+        assert!(start_button(&container).is_none());
         drop(mount);
         container.remove();
     }

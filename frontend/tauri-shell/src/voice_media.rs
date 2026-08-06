@@ -849,7 +849,20 @@ fn mono_f32_config(device: &cpal::Device, input: bool) -> Result<cpal::StreamCon
             config.buffer_size = cpal::BufferSize::Default;
             config
         })
-        .ok_or("A 48 kHz f32 audio format is unavailable".into())
+        .ok_or_else(|| {
+            if input {
+                // macOS hides input formats from processes without microphone
+                // permission, so a missing 48 kHz format on a Mac with a
+                // working microphone usually means the permission was never
+                // granted (or never requestable for this binary).
+                "The microphone offers no 48 kHz f32 format. If this machine has a working \
+                 microphone, Tyde likely lacks microphone permission (macOS: System Settings \
+                 → Privacy & Security → Microphone)."
+                    .into()
+            } else {
+                "The audio output device offers no 48 kHz f32 format".into()
+            }
+        })
 }
 
 #[cfg(test)]

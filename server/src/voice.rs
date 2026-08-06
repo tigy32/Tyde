@@ -673,6 +673,13 @@ impl VoiceConnection {
             serde_json::to_value(ending).unwrap_or_default(),
         );
         active.cancel.cancel();
+        // Nova requires every open content block to be closed before promptEnd;
+        // ending the prompt with the microphone content still open draws a
+        // ValidationException ("All contents must be closed before ending
+        // prompt") on every teardown.
+        if !active.input_ended {
+            let _ = active.provider.send(NovaInput::InputEnd);
+        }
         let _ = active.provider.send(NovaInput::Stop);
         active.provider.close();
         let (packets, bytes) = self
@@ -1113,6 +1120,12 @@ impl VoiceConnection {
             return Ok(());
         }
         if let Some((id, generation, code, retryable)) = provider_error {
+            tracing::warn!(
+                session = %id.0,
+                code = ?code,
+                retryable,
+                "voice provider error ended the session"
+            );
             self.emit_error(Some(id), generation, code, retryable, true)?;
         }
         if provider_ended {

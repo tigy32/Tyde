@@ -1375,7 +1375,7 @@ pub fn App() -> impl IntoView {
             <HostBrowser />
             <HelpTour />
             <HoverPopover />
-            <crate::voice::VoiceOverlay />
+            <crate::voice::VoiceRuntime />
         </div>
     }
 }

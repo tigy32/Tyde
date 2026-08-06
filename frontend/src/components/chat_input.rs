@@ -1315,6 +1315,8 @@ pub fn ChatInput(
                 </div>
             </Show>
 
+            <crate::voice::VoiceComposerBar agent_ref=agent_ref />
+
             <div class="chat-input-row">
                 <textarea
                     class="chat-textarea"
@@ -1335,6 +1337,7 @@ pub fn ChatInput(
                     autocapitalize="none"
                     autocomplete="off"
                 />
+                <crate::voice::VoiceComposerButton agent_ref=agent_ref />
                 <div
                     class="chat-send-split"
                     role="group"
@@ -2441,5 +2444,115 @@ mod wasm_tests {
             !cancel.text_content().unwrap_or_default().contains('⌘'),
             "Cancel item must not show a shortcut hint"
         );
+    }
+
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    /// Production stylesheet plus a fixed-size container, so the geometry the
+    /// voice-placement test reads is the geometry the user sees.
+    fn make_styled_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document
+            .get_element_by_id("test-prod-styles-chat-input")
+            .is_none()
+        {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-chat-input");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 800px; height: 400px;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    fn open_voice_gate(state: &AppState) {
+        state.host_settings_by_host.update(|settings| {
+            let mut host = protocol::HostSettings::default();
+            host.voice.enabled = true;
+            settings.insert(HOST.to_owned(), host);
+        });
+        state.voice_capabilities_by_host.update(|capabilities| {
+            capabilities.insert(
+                HOST.to_owned(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, true),
+            );
+        });
+    }
+
+    /// The voice control is a composer button, not something painted over the
+    /// text field.
+    ///
+    /// It used to be a viewport-fixed pill (`position: fixed; left: 50%;
+    /// bottom: 24px`) mounted at the app root, which is exactly where the
+    /// composer sits — so it rendered on top of the textarea and read as a
+    /// button floating in the middle of the text input. This pins the fix in
+    /// the terms the bug appeared in: the button occupies its own horizontal
+    /// space in the button row, between the text field and Send, and no part of
+    /// it overlaps the text field.
+    #[wasm_bindgen_test]
+    async fn voice_button_sits_between_the_text_field_and_send() {
+        let container = make_styled_container();
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        open_voice_gate(&state);
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let voice: HtmlElement = query(&container, "[data-test='chat-voice-start']")
+            .expect("voice-capable chat must offer the voice button in its composer")
+            .dyn_into()
+            .unwrap();
+        let textarea: HtmlElement = query(&container, ".chat-textarea")
+            .expect("composer textarea")
+            .dyn_into()
+            .unwrap();
+        let send: HtmlElement = primary(&container).dyn_into().unwrap();
+
+        let voice_rect = voice.get_bounding_client_rect();
+        let text_rect = textarea.get_bounding_client_rect();
+        let send_rect = send.get_bounding_client_rect();
+
+        assert!(
+            voice_rect.width() > 0.0 && voice_rect.height() > 0.0,
+            "voice button must be laid out, got {:?}x{:?}",
+            voice_rect.width(),
+            voice_rect.height()
+        );
+        assert!(
+            voice_rect.left() >= text_rect.right(),
+            "voice button must begin after the text field ends — it must never \
+             overlap the input: voice.left={} textarea.right={}",
+            voice_rect.left(),
+            text_rect.right()
+        );
+        assert!(
+            voice_rect.right() <= send_rect.left(),
+            "voice button must sit before Send: voice.right={} send.left={}",
+            voice_rect.right(),
+            send_rect.left()
+        );
+        assert!(
+            voice_rect.bottom() <= text_rect.bottom() + 1.0
+                && voice_rect.top() >= text_rect.top() - 1.0,
+            "voice button must share the composer row's baseline band: voice \
+             {}..{} textarea {}..{}",
+            voice_rect.top(),
+            voice_rect.bottom(),
+            text_rect.top(),
+            text_rect.bottom()
+        );
+
+        container.remove();
     }
 }
