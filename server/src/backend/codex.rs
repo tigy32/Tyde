@@ -15615,6 +15615,24 @@ fn codex_raw_event_message(value: &Value, default_message: &str) -> String {
 }
 
 impl Backend for CodexBackend {
+    fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        [
+            tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::ForkSession,
+            tyde_agent_adapter::BackendCapability::ImageInput,
+            tyde_agent_adapter::BackendCapability::Interrupt,
+            tyde_agent_adapter::BackendCapability::SessionSettings,
+            tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
+            tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
+            tyde_agent_adapter::BackendCapability::Customization,
+        ]
+        .into()
+    }
+
     fn session_settings_schema() -> SessionSettingsSchema {
         codex_session_settings_schema(Vec::new())
     }

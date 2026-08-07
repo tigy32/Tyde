@@ -32,6 +32,7 @@ use protocol::{
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tyde_agent_adapter::BackendCapabilities;
 
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
@@ -320,6 +321,17 @@ impl EventStream {
         }
     }
 
+    /// Receive the next normalized event for adapter conformance testing.
+    pub async fn recv_observation(&mut self) -> Option<tyde_agent_adapter::BackendObservation> {
+        self.recv_backend().await.map(|event| match event {
+            BackendEvent::Chat(event) => tyde_agent_adapter::BackendObservation::Chat(event),
+            BackendEvent::ModelRequestTokenUsage(usage) => {
+                tyde_agent_adapter::BackendObservation::ModelRequestTokenUsage(usage)
+            }
+            BackendEvent::Compaction(_) => tyde_agent_adapter::BackendObservation::Other,
+        })
+    }
+
     /// Non-blocking receive used to drain already-buffered backend events
     /// (e.g. queued resume-replay events) without awaiting new ones.
     pub fn try_recv(&mut self) -> Result<ChatEvent, mpsc::error::TryRecvError> {
@@ -418,6 +430,11 @@ pub enum SendOutcome {
 /// The handle is used to send input; the EventStream is used to read output.
 /// Backends are not object-safe — the agent actor knows the concrete type.
 pub trait Backend: Send + Sync + 'static {
+    /// Behaviors every supported runtime of this adapter promises to provide.
+    fn capabilities() -> BackendCapabilities
+    where
+        Self: Sized;
+
     fn session_settings_schema() -> SessionSettingsSchema
     where
         Self: Sized;
@@ -548,6 +565,17 @@ pub trait Backend: Send + Sync + 'static {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;
+}
+
+pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
+    match kind {
+        BackendKind::Tycode => tycode::TycodeBackend::capabilities(),
+        BackendKind::Acp => kiro::KiroBackend::capabilities(),
+        BackendKind::Claude => claude::ClaudeBackend::capabilities(),
+        BackendKind::Codex => codex::CodexBackend::capabilities(),
+        BackendKind::Antigravity => antigravity::AntigravityBackend::capabilities(),
+        BackendKind::Hermes => hermes::HermesBackend::capabilities(),
+    }
 }
 
 pub(crate) enum PreparedBackendHandle {
@@ -1356,12 +1384,129 @@ mod tests {
     };
 
     use super::{
-        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, backend_config_schema_catalog,
-        merge_backend_config_update, merge_backend_config_update_with_schema,
-        render_combined_spawn_instructions, sanitize_backend_config_values,
-        sanitize_backend_config_values_with_schema, validate_backend_config_values_with_schema,
+        Backend, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, backend_config_schema_catalog,
+        capabilities_for_backend_kind, merge_backend_config_update,
+        merge_backend_config_update_with_schema, render_combined_spawn_instructions,
+        sanitize_backend_config_values, sanitize_backend_config_values_with_schema,
+        validate_backend_config_values_with_schema,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
+    use tyde_agent_adapter::BackendCapability;
+
+    #[test]
+    fn every_backend_capability_declaration_is_valid() {
+        for kind in [
+            BackendKind::Tycode,
+            BackendKind::Acp,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Hermes,
+        ] {
+            capabilities_for_backend_kind(kind)
+                .validate()
+                .unwrap_or_else(|error| panic!("invalid {kind:?} capabilities: {error}"));
+        }
+        super::mock::MockBackend::capabilities()
+            .validate()
+            .expect("invalid mock capabilities");
+    }
+
+    #[test]
+    fn provider_request_usage_is_only_promised_by_codex() {
+        for kind in [
+            BackendKind::Tycode,
+            BackendKind::Acp,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Hermes,
+        ] {
+            assert_eq!(
+                capabilities_for_backend_kind(kind)
+                    .contains(BackendCapability::ModelRequestUsageReported),
+                kind == BackendKind::Codex,
+                "unexpected provider request usage declaration for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_promises_background_and_agent_initiated_turns() {
+        let capabilities = capabilities_for_backend_kind(BackendKind::Claude);
+
+        assert!(capabilities.contains(BackendCapability::BackgroundTasks));
+        assert!(capabilities.contains(BackendCapability::AgentInitiatedTurns));
+    }
+
+    #[test]
+    fn no_backend_claims_an_authoritative_context_breakdown() {
+        for kind in [
+            BackendKind::Tycode,
+            BackendKind::Acp,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Hermes,
+        ] {
+            assert!(
+                !capabilities_for_backend_kind(kind)
+                    .contains(BackendCapability::ContextBreakdownReported),
+                "{kind:?} must not advertise an estimated context breakdown as reported"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_backend_stream_passes_universal_conformance_validation() {
+        let capabilities = super::mock::MockBackend::capabilities();
+        let mut validator = tyde_agent_adapter::BackendConformanceValidator::new(capabilities)
+            .expect("valid mock capability declaration");
+        validator.input_accepted().expect("record initial input");
+        let (backend, mut events) = super::mock::MockBackend::spawn(
+            vec!["/tmp".to_owned()],
+            super::BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "universal backend conformance".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn mock backend");
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv_backend())
+                    .await
+                    .expect("mock conformance event timeout")
+                    .expect("mock conformance stream closed early");
+            match &event {
+                super::BackendEvent::Chat(event) => {
+                    validator
+                        .observe_chat_event(event)
+                        .unwrap_or_else(|error| panic!("mock event violated contract: {error}"));
+                }
+                super::BackendEvent::ModelRequestTokenUsage(usage) => {
+                    validator
+                        .observe_model_request_usage(usage)
+                        .unwrap_or_else(|error| panic!("mock usage violated contract: {error}"));
+                }
+                super::BackendEvent::Compaction(_) => {}
+            }
+            if matches!(
+                event,
+                super::BackendEvent::Chat(protocol::ChatEvent::TypingStatusChanged(false))
+            ) {
+                break;
+            }
+        }
+
+        backend.shutdown().await;
+        let snapshot = validator.finish().expect("complete mock conformance run");
+        assert_eq!(snapshot.completed_turns, 1);
+    }
 
     /// Deep-config validation/merge semantics are schema-driven; no built-in
     /// backend currently publishes a typed schema (Hermes moved to

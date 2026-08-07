@@ -1847,6 +1847,20 @@ fn verify_tycode_settings_overlay(expected: &Value, actual: &Value) -> Result<()
 }
 
 impl Backend for TycodeBackend {
+    fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        [
+            tyde_agent_adapter::BackendCapability::ListSessions,
+            tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::Interrupt,
+            tyde_agent_adapter::BackendCapability::SessionSettings,
+            tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
+            tyde_agent_adapter::BackendCapability::Customization,
+        ]
+        .into()
+    }
+
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         tycode_session_settings_schema()
     }

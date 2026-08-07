@@ -767,6 +767,22 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
 }
 
 impl Backend for HermesBackend {
+    fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        [
+            tyde_agent_adapter::BackendCapability::ListSessions,
+            tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::Interrupt,
+            tyde_agent_adapter::BackendCapability::SessionSettings,
+            tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
+            tyde_agent_adapter::BackendCapability::Customization,
+        ]
+        .into()
+    }
+
     fn session_settings_schema() -> SessionSettingsSchema {
         SessionSettingsSchema {
             backend_kind: BackendKind::Hermes,

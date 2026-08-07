@@ -335,6 +335,19 @@ fn mock_compaction_capability_for_control(control: &str) -> BackendCompactionCap
 }
 
 impl Backend for MockBackend {
+    fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        [
+            tyde_agent_adapter::BackendCapability::ListSessions,
+            tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::ForkSession,
+            tyde_agent_adapter::BackendCapability::Interrupt,
+            tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+        ]
+        .into()
+    }
+
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         empty_session_settings_schema(BackendKind::Claude)
     }

@@ -4056,6 +4056,18 @@ pub(crate) fn resolve_session_settings(
 }
 
 impl Backend for KiroBackend {
+    fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        [
+            tyde_agent_adapter::BackendCapability::ListSessions,
+            tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::Interrupt,
+            tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
+            tyde_agent_adapter::BackendCapability::Customization,
+        ]
+        .into()
+    }
+
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         empty_session_settings_schema(BackendKind::Acp)
     }

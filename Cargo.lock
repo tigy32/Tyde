@@ -6966,6 +6966,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tyde-agent-adapter",
  "url",
  "uuid",
 ]
@@ -7919,6 +7920,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
+ "tyde-agent-adapter",
  "tyde-dev-driver",
  "uuid",
 ]
@@ -8439,6 +8441,14 @@ dependencies = [
  "serde",
  "serde_derive",
  "syntect",
+]
+
+[[package]]
+name = "tyde-agent-adapter"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde_json",
 ]
 
 [[package]]

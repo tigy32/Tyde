@@ -24,6 +24,7 @@ use protocol::{
 };
 use serde_json::{Value, json};
 use server::backend::{Backend, BackendSession};
+use tyde_agent_adapter::{BackendObservation, CertificationCase};
 use uuid::Uuid;
 
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,6 +33,10 @@ const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
 const DEFAULT_HERMES_TEST_PYTHON: &str = "/Users/mike/.hermes/tyde-hermes-python";
 const DEFAULT_HERMES_TEST_PROVIDER: &str = "openrouter";
 const DEFAULT_HERMES_TEST_MODEL: &str = "anthropic/claude-haiku-4.5";
+const UNIVERSAL_CLAUDE_MODEL: &str = "haiku";
+const UNIVERSAL_CLAUDE_EFFORT: &str = "low";
+const UNIVERSAL_CODEX_MODEL: &str = "gpt-5.6-luna";
+const UNIVERSAL_CODEX_REASONING_EFFORT: &str = "low";
 const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
 static REAL_ANTIGRAVITY_NATIVE_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -4613,16 +4618,39 @@ impl RealBackendFixture {
         // These tests spawn with low cost hints to keep real backend runs
         // fast and cheap. Hints are ignored unless complexity tiers are
         // enabled, so seed the settings store with the feature on.
+        let mut settings = json!({
+            "settings": {
+                "enabled_backends": [backend_kind],
+                "default_backend": backend_kind,
+                "complexity_tiers_enabled": true
+            }
+        });
+        match backend_kind {
+            BackendKind::Claude => {
+                settings["settings"]["backend_tier_configs"] = json!({
+                    "claude": {
+                        "low": {
+                            "model": {"string": UNIVERSAL_CLAUDE_MODEL},
+                            "effort": {"string": UNIVERSAL_CLAUDE_EFFORT}
+                        }
+                    }
+                });
+            }
+            BackendKind::Codex => {
+                settings["settings"]["backend_tier_configs"] = json!({
+                    "codex": {
+                        "low": {
+                            "model": {"string": UNIVERSAL_CODEX_MODEL},
+                            "reasoning_effort": {"string": UNIVERSAL_CODEX_REASONING_EFFORT}
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
         std::fs::write(
             &settings_path,
-            serde_json::to_vec(&json!({
-                "settings": {
-                    "enabled_backends": [backend_kind],
-                    "default_backend": backend_kind,
-                    "complexity_tiers_enabled": true
-                }
-            }))
-            .expect("serialize real backend settings"),
+            serde_json::to_vec(&settings).expect("serialize real backend settings"),
         )
         .expect("seed settings store with complexity tiers enabled");
         // Real backends — NOT mock
@@ -6835,6 +6863,1286 @@ async fn assert_backend_interrupts_long_running_command(
 // ---------------------------------------------------------------------------
 // Real backend tests — opt-in because they can make real AI calls
 // ---------------------------------------------------------------------------
+
+const UNIVERSAL_REAL_BACKENDS_ENV: &str = "TYDE_REAL_BACKENDS";
+
+fn universal_real_backends() -> Result<Vec<BackendKind>, String> {
+    let configured = std::env::var(UNIVERSAL_REAL_BACKENDS_ENV)
+        .unwrap_or_else(|_| "claude,codex,kiro,hermes".to_owned());
+    let mut backends = Vec::new();
+    for value in configured
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let backend = match value.to_ascii_lowercase().as_str() {
+            "claude" => BackendKind::Claude,
+            "codex" => BackendKind::Codex,
+            "kiro" | "acp" => BackendKind::Acp,
+            "hermes" => BackendKind::Hermes,
+            "tycode" => BackendKind::Tycode,
+            "antigravity" | "agy" => BackendKind::Antigravity,
+            _ => {
+                return Err(format!(
+                    "unknown backend {value:?} in {UNIVERSAL_REAL_BACKENDS_ENV}"
+                ));
+            }
+        };
+        if !backends.contains(&backend) {
+            backends.push(backend);
+        }
+    }
+    if backends.is_empty() {
+        return Err(format!(
+            "{UNIVERSAL_REAL_BACKENDS_ENV} selected no backends"
+        ));
+    }
+    Ok(backends)
+}
+
+fn universal_backend_config(backend_kind: BackendKind) -> server::backend::BackendSpawnConfig {
+    let mut config = server::backend::BackendSpawnConfig {
+        cost_hint: cost_hint_for(backend_kind),
+        ..Default::default()
+    };
+    if backend_kind == BackendKind::Claude {
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String(UNIVERSAL_CLAUDE_MODEL.to_owned()),
+        );
+        settings.0.insert(
+            "effort".to_owned(),
+            SessionSettingValue::String(UNIVERSAL_CLAUDE_EFFORT.to_owned()),
+        );
+        config.session_settings = Some(settings);
+    } else if backend_kind == BackendKind::Hermes {
+        let provider = std::env::var("TYDE_HERMES_TEST_PROVIDER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_HERMES_TEST_PROVIDER.to_owned());
+        let model = std::env::var("TYDE_HERMES_TEST_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_HERMES_TEST_MODEL.to_owned());
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String(format!("{model} --provider {provider}")),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("none".to_owned()),
+        );
+        config.session_settings = Some(settings);
+    } else if backend_kind == BackendKind::Codex {
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String(UNIVERSAL_CODEX_MODEL.to_owned()),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String(UNIVERSAL_CODEX_REASONING_EFFORT.to_owned()),
+        );
+        config.session_settings = Some(settings);
+    }
+    config
+}
+
+#[derive(Debug)]
+struct DirectCertificationObservation {
+    prompt: String,
+    chat: Vec<ChatEvent>,
+    request_usage: Vec<protocol::ModelRequestTokenUsage>,
+}
+
+impl DirectCertificationObservation {
+    fn trace(&self) -> String {
+        self.chat
+            .iter()
+            .enumerate()
+            .map(|(index, event)| format!("{index}: {event:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn event_index(&self, predicate: impl Fn(&ChatEvent) -> bool) -> Option<usize> {
+        self.chat.iter().position(predicate)
+    }
+
+    fn final_message(&self) -> ChatMessage {
+        let mut message = self
+            .chat
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(end) => Some(end.message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing StreamEnd; trace:\n{}", self.trace()));
+        for event in &self.chat {
+            if let ChatEvent::MessageMetadataUpdated(update) = event
+                && message.message_id.as_ref() == Some(&update.message_id)
+            {
+                if let Some(model_info) = &update.model_info {
+                    message.model_info = Some(model_info.clone());
+                }
+                if let Some(token_usage) = &update.token_usage {
+                    message.token_usage = Some(token_usage.clone());
+                }
+                if let Some(context_breakdown) = &update.context_breakdown {
+                    message.context_breakdown = Some(context_breakdown.clone());
+                }
+            }
+        }
+        message
+    }
+
+    fn streamed_text(&self) -> String {
+        self.chat
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamDelta(delta) => Some(delta.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+async fn collect_direct_certification_observation<B: Backend>(
+    backend_kind: BackendKind,
+    prompt: &str,
+) -> DirectCertificationObservation {
+    let workspace = tempfile::tempdir().expect("create direct certification workspace");
+    std::fs::write(
+        workspace.path().join("README.txt"),
+        "direct certification workspace",
+    )
+    .expect("seed direct certification workspace");
+    let (backend, mut events) = B::spawn(
+        vec![workspace.path().to_string_lossy().to_string()],
+        universal_backend_config(backend_kind),
+        protocol::SendMessagePayload {
+            message: prompt.to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} spawn failed: {error}", backend_label(backend_kind)));
+    let mut observation = DirectCertificationObservation {
+        prompt: prompt.to_owned(),
+        chat: Vec::new(),
+        request_usage: Vec::new(),
+    };
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = events.recv_observation().await {
+            match event {
+                BackendObservation::Chat(event) => {
+                    let terminal = matches!(event, ChatEvent::TypingStatusChanged(false))
+                        && observation
+                            .chat
+                            .iter()
+                            .any(|event| matches!(event, ChatEvent::StreamEnd(_)));
+                    observation.chat.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                BackendObservation::ModelRequestTokenUsage(usage) => {
+                    observation.request_usage.push(usage);
+                }
+                BackendObservation::Other => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} direct case timed out", backend_label(backend_kind)));
+    backend.shutdown().await;
+    observation
+}
+
+async fn collect_direct_case(backend_kind: BackendKind) -> DirectCertificationObservation {
+    const PROMPT: &str = "Reply with exactly CERTIFICATION_OK and nothing else.";
+    match backend_kind {
+        BackendKind::Claude => {
+            collect_direct_certification_observation::<server::backend::claude::ClaudeBackend>(
+                backend_kind,
+                PROMPT,
+            )
+            .await
+        }
+        BackendKind::Codex => {
+            collect_direct_certification_observation::<server::backend::codex::CodexBackend>(
+                backend_kind,
+                PROMPT,
+            )
+            .await
+        }
+        BackendKind::Acp => {
+            collect_direct_certification_observation::<server::backend::kiro::KiroBackend>(
+                backend_kind,
+                PROMPT,
+            )
+            .await
+        }
+        BackendKind::Hermes => {
+            collect_direct_certification_observation::<server::backend::hermes::HermesBackend>(
+                backend_kind,
+                PROMPT,
+            )
+            .await
+        }
+        BackendKind::Tycode => {
+            collect_direct_certification_observation::<server::backend::tycode::TycodeBackend>(
+                backend_kind,
+                PROMPT,
+            )
+            .await
+        }
+        BackendKind::Antigravity => {
+            collect_direct_certification_observation::<
+                server::backend::antigravity::AntigravityBackend,
+            >(backend_kind, PROMPT)
+            .await
+        }
+    }
+}
+
+fn known_turn_usage(observation: &DirectCertificationObservation) -> TokenUsage {
+    let message = observation.final_message();
+    let usage = message.token_usage.unwrap_or_else(|| {
+        panic!(
+            "missing message token usage; trace:\n{}",
+            observation.trace()
+        )
+    });
+    let TokenUsageScope::Known { usage } = usage.turn else {
+        panic!("turn usage was not reported as known: {usage:?}");
+    };
+    *usage
+}
+
+fn assert_direct_certification_case(
+    backend_kind: BackendKind,
+    case: CertificationCase,
+    observation: &DirectCertificationObservation,
+) {
+    let trace = observation.trace();
+    match case {
+        CertificationCase::InitialInputEchoedOnce => {
+            let count = observation
+                .chat
+                .iter()
+                .filter(|event| {
+                    matches!(event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::User)
+                            && message.content == observation.prompt)
+                })
+                .count();
+            assert_eq!(count, 1, "user echo count was {count}; trace:\n{trace}");
+        }
+        CertificationCase::TypingStarts => assert!(
+            observation
+                .chat
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true))),
+            "missing typing true; trace:\n{trace}"
+        ),
+        CertificationCase::TypingStartsOnce => assert_eq!(
+            observation
+                .chat
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+                .count(),
+            1,
+            "typing true was duplicated; trace:\n{trace}"
+        ),
+        CertificationCase::StreamStarts => assert!(
+            observation
+                .chat
+                .iter()
+                .any(|event| matches!(event, ChatEvent::StreamStart(_))),
+            "missing StreamStart; trace:\n{trace}"
+        ),
+        CertificationCase::VisibleDeltaEmitted => assert!(
+            observation.chat.iter().any(
+                |event| matches!(event, ChatEvent::StreamDelta(delta) if !delta.text.is_empty())
+            ),
+            "missing visible delta; trace:\n{trace}"
+        ),
+        CertificationCase::StreamEnds => assert!(
+            observation
+                .chat
+                .iter()
+                .any(|event| matches!(event, ChatEvent::StreamEnd(_))),
+            "missing StreamEnd; trace:\n{trace}"
+        ),
+        CertificationCase::StreamStartsOnce => assert_eq!(
+            observation
+                .chat
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
+                .count(),
+            1,
+            "StreamStart was duplicated; trace:\n{trace}"
+        ),
+        CertificationCase::StreamEndsOnce => assert_eq!(
+            observation
+                .chat
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .count(),
+            1,
+            "StreamEnd was duplicated; trace:\n{trace}"
+        ),
+        CertificationCase::TypingStopsOnce => assert_eq!(
+            observation
+                .chat
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                .count(),
+            1,
+            "typing false was duplicated; trace:\n{trace}"
+        ),
+        CertificationCase::NoErrorOnSuccessfulTurn => assert!(
+            !observation.chat.iter().any(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    ..
+                })
+            )),
+            "successful turn emitted an error; trace:\n{trace}"
+        ),
+        CertificationCase::TypingStopsAfterStreamEnd => {
+            let end = observation
+                .event_index(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .unwrap_or_else(|| panic!("missing StreamEnd; trace:\n{trace}"));
+            let idle = observation
+                .event_index(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                .unwrap_or_else(|| panic!("missing typing false; trace:\n{trace}"));
+            assert!(
+                idle > end,
+                "typing stopped before StreamEnd; trace:\n{trace}"
+            );
+        }
+        CertificationCase::LifecycleOrderIsValid => {
+            let typing = observation
+                .event_index(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+                .unwrap_or_else(|| panic!("missing typing true; trace:\n{trace}"));
+            let start = observation
+                .event_index(|event| matches!(event, ChatEvent::StreamStart(_)))
+                .unwrap_or_else(|| panic!("missing StreamStart; trace:\n{trace}"));
+            let end = observation
+                .event_index(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .unwrap_or_else(|| panic!("missing StreamEnd; trace:\n{trace}"));
+            let idle = observation
+                .event_index(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                .unwrap_or_else(|| panic!("missing typing false; trace:\n{trace}"));
+            assert!(
+                typing < start && start < end && end < idle,
+                "invalid lifecycle order; trace:\n{trace}"
+            );
+        }
+        CertificationCase::StreamIdentityIsStable => {
+            let start_id = observation.chat.iter().find_map(|event| match event {
+                ChatEvent::StreamStart(start) => start.message_id.as_ref(),
+                _ => None,
+            });
+            let final_message = observation.final_message();
+            assert_eq!(
+                start_id,
+                final_message.message_id.as_ref().map(|id| &id.0),
+                "stream identity changed; trace:\n{trace}"
+            );
+        }
+        CertificationCase::DeltasReconstructFinalMessage => {
+            let streamed = observation.streamed_text();
+            let final_message = observation.final_message();
+            assert_eq!(
+                streamed, final_message.content,
+                "deltas did not reconstruct final message; trace:\n{trace}"
+            );
+        }
+        CertificationCase::ExactResponseDelivered => assert_eq!(
+            observation.final_message().content.trim(),
+            "CERTIFICATION_OK",
+            "unexpected response from {}",
+            backend_label(backend_kind)
+        ),
+        CertificationCase::TurnUsagePresent => {
+            let _ = known_turn_usage(observation);
+        }
+        CertificationCase::TurnInputTokensPositive => assert!(
+            known_turn_usage(observation).input_tokens > 0,
+            "reported zero input tokens"
+        ),
+        CertificationCase::TurnOutputTokensPositive => assert!(
+            known_turn_usage(observation).output_tokens > 0,
+            "reported zero output tokens"
+        ),
+        CertificationCase::TurnTotalConsistent => {
+            assert_token_usage_sane("direct certification turn", &known_turn_usage(observation));
+        }
+        CertificationCase::RequestUsagePresent => assert!(
+            !observation.request_usage.is_empty(),
+            "missing provider-request usage; trace:\n{trace}"
+        ),
+        CertificationCase::RequestSequenceStartsAtOne => assert_eq!(
+            observation
+                .request_usage
+                .first()
+                .unwrap_or_else(|| panic!("missing request usage; trace:\n{trace}"))
+                .request_id
+                .sequence,
+            1
+        ),
+        CertificationCase::RequestSequencesContiguous => {
+            for (index, usage) in observation.request_usage.iter().enumerate() {
+                assert_eq!(usage.request_id.sequence as usize, index + 1);
+            }
+        }
+        CertificationCase::RequestUsageMatchesTurn => {
+            let turn_id = &observation
+                .request_usage
+                .first()
+                .unwrap_or_else(|| panic!("missing request usage; trace:\n{trace}"))
+                .request_id
+                .turn_id;
+            assert!(
+                observation
+                    .request_usage
+                    .iter()
+                    .all(|usage| &usage.request_id.turn_id == turn_id),
+                "request usage crossed turn identities"
+            );
+        }
+        CertificationCase::RequestIdsUnique => {
+            let ids = observation
+                .request_usage
+                .iter()
+                .map(|usage| &usage.request_id)
+                .collect::<HashSet<_>>();
+            assert_eq!(ids.len(), observation.request_usage.len());
+        }
+        CertificationCase::RequestUsagePositive => assert!(
+            observation.request_usage.iter().all(|usage| {
+                usage.request.input_tokens > 0
+                    && usage.request.output_tokens > 0
+                    && usage.request.total_tokens > 0
+            }),
+            "provider request reported zero usage: {:?}",
+            observation.request_usage
+        ),
+        CertificationCase::ContextUsagePresent => assert!(
+            observation.request_usage.iter().any(|usage| {
+                usage
+                    .current_context_usage
+                    .as_ref()
+                    .is_some_and(|context| context.known().is_some())
+                    || usage.model_context_window.is_some()
+            }) || observation.final_message().context_breakdown.is_some(),
+            "missing context usage; trace:\n{trace}"
+        ),
+        CertificationCase::ContextWindowValid => {
+            let contexts = observation
+                .request_usage
+                .iter()
+                .filter_map(|usage| usage.current_context_usage.as_ref()?.known())
+                .collect::<Vec<_>>();
+            assert!(!contexts.is_empty(), "missing known context usage");
+            assert!(
+                contexts
+                    .iter()
+                    .all(|(input, window)| *window > 0 && input <= window)
+            );
+        }
+        _ => panic!("{} is not a direct single-turn case", case.id()),
+    }
+}
+
+fn is_direct_certification_case(case: CertificationCase) -> bool {
+    matches!(
+        case,
+        CertificationCase::InitialInputEchoedOnce
+            | CertificationCase::TypingStarts
+            | CertificationCase::TypingStartsOnce
+            | CertificationCase::StreamStarts
+            | CertificationCase::VisibleDeltaEmitted
+            | CertificationCase::StreamEnds
+            | CertificationCase::StreamStartsOnce
+            | CertificationCase::StreamEndsOnce
+            | CertificationCase::TypingStopsOnce
+            | CertificationCase::NoErrorOnSuccessfulTurn
+            | CertificationCase::TypingStopsAfterStreamEnd
+            | CertificationCase::LifecycleOrderIsValid
+            | CertificationCase::StreamIdentityIsStable
+            | CertificationCase::DeltasReconstructFinalMessage
+            | CertificationCase::ExactResponseDelivered
+            | CertificationCase::TurnUsagePresent
+            | CertificationCase::TurnInputTokensPositive
+            | CertificationCase::TurnOutputTokensPositive
+            | CertificationCase::TurnTotalConsistent
+            | CertificationCase::RequestUsagePresent
+            | CertificationCase::RequestSequenceStartsAtOne
+            | CertificationCase::RequestSequencesContiguous
+            | CertificationCase::RequestUsageMatchesTurn
+            | CertificationCase::RequestIdsUnique
+            | CertificationCase::RequestUsagePositive
+            | CertificationCase::ContextUsagePresent
+            | CertificationCase::ContextWindowValid
+    )
+}
+
+async fn assert_backend_reports_tool_failure(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let prompt = "Use the command execution tool exactly once to run `sh -c 'exit 37'`. Do not use any other tool. After it fails, reply TOOL_FAILURE_OBSERVED.";
+    let workspace_roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "tool-failure-certification",
+        prompt,
+    )
+    .await;
+    let turn = expect_tool_turn_after_user_echo(&mut fixture.client, &stream, prompt).await;
+    assert!(
+        turn.tool_completions
+            .iter()
+            .any(|completion| !completion.success),
+        "{} did not report a failed completion: {:?}",
+        backend_label(backend_kind),
+        turn.tool_completions
+    );
+}
+
+async fn assert_workspace_instructions_case(backend_kind: BackendKind) {
+    const SENTINEL: &str = "WORKSPACE_INSTRUCTIONS_OK";
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    std::fs::write(
+        fixture.workspace_dir.path().join("AGENTS.md"),
+        format!("When asked for the workspace sentinel, reply exactly `{SENTINEL}`."),
+    )
+    .expect("write AGENTS.md");
+    let prompt = "Reply with exactly the workspace sentinel required by AGENTS.md.";
+    let roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        roots,
+        backend_kind,
+        "workspace-instructions-case",
+        prompt,
+    )
+    .await;
+    let turn = expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, prompt).await;
+    assert_eq!(turn.final_text.trim(), SENTINEL);
+}
+
+async fn assert_host_steering_case(backend_kind: BackendKind) {
+    const SENTINEL: &str = "HOST_STEERING_OK";
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    fixture
+        .client
+        .inner
+        .steering_upsert(protocol::SteeringUpsertPayload {
+            steering: protocol::Steering {
+                id: protocol::SteeringId("live-host-steering-case".to_owned()),
+                scope: protocol::SteeringScope::Host,
+                title: "Live host steering case".to_owned(),
+                content: format!(
+                    "When asked for the steering sentinel, reply exactly `{SENTINEL}`."
+                ),
+            },
+        })
+        .await
+        .expect("install host steering");
+    let prompt = "Reply with exactly the sentinel required by Tyde steering.";
+    let roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        roots,
+        backend_kind,
+        "host-steering-case",
+        prompt,
+    )
+    .await;
+    let turn = expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, prompt).await;
+    assert_eq!(turn.final_text.trim(), SENTINEL);
+}
+
+async fn observe_skill_case(backend_kind: BackendKind) -> AssistantTurn {
+    const SENTINEL: &str = "SKILL_DELIVERY_OK";
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let skill_dir = fixture
+        .session_store_dir
+        .path()
+        .join("skills")
+        .join("live-certification-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill directory");
+    let skill = protocol::Skill {
+        id: protocol::SkillId("live-certification-skill".to_owned()),
+        name: "live-certification-skill".to_owned(),
+        title: Some("Live certification skill".to_owned()),
+        description: Some("Returns the live skill sentinel".to_owned()),
+    };
+    std::fs::write(
+        skill_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&skill).expect("serialize skill metadata"),
+    )
+    .expect("write skill metadata");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("When invoked, reply exactly `{SENTINEL}`."),
+    )
+    .expect("write skill body");
+    fixture
+        .client
+        .inner
+        .skill_refresh(protocol::SkillRefreshPayload {})
+        .await
+        .expect("refresh skills");
+    let prompt = "Invoke the installed skill named live-certification-skill and follow it exactly.";
+    let roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        roots,
+        backend_kind,
+        "skill-delivery-case",
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+    expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, prompt).await
+}
+
+async fn observe_mcp_case(backend_kind: BackendKind) -> ToolTurn {
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let script = fixture.workspace_dir.path().join("narrow_mcp_probe.py");
+    std::fs::write(
+        &script,
+        r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "initialize":
+        result = {"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"narrow-certification","version":"1"}}
+    elif request.get("method") == "tools/list":
+        result = {"tools":[{"name":"narrow_probe","description":"Return NARROW_MCP_OK","inputSchema":{"type":"object","properties":{},"additionalProperties":False}}]}
+    elif request.get("method") == "tools/call":
+        result = {"content":[{"type":"text","text":"NARROW_MCP_OK"}],"isError":False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc":"2.0","id":request_id,"result":result}), flush=True)
+"#,
+    )
+    .expect("write narrow MCP server");
+    fixture
+        .client
+        .inner
+        .mcp_server_upsert(protocol::McpServerUpsertPayload {
+            mcp_server: protocol::McpServerConfig {
+                id: protocol::McpServerId("narrow-live-mcp".to_owned()),
+                name: "narrow_certification".to_owned(),
+                transport: protocol::McpTransportConfig::Stdio {
+                    command: "python3".to_owned(),
+                    args: vec![script.to_string_lossy().to_string()],
+                    env: HashMap::new(),
+                },
+            },
+        })
+        .await
+        .expect("install narrow MCP server");
+    let prompt = "Call the MCP tool whose description says Return NARROW_MCP_OK, then reply with its exact result.";
+    let roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        roots,
+        backend_kind,
+        "narrow-mcp-case",
+        prompt,
+    )
+    .await;
+    expect_tool_turn_after_user_echo(&mut fixture.client, &stream, prompt).await
+}
+
+async fn collect_backend_text_until_idle(events: &mut server::backend::EventStream) -> String {
+    let mut streamed = String::new();
+    let mut final_text = String::new();
+    let mut saw_end = false;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::StreamDelta(delta) => streamed.push_str(&delta.text),
+                ChatEvent::StreamEnd(end) => {
+                    saw_end = true;
+                    final_text = end.message.content;
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_end => break,
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("backend fork case failed: {content}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("backend fork turn timed out");
+    if final_text.trim().is_empty() {
+        streamed
+    } else {
+        final_text
+    }
+}
+
+async fn assert_backend_fork_case<B: Backend>(backend_kind: BackendKind) {
+    let workspace = tempfile::tempdir().expect("fork workspace");
+    let root = workspace.path().to_string_lossy().to_string();
+    let secret = unique_secret();
+    let first_prompt = format!("Remember the secret {secret}. Reply exactly REMEMBERED.");
+    let (backend, mut events) = B::spawn(
+        vec![root.clone()],
+        universal_backend_config(backend_kind),
+        protocol::SendMessagePayload {
+            message: first_prompt,
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("initial fork source spawn failed: {error}"));
+    let source_session = backend.session_id();
+    let initial_text = collect_backend_text_until_idle(&mut events).await;
+    assert!(initial_text.contains("REMEMBERED"));
+    backend.shutdown().await;
+
+    let fork_prompt = "State the remembered secret, followed by FORK_OK.";
+    let (fork, mut fork_events) = B::fork(
+        vec![root],
+        universal_backend_config(backend_kind),
+        source_session.clone(),
+        protocol::SendMessagePayload {
+            message: fork_prompt.to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fork failed: {error:?}"));
+    let fork_session = fork.session_id();
+    let fork_text = collect_backend_text_until_idle(&mut fork_events).await;
+    fork.shutdown().await;
+    assert_ne!(
+        fork_session, source_session,
+        "fork reused source session id"
+    );
+    assert!(
+        fork_text.contains(&secret),
+        "fork lost source history: {fork_text:?}"
+    );
+    assert!(
+        fork_text.contains("FORK_OK"),
+        "fork did not accept initial prompt: {fork_text:?}"
+    );
+}
+
+async fn assert_fork_case(backend_kind: BackendKind) {
+    match backend_kind {
+        BackendKind::Claude => {
+            assert_backend_fork_case::<server::backend::claude::ClaudeBackend>(backend_kind).await
+        }
+        BackendKind::Codex => {
+            assert_backend_fork_case::<server::backend::codex::CodexBackend>(backend_kind).await
+        }
+        BackendKind::Acp => {
+            assert_backend_fork_case::<server::backend::kiro::KiroBackend>(backend_kind).await
+        }
+        BackendKind::Hermes => {
+            assert_backend_fork_case::<server::backend::hermes::HermesBackend>(backend_kind).await
+        }
+        BackendKind::Tycode => {
+            assert_backend_fork_case::<server::backend::tycode::TycodeBackend>(backend_kind).await
+        }
+        BackendKind::Antigravity => {
+            assert_backend_fork_case::<server::backend::antigravity::AntigravityBackend>(
+                backend_kind,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_certification_case_for_backend(backend_kind: BackendKind, case: CertificationCase) {
+    if is_direct_certification_case(case) {
+        let observation = collect_direct_case(backend_kind).await;
+        assert_direct_certification_case(backend_kind, case, &observation);
+        return;
+    }
+
+    match case {
+        CertificationCase::FollowUpCompletes
+        | CertificationCase::FollowUpInputEchoedOnce
+        | CertificationCase::FollowUpUsesDistinctMessage => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_backend_emits_typing_and_streaming_on_follow_up_turns(
+                &mut fixture,
+                backend_kind,
+            )
+            .await;
+            if case == CertificationCase::FollowUpInputEchoedOnce {
+                assert_backend_follow_up_user_echo_not_duplicated(&mut fixture, backend_kind).await;
+            }
+        }
+        CertificationCase::CumulativeUsageGrows => {
+            assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
+        }
+        CertificationCase::ToolRequestEmitted
+        | CertificationCase::ToolCompletionEmitted
+        | CertificationCase::ToolCallIdsCorrelate
+        | CertificationCase::ToolChangesWorkspace
+        | CertificationCase::ToolTurnReachesIdle => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_backend_emits_tool_events_for_file_copy(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::ToolFailureReported => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_backend_reports_tool_failure(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::InterruptEmitsCancellation
+        | CertificationCase::InterruptReturnsIdle
+        | CertificationCase::InterruptStopsCommand
+        | CertificationCase::FollowUpAfterInterrupt => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_backend_interrupts_long_running_command(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::SessionAppearsInList
+        | CertificationCase::ResumeRemembersHistory
+        | CertificationCase::ResumeAcceptsFollowUp
+        | CertificationCase::ResumePreservesWorkspace => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            resume_secret_via_protocol(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::ForkCreatesDistinctSession
+        | CertificationCase::ForkPreservesHistory
+        | CertificationCase::ForkAcceptsInitialPrompt => {
+            assert_fork_case(backend_kind).await;
+        }
+        CertificationCase::WorkspaceInstructionsObserved => {
+            assert_workspace_instructions_case(backend_kind).await;
+        }
+        CertificationCase::HostSteeringObserved => {
+            assert_host_steering_case(backend_kind).await;
+        }
+        CertificationCase::SkillDiscovered | CertificationCase::SkillResultDelivered => {
+            let turn = observe_skill_case(backend_kind).await;
+            assert_eq!(turn.final_text.trim(), "SKILL_DELIVERY_OK");
+            if case == CertificationCase::SkillDiscovered {
+                assert!(turn.delta_count > 0, "skill response did not stream");
+            }
+        }
+        CertificationCase::McpToolDiscovered
+        | CertificationCase::McpToolCalled
+        | CertificationCase::McpResultDelivered
+        | CertificationCase::McpEventsCorrelate => {
+            let turn = observe_mcp_case(backend_kind).await;
+            match case {
+                CertificationCase::McpToolDiscovered | CertificationCase::McpToolCalled => {
+                    assert!(turn.tool_requests.iter().any(|request| {
+                        request
+                            .tool_name
+                            .to_ascii_lowercase()
+                            .contains("narrow_probe")
+                    }));
+                }
+                CertificationCase::McpResultDelivered => {
+                    assert!(turn.final_text.contains("NARROW_MCP_OK"));
+                }
+                CertificationCase::McpEventsCorrelate => {
+                    assert!(turn.tool_requests.iter().all(|request| {
+                        turn.tool_completions
+                            .iter()
+                            .any(|completion| completion.tool_call_id == request.tool_call_id)
+                    }));
+                }
+                _ => unreachable!(),
+            }
+        }
+        CertificationCase::ImageEchoPreserved
+        | CertificationCase::ImageUnderstood
+        | CertificationCase::ImageResponseStreams => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_backend_describes_image_input(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::NativeSubagentProjected
+        | CertificationCase::NativeSubagentParentLinked => {
+            assert_backend_native_subagent_visibility(backend_kind).await;
+        }
+        CertificationCase::BackgroundParentBecomesIdle
+        | CertificationCase::BackgroundCompletionResumesParent
+        | CertificationCase::AgentInitiatedTurnIsDistinct
+        | CertificationCase::AgentInitiatedResultDelivered => {
+            assert_eq!(backend_kind, BackendKind::Claude);
+            assert_claude_agent_initiated_background_resume().await;
+        }
+        _ => unreachable!("direct cases returned before match: {}", case.id()),
+    }
+}
+
+async fn run_selected_certification_case(case: CertificationCase) {
+    assert!(
+        real_ai_tests_enabled(),
+        "set {RUN_REAL_AI_TESTS_ENV}=1 to authorize paid backend qualification"
+    );
+    let backends = universal_real_backends().expect("parse backend selection");
+    let _hermes_python_guard = backends
+        .contains(&BackendKind::Hermes)
+        .then(|| {
+            std::env::var("HERMES_PYTHON")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    Path::new(DEFAULT_HERMES_TEST_PYTHON)
+                        .exists()
+                        .then(|| DEFAULT_HERMES_TEST_PYTHON.to_owned())
+                })
+        })
+        .flatten()
+        .map(|python| EnvVarGuard::set("HERMES_PYTHON", python));
+    let mut failures = Vec::new();
+    let mut executions = 0usize;
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) || !backend_runtime_available(backend_kind) {
+            failures.push(format!(
+                "{}: selected backend is not runnable",
+                backend_label(backend_kind)
+            ));
+            continue;
+        }
+        let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
+        if case
+            .required_capability()
+            .is_some_and(|capability| !capabilities.contains(capability))
+        {
+            eprintln!(
+                "SKIPPED {} {}: capability not declared",
+                backend_label(backend_kind),
+                case.id()
+            );
+            continue;
+        }
+        executions += 1;
+        eprintln!("RUNNING {} {}", backend_label(backend_kind), case.id());
+        let handle = tokio::spawn(run_certification_case_for_backend(backend_kind, case));
+        if let Err(error) = handle.await {
+            failures.push(format!(
+                "{} {}: {error}",
+                backend_label(backend_kind),
+                case.id()
+            ));
+        }
+    }
+    assert!(
+        executions > 0 || failures.is_empty(),
+        "no selected backend ran"
+    );
+    assert!(
+        failures.is_empty(),
+        "backend certification case {} failed:\n{}",
+        case.id(),
+        failures.join("\n")
+    );
+}
+
+async fn assert_backend_native_subagent_visibility(backend_kind: BackendKind) {
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use the Task tool exactly once to ask a general-purpose subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
+        }
+        BackendKind::Codex => {
+            "Spawn exactly one native subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
+        }
+        BackendKind::Hermes => {
+            "Delegate to exactly one native subagent: have it read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
+        }
+        _ => {
+            "Use exactly one native subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
+        }
+    };
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("universal-native-subagent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots,
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind,
+                launch_profile_id: None,
+                cost_hint: cost_hint_for(backend_kind),
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn universal native-subagent parent");
+    let env = expect_next_event_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "native-subagent parent NewAgent",
+    )
+    .await;
+    let parent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+    let child = expect_backend_native_child_for_parent(
+        &mut fixture.client,
+        &parent.agent_id,
+        "universal backend-native child",
+    )
+    .await;
+    assert_eq!(child.origin, AgentOrigin::BackendNative);
+    assert_eq!(child.parent_agent_id.as_ref(), Some(&parent.agent_id));
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "universal backend-native child AgentStart",
+    )
+    .await;
+    assert_eq!(child_start.parent_agent_id.as_ref(), Some(&parent.agent_id));
+}
+
+async fn assert_claude_agent_initiated_background_resume() {
+    const SENTINEL: &str = "BACKGROUND_RESUME_637";
+    let backend_kind = BackendKind::Claude;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = "Use the Task tool to launch a background subagent with run_in_background=true. Its only job is to compute 419 + 218 and return the number. End the initial parent turn while it works. When its completion triggers the parent to resume, reply exactly BACKGROUND_RESUME_637.";
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "universal-agent-initiated-resume",
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+
+    let mut completed_turns = 0usize;
+    let mut saw_idle_before_result = false;
+    let mut saw_result = false;
+    tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read Claude background continuation")
+                .expect("Claude background continuation stream closed");
+            if env.kind != FrameKind::ChatEvent || env.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = env.parse_payload().expect("parse background ChatEvent");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Claude background continuation failed: {content}"),
+                ChatEvent::StreamEnd(end) => {
+                    completed_turns += 1;
+                    saw_result |= end.message.content.contains(SENTINEL);
+                }
+                ChatEvent::StreamDelta(delta) => {
+                    saw_result |= delta.text.contains(SENTINEL);
+                }
+                ChatEvent::TypingStatusChanged(false) if !saw_result => {
+                    saw_idle_before_result = true;
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_result => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Claude never resumed after its background subagent completed");
+    assert!(
+        saw_idle_before_result,
+        "Claude never went idle before its background continuation"
+    );
+    assert!(saw_result, "Claude resumed without surfacing {SENTINEL}");
+    assert!(
+        completed_turns >= 2,
+        "expected distinct initial and agent-initiated turns, got {completed_turns}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "heavy paid backend qualification; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_universal_backend_qualification_suite() {
+    assert!(
+        real_ai_tests_enabled(),
+        "set {RUN_REAL_AI_TESTS_ENV}=1 to authorize paid backend qualification"
+    );
+    let backends = universal_real_backends().expect("parse universal backend selection");
+    let _hermes_python_guard = backends
+        .contains(&BackendKind::Hermes)
+        .then(|| {
+            std::env::var("HERMES_PYTHON")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    Path::new(DEFAULT_HERMES_TEST_PYTHON)
+                        .exists()
+                        .then(|| DEFAULT_HERMES_TEST_PYTHON.to_owned())
+                })
+        })
+        .flatten()
+        .map(|python| EnvVarGuard::set("HERMES_PYTHON", python));
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            failures.push(format!(
+                "{}: backend binary is not installed",
+                backend_label(backend_kind)
+            ));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            failures.push(format!(
+                "{}: runtime prerequisites are unavailable",
+                backend_label(backend_kind)
+            ));
+            continue;
+        }
+
+        let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
+        for case in CertificationCase::ALL {
+            if case
+                .required_capability()
+                .is_some_and(|capability| !capabilities.contains(capability))
+            {
+                eprintln!(
+                    "SKIPPED {} {}: capability not declared",
+                    backend_label(backend_kind),
+                    case.id()
+                );
+                continue;
+            }
+            eprintln!("RUNNING {} {}", backend_label(backend_kind), case.id());
+            let handle = tokio::spawn(run_certification_case_for_backend(backend_kind, case));
+            if let Err(error) = handle.await {
+                failures.push(format!(
+                    "{} {}: {error}",
+                    backend_label(backend_kind),
+                    case.id()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "universal paid backend qualification failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+macro_rules! live_certification_tests {
+    ($($name:ident => $case:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            #[ignore = "paid backend certification; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+            async fn $name() {
+                run_selected_certification_case(CertificationCase::$case).await;
+            }
+        )+
+    };
+}
+
+live_certification_tests! {
+    real_cert_initial_input_echoed_once => InitialInputEchoedOnce,
+    real_cert_typing_starts => TypingStarts,
+    real_cert_typing_starts_once => TypingStartsOnce,
+    real_cert_stream_starts => StreamStarts,
+    real_cert_visible_delta_emitted => VisibleDeltaEmitted,
+    real_cert_stream_ends => StreamEnds,
+    real_cert_stream_starts_once => StreamStartsOnce,
+    real_cert_stream_ends_once => StreamEndsOnce,
+    real_cert_typing_stops_once => TypingStopsOnce,
+    real_cert_no_error_on_successful_turn => NoErrorOnSuccessfulTurn,
+    real_cert_typing_stops_after_stream_end => TypingStopsAfterStreamEnd,
+    real_cert_lifecycle_order_is_valid => LifecycleOrderIsValid,
+    real_cert_stream_identity_is_stable => StreamIdentityIsStable,
+    real_cert_deltas_reconstruct_final_message => DeltasReconstructFinalMessage,
+    real_cert_exact_response_delivered => ExactResponseDelivered,
+    real_cert_follow_up_completes => FollowUpCompletes,
+    real_cert_follow_up_input_echoed_once => FollowUpInputEchoedOnce,
+    real_cert_follow_up_uses_distinct_message => FollowUpUsesDistinctMessage,
+    real_cert_turn_usage_present => TurnUsagePresent,
+    real_cert_turn_input_tokens_positive => TurnInputTokensPositive,
+    real_cert_turn_output_tokens_positive => TurnOutputTokensPositive,
+    real_cert_turn_total_consistent => TurnTotalConsistent,
+    real_cert_cumulative_usage_grows => CumulativeUsageGrows,
+    real_cert_request_usage_present => RequestUsagePresent,
+    real_cert_request_sequence_starts_at_one => RequestSequenceStartsAtOne,
+    real_cert_request_sequences_contiguous => RequestSequencesContiguous,
+    real_cert_request_usage_matches_turn => RequestUsageMatchesTurn,
+    real_cert_request_ids_unique => RequestIdsUnique,
+    real_cert_request_usage_positive => RequestUsagePositive,
+    real_cert_context_usage_present => ContextUsagePresent,
+    real_cert_context_window_valid => ContextWindowValid,
+    real_cert_tool_request_emitted => ToolRequestEmitted,
+    real_cert_tool_completion_emitted => ToolCompletionEmitted,
+    real_cert_tool_call_ids_correlate => ToolCallIdsCorrelate,
+    real_cert_tool_changes_workspace => ToolChangesWorkspace,
+    real_cert_tool_failure_reported => ToolFailureReported,
+    real_cert_tool_turn_reaches_idle => ToolTurnReachesIdle,
+    real_cert_interrupt_emits_cancellation => InterruptEmitsCancellation,
+    real_cert_interrupt_returns_idle => InterruptReturnsIdle,
+    real_cert_interrupt_stops_command => InterruptStopsCommand,
+    real_cert_follow_up_after_interrupt => FollowUpAfterInterrupt,
+    real_cert_session_appears_in_list => SessionAppearsInList,
+    real_cert_resume_remembers_history => ResumeRemembersHistory,
+    real_cert_resume_accepts_follow_up => ResumeAcceptsFollowUp,
+    real_cert_resume_preserves_workspace => ResumePreservesWorkspace,
+    real_cert_fork_creates_distinct_session => ForkCreatesDistinctSession,
+    real_cert_fork_preserves_history => ForkPreservesHistory,
+    real_cert_fork_accepts_initial_prompt => ForkAcceptsInitialPrompt,
+    real_cert_workspace_instructions_observed => WorkspaceInstructionsObserved,
+    real_cert_host_steering_observed => HostSteeringObserved,
+    real_cert_skill_discovered => SkillDiscovered,
+    real_cert_skill_result_delivered => SkillResultDelivered,
+    real_cert_mcp_tool_discovered => McpToolDiscovered,
+    real_cert_mcp_tool_called => McpToolCalled,
+    real_cert_mcp_result_delivered => McpResultDelivered,
+    real_cert_mcp_events_correlate => McpEventsCorrelate,
+    real_cert_image_echo_preserved => ImageEchoPreserved,
+    real_cert_image_understood => ImageUnderstood,
+    real_cert_image_response_streams => ImageResponseStreams,
+    real_cert_native_subagent_projected => NativeSubagentProjected,
+    real_cert_native_subagent_parent_linked => NativeSubagentParentLinked,
+    real_cert_background_parent_becomes_idle => BackgroundParentBecomesIdle,
+    real_cert_background_completion_resumes_parent => BackgroundCompletionResumesParent,
+    real_cert_agent_initiated_turn_is_distinct => AgentInitiatedTurnIsDistinct,
+    real_cert_agent_initiated_result_delivered => AgentInitiatedResultDelivered,
+}
 
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]

@@ -8,6 +8,7 @@ protocol = { path = "../protocol" }
 mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
 server = { path = "../server", features = ["test-support"] }
 tyde-dev-driver = { path = "../dev-driver" }
+tyde-agent-adapter = { path = "../agent-adapter" }
 futures-util = "0.3"
 paste = "1"
 rmcp = { version = "0.15.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }

@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 protocol = { path = "../protocol" }
+
+[dev-dependencies]
+serde_json.workspace = true
