@@ -20,6 +20,11 @@ use crate::voice::{
 const INPUT_CAPACITY: usize = 100;
 const OUTPUT_CAPACITY: usize = 32;
 const TOOL_NAME: &str = "send_to_focused_tyde_agent";
+const SYSTEM_PROMPT: &str = "You are Tyde's voice assistant, the spoken interface to a coding \
+agent. For any substantive request — code changes, analysis, running commands, or questions \
+about the project — call send_to_focused_tyde_agent with a clear, complete message for the \
+agent, then briefly tell the user what you sent. Relay tool results conversationally. Keep \
+every spoken reply short.";
 
 pub(crate) struct AwsNovaProvider;
 
@@ -155,9 +160,17 @@ impl Grammar {
         }
     }
     fn opening(&self) -> Vec<serde_json::Value> {
+        // Nova requires the prompt's FIRST content block to carry the SYSTEM
+        // role; opening the microphone content first draws a
+        // ValidationException ("First content must have SYSTEM role") that
+        // kills every session.
+        let system = uuid::Uuid::new_v4().to_string();
         vec![
             serde_json::json!({"event":{"sessionStart":{"inferenceConfiguration":{"maxTokens":1024,"topP":0.9,"temperature":0.7},"turnDetectionConfiguration":{"endpointingSensitivity":"MEDIUM"}}}}),
             serde_json::json!({"event":{"promptStart":{"promptName":self.prompt,"audioOutputConfiguration":{"mediaType":"audio/lpcm","sampleRateHertz":24000,"sampleSizeBits":16,"channelCount":1,"voiceId":"matthew","encoding":"base64","audioType":"SPEECH"},"textOutputConfiguration":{"mediaType":"text/plain"},"toolUseOutputConfiguration":{"mediaType":"application/json"},"toolConfiguration":{"tools":[{"toolSpec":{"name":TOOL_NAME,"description":"Send substantive work to the focused Tyde agent","inputSchema":{"json":"{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}"}}}]}}}}),
+            serde_json::json!({"event":{"contentStart":{"promptName":self.prompt,"contentName":system,"role":"SYSTEM","type":"TEXT","interactive":false,"textInputConfiguration":{"mediaType":"text/plain"}}}}),
+            serde_json::json!({"event":{"textInput":{"promptName":self.prompt,"contentName":system,"content":SYSTEM_PROMPT}}}),
+            serde_json::json!({"event":{"contentEnd":{"promptName":self.prompt,"contentName":system}}}),
             serde_json::json!({"event":{"contentStart":{"promptName":self.prompt,"contentName":self.microphone,"role":"USER","type":"AUDIO","interactive":true,"audioInputConfiguration":{"mediaType":"audio/lpcm","sampleRateHertz":16000,"sampleSizeBits":16,"channelCount":1,"audioType":"SPEECH","encoding":"base64"}}}}),
         ]
     }
@@ -537,6 +550,39 @@ fn failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nova rejects any prompt whose first content block is not SYSTEM-role
+    /// ("First content must have SYSTEM role", ValidationException) — it
+    /// killed every live session on beta.56. The opening must send a closed
+    /// SYSTEM text block before it opens the microphone content.
+    #[test]
+    fn opening_sends_closed_system_content_before_the_microphone() {
+        let grammar = Grammar::new(&protocol::VoiceSessionId("session".into()));
+        let opening = grammar.opening();
+        assert!(opening[0]["event"].get("sessionStart").is_some());
+        assert!(opening[1]["event"].get("promptStart").is_some());
+
+        let system_start = &opening[2]["event"]["contentStart"];
+        assert_eq!(system_start["role"], "SYSTEM");
+        assert_eq!(system_start["type"], "TEXT");
+        let system_name = system_start["contentName"].as_str().unwrap();
+
+        let text = &opening[3]["event"]["textInput"];
+        assert_eq!(text["contentName"], system_name);
+        assert!(
+            !text["content"].as_str().unwrap().trim().is_empty(),
+            "the SYSTEM block must carry a real system prompt"
+        );
+        assert_eq!(
+            opening[4]["event"]["contentEnd"]["contentName"],
+            system_name
+        );
+
+        let audio_start = &opening[5]["event"]["contentStart"];
+        assert_eq!(audio_start["role"], "USER");
+        assert_eq!(audio_start["type"], "AUDIO");
+        assert_eq!(opening.len(), 6);
+    }
 
     #[test]
     fn expired_sso_is_typed_without_leaking_provider_text() {
