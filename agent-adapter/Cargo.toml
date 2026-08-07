@@ -1,0 +1,8 @@
+[package]
+name = "tyde-agent-adapter"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+protocol = { path = "../protocol" }
