@@ -414,6 +414,152 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
     }
 }
 
+fn backend_value(backend: protocol::BackendKind) -> &'static str {
+    match backend {
+        protocol::BackendKind::Tycode => "tycode",
+        protocol::BackendKind::Acp => "acp",
+        protocol::BackendKind::Claude => "claude",
+        protocol::BackendKind::Codex => "codex",
+        protocol::BackendKind::Antigravity => "antigravity",
+        protocol::BackendKind::Hermes => "hermes",
+    }
+}
+
+fn backend_label(backend: protocol::BackendKind) -> &'static str {
+    match backend {
+        protocol::BackendKind::Tycode => "Tycode",
+        protocol::BackendKind::Acp => "ACP",
+        protocol::BackendKind::Claude => "Claude",
+        protocol::BackendKind::Codex => "Codex",
+        protocol::BackendKind::Antigravity => "Antigravity",
+        protocol::BackendKind::Hermes => "Hermes",
+    }
+}
+
+fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
+    match value {
+        "tycode" => Some(protocol::BackendKind::Tycode),
+        "acp" => Some(protocol::BackendKind::Acp),
+        "claude" => Some(protocol::BackendKind::Claude),
+        "codex" => Some(protocol::BackendKind::Codex),
+        "antigravity" => Some(protocol::BackendKind::Antigravity),
+        "hermes" => Some(protocol::BackendKind::Hermes),
+        _ => None,
+    }
+}
+
+#[component]
+fn NewChatOptions() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+
+    let backend_state = state.clone();
+    let enabled_backends = Memo::new(move |_| {
+        backend_state
+            .active_host_settings()
+            .map(|settings| settings.enabled_backends)
+            .unwrap_or_default()
+    });
+    let default_state = state.clone();
+    let default_backend_label = move || {
+        default_state
+            .active_host_settings()
+            .and_then(|settings| settings.default_backend)
+            .map(|backend| format!("Host default ({})", backend_label(backend)))
+            .unwrap_or_else(|| "Host default".to_owned())
+    };
+    let selected_backend_state = state.clone();
+    let selected_backend = move || {
+        selected_backend_state
+            .draft_backend_override
+            .get()
+            .map(backend_value)
+            .unwrap_or_default()
+    };
+    let change_backend_state = state.clone();
+    let on_backend_change = move |event| {
+        let value = event_target_value(&event);
+        change_backend_state
+            .draft_backend_override
+            .set(parse_backend(&value));
+    };
+
+    let custom_agents_state = state.clone();
+    let custom_agents = Memo::new(move |_| {
+        let mut agents = custom_agents_state
+            .active_host_custom_agents()
+            .into_values()
+            .filter(|agent| agent.id.0 != "tyde-default")
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.name.cmp(&right.name));
+        agents
+    });
+    let selected_agent_state = state.clone();
+    let selected_agent = move || {
+        selected_agent_state
+            .draft_custom_agent_id
+            .get()
+            .map(|id| id.0)
+            .unwrap_or_default()
+    };
+    let change_agent_state = state.clone();
+    let on_agent_change = move |event| {
+        let value = event_target_value(&event);
+        change_agent_state
+            .draft_custom_agent_id
+            .set((!value.is_empty()).then_some(protocol::CustomAgentId(value)));
+    };
+    let agent_hint_state = state.clone();
+    let agent_hint = move || {
+        let Some(selected) = agent_hint_state.draft_custom_agent_id.get() else {
+            return "Use the host's default agent instructions.".to_owned();
+        };
+        agent_hint_state
+            .active_host_custom_agents()
+            .get(&selected)
+            .map(|agent| agent.description.clone())
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| "Use this custom agent for the new chat.".to_owned())
+    };
+
+    view! {
+        <section class="new-chat-options" data-mobile-test="new-chat-options" aria-label="New chat options">
+            <label class="new-chat-option">
+                <span class="new-chat-option-label">"Backend"</span>
+                <select
+                    class="new-chat-option-select"
+                    data-mobile-test="new-chat-backend"
+                    aria-label="Backend"
+                    prop:value=selected_backend
+                    on:change=on_backend_change
+                >
+                    <option value="">{default_backend_label}</option>
+                    {move || enabled_backends.get().into_iter().map(|backend| view! {
+                        <option value=backend_value(backend)>{backend_label(backend)}</option>
+                    }).collect::<Vec<_>>()}
+                </select>
+            </label>
+            <label class="new-chat-option">
+                <span class="new-chat-option-label">"Agent"</span>
+                <select
+                    class="new-chat-option-select"
+                    data-mobile-test="new-chat-agent"
+                    aria-label="Agent"
+                    aria-describedby="new-chat-agent-hint"
+                    prop:value=selected_agent
+                    on:change=on_agent_change
+                >
+                    <option value="">"Default agent"</option>
+                    {move || custom_agents.get().into_iter().map(|agent| {
+                        let value = agent.id.0;
+                        view! { <option value=value>{agent.name}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
+            </label>
+            <p id="new-chat-agent-hint" class="new-chat-option-hint">{agent_hint}</p>
+        </section>
+    }
+}
+
 /// Mobile chat composer.
 ///
 /// Primary button label follows the state matrix: "Send" when idle, "Queue"
@@ -867,6 +1013,9 @@ pub fn ChatInput() -> impl IntoView {
             >
                 {move || composer.announcement.get()}
             </div>
+            <Show when=move || state.active_agent.get().is_none()>
+                <NewChatOptions />
+            </Show>
             {move || {
                 let rows = queued_rows.get();
                 if rows.is_empty() {
@@ -1233,8 +1382,8 @@ mod wasm_tests {
     use crate::state::{AgentInfo, AgentRef, AppState, LocalHostId};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, QueuedMessageId, SessionId,
-        StreamPath,
+        AgentId, AgentOrigin, BackendKind, CustomAgent, CustomAgentId, HostSettings,
+        QueuedMessageEntry, QueuedMessageId, SessionId, StreamPath, ToolPolicy,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1517,6 +1666,103 @@ mod wasm_tests {
         });
         std::mem::forget(h);
         handle.borrow().as_ref().unwrap().clone()
+    }
+
+    #[wasm_bindgen_test]
+    async fn new_chat_can_choose_backend_and_custom_agent() {
+        let container = make_container();
+        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handle_for_mount = handle.clone();
+        let h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let host = LocalHostId("host-1".to_owned());
+            state.active_local_host_id.set(Some(host.clone()));
+            state.host_settings_by_host.update(|settings| {
+                settings.insert(
+                    host.clone(),
+                    HostSettings {
+                        enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+                        default_backend: Some(BackendKind::Codex),
+                        ..HostSettings::default()
+                    },
+                );
+            });
+            state.custom_agents_by_host.update(|agents| {
+                agents.entry(host).or_default().insert(
+                    CustomAgentId("reviewer".to_owned()),
+                    CustomAgent {
+                        id: CustomAgentId("reviewer".to_owned()),
+                        name: "Reviewer".to_owned(),
+                        description: "Review changes before they ship.".to_owned(),
+                        instructions: None,
+                        skill_ids: Vec::new(),
+                        mcp_server_ids: Vec::new(),
+                        tool_policy: ToolPolicy::Unrestricted,
+                    },
+                );
+            });
+            *handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        std::mem::forget(h);
+        next_tick().await;
+
+        let backend: web_sys::HtmlSelectElement = container
+            .query_selector("[data-mobile-test='new-chat-backend']")
+            .unwrap()
+            .expect("backend selector")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            backend.text_content().unwrap_or_default().contains("Codex")
+                && backend
+                    .text_content()
+                    .unwrap_or_default()
+                    .contains("Claude"),
+            "every enabled backend should be offered"
+        );
+        backend.set_value("claude");
+        backend
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+
+        let agent: web_sys::HtmlSelectElement = container
+            .query_selector("[data-mobile-test='new-chat-agent']")
+            .unwrap()
+            .expect("agent selector")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            agent
+                .text_content()
+                .unwrap_or_default()
+                .contains("Reviewer"),
+            "custom agents should be offered by name"
+        );
+        agent.set_value("reviewer");
+        agent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        let state = handle.borrow().as_ref().unwrap().clone();
+        assert_eq!(
+            state.draft_backend_override.get_untracked(),
+            Some(BackendKind::Claude)
+        );
+        assert_eq!(
+            state.draft_custom_agent_id.get_untracked(),
+            Some(CustomAgentId("reviewer".to_owned()))
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Review changes before they ship."),
+            "the chosen agent's description should explain the selection"
+        );
     }
 
     /// **A double-tap must never buy two agents.**

@@ -30,6 +30,7 @@ web-sys = { version = "0.3", features = [
     "CustomEvent",
     "CustomEventInit",
     "Document",
+    "CssStyleDeclaration",
     "Event",
     "Element",
     "EventTarget",
@@ -61,6 +62,7 @@ web-sys = { version = "0.3", features = [
     "NodeList",
     "Storage",
     "Window",
+    "VisualViewport",
     "Headers",
     "Location",
     "Request",
@@ -85,6 +87,7 @@ web-sys = { version = "0.3", features = [
     "File",
     "FileList",
     "HtmlInputElement",
+    "HtmlSelectElement",
 ] }
 log = "0.4"
 console_log = "1"

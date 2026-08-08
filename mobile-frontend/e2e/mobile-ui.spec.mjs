@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 const FIXTURE_STATES = [
   "onboarding",
   "home",
+  "new-chat",
   "chat",
   "chat-light",
   "disconnected",
@@ -94,4 +95,24 @@ test("return inserts a new line instead of sending", async ({ page }) => {
       page.evaluate(() => window.__TYDE_FIXTURE_SENT_LINES__?.length ?? 0),
     )
     .toBe(0);
+});
+
+test("new chat sends the selected backend and agent", async ({ page }) => {
+  await openFixture(page, "new-chat");
+
+  await page.locator("[data-mobile-test='new-chat-backend']").selectOption("claude");
+  await page.locator("[data-mobile-test='new-chat-agent']").selectOption("fixture-reviewer");
+  await expect(page.locator("[data-mobile-test='new-chat-options']")).toContainText(
+    "Review a change for correctness and regressions.",
+  );
+  await page.locator("[data-mobile-test='chat-input']").fill("Review this change");
+  await page.locator("[data-mobile-test='chat-send']").click();
+
+  await expect
+    .poll(() => page.evaluate(() => window.__TYDE_FIXTURE_SENT_LINES__?.length ?? 0))
+    .toBe(1);
+  const sent = await page.evaluate(() => JSON.parse(window.__TYDE_FIXTURE_SENT_LINES__[0]));
+  expect(sent.kind).toBe("spawn_agent");
+  expect(sent.payload.custom_agent_id).toBe("fixture-reviewer");
+  expect(sent.payload.params.backend_kind).toBe("claude");
 });

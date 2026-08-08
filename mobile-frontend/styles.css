@@ -17,6 +17,8 @@
     --nav-height: 52px;
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+    --active-safe-area-bottom: var(--safe-area-bottom);
+    --app-height: 100dvh;
 }
 
 [data-theme="dark"] {
@@ -83,9 +85,12 @@ html, body {
     -webkit-font-smoothing: antialiased;
     -webkit-text-size-adjust: 100%;
     -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
 }
 
 body {
+    position: fixed;
+    inset: 0;
     background: var(--bg-base);
     color: var(--text-primary);
 }
@@ -110,7 +115,8 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     height: 100vh;
-    height: 100dvh;
+    height: var(--app-height, 100dvh);
+    min-height: 0;
     overflow: hidden;
     padding-top: var(--safe-area-top);
 }
@@ -350,8 +356,8 @@ input, textarea, select {
 .bottom-nav {
     display: flex;
     align-items: stretch;
-    height: calc(var(--nav-height) + var(--safe-area-bottom));
-    padding-bottom: var(--safe-area-bottom);
+    height: calc(var(--nav-height) + var(--active-safe-area-bottom));
+    padding-bottom: var(--active-safe-area-bottom);
     flex-shrink: 0;
     background: var(--bg-surface);
     border-top: 1px solid var(--border-default);
@@ -388,6 +394,7 @@ input, textarea, select {
 
 .mobile-content {
     flex: 1;
+    min-height: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -399,6 +406,7 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     overflow: hidden;
 }
 
@@ -1156,7 +1164,9 @@ input, textarea, select {
 
 .chat-messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
+    overscroll-behavior-y: contain;
     -webkit-overflow-scrolling: touch;
     padding: var(--space-2) var(--space-2);
 }
@@ -1834,9 +1844,56 @@ input, textarea, select {
 
 /* ── Chat Input ─────────────────────────────────────────────────────── */
 
+.new-chat-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+}
+
+.new-chat-option {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.new-chat-option-label {
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.new-chat-option-select {
+    width: 100%;
+    min-height: 36px;
+    padding: 0 30px 0 var(--space-2);
+    overflow: hidden;
+    color: var(--text-primary);
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-button);
+    font-size: 16px;
+    text-overflow: ellipsis;
+}
+
+.new-chat-option-select:focus {
+    border-color: var(--accent-primary);
+    outline: none;
+}
+
+.new-chat-option-hint {
+    grid-column: 1 / -1;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    line-height: 1.35;
+}
+
 .chat-input-container {
     flex-shrink: 0;
-    padding: var(--space-2) var(--space-3) calc(var(--space-2) + var(--safe-area-bottom));
+    padding: var(--space-2) var(--space-3) max(var(--space-2), var(--active-safe-area-bottom));
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
 }
@@ -1939,7 +1996,7 @@ input, textarea, select {
     border: 1px solid var(--border-default);
     border-radius: var(--radius-button);
     resize: none;
-    font-size: 15px;
+    font-size: 16px;
     line-height: 1.4;
     outline: none;
     overflow-y: hidden;

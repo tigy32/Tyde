@@ -2,8 +2,8 @@ use std::cell::Cell;
 
 use leptos::prelude::*;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, ChatMessage, ChatMessageId, MessageSender, SessionId,
-    StreamPath,
+    AgentId, AgentOrigin, BackendKind, ChatMessage, ChatMessageId, CustomAgent, CustomAgentId,
+    HostSettings, MessageSender, SessionId, StreamPath, ToolPolicy,
 };
 use wasm_bindgen::JsValue;
 
@@ -105,6 +105,30 @@ pub fn seed_state(state: &AppState) {
     state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
         round_trips.insert(host.clone(), 47);
     });
+    state.host_settings_by_host.update(|settings| {
+        settings.insert(
+            host.clone(),
+            HostSettings {
+                enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+                default_backend: Some(BackendKind::Codex),
+                ..HostSettings::default()
+            },
+        );
+    });
+    state.custom_agents_by_host.update(|agents| {
+        agents.entry(host.clone()).or_default().insert(
+            CustomAgentId("fixture-reviewer".to_owned()),
+            CustomAgent {
+                id: CustomAgentId("fixture-reviewer".to_owned()),
+                name: "Code reviewer".to_owned(),
+                description: "Review a change for correctness and regressions.".to_owned(),
+                instructions: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: ToolPolicy::Unrestricted,
+            },
+        );
+    });
     state.agents.set(vec![AgentInfo {
         local_host_id: host.clone(),
         agent_id: agent_id.clone(),
@@ -136,6 +160,10 @@ pub fn seed_state(state: &AppState) {
     });
 
     match name.as_str() {
+        "new-chat" => {
+            state.active_agent.set(None);
+            state.viewing_chat.set(true);
+        }
         "chat" | "chat-light" | "disconnected" | "error" => {
             state.viewing_chat.set(true);
         }
