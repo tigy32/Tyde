@@ -1186,6 +1186,21 @@ struct CompletedWrite<S> {
 
 type PendingWrite<S> = Pin<Box<dyn Future<Output = CompletedWrite<S>>>>;
 
+/// A frame read owns the reader for its whole duration and hands it back on
+/// completion, exactly like [`CompletedWrite`] does for the writer. A TYD2
+/// record read is a multi-step `read_exact` sequence; if its future were
+/// recreated per `select!` iteration, any other branch completing mid-record
+/// (a finished write, a control change) would drop it after it had already
+/// consumed part of the record, desyncing the byte stream and failing the
+/// next read with "invalid TYD2 record magic".
+struct CompletedRead<R> {
+    frames: protocol::FrameReader<R>,
+    result: Result<Option<protocol::ProtocolFrame>, protocol::FrameError>,
+}
+
+type PendingRead<S> =
+    Pin<Box<dyn Future<Output = CompletedRead<BufReader<tokio::io::ReadHalf<S>>>>>>;
+
 async fn run_connected_loop<S>(
     context: ConnectedSessionContext<'_>,
     stream: S,
@@ -1203,12 +1218,25 @@ where
         writer_deadline,
     } = context;
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut frames = protocol::FrameReader::new(BufReader::new(read_half));
+    let mut frames_slot = Some(protocol::FrameReader::new(BufReader::new(read_half)));
+    let mut read_future: Option<PendingRead<S>> = None;
     let mut write_half = Some(write_half);
     let mut in_flight = None;
     let mut write_future: Option<PendingWrite<S>> = None;
 
     loop {
+        // The in-progress frame read is retained across select iterations (see
+        // [`CompletedRead`]); it is only recreated after the previous read
+        // completed and parked the reader back in `frames_slot`.
+        if read_future.is_none() {
+            let mut frames = frames_slot
+                .take()
+                .expect("frame reader is parked whenever no read is in flight");
+            read_future = Some(Box::pin(async move {
+                let result = frames.read_frame().await;
+                CompletedRead { frames, result }
+            }));
+        }
         // A ready Stop/invalidation must win this poll even when inbound,
         // writer, and data work remain continuously ready.
         tokio::select! {
@@ -1287,8 +1315,16 @@ where
                     }
                 }
             }
-            read_result = frames.read_frame() => {
-                match read_result {
+            read_completed = async {
+                match read_future.as_mut() {
+                    Some(future) => future.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let CompletedRead { frames, result } = read_completed;
+                read_future = None;
+                frames_slot = Some(frames);
+                match result {
                     Ok(None) => {
                         settle_connected_teardown(local_host_id, in_flight.take(), rx);
                         return ConnectedOutcome::Disconnected(ConnectErr::Io(std::io::Error::new(
@@ -2008,6 +2044,161 @@ mod tests {
     async fn wasm_continuous_inbound_and_data_pressure_cannot_delay_stop() {
         let _send_guard = test_clean_sends();
         assert_continuous_pressure_stop_is_prioritized().await;
+    }
+
+    /// Scripted stream for [`frame_read_survives_a_write_completing_mid_record`]:
+    /// serves inbound bytes in fixed installments, releasing every installment
+    /// after the first only once the writer has flushed. This pins the exact
+    /// interleaving of the 2026-08-08 field failure: a TYD2 record read is
+    /// mid-flight when a queued submission's write completes.
+    struct SplitReadStreamState {
+        chunks: RefCell<std::collections::VecDeque<Vec<u8>>>,
+        served_first: std::cell::Cell<bool>,
+        flushed: std::cell::Cell<bool>,
+        written: RefCell<Vec<u8>>,
+    }
+
+    struct SplitReadStream {
+        state: Rc<SplitReadStreamState>,
+    }
+
+    impl AsyncRead for SplitReadStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.state.served_first.get() && !self.state.flushed.get() {
+                return std::task::Poll::Pending;
+            }
+            let Some(chunk) = self.state.chunks.borrow_mut().pop_front() else {
+                return std::task::Poll::Pending;
+            };
+            self.state.served_first.set(true);
+            buffer.put_slice(&chunk);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for SplitReadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.state.written.borrow_mut().extend_from_slice(buffer);
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.state.flushed.set(true);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // Field failure 2026-08-08: bootstrap records span several MQTT chunks, so
+    // a frame read is regularly mid-record when a write (heartbeat, submission)
+    // completes. The read future must be retained across select iterations —
+    // a per-iteration read future is dropped by the winning write arm after it
+    // already consumed part of the record, desyncing the byte stream and
+    // killing the connection with "invalid TYD2 record magic" on the next
+    // read. This test splits one record around a racing write and requires the
+    // frame to survive intact.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn frame_read_survives_a_write_completing_mid_record() {
+        let (manager, host, mut rx, mut control_rx) = active_manager(2, Some(77));
+
+        // A submission queued before the loop starts guarantees the command
+        // branch fires during the first (partial) record read.
+        manager
+            .send_line(host.clone(), test_host_line("outbound", 1))
+            .await
+            .expect("queued submission must be admitted");
+
+        let inbound_line = test_host_line("inbound", 1);
+        let record = framed_host_line(&inbound_line);
+        assert!(
+            record.len() > 20,
+            "fixture record must span the fixed header"
+        );
+        // Split inside the 20-byte fixed record header so the read is
+        // unambiguously mid-record when the write interleaves.
+        let state = Rc::new(SplitReadStreamState {
+            chunks: RefCell::new(std::collections::VecDeque::from(vec![
+                record[..10].to_vec(),
+                record[10..].to_vec(),
+            ])),
+            served_first: std::cell::Cell::new(false),
+            flushed: std::cell::Cell::new(false),
+            written: RefCell::new(Vec::new()),
+        });
+        let stream = SplitReadStream {
+            state: state.clone(),
+        };
+
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let received_for_listener = received.clone();
+        let host_for_listener = host.clone();
+        let manager_for_listener = manager.clone();
+        let unlisten_line = events::on_host_line(move |event| {
+            if event.host_id == host_for_listener.0 {
+                received_for_listener.borrow_mut().push(event.line.clone());
+                manager_for_listener
+                    .disconnect(host_for_listener.clone())
+                    .expect("Stop path must settle the connected session");
+            }
+        });
+
+        let outcome = run_connected_loop(
+            ConnectedSessionContext {
+                manager: &manager,
+                local_host_id: &host,
+                actor_instance_id: 1,
+                connection_instance_id: 77,
+                writer_deadline: Duration::from_secs(5),
+            },
+            stream,
+            &mut rx,
+            &mut control_rx,
+        )
+        .await;
+        unlisten_line();
+
+        let outcome_desc = match &outcome {
+            ConnectedOutcome::StopRequested => "StopRequested".to_owned(),
+            ConnectedOutcome::Disconnected(error) => format!("Disconnected({error})"),
+        };
+        assert!(
+            matches!(outcome, ConnectedOutcome::StopRequested),
+            "the split record must survive the interleaved write; connection ended with {outcome_desc}"
+        );
+        let received = received.borrow();
+        assert_eq!(
+            received.len(),
+            1,
+            "exactly one inbound frame must be delivered"
+        );
+        let received_envelope: protocol::Envelope =
+            serde_json::from_str(&received[0]).expect("delivered line is an envelope");
+        let expected_envelope: protocol::Envelope =
+            serde_json::from_str(&inbound_line).expect("fixture line is an envelope");
+        assert_eq!(received_envelope, expected_envelope);
+        assert_eq!(
+            &*state.written.borrow(),
+            &framed_host_line(&test_host_line("outbound", 1)),
+            "the interleaved submission must still be written intact"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
