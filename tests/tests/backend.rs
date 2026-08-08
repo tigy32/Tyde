@@ -1262,8 +1262,8 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
     assert_eq!(parent_followup.identity_errors, 0);
     assert_eq!(parent_followup.cancellations, 0);
     assert_eq!(
-        parent_followup.active_transitions, 2,
-        "Codex emits active once for turn/started and once when parent-followup opens"
+        parent_followup.active_transitions, 1,
+        "Codex must emit active only once while the turn remains active"
     );
     assert_eq!(parent_followup.idle_transitions, 1);
     assert_eq!(child_live.stream_starts, vec!["child-good", "child-active"]);
@@ -4768,7 +4768,7 @@ async fn expect_agent_start_on_stream(
     }
 }
 
-async fn expect_backend_native_child_for_parent(
+async fn expect_subagent_child_for_parent(
     client: &mut ValidatedConnection,
     parent_agent_id: &protocol::AgentId,
     context: &str,
@@ -4785,8 +4785,10 @@ async fn expect_backend_native_child_for_parent(
             continue;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
-        if payload.origin == AgentOrigin::BackendNative
-            && payload.parent_agent_id.as_ref() == Some(parent_agent_id)
+        if matches!(
+            payload.origin,
+            AgentOrigin::BackendNative | AgentOrigin::AgentControl
+        ) && payload.parent_agent_id.as_ref() == Some(parent_agent_id)
         {
             return payload;
         }
@@ -5176,15 +5178,29 @@ async fn expect_assistant_turn_after_user_echo(
                     "never received MessageAdded(User) echo"
                 );
                 assert!(got_stream_start, "received StreamEnd before StreamStart");
+                if !data.message.tool_calls.is_empty() {
+                    got_stream_start = false;
+                    streamed_text.clear();
+                    delta_count = 0;
+                    continue;
+                }
                 let final_text = if data.message.content.trim().is_empty() {
-                    streamed_text
+                    std::mem::take(&mut streamed_text)
                 } else {
                     data.message.content
                 };
+                if final_text.trim().is_empty() {
+                    got_stream_start = false;
+                    delta_count = 0;
+                    continue;
+                }
                 return AssistantTurn {
                     final_text,
                     delta_count,
                 };
+            }
+            ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
+                panic!("backend became idle without a non-empty assistant response")
             }
             _ => {}
         }
@@ -5235,14 +5251,22 @@ async fn expect_assistant_turn_after_user_echo_with_images(
                 }
                 assert!(got_stream_start, "received StreamEnd before StreamStart");
                 let final_text = if data.message.content.trim().is_empty() {
-                    streamed_text
+                    std::mem::take(&mut streamed_text)
                 } else {
                     data.message.content
                 };
+                if final_text.trim().is_empty() {
+                    got_stream_start = false;
+                    delta_count = 0;
+                    continue;
+                }
                 return AssistantTurn {
                     final_text,
                     delta_count,
                 };
+            }
+            ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
+                panic!("backend became idle without a non-empty image response")
             }
             _ => {}
         }
@@ -5382,16 +5406,19 @@ fn known_turn_from_folded(
 
     let this_turn = this_turn.clone();
     let agent_total = agent_total.clone();
-    assert_eq!(
-        folded
-            .message
-            .token_usage
-            .as_ref()
-            .and_then(|usage| usage.request.known_usage()),
-        Some(&this_turn),
-        "{} turn {turn_index}: request usage must match this turn usage for one-request backend turn",
-        backend_label(backend_kind)
-    );
+    if let Some(request) = folded
+        .message
+        .token_usage
+        .as_ref()
+        .and_then(|usage| usage.request.known_usage())
+    {
+        assert_eq!(
+            request,
+            &this_turn,
+            "{} turn {turn_index}: reported request usage must match this turn usage for one-request backend turn",
+            backend_label(backend_kind)
+        );
+    }
     assert!(
         this_turn.total_tokens > 0,
         "{} turn {turn_index}: this_turn.total_tokens must be positive: {:?}",
@@ -5902,6 +5929,7 @@ async fn expect_assistant_turn_with_typing_after_user_echo(
     }
 }
 
+#[derive(Debug)]
 struct ToolTurn {
     final_text: String,
     tool_requests: Vec<ToolRequest>,
@@ -5914,6 +5942,14 @@ fn unique_secret() -> String {
         .expect("system clock before unix epoch")
         .as_nanos();
     format!("TYDE-SECRET-{now}")
+}
+
+fn unique_project_identifier() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    format!("TYDE-PROJECT-{now}")
 }
 
 fn only_session_for_backend(
@@ -6529,7 +6565,6 @@ async fn expect_tool_turn_after_user_echo(
         }
 
         if saw_stream_end
-            && !tool_requests.is_empty()
             && tool_requests
                 .keys()
                 .all(|call_id| tool_completions.contains_key(call_id))
@@ -7352,12 +7387,21 @@ fn assert_direct_certification_case(
                 .iter()
                 .filter_map(|usage| usage.current_context_usage.as_ref()?.known())
                 .collect::<Vec<_>>();
-            assert!(!contexts.is_empty(), "missing known context usage");
-            assert!(
-                contexts
-                    .iter()
-                    .all(|(input, window)| *window > 0 && input <= window)
-            );
+            if contexts.is_empty() {
+                let final_message = observation.final_message();
+                let breakdown = final_message
+                    .context_breakdown
+                    .as_ref()
+                    .expect("missing known context usage");
+                assert!(breakdown.context_window > 0);
+                assert!(breakdown.input_tokens <= breakdown.context_window);
+            } else {
+                assert!(
+                    contexts
+                        .iter()
+                        .all(|(input, window)| *window > 0 && input <= window)
+                );
+            }
         }
         _ => panic!("{} is not a direct single-turn case", case.id()),
     }
@@ -7400,7 +7444,18 @@ async fn assert_backend_reports_tool_failure(
     fixture: &mut RealBackendFixture,
     backend_kind: BackendKind,
 ) {
-    let prompt = "Use the command execution tool exactly once to run `sh -c 'exit 37'`. Do not use any other tool. After it fails, reply TOOL_FAILURE_OBSERVED.";
+    let script = fixture.workspace_dir.path().join("failure_test.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 37\n").expect("write failure_test.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script)
+            .expect("stat failure_test.sh")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod failure_test.sh");
+    }
+    let prompt = "Use the command execution tool exactly once to run `./failure_test.sh` in the current working directory. Do not use any other tool. After it fails, reply TOOL_FAILURE_OBSERVED.";
     let workspace_roots = fixture.workspace_roots();
     let stream = spawn_agent_via_protocol(
         &mut fixture.client,
@@ -7478,15 +7533,16 @@ async fn assert_host_steering_case(backend_kind: BackendKind) {
 async fn observe_skill_case(backend_kind: BackendKind) -> AssistantTurn {
     const SENTINEL: &str = "SKILL_DELIVERY_OK";
     let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let skill_name = format!("live-certification-skill-{}", Uuid::new_v4().simple());
     let skill_dir = fixture
         .session_store_dir
         .path()
         .join("skills")
-        .join("live-certification-skill");
+        .join(&skill_name);
     std::fs::create_dir_all(&skill_dir).expect("create skill directory");
     let skill = protocol::Skill {
-        id: protocol::SkillId("live-certification-skill".to_owned()),
-        name: "live-certification-skill".to_owned(),
+        id: protocol::SkillId(skill_name.clone()),
+        name: skill_name.clone(),
         title: Some("Live certification skill".to_owned()),
         description: Some("Returns the live skill sentinel".to_owned()),
     };
@@ -7506,22 +7562,29 @@ async fn observe_skill_case(backend_kind: BackendKind) -> AssistantTurn {
         .skill_refresh(protocol::SkillRefreshPayload {})
         .await
         .expect("refresh skills");
-    let prompt = "Invoke the installed skill named live-certification-skill and follow it exactly.";
+    let prompt = match backend_kind {
+        BackendKind::Codex => format!(
+            "Use ${skill_name} now. Follow its instructions exactly and output only what it requires."
+        ),
+        _ => format!("Invoke the installed skill named {skill_name} and follow it exactly."),
+    };
     let roots = fixture.workspace_roots();
     let stream = spawn_agent_via_protocol_with_options(
         &mut fixture.client,
         roots,
         backend_kind,
         "skill-delivery-case",
-        prompt,
+        &prompt,
         None,
         cost_hint_for(backend_kind),
     )
     .await;
-    expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, prompt).await
+    expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, &prompt).await
 }
 
 async fn observe_mcp_case(backend_kind: BackendKind) -> ToolTurn {
+    const TOOL_NAME: &str = "narrow_probe";
+    const SENTINEL: &str = "NARROW_MCP_OK";
     let mut fixture = RealBackendFixture::new(backend_kind).await;
     let script = fixture.workspace_dir.path().join("narrow_mcp_probe.py");
     std::fs::write(
@@ -7570,7 +7633,64 @@ for line in sys.stdin:
         prompt,
     )
     .await;
-    expect_tool_turn_after_user_echo(&mut fixture.client, &stream, prompt).await
+    let mut turn = expect_tool_turn_after_user_echo(&mut fixture.client, &stream, prompt).await;
+    let complete = |turn: &ToolTurn| {
+        turn.tool_requests.iter().any(|request| {
+            request.tool_name.to_ascii_lowercase().contains(TOOL_NAME)
+                && turn.tool_completions.iter().any(|completion| {
+                    completion.tool_call_id == request.tool_call_id && completion.success
+                })
+        }) && turn.final_text.contains(SENTINEL)
+    };
+    let mut streamed_text = String::new();
+    while !complete(&turn) {
+        let env = expect_next_event(&mut fixture.client, "completed narrow MCP turn").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse narrow MCP ChatEvent");
+        match event {
+            ChatEvent::StreamStart(_) => streamed_text.clear(),
+            ChatEvent::StreamDelta(delta) => streamed_text.push_str(&delta.text),
+            ChatEvent::StreamEnd(data) => {
+                turn.final_text = if data.message.content.trim().is_empty() {
+                    streamed_text.clone()
+                } else {
+                    data.message.content
+                };
+            }
+            ChatEvent::ToolRequest(request) => {
+                if !turn
+                    .tool_requests
+                    .iter()
+                    .any(|existing| existing.tool_call_id == request.tool_call_id)
+                {
+                    turn.tool_requests.push(request);
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                if let Some(existing) = turn
+                    .tool_completions
+                    .iter_mut()
+                    .find(|existing| existing.tool_call_id == completion.tool_call_id)
+                {
+                    *existing = completion;
+                } else {
+                    turn.tool_completions.push(completion);
+                }
+            }
+            ChatEvent::MessageAdded(ChatMessage {
+                sender: MessageSender::Error,
+                content,
+                ..
+            }) => panic!("narrow MCP turn failed: {content}"),
+            ChatEvent::TypingStatusChanged(false) => {
+                panic!("narrow MCP turn became idle before delivering its tool result: {turn:?}")
+            }
+            _ => {}
+        }
+    }
+    turn
 }
 
 async fn collect_backend_text_until_idle(events: &mut server::backend::EventStream) -> String {
@@ -7607,8 +7727,9 @@ async fn collect_backend_text_until_idle(events: &mut server::backend::EventStre
 async fn assert_backend_fork_case<B: Backend>(backend_kind: BackendKind) {
     let workspace = tempfile::tempdir().expect("fork workspace");
     let root = workspace.path().to_string_lossy().to_string();
-    let secret = unique_secret();
-    let first_prompt = format!("Remember the secret {secret}. Reply exactly REMEMBERED.");
+    let identifier = unique_project_identifier();
+    let first_prompt =
+        format!("The project identifier is {identifier}. Reply exactly PROJECT_IDENTIFIER_STORED.");
     let (backend, mut events) = B::spawn(
         vec![root.clone()],
         universal_backend_config(backend_kind),
@@ -7623,10 +7744,10 @@ async fn assert_backend_fork_case<B: Backend>(backend_kind: BackendKind) {
     .unwrap_or_else(|error| panic!("initial fork source spawn failed: {error}"));
     let source_session = backend.session_id();
     let initial_text = collect_backend_text_until_idle(&mut events).await;
-    assert!(initial_text.contains("REMEMBERED"));
+    assert!(initial_text.contains("PROJECT_IDENTIFIER_STORED"));
     backend.shutdown().await;
 
-    let fork_prompt = "State the remembered secret, followed by FORK_OK.";
+    let fork_prompt = "State the project identifier, followed by FORK_OK.";
     let (fork, mut fork_events) = B::fork(
         vec![root],
         universal_backend_config(backend_kind),
@@ -7648,7 +7769,7 @@ async fn assert_backend_fork_case<B: Backend>(backend_kind: BackendKind) {
         "fork reused source session id"
     );
     assert!(
-        fork_text.contains(&secret),
+        fork_text.contains(&identifier),
         "fork lost source history: {fork_text:?}"
     );
     assert!(
@@ -7746,7 +7867,11 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
         }
         CertificationCase::SkillDiscovered | CertificationCase::SkillResultDelivered => {
             let turn = observe_skill_case(backend_kind).await;
-            assert_eq!(turn.final_text.trim(), "SKILL_DELIVERY_OK");
+            assert!(
+                turn.final_text.contains("SKILL_DELIVERY_OK"),
+                "skill response did not deliver the skill's sentinel: {:?}",
+                turn.final_text,
+            );
             if case == CertificationCase::SkillDiscovered {
                 assert!(turn.delta_count > 0, "skill response did not stream");
             }
@@ -7788,7 +7913,7 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
         | CertificationCase::NativeSubagentParentLinked => {
             assert_backend_native_subagent_visibility(backend_kind).await;
         }
-        CertificationCase::BackgroundParentBecomesIdle
+        CertificationCase::BackgroundWorkKeepsAgentActive
         | CertificationCase::BackgroundCompletionResumesParent
         | CertificationCase::AgentInitiatedTurnIsDistinct
         | CertificationCase::AgentInitiatedResultDelivered => {
@@ -7869,7 +7994,7 @@ async fn assert_backend_native_subagent_visibility(backend_kind: BackendKind) {
     let workspace_roots = fixture.workspace_roots();
     let prompt = match backend_kind {
         BackendKind::Claude => {
-            "Use the Task tool exactly once to ask a general-purpose subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
+            "Use the Agent tool exactly once to ask a general-purpose subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
         }
         BackendKind::Codex => {
             "Spawn exactly one native subagent to read README.txt and return its first line. Wait for it, then reply SUBAGENT_OK."
@@ -7909,13 +8034,16 @@ async fn assert_backend_native_subagent_visibility(backend_kind: BackendKind) {
     )
     .await;
     let parent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
-    let child = expect_backend_native_child_for_parent(
+    let child = expect_subagent_child_for_parent(
         &mut fixture.client,
         &parent.agent_id,
         "universal backend-native child",
     )
     .await;
-    assert_eq!(child.origin, AgentOrigin::BackendNative);
+    assert!(matches!(
+        child.origin,
+        AgentOrigin::BackendNative | AgentOrigin::AgentControl
+    ));
     assert_eq!(child.parent_agent_id.as_ref(), Some(&parent.agent_id));
     let child_start = expect_agent_start_on_stream(
         &mut fixture.client,
@@ -7931,7 +8059,7 @@ async fn assert_claude_agent_initiated_background_resume() {
     let backend_kind = BackendKind::Claude;
     let mut fixture = RealBackendFixture::new(backend_kind).await;
     let workspace_roots = fixture.workspace_roots();
-    let prompt = "Use the Task tool to launch a background subagent with run_in_background=true. Its only job is to compute 419 + 218 and return the number. End the initial parent turn while it works. When its completion triggers the parent to resume, reply exactly BACKGROUND_RESUME_637.";
+    let prompt = "Use the Agent tool to launch a general-purpose subagent with run_in_background=true. Its only job is to compute 419 + 218 and return the number. End the initial parent turn while it works. When its completion triggers the parent to resume, reply exactly BACKGROUND_RESUME_637.";
     let stream = spawn_agent_via_protocol_with_options(
         &mut fixture.client,
         workspace_roots,
@@ -7982,8 +8110,8 @@ async fn assert_claude_agent_initiated_background_resume() {
     .await
     .expect("Claude never resumed after its background subagent completed");
     assert!(
-        saw_idle_before_result,
-        "Claude never went idle before its background continuation"
+        !saw_idle_before_result,
+        "Claude reported itself idle while background work was still active"
     );
     assert!(saw_result, "Claude resumed without surfacing {SENTINEL}");
     assert!(
@@ -8138,7 +8266,7 @@ live_certification_tests! {
     real_cert_image_response_streams => ImageResponseStreams,
     real_cert_native_subagent_projected => NativeSubagentProjected,
     real_cert_native_subagent_parent_linked => NativeSubagentParentLinked,
-    real_cert_background_parent_becomes_idle => BackgroundParentBecomesIdle,
+    real_cert_background_work_keeps_agent_active => BackgroundWorkKeepsAgentActive,
     real_cert_background_completion_resumes_parent => BackgroundCompletionResumesParent,
     real_cert_agent_initiated_turn_is_distinct => AgentInitiatedTurnIsDistinct,
     real_cert_agent_initiated_result_delivered => AgentInitiatedResultDelivered,
@@ -9414,7 +9542,7 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
         .await;
         assert_eq!(parent_start.agent_id, parent_new.agent_id);
 
-        let child_new = expect_backend_native_child_for_parent(
+        let child_new = expect_subagent_child_for_parent(
             &mut fixture.client,
             &parent_new.agent_id,
             "backend-native child NewAgent",

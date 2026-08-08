@@ -2683,13 +2683,11 @@ impl HermesGatewayHandle {
         // worse than silence. Remote targets never get here: the caller drops
         // their skills, because this edits a config file on *this* machine.
         let registration = if expose_skills && target.remote_host.is_none() {
-            Some(match crate::store::skills::SkillStore::default_root_dir() {
-                Ok(skills_root) => register_hermes_skill_dir(&target, &skills_root).await,
-                Err(err) => Err(err),
-            })
+            Some(register_hermes_skill_dirs(&target, &resolved.skills).await)
         } else {
             None
         };
+        let skills_discoverable = registration.as_ref().is_some_and(Result::is_ok);
         let (spawn_instructions, skill_notice) = hermes_skill_exposure(resolved, registration);
         if let Some(notice) = skill_notice.as_deref() {
             tracing::warn!("{notice}");
@@ -2702,8 +2700,13 @@ impl HermesGatewayHandle {
                 spawn_instructions.to_string(),
             );
         }
-        let mcp_runtime =
-            prepare_hermes_mcp_runtime(&mut target, startup_mcp_servers, tool_policy).await?;
+        let mcp_runtime = prepare_hermes_mcp_runtime(
+            &mut target,
+            startup_mcp_servers,
+            tool_policy,
+            skills_discoverable,
+        )
+        .await?;
         let expects_mcp_tools = !startup_mcp_servers.is_empty();
         let mcp_ready_path = mcp_runtime
             .as_ref()
@@ -3374,6 +3377,7 @@ async fn prepare_hermes_mcp_runtime(
     target: &mut HermesSpawnTarget,
     startup_mcp_servers: &[StartupMcpServer],
     tool_policy: &protocol::ToolPolicy,
+    skills_discoverable: bool,
 ) -> Result<Option<HermesMcpRuntime>, String> {
     let isolate_without_tools = matches!(
         tool_policy,
@@ -3390,12 +3394,9 @@ async fn prepare_hermes_mcp_runtime(
 
     let bridge_program = resolve_hermes_bridge_executable()?;
     let selected = register_hermes_mcp_bridge(target, &bridge_program).await?;
-    let selected_toolsets = if let Some(mut selected) = selected {
-        if isolate_without_tools {
-            selected = vec![MANAGED_SERVER_NAME.to_string()];
-        } else if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
-            selected.push(MANAGED_SERVER_NAME.to_string());
-        }
+    let selected_toolsets = if let Some(selected) = selected {
+        let selected =
+            hermes_selected_toolsets(selected, isolate_without_tools, skills_discoverable);
         let selected = selected.join(",");
         target
             .env
@@ -3466,6 +3467,23 @@ async fn prepare_hermes_mcp_runtime(
         _descriptor_dir: descriptor_dir,
         ready_path,
     }))
+}
+
+fn hermes_selected_toolsets(
+    mut selected: Vec<String>,
+    isolate_without_tools: bool,
+    skills_discoverable: bool,
+) -> Vec<String> {
+    if isolate_without_tools {
+        return vec![MANAGED_SERVER_NAME.to_string()];
+    }
+    if skills_discoverable && !selected.iter().any(|name| name == "skills") {
+        selected.push("skills".to_string());
+    }
+    if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
+        selected.push(MANAGED_SERVER_NAME.to_string());
+    }
+    selected
 }
 
 async fn register_hermes_mcp_bridge(
@@ -3621,6 +3639,35 @@ async fn register_hermes_skill_dir(
         "Hermes discovers Tyde skills through skills.external_dirs"
     );
     Ok(())
+}
+
+async fn register_hermes_skill_dirs(
+    target: &HermesSpawnTarget,
+    skills: &[crate::agent::customization::ResolvedSkill],
+) -> Result<(), String> {
+    for root in hermes_skill_roots(skills)? {
+        register_hermes_skill_dir(target, &root).await?;
+    }
+    Ok(())
+}
+
+fn hermes_skill_roots(
+    skills: &[crate::agent::customization::ResolvedSkill],
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for skill in skills {
+        let root = skill.source_dir.parent().ok_or_else(|| {
+            format!(
+                "Hermes skill '{}' has no parent store directory: {}",
+                skill.name,
+                skill.source_dir.display()
+            )
+        })?;
+        if !roots.iter().any(|existing: &PathBuf| existing == root) {
+            roots.push(root.to_path_buf());
+        }
+    }
+    Ok(roots)
 }
 
 /// Expand a leading `~` the way Hermes' own `Path.expanduser` does, so two
@@ -11133,6 +11180,33 @@ for line in sys.stdin:
             skill_selection: selection,
             ..ResolvedSpawnConfig::default()
         }
+    }
+
+    #[test]
+    fn hermes_registers_the_resolved_skill_store_not_the_global_default() {
+        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
+
+        assert_eq!(
+            hermes_skill_roots(&resolved.skills).expect("resolved skill roots"),
+            vec![PathBuf::from("/nonexistent/tyde-test-skills")]
+        );
+    }
+
+    #[test]
+    fn hermes_keeps_skills_available_when_mcp_selects_toolsets() {
+        assert_eq!(
+            hermes_selected_toolsets(vec!["terminal".to_string()], false, true),
+            vec![
+                "terminal".to_string(),
+                "skills".to_string(),
+                MANAGED_SERVER_NAME.to_string()
+            ]
+        );
+        assert_eq!(
+            hermes_selected_toolsets(vec!["terminal".to_string()], true, true),
+            vec![MANAGED_SERVER_NAME.to_string()],
+            "an empty allowlist remains authoritative"
+        );
     }
 
     /// The failure this closes: a remote gateway reads another machine's config

@@ -7553,6 +7553,13 @@ pub enum OrchestrationWorkflowPhase {
 /// `ToolRequest` must be answered by exactly one
 /// `ToolExecutionCompleted` with the same `tool_call_id`.
 ///
+/// ### Activity
+/// `TypingStatusChanged` is the authoritative backend activity signal. Once a
+/// backend emits `true`, it must not emit `false` until foreground turns,
+/// background tasks, subagents, workflows, and any provider-initiated
+/// continuation have all quiesced. Turn and stream boundaries do not by
+/// themselves make a backend idle.
+///
 /// ### Cancellation ordering
 /// When a turn is cancelled the backend must, in this order:
 ///   1. If a stream is currently open, emit `StreamEnd` to close it. A reserved

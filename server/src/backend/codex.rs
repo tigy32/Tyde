@@ -2255,6 +2255,7 @@ impl CodexSession {
                 execution_mode: config.execution_mode,
                 turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
                 active_turn_id: None,
+                awaiting_root_turn_start: false,
                 interrupt_next_root_turn: false,
                 pending_compaction: None,
                 active_stream: None,
@@ -3419,6 +3420,7 @@ struct CodexState {
     execution_mode: BackendExecutionMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
+    awaiting_root_turn_start: bool,
     /// Set when the user cancels while no root turn is tracked. A root turn
     /// that starts while this is set raced the cancel — the user has already
     /// been told the agent is idle, so that turn is interrupted and
@@ -5778,7 +5780,6 @@ impl CodexInner {
         };
         if let Some((publish, message_id, generated_identity, model, reasoning)) = emission {
             if publish {
-                self.emitter.typing_status_changed(true);
                 Self::emit_stream_start(
                     self.emitter.as_ref(),
                     message_id.clone(),
@@ -5949,6 +5950,7 @@ impl CodexInner {
                     // This send supersedes any cancel that raced an earlier
                     // turn start; the next turn/started belongs to it.
                     state.interrupt_next_root_turn = false;
+                    state.awaiting_root_turn_start = true;
                     state.pending_user_input_bytes = message.len() as u64;
                     let (model_override, effort_override) = match state.execution_mode {
                         BackendExecutionMode::Agent => (
@@ -6003,6 +6005,7 @@ impl CodexInner {
                     codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
+                    self.state.lock().await.awaiting_root_turn_start = false;
                     self.emitter.typing_status_changed(false);
                     return Err(err);
                 }
@@ -6021,7 +6024,10 @@ impl CodexInner {
                     // Ok here leaves the client stuck on "Cancelling…"
                     // forever waiting for events that will never come.
                     // operation_cancelled ends with TypingStatusChanged(false).
-                    self.state.lock().await.interrupt_next_root_turn = true;
+                    let mut state = self.state.lock().await;
+                    state.interrupt_next_root_turn = true;
+                    state.awaiting_root_turn_start = false;
+                    drop(state);
                     self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
@@ -6682,7 +6688,7 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("turn")
                     .to_string();
-                {
+                let provider_initiated = {
                     let mut state = self.state.lock().await;
                     if state
                         .terminated_turns
@@ -6716,6 +6722,8 @@ impl CodexInner {
                         return;
                     }
                     state.terminated_turn_awaiting_replacement = None;
+                    let provider_initiated = !state.awaiting_root_turn_start;
+                    state.awaiting_root_turn_start = false;
                     state.active_turn_id = Some(turn_id.clone());
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
@@ -6738,8 +6746,11 @@ impl CodexInner {
                             ..TurnContextEstimate::default()
                         },
                     );
+                    provider_initiated
+                };
+                if provider_initiated {
+                    self.emitter.typing_status_changed(true);
                 }
-                self.emitter.typing_status_changed(true);
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -6823,7 +6834,6 @@ impl CodexInner {
                     self.append_text_to_active_stream(&message_id, &delta).await
                 {
                     if publish {
-                        self.emitter.typing_status_changed(true);
                         Self::emit_stream_start(
                             self.emitter.as_ref(),
                             message_id.clone(),
@@ -12005,12 +12015,7 @@ fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
             .map(|items| {
                 items
                     .iter()
-                    .filter(|item| {
-                        matches!(
-                            item.get("type").and_then(Value::as_str),
-                            Some("userMessage" | "agentMessage")
-                        )
-                    })
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
                     .count() as u64
             })
             .sum::<u64>()
@@ -12935,7 +12940,7 @@ fn record_model_request_token_usage(
         return Some(ModelRequestTokenUsage {
             request_id: ModelRequestId {
                 turn_id: ModelTurnId(turn_id),
-                sequence: state.request_count.saturating_sub(1),
+                sequence: state.request_count,
             },
             current_context_usage: Some(current_context_usage(&request, context_window)),
             request,
@@ -12946,7 +12951,7 @@ fn record_model_request_token_usage(
         });
     }
 
-    let sequence = state.request_count;
+    let sequence = state.request_count.saturating_add(1);
     state.request_count = state.request_count.saturating_add(1);
     add_token_usage(&mut state.turn, &request);
     state.latest_request = Some(request.clone());
@@ -16205,6 +16210,34 @@ mod tests {
     use tokio::time::timeout;
 
     static CODEX_FAKE_APP_SERVER_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn session_metadata_counts_only_assistant_responses() {
+        let metadata = codex_thread_to_session_metadata(&json!({
+            "id": "thread-1",
+            "turns": [
+                {
+                    "items": [
+                        { "type": "userMessage", "text": "first" },
+                        { "type": "reasoning", "text": "thinking" },
+                        { "type": "agentMessage", "text": "answer one" }
+                    ]
+                },
+                {
+                    "items": [
+                        { "type": "userMessage", "text": "second" },
+                        { "type": "agentMessage", "text": "answer two" }
+                    ]
+                }
+            ]
+        }))
+        .expect("session metadata");
+
+        assert_eq!(
+            metadata.get("message_count").and_then(Value::as_u64),
+            Some(2)
+        );
+    }
 
     #[test]
     fn transcript_metadata_attests_provider_identity_without_guessing_generated_ids() {
@@ -20457,6 +20490,50 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn submitted_turn_emits_one_active_event() {
+        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "initial".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+
+        let active_events = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut active_events = 0;
+            let mut stream_ended = false;
+            while let Some(event) = events.recv().await {
+                match event {
+                    ChatEvent::TypingStatusChanged(true) => {
+                        active_events += 1;
+                    }
+                    ChatEvent::StreamEnd(_) => {
+                        stream_ended = true;
+                    }
+                    ChatEvent::TypingStatusChanged(false) if stream_ended => {
+                        return active_events;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("fake Codex event stream ended before idle");
+        })
+        .await
+        .expect("fake Codex idle timeout");
+
+        assert_eq!(active_events, 1);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn strict_termination_interrupts_once_without_waiting() {
         let fake = CodexFakeAppServer::new("strict_termination_interrupt_held", "unused");
         let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
@@ -21805,6 +21882,7 @@ for line in sys.stdin:
             execution_mode: BackendExecutionMode::Agent,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
+            awaiting_root_turn_start: false,
             interrupt_next_root_turn: false,
             pending_compaction: None,
             active_stream: Some(ActiveStreamState {
@@ -26841,16 +26919,16 @@ Do not describe the tool, and do not skip the tool call."#;
             let reasoning_events = drain_events(&mut rx);
             assert_eq!(
                 event_kinds(&reasoning_events),
-                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"]
+                vec!["StreamStart", "StreamReasoningDelta"]
             );
-            let generated_id = reasoning_events[1]
+            let generated_id = reasoning_events[0]
                 .pointer("/data/message_id")
                 .and_then(Value::as_str)
                 .expect("generated reasoning id")
                 .to_string();
             assert!(generated_id.starts_with("server-generated:idless_reasoning:"));
             assert_eq!(
-                reasoning_events[2]
+                reasoning_events[1]
                     .pointer("/data/message_id")
                     .and_then(Value::as_str),
                 Some(generated_id.as_str())
@@ -28994,7 +29072,6 @@ Do not describe the tool, and do not skip the tool call."#;
                     "StreamStart",
                     "ToolRequest",
                     "StreamEnd",
-                    "TypingStatusChanged",
                     "StreamStart",
                     "StreamDelta",
                     "ToolExecutionCompleted",
@@ -29990,7 +30067,6 @@ Do not describe the tool, and do not skip the tool call."#;
             assert_eq!(
                 event_kinds(&events),
                 vec![
-                    "TypingStatusChanged",
                     "StreamStart",
                     "StreamReasoningDelta",
                     "StreamEnd",
@@ -33454,7 +33530,7 @@ Do not describe the tool, and do not skip the tool call."#;
             context_window,
         )
         .expect("first request");
-        assert_eq!(first.request_id.sequence, 0);
+        assert_eq!(first.request_id.sequence, 1);
         assert_eq!(first.request.total_tokens, 110);
         assert_eq!(first.turn.total_tokens, 110);
         assert_eq!(first.cumulative.total_tokens, 1_100);
@@ -33494,7 +33570,7 @@ Do not describe the tool, and do not skip the tool call."#;
             context_window,
         )
         .expect("second request");
-        assert_eq!(second.request_id.sequence, 1);
+        assert_eq!(second.request_id.sequence, 2);
         assert_eq!(second.request.total_tokens, 140);
         assert_eq!(second.turn.total_tokens, 250);
         assert_eq!(second.cumulative.total_tokens, 1_240);
@@ -33591,7 +33667,7 @@ Do not describe the tool, and do not skip the tool call."#;
             Some(400_000),
         )
         .expect("new explicit provider window");
-        assert_eq!(enriched.request_id.sequence, 0);
+        assert_eq!(enriched.request_id.sequence, 1);
         assert_eq!(
             enriched.current_context_usage,
             Some(CurrentContextUsage::Known {

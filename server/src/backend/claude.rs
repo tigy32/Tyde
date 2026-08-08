@@ -574,6 +574,8 @@ impl ClaudeSession {
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+            background_work_active: std::sync::atomic::AtomicBool::new(false),
+            typing_active: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Armed through the same call every other caller uses, immediately after
@@ -869,6 +871,12 @@ struct ClaudeInner {
     /// token, so a stray frame arriving after a `result` can never open one.
     /// Atomic because the reader consults it synchronously per frame.
     pending_cli_wake: std::sync::atomic::AtomicBool,
+    /// True while provider-owned work can continue after the foreground turn
+    /// that launched it has ended. Typing is the public activity contract, so
+    /// a foreground `result` must not make the agent appear idle while this is
+    /// set.
+    background_work_active: std::sync::atomic::AtomicBool,
+    typing_active: std::sync::atomic::AtomicBool,
 }
 
 struct BackgroundTaskRegistry {
@@ -2211,7 +2219,7 @@ impl ClaudeInner {
         }
 
         let quiesced_waiters = self.clear_active_turn(turn_id).await;
-        self.emit_typing_status(false);
+        self.emit_idle_if_quiescent();
         notify_turn_quiesced(quiesced_waiters);
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
@@ -2223,14 +2231,44 @@ impl ClaudeInner {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn disarm_cli_wake(&self) {
-        self.pending_cli_wake
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
     fn take_pending_cli_wake(&self) -> bool {
         self.pending_cli_wake
             .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn has_pending_cli_wake(&self) -> bool {
+        self.pending_cli_wake
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_background_work_active(&self, active: bool) -> bool {
+        self.background_work_active
+            .swap(active, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn emit_idle_if_quiescent(&self) {
+        if !self
+            .background_work_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self.has_pending_cli_wake()
+        {
+            self.emit_typing_status(false);
+        }
+    }
+
+    async fn emit_idle_if_no_active_turn(&self) {
+        let turn_active = self
+            .state
+            .lock()
+            .await
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| {
+                !matches!(turn.owner, ClaudeTurnOwner::User) || turn.outcome_tx.is_some()
+            });
+        if !turn_active {
+            self.emit_idle_if_quiescent();
+        }
     }
 
     /// Wait until no turn is installed, i.e. the previous turn's finalizer has
@@ -2663,7 +2701,7 @@ impl ClaudeInner {
             });
         }
 
-        self.emit_typing_status(false);
+        self.emit_idle_if_quiescent();
         Ok(())
     }
 
@@ -2695,7 +2733,7 @@ impl ClaudeInner {
             });
         }
 
-        self.emit_typing_status(false);
+        self.emit_idle_if_quiescent();
         Ok(())
     }
 
@@ -3750,6 +3788,10 @@ impl ClaudeInner {
             .expect("Claude background task mutex poisoned");
         registry.owner_active = false;
         drain_background_task_entries(&mut registry.entries);
+        self.background_work_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.pending_cli_wake
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn activate_background_task_owner(&self) {
@@ -3980,6 +4022,8 @@ impl ClaudeInner {
 
         self.emitter.session_started(&normalized);
         self.emitter.conversation_cleared();
+        self.typing_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.emitter.typing_status_changed(false);
 
         let replay = match if let Some(host) = &ssh_host {
@@ -4208,7 +4252,13 @@ impl ClaudeInner {
     }
 
     fn emit_typing_status(&self, typing: bool) {
-        self.emitter.typing_status_changed(typing);
+        if self
+            .typing_active
+            .swap(typing, std::sync::atomic::Ordering::Relaxed)
+            != typing
+        {
+            self.emitter.typing_status_changed(typing);
+        }
     }
 
     fn emit_stream_start(&self, message_id: &str, model: Option<String>) {
@@ -4285,6 +4335,8 @@ impl ClaudeInner {
     }
 
     fn emit_operation_cancelled(&self, message: &str) {
+        self.typing_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.emitter.operation_cancelled(message);
     }
 
@@ -4954,6 +5006,30 @@ struct PersistentStdoutTurnState {
     segment: SegmentState,
 }
 
+async fn sync_persistent_background_activity(
+    inner: &ClaudeInner,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+    workflow_runs: &HashMap<String, WorkflowRunEntry>,
+) {
+    let bash_active = {
+        let registry = inner
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned");
+        registry.owner_active && !registry.entries.is_empty()
+    };
+    let subagent_active = subagent_streams.values().any(|stream| {
+        matches!(
+            stream.execution,
+            SubAgentExecution::Background | SubAgentExecution::Unknown
+        )
+    });
+    let active = bash_active || subagent_active || !workflow_runs.is_empty();
+    if inner.set_background_work_active(active) && !active {
+        inner.emit_idle_if_no_active_turn().await;
+    }
+}
+
 async fn read_claude_stdout_persistent(
     stdout: ChildStdout,
     inner: Arc<ClaudeInner>,
@@ -5210,10 +5286,12 @@ async fn read_claude_stdout_persistent(
         recent_system_subtypes.observe(&value);
 
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
             continue;
         }
         let handled_background_task = inner.handle_background_task_frame(&value, &subagent_streams);
         if handled_background_task {
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
             continue;
         }
 
@@ -5241,6 +5319,7 @@ async fn read_claude_stdout_persistent(
             // arrives on the parent stream after the parent's turn `result`.
             // Handle it pre-gate so it lands even with no active turn.
             finalize_background_subagent_completion(&value, &mut subagent_streams);
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
 
         if let Some(parent_id) = extract_parent_tool_use_id(&value) {
@@ -5263,6 +5342,7 @@ async fn read_claude_stdout_persistent(
                     &subagent_streams,
                 );
             }
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
             continue;
         }
 
@@ -5276,6 +5356,7 @@ async fn read_claude_stdout_persistent(
             )
             .await;
             known_subagent_ids.extend(subagent_streams.keys().cloned());
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
@@ -5295,7 +5376,7 @@ async fn read_claude_stdout_persistent(
                         recent_system_subtypes.warn_once_on_dropped_frame(&value);
                         continue;
                     }
-                    if !inner.take_pending_cli_wake() {
+                    if !inner.has_pending_cli_wake() {
                         recent_system_subtypes.warn_once_on_dropped_turn_start(&value);
                         continue;
                     }
@@ -5311,18 +5392,18 @@ async fn read_claude_stdout_persistent(
                             || inner.begin_cli_initiated_turn().await.is_none()
                         {
                             // The wake could not be adopted even after waiting
-                            // for the hand-off. The token goes back so a later
-                            // frame can retry, but this is the fix's own
-                            // failure mode and must be visible.
+                            // for the hand-off. Leave the token armed so a
+                            // later frame can retry, but make this failure mode
+                            // visible.
                             tracing::warn!(
                                 wait_secs = CLAUDE_WAKE_QUIESCE_WAIT.as_secs(),
                                 "could not open a turn for a Claude wake; the previous turn \
                                  did not hand off in time or the backend is closing"
                             );
-                            inner.arm_cli_wake();
                             continue;
                         }
                     }
+                    inner.take_pending_cli_wake();
                     match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
                         Some(turn) => turn,
                         None => continue,
@@ -5373,6 +5454,7 @@ async fn read_claude_stdout_persistent(
 
         if subagent_emitter.is_some() {
             detect_subagent_completions(&value, &mut subagent_streams).await;
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
 
         if value.get("type").and_then(Value::as_str) == Some("result") {
@@ -5394,6 +5476,7 @@ async fn read_claude_stdout_persistent(
     for (_tool_use_id, stream) in subagent_streams.drain() {
         finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
     }
+    inner.set_background_work_active(false);
 
     fail_pending_control_waiters(&control_waiters, "Claude CLI process exited").await;
     let _turn_event_guard = inner.turn_event_gate.lock().await;
@@ -5557,8 +5640,6 @@ async fn prepare_persistent_stdout_turn(
         }
         (active.id, state.model.clone(), owner)
     };
-    inner.disarm_cli_wake();
-
     if turn_state.active_turn_id != Some(turn_id) {
         let base_message_id = format!("claude-msg-{turn_id}");
         turn_state.active_turn_id = Some(turn_id);
@@ -6412,6 +6493,8 @@ async fn ensure_subagent_stream(
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+        background_work_active: std::sync::atomic::AtomicBool::new(false),
+        typing_active: std::sync::atomic::AtomicBool::new(false),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
@@ -13515,6 +13598,8 @@ mod tests {
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+            background_work_active: std::sync::atomic::AtomicBool::new(false),
+            typing_active: std::sync::atomic::AtomicBool::new(false),
         };
         (inner, event_rx)
     }
@@ -18024,13 +18109,11 @@ for raw_line in sys.stdin:
         assert_eq!(log_contents.matches("\"type\":\"user\"").count(), 2);
     }
 
-    /// End-to-end guard for the tray row of a background command launched
-    /// while another background task is already running. A concurrent task
-    /// makes the CLI emit `task_started` (and the `tool_result`) *before*
-    /// `message_delta`/`message_stop`, so ownership cannot be resolved from
-    /// the tool request at `task_started` time. The client must still receive
-    /// a `Running` snapshot — that snapshot is the only thing the in-flight
-    /// tray renders a background command from.
+    /// End-to-end replay of the frame ordering captured when a background
+    /// command starts alongside another task. The capture puts `task_started`
+    /// and the `tool_result` before `message_delta`/`message_stop`, so ownership
+    /// cannot be resolved from the tool request at `task_started` time. The
+    /// client must still receive the `Running` snapshot the tray renders.
     #[tokio::test(flavor = "current_thread")]
     async fn fake_concurrent_background_launch_publishes_running_snapshot() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
@@ -18043,6 +18126,7 @@ for raw_line in sys.stdin:
 import json
 import os
 import sys
+import time
 
 args = sys.argv[1:]
 session_id = "fake-concurrent-bg"
@@ -18172,6 +18256,17 @@ def arm_watcher():
         "session_id": session_id,
         "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
     })
+    time.sleep(0.1)
+    emit({
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": session_id,
+        "task_id": "watchtask",
+        "tool_use_id": WATCH,
+        "parent_tool_use_id": "fixture_no_wake",
+        "status": "stopped",
+        "summary": "watcher stopped",
+    })
 
 def launch_at_finalization():
     # Turn 3 models the window the per-frame ownership retry cannot cover: the
@@ -18239,6 +18334,17 @@ def launch_at_finalization():
         "result": "late launch",
         "session_id": session_id,
         "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+    })
+    time.sleep(0.1)
+    emit({
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": session_id,
+        "task_id": "latetask",
+        "tool_use_id": LATE,
+        "parent_tool_use_id": "fixture_no_wake",
+        "status": "stopped",
+        "summary": "late probe stopped",
     })
 
 log("START " + " ".join(args))
@@ -18371,6 +18477,16 @@ for raw_line in sys.stdin:
         "session_id": session_id,
         "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
     })
+    emit({
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": session_id,
+        "task_id": "bgtask",
+        "tool_use_id": TOOL,
+        "parent_tool_use_id": "fixture_no_wake",
+        "status": "stopped",
+        "summary": "probe stopped",
+    })
 "#,
         )
         .expect("write fake concurrent background Claude script");
@@ -18409,9 +18525,11 @@ for raw_line in sys.stdin:
             })
             .await
             .expect("send watcher turn");
-        // Let the watcher turn go fully idle so its task is live in the
-        // registry before the background command is launched — production
-        // only fails when a task from an earlier turn is still running.
+        // The fixture terminates its watcher before accepting the next user
+        // turn. Typing now remains active for observed background work, so the
+        // old fixture behavior of waiting for idle while leaving it running
+        // contradicted the backend contract. The next turn still replays the
+        // captured concurrent-task frame ordering above.
         timeout(Duration::from_secs(5), async {
             loop {
                 let event = rx
@@ -24887,6 +25005,8 @@ for raw_line in sys.stdin:
                 skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                 skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
                 pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+                background_work_active: std::sync::atomic::AtomicBool::new(false),
+                typing_active: std::sync::atomic::AtomicBool::new(false),
             }),
             event_rx,
         )
@@ -25376,6 +25496,14 @@ for line in sys.stdin:
         continue
     if value.get("type") != "user":
         continue
+    emit({
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": session_id,
+        "task_id": "waketask",
+        "task_type": "local_bash",
+        "tool_use_id": "toolu_wake_probe",
+    })
     turn("launch-msg", "LAUNCHED", 3,
          {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
     # The launching turn is over. The task completing is what makes the real
@@ -25430,7 +25558,6 @@ for line in sys.stdin:
 
         let mut events: Vec<Value> = Vec::new();
         let collected = timeout(Duration::from_secs(20), async {
-            let mut idle_count = 0usize;
             loop {
                 let event = rx
                     .recv()
@@ -25440,12 +25567,7 @@ for line in sys.stdin:
                     && event.get("data").and_then(Value::as_bool) == Some(false);
                 events.push(event);
                 if idle {
-                    idle_count += 1;
-                    // One idle closes the launching turn; the second closes
-                    // the wake turn.
-                    if idle_count == 2 {
-                        return;
-                    }
+                    return;
                 }
             }
         })
@@ -25471,6 +25593,18 @@ for line in sys.stdin:
             stream_ends.len(),
             2,
             "expected the launching turn and the wake turn. Events:\n{dump}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("TypingStatusChanged")
+                        && event.get("data").and_then(Value::as_bool) == Some(false)
+                })
+                .count(),
+            1,
+            "background work and its wake turn must remain one continuous active interval. \
+             Events:\n{dump}"
         );
         assert_eq!(
             stream_end_message(stream_ends[0])
@@ -25664,6 +25798,14 @@ for line in sys.stdin:
         continue
     if value.get("type") != "user":
         continue
+    emit({
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": session_id,
+        "task_id": "waketask",
+        "task_type": "local_bash",
+        "tool_use_id": "toolu_wake_probe",
+    })
     launching_turn()
     emit({
         "type": "system",
@@ -25714,7 +25856,6 @@ for line in sys.stdin:
 
         let mut events: Vec<Value> = Vec::new();
         let collected = timeout(Duration::from_secs(20), async {
-            let mut idle_count = 0usize;
             loop {
                 let event = rx
                     .recv()
@@ -25724,10 +25865,7 @@ for line in sys.stdin:
                     && event.get("data").and_then(Value::as_bool) == Some(false);
                 events.push(event);
                 if idle {
-                    idle_count += 1;
-                    if idle_count == 2 {
-                        return;
-                    }
+                    return;
                 }
             }
         })
@@ -26035,6 +26173,59 @@ for line in sys.stdin:
                 .is_none(),
             "a turn that produced its result must not absorb further frames"
         );
+    }
+
+    #[tokio::test]
+    async fn active_turn_frames_do_not_consume_a_pending_wake() {
+        let (inner, _rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        {
+            let mut state = inner.state.lock().await;
+            let (outcome_tx, _outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: 12,
+                owner: ClaudeTurnOwner::User,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+        inner.arm_cli_wake();
+
+        let mut turn_state = PersistentStdoutTurnState::default();
+        assert!(
+            prepare_persistent_stdout_turn(&inner, &mut turn_state)
+                .await
+                .is_some()
+        );
+        assert!(
+            inner.has_pending_cli_wake(),
+            "a task notification can precede the launching turn's remaining frames"
+        );
+    }
+
+    #[test]
+    fn idle_is_suppressed_until_provider_work_is_quiescent() {
+        let (inner, mut rx) = make_test_inner();
+        inner.emit_typing_status(true);
+        let _ = rx.try_recv().expect("active marker");
+
+        inner.set_background_work_active(true);
+        inner.emit_idle_if_quiescent();
+        assert!(rx.try_recv().is_err());
+
+        inner.set_background_work_active(false);
+        inner.arm_cli_wake();
+        inner.emit_idle_if_quiescent();
+        assert!(rx.try_recv().is_err());
+
+        assert!(inner.take_pending_cli_wake());
+        inner.emit_idle_if_quiescent();
+        let idle = rx.try_recv().expect("quiescent backend must report idle");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
@@ -28221,6 +28412,8 @@ for line in sys.stdin:
                     skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                     skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
                     pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+                    background_work_active: std::sync::atomic::AtomicBool::new(false),
+                    typing_active: std::sync::atomic::AtomicBool::new(false),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
                 parent_tool_name: "Task".to_string(),
