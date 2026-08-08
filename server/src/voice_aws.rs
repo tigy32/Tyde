@@ -201,14 +201,13 @@ impl Grammar {
                     serde_json::json!({"event":{"contentEnd":{"promptName":self.prompt,"contentName":content}}}),
                 ]
             }
-            NovaInput::Progress { text } => {
-                let content = uuid::Uuid::new_v4().to_string();
-                vec![
-                    serde_json::json!({"event":{"contentStart":{"promptName":self.prompt,"contentName":content,"role":"SYSTEM","type":"TEXT","interactive":false,"textInputConfiguration":{"mediaType":"text/plain"}}}}),
-                    serde_json::json!({"event":{"textInput":{"promptName":self.prompt,"contentName":content,"content":text}}}),
-                    serde_json::json!({"event":{"contentEnd":{"promptName":self.prompt,"contentName":content}}}),
-                ]
-            }
+            // Nova permits exactly ONE SYSTEM content block per prompt, and
+            // the opening grammar already sent it. Encoding progress as a
+            // second SYSTEM block was a fatal ValidationException ("Duplicate
+            // SYSTEM content") that killed every session on its first agent
+            // call. Progress is surfaced through the UI transcript lane
+            // instead of the provider prompt.
+            NovaInput::Progress { .. } => Vec::new(),
             NovaInput::Stop => vec![
                 serde_json::json!({"event":{"promptEnd":{"promptName":self.prompt}}}),
                 serde_json::json!({"event":{"sessionEnd":{}}}),
@@ -325,15 +324,26 @@ async fn run_stream(context: StreamContext) {
             Ok(Some(v)) => v,
             Ok(None) => break,
             Err(error) => {
+                let raw = format!("{error:?}");
+                let failure = categorize_start_failure(&raw);
+                // Credential failures stay typed-only so provider text never
+                // leaks tokens or account diagnostics; everything else keeps
+                // the human-readable service message so the UI can show WHY
+                // the session died instead of a generic "unavailable".
+                let detail = match failure.category {
+                    "credentials_expired" | "credentials_unavailable" => None,
+                    _ => extract_service_message(&raw),
+                };
                 if closing.load(Ordering::Acquire) {
-                    tracing::debug!(provider_error=?error,"Nova stream receive failed during close");
+                    tracing::debug!(provider_error=%raw,"Nova stream receive failed during close");
                 } else {
-                    tracing::warn!(provider_error=?error,"Nova stream receive failed mid-session");
+                    tracing::warn!(category = failure.category, provider_error=%raw,"Nova stream receive failed mid-session");
                 }
                 let _ = output_tx
                     .send(NovaOutput::ProviderError {
-                        code: protocol::VoiceErrorCode::ProviderUnavailable,
-                        retryable: true,
+                        code: failure.code,
+                        retryable: failure.retryable,
+                        detail,
                     })
                     .await;
                 return;
@@ -353,6 +363,31 @@ async fn run_stream(context: StreamContext) {
         }
     }
     let _ = output_tx.send(NovaOutput::End { clean: true }).await;
+}
+
+/// Pull the human-readable service message out of an SDK error's debug
+/// representation — e.g. the ValidationException text inside
+/// `message: Some("RequestId=… : Error(s):\nError 1 : …")`.
+fn extract_service_message(debug: &str) -> Option<String> {
+    let marker = "message: Some(\"";
+    let start = debug.find(marker)? + marker.len();
+    let rest = &debug[start..];
+    let end = rest.find("\")")?;
+    let text = rest[..end].replace("\\n", " ").replace("\\\"", "\"");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut bounded = trimmed.to_string();
+    if bounded.len() > 300 {
+        let mut cut = 300;
+        while !bounded.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        bounded.truncate(cut);
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn categorize_start_failure(redacted_debug: &str) -> ProviderFailure {
@@ -407,9 +442,17 @@ impl Parser {
             || event.get("throttlingException").is_some()
         {
             tracing::warn!(provider_event = %event, "Nova stream reported an error event");
+            let detail = ["error", "internalServerException", "throttlingException"]
+                .iter()
+                .find_map(|key| event.get(*key))
+                .and_then(|body| body.get("message"))
+                .and_then(|message| message.as_str())
+                .filter(|message| !message.trim().is_empty())
+                .map(|message| message.trim().to_string());
             return vec![NovaOutput::ProviderError {
                 code: protocol::VoiceErrorCode::ProviderUnavailable,
                 retryable: true,
+                detail,
             }];
         }
         if let Some(start) = event.get("completionStart") {
@@ -595,9 +638,54 @@ mod tests {
             code: failure.code,
             retryable: failure.retryable,
             fatal: true,
+            detail: None,
         };
         let encoded = serde_json::to_string(&payload).unwrap();
         assert!(!encoded.contains("secret-sso-diagnostic"));
+    }
+
+    /// Nova permits exactly ONE SYSTEM content block per prompt. beta.58
+    /// killed every live session on its first agent call because Progress
+    /// was encoded as a second SYSTEM block — Bedrock rejected the stream
+    /// with "Duplicate SYSTEM content. SYSTEM content can only be provided
+    /// once per prompt". The whole prompt lifetime must carry one SYSTEM
+    /// block, and Progress must never reach the provider.
+    #[test]
+    fn prompt_lifetime_carries_exactly_one_system_block() {
+        let grammar = Grammar::new(&protocol::VoiceSessionId("session".into()));
+        let mut events = grammar.opening();
+        events.extend(grammar.encode(NovaInput::Progress {
+            text: "The Tyde agent is still working.".into(),
+        }));
+        events.extend(grammar.encode(NovaInput::ToolResult {
+            tool_use_id: "tool-1".into(),
+            message_id: "message-1".into(),
+            result: "done".into(),
+        }));
+        events.extend(grammar.encode(NovaInput::InputEnd));
+        events.extend(grammar.encode(NovaInput::Stop));
+        let system_blocks = events
+            .iter()
+            .filter(|event| event["event"]["contentStart"]["role"] == "SYSTEM")
+            .count();
+        assert_eq!(system_blocks, 1, "one SYSTEM block per prompt, ever");
+        assert!(
+            grammar
+                .encode(NovaInput::Progress {
+                    text: "still working".into()
+                })
+                .is_empty(),
+            "progress must never reach the provider prompt"
+        );
+    }
+
+    #[test]
+    fn mid_session_error_detail_extracts_the_service_message() {
+        let raw = r#"ServiceError(ServiceError { source: ValidationException(ValidationException { message: Some("RequestId=69aacc09 : Error(s):\nError 1 : Duplicate SYSTEM content. SYSTEM content can only be provided once per prompt."), meta: ErrorMetadata { code: None } }) })"#;
+        let detail = extract_service_message(raw).expect("detail extracted");
+        assert!(detail.contains("Duplicate SYSTEM content"), "{detail}");
+        assert!(!detail.contains("\\n"), "escapes are unescaped: {detail}");
+        assert!(extract_service_message("no message here").is_none());
     }
 
     #[test]

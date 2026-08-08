@@ -74,6 +74,16 @@ where
     .await
 }
 
+/// The three voices of a session, each pinned to its own display lane so the
+/// band can show what the model is hearing (you), what it is saying (Nova),
+/// and what the coding agent is doing — instead of one interleaved stream.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoiceLanes {
+    pub you: Option<String>,
+    pub nova: Option<String>,
+    pub agent: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum VoiceUiState {
     Idle,
@@ -88,7 +98,7 @@ pub enum VoiceUiState {
         session_id: protocol::VoiceSessionId,
         target: protocol::VoiceTarget,
         state: protocol::VoiceSessionState,
-        transcript: Option<protocol::VoiceTranscriptPayload>,
+        lanes: VoiceLanes,
         next_output_media_seq: u64,
         dropped_output_packets: u64,
     },
@@ -343,7 +353,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     session_id: payload.session_id,
                     target: payload.target,
                     state: protocol::VoiceSessionState::Listening,
-                    transcript: None,
+                    lanes: VoiceLanes::default(),
                     next_output_media_seq: 0,
                     dropped_output_packets: 0,
                 });
@@ -376,14 +386,17 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     return;
                 }
                 state.voice_ui.update(|current| {
-                    if let VoiceUiState::Active {
-                        transcript: slot, ..
-                    } = current
-                    {
-                        *slot = Some(transcript.clone())
+                    if let VoiceUiState::Active { lanes, .. } = current {
+                        let slot = match transcript.speaker {
+                            protocol::VoiceTranscriptSpeaker::User => &mut lanes.you,
+                            protocol::VoiceTranscriptSpeaker::Assistant => &mut lanes.nova,
+                            protocol::VoiceTranscriptSpeaker::Progress => &mut lanes.agent,
+                        };
+                        *slot = Some(transcript.text.clone());
                     }
                 });
                 if transcript.is_final
+                    && state.voice_transcript_in_chat.get_untracked()
                     && let Some(agent_id) = agent_id
                 {
                     state.push_chat_entry(
@@ -508,11 +521,20 @@ fn voice_error_message(payload: &protocol::VoiceErrorPayload) -> String {
         | protocol::VoiceErrorCode::WrongTarget
         | protocol::VoiceErrorCode::Internal => "an internal voice error occurred",
     };
-    if payload.retryable {
+    let mut message = if payload.retryable {
         format!("Voice ended: {cause}. You can retry.")
     } else {
         format!("Voice ended: {cause}.")
+    };
+    if let Some(detail) = payload
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        message.push_str(&format!(" Provider said: “{detail}”"));
     }
+    message
 }
 
 fn handle_voice_opus_packet(packet_state: &AppState, event: bridge::VoiceOpusPacketEvent) {
@@ -750,51 +772,149 @@ pub fn install_media_listeners(state: AppState) {
 /// and the two session actions. Idle is deliberately absent — starting voice
 /// is offered by [`VoiceComposerButton`] in the composer row, so this renders
 /// only once a session exists.
+/// The status word and orb animation for a live phase. "Thinking" covers the
+/// agent-tool wait, matching what the user perceives: the assistant heard
+/// them and is off working.
+fn phase_presentation(phase: protocol::VoiceSessionState) -> (&'static str, &'static str) {
+    match phase {
+        protocol::VoiceSessionState::Starting => ("Connecting", "voice-orb--starting"),
+        protocol::VoiceSessionState::Listening => ("Listening", "voice-orb--listening"),
+        protocol::VoiceSessionState::AgentWorking => ("Thinking", "voice-orb--thinking"),
+        protocol::VoiceSessionState::Speaking => ("Speaking", "voice-orb--speaking"),
+        protocol::VoiceSessionState::Interrupting => ("Interrupting", "voice-orb--speaking"),
+        protocol::VoiceSessionState::Ending | protocol::VoiceSessionState::Ended => {
+            ("Ending", "voice-orb--starting")
+        }
+    }
+}
+
+fn lane_row(label: &'static str, text: Option<String>, test_id: &'static str) -> impl IntoView {
+    view! {
+        <div class="voice-lane" data-testid=test_id>
+            <span class="voice-lane-label">{label}</span>
+            <span class="voice-lane-text">{text.unwrap_or_else(|| "—".into())}</span>
+        </div>
+    }
+}
+
 #[component]
 fn VoiceSessionControls(state: AppState) -> impl IntoView {
     move || {
         let stop_state = state.clone();
         let interrupt_state = state.clone();
         let dismiss_state = state.clone();
+        let collapsed = state.voice_band_collapsed;
+        let in_chat = state.voice_transcript_in_chat;
         match state.voice_ui.get() {
             VoiceUiState::Idle => ().into_any(),
-            VoiceUiState::Starting { .. } => view! { <span>"Connecting voice…"</span> }.into_any(),
-            VoiceUiState::Active {
-                state: phase,
-                transcript,
-                ..
-            } => view! {
-                <span class="voice-pulse">{format!("{phase:?}")}</span>
-                <span class="voice-transcript">
-                    {transcript.map(|value| value.text).unwrap_or_default()}
-                </span>
-                <button
-                    class="chat-send-btn voice-action"
-                    on:click=move |_| interrupt(interrupt_state.clone())
-                >
-                    "Interrupt"
-                </button>
-                <button
-                    class="chat-send-btn voice-action"
-                    on:click=move |_| {
-                        stop(
-                            stop_state.clone(),
-                            protocol::VoiceStopReason::UserExited,
-                        )
-                    }
-                >
-                    "Done"
-                </button>
+            VoiceUiState::Starting { .. } => view! {
+                <div class="voice-band voice-band--starting">
+                    <span class="voice-orb voice-orb--starting" aria-hidden="true"></span>
+                    <span class="voice-band-status">"Connecting voice…"</span>
+                </div>
             }
             .into_any(),
+            VoiceUiState::Active {
+                state: phase,
+                lanes,
+                ..
+            } => {
+                let (status, orb_class) = phase_presentation(phase);
+                let agent_lane = lanes.agent.clone().or_else(|| {
+                    (phase == protocol::VoiceSessionState::AgentWorking)
+                        .then(|| "working…".to_string())
+                });
+                if collapsed.get() {
+                    let ticker = lanes.you.clone().unwrap_or_default();
+                    view! {
+                        <div class="voice-band voice-band--collapsed" data-testid="voice-band-collapsed">
+                            <span class=format!("voice-orb voice-orb--mini {orb_class}") aria-hidden="true"></span>
+                            <span class="voice-band-status">{status}</span>
+                            <span class="voice-band-ticker">{ticker}</span>
+                            <button
+                                class="chat-send-btn voice-action"
+                                data-testid="voice-band-expand"
+                                aria-label="Expand voice panel"
+                                title="Expand voice panel"
+                                on:click=move |_| collapsed.set(false)
+                            >
+                                "⌃"
+                            </button>
+                            <button
+                                class="chat-send-btn voice-action"
+                                on:click=move |_| {
+                                    stop(stop_state.clone(), protocol::VoiceStopReason::UserExited)
+                                }
+                            >
+                                "End"
+                            </button>
+                        </div>
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <div class="voice-band voice-band--expanded" data-testid="voice-band-expanded">
+                            <div class="voice-band-orb-zone">
+                                <span class=format!("voice-orb {orb_class}") aria-hidden="true"></span>
+                                <span class="voice-band-status">{status}</span>
+                            </div>
+                            <div class="voice-band-lanes">
+                                {lane_row("You", lanes.you.clone(), "voice-lane-you")}
+                                {lane_row("Nova", lanes.nova.clone(), "voice-lane-nova")}
+                                {lane_row("Agent", agent_lane, "voice-lane-agent")}
+                            </div>
+                            <div class="voice-band-controls">
+                                <button
+                                    class="chat-send-btn voice-action"
+                                    data-testid="voice-band-collapse"
+                                    aria-label="Collapse voice panel"
+                                    title="Collapse voice panel"
+                                    on:click=move |_| collapsed.set(true)
+                                >
+                                    "⌄"
+                                </button>
+                                <button
+                                    class="chat-send-btn voice-action"
+                                    on:click=move |_| interrupt(interrupt_state.clone())
+                                >
+                                    "Interrupt"
+                                </button>
+                                <button
+                                    class="chat-send-btn voice-action"
+                                    on:click=move |_| {
+                                        stop(
+                                            stop_state.clone(),
+                                            protocol::VoiceStopReason::UserExited,
+                                        )
+                                    }
+                                >
+                                    "End"
+                                </button>
+                                <label class="voice-band-toggle" title="Also append finalized voice transcripts to the agent chat">
+                                    <input
+                                        type="checkbox"
+                                        prop:checked=move || in_chat.get()
+                                        on:change=move |_| in_chat.update(|value| *value = !*value)
+                                    />
+                                    "Transcript in chat"
+                                </label>
+                            </div>
+                        </div>
+                    }
+                    .into_any()
+                }
+            }
             VoiceUiState::Failed(error) => view! {
-                <span class="voice-error" data-testid="voice-error">{error}</span>
-                <button
-                    class="chat-send-btn voice-action"
-                    on:click=move |_| dismiss_state.voice_ui.set(VoiceUiState::Idle)
-                >
-                    "Dismiss"
-                </button>
+                <div class="voice-band voice-band--failed">
+                    <span class="voice-orb voice-orb--failed" aria-hidden="true"></span>
+                    <span class="voice-error" data-testid="voice-error">{error}</span>
+                    <button
+                        class="chat-send-btn voice-action"
+                        on:click=move |_| dismiss_state.voice_ui.set(VoiceUiState::Idle)
+                    >
+                        "Dismiss"
+                    </button>
+                </div>
             }
             .into_any(),
         }
@@ -869,7 +989,17 @@ pub fn VoiceComposerButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
                 title="Start voice"
                 on:click=move |_| start(start_state.get_value())
             >
-                "Voice"
+                <svg
+                    class="voice-mic-icon"
+                    viewBox="0 0 24 24"
+                    width="16"
+                    height="16"
+                    fill="currentColor"
+                    aria-hidden="true"
+                >
+                    <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z" />
+                    <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.08A7 7 0 0 0 19 11z" />
+                </svg>
             </button>
         </Show>
     }
@@ -920,6 +1050,33 @@ pub fn VoiceRuntime() -> impl IntoView {
 mod gate_tests {
     use super::*;
 
+    /// The failed surface must say WHY the provider dropped the session when
+    /// the host supplies detail (beta.58's killer was only visible in host
+    /// logs), while detail-less payloads keep the typed summary alone.
+    #[test]
+    fn provider_detail_is_appended_to_the_error_message() {
+        let mut payload = protocol::VoiceErrorPayload {
+            session_id: None,
+            generation: 1,
+            code: protocol::VoiceErrorCode::ProviderUnavailable,
+            retryable: true,
+            fatal: true,
+            detail: Some(
+                "Duplicate SYSTEM content. SYSTEM content can only be provided once per prompt."
+                    .into(),
+            ),
+        };
+        let message = voice_error_message(&payload);
+        assert!(message.contains("Amazon Bedrock"), "{message}");
+        assert!(message.contains("retry"), "{message}");
+        assert!(message.contains("Duplicate SYSTEM content"), "{message}");
+
+        payload.detail = None;
+        let message = voice_error_message(&payload);
+        assert!(message.contains("Amazon Bedrock"), "{message}");
+        assert!(!message.contains("Provider said"), "{message}");
+    }
+
     fn active_downlink_state(generation: u64, next_output_media_seq: u64) -> VoiceUiState {
         VoiceUiState::Active {
             host_id: "local".to_string(),
@@ -930,7 +1087,7 @@ mod gate_tests {
             },
             generation,
             state: protocol::VoiceSessionState::Listening,
-            transcript: None,
+            lanes: VoiceLanes::default(),
             next_output_media_seq,
             dropped_output_packets: 0,
         }
@@ -1328,7 +1485,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/voice-agent/instance".to_owned()),
             },
             state: protocol::VoiceSessionState::Listening,
-            transcript: None,
+            lanes: VoiceLanes::default(),
             next_output_media_seq: 0,
             dropped_output_packets: 0,
         }
@@ -1747,6 +1904,7 @@ mod wasm_tests {
                 code: protocol::VoiceErrorCode::ProviderUnavailable,
                 retryable: true,
                 fatal: true,
+                detail: None,
             },
         )
         .expect("encode voice_error envelope");
@@ -1781,6 +1939,163 @@ mod wasm_tests {
         assert!(
             start_button(&container).is_some(),
             "dismissing the error must restore the start button"
+        );
+
+        drop(mount);
+        container.remove();
+    }
+
+    /// The voice band separates the session's three voices into lanes — what
+    /// the model hears (You), what it says (Nova), and what the agent is
+    /// doing — keeps finalized voice turns OUT of the agent chat unless the
+    /// user opts in, and treats collapse as a sticky user choice that session
+    /// traffic must never undo.
+    #[wasm_bindgen_test]
+    async fn voice_band_lanes_chat_gating_and_sticky_collapse() {
+        let _stub = install_voice_listener_stub(None, None);
+        let container = container();
+        let state = AppState::new();
+        open_voice_gate(&state);
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            let state = render_state.clone();
+            provide_context(state.clone());
+            let agent_ref = Signal::derive(move || state.active_agent.get());
+            view! { <VoiceComposerBar agent_ref=agent_ref /> }
+        });
+        next_tick().await;
+        state.voice_ui.set(active_voice_state(1));
+        next_tick().await;
+
+        let transcript = |speaker, text: &str, is_final| {
+            protocol::Envelope::from_payload(
+                StreamPath("/voice/voice-session".to_owned()),
+                FrameKind::VoiceTranscript,
+                1,
+                &protocol::VoiceTranscriptPayload {
+                    session_id: protocol::VoiceSessionId("voice-session".to_owned()),
+                    generation: 1,
+                    speaker,
+                    text: text.to_owned(),
+                    is_final,
+                    message_id: None,
+                },
+            )
+            .expect("encode transcript envelope")
+        };
+        let chat_row_total = || {
+            state
+                .chat_rows
+                .with_untracked(|rows| rows.values().map(Vec::len).sum::<usize>())
+        };
+
+        handle_control(
+            &state,
+            "local",
+            &transcript(
+                protocol::VoiceTranscriptSpeaker::User,
+                "fix the flaky test",
+                false,
+            ),
+        );
+        handle_control(
+            &state,
+            "local",
+            &transcript(
+                protocol::VoiceTranscriptSpeaker::Assistant,
+                "asking the agent now",
+                false,
+            ),
+        );
+        handle_control(
+            &state,
+            "local",
+            &transcript(
+                protocol::VoiceTranscriptSpeaker::Progress,
+                "agent is reading voice.rs",
+                false,
+            ),
+        );
+        next_tick().await;
+
+        let lane_text = |id: &str| {
+            container
+                .query_selector(&format!("[data-testid='{id}']"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing lane {id}"))
+                .text_content()
+                .unwrap()
+        };
+        assert!(lane_text("voice-lane-you").contains("fix the flaky test"));
+        assert!(lane_text("voice-lane-nova").contains("asking the agent now"));
+        assert!(lane_text("voice-lane-agent").contains("agent is reading voice.rs"));
+
+        handle_control(
+            &state,
+            "local",
+            &transcript(protocol::VoiceTranscriptSpeaker::User, "final words", true),
+        );
+        next_tick().await;
+        assert_eq!(
+            chat_row_total(),
+            0,
+            "voice transcripts must stay out of the chat unless the user opts in"
+        );
+
+        state.voice_transcript_in_chat.set(true);
+        handle_control(
+            &state,
+            "local",
+            &transcript(
+                protocol::VoiceTranscriptSpeaker::User,
+                "on the record",
+                true,
+            ),
+        );
+        next_tick().await;
+        assert_eq!(
+            chat_row_total(),
+            1,
+            "opting in must append finalized turns to the chat"
+        );
+
+        let collapse: HtmlElement = container
+            .query_selector("[data-testid='voice-band-collapse']")
+            .unwrap()
+            .expect("expanded band offers a collapse control")
+            .dyn_into()
+            .unwrap();
+        collapse.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-testid='voice-band-collapsed']")
+                .unwrap()
+                .is_some(),
+            "collapse must switch to the one-line strip"
+        );
+        handle_control(
+            &state,
+            "local",
+            &transcript(
+                protocol::VoiceTranscriptSpeaker::Assistant,
+                "still talking",
+                false,
+            ),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-testid='voice-band-collapsed']")
+                .unwrap()
+                .is_some(),
+            "session traffic must not expand a collapsed band"
+        );
+        assert!(
+            container
+                .query_selector("[data-testid='voice-band-expanded']")
+                .unwrap()
+                .is_none()
         );
 
         drop(mount);

@@ -3751,6 +3751,14 @@ pub struct AppState {
     pub voice_capabilities_by_host: RwSignal<HashMap<String, protocol::VoiceCapabilitiesPayload>>,
     pub voice_ui: RwSignal<crate::voice::VoiceUiState>,
     pub voice_generation: RwSignal<u64>,
+    /// Sticky user choice between the expanded voice band and the one-line
+    /// strip. Never changed by session state — a view the user chose must
+    /// not move on its own.
+    pub voice_band_collapsed: RwSignal<bool>,
+    /// Whether finalized voice transcripts are also appended to the agent
+    /// chat. Off by default: the voice band is the voice conversation's
+    /// home, and mixing it into the agent thread was reported as confusing.
+    pub voice_transcript_in_chat: RwSignal<bool>,
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
@@ -4322,6 +4330,8 @@ impl AppState {
             voice_capabilities_by_host: RwSignal::new(HashMap::new()),
             voice_ui: RwSignal::new(crate::voice::VoiceUiState::Idle),
             voice_generation: RwSignal::new(0),
+            voice_band_collapsed: RwSignal::new(false),
+            voice_transcript_in_chat: RwSignal::new(false),
             projects: RwSignal::new(Vec::new()),
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),

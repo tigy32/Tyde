@@ -2034,6 +2034,7 @@ mod voice_tests {
             code: protocol::VoiceErrorCode::ToolBusy,
             retryable: true,
             fatal: false,
+            detail: None,
         };
         for valid in [
             frame(&stream, FrameKind::VoiceTranscript, &transcript, Vec::new()),

@@ -7217,6 +7217,12 @@ pub struct VoiceErrorPayload {
     pub code: VoiceErrorCode,
     pub retryable: bool,
     pub fatal: bool,
+    /// Human-readable provider failure text (e.g. the Bedrock
+    /// ValidationException message). Never populated for credential
+    /// failures, which stay typed-only so provider text cannot leak
+    /// account diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

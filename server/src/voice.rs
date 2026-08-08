@@ -111,6 +111,7 @@ pub(crate) enum NovaOutput {
     ProviderError {
         code: VoiceErrorCode,
         retryable: bool,
+        detail: Option<String>,
     },
     End {
         clean: bool,
@@ -741,6 +742,18 @@ impl VoiceConnection {
         retryable: bool,
         fatal: bool,
     ) -> Result<(), String> {
+        self.emit_error_with_detail(id, generation, code, retryable, fatal, None)
+    }
+
+    fn emit_error_with_detail(
+        &self,
+        id: Option<VoiceSessionId>,
+        generation: u64,
+        code: VoiceErrorCode,
+        retryable: bool,
+        fatal: bool,
+        detail: Option<String>,
+    ) -> Result<(), String> {
         let path = id.as_ref().map_or_else(
             || StreamPath("/voice".into()),
             |session| StreamPath(format!("/voice/{}", session.0)),
@@ -751,6 +764,7 @@ impl VoiceConnection {
             code,
             retryable,
             fatal,
+            detail,
         };
         self.output
             .with_path(path)
@@ -933,6 +947,27 @@ impl VoiceConnection {
                 return Ok(());
             };
             while let Ok(input) = active.tool_rx.try_recv() {
+                // Progress is a UI-only signal (the provider prompt must not
+                // receive it — Nova allows one SYSTEM block per prompt), so
+                // broadcast it as a transcript here, provider-independently.
+                if let NovaInput::Progress { text } = &input {
+                    let payload = VoiceTranscriptPayload {
+                        session_id: active.id.clone(),
+                        generation: active.generation,
+                        speaker: protocol::VoiceTranscriptSpeaker::Progress,
+                        text: text.clone(),
+                        is_final: false,
+                        message_id: None,
+                    };
+                    self.output
+                        .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                        .send_value(
+                            FrameKind::VoiceTranscript,
+                            serde_json::to_value(payload)
+                                .map_err(|_| "encode progress transcript")?,
+                        )
+                        .map_err(|_| "output closed")?;
+                }
                 active
                     .provider
                     .send(input)
@@ -1103,9 +1138,18 @@ impl VoiceConnection {
                         }
                         break;
                     }
-                    NovaOutput::ProviderError { code, retryable } => {
-                        provider_error =
-                            Some((active.id.clone(), active.generation, code, retryable));
+                    NovaOutput::ProviderError {
+                        code,
+                        retryable,
+                        detail,
+                    } => {
+                        provider_error = Some((
+                            active.id.clone(),
+                            active.generation,
+                            code,
+                            retryable,
+                            detail,
+                        ));
                         provider_ended = true;
                         break;
                     }
@@ -1119,14 +1163,15 @@ impl VoiceConnection {
             self.finish(VoiceStopReason::ProviderCompleted);
             return Ok(());
         }
-        if let Some((id, generation, code, retryable)) = provider_error {
+        if let Some((id, generation, code, retryable, detail)) = provider_error {
             tracing::warn!(
                 session = %id.0,
                 code = ?code,
                 retryable,
+                detail = detail.as_deref().unwrap_or(""),
                 "voice provider error ended the session"
             );
-            self.emit_error(Some(id), generation, code, retryable, true)?;
+            self.emit_error_with_detail(Some(id), generation, code, retryable, true, detail)?;
         }
         if provider_ended {
             self.finish(VoiceStopReason::ProviderFailed);

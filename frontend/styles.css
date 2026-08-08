@@ -13812,33 +13812,6 @@ pre.tool-error-pre {
     }
 }
 
-/* ===== Reduced motion =====
-   Placed last on purpose: these selectors have the same specificity as the rules
-   they override, so source order is what decides. An earlier block (as the first
-   attempt at this was) is silently beaten by the `.context-menu { animation }`
-   further down the file.
-
-   Only rules that actually animate appear here — a selector listed for an
-   element with nothing to animate is dead weight that reads as coverage. */
-@media (prefers-reduced-motion: reduce) {
-    /* `menu-in`. `.context-menu` covers the tab menu, the pane-actions menu and
-       the explorer's file menu, all of which carry that class. */
-    .context-menu,
-    .chat-send-menu {
-        animation: none;
-    }
-
-    /* Opacity reveal: the git panel's action group. */
-    .gp-file-actions {
-        transition: none;
-    }
-
-    /* The compaction banner's spinner runs for minutes at a time — by far the
-       longest-lived animation in the app, and the one most worth stopping. */
-    .compacting-card-icon {
-        animation: none;
-    }
-}
 /* Voice lives in the composer, not in a floating overlay. The previous
    `.voice-strip` was `position: fixed; left: 50%; bottom: 24px`, which is
    exactly where the composer sits — so the idle "Voice" chip painted on top of
@@ -13889,4 +13862,194 @@ pre.tool-error-pre {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.voice-band {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex: 1;
+    min-width: 0;
+}
+
+.voice-band-orb-zone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 72px;
+    flex-shrink: 0;
+}
+
+.voice-orb {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #ffffff 0%, #9fdcff 30%, #2277e0 70%, #12408a 100%);
+    box-shadow:
+        0 0 12px rgba(64, 156, 255, 0.55),
+        0 0 28px rgba(64, 156, 255, 0.25);
+    animation: voice-orb-breathe 2.4s ease-in-out infinite;
+    flex-shrink: 0;
+}
+
+.voice-orb--mini {
+    width: 14px;
+    height: 14px;
+    box-shadow: 0 0 6px rgba(64, 156, 255, 0.6);
+}
+
+.voice-orb--starting {
+    animation-duration: 1.1s;
+    opacity: 0.7;
+}
+
+.voice-orb--thinking {
+    filter: saturate(0.45) brightness(0.85);
+    animation-duration: 3.6s;
+}
+
+.voice-orb--speaking {
+    animation: voice-orb-ripple 1s ease-out infinite;
+}
+
+.voice-orb--failed {
+    width: 20px;
+    height: 20px;
+    background: radial-gradient(circle at 35% 35%, #f2b8b5 0%, #b3261e 70%, #5f100c 100%);
+    box-shadow: 0 0 10px rgba(179, 38, 30, 0.5);
+    animation: none;
+    opacity: 0.85;
+}
+
+@keyframes voice-orb-breathe {
+    0%,
+    100% {
+        transform: scale(1);
+    }
+    50% {
+        transform: scale(1.08);
+        box-shadow:
+            0 0 18px rgba(64, 156, 255, 0.75),
+            0 0 40px rgba(64, 156, 255, 0.35);
+    }
+}
+
+@keyframes voice-orb-ripple {
+    0% {
+        box-shadow: 0 0 0 0 rgba(64, 156, 255, 0.5);
+    }
+    100% {
+        box-shadow: 0 0 0 14px rgba(64, 156, 255, 0);
+    }
+}
+
+.voice-band-status {
+    font-weight: 600;
+    color: var(--accent-primary);
+    font-size: 0.85rem;
+    flex-shrink: 0;
+}
+
+.voice-band-lanes {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+}
+
+.voice-lane {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.voice-lane-label {
+    flex-shrink: 0;
+    width: 44px;
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.voice-lane-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+}
+
+.voice-band-controls {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.voice-band-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.voice-band-ticker {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
+.voice-mic-icon {
+    display: block;
+}
+
+/* ===== Reduced motion =====
+   Placed last on purpose: these selectors have the same specificity as the rules
+   they override, so source order is what decides. An earlier block (as the first
+   attempt at this was) is silently beaten by the `.context-menu { animation }`
+   further down the file.
+
+   Only rules that actually animate appear here — a selector listed for an
+   element with nothing to animate is dead weight that reads as coverage. */
+@media (prefers-reduced-motion: reduce) {
+    /* `menu-in`. `.context-menu` covers the tab menu, the pane-actions menu and
+       the explorer's file menu, all of which carry that class. */
+    .context-menu,
+    .chat-send-menu {
+        animation: none;
+    }
+
+    /* Opacity reveal: the git panel's action group. */
+    .gp-file-actions {
+        transition: none;
+    }
+
+    /* The compaction banner's spinner runs for minutes at a time — by far the
+       longest-lived animation in the app, and the one most worth stopping. */
+    .compacting-card-icon {
+        animation: none;
+    }
+
+    /* The voice orb breathes for the whole session and ripples while
+       speaking. */
+    .voice-orb {
+        animation: none;
+    }
 }
