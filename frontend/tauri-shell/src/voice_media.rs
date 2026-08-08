@@ -684,8 +684,15 @@ fn open_device_session(
     let output_device = host
         .default_output_device()
         .ok_or("No audio output is available")?;
-    let input_config = mono_f32_config(&input_device, true)?;
-    let output_config = mono_f32_config(&output_device, false)?;
+    let (input_config, input_rate) = device_f32_config(&input_device, true)?;
+    let (output_config, output_rate) = device_f32_config(&output_device, false)?;
+    if input_rate != 48_000 || output_rate != 48_000 {
+        tracing::info!(
+            input_rate,
+            output_rate,
+            "voice devices run off 48 kHz; resampling engaged"
+        );
+    }
     let processor = Arc::new(
         Processor::new(48_000).map_err(|error| format!("AEC initialization failed: {error}"))?,
     );
@@ -710,6 +717,8 @@ fn open_device_session(
         .map_err(|error| format!("Opus decoder failed: {error}"))?;
     let mut playback = VecDeque::<f32>::new();
     let mut render_frame = Vec::with_capacity(480);
+    let mut output_resampler = Resampler::new(48_000, output_rate);
+    let mut device_ready = VecDeque::<f32>::new();
     let output_channels = usize::from(output_config.channels);
     let output = output_device
         .build_output_stream(
@@ -726,6 +735,8 @@ fn open_device_session(
                         .is_ok()
                     {}
                     render_frame.clear();
+                    output_resampler.reset();
+                    device_ready.clear();
                 }
                 while let Ok(packet) = output_rx.lock().expect("voice output lock").try_recv() {
                     let mut pcm = vec![0i16; 960];
@@ -737,16 +748,24 @@ fn open_device_session(
                         );
                     }
                 }
-                for frame in data.chunks_mut(output_channels) {
+                // The playback clock and AEC render reference stay in the
+                // 48 kHz domain even when the device runs at another rate;
+                // an underrun renders silence, exactly as it did at 48 kHz.
+                let frames_needed = data.len() / output_channels.max(1);
+                while device_ready.len() < frames_needed {
                     let sample = playback.pop_front().unwrap_or(0.0);
                     render_frame.push(sample);
-                    for channel in frame {
-                        *channel = sample;
-                    }
                     if render_frame.len() == 480 {
                         let mut channels = vec![std::mem::take(&mut render_frame)];
                         let _ = output_processor.process_render_frame(&mut channels);
                         render_frame = Vec::with_capacity(480);
+                    }
+                    output_resampler.push(sample, &mut device_ready);
+                }
+                for frame in data.chunks_mut(output_channels) {
+                    let sample = device_ready.pop_front().unwrap_or(0.0);
+                    for channel in frame {
+                        *channel = sample;
                     }
                 }
             },
@@ -769,13 +788,19 @@ fn open_device_session(
         .set_bitrate(opus::Bitrate::Bits(24_000))
         .map_err(|error| format!("Opus bitrate failed: {error}"))?;
     let mut media_seq = 0u64;
+    let mut input_resampler = Resampler::new(input_rate, 48_000);
+    let mut resampled = VecDeque::<f32>::new();
     let input_channels = usize::from(input_config.channels);
     let input = input_device
         .build_input_stream(
             &input_config,
             move |data: &[f32], _| {
                 for frame in data.chunks(input_channels) {
-                    capture.push(frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32);
+                    let mono = frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32;
+                    input_resampler.push(mono, &mut resampled);
+                }
+                while let Some(sample) = resampled.pop_front() {
+                    capture.push(sample);
                     if capture.len() == 480 {
                         let mut channels = vec![std::mem::take(&mut capture)];
                         if input_processor.process_capture_frame(&mut channels).is_ok() {
@@ -825,7 +850,17 @@ fn open_device_session(
     })
 }
 
-fn mono_f32_config(device: &cpal::Device, input: bool) -> Result<cpal::StreamConfig, String> {
+/// AEC and Opus run at a fixed 48 kHz, but the default devices may not:
+/// Bluetooth headsets in call mode commonly expose only 8/16/24 kHz. Device
+/// streams therefore open at the closest rate the hardware offers and are
+/// bridged to the 48 kHz pipeline by [`Resampler`].
+fn device_f32_config(
+    device: &cpal::Device,
+    input: bool,
+) -> Result<(cpal::StreamConfig, u32), String> {
+    let name = device
+        .name()
+        .unwrap_or_else(|_| "unknown device".to_string());
     let ranges: Vec<_> = if input {
         device
             .supported_input_configs()
@@ -837,32 +872,134 @@ fn mono_f32_config(device: &cpal::Device, input: bool) -> Result<cpal::StreamCon
             .map_err(|error| error.to_string())?
             .collect()
     };
-    ranges
-        .into_iter()
-        .find(|range| {
-            range.sample_format() == cpal::SampleFormat::F32
-                && range.min_sample_rate().0 <= 48_000
-                && range.max_sample_rate().0 >= 48_000
-        })
+    select_f32_config(&name, &ranges, input)
+}
+
+fn select_f32_config(
+    name: &str,
+    ranges: &[cpal::SupportedStreamConfigRange],
+    input: bool,
+) -> Result<(cpal::StreamConfig, u32), String> {
+    let best = ranges
+        .iter()
+        .filter(|range| range.sample_format() == cpal::SampleFormat::F32)
         .map(|range| {
-            let mut config = range.with_sample_rate(cpal::SampleRate(48_000)).config();
-            config.buffer_size = cpal::BufferSize::Default;
-            config
+            let rate = 48_000u32.clamp(range.min_sample_rate().0, range.max_sample_rate().0);
+            (rate, range)
         })
-        .ok_or_else(|| {
-            if input {
-                // macOS hides input formats from processes without microphone
-                // permission, so a missing 48 kHz format on a Mac with a
-                // working microphone usually means the permission was never
-                // granted (or never requestable for this binary).
-                "The microphone offers no 48 kHz f32 format. If this machine has a working \
-                 microphone, Tyde likely lacks microphone permission (macOS: System Settings \
-                 → Privacy & Security → Microphone)."
-                    .into()
-            } else {
-                "The audio output device offers no 48 kHz f32 format".into()
-            }
+        .min_by_key(|(rate, range)| (rate.abs_diff(48_000), range.channels()));
+    if let Some((rate, range)) = best {
+        let mut config = (*range).with_sample_rate(cpal::SampleRate(rate)).config();
+        config.buffer_size = cpal::BufferSize::Default;
+        return Ok((config, rate));
+    }
+    let side = if input {
+        "microphone"
+    } else {
+        "audio output device"
+    };
+    if ranges.is_empty() {
+        if input {
+            // macOS hides input formats from processes that are denied (or
+            // cannot be granted) microphone permission, so an empty format
+            // list on a Mac with a working microphone points at permission,
+            // not hardware.
+            return Err(format!(
+                "macOS reports no formats for the microphone \"{name}\". If this machine has \
+                 a working microphone, Tyde likely lacks microphone permission (System \
+                 Settings → Privacy & Security → Microphone)."
+            ));
+        }
+        return Err(format!("The {side} \"{name}\" reports no audio formats"));
+    }
+    let formats = ranges
+        .iter()
+        .map(|range| {
+            format!(
+                "{:?} @ {}-{} Hz, {}ch",
+                range.sample_format(),
+                range.min_sample_rate().0,
+                range.max_sample_rate().0,
+                range.channels()
+            )
         })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "The {side} \"{name}\" offers no f32 format (available: {formats})"
+    ))
+}
+
+/// Streaming sample-rate converter bridging device streams to the fixed
+/// 48 kHz AEC/Opus pipeline. Built for speech: linear interpolation, plus a
+/// moving-average low-pass sized to the decimation ratio to bound aliasing
+/// when converting downward.
+struct Resampler {
+    /// Source samples per output sample.
+    step: f64,
+    /// Source-stream position of the next output sample.
+    pos: f64,
+    /// Number of source samples pushed so far.
+    src_pushed: u64,
+    window: VecDeque<f32>,
+    window_len: usize,
+    window_sum: f64,
+    prev_filtered: f32,
+    curr_filtered: f32,
+    passthrough: bool,
+}
+
+impl Resampler {
+    fn new(src_rate: u32, dst_rate: u32) -> Self {
+        let step = f64::from(src_rate) / f64::from(dst_rate);
+        let window_len = (step.ceil() as usize).max(1);
+        Self {
+            step,
+            pos: 0.0,
+            src_pushed: 0,
+            window: VecDeque::with_capacity(window_len),
+            window_len,
+            window_sum: 0.0,
+            prev_filtered: 0.0,
+            curr_filtered: 0.0,
+            passthrough: src_rate == dst_rate,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0.0;
+        self.src_pushed = 0;
+        self.window.clear();
+        self.window_sum = 0.0;
+        self.prev_filtered = 0.0;
+        self.curr_filtered = 0.0;
+    }
+
+    fn push(&mut self, sample: f32, out: &mut VecDeque<f32>) {
+        if self.passthrough {
+            out.push_back(sample);
+            return;
+        }
+        self.window.push_back(sample);
+        self.window_sum += f64::from(sample);
+        if self.window.len() > self.window_len
+            && let Some(oldest) = self.window.pop_front()
+        {
+            self.window_sum -= f64::from(oldest);
+        }
+        self.prev_filtered = self.curr_filtered;
+        self.curr_filtered = (self.window_sum / self.window.len() as f64) as f32;
+        let n = self.src_pushed as f64;
+        self.src_pushed += 1;
+        // Emit every output that falls in the source interval (n-1, n]; the
+        // eager emission on each push keeps `pos` inside that interval, so
+        // only the last two filtered values are ever needed.
+        while self.pos <= n {
+            let frac = (self.pos - (n - 1.0)).clamp(0.0, 1.0) as f32;
+            out.push_back(self.prev_filtered + (self.curr_filtered - self.prev_filtered) * frac);
+            self.pos += self.step;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1033,5 +1170,135 @@ mod tests {
         }
         assert!(changed_capture, "AEC must alter a captured render echo");
         assert!(processor.get_stats().echo_return_loss.is_some());
+    }
+
+    fn range(
+        channels: u16,
+        min: u32,
+        max: u32,
+        format: cpal::SampleFormat,
+    ) -> cpal::SupportedStreamConfigRange {
+        cpal::SupportedStreamConfigRange::new(
+            channels,
+            cpal::SampleRate(min),
+            cpal::SampleRate(max),
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn select_f32_config_prefers_native_48k() {
+        let ranges = vec![
+            range(1, 8_000, 24_000, cpal::SampleFormat::F32),
+            range(2, 44_100, 96_000, cpal::SampleFormat::F32),
+        ];
+        let (config, rate) = select_f32_config("Test Mic", &ranges, true).unwrap();
+        assert_eq!(rate, 48_000);
+        assert_eq!(config.sample_rate.0, 48_000);
+        assert_eq!(config.channels, 2);
+    }
+
+    #[test]
+    fn select_f32_config_takes_closest_rate_for_bluetooth_style_mics() {
+        let ranges = vec![
+            range(1, 8_000, 8_000, cpal::SampleFormat::F32),
+            range(1, 16_000, 16_000, cpal::SampleFormat::F32),
+            range(1, 24_000, 24_000, cpal::SampleFormat::F32),
+        ];
+        let (config, rate) = select_f32_config("BT Headset", &ranges, true).unwrap();
+        assert_eq!(rate, 24_000);
+        assert_eq!(config.sample_rate.0, 24_000);
+        assert_eq!(config.channels, 1);
+    }
+
+    #[test]
+    fn select_f32_config_blames_permission_only_when_formats_are_hidden() {
+        let error = select_f32_config("MacBook Pro Microphone", &[], true).unwrap_err();
+        assert!(error.contains("permission"), "{error}");
+        assert!(error.contains("MacBook Pro Microphone"), "{error}");
+
+        let ranges = vec![range(1, 8_000, 48_000, cpal::SampleFormat::I16)];
+        let error = select_f32_config("Odd Device", &ranges, true).unwrap_err();
+        assert!(!error.contains("permission"), "{error}");
+        assert!(error.contains("Odd Device"), "{error}");
+        assert!(error.contains("I16"), "{error}");
+    }
+
+    #[test]
+    fn resampler_passthrough_is_bit_exact() {
+        let mut resampler = Resampler::new(48_000, 48_000);
+        let mut out = VecDeque::new();
+        let input: Vec<f32> = (0..480).map(|i| (i as f32 * 0.01).sin()).collect();
+        for &sample in &input {
+            resampler.push(sample, &mut out);
+        }
+        assert_eq!(out.iter().copied().collect::<Vec<_>>(), input);
+    }
+
+    #[test]
+    fn resampler_upsamples_16k_to_48k_preserving_level_and_count() {
+        let mut resampler = Resampler::new(16_000, 48_000);
+        let mut out = VecDeque::new();
+        for _ in 0..1_600 {
+            resampler.push(0.5, &mut out);
+        }
+        let produced = out.len() as i64;
+        assert!((produced - 4_800).abs() <= 3, "produced {produced}");
+        assert!(out.iter().all(|sample| (sample - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn resampler_downsamples_48k_to_16k_preserving_level_and_count() {
+        let mut resampler = Resampler::new(48_000, 16_000);
+        let mut out = VecDeque::new();
+        for _ in 0..4_800 {
+            resampler.push(0.25, &mut out);
+        }
+        let produced = out.len() as i64;
+        assert!((produced - 1_600).abs() <= 3, "produced {produced}");
+        assert!(out.iter().all(|sample| (sample - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn resampler_tracks_fractional_ratios_without_drift() {
+        let mut resampler = Resampler::new(44_100, 48_000);
+        let mut out = VecDeque::new();
+        for _ in 0..44_100 {
+            resampler.push(1.0, &mut out);
+        }
+        let produced = out.len() as i64;
+        assert!((produced - 48_000).abs() <= 3, "produced {produced}");
+    }
+
+    #[test]
+    fn resampler_upsampling_interpolates_monotonic_ramps() {
+        let mut resampler = Resampler::new(24_000, 48_000);
+        let mut out = VecDeque::new();
+        for i in 0..240 {
+            resampler.push(i as f32, &mut out);
+        }
+        let samples: Vec<f32> = out.into_iter().collect();
+        assert!(
+            samples.windows(2).all(|pair| pair[1] >= pair[0]),
+            "not monotonic"
+        );
+        assert!((samples[3] - 1.5).abs() < 1e-6, "got {}", samples[3]);
+    }
+
+    #[test]
+    fn resampler_reset_restarts_the_stream_clock() {
+        let mut resampler = Resampler::new(16_000, 48_000);
+        let mut out = VecDeque::new();
+        for _ in 0..16 {
+            resampler.push(1.0, &mut out);
+        }
+        let first_run = out.len();
+        out.clear();
+        resampler.reset();
+        for _ in 0..16 {
+            resampler.push(1.0, &mut out);
+        }
+        assert_eq!(out.len(), first_run);
     }
 }
