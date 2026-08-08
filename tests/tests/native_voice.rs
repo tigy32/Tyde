@@ -325,6 +325,21 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     let _ = next_kind(&mut client, FrameKind::VoiceOutput).await;
     let output = next_kind(&mut client, FrameKind::VoiceAudio).await;
     assert!(!output.binary.is_empty());
+    // Downlink audio must ride its dedicated sub-stream and start its OWN
+    // envelope seq at 0. When audio shared the JSON stream's counter, the
+    // frontend validator (which never sees audio frames — the shell consumes
+    // them natively) desynced at Nova's first spoken word and grayed out the
+    // whole connection.
+    assert_eq!(
+        output.envelope.stream,
+        StreamPath(format!("/voice/{}/audio", accepted.session_id.0)),
+        "downlink audio must use the dedicated audio sub-stream"
+    );
+    assert_eq!(
+        output.envelope.seq, 0,
+        "the audio sub-stream must own a fresh seq counter, not inherit the \
+         JSON envelope stream's count"
+    );
     let hands_free_audio = VoiceAudioPayload {
         session_id: accepted.session_id.clone(),
         generation: 1,

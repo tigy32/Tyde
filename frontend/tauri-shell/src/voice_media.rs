@@ -719,6 +719,7 @@ fn open_device_session(
     let mut render_frame = Vec::with_capacity(480);
     let mut output_resampler = Resampler::new(48_000, output_rate);
     let mut device_ready = VecDeque::<f32>::new();
+    let mut jitter_gate = JitterGate::new(JITTER_TARGET_SAMPLES);
     let output_channels = usize::from(output_config.channels);
     let output = output_device
         .build_output_stream(
@@ -737,6 +738,7 @@ fn open_device_session(
                     render_frame.clear();
                     output_resampler.reset();
                     device_ready.clear();
+                    jitter_gate.reset();
                 }
                 while let Ok(packet) = output_rx.lock().expect("voice output lock").try_recv() {
                     let mut pcm = vec![0i16; 960];
@@ -753,7 +755,7 @@ fn open_device_session(
                 // an underrun renders silence, exactly as it did at 48 kHz.
                 let frames_needed = data.len() / output_channels.max(1);
                 while device_ready.len() < frames_needed {
-                    let sample = playback.pop_front().unwrap_or(0.0);
+                    let sample = jitter_gate.next(&mut playback);
                     render_frame.push(sample);
                     if render_frame.len() == 480 {
                         let mut channels = vec![std::mem::take(&mut render_frame)];
@@ -928,6 +930,51 @@ fn select_f32_config(
     Err(format!(
         "The {side} \"{name}\" offers no f32 format (available: {formats})"
     ))
+}
+
+/// 150 ms at the 48 kHz pipeline rate. Enough headroom to absorb SSH-bridge
+/// and webview-event bursts without adding conversational latency a person
+/// would notice.
+const JITTER_TARGET_SAMPLES: usize = 7_200;
+
+/// Playback shock absorber. Voice audio reaches the shell over an SSH bridge
+/// and the webview event path, both of which deliver in bursts under load;
+/// playing the instant packets arrive turns every late burst into an audible
+/// gap. After any underrun (and at session start) the gate holds silence
+/// until the playback queue rebuilds `target_samples` of headroom.
+struct JitterGate {
+    buffering: bool,
+    target_samples: usize,
+}
+
+impl JitterGate {
+    fn new(target_samples: usize) -> Self {
+        Self {
+            buffering: true,
+            target_samples,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buffering = true;
+    }
+
+    fn next(&mut self, playback: &mut VecDeque<f32>) -> f32 {
+        if self.buffering {
+            if playback.len() >= self.target_samples {
+                self.buffering = false;
+            } else {
+                return 0.0;
+            }
+        }
+        match playback.pop_front() {
+            Some(sample) => sample,
+            None => {
+                self.buffering = true;
+                0.0
+            }
+        }
+    }
 }
 
 /// Streaming sample-rate converter bridging device streams to the fixed
@@ -1284,6 +1331,45 @@ mod tests {
             "not monotonic"
         );
         assert!((samples[3] - 1.5).abs() < 1e-6, "got {}", samples[3]);
+    }
+
+    #[test]
+    fn jitter_gate_holds_silence_until_target_then_plays() {
+        let mut gate = JitterGate::new(4);
+        let mut playback: VecDeque<f32> = VecDeque::new();
+        playback.extend([0.1, 0.2, 0.3]);
+        assert_eq!(gate.next(&mut playback), 0.0, "below target stays silent");
+        assert_eq!(playback.len(), 3, "buffering must not consume samples");
+        playback.push_back(0.4);
+        assert_eq!(gate.next(&mut playback), 0.1, "target reached, plays");
+        assert_eq!(gate.next(&mut playback), 0.2);
+    }
+
+    #[test]
+    fn jitter_gate_rearms_on_underrun_and_on_reset() {
+        let mut gate = JitterGate::new(2);
+        let mut playback: VecDeque<f32> = VecDeque::from([0.5, 0.6]);
+        assert_eq!(gate.next(&mut playback), 0.5);
+        assert_eq!(gate.next(&mut playback), 0.6);
+        assert_eq!(gate.next(&mut playback), 0.0, "underrun renders silence");
+        playback.push_back(0.7);
+        assert_eq!(
+            gate.next(&mut playback),
+            0.0,
+            "one queued sample is below target — the gate must re-buffer"
+        );
+        playback.push_back(0.8);
+        assert_eq!(gate.next(&mut playback), 0.7);
+
+        let mut gate = JitterGate::new(2);
+        let mut playback: VecDeque<f32> = VecDeque::from([0.5, 0.6]);
+        assert_eq!(gate.next(&mut playback), 0.5);
+        gate.reset();
+        assert_eq!(
+            gate.next(&mut playback),
+            0.0,
+            "reset must re-buffer even with a sample queued"
+        );
     }
 
     #[test]

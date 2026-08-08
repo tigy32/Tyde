@@ -56,8 +56,16 @@ pub fn resume_session(
     state.open_tab(TabContent::empty_chat(), "New Chat".to_owned(), true);
     let state = state.clone();
     spawn_local(async move {
+        // Both failure paths must be USER-visible: a silent failure here
+        // strands the just-opened draft tab as a chat that never loads,
+        // which reads as "history is broken" (live-reported during the
+        // beta.59 voice QA disconnects).
         let Some(host_stream) = state.host_stream_untracked(&host_id) else {
             log::error!("resume_session: host stream missing for {host_id}");
+            crate::components::header::report_user_error(format!(
+                "Tyde could not load the session because host “{host_id}” is not \
+                 connected. Reconnect and pick the session again."
+            ));
             return;
         };
         let payload = SpawnAgentPayload {
@@ -73,6 +81,10 @@ pub fn resume_session(
         if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
         {
             log::error!("failed to send SpawnAgent (resume): {error}");
+            crate::components::header::report_user_error(format!(
+                "Tyde could not load the session from host “{host_id}”: {error}. \
+                 Reconnect and pick the session again."
+            ));
         }
     });
 }

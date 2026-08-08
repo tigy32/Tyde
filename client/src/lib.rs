@@ -185,7 +185,22 @@ fn require_active_voice<'a>(
     session_id: &protocol::VoiceSessionId,
     generation: u64,
 ) -> Result<&'a ServerVoiceSession, FrameError> {
-    let expected_stream = StreamPath(format!("/voice/{}", session_id.0));
+    require_active_voice_on(
+        state,
+        frame,
+        session_id,
+        generation,
+        StreamPath(format!("/voice/{}", session_id.0)),
+    )
+}
+
+fn require_active_voice_on<'a>(
+    state: &'a ServerVoiceState,
+    frame: &ProtocolFrame,
+    session_id: &protocol::VoiceSessionId,
+    generation: u64,
+    expected_stream: StreamPath,
+) -> Result<&'a ServerVoiceSession, FrameError> {
     state
         .active
         .as_ref()
@@ -251,8 +266,18 @@ fn accept_server_voice_frame(
                     "invalid server VoiceAudio direction or timestamp",
                 ));
             }
-            let active =
-                require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            // Downlink audio rides its own sub-stream with its own envelope
+            // sequence counter. The shell consumes audio natively while the
+            // frontend validates the JSON envelope stream, so sharing one
+            // counter desyncs the frontend (a partial observer) at Nova's
+            // first spoken word.
+            let active = require_active_voice_on(
+                state,
+                frame,
+                &payload.session_id,
+                payload.generation,
+                StreamPath(format!("/voice/{}/audio", payload.session_id.0)),
+            )?;
             if payload.first_media_seq < active.next_output_media_seq {
                 return Err(reject_voice("server voice media sequence moved backwards"));
             }
@@ -2052,15 +2077,37 @@ mod voice_tests {
             timestamp_samples_48k: 0,
             packet_lengths: vec![3],
         };
+        // Downlink audio must arrive on its dedicated sub-stream (own seq
+        // counter — the frontend never sees these frames, so sharing the
+        // JSON stream's counter desyncs it)…
+        let audio_stream = format!("{stream}/audio");
         assert!(matches!(
             accept(
                 &mut state,
                 &host,
-                frame(&stream, FrameKind::VoiceAudio, &audio, vec![1, 2, 3]),
+                frame(&audio_stream, FrameKind::VoiceAudio, &audio, vec![1, 2, 3]),
             )
             .unwrap(),
             Some(VoiceEvent::Audio { .. })
         ));
+        // …and is rejected on the JSON envelope stream, the pre-sub-stream
+        // routing that caused the desync.
+        let misrouted = protocol::VoiceAudioPayload {
+            session_id: accepted.session_id.clone(),
+            generation: accepted.generation,
+            direction: protocol::VoiceDirection::Output,
+            first_media_seq: 1,
+            timestamp_samples_48k: 960,
+            packet_lengths: vec![3],
+        };
+        assert!(
+            accept(
+                &mut state,
+                &host,
+                frame(&stream, FrameKind::VoiceAudio, &misrouted, vec![1, 2, 3]),
+            )
+            .is_err()
+        );
         let stop = protocol::VoiceStopPayload {
             session_id: accepted.session_id,
             generation: accepted.generation,

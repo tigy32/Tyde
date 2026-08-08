@@ -310,9 +310,16 @@ async fn reader_task(
                             emit_error(&app, &host_id, "host voice audio routing mismatch".into());
                         break;
                     }
+                    // Downlink audio arrives on its dedicated sub-stream —
+                    // its envelope seqs are deliberately outside the JSON
+                    // envelope stream's counter (the frontend validates that
+                    // one and never sees these frames).
                     if payload.validate_body(frame.binary.len()).is_err()
                         || frame.envelope.stream
-                            != protocol::StreamPath(format!("/voice/{}", payload.session_id.0))
+                            != protocol::StreamPath(format!(
+                                "/voice/{}/audio",
+                                payload.session_id.0
+                            ))
                     {
                         let _ =
                             emit_error(&app, &host_id, "host voice audio routing mismatch".into());

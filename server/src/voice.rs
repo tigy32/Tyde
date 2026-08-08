@@ -696,6 +696,19 @@ impl VoiceConnection {
             .stats
             .queue_high_water_packets
             .max(queue_metrics.2.min(8));
+        // The flow counters are the only quantitative record of audio health
+        // (drops, gaps, queue pressure); without this line they die with the
+        // session and "choppy audio" reports are unfalsifiable from host logs.
+        tracing::info!(
+            session = %active.id.0,
+            reason = ?reason,
+            admitted_packets = active.stats.admitted_packets,
+            admitted_bytes = active.stats.admitted_bytes,
+            dropped_packets = active.stats.dropped_packets,
+            dropped_bytes = active.stats.dropped_bytes,
+            queue_high_water_packets = active.stats.queue_high_water_packets,
+            "voice session ended"
+        );
         let ended = VoiceStatePayload {
             session_id: active.id.clone(),
             generation: active.generation,
@@ -1048,8 +1061,14 @@ impl VoiceConnection {
                                 timestamp_samples_48k: active.output_timestamp_48k,
                                 packet_lengths: vec![len as u16],
                             };
+                            // Downlink audio rides its own sub-stream with its
+                            // own sequence counter. The shell consumes these
+                            // frames natively, so if they shared the JSON
+                            // envelope stream's counter the frontend validator
+                            // (a partial observer) would desync at Nova's
+                            // first spoken word and gray out the connection.
                             self.output
-                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                .with_path(StreamPath(format!("/voice/{}/audio", active.id.0)))
                                 .send_binary(
                                     FrameKind::VoiceAudio,
                                     serde_json::to_value(payload).unwrap_or_default(),
