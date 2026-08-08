@@ -1,6 +1,6 @@
 [package]
 name = "tyde-server"
-version = "0.8.19-beta.59"
+version = "0.8.19-beta.60"
 edition.workspace = true
 
 [[bin]]
