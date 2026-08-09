@@ -72,13 +72,14 @@ pub enum CertificationCase {
     NativeSubagentProjected,
     NativeSubagentParentLinked,
     BackgroundWorkKeepsAgentActive,
+    BackgroundCompletionReleasesAgent,
     BackgroundCompletionResumesParent,
     AgentInitiatedTurnIsDistinct,
     AgentInitiatedResultDelivered,
 }
 
 impl CertificationCase {
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 66] = [
         Self::InitialInputEchoedOnce,
         Self::TypingStarts,
         Self::TypingStartsOnce,
@@ -141,6 +142,7 @@ impl CertificationCase {
         Self::NativeSubagentProjected,
         Self::NativeSubagentParentLinked,
         Self::BackgroundWorkKeepsAgentActive,
+        Self::BackgroundCompletionReleasesAgent,
         Self::BackgroundCompletionResumesParent,
         Self::AgentInitiatedTurnIsDistinct,
         Self::AgentInitiatedResultDelivered,
@@ -210,6 +212,7 @@ impl CertificationCase {
             Self::NativeSubagentProjected => "native_subagent_projected",
             Self::NativeSubagentParentLinked => "native_subagent_parent_linked",
             Self::BackgroundWorkKeepsAgentActive => "background_work_keeps_agent_active",
+            Self::BackgroundCompletionReleasesAgent => "background_completion_releases_agent",
             Self::BackgroundCompletionResumesParent => "background_completion_resumes_parent",
             Self::AgentInitiatedTurnIsDistinct => "agent_initiated_turn_is_distinct",
             Self::AgentInitiatedResultDelivered => "agent_initiated_result_delivered",
@@ -221,6 +224,7 @@ impl CertificationCase {
             Self::NativeSubagentProjected
             | Self::NativeSubagentParentLinked
             | Self::BackgroundWorkKeepsAgentActive
+            | Self::BackgroundCompletionReleasesAgent
             | Self::BackgroundCompletionResumesParent
             | Self::AgentInitiatedTurnIsDistinct
             | Self::AgentInitiatedResultDelivered => CertificationTier::SpecializedLive,
@@ -284,9 +288,9 @@ impl CertificationCase {
             Self::NativeSubagentProjected | Self::NativeSubagentParentLinked => {
                 Some(BackendCapability::Subagents)
             }
-            Self::BackgroundWorkKeepsAgentActive | Self::BackgroundCompletionResumesParent => {
-                Some(BackendCapability::BackgroundTasks)
-            }
+            Self::BackgroundWorkKeepsAgentActive
+            | Self::BackgroundCompletionReleasesAgent
+            | Self::BackgroundCompletionResumesParent => Some(BackendCapability::BackgroundTasks),
             Self::AgentInitiatedTurnIsDistinct | Self::AgentInitiatedResultDelivered => {
                 Some(BackendCapability::AgentInitiatedTurns)
             }

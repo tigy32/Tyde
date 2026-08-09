@@ -7920,6 +7920,10 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
             assert_eq!(backend_kind, BackendKind::Claude);
             assert_claude_agent_initiated_background_resume().await;
         }
+        CertificationCase::BackgroundCompletionReleasesAgent => {
+            assert_eq!(backend_kind, BackendKind::Claude);
+            assert_claude_background_command_releases_activity().await;
+        }
         _ => unreachable!("direct cases returned before match: {}", case.id()),
     }
 }
@@ -8126,6 +8130,106 @@ async fn assert_claude_agent_initiated_background_resume() {
     );
 }
 
+async fn assert_claude_background_command_releases_activity() {
+    let backend_kind = BackendKind::Claude;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = "Use the Bash tool exactly once to run `sleep 15; printf TYDE_BACKGROUND_DONE` with run_in_background=true. Do not call TaskOutput or any other tool. After Bash reports that the command is running in the background, end your initial response by replying exactly BACKGROUND_COMMAND_LAUNCHED; do not wait for its result.";
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "background-command-releases-activity",
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+
+    let mut saw_running = false;
+    let mut saw_initial_turn_end = false;
+    let mut saw_terminal = false;
+    let mut terminal_snapshots_before_idle = 0usize;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read Claude background command lifecycle")
+                .expect("Claude background command stream closed");
+            if env.kind != FrameKind::ChatEvent || env.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = env
+                .parse_payload()
+                .expect("parse Claude background command ChatEvent");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Claude background command failed: {content}"),
+                ChatEvent::StreamEnd(end)
+                    if saw_running
+                        && !saw_terminal
+                        && end.message.tool_calls.is_empty()
+                        && end.message.content.contains("BACKGROUND_COMMAND_LAUNCHED") =>
+                {
+                    saw_initial_turn_end = true;
+                }
+                ChatEvent::ToolProgress(progress) => {
+                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                        continue;
+                    };
+                    match task.status {
+                        protocol::BackgroundTaskStatus::Running => saw_running = true,
+                        protocol::BackgroundTaskStatus::Completed
+                        | protocol::BackgroundTaskStatus::Stopped
+                        | protocol::BackgroundTaskStatus::Failed
+                        | protocol::BackgroundTaskStatus::Unknown => {
+                            assert!(
+                                saw_running,
+                                "background command became terminal without reporting running"
+                            );
+                            assert!(
+                                saw_initial_turn_end,
+                                "background command completed before Claude ended its initial turn"
+                            );
+                            assert_eq!(
+                                task.status,
+                                protocol::BackgroundTaskStatus::Completed,
+                                "background command did not complete successfully"
+                            );
+                            saw_terminal = true;
+                            terminal_snapshots_before_idle += 1;
+                        }
+                    }
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_running && !saw_terminal => {
+                    panic!("Claude became idle while its background command was still running")
+                }
+                ChatEvent::TypingStatusChanged(true) if saw_terminal => {
+                    panic!(
+                        "Claude started another turn before releasing activity for the completed background command"
+                    )
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_terminal => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Claude never released activity after its background command completed");
+
+    assert!(saw_running, "Claude did not launch a background command");
+    assert!(saw_initial_turn_end, "Claude did not end its initial turn");
+    assert_eq!(
+        terminal_snapshots_before_idle, 1,
+        "Claude retained the terminal background task until a later notification before releasing activity"
+    );
+}
+
 #[tokio::test]
 #[ignore = "heavy paid backend qualification; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_universal_backend_qualification_suite() {
@@ -8273,6 +8377,7 @@ live_certification_tests! {
     real_cert_native_subagent_projected => NativeSubagentProjected,
     real_cert_native_subagent_parent_linked => NativeSubagentParentLinked,
     real_cert_background_work_keeps_agent_active => BackgroundWorkKeepsAgentActive,
+    real_cert_background_completion_releases_agent => BackgroundCompletionReleasesAgent,
     real_cert_background_completion_resumes_parent => BackgroundCompletionResumesParent,
     real_cert_agent_initiated_turn_is_distinct => AgentInitiatedTurnIsDistinct,
     real_cert_agent_initiated_result_delivered => AgentInitiatedResultDelivered,
