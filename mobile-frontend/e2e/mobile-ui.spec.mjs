@@ -117,9 +117,16 @@ test("new chat sends the selected backend and agent", async ({ page }) => {
   expect(sent.payload.params.backend_kind).toBe("claude");
 });
 
-test("chat composer follows a reduced dynamic viewport", async ({ page }) => {
+test("chat composer ignores a stale visual viewport height", async ({ page }) => {
+  await page.addInitScript(() => {
+    if (window.visualViewport) {
+      Object.defineProperty(window.visualViewport, "height", {
+        configurable: true,
+        get: () => 180,
+      });
+    }
+  });
   await openFixture(page, "chat");
-  await page.setViewportSize({ width: 390, height: 430 });
 
   await expect
     .poll(() =>
