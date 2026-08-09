@@ -8072,7 +8072,8 @@ async fn assert_claude_agent_initiated_background_resume() {
     .await;
 
     let mut completed_turns = 0usize;
-    let mut saw_idle_before_result = false;
+    let mut background_running = false;
+    let mut saw_idle_while_background_running = false;
     let mut saw_result = false;
     tokio::time::timeout(Duration::from_secs(240), async {
         loop {
@@ -8099,8 +8100,13 @@ async fn assert_claude_agent_initiated_background_resume() {
                 ChatEvent::StreamDelta(delta) => {
                     saw_result |= delta.text.contains(SENTINEL);
                 }
-                ChatEvent::TypingStatusChanged(false) if !saw_result => {
-                    saw_idle_before_result = true;
+                ChatEvent::ToolProgress(progress) => {
+                    if let protocol::ToolProgressUpdate::SubAgent(subagent) = progress.update {
+                        background_running = !subagent.completed;
+                    }
+                }
+                ChatEvent::TypingStatusChanged(false) if background_running => {
+                    saw_idle_while_background_running = true;
                 }
                 ChatEvent::TypingStatusChanged(false) if saw_result => break,
                 _ => {}
@@ -8110,7 +8116,7 @@ async fn assert_claude_agent_initiated_background_resume() {
     .await
     .expect("Claude never resumed after its background subagent completed");
     assert!(
-        !saw_idle_before_result,
+        !saw_idle_while_background_running,
         "Claude reported itself idle while background work was still active"
     );
     assert!(saw_result, "Claude resumed without surfacing {SENTINEL}");

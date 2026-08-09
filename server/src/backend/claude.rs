@@ -2250,7 +2250,6 @@ impl ClaudeInner {
         if !self
             .background_work_active
             .load(std::sync::atomic::Ordering::Relaxed)
-            && !self.has_pending_cli_wake()
         {
             self.emit_typing_status(false);
         }
@@ -5016,7 +5015,11 @@ async fn sync_persistent_background_activity(
             .background_tasks
             .lock()
             .expect("Claude background task mutex poisoned");
-        registry.owner_active && !registry.entries.is_empty()
+        registry.owner_active
+            && registry
+                .entries
+                .values()
+                .any(|entry| entry.state.status == BackgroundTaskStatus::Running)
     };
     let subagent_active = subagent_streams.values().any(|stream| {
         matches!(
@@ -23263,6 +23266,45 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn terminal_task_update_releases_activity_before_notification() {
+        let (inner, mut rx) = make_test_inner();
+        inner.emit_typing_status(true);
+        register_shared_background_task(&inner);
+        sync_persistent_background_activity(&inner, &HashMap::new(), &HashMap::new()).await;
+        while rx.try_recv().is_ok() {}
+
+        assert!(
+            inner.handle_background_task_frame(
+                &bash_task_updated_frame("completed"),
+                &HashMap::new(),
+            )
+        );
+        sync_persistent_background_activity(&inner, &HashMap::new(), &HashMap::new()).await;
+
+        let registry = inner
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned");
+        assert_eq!(registry.entries.len(), 1, "notification still owns cleanup");
+        assert!(
+            registry
+                .entries
+                .values()
+                .all(|entry| entry.state.status == BackgroundTaskStatus::Completed)
+        );
+        drop(registry);
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| {
+                event_kind(event) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false)
+            }),
+            "a terminal task is not active work while its notification is pending: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn background_bash_owner_loss_requires_stopped_and_completion_once() {
         for cause in ["stdout EOF", "explicit shutdown with reader abort"] {
             let (inner, mut rx) = make_test_inner();
@@ -25558,15 +25600,19 @@ for line in sys.stdin:
 
         let mut events: Vec<Value> = Vec::new();
         let collected = timeout(Duration::from_secs(20), async {
+            let mut completed_turns = 0usize;
             loop {
                 let event = rx
                     .recv()
                     .await
                     .expect("Claude event channel should stay open");
+                if event_kind(&event) == Some("StreamEnd") {
+                    completed_turns += 1;
+                }
                 let idle = event_kind(&event) == Some("TypingStatusChanged")
                     && event.get("data").and_then(Value::as_bool) == Some(false);
                 events.push(event);
-                if idle {
+                if idle && completed_turns == 2 {
                     return;
                 }
             }
@@ -25602,8 +25648,8 @@ for line in sys.stdin:
                         && event.get("data").and_then(Value::as_bool) == Some(false)
                 })
                 .count(),
-            1,
-            "background work and its wake turn must remain one continuous active interval. \
+            2,
+            "terminal background work ends one active interval and the CLI wake owns another. \
              Events:\n{dump}"
         );
         assert_eq!(
@@ -25856,15 +25902,22 @@ for line in sys.stdin:
 
         let mut events: Vec<Value> = Vec::new();
         let collected = timeout(Duration::from_secs(20), async {
+            let mut saw_wake_tool_completion = false;
             loop {
                 let event = rx
                     .recv()
                     .await
                     .expect("Claude event channel should stay open");
+                saw_wake_tool_completion |= event_kind(&event) == Some("ToolExecutionCompleted")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        == Some("toolu_wake_followup");
                 let idle = event_kind(&event) == Some("TypingStatusChanged")
                     && event.get("data").and_then(Value::as_bool) == Some(false);
                 events.push(event);
-                if idle {
+                if idle && saw_wake_tool_completion {
                     return;
                 }
             }
@@ -26219,13 +26272,15 @@ for line in sys.stdin:
         inner.set_background_work_active(false);
         inner.arm_cli_wake();
         inner.emit_idle_if_quiescent();
-        assert!(rx.try_recv().is_err());
+        let idle = rx
+            .try_recv()
+            .expect("a possible future wake is not active provider work");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
 
         assert!(inner.take_pending_cli_wake());
         inner.emit_idle_if_quiescent();
-        let idle = rx.try_recv().expect("quiescent backend must report idle");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
+        assert!(rx.try_recv().is_err(), "idle is not emitted twice");
     }
 
     #[test]
