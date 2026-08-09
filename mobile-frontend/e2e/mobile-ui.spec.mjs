@@ -116,3 +116,20 @@ test("new chat sends the selected backend and agent", async ({ page }) => {
   expect(sent.payload.custom_agent_id).toBe("fixture-reviewer");
   expect(sent.payload.params.backend_kind).toBe("claude");
 });
+
+test("chat composer follows a reduced dynamic viewport", async ({ page }) => {
+  await openFixture(page, "chat");
+  await page.setViewportSize({ width: 390, height: 430 });
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const composer = document.querySelector(
+          "[data-mobile-test='chat-input-container']",
+        );
+        if (!composer) return Number.POSITIVE_INFINITY;
+        return Math.abs(composer.getBoundingClientRect().bottom - window.innerHeight);
+      }),
+    )
+    .toBeLessThanOrEqual(1);
+});

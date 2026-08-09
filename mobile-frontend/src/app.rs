@@ -33,13 +33,11 @@ thread_local! {
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static PAGE_HIDDEN_SINCE_MS: Cell<Option<u64>> = const { Cell::new(None) };
-    static VIEWPORT_BASELINE: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
 }
 
 #[component]
 pub fn App() -> impl IntoView {
     let state = AppState::new();
-    install_visual_viewport_sync();
     crate::components::settings_view::restore_appearance(&state);
     provide_context(state.clone());
 
@@ -57,84 +55,10 @@ pub fn App() -> impl IntoView {
 #[component]
 pub fn FixtureApp() -> impl IntoView {
     let state = AppState::new();
-    install_visual_viewport_sync();
     crate::fixtures::seed_state(&state);
     provide_context(state);
 
     view! { <AppSurface /> }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn install_visual_viewport_sync() {
-    use wasm_bindgen::{JsCast, closure::Closure};
-
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(viewport) = window.visual_viewport() else {
-        return;
-    };
-
-    sync_visual_viewport(&viewport);
-    let viewport_for_listener = viewport.clone();
-    let listener = Closure::<dyn FnMut()>::new(move || {
-        sync_visual_viewport(&viewport_for_listener);
-    });
-    let callback = listener.as_ref().unchecked_ref();
-    let resize_installed = viewport
-        .add_event_listener_with_callback("resize", callback)
-        .is_ok();
-    let scroll_installed = viewport
-        .add_event_listener_with_callback("scroll", callback)
-        .is_ok();
-    if !resize_installed && !scroll_installed {
-        log::warn!("could not install visual viewport synchronization");
-        return;
-    }
-    if !resize_installed || !scroll_installed {
-        log::warn!("visual viewport synchronization is only partially installed");
-    }
-    listener.forget();
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn install_visual_viewport_sync() {}
-
-#[cfg(target_arch = "wasm32")]
-fn sync_visual_viewport(viewport: &web_sys::VisualViewport) {
-    use wasm_bindgen::JsCast;
-
-    let width = viewport.width();
-    let height = viewport.height();
-    let baseline = VIEWPORT_BASELINE.with(|baseline| {
-        let (previous_width, previous_height) = baseline.get();
-        let next_height = if (previous_width - width).abs() > 1.0 || previous_height == 0.0 {
-            height
-        } else {
-            previous_height.max(height)
-        };
-        baseline.set((width, next_height));
-        next_height
-    });
-    let keyboard_open = baseline - height > 100.0;
-
-    let Some(root) = web_sys::window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.document_element())
-        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
-    else {
-        return;
-    };
-    let style = root.style();
-    let _ = style.set_property("--app-height", &format!("{height}px"));
-    let _ = style.set_property(
-        "--active-safe-area-bottom",
-        if keyboard_open {
-            "0px"
-        } else {
-            "env(safe-area-inset-bottom, 0px)"
-        },
-    );
 }
 
 #[component]
