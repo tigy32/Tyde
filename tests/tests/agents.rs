@@ -5194,6 +5194,29 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
 
     fixture
         .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1 },
+        })
+        .await
+        .expect("set supervisor stall timeout");
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
+        })
+        .await
+        .expect("enable supervisor stall timeout");
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorEnabled { enabled: true },
+        })
+        .await
+        .expect("enable supervisor");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    fixture
+        .client
         .interrupt(&child_new.instance_stream)
         .await
         .expect("interrupt held child");

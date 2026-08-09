@@ -3384,6 +3384,7 @@ pub(crate) fn spawn_agent_actor(
         let mut backend_typing = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
+        let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut close_deadline: Option<tokio::time::Instant> = None;
@@ -4054,6 +4055,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::OperationCancelled(_) => {
                             pending_tool_response_ids.clear();
+                            active_agent_await_ids.clear();
                             if let Some(compaction) = active_compaction.as_mut() {
                                 compaction.error = Some("compaction summary turn was cancelled".to_owned());
                             }
@@ -4066,6 +4068,12 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::ToolRequest(request) => {
                             open_tool_call_ids.insert(request.tool_call_id.clone());
+                            if matches!(
+                                &request.tool_type,
+                                protocol::ToolRequestType::TydeAwaitAgents { .. }
+                            ) {
+                                active_agent_await_ids.insert(request.tool_call_id.clone());
+                            }
                             let waiting_for_plan_approval = matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::ExitPlanMode { .. }
@@ -4085,6 +4093,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
                             open_tool_call_ids.remove(&completion.tool_call_id);
+                            active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
                             if completed_pending_response && pending_tool_response_ids.is_empty() && in_turn {
@@ -5623,6 +5632,8 @@ pub(crate) fn spawn_agent_actor(
                                 SupervisorStallInterruptOutcome::NotStalled
                             } else if active_compaction.is_some() || compaction_blocked {
                                 SupervisorStallInterruptOutcome::Rejected
+                            } else if !active_agent_await_ids.is_empty() {
+                                SupervisorStallInterruptOutcome::NotStalled
                             } else if let Some(remaining) = progress_at
                                 .map(|at| stall_timeout.saturating_sub(now.saturating_duration_since(at)))
                                 .filter(|remaining| !remaining.is_zero())
