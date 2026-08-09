@@ -373,14 +373,32 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
         hands_free_interrupted.state,
         protocol::VoiceSessionState::Interrupting
     );
+    // Corrected assertion (evidence: beta.60 live sessions 6fcbf6e5/c3c225e1
+    // — exactly one voice_output per session while transcripts flowed for the
+    // whole session; every response after the first was silently discarded by
+    // the output-generation filter). Nova orders each content's audio frames
+    // BEFORE its INTERRUPTED marker, so audio arriving after a
+    // provider-reported interruption is the model's NEXT response at the
+    // unchanged generation. The old assertion ("no VoiceAudio within 100ms")
+    // encoded the mute itself; the contract it reached for — the interrupted
+    // response's tail must not play — is still enforced: queued frames are
+    // purged (discard_voice_audio) and the client flushes playback on the
+    // Interrupting state. The follow-on response must now be re-announced and
+    // reach the audio sub-stream on the same continuing seq counter.
+    let _ = next_kind(&mut client, FrameKind::VoiceOutput).await;
+    let resumed = next_kind(&mut client, FrameKind::VoiceAudio).await;
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            next_kind(&mut client, FrameKind::VoiceAudio)
-        )
-        .await
-        .is_err(),
-        "Nova-detected interruption must purge queued and reject stale output"
+        !resumed.binary.is_empty(),
+        "the response following a Nova-detected interruption must play"
+    );
+    assert_eq!(
+        resumed.envelope.stream,
+        StreamPath(format!("/voice/{}/audio", accepted.session_id.0)),
+        "post-interrupt audio stays on the dedicated audio sub-stream"
+    );
+    assert_eq!(
+        resumed.envelope.seq, 1,
+        "post-interrupt audio continues the audio sub-stream's seq counter"
     );
     let interrupt = protocol::VoiceSessionPayload {
         session_id: accepted.session_id.clone(),

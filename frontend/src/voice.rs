@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
 };
 
 use leptos::prelude::*;
@@ -303,8 +303,8 @@ pub fn interrupt(state: AppState) {
     else {
         return;
     };
+    enqueue_media_item(&state, QueuedMediaItem::Flush { generation });
     spawn_local(async move {
-        let _ = bridge::voice_media_flush_output(generation).await;
         let payload = protocol::VoiceSessionPayload {
             session_id: session_id.clone(),
             generation,
@@ -452,9 +452,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     }
                 });
                 if let Some(generation) = flush_generation {
-                    spawn_local(async move {
-                        let _ = bridge::voice_media_flush_output(generation).await;
-                    });
+                    enqueue_media_item(state, QueuedMediaItem::Flush { generation });
                 }
             }
         }
@@ -463,6 +461,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                 && matches!(state.voice_ui.get_untracked(),VoiceUiState::Active{generation,ref session_id,..} if generation==payload.generation&&session_id==&payload.session_id)
             {
                 state.voice_ui.set(VoiceUiState::Idle);
+                clear_media_push_queue();
                 spawn_local(async {
                     let _ = bridge::voice_media_stop().await;
                 });
@@ -488,6 +487,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     state
                         .voice_ui
                         .set(VoiceUiState::Failed(voice_error_message(&payload)));
+                    clear_media_push_queue();
                     spawn_local(async {
                         let _ = bridge::voice_media_stop().await;
                     });
@@ -617,6 +617,92 @@ fn dispose_media_listener_lifecycle(token: u64) {
     drop(handles);
 }
 
+/// Downlink audio packets and playback flushes ride one ordered FIFO drained
+/// by a single task. Spawning an IPC task per packet gave no ordering
+/// guarantee — a reordered pair garbles the stateful Opus decoder — and a
+/// flush racing ahead of queued packets could eat the head of the response
+/// that follows an interrupt. A Flush entering the queue drops every packet
+/// queued before it: by FIFO order those all predate the interrupt.
+enum QueuedMediaItem {
+    Packet {
+        generation: u64,
+        media_seq: u64,
+        timestamp_samples_48k: u64,
+        opus: Vec<u8>,
+    },
+    Flush {
+        generation: u64,
+    },
+}
+
+thread_local! {
+    static VOICE_MEDIA_PUSH_QUEUE: RefCell<VecDeque<QueuedMediaItem>> =
+        const { RefCell::new(VecDeque::new()) };
+    static VOICE_MEDIA_PUSHER_RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn clear_media_push_queue() {
+    VOICE_MEDIA_PUSH_QUEUE.with(|queue| queue.borrow_mut().clear());
+}
+
+fn enqueue_media_item(state: &AppState, item: QueuedMediaItem) {
+    VOICE_MEDIA_PUSH_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if matches!(item, QueuedMediaItem::Flush { .. }) {
+            queue.clear();
+        }
+        queue.push_back(item);
+    });
+    if VOICE_MEDIA_PUSHER_RUNNING.with(|running| running.replace(true)) {
+        return;
+    }
+    let state = state.clone();
+    spawn_local(async move {
+        loop {
+            let Some(item) = VOICE_MEDIA_PUSH_QUEUE.with(|queue| queue.borrow_mut().pop_front())
+            else {
+                VOICE_MEDIA_PUSHER_RUNNING.with(|running| running.set(false));
+                return;
+            };
+            match item {
+                QueuedMediaItem::Packet {
+                    generation,
+                    media_seq,
+                    timestamp_samples_48k,
+                    opus,
+                } => {
+                    if let Err(error) = bridge::voice_media_push_output(
+                        generation,
+                        media_seq,
+                        timestamp_samples_48k,
+                        &opus,
+                    )
+                    .await
+                    {
+                        log::warn!("voice output packet {media_seq} not played: {error}");
+                        state.voice_ui.update(|current| {
+                            if let VoiceUiState::Active {
+                                generation: active_generation,
+                                dropped_output_packets,
+                                ..
+                            } = current
+                                && *active_generation == generation
+                            {
+                                *dropped_output_packets = dropped_output_packets.saturating_add(1);
+                            }
+                        });
+                    }
+                }
+                QueuedMediaItem::Flush { generation } => {
+                    if let Err(error) = bridge::voice_media_flush_output(generation).await {
+                        log::warn!("voice playback flush failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum VoiceDownlinkRejection {
     Inactive,
@@ -694,15 +780,15 @@ fn handle_host_voice_frame(frame_state: &AppState, event: bridge::HostVoiceFrame
         let packet = event.opus[offset..end].to_vec();
         let timestamp_samples_48k =
             payload.timestamp_samples_48k + (packet_index as u64).saturating_mul(960);
-        spawn_local(async move {
-            let _ = bridge::voice_media_push_output(
+        enqueue_media_item(
+            frame_state,
+            QueuedMediaItem::Packet {
                 generation,
                 media_seq,
                 timestamp_samples_48k,
-                &packet,
-            )
-            .await;
-        });
+                opus: packet,
+            },
+        );
         offset = end;
     }
 }

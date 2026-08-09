@@ -240,13 +240,19 @@ impl NovaProvider for SyntheticNovaProvider {
                             if started && produced_output && !hands_free_interrupted =>
                         {
                             hands_free_interrupted = true;
-                            let stale = output_generation;
                             let _ = output_tx
                                 .send(NovaOutput::State(VoiceSessionState::Interrupting))
                                 .await;
+                            // Per Nova's per-content event ordering, every
+                            // audio frame of the interrupted content precedes
+                            // the INTERRUPTED marker — so audio emitted after
+                            // it models the NEXT response, still stamped with
+                            // the current generation. It must reach playback;
+                            // treating it as stale is the bug that muted every
+                            // response after the first (beta.60 live QA).
                             let _ = output_tx
                                 .send(NovaOutput::Audio24Khz {
-                                    output_generation: stale,
+                                    output_generation,
                                     samples: vec![0; 480],
                                 })
                                 .await;
@@ -315,7 +321,8 @@ struct ActiveVoice {
     tool_rx: mpsc::Receiver<NovaInput>,
     output_active: bool,
     output_generation: u64,
-    pending_interrupt_acks: u64,
+    stale_output_chunks: u64,
+    stale_output_samples: u64,
     started_at: Instant,
     last_target_check: Instant,
     queue_drop_baseline: (u64, u64),
@@ -576,9 +583,19 @@ impl VoiceConnection {
 
     fn apply_interrupt(&mut self, provider_reported: bool) -> Result<(), String> {
         let active = self.active.as_mut().ok_or("no active voice session")?;
-        if provider_reported && active.pending_interrupt_acks > 0 {
-            active.pending_interrupt_acks -= 1;
-        } else {
+        // A provider-reported interrupt is already ordered in the provider's
+        // event lane: every audio frame of the interrupted content precedes
+        // its INTERRUPTED marker, so nothing future remains to stale-drop —
+        // only the locally queued tail, which the flush below discards.
+        // Minting a generation here races the provider's per-completion
+        // stamp (snapshotted at completionStart, possibly parsed before this
+        // runs) and leaves the expected generation permanently one ahead:
+        // every response after the first is then silently muted. Only
+        // client-initiated interrupts bump, because there the provider keeps
+        // streaming the interrupted content and the stale stamp is what
+        // discards its remainder; that bump and the provider's store happen
+        // synchronously on this task, so no snapshot can slip between them.
+        if !provider_reported {
             active.output_generation = active.output_generation.wrapping_add(1);
             active
                 .provider
@@ -586,9 +603,6 @@ impl VoiceConnection {
                     output_generation: active.output_generation,
                 })
                 .map_err(|_| "provider interrupt failed")?;
-            if !provider_reported {
-                active.pending_interrupt_acks = active.pending_interrupt_acks.saturating_add(1);
-            }
         }
         let (packets, bytes) = self
             .output
@@ -707,6 +721,8 @@ impl VoiceConnection {
             dropped_packets = active.stats.dropped_packets,
             dropped_bytes = active.stats.dropped_bytes,
             queue_high_water_packets = active.stats.queue_high_water_packets,
+            stale_output_chunks = active.stale_output_chunks,
+            stale_output_samples = active.stale_output_samples,
             "voice session ended"
         );
         let ended = VoiceStatePayload {
@@ -887,7 +903,8 @@ impl VoiceConnection {
                         tool_rx,
                         output_active: false,
                         output_generation: 0,
-                        pending_interrupt_acks: 0,
+                        stale_output_chunks: 0,
+                        stale_output_samples: 0,
                         started_at: Instant::now(),
                         last_target_check: Instant::now(),
                         queue_drop_baseline: (queue_metrics.0, queue_metrics.1),
@@ -1014,6 +1031,19 @@ impl VoiceConnection {
                         samples,
                     } => {
                         if output_generation != active.output_generation {
+                            // Stale tail of a client-interrupted response.
+                            // Count it: an uncounted `continue` here is how
+                            // "only the first response is audible" hid from
+                            // the flow stats for three betas.
+                            active.stale_output_chunks += 1;
+                            active.stale_output_samples += samples.len() as u64;
+                            tracing::debug!(
+                                session = %active.id.0,
+                                output_generation,
+                                expected = active.output_generation,
+                                samples = samples.len(),
+                                "discarded stale voice output"
+                            );
                             continue;
                         }
                         if !active.output_active {

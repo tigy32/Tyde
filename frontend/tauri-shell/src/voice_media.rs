@@ -706,7 +706,13 @@ fn open_device_session(
         ..Default::default()
     });
 
-    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    // Bedrock streams a response's audio several times faster than real-time,
+    // so this queue must absorb the burst between IPC pushes and the output
+    // callback's drain — at 8 slots (160ms) it overflowed on every response
+    // and dropped packets mid-word. 1024 packets ≈ 20s of 20ms Opus frames
+    // (~60KB), beyond any single response burst, while still bounded so a
+    // wedged callback fails visibly instead of accumulating forever.
+    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(1024);
     let output_rx = Arc::new(Mutex::new(output_rx));
     let playback_epoch = Arc::new(AtomicU64::new(0));
     let callback_epoch = playback_epoch.clone();
