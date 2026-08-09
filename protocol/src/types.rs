@@ -2599,7 +2599,28 @@ pub struct VoiceSettings {
     #[serde(default = "default_voice_nova_model")]
     pub nova_model: String,
     #[serde(default)]
+    pub endpointing_sensitivity: VoiceEndpointingSensitivity,
+    #[serde(default)]
     pub availability: VoiceAvailability,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEndpointingSensitivity {
+    High,
+    Medium,
+    #[default]
+    Low,
+}
+
+impl VoiceEndpointingSensitivity {
+    pub fn nova_value(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
+        }
+    }
 }
 
 fn default_voice_nova_model() -> String {
@@ -2613,6 +2634,7 @@ impl Default for VoiceSettings {
             aws_profile: None,
             aws_region: None,
             nova_model: default_voice_nova_model(),
+            endpointing_sensitivity: VoiceEndpointingSensitivity::default(),
             availability: VoiceAvailability::default(),
         }
     }
@@ -2927,6 +2949,9 @@ pub enum HostSettingValue {
     VoiceNovaModel {
         model: String,
     },
+    VoiceEndpointingSensitivity {
+        sensitivity: VoiceEndpointingSensitivity,
+    },
 }
 
 impl HostSettingValue {
@@ -2982,6 +3007,9 @@ impl HostSettingValue {
             Self::VoiceAwsProfile { .. } => HostSettingErrorTarget::VoiceAwsProfile,
             Self::VoiceAwsRegion { .. } => HostSettingErrorTarget::VoiceAwsRegion,
             Self::VoiceNovaModel { .. } => HostSettingErrorTarget::VoiceNovaModel,
+            Self::VoiceEndpointingSensitivity { .. } => {
+                HostSettingErrorTarget::VoiceEndpointingSensitivity
+            }
         }
     }
 }
@@ -3021,6 +3049,7 @@ pub enum HostSettingErrorTarget {
     VoiceAwsProfile,
     VoiceAwsRegion,
     VoiceNovaModel,
+    VoiceEndpointingSensitivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

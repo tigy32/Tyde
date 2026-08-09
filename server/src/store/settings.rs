@@ -532,6 +532,9 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::VoiceNovaModel { model } => {
             settings.voice.nova_model = validate_voice_model(&model)?.to_owned();
         }
+        HostSettingValue::VoiceEndpointingSensitivity { sensitivity } => {
+            settings.voice.endpointing_sensitivity = sensitivity;
+        }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
                 settings.background_agent_features.auto_generate_agent_names = enabled;
@@ -1679,6 +1682,20 @@ mod tests {
         assert_eq!(
             store.get().unwrap().voice.nova_model,
             "amazon.nova-2-sonic-v1:0"
+        );
+
+        assert_eq!(
+            store.get().unwrap().voice.endpointing_sensitivity,
+            protocol::VoiceEndpointingSensitivity::Low
+        );
+        let settings = store
+            .apply(HostSettingValue::VoiceEndpointingSensitivity {
+                sensitivity: protocol::VoiceEndpointingSensitivity::High,
+            })
+            .unwrap();
+        assert_eq!(
+            settings.voice.endpointing_sensitivity,
+            protocol::VoiceEndpointingSensitivity::High
         );
     }
 }

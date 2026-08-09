@@ -5790,10 +5790,12 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
     let state_for_voice_profile = state.clone();
     let state_for_voice_region = state.clone();
     let state_for_voice_model = state.clone();
+    let state_for_voice_endpointing = state.clone();
     let state_for_voice_enabled_commit = state.clone();
     let state_for_voice_profile_commit = state.clone();
     let state_for_voice_region_commit = state.clone();
     let state_for_voice_model_commit = state.clone();
+    let state_for_voice_endpointing_commit = state.clone();
     let state_for_voice_disabled = state;
 
     view! {
@@ -5827,6 +5829,20 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
                 prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
                 on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_setting(&state_for_voice_model_commit,HostSettingValue::VoiceNovaModel{model:input.value()}); }
             ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
+            <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
+            <p class="settings-description">"How long Nova 2 Sonic waits through a pause before deciding that you finished speaking. Patient minimizes interruptions; Fast responds sooner. New and existing configurations default to Patient."</p>
+            <select id="voice-endpointing-sensitivity" class="settings-select"
+                prop:value=move || state_for_voice_endpointing.selected_host_settings().map(|settings|settings.voice.endpointing_sensitivity.nova_value()).unwrap_or("LOW")
+                on:change=move |ev| {
+                    let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
+                    let sensitivity=match input.value().as_str() {
+                        "HIGH" => protocol::VoiceEndpointingSensitivity::High,
+                        "MEDIUM" => protocol::VoiceEndpointingSensitivity::Medium,
+                        _ => protocol::VoiceEndpointingSensitivity::Low,
+                    };
+                    send_host_setting(&state_for_voice_endpointing_commit,HostSettingValue::VoiceEndpointingSensitivity{sensitivity});
+                }
+            ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
         </div>
     }
 }
@@ -9111,6 +9127,52 @@ mod wasm_tests {
             settings.len(),
             1,
             "the voice toggle must commit exactly one setting and nothing else: {settings:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn voice_tab_endpointing_defaults_to_patient_and_commits_selection() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Voice");
+        next_tick().await;
+
+        let select: HtmlSelectElement = container
+            .query_selector("#voice-endpointing-sensitivity")
+            .unwrap()
+            .expect("voice endpointing sensitivity selector must render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(select.value(), "LOW", "patient is the default");
+
+        select.set_value("HIGH");
+        let dispatch_target: HtmlInputElement = select.unchecked_into();
+        dispatch_change(&dispatch_target);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let endpointing = settings
+            .iter()
+            .find(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str())
+                    == Some("voice_endpointing_sensitivity")
+            })
+            .expect("changing endpointing sensitivity must emit its typed setting");
+        assert_eq!(
+            endpointing
+                .get("sensitivity")
+                .and_then(|value| value.as_str()),
+            Some("high")
         );
     }
 

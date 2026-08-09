@@ -103,17 +103,23 @@ after reconfigure failure; recovery is bounded to that crate's `OUT_DIR`.
 
 ## Nova and tools
 
-Nova uses the server's configured AWS profile, region, and exact model
-(`amazon.nova-2-sonic-v1:0` by default). Missing or expired credentials and
-model/region failures are typed and visible; there is no model or provider
-downgrade. AWS event-stream base64 occurs only at that provider boundary.
+Nova uses the server's configured AWS profile, region, exact model
+(`amazon.nova-2-sonic-v1:0` by default), and turn-ending sensitivity. Turn
+ending defaults to low sensitivity (the patient, roughly two-second pause) and
+can be changed to medium or high in Voice settings. Missing or expired
+credentials and model/region failures are typed and visible; there is no model
+or provider downgrade. AWS event-stream base64 occurs only at that provider
+boundary.
 
 Nova's single tool sends substantive work through the existing agent handle.
 The voice layer validates the target instance, attaches the normal agent event
 stream before delivery, correlates `StreamStart`/`StreamEnd` by `message_id`,
 resets a 90-second inactivity deadline on each event, enforces a 450-second
-total bound, and returns periodic progress to Nova. The backend agent remains
-voice-unaware and is not cancelled by a voice interruption.
+total bound, and returns the completed assistant message to Nova as the tool
+result. Periodic working updates are UI-only because Nova accepts one system
+content block per prompt and the tool protocol has no partial-result event.
+The backend agent remains voice-unaware and is not cancelled by a voice
+interruption.
 
 ## Validation
 

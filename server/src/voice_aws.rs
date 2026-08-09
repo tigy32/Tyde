@@ -61,7 +61,7 @@ impl NovaProvider for AwsNovaProvider {
             let (output_tx, output_rx) = mpsc::channel(OUTPUT_CAPACITY);
             let closing = Arc::new(AtomicBool::new(false));
             let output_generation = Arc::new(AtomicU64::new(0));
-            let grammar = Grammar::new(session);
+            let grammar = Grammar::new(session, settings.endpointing_sensitivity);
             let model = settings.nova_model.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
             tokio::spawn(run_stream(StreamContext {
@@ -151,12 +151,17 @@ impl NovaSession for AwsNovaSession {
 struct Grammar {
     prompt: String,
     microphone: String,
+    endpointing_sensitivity: protocol::VoiceEndpointingSensitivity,
 }
 impl Grammar {
-    fn new(_: &protocol::VoiceSessionId) -> Self {
+    fn new(
+        _: &protocol::VoiceSessionId,
+        endpointing_sensitivity: protocol::VoiceEndpointingSensitivity,
+    ) -> Self {
         Self {
             prompt: uuid::Uuid::new_v4().to_string(),
             microphone: uuid::Uuid::new_v4().to_string(),
+            endpointing_sensitivity,
         }
     }
     fn opening(&self) -> Vec<serde_json::Value> {
@@ -166,7 +171,7 @@ impl Grammar {
         // kills every session.
         let system = uuid::Uuid::new_v4().to_string();
         vec![
-            serde_json::json!({"event":{"sessionStart":{"inferenceConfiguration":{"maxTokens":1024,"topP":0.9,"temperature":0.7},"turnDetectionConfiguration":{"endpointingSensitivity":"MEDIUM"}}}}),
+            serde_json::json!({"event":{"sessionStart":{"inferenceConfiguration":{"maxTokens":1024,"topP":0.9,"temperature":0.7},"turnDetectionConfiguration":{"endpointingSensitivity":self.endpointing_sensitivity.nova_value()}}}}),
             serde_json::json!({"event":{"promptStart":{"promptName":self.prompt,"audioOutputConfiguration":{"mediaType":"audio/lpcm","sampleRateHertz":24000,"sampleSizeBits":16,"channelCount":1,"voiceId":"matthew","encoding":"base64","audioType":"SPEECH"},"textOutputConfiguration":{"mediaType":"text/plain"},"toolUseOutputConfiguration":{"mediaType":"application/json"},"toolConfiguration":{"tools":[{"toolSpec":{"name":TOOL_NAME,"description":"Send substantive work to the focused Tyde agent","inputSchema":{"json":"{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}"}}}]}}}}),
             serde_json::json!({"event":{"contentStart":{"promptName":self.prompt,"contentName":system,"role":"SYSTEM","type":"TEXT","interactive":false,"textInputConfiguration":{"mediaType":"text/plain"}}}}),
             serde_json::json!({"event":{"textInput":{"promptName":self.prompt,"contentName":system,"content":SYSTEM_PROMPT}}}),
@@ -600,9 +605,16 @@ mod tests {
     /// SYSTEM text block before it opens the microphone content.
     #[test]
     fn opening_sends_closed_system_content_before_the_microphone() {
-        let grammar = Grammar::new(&protocol::VoiceSessionId("session".into()));
+        let grammar = Grammar::new(
+            &protocol::VoiceSessionId("session".into()),
+            protocol::VoiceEndpointingSensitivity::Low,
+        );
         let opening = grammar.opening();
         assert!(opening[0]["event"].get("sessionStart").is_some());
+        assert_eq!(
+            opening[0]["event"]["sessionStart"]["turnDetectionConfiguration"]["endpointingSensitivity"],
+            "LOW"
+        );
         assert!(opening[1]["event"].get("promptStart").is_some());
 
         let system_start = &opening[2]["event"]["contentStart"];
@@ -652,7 +664,10 @@ mod tests {
     /// block, and Progress must never reach the provider.
     #[test]
     fn prompt_lifetime_carries_exactly_one_system_block() {
-        let grammar = Grammar::new(&protocol::VoiceSessionId("session".into()));
+        let grammar = Grammar::new(
+            &protocol::VoiceSessionId("session".into()),
+            protocol::VoiceEndpointingSensitivity::Low,
+        );
         let mut events = grammar.opening();
         events.extend(grammar.encode(NovaInput::Progress {
             text: "The Tyde agent is still working.".into(),
@@ -718,7 +733,10 @@ mod tests {
 
     #[test]
     fn interrupt_is_local_generation_control_and_aws_barge_in_remains_continuous_audio() {
-        let grammar = Grammar::new(&protocol::VoiceSessionId("session".into()));
+        let grammar = Grammar::new(
+            &protocol::VoiceSessionId("session".into()),
+            protocol::VoiceEndpointingSensitivity::Low,
+        );
         assert!(
             grammar
                 .encode(NovaInput::Interrupt {
@@ -729,6 +747,22 @@ mod tests {
         let encoded = grammar.encode(NovaInput::Audio16Khz(vec![0; 320]));
         assert_eq!(encoded.len(), 1);
         assert!(encoded[0]["event"].get("audioInput").is_some());
+    }
+
+    #[test]
+    fn opening_uses_configured_endpointing_sensitivity() {
+        for (sensitivity, expected) in [
+            (protocol::VoiceEndpointingSensitivity::High, "HIGH"),
+            (protocol::VoiceEndpointingSensitivity::Medium, "MEDIUM"),
+            (protocol::VoiceEndpointingSensitivity::Low, "LOW"),
+        ] {
+            let opening =
+                Grammar::new(&protocol::VoiceSessionId("session".into()), sensitivity).opening();
+            assert_eq!(
+                opening[0]["event"]["sessionStart"]["turnDetectionConfiguration"]["endpointingSensitivity"],
+                expected
+            );
+        }
     }
 
     #[test]

@@ -1071,6 +1071,11 @@ fn persisted_native_voice_settings_migrate_without_legacy_network_fields() {
     assert_eq!(settings.voice.aws_region.as_deref(), Some("us-west-2"));
     assert_eq!(settings.voice.nova_model, "amazon.nova-2-sonic-v1:0");
     assert_eq!(
+        settings.voice.endpointing_sensitivity,
+        protocol::VoiceEndpointingSensitivity::Low,
+        "voice settings written before endpointing control default to the patient value"
+    );
+    assert_eq!(
         settings.voice.availability,
         protocol::VoiceAvailability::Available,
         "persisted availability is untrusted and recomputed from current native settings"

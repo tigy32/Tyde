@@ -245,6 +245,7 @@ pub fn SettingsView() -> impl IntoView {
                                 <div class="settings-info">
                                     <div class="settings-row"><span class="settings-label">"Status"</span><span class="settings-value">{if settings.voice.enabled {"Enabled"} else {"Disabled"}}</span></div>
                                     <div class="settings-row"><span class="settings-label">"Model"</span><span class="settings-value">{settings.voice.nova_model}</span></div>
+                                    <div class="settings-row"><span class="settings-label">"Turn ending"</span><span class="settings-value">{match settings.voice.endpointing_sensitivity { protocol::VoiceEndpointingSensitivity::High => "Fast", protocol::VoiceEndpointingSensitivity::Medium => "Balanced", protocol::VoiceEndpointingSensitivity::Low => "Patient" }}</span></div>
                                     <p class="settings-muted">"Voice capture is foreground-only and uses this device’s echo cancellation, noise suppression, and gain control. Configure AWS profile and region on the desktop host."</p>
                                 </div>
                             }.into_any(),
