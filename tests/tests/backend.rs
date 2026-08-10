@@ -7914,12 +7914,16 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
             assert_backend_native_subagent_visibility(backend_kind).await;
         }
         CertificationCase::BackgroundWorkKeepsAgentActive
-        | CertificationCase::BackgroundCompletionResumesParent
         | CertificationCase::AgentInitiatedTurnIsDistinct
         | CertificationCase::AgentInitiatedResultDelivered => {
             assert_eq!(backend_kind, BackendKind::Claude);
             assert_claude_agent_initiated_background_resume().await;
         }
+        CertificationCase::BackgroundCompletionResumesParent => match backend_kind {
+            BackendKind::Claude => assert_claude_agent_initiated_background_resume().await,
+            BackendKind::Codex => assert_codex_background_completion_resumes_parent().await,
+            _ => unreachable!("background completion resume is not certified for {backend_kind:?}"),
+        },
         CertificationCase::BackgroundCompletionReleasesAgent => {
             assert_eq!(backend_kind, BackendKind::Claude);
             assert_claude_background_command_releases_activity().await;
@@ -7941,7 +7945,13 @@ fn backend_supports_certification_case(
             | CertificationCase::AgentInitiatedTurnIsDistinct
             | CertificationCase::AgentInitiatedResultDelivered
     ) {
-        return backend_kind == BackendKind::Claude
+        let supported_backend = match case {
+            CertificationCase::BackgroundCompletionResumesParent => {
+                matches!(backend_kind, BackendKind::Claude | BackendKind::Codex)
+            }
+            _ => backend_kind == BackendKind::Claude,
+        };
+        return supported_backend
             && case
                 .required_capability()
                 .is_none_or(|capability| capabilities.contains(capability));
@@ -8147,6 +8157,178 @@ async fn assert_claude_agent_initiated_background_resume() {
         completed_turns >= 2,
         "expected distinct initial and agent-initiated turns, got {completed_turns}"
     );
+}
+
+async fn assert_codex_background_completion_resumes_parent() {
+    const LAUNCHED: &str = "CODEX_BACKGROUND_LAUNCHED_731";
+    const COMPLETED: &str = "CODEX_BACKGROUND_COMPLETE_731";
+    const RESUMED: &str = "CODEX_BACKGROUND_RESUMED_731";
+    let backend_kind = BackendKind::Codex;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = format!(
+        "Use command execution exactly once to run exactly `sleep 20; printf {COMPLETED}`. Set \
+         its initial yield to no more than one second so the tool returns while the process is \
+         still running. Do not add `&`, and do not call write_stdin, wait, poll, or any other \
+         tool afterward. As soon as the tool reports a running session, end the initial turn by \
+         replying exactly {LAUNCHED}. When the command's completion wakes you in a later turn, \
+         reply exactly {RESUMED}."
+    );
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "codex-background-completion-resume",
+        &prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+
+    let mut background_tool_call_id = None;
+    let mut saw_launched = false;
+    let mut saw_idle_before_completion = false;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read Codex background launch lifecycle")
+                .expect("Codex background launch stream closed");
+            if env.kind != FrameKind::ChatEvent || env.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = env
+                .parse_payload()
+                .expect("parse Codex background launch ChatEvent");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Codex background launch failed: {content}"),
+                ChatEvent::StreamDelta(delta) => {
+                    saw_launched |= delta.text.contains(LAUNCHED);
+                }
+                ChatEvent::StreamEnd(end) => {
+                    saw_launched |= end.message.content.contains(LAUNCHED);
+                }
+                ChatEvent::ToolProgress(progress) => {
+                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                        continue;
+                    };
+                    if task.status == protocol::BackgroundTaskStatus::Running
+                        && task
+                            .description
+                            .as_deref()
+                            .is_some_and(|value| value.contains(COMPLETED))
+                    {
+                        assert!(
+                            background_tool_call_id
+                                .as_ref()
+                                .is_none_or(|known| known == &progress.tool_call_id),
+                            "Codex changed background tool identity"
+                        );
+                        background_tool_call_id = Some(progress.tool_call_id);
+                    }
+                }
+                ChatEvent::TypingStatusChanged(false)
+                    if background_tool_call_id.is_some() && !saw_idle_before_completion =>
+                {
+                    assert!(
+                        saw_launched,
+                        "Codex ended its launch turn without the required launch sentinel"
+                    );
+                    saw_idle_before_completion = true;
+                }
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if background_tool_call_id.as_deref()
+                        == Some(completion.tool_call_id.as_str()) =>
+                {
+                    assert!(
+                        saw_idle_before_completion,
+                        "Codex kept the original turn active until completion; the model likely \
+                         polled instead of exercising idle wake-up"
+                    );
+                    assert!(
+                        completion.success,
+                        "background command failed: {completion:?}"
+                    );
+                    let ToolExecutionResult::RunCommand {
+                        exit_code, stdout, ..
+                    } = completion.tool_result
+                    else {
+                        panic!("Codex background command returned a non-command result")
+                    };
+                    assert_eq!(
+                        exit_code, 0,
+                        "Codex background command exited unsuccessfully"
+                    );
+                    assert!(
+                        stdout.contains(COMPLETED),
+                        "Codex background completion omitted {COMPLETED}: {stdout:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Codex never completed the qualified idle background command");
+
+    assert!(
+        background_tool_call_id.is_some(),
+        "Codex never reported the command as background work"
+    );
+    assert!(saw_launched, "Codex never emitted {LAUNCHED}");
+    assert!(
+        saw_idle_before_completion,
+        "Codex never became idle before background completion"
+    );
+
+    let mut saw_resumed_turn = false;
+    let mut saw_result = false;
+    let resumed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read Codex background continuation")
+                .expect("Codex background continuation stream closed");
+            if env.kind != FrameKind::ChatEvent || env.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = env
+                .parse_payload()
+                .expect("parse Codex background continuation ChatEvent");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Codex background continuation failed: {content}"),
+                ChatEvent::TypingStatusChanged(true) => saw_resumed_turn = true,
+                ChatEvent::StreamDelta(delta) => saw_result |= delta.text.contains(RESUMED),
+                ChatEvent::StreamEnd(end) => {
+                    saw_result |= end.message.content.contains(RESUMED);
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_resumed_turn && saw_result => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        resumed.is_ok(),
+        "Codex delivered the background completion while idle but did not initiate a continuation \
+         turn within 90 seconds"
+    );
+    assert!(saw_resumed_turn, "Codex did not start a continuation turn");
+    assert!(saw_result, "Codex resumed without surfacing {RESUMED}");
 }
 
 async fn assert_claude_background_command_releases_activity() {
