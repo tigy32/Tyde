@@ -16,7 +16,7 @@ use crate::components::agents_panel::{
     DerivedAgentState, backend_class, backend_label, derive_agent_state, relative_time,
     status_class, status_icon, status_label,
 };
-use crate::state::{ActiveAgentRef, AgentInfo, AgentMonitorKey, AppState, ProjectInfo, TabContent};
+use crate::state::{AgentInfo, AgentMonitorKey, AppState, ProjectInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DropPlacement {
@@ -929,14 +929,7 @@ fn toggle_in_vec<T: Clone + PartialEq>(items: &[T], value: &T) -> Vec<T> {
 }
 
 fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
-    state.open_tab(
-        TabContent::chat_with_agent(ActiveAgentRef {
-            host_id: agent.host_id.clone(),
-            agent_id: agent.agent_id.clone(),
-        }),
-        agent.name.clone(),
-        true,
-    );
+    crate::components::agents_panel::open_agent_chat(state, agent);
 }
 
 #[component]

@@ -1346,21 +1346,44 @@ fn render_agent_tree_group(
 }
 
 /// Switch the active project (and host) to the project the clicked agent
-/// belongs to, then open (and activate) its chat tab. Ordering is
+/// belongs to, then open (and activate) its chat tab. Agent-control children
+/// created before project inheritance was added can have no project of their
+/// own; for those records the parent agent's project is authoritative. A
+/// genuinely unscoped agent opens in the current center zone rather than
+/// treating missing ownership metadata as an instruction to switch Home.
+/// Ordering is
 /// load-bearing: `switch_active_project` replaces `center_zone`, so it MUST
 /// run before `open_tab` or the new tab lands in the old project's zone and is
-/// discarded. A `None` project switches to Home; the chat tab still carries the
-/// agent's `host_id` so host context stays correct. Switching to the already-
-/// active project is a no-op (early-returns inside `switch_active_project`).
+/// discarded. An agent with no resolvable project stays in the current center
+/// zone; the chat tab still carries the agent's `host_id` so host context stays
+/// correct. Switching to the already-active project is a no-op (early-returns
+/// inside `switch_active_project`).
 ///
 /// Shared with the tool cards' "Open agent" action so every surface that opens
 /// an agent chat uses the same project-switch-then-open ordering.
 pub(crate) fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
-    state.switch_active_project(agent_project_ref(agent));
-    state.open_tab(
+    let project = agent_project_ref(agent).or_else(|| parent_agent_project_ref(state, agent));
+    log::info!(
+        "open agent navigation agent={} host={} explicit_project={:?} resolved_project={:?} active_project_before={:?}",
+        agent.agent_id.0,
+        agent.host_id,
+        agent.project_id,
+        project,
+        state.active_project.get_untracked(),
+    );
+    if let Some(project) = project {
+        state.switch_active_project(Some(project));
+    }
+    let opened = state.open_tab(
         TabContent::chat_with_agent(agent_chat_ref(agent)),
         agent.name.clone(),
         true,
+    );
+    log::info!(
+        "open agent navigation completed agent={} opened_tab={opened:?} active_project_after={:?} active_agent_after={:?}",
+        agent.agent_id.0,
+        state.active_project.get_untracked(),
+        state.active_agent.get_untracked(),
     );
 }
 
@@ -1377,6 +1400,18 @@ pub(crate) fn agent_project_ref(agent: &AgentInfo) -> Option<ActiveProjectRef> {
     agent.project_id.clone().map(|project_id| ActiveProjectRef {
         host_id: agent.host_id.clone(),
         project_id,
+    })
+}
+
+fn parent_agent_project_ref(state: &AppState, agent: &AgentInfo) -> Option<ActiveProjectRef> {
+    let parent_id = agent.parent_agent_id.as_ref()?;
+    state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|candidate| {
+                candidate.host_id == agent.host_id && candidate.agent_id == *parent_id
+            })
+            .and_then(agent_project_ref)
     })
 }
 

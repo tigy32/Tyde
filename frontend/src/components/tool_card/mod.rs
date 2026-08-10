@@ -1755,7 +1755,7 @@ mod persistent_agent_resolver_tests {
 mod live_card_wasm_tests {
     use super::*;
     use crate::components::tool_card::test_utils::*;
-    use crate::state::{AgentInfo, AppState, StreamingState};
+    use crate::state::{ActiveProjectRef, AgentInfo, AppState, StreamingState};
     use leptos::mount::mount_to;
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
@@ -2379,6 +2379,56 @@ mod live_card_wasm_tests {
             .expect("clicking the receipt opens the child agent");
         assert_eq!(opened.agent_id, agent_id);
         assert_eq!(opened.host_id, "host-1");
+    }
+
+    #[wasm_bindgen_test]
+    async fn projectless_child_receipt_uses_parent_project() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let project_id = ProjectId("parent-project".to_owned());
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "host-1".to_owned(),
+            project_id: project_id.clone(),
+        }));
+        let mut parent = agent_info("agent-1", "Parent", true);
+        parent.parent_agent_id = None;
+        parent.project_id = Some(project_id.clone());
+        let child = agent_info("agent-sub", "Worker", true);
+        assert_eq!(
+            child.project_id, None,
+            "fixture is the legacy projectless child"
+        );
+        state.agents.set(vec![parent, child]);
+        next_tick().await;
+
+        container
+            .query_selector(".tool-live-agent-receipt-link")
+            .expect("query receipt link")
+            .expect("receipt link")
+            .dyn_into::<HtmlElement>()
+            .expect("HTML button")
+            .click();
+        next_tick().await;
+
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(ActiveProjectRef {
+                host_id: "host-1".to_owned(),
+                project_id,
+            }),
+            "missing child metadata must not switch the transcript to Home"
+        );
+        assert_eq!(
+            state
+                .active_agent
+                .get_untracked()
+                .map(|agent| agent.agent_id),
+            Some(AgentId("agent-sub".to_owned())),
+            "the receipt opens the projectless legacy child"
+        );
     }
 
     /// The receipt is a vertical list: one row per referenced agent, each
