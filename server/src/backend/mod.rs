@@ -1470,6 +1470,7 @@ mod tests {
                     BackendCapability::ContextUsageReported,
                     BackendCapability::Subagents,
                     BackendCapability::BackgroundTasks,
+                    BackendCapability::AgentInitiatedTurns,
                     BackendCapability::WorkspaceInstructions,
                     BackendCapability::Customization,
                 ][..],

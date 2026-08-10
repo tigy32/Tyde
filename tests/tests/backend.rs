@@ -7913,13 +7913,13 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
         | CertificationCase::NativeSubagentParentLinked => {
             assert_backend_native_subagent_visibility(backend_kind).await;
         }
-        CertificationCase::BackgroundWorkKeepsAgentActive
-        | CertificationCase::AgentInitiatedTurnIsDistinct
-        | CertificationCase::AgentInitiatedResultDelivered => {
+        CertificationCase::BackgroundWorkKeepsAgentActive => {
             assert_eq!(backend_kind, BackendKind::Claude);
             assert_claude_agent_initiated_background_resume().await;
         }
-        CertificationCase::BackgroundCompletionResumesParent => match backend_kind {
+        CertificationCase::BackgroundCompletionResumesParent
+        | CertificationCase::AgentInitiatedTurnIsDistinct
+        | CertificationCase::AgentInitiatedResultDelivered => match backend_kind {
             BackendKind::Claude => assert_claude_agent_initiated_background_resume().await,
             BackendKind::Codex => assert_codex_background_completion_resumes_parent().await,
             _ => unreachable!("background completion resume is not certified for {backend_kind:?}"),
@@ -7946,7 +7946,9 @@ fn backend_supports_certification_case(
             | CertificationCase::AgentInitiatedResultDelivered
     ) {
         let supported_backend = match case {
-            CertificationCase::BackgroundCompletionResumesParent => {
+            CertificationCase::BackgroundCompletionResumesParent
+            | CertificationCase::AgentInitiatedTurnIsDistinct
+            | CertificationCase::AgentInitiatedResultDelivered => {
                 matches!(backend_kind, BackendKind::Claude | BackendKind::Codex)
             }
             _ => backend_kind == BackendKind::Claude,

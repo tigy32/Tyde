@@ -30,13 +30,13 @@ The built-in adapter declarations are:
 | Tycode | list, resume | interrupt | session, MCP, workspace, customization | turn | — |
 | ACP | list, resume | interrupt | MCP, workspace, customization | — | — |
 | Claude | resume, fork | image, interrupt | session, MCP, workspace, customization | turn | subagents, background, initiated turns |
-| Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background |
+| Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background, initiated turns |
 | Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
 | Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
 
 No built-in adapter currently claims authoritative context breakdowns or
 mid-turn steering. Background support does not imply autonomous continuation;
-only Claude currently declares agent-initiated turns.
+Claude and Codex currently declare agent-initiated turns.
 
 ## Conformance validation
 

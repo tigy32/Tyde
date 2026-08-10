@@ -2276,6 +2276,8 @@ impl CodexSession {
                 background_command_owner_active: true,
                 outstanding_command_executions: HashMap::new(),
                 background_terminal_poll_active: false,
+                pending_background_wakes: VecDeque::new(),
+                background_wake_request_in_flight: false,
                 experimental_raw_events_requested: CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
                 raw_response_item_completed_seen: false,
                 first_background_list_thread_id: None,
@@ -3343,6 +3345,14 @@ struct CodexBackgroundCommand {
     missing_polls: u8,
 }
 
+struct CodexBackgroundWake {
+    tool_call_id: String,
+    task_id: String,
+    description: Option<String>,
+    exit_code: i32,
+    output: String,
+}
+
 /// A `commandExecution` item between `item/started` and `item/completed`.
 ///
 /// Every command is tracked until a yielded unified-exec result proves that
@@ -3450,6 +3460,8 @@ struct CodexState {
     outstanding_command_executions: HashMap<(String, String), CodexOutstandingCommand>,
     /// Whether the background-terminal poll loop is already running.
     background_terminal_poll_active: bool,
+    pending_background_wakes: VecDeque<CodexBackgroundWake>,
+    background_wake_request_in_flight: bool,
     experimental_raw_events_requested: bool,
     raw_response_item_completed_seen: bool,
     first_background_list_thread_id: Option<String>,
@@ -4276,10 +4288,119 @@ impl CodexInner {
             .remove(&(thread_id, provider_item_id.to_owned()))
     }
 
+    async fn enqueue_background_wake(
+        self: &Arc<Self>,
+        command: CodexBackgroundCommand,
+        exit_code: i32,
+        output: String,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            if !state.background_command_owner_active {
+                return;
+            }
+            state
+                .pending_background_wakes
+                .push_back(CodexBackgroundWake {
+                    tool_call_id: command.tool_call_id,
+                    task_id: command.task_id,
+                    description: command.description,
+                    exit_code,
+                    output,
+                });
+        }
+        self.spawn_pending_background_wake();
+    }
+
+    fn spawn_pending_background_wake(self: &Arc<Self>) {
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some((thread_id, wakes, model, effort, approval_policy, sandbox_policy)) = ({
+                let mut state = inner.state.lock().await;
+                if state.pending_background_wakes.is_empty()
+                    || state.background_wake_request_in_flight
+                    || state.active_turn_id.is_some()
+                    || state.awaiting_root_turn_start
+                    || !state.background_command_owner_active
+                {
+                    None
+                } else {
+                    state.background_wake_request_in_flight = true;
+                    let wakes = state.pending_background_wakes.drain(..).collect::<Vec<_>>();
+                    let (model, effort) = match state.execution_mode {
+                        BackendExecutionMode::Agent => (
+                            state.model_override.clone(),
+                            state.reasoning_effort_override.clone(),
+                        ),
+                        BackendExecutionMode::InferenceOnly => (None, None),
+                    };
+                    let approval_policy = state
+                        .approval_policy
+                        .clone()
+                        .unwrap_or_else(|| codex_approval_policy(state.execution_mode).to_string());
+                    let sandbox_policy = codex_sandbox_policy(
+                        state.access_mode,
+                        state.turn_network_access,
+                        state.execution_mode,
+                    );
+                    Some((
+                        state.thread_id.clone(),
+                        wakes,
+                        model,
+                        effort,
+                        approval_policy,
+                        sandbox_policy,
+                    ))
+                }
+            }) else {
+                return;
+            };
+
+            let notification = codex_background_wake_notification(&wakes);
+            {
+                let mut state = inner.state.lock().await;
+                state.pending_user_input_bytes = notification.len() as u64;
+            }
+            let mut params = json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": notification,
+                    "text_elements": []
+                }],
+                "summary": CODEX_REASONING_SUMMARY_LEVEL,
+                "approvalPolicy": approval_policy,
+                "sandboxPolicy": sandbox_policy
+            });
+            if let Some(model) = model {
+                params["model"] = Value::String(model);
+            }
+            if let Some(effort) = effort {
+                params["effort"] = Value::String(effort);
+            }
+
+            if let Err(error) = inner.rpc.request("turn/start", params).await {
+                let mut state = inner.state.lock().await;
+                state.background_wake_request_in_flight = false;
+                state.pending_user_input_bytes = 0;
+                for wake in wakes.into_iter().rev() {
+                    state.pending_background_wakes.push_front(wake);
+                }
+                drop(state);
+                tracing::warn!(%error, "Failed to start Codex background completion turn");
+                inner
+                    .emitter
+                    .warning_message("Codex could not resume after background work completed");
+            }
+        });
+    }
+
     async fn drain_background_commands(&self) {
         let commands = {
             let mut state = self.state.lock().await;
             state.background_command_owner_active = false;
+            state.pending_background_wakes.clear();
+            state.background_wake_request_in_flight = false;
             let commands = take_all_codex_commands(&mut state);
             for command in &commands {
                 state.pending_tool_call_ids.remove(&command.tool_call_id);
@@ -6166,6 +6287,8 @@ impl CodexInner {
             state.turn_context_by_turn.clear();
             state.file_change_call_ids.clear();
             state.background_command_owner_active = true;
+            state.pending_background_wakes.clear();
+            state.background_wake_request_in_flight = false;
             state.pending_request = None;
             state.pending_user_input_bytes = 0;
             state.conversation_bytes_total = 0;
@@ -6724,6 +6847,7 @@ impl CodexInner {
                     state.terminated_turn_awaiting_replacement = None;
                     let provider_initiated = !state.awaiting_root_turn_start;
                     state.awaiting_root_turn_start = false;
+                    state.background_wake_request_in_flight = false;
                     state.active_turn_id = Some(turn_id.clone());
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
@@ -10297,7 +10421,7 @@ impl CodexInner {
         }
     }
 
-    async fn handle_item_completed(&self, params: &Value) {
+    async fn handle_item_completed(self: &Arc<Self>, params: &Value) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -10616,7 +10740,7 @@ impl CodexInner {
                     json!({
                         "kind": "RunCommand",
                         "exit_code": exit_code,
-                        "stdout": output,
+                        "stdout": output.clone(),
                         "stderr": ""
                     }),
                     if success {
@@ -10635,6 +10759,8 @@ impl CodexInner {
                         },
                         Some(exit_code as i64),
                     ));
+                    self.enqueue_background_wake(command, exit_code, output)
+                        .await;
                 }
             }
             "fileChange" => {
@@ -11315,7 +11441,7 @@ impl CodexInner {
             .task_update(&protocol::TaskList { title, tasks });
     }
 
-    async fn handle_turn_completed(&self, params: &Value) {
+    async fn handle_turn_completed(self: &Arc<Self>, params: &Value) {
         let completed_turn_id = extract_turn_id(params);
         let consumed_terminated_turn = {
             let mut state = self.state.lock().await;
@@ -11641,6 +11767,7 @@ impl CodexInner {
 
         self.trace_terminal_emission("idle", None).await;
         self.emitter.typing_status_changed(false);
+        self.spawn_pending_background_wake();
 
         if turn_status == "failed" {
             let message = params
@@ -13501,6 +13628,26 @@ fn parse_codex_background_terminals(result: &Value) -> Vec<CodexBackgroundTermin
             })
         })
         .collect()
+}
+
+fn codex_background_wake_notification(wakes: &[CodexBackgroundWake]) -> String {
+    let mut notification = String::from(
+        "[Tyde internal background-task notification]\n\
+         Background work from an earlier turn has finished. Continue the work that was waiting \
+         for these results. Do not describe this notification as a new user request.\n",
+    );
+    for wake in wakes {
+        let output = wake.output.chars().take(16_384).collect::<String>();
+        notification.push_str(&format!(
+            "\nTool call: {}\nTask: {}\nCommand: {}\nExit code: {}\nOutput:\n{}\n",
+            wake.tool_call_id,
+            wake.task_id,
+            wake.description.as_deref().unwrap_or("unknown command"),
+            wake.exit_code,
+            output,
+        ));
+    }
+    notification
 }
 
 fn estimate_file_change_tool_bytes(item: &Value) -> u64 {
@@ -15633,6 +15780,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
         ]
@@ -21913,6 +22061,8 @@ for line in sys.stdin:
             background_command_owner_active: true,
             outstanding_command_executions: HashMap::new(),
             background_terminal_poll_active: false,
+            pending_background_wakes: VecDeque::new(),
+            background_wake_request_in_flight: false,
             experimental_raw_events_requested: CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             raw_response_item_completed_seen: false,
             first_background_list_thread_id: None,
@@ -29382,6 +29532,8 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
             drain_events(&mut rx);
 
+            let wake_request = install_codex_request_observer("turn/start");
+
             inner
                 .handle_notification(
                     "item/completed",
@@ -29403,6 +29555,11 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
+
+            tokio::time::timeout(Duration::from_secs(1), wake_request)
+                .await
+                .expect("background completion did not schedule a continuation turn")
+                .expect("Codex request observer closed before the continuation turn");
 
             let events = drain_events(&mut rx);
             let progress = events
