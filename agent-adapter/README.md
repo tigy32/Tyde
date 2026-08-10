@@ -23,6 +23,21 @@ idle. `AgentInitiatedTurns` permits a backend to start a new turn without a new
 caller input, such as Claude resuming a parent when a background subagent
 finishes.
 
+The built-in adapter declarations are:
+
+| Backend | Sessions | Input/control | Configuration | Usage | Agents/work |
+| --- | --- | --- | --- | --- | --- |
+| Tycode | list, resume | interrupt | session, MCP, workspace, customization | turn | — |
+| ACP | list, resume | interrupt | MCP, workspace, customization | — | — |
+| Claude | resume, fork | image, interrupt | session, MCP, workspace, customization | turn | subagents, background, initiated turns |
+| Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background |
+| Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
+| Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
+
+No built-in adapter currently claims authoritative context breakdowns or
+mid-turn steering. Background support does not imply autonomous continuation;
+only Claude currently declares agent-initiated turns.
+
 ## Conformance validation
 
 `BackendConformanceValidator` consumes accepted inputs, replay boundaries,
@@ -45,7 +60,7 @@ run.
 
 ## Paid qualification suite
 
-`CertificationCase` defines 65 narrow live contracts. Every case is an
+`CertificationCase` defines 66 narrow live contracts. Every case is an
 independent ignored test, so a model can iterate on one invariant with one cheap
 provider call. The aggregate `real_universal_backend_qualification_suite` runs
 the same catalog across every selected backend and reports all failures it can

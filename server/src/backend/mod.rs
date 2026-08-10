@@ -1413,30 +1413,105 @@ mod tests {
     }
 
     #[test]
-    fn provider_request_usage_is_only_promised_by_codex() {
-        for kind in [
-            BackendKind::Tycode,
-            BackendKind::Acp,
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Antigravity,
-            BackendKind::Hermes,
-        ] {
+    fn built_in_backend_capability_matrix_is_exact() {
+        let expected = [
+            (
+                BackendKind::Tycode,
+                &[
+                    BackendCapability::ListSessions,
+                    BackendCapability::ResumeSession,
+                    BackendCapability::Interrupt,
+                    BackendCapability::SessionSettings,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::TurnUsageReported,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+            (
+                BackendKind::Acp,
+                &[
+                    BackendCapability::ListSessions,
+                    BackendCapability::ResumeSession,
+                    BackendCapability::Interrupt,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+            (
+                BackendKind::Claude,
+                &[
+                    BackendCapability::ResumeSession,
+                    BackendCapability::ForkSession,
+                    BackendCapability::ImageInput,
+                    BackendCapability::Interrupt,
+                    BackendCapability::SessionSettings,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::TurnUsageReported,
+                    BackendCapability::Subagents,
+                    BackendCapability::BackgroundTasks,
+                    BackendCapability::AgentInitiatedTurns,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+            (
+                BackendKind::Codex,
+                &[
+                    BackendCapability::ResumeSession,
+                    BackendCapability::ForkSession,
+                    BackendCapability::ImageInput,
+                    BackendCapability::Interrupt,
+                    BackendCapability::SessionSettings,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::TurnUsageReported,
+                    BackendCapability::ModelRequestUsageReported,
+                    BackendCapability::ContextUsageReported,
+                    BackendCapability::Subagents,
+                    BackendCapability::BackgroundTasks,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+            (
+                BackendKind::Antigravity,
+                &[
+                    BackendCapability::ResumeSession,
+                    BackendCapability::Interrupt,
+                    BackendCapability::SessionSettings,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+            (
+                BackendKind::Hermes,
+                &[
+                    BackendCapability::ListSessions,
+                    BackendCapability::ResumeSession,
+                    BackendCapability::Interrupt,
+                    BackendCapability::SessionSettings,
+                    BackendCapability::StartupMcpServers,
+                    BackendCapability::TurnUsageReported,
+                    BackendCapability::ContextUsageReported,
+                    BackendCapability::Subagents,
+                    BackendCapability::BackgroundTasks,
+                    BackendCapability::WorkspaceInstructions,
+                    BackendCapability::Customization,
+                ][..],
+            ),
+        ];
+
+        for (kind, expected) in expected {
+            let actual = capabilities_for_backend_kind(kind)
+                .iter()
+                .collect::<Vec<_>>();
             assert_eq!(
-                capabilities_for_backend_kind(kind)
-                    .contains(BackendCapability::ModelRequestUsageReported),
-                kind == BackendKind::Codex,
-                "unexpected provider request usage declaration for {kind:?}"
+                actual, expected,
+                "incorrect capability matrix row for {kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn claude_promises_background_and_agent_initiated_turns() {
-        let capabilities = capabilities_for_backend_kind(BackendKind::Claude);
-
-        assert!(capabilities.contains(BackendCapability::BackgroundTasks));
-        assert!(capabilities.contains(BackendCapability::AgentInitiatedTurns));
     }
 
     #[test]

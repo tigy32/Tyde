@@ -7928,6 +7928,28 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
     }
 }
 
+fn backend_supports_certification_case(
+    backend_kind: BackendKind,
+    capabilities: &tyde_agent_adapter::BackendCapabilities,
+    case: CertificationCase,
+) -> bool {
+    if matches!(
+        case,
+        CertificationCase::BackgroundWorkKeepsAgentActive
+            | CertificationCase::BackgroundCompletionReleasesAgent
+            | CertificationCase::BackgroundCompletionResumesParent
+            | CertificationCase::AgentInitiatedTurnIsDistinct
+            | CertificationCase::AgentInitiatedResultDelivered
+    ) {
+        return backend_kind == BackendKind::Claude
+            && case
+                .required_capability()
+                .is_none_or(|capability| capabilities.contains(capability));
+    }
+    case.required_capability()
+        .is_none_or(|capability| capabilities.contains(capability))
+}
+
 async fn run_selected_certification_case(case: CertificationCase) {
     assert!(
         real_ai_tests_enabled(),
@@ -7959,12 +7981,9 @@ async fn run_selected_certification_case(case: CertificationCase) {
             continue;
         }
         let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
-        if case
-            .required_capability()
-            .is_some_and(|capability| !capabilities.contains(capability))
-        {
+        if !backend_supports_certification_case(backend_kind, &capabilities, case) {
             eprintln!(
-                "SKIPPED {} {}: capability not declared",
+                "SKIPPED {} {}: case is not certified for backend capabilities",
                 backend_label(backend_kind),
                 case.id()
             );
@@ -8272,12 +8291,9 @@ async fn real_universal_backend_qualification_suite() {
 
         let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
         for case in CertificationCase::ALL {
-            if case
-                .required_capability()
-                .is_some_and(|capability| !capabilities.contains(capability))
-            {
+            if !backend_supports_certification_case(backend_kind, &capabilities, case) {
                 eprintln!(
-                    "SKIPPED {} {}: capability not declared",
+                    "SKIPPED {} {}: case is not certified for backend capabilities",
                     backend_label(backend_kind),
                     case.id()
                 );
