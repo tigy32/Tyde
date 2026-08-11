@@ -104,6 +104,7 @@ pub fn FileExplorer() -> impl IntoView {
     let filter = RwSignal::new(String::new());
     let show_hidden = RwSignal::new(false);
     let expanded_dirs = RwSignal::new(HashSet::<String>::new());
+    let collapsed_roots = RwSignal::new(HashSet::<String>::new());
 
     let tree = Memo::new(move |_| {
         let pid = state.active_project.get()?.project_id;
@@ -247,6 +248,7 @@ pub fn FileExplorer() -> impl IntoView {
                                         &filter_val,
                                         hidden,
                                         expanded_dirs,
+                                        collapsed_roots,
                                         project_ref.clone(),
                                     )
                                 })
@@ -503,11 +505,17 @@ fn render_root_section(
     filter: &str,
     show_hidden: bool,
     expanded_dirs: RwSignal<HashSet<String>>,
+    collapsed_roots: RwSignal<HashSet<String>>,
     project_ref: Option<(String, ProjectId)>,
 ) -> Vec<AnyView> {
     let mut views = Vec::new();
     let root_label = root_display_name(&root);
     let root_title = root.0.clone();
+    let root_key = root.0.clone();
+    let is_expanded = {
+        let root_key = root_key.clone();
+        Signal::derive(move || !collapsed_roots.with(|roots| roots.contains(&root_key)))
+    };
     let remove_button = project_ref.map(|(host_id, project_id)| {
         let root_for_remove = root.clone();
         let on_remove = move |ev: web_sys::MouseEvent| {
@@ -533,20 +541,52 @@ fn render_root_section(
     views.push(
         view! {
             <div class="fe-root-header" title=root_title>
-                <span class="fe-root-name">{root_label}</span>
+                <button
+                    class="fe-root-toggle"
+                    data-test="fe-root-toggle"
+                    aria-expanded=move || if is_expanded.get() { "true" } else { "false" }
+                    on:click={
+                        let root_key = root_key.clone();
+                        move |_| {
+                            collapsed_roots.update(|roots| {
+                                if !roots.insert(root_key.clone()) {
+                                    roots.remove(&root_key);
+                                }
+                            });
+                        }
+                    }
+                >
+                    <span class="fe-chevron">
+                        {move || if is_expanded.get() { "\u{25be}" } else { "\u{25b8}" }}
+                    </span>
+                    <span class="fe-root-name">{root_label}</span>
+                </button>
                 {remove_button}
             </div>
         }
         .into_any(),
     );
-    views.extend(render_nodes(
-        root,
-        nodes,
-        0,
-        filter,
-        show_hidden,
-        expanded_dirs,
-    ));
+    let filter_for_nodes = filter.to_owned();
+    views.push(
+        view! {
+            <Show when=move || is_expanded.get()>
+                {
+                    let root = root.clone();
+                    let nodes = nodes.clone();
+                    let filter = filter_for_nodes.clone();
+                    move || render_nodes(
+                        root.clone(),
+                        nodes.clone(),
+                        0,
+                        &filter,
+                        show_hidden,
+                        expanded_dirs,
+                    )
+                }
+            </Show>
+        }
+        .into_any(),
+    );
     views
 }
 
@@ -1011,6 +1051,46 @@ mod wasm_tests {
                 .center_zone
                 .with_untracked(|center_zone| center_zone.is_split()),
             "an ordinary open never creates a split"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_roots_collapse_and_expand_their_files() {
+        let container = make_container();
+        let _state = mount_explorer_with_files(container.clone(), &["main.rs"]);
+        next_tick().await;
+
+        let root = container
+            .query_selector("button[data-test='fe-root-toggle']")
+            .unwrap()
+            .expect("the project root renders as a tree toggle")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(root.get_attribute("aria-expanded").as_deref(), Some("true"));
+        assert_eq!(
+            file_rows(&container).len(),
+            1,
+            "expanded roots show their files"
+        );
+
+        root.click();
+        next_tick().await;
+        assert_eq!(
+            root.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert!(
+            file_rows(&container).is_empty(),
+            "collapsing a root hides only the tree contained by that root"
+        );
+
+        root.click();
+        next_tick().await;
+        assert_eq!(root.get_attribute("aria-expanded").as_deref(), Some("true"));
+        assert_eq!(
+            file_rows(&container).len(),
+            1,
+            "expanding restores its files"
         );
     }
 
