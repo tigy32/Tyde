@@ -76,13 +76,14 @@ pub enum CertificationCase {
     NativeSubagentParentLinked,
     BackgroundWorkKeepsAgentActive,
     BackgroundCompletionReleasesAgent,
+    BackgroundCompletionRetiresTrayEntry,
     BackgroundCompletionResumesParent,
     AgentInitiatedTurnIsDistinct,
     AgentInitiatedResultDelivered,
 }
 
 impl CertificationCase {
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 70] = [
         Self::InitialInputEchoedOnce,
         Self::TypingStarts,
         Self::TypingStartsOnce,
@@ -149,6 +150,7 @@ impl CertificationCase {
         Self::NativeSubagentParentLinked,
         Self::BackgroundWorkKeepsAgentActive,
         Self::BackgroundCompletionReleasesAgent,
+        Self::BackgroundCompletionRetiresTrayEntry,
         Self::BackgroundCompletionResumesParent,
         Self::AgentInitiatedTurnIsDistinct,
         Self::AgentInitiatedResultDelivered,
@@ -226,6 +228,9 @@ impl CertificationCase {
             Self::NativeSubagentParentLinked => "native_subagent_parent_linked",
             Self::BackgroundWorkKeepsAgentActive => "background_work_keeps_agent_active",
             Self::BackgroundCompletionReleasesAgent => "background_completion_releases_agent",
+            Self::BackgroundCompletionRetiresTrayEntry => {
+                "background_completion_retires_tray_entry"
+            }
             Self::BackgroundCompletionResumesParent => "background_completion_resumes_parent",
             Self::AgentInitiatedTurnIsDistinct => "agent_initiated_turn_is_distinct",
             Self::AgentInitiatedResultDelivered => "agent_initiated_result_delivered",
@@ -238,6 +243,7 @@ impl CertificationCase {
             | Self::NativeSubagentParentLinked
             | Self::BackgroundWorkKeepsAgentActive
             | Self::BackgroundCompletionReleasesAgent
+            | Self::BackgroundCompletionRetiresTrayEntry
             | Self::BackgroundCompletionResumesParent
             | Self::AgentInitiatedTurnIsDistinct
             | Self::AgentInitiatedResultDelivered => CertificationTier::SpecializedLive,
@@ -282,7 +288,10 @@ impl CertificationCase {
             Self::InterruptEmitsCancellation
             | Self::InterruptReturnsIdle
             | Self::InterruptStopsCommand
-            | Self::FollowUpAfterInterrupt => Some(BackendCapability::Interrupt),
+            | Self::FollowUpAfterInterrupt
+            | Self::InterruptAllowsFollowUpDuringBackgroundWork => {
+                Some(BackendCapability::Interrupt)
+            }
             Self::SessionAppearsInList => Some(BackendCapability::ListSessions),
             Self::ResumeRemembersHistory
             | Self::ResumeAcceptsFollowUp
@@ -306,6 +315,7 @@ impl CertificationCase {
             }
             Self::BackgroundWorkKeepsAgentActive
             | Self::BackgroundCompletionReleasesAgent
+            | Self::BackgroundCompletionRetiresTrayEntry
             | Self::BackgroundCompletionResumesParent => Some(BackendCapability::BackgroundTasks),
             Self::AgentInitiatedTurnIsDistinct | Self::AgentInitiatedResultDelivered => {
                 Some(BackendCapability::AgentInitiatedTurns)

@@ -6965,7 +6965,7 @@ async fn assert_interrupt_follow_up_survives_request_timeout(
             "Immediately run exactly `./interrupt_timeout_test.sh` using the available command tool. Do not only describe it."
         }
         BackendKind::Tycode => {
-            "Write 100 numbered lines containing the word context, then end with READY_TO_INTERRUPT."
+            "Use the bash tool exactly once to run `./interrupt_timeout_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
         }
         BackendKind::Hermes => {
             "Immediately run exactly `./interrupt_timeout_test.sh` in the current working directory. Do not only describe it."
@@ -6983,21 +6983,26 @@ async fn assert_interrupt_follow_up_survives_request_timeout(
             "Reply exactly INTERRUPT_TEST_READY.",
         )
         .await;
+        let readiness_prompt = "Reply exactly INTERRUPT_TEST_READY.";
+        let readiness = expect_assistant_turn_after_user_echo(
+            &mut fixture.client,
+            &candidate,
+            readiness_prompt,
+        )
+        .await;
+        assert!(
+            readiness.final_text.contains("INTERRUPT_TEST_READY"),
+            "{backend_kind:?} did not complete interrupt test readiness: {:?}",
+            readiness.final_text
+        );
         loop {
-            let envelope = expect_next_event(&mut fixture.client, "interrupt test readiness").await;
-            if envelope.kind == FrameKind::AgentError && envelope.stream == candidate {
-                let error: protocol::AgentErrorPayload = envelope
-                    .parse_payload()
-                    .expect("parse readiness AgentError");
-                panic!(
-                    "backend failed during interrupt test readiness: {}",
-                    error.message
-                );
-            }
+            let envelope = expect_next_event(&mut fixture.client, "interrupt readiness idle").await;
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != candidate {
                 continue;
             }
-            let event: ChatEvent = envelope.parse_payload().expect("parse readiness ChatEvent");
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse interrupt readiness idle event");
             if matches!(event, ChatEvent::TypingStatusChanged(false)) {
                 break;
             }
@@ -7032,13 +7037,7 @@ async fn assert_interrupt_follow_up_survives_request_timeout(
                     started_stream = Some(candidate);
                     break;
                 }
-                ChatEvent::StreamDelta(delta) => {
-                    pre_interrupt_text.push_str(&delta.text);
-                    if backend_kind == BackendKind::Tycode && !delta.text.is_empty() {
-                        started_stream = Some(candidate);
-                        break;
-                    }
-                }
+                ChatEvent::StreamDelta(delta) => pre_interrupt_text.push_str(&delta.text),
                 ChatEvent::StreamEnd(end) if !end.message.content.trim().is_empty() => {
                     pre_interrupt_text = end.message.content;
                 }
@@ -7157,16 +7156,35 @@ async fn assert_interrupt_follow_up_survives_request_timeout(
     );
 }
 
-async fn assert_claude_interrupt_allows_follow_up_during_background_work(
+async fn assert_interrupt_allows_follow_up_during_background_work(
     fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
 ) {
-    let backend_kind = BackendKind::Claude;
     let proof_path = fixture
         .workspace_dir
         .path()
         .join("BACKGROUND_INTERRUPT_PROOF.txt");
     let workspace_roots = fixture.workspace_roots();
-    let prompt = "Use the Bash tool exactly once to run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` with run_in_background=true. Do not call TaskOutput, TaskStop, or any other tool. After Bash reports that the command is running in the background, end the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY; do not wait for its result.";
+    let prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use the Bash tool exactly once to run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` with run_in_background=true. Do not call TaskOutput, TaskStop, or any other tool. After Bash reports that the command is running in the background, end the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY; do not wait for its result."
+        }
+        BackendKind::Codex => {
+            "Use command execution exactly once to run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt`. Set its initial yield to no more than one second so the tool returns while the process is still running. Do not add `&`, and do not call write_stdin, wait, poll, or any other tool afterward. As soon as the tool reports a running session, end the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY; do not wait for its result."
+        }
+        BackendKind::Hermes => {
+            "Use the terminal tool exactly once with background=true to run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt`. Do not call process, wait, poll, or any other tool afterward. As soon as the tool reports a background process, end the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY; do not wait for its result."
+        }
+        BackendKind::Acp => {
+            "Run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` as background work using the command tool exactly once. Do not wait or poll. End the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY."
+        }
+        BackendKind::Tycode => {
+            "Run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` as background work using the build/test tool exactly once. Do not wait or poll. End the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY."
+        }
+        BackendKind::Antigravity => {
+            "Run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` as background work using the command tool exactly once. Do not wait or poll. End the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY."
+        }
+    };
     let stream = spawn_agent_via_protocol_with_options(
         &mut fixture.client,
         workspace_roots,
@@ -7186,20 +7204,20 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
                 .client
                 .next_event()
                 .await
-                .expect("read Claude detached background setup")
-                .expect("Claude detached background setup stream closed");
+                .expect("read detached background setup")
+                .expect("detached background setup stream closed");
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
                 continue;
             }
             let event: ChatEvent = envelope
                 .parse_payload()
-                .expect("parse Claude detached background setup event");
+                .expect("parse detached background setup event");
             match event {
                 ChatEvent::MessageAdded(ChatMessage {
                     sender: MessageSender::Error,
                     content,
                     ..
-                }) => panic!("Claude detached background setup failed: {content}"),
+                }) => panic!("{backend_kind:?} detached background setup failed: {content}"),
                 ChatEvent::ToolProgress(progress) => {
                     if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
                         && task.status == protocol::BackgroundTaskStatus::Running
@@ -7217,7 +7235,7 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
                 ChatEvent::TypingStatusChanged(false)
                     if background_tool_call_id.is_some() && !foreground_ended =>
                 {
-                    panic!("Claude became idle before ending its foreground turn")
+                    panic!("{backend_kind:?} became idle before ending its foreground turn")
                 }
                 _ => {}
             }
@@ -7227,7 +7245,7 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
         }
     })
     .await
-    .expect("Claude did not enter detached-background-only activity");
+    .unwrap_or_else(|_| panic!("{backend_kind:?} did not enter detached-background-only activity"));
 
     fixture
         .client
@@ -7236,7 +7254,6 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
         .expect("interrupt detached Claude background command");
 
     let background_tool_call_id = background_tool_call_id.expect("background tool call id");
-    let mut saw_operation_cancelled = false;
     let mut saw_idle = false;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -7245,11 +7262,14 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
                 .next_event()
                 .await
                 .expect("read detached background cancellation")
-                .expect("Claude stream closed during detached background cancellation");
+                .expect("backend stream closed during detached background cancellation");
             if envelope.kind == FrameKind::AgentError && envelope.stream == stream {
                 let error: protocol::AgentErrorPayload =
                     envelope.parse_payload().expect("parse cancellation AgentError");
-                panic!("Claude detached background cancellation failed: {}", error.message);
+                panic!(
+                    "{backend_kind:?} detached background cancellation failed: {}",
+                    error.message
+                );
             }
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
                 continue;
@@ -7265,7 +7285,7 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
                         assert_eq!(
                             task.status,
                             protocol::BackgroundTaskStatus::Running,
-                            "conversation interrupt stopped detached Claude background work"
+                            "conversation interrupt stopped detached {backend_kind:?} background work"
                         );
                     }
                 }
@@ -7273,14 +7293,13 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
                     if completion.tool_call_id == background_tool_call_id =>
                 {
                     panic!(
-                        "conversation interrupt terminated detached Claude background work: {completion:?}"
+                        "conversation interrupt terminated detached {backend_kind:?} background work: {completion:?}"
                     );
                 }
-                ChatEvent::OperationCancelled(_) => saw_operation_cancelled = true,
                 ChatEvent::TypingStatusChanged(false) => saw_idle = true,
                 _ => {}
             }
-            if saw_operation_cancelled && saw_idle {
+            if saw_idle {
                 break;
             }
         }
@@ -7288,14 +7307,14 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "Claude did not make the conversation interactive within 10 seconds while detached background work remained active: operation_cancelled={saw_operation_cancelled} idle={saw_idle}"
+            "{backend_kind:?} did not make the conversation interactive within 10 seconds while detached background work remained active: idle={saw_idle}"
         )
     });
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
         !proof_path.exists(),
-        "detached Claude background command completed before the follow-up"
+        "detached {backend_kind:?} background command completed before the follow-up"
     );
 
     let follow_up = "Reply exactly BACKGROUND_INTERRUPT_FOLLOW_UP_OK.";
@@ -7310,20 +7329,9 @@ async fn assert_claude_interrupt_allows_follow_up_during_background_work(
         response
             .final_text
             .contains("BACKGROUND_INTERRUPT_FOLLOW_UP_OK"),
-        "Claude did not recover after detached background cancellation: {:?}",
+        "{backend_kind:?} did not recover after detached background cancellation: {:?}",
         response.final_text
     );
-}
-
-async fn assert_interrupt_allows_follow_up_during_background_work(
-    fixture: &mut RealBackendFixture,
-    backend_kind: BackendKind,
-) {
-    if backend_kind == BackendKind::Claude {
-        assert_claude_interrupt_allows_follow_up_during_background_work(fixture).await;
-    } else {
-        assert_backend_interrupts_long_running_command(fixture, backend_kind).await;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8520,6 +8528,9 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
             assert_eq!(backend_kind, BackendKind::Claude);
             assert_claude_background_command_releases_activity().await;
         }
+        CertificationCase::BackgroundCompletionRetiresTrayEntry => {
+            assert_background_completion_retires_tray_entry(backend_kind).await;
+        }
         _ => unreachable!("direct cases returned before match: {}", case.id()),
     }
 }
@@ -8549,6 +8560,11 @@ fn backend_supports_certification_case(
             && case
                 .required_capability()
                 .is_none_or(|capability| capabilities.contains(capability));
+    }
+    if case == CertificationCase::InterruptAllowsFollowUpDuringBackgroundWork
+        && !capabilities.contains(tyde_agent_adapter::BackendCapability::BackgroundTasks)
+    {
+        return false;
     }
     case.required_capability()
         .is_none_or(|capability| capabilities.contains(capability))
@@ -9025,6 +9041,124 @@ async fn assert_claude_background_command_releases_activity() {
     );
 }
 
+async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKind) {
+    const DONE: &str = "BACKGROUND_TRAY_DONE_941";
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use the Bash tool exactly once to run `sleep 8; printf BACKGROUND_TRAY_DONE_941` with run_in_background=true. Do not call TaskOutput, TaskStop, or any other tool. After Bash reports that the command is running in the background, end the foreground turn by replying exactly BACKGROUND_TRAY_LAUNCHED; do not wait for its result."
+        }
+        BackendKind::Codex => {
+            "Use command execution exactly once to run `sleep 8; printf BACKGROUND_TRAY_DONE_941`. Set its initial yield to no more than one second so the tool returns while the process is still running. Do not add `&`, and do not call write_stdin, wait, poll, or any other tool afterward. As soon as the tool reports a running session, end the foreground turn by replying exactly BACKGROUND_TRAY_LAUNCHED; do not wait for its result."
+        }
+        BackendKind::Hermes => {
+            "Use the terminal tool with background=true to run `sleep 8; printf BACKGROUND_TRAY_DONE_941`. After it reports a background process, use the process tool exactly once with action=wait for that process so its completion is reported. Do not use any other tools. Then reply exactly BACKGROUND_TRAY_LAUNCHED."
+        }
+        BackendKind::Acp => {
+            "Run `sleep 8; printf BACKGROUND_TRAY_DONE_941` as background work, wait for that same background task to report completion, then reply exactly BACKGROUND_TRAY_LAUNCHED."
+        }
+        BackendKind::Tycode => {
+            "Run `sleep 8; printf BACKGROUND_TRAY_DONE_941` as background work, wait for that same background task to report completion, then reply exactly BACKGROUND_TRAY_LAUNCHED."
+        }
+        BackendKind::Antigravity => {
+            "Run `sleep 8; printf BACKGROUND_TRAY_DONE_941` as background work, wait for that same background task to report completion, then reply exactly BACKGROUND_TRAY_LAUNCHED."
+        }
+    };
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "background-completion-retires-tray-entry",
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+
+    let mut background_tool_call_id = None;
+    let mut saw_terminal = false;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let envelope = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read background tray lifecycle")
+                .expect("background tray lifecycle stream closed");
+            if envelope.kind == FrameKind::AgentError && envelope.stream == stream {
+                let error: protocol::AgentErrorPayload = envelope
+                    .parse_payload()
+                    .expect("parse background tray AgentError");
+                panic!("{backend_kind:?} background tray case failed: {}", error.message);
+            }
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse background tray lifecycle event");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("{backend_kind:?} background tray case failed: {content}"),
+                ChatEvent::ToolProgress(progress) => {
+                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                        continue;
+                    };
+                    match task.status {
+                        protocol::BackgroundTaskStatus::Running => {
+                            assert!(
+                                task.description
+                                    .as_deref()
+                                    .is_some_and(|description| description.contains(DONE)),
+                                "{backend_kind:?} reported unrelated background work: {task:?}"
+                            );
+                            assert!(
+                                background_tool_call_id
+                                    .as_ref()
+                                    .is_none_or(|known| known == &progress.tool_call_id),
+                                "{backend_kind:?} changed background tool identity"
+                            );
+                            background_tool_call_id = Some(progress.tool_call_id);
+                        }
+                        protocol::BackgroundTaskStatus::Completed => {
+                            assert_eq!(
+                                background_tool_call_id.as_deref(),
+                                Some(progress.tool_call_id.as_str()),
+                                "{backend_kind:?} completed a background task without retiring the running tray entry"
+                            );
+                            saw_terminal = true;
+                            break;
+                        }
+                        status => panic!(
+                            "{backend_kind:?} background task ended with {status:?} instead of Completed"
+                        ),
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{backend_kind:?} never emitted terminal progress to retire its running background tray entry: tool_call_id={background_tool_call_id:?}"
+        )
+    });
+
+    assert!(
+        background_tool_call_id.is_some(),
+        "{backend_kind:?} never reported the command as background work"
+    );
+    assert!(
+        saw_terminal,
+        "{backend_kind:?} never retired the running background tray entry"
+    );
+}
+
 #[tokio::test]
 #[ignore = "heavy paid backend qualification; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_universal_backend_qualification_suite() {
@@ -9173,6 +9307,7 @@ live_certification_tests! {
     real_cert_native_subagent_parent_linked => NativeSubagentParentLinked,
     real_cert_background_work_keeps_agent_active => BackgroundWorkKeepsAgentActive,
     real_cert_background_completion_releases_agent => BackgroundCompletionReleasesAgent,
+    real_cert_background_completion_retires_tray_entry => BackgroundCompletionRetiresTrayEntry,
     real_cert_background_completion_resumes_parent => BackgroundCompletionResumesParent,
     real_cert_agent_initiated_turn_is_distinct => AgentInitiatedTurnIsDistinct,
     real_cert_agent_initiated_result_delivered => AgentInitiatedResultDelivered,

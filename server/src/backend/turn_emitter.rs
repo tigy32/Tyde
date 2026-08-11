@@ -468,6 +468,20 @@ impl TurnEmitter {
         self.lock().abort(message);
     }
 
+    pub fn interrupt_acknowledged(&self, message: &str) {
+        // Background tools still own their pending completion, so this cannot
+        // use the normal cancellation tail that closes every pending tool.
+        let state = self.lock();
+        state.send(json!({
+            "kind": "OperationCancelled",
+            "data": { "message": message },
+        }));
+        state.send(json!({
+            "kind": "TypingStatusChanged",
+            "data": false,
+        }));
+    }
+
     // ---------- Messages (user / assistant / system / error / warning) ----------
 
     pub fn user_message(&self, content: &str, images: Vec<Value>) {

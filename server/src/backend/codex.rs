@@ -2256,6 +2256,7 @@ impl CodexSession {
                 execution_mode: config.execution_mode,
                 turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
                 active_turn_id: None,
+                foreground_response_completed: false,
                 awaiting_root_turn_start: false,
                 interrupt_next_root_turn: false,
                 pending_compaction: None,
@@ -3432,6 +3433,7 @@ struct CodexState {
     execution_mode: BackendExecutionMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
+    foreground_response_completed: bool,
     awaiting_root_turn_start: bool,
     /// Set when the user cancels while no root turn is tracked. A root turn
     /// that starts while this is set raced the cancel — the user has already
@@ -4882,6 +4884,9 @@ impl CodexInner {
             let mut state = self.state.lock().await;
             if kind == CodexProviderItemKind::AgentMessage {
                 state.close_active_stream_when_tools_idle = false;
+                if provider_completed {
+                    state.foreground_response_completed = true;
+                }
                 if renderable {
                     state.conversation_bytes_total = state
                         .conversation_bytes_total
@@ -6135,10 +6140,22 @@ impl CodexInner {
                 Ok(())
             }
             SessionCommand::CancelConversation => {
-                let (thread_id, turn_id_opt) = {
+                let (thread_id, turn_id_opt, foreground_ended_with_background_work) = {
                     let state = self.state.lock().await;
-                    (state.thread_id.clone(), state.active_turn_id.clone())
+                    (
+                        state.thread_id.clone(),
+                        state.active_turn_id.clone(),
+                        !state.background_commands.is_empty()
+                            && (state.active_turn_id.is_none()
+                                || state.foreground_response_completed),
+                    )
                 };
+                if foreground_ended_with_background_work {
+                    self.emitter.interrupt_acknowledged(
+                        "Codex foreground turn already ended; background work continues.",
+                    );
+                    return Ok(());
+                }
                 let Some(turn_id) = turn_id_opt else {
                     // No tracked turn to interrupt. A turn may still be
                     // spooling (turn/start dispatched, turn/started not yet
@@ -6861,6 +6878,7 @@ impl CodexInner {
                     state.awaiting_root_turn_start = false;
                     state.background_wake_request_in_flight = false;
                     state.active_turn_id = Some(turn_id.clone());
+                    state.foreground_response_completed = false;
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
                     state.provider_supersessions_this_turn = 0;
@@ -10108,6 +10126,7 @@ impl CodexInner {
         let item_id = item.get("id").and_then(Value::as_str);
         let notification_thread_id = extract_notification_thread_id(params);
         let notification_turn_id = extract_turn_id(params);
+        self.state.lock().await.foreground_response_completed = false;
 
         match item_type {
             "agentMessage" => {
@@ -11560,6 +11579,7 @@ impl CodexInner {
             let completed_turn_id =
                 extract_turn_id(params).or_else(|| state.active_turn_id.clone());
             state.active_turn_id = None;
+            state.foreground_response_completed = false;
             let mut open_item_without_completion = false;
             let mut open_item_published = false;
             let mut interrupted_published_stream = None;
@@ -22046,6 +22066,7 @@ for line in sys.stdin:
             execution_mode: BackendExecutionMode::Agent,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
+            foreground_response_completed: false,
             awaiting_root_turn_start: false,
             interrupt_next_root_turn: false,
             pending_compaction: None,

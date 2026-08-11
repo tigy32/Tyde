@@ -132,6 +132,12 @@ that:
 2. Passes only when the bug is fixed.
 3. Runs and passes against every supported backend.
 
+Within a conformance case, the only backend-specific branching allowed is the
+prompt string used to make the model perform the same test behavior reliably.
+Setup, event collection, and assertions must be identical for every backend
+eligible under the case's capability requirements; never substitute a different
+scenario or oracle for one provider.
+
 Real-backend tests are expensive, so prefer targeted conformance tests while
 iterating. Running them is pre-authorized. Before shipping a backend-provider
 change, the complete conformance suite must pass for each changed backend. If a
