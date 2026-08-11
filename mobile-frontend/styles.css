@@ -110,15 +110,8 @@ input, textarea, select {
 .mobile-app {
     display: flex;
     flex-direction: column;
-    /* Exactly the region the (overflow: hidden) body clips to — NOT a
-       viewport unit. 100dvh disagrees with the clipped region while iOS
-       browser chrome or the software keyboard is in flux, which left the
-       bottom nav floating above a band of dead background (dvh short) or
-       clipped off-screen (dvh long). html, body, and #app-root are all
-       height: 100%, so this resolves; when the keyboard resizes the layout
-       viewport (interactive-widget=resizes-content), the chain shrinks with
-       it and the composer stays reachable. */
-    height: 100%;
+    height: 100vh;
+    height: 100dvh;
     min-height: 0;
     overflow: hidden;
     padding-top: var(--safe-area-top);
@@ -4111,13 +4104,12 @@ input, textarea, select {
  * shell, above the navigated content) and agent-scoped (inside a chat, directly
  * above the composer).
  *
- * The app shell is a fixed-height flex column (`.mobile-app`, sized to the
- * visible viewport), so this surface MUST be `flex-shrink: 0` — otherwise it
- * gets crushed to nothing — and it MUST cap its own height, or a handful of
- * failed messages squeeze the content (or the composer) off the screen
- * entirely. The shell shrinks when the software keyboard resizes the layout
- * viewport, so the cap is what keeps the composer reachable with the
- * keyboard up.
+ * The app shell is a fixed-height flex column (`.mobile-app`, 100dvh), so this
+ * surface MUST be `flex-shrink: 0` — otherwise it gets crushed to nothing — and
+ * it MUST cap its own height, or a handful of failed messages squeeze the
+ * content (or the composer) off the screen entirely. `100dvh` shrinks when the
+ * software keyboard opens, so the cap is what keeps the composer reachable with
+ * the keyboard up.
  */
 .pending-submissions {
     flex-shrink: 0;
