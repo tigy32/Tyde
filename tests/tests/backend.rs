@@ -7157,6 +7157,175 @@ async fn assert_interrupt_follow_up_survives_request_timeout(
     );
 }
 
+async fn assert_claude_interrupt_allows_follow_up_during_background_work(
+    fixture: &mut RealBackendFixture,
+) {
+    let backend_kind = BackendKind::Claude;
+    let proof_path = fixture
+        .workspace_dir
+        .path()
+        .join("BACKGROUND_INTERRUPT_PROOF.txt");
+    let workspace_roots = fixture.workspace_roots();
+    let prompt = "Use the Bash tool exactly once to run `sleep 120; printf SHOULD_NOT_EXIST > BACKGROUND_INTERRUPT_PROOF.txt` with run_in_background=true. Do not call TaskOutput, TaskStop, or any other tool. After Bash reports that the command is running in the background, end the foreground turn by replying exactly BACKGROUND_INTERRUPT_READY; do not wait for its result.";
+    let stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "interrupt-detached-background-command",
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+
+    let mut background_tool_call_id = None;
+    let mut foreground_ended = false;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let envelope = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read Claude detached background setup")
+                .expect("Claude detached background setup stream closed");
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse Claude detached background setup event");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Claude detached background setup failed: {content}"),
+                ChatEvent::ToolProgress(progress) => {
+                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
+                        && task.status == protocol::BackgroundTaskStatus::Running
+                    {
+                        background_tool_call_id = Some(progress.tool_call_id);
+                    }
+                }
+                ChatEvent::StreamEnd(end)
+                    if background_tool_call_id.is_some()
+                        && end.message.tool_calls.is_empty()
+                        && end.message.content.contains("BACKGROUND_INTERRUPT_READY") =>
+                {
+                    foreground_ended = true;
+                }
+                ChatEvent::TypingStatusChanged(false)
+                    if background_tool_call_id.is_some() && !foreground_ended =>
+                {
+                    panic!("Claude became idle before ending its foreground turn")
+                }
+                _ => {}
+            }
+            if background_tool_call_id.is_some() && foreground_ended {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Claude did not enter detached-background-only activity");
+
+    fixture
+        .client
+        .interrupt(&stream)
+        .await
+        .expect("interrupt detached Claude background command");
+
+    let background_tool_call_id = background_tool_call_id.expect("background tool call id");
+    let mut saw_operation_cancelled = false;
+    let mut saw_idle = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let envelope = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read detached background cancellation")
+                .expect("Claude stream closed during detached background cancellation");
+            if envelope.kind == FrameKind::AgentError && envelope.stream == stream {
+                let error: protocol::AgentErrorPayload =
+                    envelope.parse_payload().expect("parse cancellation AgentError");
+                panic!("Claude detached background cancellation failed: {}", error.message);
+            }
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
+                continue;
+            }
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse detached background cancellation event");
+            match event {
+                ChatEvent::ToolProgress(progress)
+                    if progress.tool_call_id == background_tool_call_id =>
+                {
+                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update {
+                        assert_eq!(
+                            task.status,
+                            protocol::BackgroundTaskStatus::Running,
+                            "conversation interrupt stopped detached Claude background work"
+                        );
+                    }
+                }
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == background_tool_call_id =>
+                {
+                    panic!(
+                        "conversation interrupt terminated detached Claude background work: {completion:?}"
+                    );
+                }
+                ChatEvent::OperationCancelled(_) => saw_operation_cancelled = true,
+                ChatEvent::TypingStatusChanged(false) => saw_idle = true,
+                _ => {}
+            }
+            if saw_operation_cancelled && saw_idle {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Claude did not make the conversation interactive within 10 seconds while detached background work remained active: operation_cancelled={saw_operation_cancelled} idle={saw_idle}"
+        )
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !proof_path.exists(),
+        "detached Claude background command completed before the follow-up"
+    );
+
+    let follow_up = "Reply exactly BACKGROUND_INTERRUPT_FOLLOW_UP_OK.";
+    fixture
+        .client
+        .send_message(&stream, follow_up.to_owned())
+        .await
+        .expect("send follow-up after detached background cancellation");
+    let response =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, follow_up).await;
+    assert!(
+        response
+            .final_text
+            .contains("BACKGROUND_INTERRUPT_FOLLOW_UP_OK"),
+        "Claude did not recover after detached background cancellation: {:?}",
+        response.final_text
+    );
+}
+
+async fn assert_interrupt_allows_follow_up_during_background_work(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    if backend_kind == BackendKind::Claude {
+        assert_claude_interrupt_allows_follow_up_during_background_work(fixture).await;
+    } else {
+        assert_backend_interrupts_long_running_command(fixture, backend_kind).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Real backend tests — opt-in because they can make real AI calls
 // ---------------------------------------------------------------------------
@@ -8262,6 +8431,11 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
             let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_interrupt_follow_up_survives_request_timeout(&mut fixture, backend_kind).await;
         }
+        CertificationCase::InterruptAllowsFollowUpDuringBackgroundWork => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_interrupt_allows_follow_up_during_background_work(&mut fixture, backend_kind)
+                .await;
+        }
         CertificationCase::SessionAppearsInList
         | CertificationCase::ResumeRemembersHistory
         | CertificationCase::ResumeAcceptsFollowUp
@@ -8975,6 +9149,7 @@ live_certification_tests! {
     real_cert_interrupt_stops_command => InterruptStopsCommand,
     real_cert_follow_up_after_interrupt => FollowUpAfterInterrupt,
     real_cert_interrupt_follow_up_survives_request_timeout => InterruptFollowUpSurvivesRequestTimeout,
+    real_cert_interrupt_allows_follow_up_during_background_work => InterruptAllowsFollowUpDuringBackgroundWork,
     real_cert_session_appears_in_list => SessionAppearsInList,
     real_cert_resume_remembers_history => ResumeRemembersHistory,
     real_cert_resume_accepts_follow_up => ResumeAcceptsFollowUp,

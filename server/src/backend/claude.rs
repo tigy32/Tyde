@@ -3838,6 +3838,16 @@ impl ClaudeInner {
         let (turn_id, quiesced_rx) = {
             let mut state = self.state.lock().await;
             let Some(active) = state.active_turn.as_mut() else {
+                let message = if self
+                    .background_work_active
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    "Claude foreground turn already ended; background work continues."
+                } else {
+                    "No Claude foreground turn was running."
+                };
+                drop(state);
+                self.emit_operation_cancelled(message);
                 return;
             };
             let (quiesced_tx, quiesced_rx) = oneshot::channel();

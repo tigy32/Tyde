@@ -52,6 +52,7 @@ pub enum CertificationCase {
     InterruptStopsCommand,
     FollowUpAfterInterrupt,
     InterruptFollowUpSurvivesRequestTimeout,
+    InterruptAllowsFollowUpDuringBackgroundWork,
     SessionAppearsInList,
     ResumeRemembersHistory,
     ResumeAcceptsFollowUp,
@@ -81,7 +82,7 @@ pub enum CertificationCase {
 }
 
 impl CertificationCase {
-    pub const ALL: [Self; 68] = [
+    pub const ALL: [Self; 69] = [
         Self::InitialInputEchoedOnce,
         Self::TypingStarts,
         Self::TypingStartsOnce,
@@ -124,6 +125,7 @@ impl CertificationCase {
         Self::InterruptStopsCommand,
         Self::FollowUpAfterInterrupt,
         Self::InterruptFollowUpSurvivesRequestTimeout,
+        Self::InterruptAllowsFollowUpDuringBackgroundWork,
         Self::SessionAppearsInList,
         Self::ResumeRemembersHistory,
         Self::ResumeAcceptsFollowUp,
@@ -198,6 +200,9 @@ impl CertificationCase {
             Self::InterruptFollowUpSurvivesRequestTimeout => {
                 "interrupt_follow_up_survives_request_timeout"
             }
+            Self::InterruptAllowsFollowUpDuringBackgroundWork => {
+                "interrupt_allows_follow_up_during_background_work"
+            }
             Self::SessionAppearsInList => "session_appears_in_list",
             Self::ResumeRemembersHistory => "resume_remembers_history",
             Self::ResumeAcceptsFollowUp => "resume_accepts_follow_up",
@@ -245,6 +250,7 @@ impl CertificationCase {
             | Self::InterruptStopsCommand
             | Self::FollowUpAfterInterrupt
             | Self::InterruptFollowUpSurvivesRequestTimeout
+            | Self::InterruptAllowsFollowUpDuringBackgroundWork
             | Self::SessionAppearsInList
             | Self::ResumeRemembersHistory
             | Self::ResumeAcceptsFollowUp
