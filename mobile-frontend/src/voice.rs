@@ -653,14 +653,28 @@ pub fn MobileVoiceBar() -> impl IntoView {
     });
     let visible_state = state.clone();
     let visible = Memo::new(move |_| {
-        active_target(&visible_state).is_some_and(|(host, _)| {
-            visible_state
-                .host_settings_by_host
-                .with(|v| v.get(&host).is_some_and(|s| s.voice.enabled))
-                && visible_state
-                    .voice_capabilities_by_host
-                    .with(|v| v.get(&host).is_some_and(|c| c.nova_available))
-        })
+        // Tracked reads only. `active_target` reads untracked (it serves
+        // event handlers), so a memo built on it computes once — with no
+        // active chat at mount time that is `false` with zero subscriptions,
+        // and the bar can never appear afterwards.
+        let Some(active) = visible_state.active_agent.get() else {
+            return false;
+        };
+        let known_agent = visible_state.agents.with(|agents| {
+            agents.iter().any(|agent| {
+                agent.local_host_id == active.local_host_id && agent.agent_id == active.agent_id
+            })
+        });
+        if !known_agent {
+            return false;
+        }
+        let host = active.local_host_id;
+        visible_state
+            .host_settings_by_host
+            .with(|v| v.get(&host).is_some_and(|s| s.voice.enabled))
+            && visible_state
+                .voice_capabilities_by_host
+                .with(|v| v.get(&host).is_some_and(|c| c.nova_available))
     });
     let render_state = StoredValue::new(state);
     view! {
@@ -733,6 +747,79 @@ mod wasm_tests {
                 .query_selector("button[aria-label='Start voice']")
                 .unwrap()
                 .is_some()
+        );
+        drop(mount);
+        container.remove();
+    }
+
+    /// **Opening a chat must reveal the voice bar.**
+    ///
+    /// The bar always mounts before any chat is active (it lives in the host
+    /// shell), so its visibility memo starts `false`. It used to compute that
+    /// through untracked reads, subscribing to nothing — the memo never
+    /// recomputed and the Voice button could never appear, even on a
+    /// voice-capable host. This drives the live order: capabilities and
+    /// settings arrive on connect, the user opens a chat afterwards.
+    #[wasm_bindgen_test]
+    async fn voice_bar_appears_when_a_chat_becomes_active_after_mount() {
+        let container = container();
+        let state = AppState::new();
+        let mount_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <MobileVoiceBar /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("button[aria-label='Start voice']")
+                .unwrap()
+                .is_none(),
+            "no voice button may show before a chat is active"
+        );
+
+        let host = LocalHostId("voice-host".to_owned());
+        let agent_id = protocol::AgentId("voice-agent".to_owned());
+        state.voice_capabilities_by_host.update(|caps| {
+            caps.insert(
+                host.clone(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+            );
+        });
+        let mut settings = protocol::HostSettings::default();
+        settings.voice.enabled = true;
+        state.host_settings_by_host.update(|map| {
+            map.insert(host.clone(), settings);
+        });
+        state.agents.set(vec![crate::state::AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Voice agent".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: protocol::StreamPath("/agent/voice-agent/instance".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host,
+            agent_id,
+        }));
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("button[aria-label='Start voice']")
+                .unwrap()
+                .is_some(),
+            "the Voice button must appear once a chat is active on a \
+             voice-capable host"
         );
         drop(mount);
         container.remove();
