@@ -51,10 +51,12 @@ pub enum CertificationCase {
     InterruptReturnsIdle,
     InterruptStopsCommand,
     FollowUpAfterInterrupt,
+    InterruptFollowUpSurvivesRequestTimeout,
     SessionAppearsInList,
     ResumeRemembersHistory,
     ResumeAcceptsFollowUp,
     ResumePreservesWorkspace,
+    ResumeOwnsStartupNotifications,
     ForkCreatesDistinctSession,
     ForkPreservesHistory,
     ForkAcceptsInitialPrompt,
@@ -79,7 +81,7 @@ pub enum CertificationCase {
 }
 
 impl CertificationCase {
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 68] = [
         Self::InitialInputEchoedOnce,
         Self::TypingStarts,
         Self::TypingStartsOnce,
@@ -121,10 +123,12 @@ impl CertificationCase {
         Self::InterruptReturnsIdle,
         Self::InterruptStopsCommand,
         Self::FollowUpAfterInterrupt,
+        Self::InterruptFollowUpSurvivesRequestTimeout,
         Self::SessionAppearsInList,
         Self::ResumeRemembersHistory,
         Self::ResumeAcceptsFollowUp,
         Self::ResumePreservesWorkspace,
+        Self::ResumeOwnsStartupNotifications,
         Self::ForkCreatesDistinctSession,
         Self::ForkPreservesHistory,
         Self::ForkAcceptsInitialPrompt,
@@ -191,10 +195,14 @@ impl CertificationCase {
             Self::InterruptReturnsIdle => "interrupt_returns_idle",
             Self::InterruptStopsCommand => "interrupt_stops_command",
             Self::FollowUpAfterInterrupt => "follow_up_after_interrupt",
+            Self::InterruptFollowUpSurvivesRequestTimeout => {
+                "interrupt_follow_up_survives_request_timeout"
+            }
             Self::SessionAppearsInList => "session_appears_in_list",
             Self::ResumeRemembersHistory => "resume_remembers_history",
             Self::ResumeAcceptsFollowUp => "resume_accepts_follow_up",
             Self::ResumePreservesWorkspace => "resume_preserves_workspace",
+            Self::ResumeOwnsStartupNotifications => "resume_owns_startup_notifications",
             Self::ForkCreatesDistinctSession => "fork_creates_distinct_session",
             Self::ForkPreservesHistory => "fork_preserves_history",
             Self::ForkAcceptsInitialPrompt => "fork_accepts_initial_prompt",
@@ -236,10 +244,12 @@ impl CertificationCase {
             | Self::InterruptReturnsIdle
             | Self::InterruptStopsCommand
             | Self::FollowUpAfterInterrupt
+            | Self::InterruptFollowUpSurvivesRequestTimeout
             | Self::SessionAppearsInList
             | Self::ResumeRemembersHistory
             | Self::ResumeAcceptsFollowUp
             | Self::ResumePreservesWorkspace
+            | Self::ResumeOwnsStartupNotifications
             | Self::ForkCreatesDistinctSession
             | Self::ForkPreservesHistory
             | Self::ForkAcceptsInitialPrompt => CertificationTier::StatefulLive,

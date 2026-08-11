@@ -15,12 +15,12 @@ use protocol::{
     CustomAgentId, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind,
     HostBootstrapPayload, HostSettingValue, ImageData, ListSessionsPayload,
     MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator,
-    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
-    SessionSummary, SetSessionSettingsPayload, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-    ToolRequestType,
+    QueuedMessagesPayload, SendQueuedMessageNowPayload, SessionHistoryPayload, SessionId,
+    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSessionSettingsPayload,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
+    ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use server::backend::{Backend, BackendSession};
@@ -35,7 +35,7 @@ const DEFAULT_HERMES_TEST_PROVIDER: &str = "openrouter";
 const DEFAULT_HERMES_TEST_MODEL: &str = "anthropic/claude-haiku-4.5";
 const UNIVERSAL_CLAUDE_MODEL: &str = "haiku";
 const UNIVERSAL_CLAUDE_EFFORT: &str = "low";
-const UNIVERSAL_CODEX_MODEL: &str = "gpt-5.6-luna";
+const UNIVERSAL_CODEX_MODEL: &str = "gpt-5.6-sol";
 const UNIVERSAL_CODEX_REASONING_EFFORT: &str = "low";
 const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
 static REAL_ANTIGRAVITY_NATIVE_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -4592,6 +4592,14 @@ impl ValidatedConnection {
         self.inner.interrupt(stream).await
     }
 
+    async fn send_queued_message_now(
+        &mut self,
+        stream: &StreamPath,
+        payload: SendQueuedMessageNowPayload,
+    ) -> Result<(), protocol::FrameError> {
+        self.inner.send_queued_message_now(stream, payload).await
+    }
+
     async fn send_message(
         &mut self,
         stream: &StreamPath,
@@ -4739,6 +4747,15 @@ async fn expect_next_event(client: &mut ValidatedConnection, context: &str) -> E
         }
 
         return env;
+    }
+}
+
+async fn expect_next_unfiltered_event(client: &mut ValidatedConnection, context: &str) -> Envelope {
+    match tokio::time::timeout(REAL_BACKEND_TIMEOUT, client.next_event()).await {
+        Ok(Ok(Some(envelope))) => envelope,
+        Ok(Ok(None)) => panic!("connection closed before {context}"),
+        Ok(Err(error)) => panic!("next_event failed before {context}: {error:?}"),
+        Err(_) => panic!("timed out waiting for {context}"),
     }
 }
 
@@ -5138,6 +5155,13 @@ async fn expect_assistant_turn_after_user_echo(
 
     loop {
         let env = expect_next_event(client, "ChatEvent").await;
+        if env.kind == FrameKind::AgentError && env.stream == *agent_stream {
+            let error: protocol::AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+            panic!(
+                "backend failed before completing prompt {prompt:?}: {}",
+                error.message
+            );
+        }
         if env.kind != FrameKind::ChatEvent || env.stream != *agent_stream {
             continue;
         }
@@ -5200,7 +5224,9 @@ async fn expect_assistant_turn_after_user_echo(
                 };
             }
             ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
-                panic!("backend became idle without a non-empty assistant response")
+                panic!(
+                    "backend became idle without a non-empty assistant response for prompt {prompt:?}"
+                )
             }
             _ => {}
         }
@@ -5844,6 +5870,14 @@ async fn expect_assistant_turn_with_typing_after_user_echo(
 
     loop {
         let env = expect_next_event(client, "follow-up typing/stream ChatEvent").await;
+        if env.kind == FrameKind::AgentError && env.stream == *agent_stream {
+            let error: protocol::AgentErrorPayload =
+                env.parse_payload().expect("parse typed-turn AgentError");
+            panic!(
+                "backend failed before completing prompt {prompt:?}: {}",
+                error.message
+            );
+        }
         if env.kind != FrameKind::ChatEvent || env.stream != *agent_stream {
             continue;
         }
@@ -6565,6 +6599,7 @@ async fn expect_tool_turn_after_user_echo(
         }
 
         if saw_stream_end
+            && !tool_requests.is_empty()
             && tool_requests
                 .keys()
                 .all(|call_id| tool_completions.contains_key(call_id))
@@ -6892,6 +6927,233 @@ async fn assert_backend_interrupts_long_running_command(
     assert!(
         !follow_up_turn.final_text.trim().is_empty(),
         "expected non-empty follow-up response after interrupt for {backend_kind:?}"
+    );
+}
+
+async fn assert_interrupt_follow_up_survives_request_timeout(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let script_path = fixture
+        .workspace_dir
+        .path()
+        .join("interrupt_timeout_test.sh");
+    std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").expect("write interrupt_timeout_test.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat interrupt_timeout_test.sh")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod interrupt_timeout_test.sh");
+    }
+
+    let initial_prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use the Bash tool exactly once to execute exactly `./interrupt_timeout_test.sh`. Start immediately and do not use another tool."
+        }
+        BackendKind::Codex => {
+            "Immediately execute exactly `./interrupt_timeout_test.sh` in the current working directory. Do not explain first and do not use another tool."
+        }
+        BackendKind::Antigravity => {
+            "Execute exactly `./interrupt_timeout_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
+        }
+        BackendKind::Acp => {
+            "Immediately run exactly `./interrupt_timeout_test.sh` using the available command tool. Do not only describe it."
+        }
+        BackendKind::Tycode => {
+            "Write 100 numbered lines containing the word context, then end with READY_TO_INTERRUPT."
+        }
+        BackendKind::Hermes => {
+            "Immediately run exactly `./interrupt_timeout_test.sh` in the current working directory. Do not only describe it."
+        }
+    };
+    let workspace_roots = fixture.workspace_roots();
+    let mut started_stream = None;
+    let mut failed_attempts = Vec::new();
+    for attempt in 1..=3 {
+        let candidate = spawn_agent_via_protocol(
+            &mut fixture.client,
+            workspace_roots.clone(),
+            backend_kind,
+            &format!("interrupt-request-timeout-{attempt}"),
+            "Reply exactly INTERRUPT_TEST_READY.",
+        )
+        .await;
+        loop {
+            let envelope = expect_next_event(&mut fixture.client, "interrupt test readiness").await;
+            if envelope.kind == FrameKind::AgentError && envelope.stream == candidate {
+                let error: protocol::AgentErrorPayload = envelope
+                    .parse_payload()
+                    .expect("parse readiness AgentError");
+                panic!(
+                    "backend failed during interrupt test readiness: {}",
+                    error.message
+                );
+            }
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != candidate {
+                continue;
+            }
+            let event: ChatEvent = envelope.parse_payload().expect("parse readiness ChatEvent");
+            if matches!(event, ChatEvent::TypingStatusChanged(false)) {
+                break;
+            }
+        }
+        fixture
+            .client
+            .send_message(&candidate, initial_prompt.to_owned())
+            .await
+            .expect("send long-running interrupt prompt");
+        let mut pre_interrupt_text = String::new();
+        let mut attempt_trace = Vec::new();
+        loop {
+            let envelope = expect_next_event(&mut fixture.client, "long-running ToolRequest").await;
+            if envelope.kind == FrameKind::AgentError && envelope.stream == candidate {
+                let error: protocol::AgentErrorPayload = envelope
+                    .parse_payload()
+                    .expect("parse pre-interrupt AgentError");
+                panic!("backend failed before interrupt: {}", error.message);
+            }
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != candidate {
+                continue;
+            }
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse pre-interrupt ChatEvent");
+            attempt_trace.push(format!("{event:?}"));
+            match event {
+                ChatEvent::ToolRequest(ToolRequest {
+                    tool_type: ToolRequestType::RunCommand { ref command, .. },
+                    ..
+                }) if command.contains("interrupt_timeout_test.sh") => {
+                    started_stream = Some(candidate);
+                    break;
+                }
+                ChatEvent::StreamDelta(delta) => {
+                    pre_interrupt_text.push_str(&delta.text);
+                    if backend_kind == BackendKind::Tycode && !delta.text.is_empty() {
+                        started_stream = Some(candidate);
+                        break;
+                    }
+                }
+                ChatEvent::StreamEnd(end) if !end.message.content.trim().is_empty() => {
+                    pre_interrupt_text = end.message.content;
+                }
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("backend failed before starting interrupt command: {content}"),
+                ChatEvent::TypingStatusChanged(false) => {
+                    failed_attempts.push((pre_interrupt_text, attempt_trace));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if started_stream.is_some() {
+            break;
+        }
+    }
+    let stream = started_stream.unwrap_or_else(|| {
+        panic!(
+            "backend became idle before starting interrupt command for {backend_kind:?} in three attempts: {failed_attempts:?}"
+        )
+    });
+
+    let queued_prompt = "The running command is cancelled. Reply exactly INTERRUPT_FOLLOW_UP_OK.";
+    fixture
+        .client
+        .send_message(&stream, queued_prompt.to_owned())
+        .await
+        .expect("queue follow-up during long-running command");
+    let queued_id = loop {
+        let envelope =
+            expect_next_unfiltered_event(&mut fixture.client, "queued follow-up snapshot").await;
+        if envelope.kind == FrameKind::AgentError && envelope.stream == stream {
+            let error: protocol::AgentErrorPayload = envelope
+                .parse_payload()
+                .expect("parse queued follow-up AgentError");
+            panic!(
+                "backend failed while queueing interrupt follow-up: {}",
+                error.message
+            );
+        }
+        if envelope.kind != FrameKind::QueuedMessages || envelope.stream != stream {
+            continue;
+        }
+        let queued: QueuedMessagesPayload = envelope
+            .parse_payload()
+            .expect("parse QueuedMessages after follow-up");
+        if let Some(message) = queued
+            .messages
+            .into_iter()
+            .find(|message| message.message == queued_prompt)
+        {
+            break message.id;
+        }
+    };
+    fixture
+        .client
+        .send_queued_message_now(&stream, SendQueuedMessageNowPayload { id: queued_id })
+        .await
+        .expect("interrupt with queued follow-up");
+    fixture
+        .client
+        .interrupt(&stream)
+        .await
+        .expect("repeat interrupt while cancellation is in flight");
+
+    let quiet_result = tokio::time::timeout(Duration::from_secs(50), async {
+        loop {
+            let envelope = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read backend events after interrupt")
+                .expect("backend connection closed after interrupt");
+            if envelope.stream != stream {
+                continue;
+            }
+            if envelope.kind == FrameKind::AgentError {
+                let error: protocol::AgentErrorPayload = envelope
+                    .parse_payload()
+                    .expect("parse delayed interrupt AgentError");
+                panic!(
+                    "backend failed after an apparently successful interrupt: {}",
+                    error.message
+                );
+            }
+            assert_ne!(
+                envelope.kind,
+                FrameKind::AgentClosed,
+                "backend closed after an apparently successful interrupt"
+            );
+        }
+    })
+    .await;
+    assert!(
+        quiet_result.is_err(),
+        "post-interrupt health observation ended unexpectedly"
+    );
+
+    let health_prompt = "Reply exactly INTERRUPT_SESSION_STILL_HEALTHY.";
+    fixture
+        .client
+        .send_message(&stream, health_prompt.to_owned())
+        .await
+        .expect("send health check after interrupt timeout horizon");
+    let health_turn =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, health_prompt).await;
+    assert!(
+        health_turn
+            .final_text
+            .contains("INTERRUPT_SESSION_STILL_HEALTHY"),
+        "backend stopped accepting work after interrupt for {backend_kind:?}: {:?}",
+        health_turn.final_text
     );
 }
 
@@ -7710,7 +7972,7 @@ async fn collect_backend_text_until_idle(events: &mut server::backend::EventStre
                     sender: MessageSender::Error,
                     content,
                     ..
-                }) => panic!("backend fork case failed: {content}"),
+                }) => panic!("backend direct conformance case failed: {content}"),
                 _ => {}
             }
         }
@@ -7721,6 +7983,155 @@ async fn collect_backend_text_until_idle(events: &mut server::backend::EventStre
         streamed
     } else {
         final_text
+    }
+}
+
+async fn drain_resume_replay(
+    events: &mut server::backend::EventStream,
+    backend_kind: BackendKind,
+    cycle: usize,
+) {
+    if let Some(replay_complete) = events.take_resume_replay_complete() {
+        tokio::time::timeout(Duration::from_secs(180), replay_complete)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("resume replay cycle {cycle} timed out for {backend_kind:?}")
+            })
+            .unwrap_or_else(|_| {
+                panic!("resume replay cycle {cycle} closed early for {backend_kind:?}")
+            });
+    }
+    while let Ok(event) = events.try_recv() {
+        if let ChatEvent::MessageAdded(ChatMessage {
+            sender: MessageSender::Error,
+            content,
+            ..
+        }) = event
+        {
+            panic!("resume replay cycle {cycle} failed for {backend_kind:?}: {content}");
+        }
+    }
+}
+
+async fn assert_backend_resume_startup_case<B: Backend>(backend_kind: BackendKind) {
+    let workspace = tempfile::tempdir().expect("resume workspace");
+    let root = workspace.path().to_string_lossy().to_string();
+    let initial_prompt =
+        "Write 100 numbered lines containing the word context, then end with READY_TO_RESUME.";
+    let (mut backend, mut events) = B::spawn(
+        vec![root.clone()],
+        universal_backend_config(backend_kind),
+        protocol::SendMessagePayload {
+            message: initial_prompt.to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("initial resume source spawn failed: {error}"));
+    let mut session_id = backend.session_id();
+    let initial_text = collect_backend_text_until_idle(&mut events).await;
+    assert!(
+        initial_text.contains("READY_TO_RESUME"),
+        "resume source turn failed for {backend_kind:?}: {initial_text:?}"
+    );
+    for cycle in 1..=10 {
+        backend.shutdown().await;
+        let (resumed, mut resumed_events) = B::resume(
+            vec![root.clone()],
+            universal_backend_config(backend_kind),
+            session_id.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("closed-session resume cycle {cycle} failed: {error}"));
+        assert_eq!(
+            resumed.session_id(),
+            session_id,
+            "resume cycle {cycle} changed provider session identity"
+        );
+        drain_resume_replay(&mut resumed_events, backend_kind, cycle).await;
+        let resume_prompt =
+            format!("In one short sentence, explain why resume cycle {cycle} is useful.");
+        assert!(
+            resumed
+                .send(protocol::AgentInput::SendMessage(
+                    protocol::SendMessagePayload {
+                        message: resume_prompt,
+                        images: None,
+                        origin: None,
+                        tool_response: None,
+                    },
+                ))
+                .await,
+            "resumed backend rejected input for cycle {cycle}"
+        );
+        let resumed_text = collect_backend_text_until_idle(&mut resumed_events).await;
+        assert!(
+            !resumed_text.trim().is_empty(),
+            "resume cycle {cycle} produced no response for {backend_kind:?}"
+        );
+        session_id = resumed.session_id();
+        backend = resumed;
+        events = resumed_events;
+    }
+
+    let follow_up = "In one short sentence, confirm that this session still works.";
+    assert!(
+        backend
+            .send(protocol::AgentInput::SendMessage(
+                protocol::SendMessagePayload {
+                    message: follow_up.to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                },
+            ))
+            .await,
+        "resumed backend rejected follow-up input"
+    );
+    let follow_up_text = collect_backend_text_until_idle(&mut events).await;
+    backend.shutdown().await;
+    assert!(
+        !follow_up_text.trim().is_empty(),
+        "resumed backend produced no follow-up for {backend_kind:?}"
+    );
+}
+
+async fn assert_resume_startup_case(backend_kind: BackendKind) {
+    match backend_kind {
+        BackendKind::Claude => {
+            assert_backend_resume_startup_case::<server::backend::claude::ClaudeBackend>(
+                backend_kind,
+            )
+            .await
+        }
+        BackendKind::Codex => {
+            assert_backend_resume_startup_case::<server::backend::codex::CodexBackend>(backend_kind)
+                .await
+        }
+        BackendKind::Acp => {
+            assert_backend_resume_startup_case::<server::backend::kiro::KiroBackend>(backend_kind)
+                .await
+        }
+        BackendKind::Hermes => {
+            assert_backend_resume_startup_case::<server::backend::hermes::HermesBackend>(
+                backend_kind,
+            )
+            .await
+        }
+        BackendKind::Tycode => {
+            assert_backend_resume_startup_case::<server::backend::tycode::TycodeBackend>(
+                backend_kind,
+            )
+            .await
+        }
+        BackendKind::Antigravity => {
+            assert_backend_resume_startup_case::<server::backend::antigravity::AntigravityBackend>(
+                backend_kind,
+            )
+            .await
+        }
     }
 }
 
@@ -7847,12 +8258,19 @@ async fn run_certification_case_for_backend(backend_kind: BackendKind, case: Cer
             let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_interrupts_long_running_command(&mut fixture, backend_kind).await;
         }
+        CertificationCase::InterruptFollowUpSurvivesRequestTimeout => {
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
+            assert_interrupt_follow_up_survives_request_timeout(&mut fixture, backend_kind).await;
+        }
         CertificationCase::SessionAppearsInList
         | CertificationCase::ResumeRemembersHistory
         | CertificationCase::ResumeAcceptsFollowUp
         | CertificationCase::ResumePreservesWorkspace => {
             let mut fixture = RealBackendFixture::new(backend_kind).await;
             resume_secret_via_protocol(&mut fixture, backend_kind).await;
+        }
+        CertificationCase::ResumeOwnsStartupNotifications => {
+            assert_resume_startup_case(backend_kind).await;
         }
         CertificationCase::ForkCreatesDistinctSession
         | CertificationCase::ForkPreservesHistory
@@ -8556,10 +8974,12 @@ live_certification_tests! {
     real_cert_interrupt_returns_idle => InterruptReturnsIdle,
     real_cert_interrupt_stops_command => InterruptStopsCommand,
     real_cert_follow_up_after_interrupt => FollowUpAfterInterrupt,
+    real_cert_interrupt_follow_up_survives_request_timeout => InterruptFollowUpSurvivesRequestTimeout,
     real_cert_session_appears_in_list => SessionAppearsInList,
     real_cert_resume_remembers_history => ResumeRemembersHistory,
     real_cert_resume_accepts_follow_up => ResumeAcceptsFollowUp,
     real_cert_resume_preserves_workspace => ResumePreservesWorkspace,
+    real_cert_resume_owns_startup_notifications => ResumeOwnsStartupNotifications,
     real_cert_fork_creates_distinct_session => ForkCreatesDistinctSession,
     real_cert_fork_preserves_history => ForkPreservesHistory,
     real_cert_fork_accepts_initial_prompt => ForkAcceptsInitialPrompt,

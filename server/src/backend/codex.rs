@@ -2247,6 +2247,7 @@ impl CodexSession {
             emitter,
             state: Mutex::new(CodexState {
                 thread_id,
+                pending_resume_thread_id: None,
                 effective_model: model,
                 model_override: None,
                 reasoning_effort_override: None,
@@ -3422,6 +3423,7 @@ enum CodexNotificationOwner {
 
 struct CodexState {
     thread_id: String,
+    pending_resume_thread_id: Option<String>,
     effective_model: Option<String>,
     model_override: Option<String>,
     reasoning_effort_override: Option<String>,
@@ -6152,16 +6154,13 @@ impl CodexInner {
                     self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
-                let _ = self
-                    .rpc
-                    .request(
-                        "turn/interrupt",
-                        json!({
-                            "threadId": thread_id,
-                            "turnId": turn_id
-                        }),
-                    )
-                    .await?;
+                self.rpc.spawn_request(
+                    "turn/interrupt",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id
+                    }),
+                );
                 Ok(())
             }
             SessionCommand::GetSettings => {
@@ -6236,40 +6235,53 @@ impl CodexInner {
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
-        let response = self
-            .rpc
-            .request(
-                "thread/resume",
-                json!({
-                    "threadId": session_id,
-                    "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS
-                }),
-            )
-            .await?;
+        self.state.lock().await.pending_resume_thread_id = Some(session_id.clone());
+        let resumed = async {
+            let response = self
+                .rpc
+                .request(
+                    "thread/resume",
+                    json!({
+                        "threadId": session_id,
+                        "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS
+                    }),
+                )
+                .await?;
 
-        let thread = response
-            .get("thread")
-            .ok_or("Codex thread/resume response missing thread")?;
-        let resumed_thread_id = thread
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or("Codex thread/resume response missing thread.id")?
-            .to_string();
-        let resumed_model = response
-            .get("model")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        let turns = thread
-            .get("turns")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
+            let thread = response
+                .get("thread")
+                .ok_or("Codex thread/resume response missing thread")?;
+            let resumed_thread_id = thread
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("Codex thread/resume response missing thread.id")?
+                .to_string();
+            let resumed_model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let turns = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
+        }
+        .await;
+        let (resumed_thread_id, resumed_model, turns) = match resumed {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                self.state.lock().await.pending_resume_thread_id = None;
+                return Err(error);
+            }
+        };
 
         self.drain_background_commands().await;
         self.complete_all_codex_subagents().await;
 
         {
             let mut state = self.state.lock().await;
+            state.pending_resume_thread_id = None;
             state.thread_id = resumed_thread_id;
             if let Some(model) = resumed_model.clone() {
                 state.effective_model = Some(model);
@@ -12062,7 +12074,9 @@ fn classify_codex_notification_owner(state: &CodexState, params: &Value) -> Code
     let Some(thread_id) = extract_notification_thread_id(params) else {
         return CodexNotificationOwner::Unknown { thread_id: None };
     };
-    if thread_id == state.thread_id {
+    if thread_id == state.thread_id
+        || state.pending_resume_thread_id.as_deref() == Some(thread_id.as_str())
+    {
         return CodexNotificationOwner::Parent { thread_id };
     }
     if state.subagent_streams.contains_key(&thread_id) {
@@ -22023,6 +22037,7 @@ for line in sys.stdin:
     fn test_codex_state() -> CodexState {
         CodexState {
             thread_id: "thread-test".to_string(),
+            pending_resume_thread_id: None,
             effective_model: Some("codex".to_string()),
             model_override: None,
             reasoning_effort_override: Some("xhigh".to_string()),
