@@ -1354,9 +1354,16 @@ where
                     }
                     Err(error) => {
                         settle_connected_teardown(local_host_id, in_flight.take(), rx);
-                        return ConnectedOutcome::Disconnected(ConnectErr::Io(
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                        ));
+                        // A transport failure (e.g. the planned renewal-deadline
+                        // teardown) reaches here as `FrameError::Io`; keep the
+                        // original io error so retryability and credential
+                        // classification can still see the typed error inside.
+                        // Genuine framing corruption keeps `InvalidData`.
+                        let io_error = match error {
+                            protocol::FrameError::Io(io_error) => io_error,
+                            other => std::io::Error::new(std::io::ErrorKind::InvalidData, other),
+                        };
+                        return ConnectedOutcome::Disconnected(ConnectErr::Io(io_error));
                     }
                 }
             }
@@ -1502,19 +1509,41 @@ fn io_error_is_retryable(error: &std::io::Error) -> bool {
     )
 }
 
-fn transport_error_from_io(error: &std::io::Error) -> Option<&MqttTransportError> {
-    error
+/// Typed transport errors can sit several layers deep: the byte stream fails
+/// with `io::Error(MqttTransportError)`, the frame reader wraps that in
+/// `FrameError::Io`, and callers may wrap once more. A single-level
+/// `get_ref()` downcast misses those, which misclassified the planned
+/// renewal-deadline teardown as fatal — so walk the whole source chain.
+fn error_source_from_io<T: std::error::Error + 'static>(error: &std::io::Error) -> Option<&T> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error
         .get_ref()
-        .and_then(|source| source.downcast_ref::<MqttTransportError>())
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(typed) = current.downcast_ref::<T>() {
+            return Some(typed);
+        }
+        // `io::Error::source()` skips the payload it carries (it returns the
+        // payload's own source), so descend through nested io errors via
+        // `get_ref` to keep each payload visible to the downcast above.
+        source = match current.downcast_ref::<std::io::Error>() {
+            Some(nested_io) => nested_io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
+    }
+    None
+}
+
+fn transport_error_from_io(error: &std::io::Error) -> Option<&MqttTransportError> {
+    error_source_from_io::<MqttTransportError>(error)
 }
 
 /// Outbound write failures cross the io boundary as [`mqtt_transport::WriteAckError`]
 /// (the typed transport error itself is not cloneable across every ack); both
 /// carriers preserve retryability and credential classification.
 fn write_ack_error_from_io(error: &std::io::Error) -> Option<&mqtt_transport::WriteAckError> {
-    error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<mqtt_transport::WriteAckError>())
+    error_source_from_io::<mqtt_transport::WriteAckError>(error)
 }
 
 /// True when the failure means the broker rejected this connection's grant
@@ -1815,6 +1844,46 @@ mod tests {
         );
         assert!(manager.inner.borrow().active.contains_key(&host));
         drop(rx);
+    }
+
+    #[test]
+    fn renewal_deadline_read_failure_is_retryable_and_invalidates_credentials() {
+        // Mirror of the live failure chain: the byte stream fails with
+        // io::Error(ManagedSessionExpired), the frame reader wraps it in
+        // FrameError::Io, and the read arm forwards the inner io error.
+        let stream_error = std::io::Error::other(MqttTransportError::ManagedSessionExpired);
+        let error = ConnectErr::Io(stream_error);
+        assert!(
+            error.is_retryable(),
+            "the planned renewal teardown must reconnect, not fail the actor"
+        );
+        assert!(
+            connect_error_invalidates_credentials(&error),
+            "the expired grant must be dropped so the retry mints a fresh one"
+        );
+    }
+
+    #[test]
+    fn typed_transport_errors_survive_extra_io_wrapping() {
+        // Even when double-wrapped (io::Error → FrameError::Io → io::Error,
+        // the shape that previously reached classification), the typed
+        // transport error must be found by walking the source chain.
+        let stream_error = std::io::Error::other(MqttTransportError::ManagedSessionExpired);
+        let frame_error = protocol::FrameError::from(stream_error);
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, frame_error);
+        let error = ConnectErr::Io(wrapped);
+        assert!(error.is_retryable());
+        assert!(connect_error_invalidates_credentials(&error));
+    }
+
+    #[test]
+    fn framing_corruption_stays_a_visible_non_retryable_failure() {
+        let frame_error =
+            protocol::FrameError::Protocol("invalid TYD2 record magic 0x00000000".to_owned());
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, frame_error);
+        let error = ConnectErr::Io(wrapped);
+        assert!(!error.is_retryable());
+        assert!(!connect_error_invalidates_credentials(&error));
     }
 
     #[test]
