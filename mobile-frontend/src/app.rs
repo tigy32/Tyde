@@ -1341,6 +1341,101 @@ mod wasm_tests {
         container.remove();
     }
 
+    /// Inject the production stylesheet once per test session so geometry
+    /// assertions reflect real styling.
+    const PROD_STYLES: &str = include_str!("../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document
+            .get_element_by_id("test-prod-styles-mobile")
+            .is_none()
+        {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-mobile");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
+
+    /// **The bottom nav must sit flush with the visible bottom edge.**
+    ///
+    /// The shell used to be sized with `100dvh`, which disagrees with the
+    /// region the `overflow: hidden` body actually clips to whenever iOS
+    /// browser chrome or the software keyboard is in flux: the nav — the
+    /// shell's bottom flex child — floated mid-screen above a band of dead
+    /// background (dvh short), or was clipped off-screen (dvh long). The
+    /// user-visible contract: the shell ends exactly at its host container's
+    /// bottom edge, and the nav ends exactly at the shell's bottom edge.
+    ///
+    /// The container is deliberately shorter than the headless viewport so a
+    /// viewport-unit-sized shell cannot coincidentally line up with the
+    /// container bottom: only percentage sizing makes this pass.
+    #[wasm_bindgen_test]
+    async fn bottom_nav_sits_flush_with_the_visible_bottom_edge() {
+        ensure_styles_loaded();
+        let container = make_container();
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; top: 0; left: 0; width: 390px; height: 400px;",
+            )
+            .unwrap();
+        let host = fixture_host("layout-host", "Layout host");
+        let host_id = host.local_host_id.clone();
+        let state = AppState::new();
+        state.paired_hosts.set(vec![host]);
+        state.active_local_host_id.set(Some(host_id.clone()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host_id.clone(), ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|settings| {
+            settings.insert(host_id, empty_host_settings());
+        });
+        state.app_mode.set(AppMode::Workspace);
+        let state_for_mount = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <AppSurface /> }
+        });
+        next_tick().await;
+
+        let shell = container
+            .query_selector(".mobile-app")
+            .unwrap()
+            .expect("workspace mode renders the app shell");
+        let nav = container
+            .query_selector("[data-mobile-test='bottom-nav']")
+            .unwrap()
+            .expect("workspace mode outside a chat shows the bottom nav");
+
+        let container_rect = container.get_bounding_client_rect();
+        let shell_rect = shell.get_bounding_client_rect();
+        let nav_rect = nav.get_bounding_client_rect();
+
+        assert!(
+            nav_rect.height() > 0.0,
+            "bottom nav must have a visible layout box"
+        );
+        assert!(
+            (shell_rect.bottom() - container_rect.bottom()).abs() < 0.6,
+            "app shell must end at the visible bottom edge, not above or below \
+             it (shell bottom {}, visible bottom {})",
+            shell_rect.bottom(),
+            container_rect.bottom()
+        );
+        assert!(
+            (nav_rect.bottom() - shell_rect.bottom()).abs() < 0.6,
+            "bottom nav must sit flush with the shell bottom with no dead \
+             band below it (nav bottom {}, shell bottom {})",
+            nav_rect.bottom(),
+            shell_rect.bottom()
+        );
+
+        drop(mount);
+        container.remove();
+    }
+
     /// **The real disconnect lifecycle must leave the user somewhere they can act.**
     ///
     /// `apply_disconnect` used to clear `active_agent` and `viewing_chat`, which
