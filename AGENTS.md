@@ -114,26 +114,32 @@ For clippy: **fix the underlying issue**. Do not paper over violations with
 just to silence the lint. If a suppression is genuinely warranted, justify
 it in a comment and ideally raise it with the user first.
 
-### 3. Live real-money backend tests are special
+### 3. Backend conformance
 
-`backend.rs` tests exercise real AI agents (real API calls, real money).
+Backend correctness is established only by the real-backend conformance suite.
+Missing credentials, binaries, readiness, or compatibility are failures, not
+skips.
 
-- Live backend tests are not ordinary repository validation and are not part of
-  `./dev.sh check`.
-- **Do not** run live backend tests unless the user explicitly approves API
-  calls that may spend money, even when changing a backend.
-- Real-AI tests are ignored by default and must stay opt-in. Do not set
-  `TYDE_RUN_REAL_AI_TESTS`, `TYDE_LIVE_CODEX_TEST`, or
-  `TYDE_RUN_CLAUDE_INTEGRATION` unless the user explicitly approves running
-  tests that may spend money.
-- To run the real backend integration tests intentionally:
-  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p tests --test backend real_ -- --ignored --nocapture`
-- To run the lower-level live backend tests intentionally:
-  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_codex -- --ignored --nocapture`
-  and
-  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_claude -- --ignored --nocapture`
-- Without explicit approval, rely on `./dev.sh check` and leave the live tests
-  ignored.
+Do not use fake backends, scripted providers, canned RPC responses, or synthetic
+backend events to test backend behavior. Backend mocks are allowed only when
+testing code strictly above the backend boundary and do not count as backend
+coverage.
+
+Every newly discovered backend bug must add a real conformance regression test
+that:
+
+1. Reproduces the bug without the fix.
+2. Passes only when the bug is fixed.
+3. Runs and passes against every supported backend.
+
+Real-backend tests are expensive, so prefer targeted conformance tests while
+iterating. Running them is pre-authorized. Before shipping a backend-provider
+change, the complete conformance suite must pass for each changed backend. If a
+conformance test is added or changed, it must pass against every supported
+backend.
+
+A backend fix is incomplete until its regression test, `./dev.sh check`, and
+the required real-backend conformance runs pass.
 
 ### 4. Local commits only
 
@@ -291,7 +297,7 @@ or release and must be fixed and validated in a workbench.
 `./dev.sh check` is the only local validation entry point. Never invoke
 underlying Cargo, Clippy, nextest, wasm, web, or filtered commands. Review-only
 and read-only work runs no validation. Paid live-backend tests remain separate
-from ordinary validation and require explicit user approval.
+from ordinary validation and follow the backend conformance policy above.
 
 No orchestrator, parent agent, prompt, or stale repository text may waive or
 contradict the mandatory workbench and post-land `main` gates.
