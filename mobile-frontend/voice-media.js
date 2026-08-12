@@ -1,4 +1,15 @@
 (() => {
+  // Resolve companion assets (worker + worklets) against THIS script's URL,
+  // not the page URL: in production the loader page lives at the site root
+  // while the bundle's assets live under the versioned directory, so
+  // page-relative paths 404 there.
+  const SCRIPT_BASE =
+    (document.currentScript && document.currentScript.src) ||
+    (window.location && window.location.href) ||
+    "";
+  const assetUrl = (name) =>
+    SCRIPT_BASE ? new URL(name, SCRIPT_BASE).toString() : name;
+
   let context = null;
   let capture = null;
   let playback = null;
@@ -23,7 +34,7 @@
 
   function installWorker() {
     if (worker) return;
-    worker = new Worker("voice-codec-worker.js");
+    worker = new Worker(assetUrl("voice-codec-worker.js"));
     worker.onmessage = (event) => {
       if (event.data.type === "probe-ready") {
         probeWait?.resolve(true);
@@ -55,8 +66,8 @@
       context ||
       new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
     await context.resume();
-    await context.audioWorklet.addModule("voice-capture-worklet.js");
-    await context.audioWorklet.addModule("voice-playback-worklet.js");
+    await context.audioWorklet.addModule(assetUrl("voice-capture-worklet.js"));
+    await context.audioWorklet.addModule(assetUrl("voice-playback-worklet.js"));
     installWorker();
     probeWait = deferred();
     worker.postMessage({ type: "probe" });

@@ -58,6 +58,8 @@ web-sys = { version = "0.3", features = [
     "AudioWorkletNode",
     "CssStyleDeclaration",
     "DomRect",
+    "HtmlHeadElement",
+    "HtmlScriptElement",
     "Navigator",
     "Node",
     "NodeList",

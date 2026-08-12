@@ -78,6 +78,62 @@ async fn send<T: serde::Serialize>(
     }
 }
 
+/// Load `voice-media.js` (which installs `window.TydeVoiceMedia`) on first
+/// use. The production loader page injects only the bundle's stylesheets and
+/// entry script — the `<script src="voice-media.js">` tag in the bundle's own
+/// index.html never runs there — so the app must load it itself, resolved
+/// against the bundle's versioned asset directory (taken from the injected
+/// stylesheet link, the one asset guaranteed to be in the DOM in every
+/// environment).
+async fn ensure_media_installed() -> Result<(), String> {
+    let window = web_sys::window().ok_or("window unavailable")?;
+    let installed = js_sys::Reflect::get(&window, &JsValue::from_str("TydeVoiceMedia"))
+        .is_ok_and(|value| !value.is_undefined() && !value.is_null());
+    if installed {
+        return Ok(());
+    }
+    let document = window.document().ok_or("document unavailable")?;
+    let stylesheet_href = document
+        .query_selector("link[rel='stylesheet'][href*='styles-']")
+        .ok()
+        .flatten()
+        .and_then(|link| link.get_attribute("href"))
+        .ok_or_else(|| {
+            "cannot locate the bundle stylesheet to resolve voice-media.js".to_owned()
+        })?;
+    let base = &stylesheet_href[..stylesheet_href.rfind('/').map_or(0, |index| index + 1)];
+    let url = format!("{base}voice-media.js");
+
+    let script = document
+        .create_element("script")
+        .map_err(js_error)?
+        .dyn_into::<web_sys::HtmlScriptElement>()
+        .map_err(|_| "script element construction failed".to_owned())?;
+    script.set_src(&url);
+    let loaded = js_sys::Promise::new(&mut |resolve, reject| {
+        script.set_onload(Some(&resolve));
+        script.set_onerror(Some(&reject));
+    });
+    document
+        .head()
+        .ok_or("document head unavailable")?
+        .append_child(&script)
+        .map_err(js_error)?;
+    JsFuture::from(loaded)
+        .await
+        .map_err(|_| format!("voice media script failed to load from {url}"))?;
+
+    let installed_now = js_sys::Reflect::get(&window, &JsValue::from_str("TydeVoiceMedia"))
+        .is_ok_and(|value| !value.is_undefined() && !value.is_null());
+    if installed_now {
+        Ok(())
+    } else {
+        Err(format!(
+            "voice media script loaded from {url} but did not install TydeVoiceMedia"
+        ))
+    }
+}
+
 fn media_call(
     name: &str,
     arg: JsValue,
@@ -140,6 +196,10 @@ fn start(state: AppState) {
         target: target.clone(),
     });
     spawn_local(async move {
+        if let Err(error) = ensure_media_installed().await {
+            state.voice_ui.set(MobileVoiceState::Failed(error));
+            return;
+        }
         if let Err(error) = media_call("prepare", JsValue::NULL).await {
             let _ = media_call("stop", JsValue::NULL).await;
             state.voice_ui.set(MobileVoiceState::Failed(error));
