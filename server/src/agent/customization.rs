@@ -114,29 +114,6 @@ impl ResolvedSkill {
     }
 }
 
-#[cfg(test)]
-impl ResolvedSkill {
-    /// A skill fixture with no store behind it, for tests that exercise
-    /// rendering rather than resolution. An empty `body` yields a path-only
-    /// skill, matching what resolution produces for a discovering backend.
-    pub(crate) fn test_fixture(name: &str, body: &str) -> Self {
-        let source_dir = PathBuf::from("/nonexistent/tyde-test-skills").join(name);
-        Self {
-            id: SkillId(name.to_string()),
-            name: name.to_string(),
-            title: None,
-            description: None,
-            skill_md_path: source_dir.join("SKILL.md"),
-            source_dir,
-            payload: if body.is_empty() {
-                SkillPayload::Path
-            } else {
-                SkillPayload::Inline(body.to_string())
-            },
-        }
-    }
-}
-
 /// Why a session holds the skills it holds.
 ///
 /// Adapters need this to scope what they tell the model: advertising "these
@@ -390,6 +367,7 @@ pub(crate) fn protocol_mcp_servers_to_startup(
         .iter()
         .map(|server| StartupMcpServer {
             name: server.name.clone(),
+            supports_parallel_tool_calls: server.supports_parallel_tool_calls,
             transport: match &server.transport {
                 McpTransportConfig::Http {
                     url,
@@ -442,6 +420,7 @@ fn startup_mcp_server_to_protocol(server: &StartupMcpServer) -> McpServerConfig 
     McpServerConfig {
         id: McpServerId(format!("builtin:{}", server.name)),
         name: server.name.clone(),
+        supports_parallel_tool_calls: server.supports_parallel_tool_calls,
         transport: match &server.transport {
             StartupMcpTransport::Http {
                 url,

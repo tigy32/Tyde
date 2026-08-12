@@ -32,16 +32,15 @@ use crate::backend::claude_skills::{
     unsupported_plugin_dir_notice, verify_init_frame, verify_plugin_inventory,
 };
 use crate::backend::turn_emitter::{
-    AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+    AgentName, AssistantMessagePayload, RetryAttemptPayload, StreamEndPayload,
+    ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
     AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
-    StartupMcpTransport,
+    StartupMcpTransport, normalize_mcp_call_tool_result,
 };
 use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
-#[cfg(test)]
-use crate::sub_agent::SubAgentHandle;
 use crate::subprocess::ImageAttachment;
 
 /// Per-sub-agent stream state, tracking its own summary and segment.
@@ -76,6 +75,9 @@ struct SubAgentStream {
     seen_tool_call_ids: HashSet<String>,
     last_tool_name: Option<String>,
     reported_total_tokens: Option<u64>,
+    execution_failed: bool,
+    pending_terminal: Option<(String, Option<String>)>,
+    pending_parent_progress: VecDeque<ToolProgressData>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -93,6 +95,8 @@ struct PendingSubAgentPrompt {
 }
 
 const CLAUDE_AGENT_NAME: &str = "claude";
+const CLAUDE_FREE_TEXT_SENTINEL: &str = "TYDE_FREE_TEXT";
+const CLAUDE_FREE_TEXT_OTHER: &str = "Other";
 
 const CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
 const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
@@ -106,48 +110,18 @@ const CLAUDE_WAKE_QUIESCE_WAIT: Duration = Duration::from_secs(5);
 // Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a session will hold its output waiting for the CLI to report which
-/// skills it loaded. Matches the handshake timeout in production; shortened in
-/// tests so the silent-CLI regression does not spend half a minute proving the
-/// watchdog fires.
-#[cfg(not(test))]
+/// skills it loaded. Matches the provider-process handshake timeout.
 const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = CLAUDE_INITIALIZE_TIMEOUT;
-#[cfg(test)]
-const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
 /// How much output a session will hold while waiting to learn whether it has
 /// its skills. Generous enough that a normal first response never trips it, and
 /// bounded so a CLI that never reports cannot grow the buffer without limit.
-#[cfg(not(test))]
 const CLAUDE_HELD_BACK_FRAME_LIMIT: usize = 512;
-#[cfg(not(test))]
 const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-#[cfg(test)]
-const CLAUDE_HELD_BACK_FRAME_LIMIT: usize = 8;
-#[cfg(test)]
-const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 64 * 1024;
 
-#[cfg(test)]
-pub(crate) static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-#[cfg(test)]
-static CLAUDE_PROCESS_SPAWN_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<u32>>> =
-    std::sync::Mutex::new(None);
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(18);
 const CLAUDE_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 const TYDE_CLAUDE_BIN_ENV: &str = "TYDE_CLAUDE_BIN";
-
-#[cfg(test)]
-fn observe_claude_process_spawned(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    if let Some(observer) = CLAUDE_PROCESS_SPAWN_OBSERVER
-        .lock()
-        .expect("Claude process spawn observer mutex poisoned")
-        .take()
-    {
-        let _ = observer.send(pid);
-    }
-}
 
 static CLAUDE_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -530,6 +504,7 @@ impl ClaudeSession {
                 session_id: None,
                 fork_from_session_id: mode.fork_from_session_id,
                 start_session_fresh: false,
+                resume_bootstrap_required: true,
                 ephemeral: mode.no_session_persistence,
                 model: None,
                 effort: Some(ClaudeEffort::High),
@@ -558,6 +533,8 @@ impl ClaudeSession {
                 installed_provider_version: None,
                 provider_version: None,
                 process_generation: 0,
+                resume_bootstrap: None,
+                resume_empty_result_generation: None,
                 pending_compaction: None,
                 closing: false,
                 restart_process_after_turn: false,
@@ -571,6 +548,7 @@ impl ClaudeSession {
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
             background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
+            native_subagent_tasks: StdMutex::new(HashSet::new()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
@@ -684,8 +662,6 @@ struct PendingExitPlanModeControl {
     tool_call_id: String,
     tool_name: String,
     input: Value,
-    plan: Option<String>,
-    plan_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,6 +721,7 @@ struct ClaudeState {
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
     start_session_fresh: bool,
+    resume_bootstrap_required: bool,
     ephemeral: bool,
     model: Option<String>,
     effort: Option<ClaudeEffort>,
@@ -776,6 +753,8 @@ struct ClaudeState {
     installed_provider_version: Option<String>,
     provider_version: Option<String>,
     process_generation: u64,
+    resume_bootstrap: Option<ClaudeResumeBootstrap>,
+    resume_empty_result_generation: Option<u64>,
     pending_compaction: Option<PendingClaudeCompaction>,
     /// Set by `shutdown`. Blocks new turns (including CLI-initiated ones) and
     /// process respawn after the backend has been told to close.
@@ -805,6 +784,7 @@ impl Default for ClaudeState {
             session_id: None,
             fork_from_session_id: None,
             start_session_fresh: false,
+            resume_bootstrap_required: true,
             ephemeral: false,
             model: None,
             effort: None,
@@ -830,6 +810,8 @@ impl Default for ClaudeState {
             installed_provider_version: None,
             provider_version: None,
             process_generation: 0,
+            resume_bootstrap: None,
+            resume_empty_result_generation: None,
             pending_compaction: None,
             closing: false,
             restart_process_after_turn: false,
@@ -840,6 +822,13 @@ impl Default for ClaudeState {
             authoritative_capacity_emitted: false,
         }
     }
+}
+
+struct ClaudeResumeBootstrap {
+    generation: u64,
+    fork_session: bool,
+    completions: Vec<oneshot::Sender<Result<(), String>>>,
+    quarantined_frames: usize,
 }
 
 struct ClaudeInner {
@@ -853,6 +842,7 @@ struct ClaudeInner {
     turn_event_gate: Mutex<()>,
     task_tracker: StdMutex<ClaudeTaskTracker>,
     background_tasks: StdMutex<BackgroundTaskRegistry>,
+    native_subagent_tasks: StdMutex<HashSet<String>>,
     /// Gates the first prompt on the CLI confirming this session's skills.
     /// A `watch` rather than a one-shot because a respawn re-arms it.
     skill_readiness: watch::Sender<ClaudeSkillReadiness>,
@@ -919,18 +909,56 @@ struct ClaudeProcessRuntime {
 type ClaudeControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 
 impl ClaudeProcessRuntime {
-    fn abort_readers(&self) {
-        self.stdout_task.abort();
+    async fn shutdown(mut self) {
+        if let Err(err) = self.stdin.lock().await.shutdown().await {
+            tracing::warn!("Failed to close Claude stdin for graceful shutdown: {err}");
+        }
+        let mut child = self.child.lock().await;
+        if let Some(process) = child.as_mut() {
+            let graceful = tokio::time::timeout(Duration::from_secs(5), process.wait()).await;
+            eprintln!(
+                "TYDE CLAUDE CLEANUP process_group_final_kill graceful_wait={:?}",
+                graceful
+                    .as_ref()
+                    .map(|result| result.as_ref().map(|status| status.code()))
+            );
+            // `claude` may exit after closing stdin while a provider-owned
+            // background command remains in its process group. Always signal
+            // the group after the graceful wait so no descendant survives a
+            // session shutdown, including a task_started frame that raced the
+            // stop_task snapshot.
+            let _ = process.kill().await;
+        }
+        *child = None;
+        drop(child);
+        if tokio::time::timeout(Duration::from_secs(2), &mut self.stdout_task)
+            .await
+            .is_err()
+        {
+            self.stdout_task.abort();
+        }
         self.stderr_task.abort();
     }
 
-    async fn kill(self) {
-        self.abort_readers();
+    async fn kill(mut self) {
         let mut child = self.child.lock().await;
         if let Some(child) = child.as_mut() {
             let _ = child.kill().await;
         }
         *child = None;
+        drop(child);
+        if tokio::time::timeout(Duration::from_secs(2), &mut self.stdout_task)
+            .await
+            .is_err()
+        {
+            self.stdout_task.abort();
+        }
+        self.stderr_task.abort();
+    }
+
+    fn abort_readers(&self) {
+        self.stdout_task.abort();
+        self.stderr_task.abort();
     }
 }
 
@@ -1103,6 +1131,16 @@ struct ClaudeSystemFrame {
     /// rest of the frame.
     #[serde(default)]
     workflow_progress: Option<Vec<Value>>,
+    #[serde(default)]
+    attempt: Option<u64>,
+    #[serde(default)]
+    max_retries: Option<u64>,
+    #[serde(default)]
+    retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1461,6 +1499,30 @@ enum ClaudeHistoryReplayItem {
     Compaction(BackendObservedCompaction),
 }
 
+fn claude_replay_requires_resume_bootstrap(items: &[ClaudeHistoryReplayItem]) -> bool {
+    let Some(ClaudeHistoryReplayItem::Message(message)) = items
+        .iter()
+        .rev()
+        .find(|item| matches!(item, ClaudeHistoryReplayItem::Message(_)))
+    else {
+        return true;
+    };
+    let provider_quiescent_after_interrupt = message
+        .get("sender")
+        .and_then(Value::as_str)
+        .is_some_and(|sender| sender.eq_ignore_ascii_case("user"))
+        && message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| {
+                matches!(
+                    content.trim(),
+                    "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+                )
+            });
+    !provider_quiescent_after_interrupt
+}
+
 struct ClaudeSessionReplay {
     items: Vec<ClaudeHistoryReplayItem>,
     cumulative_usage: Option<Value>,
@@ -1526,24 +1588,6 @@ impl TurnOutcome {
     }
 }
 
-#[cfg(test)]
-struct RunTurnParams<'a> {
-    message_id: &'a str,
-    workspace_root: &'a str,
-    ssh_host: Option<&'a str>,
-    prompt: &'a str,
-    images: &'a [ImageAttachment],
-    session_id: Option<String>,
-    ephemeral: bool,
-    model: Option<String>,
-    effort: Option<ClaudeEffort>,
-    permission_mode: Option<String>,
-    startup_mcp_config_json: Option<String>,
-    steering_content: Option<String>,
-    agent_identity: Option<AgentIdentity>,
-    tool_policy: ToolPolicy,
-}
-
 enum TurnStartError {
     Cancelled,
     Failed(String),
@@ -1584,29 +1628,6 @@ struct ExitPlanModeControlRequest {
     tool_call_id: String,
     tool_name: String,
     input: Value,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct AskAnswerRaceHook {
-    after_write: Arc<tokio::sync::Notify>,
-    resume: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(test)]
-static ASK_ANSWER_RACE_HOOK: std::sync::Mutex<Option<AskAnswerRaceHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-async fn pause_after_ask_answer_control_response_write_for_test() {
-    let hook = ASK_ANSWER_RACE_HOOK
-        .lock()
-        .expect("AskUserQuestion answer race hook mutex poisoned")
-        .clone();
-    if let Some(hook) = hook {
-        hook.after_write.notify_one();
-        hook.resume.notified().await;
-    }
 }
 
 /// Identity a skill failure was decided against.
@@ -1745,12 +1766,6 @@ impl ClaudeInner {
             return Ok(ClaudeSendAdmission::Handled);
         }
 
-        if this
-            .answer_pending_ask_user_question(message.clone(), images.clone())
-            .await?
-        {
-            return Ok(ClaudeSendAdmission::Handled);
-        }
         Ok(this.start_turn(message, images).await)
     }
 
@@ -2020,100 +2035,6 @@ impl ClaudeInner {
         notify_turn_quiesced(waiters);
     }
 
-    #[cfg(test)]
-    async fn run_turn(
-        self: &Arc<Self>,
-        params: RunTurnParams<'_>,
-        _cancel_rx: oneshot::Receiver<()>,
-    ) -> TurnOutcome {
-        let RunTurnParams {
-            message_id,
-            workspace_root,
-            ssh_host,
-            prompt,
-            images,
-            session_id,
-            ephemeral,
-            model,
-            effort,
-            permission_mode,
-            startup_mcp_config_json,
-            steering_content,
-            agent_identity,
-            tool_policy,
-        } = params;
-
-        let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock().await;
-            state.workspace_root = workspace_root.to_string();
-            state.ssh_host = ssh_host.map(str::to_string);
-            state.session_id = session_id;
-            state.start_session_fresh = false;
-            state.ephemeral = ephemeral;
-            state.model = model.clone();
-            state.effort = effort;
-            state.permission_mode = permission_mode;
-            state.startup_mcp_config_json = startup_mcp_config_json;
-            state.steering_content = steering_content;
-            state.agent_identity = agent_identity;
-            state.tool_policy = tool_policy;
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            state.conversation_bytes_total = state
-                .conversation_bytes_total
-                .saturating_add(estimate_turn_input_bytes(prompt, images));
-        }
-
-        match self
-            .write_turn_to_persistent_process(turn_id, prompt, images)
-            .await
-        {
-            Ok(()) => {}
-            Err(TurnStartError::Cancelled) => {
-                self.complete_active_turn_with_outcome(
-                    turn_id,
-                    TurnOutcome::Cancelled {
-                        summary: ClaudeStdoutSummary::default(),
-                    },
-                )
-                .await;
-            }
-            Err(TurnStartError::Failed(error)) => {
-                self.complete_active_turn_with_outcome(
-                    turn_id,
-                    TurnOutcome::Failed {
-                        summary: ClaudeStdoutSummary::default(),
-                        error,
-                    },
-                )
-                .await;
-            }
-        }
-
-        let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-            summary: ClaudeStdoutSummary::default(),
-            error: "Claude turn ended before returning a result".to_string(),
-        });
-        if !ephemeral && let Some(session_id) = outcome.summary().session_id.clone() {
-            self.set_session_id(session_id.clone()).await;
-            self.emitter.session_started(&session_id);
-        }
-        let waiters = self.clear_active_turn(turn_id).await;
-        notify_turn_quiesced(waiters);
-        self.shutdown_process().await;
-        let _ = message_id;
-        outcome
-    }
-
     async fn finalize_turn(
         self: &Arc<Self>,
         turn_id: u64,
@@ -2219,7 +2140,7 @@ impl ClaudeInner {
         }
 
         let quiesced_waiters = self.clear_active_turn(turn_id).await;
-        self.emit_idle_if_quiescent();
+        self.emit_typing_status(false);
         notify_turn_quiesced(quiesced_waiters);
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
@@ -2353,6 +2274,11 @@ impl ClaudeInner {
     }
 
     async fn observe_compaction_frame(&self, turn_id: u64, value: &Value) {
+        tracing::warn!(
+            turn_id,
+            frame = %value,
+            "Claude compaction diagnostic frame"
+        );
         if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
             let current_session_id = self.state.lock().await.session_id.clone();
             if current_session_id
@@ -2518,7 +2444,7 @@ impl ClaudeInner {
         forced_failure: Option<String>,
         dispatch_uncertain: bool,
     ) -> Option<BackendCompactionResult> {
-        let (result, terminal_tx, timeout_cancel_tx, waiters) = {
+        let (result, observation, terminal_tx, timeout_cancel_tx, waiters) = {
             let mut state = self.state.lock().await;
             let active_matches = state.active_turn.as_ref().is_some_and(|active| {
                 active.id == turn_id && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
@@ -2565,6 +2491,17 @@ impl ClaudeInner {
                         "Claude returned a result without a manual compact boundary".to_string()
                     })
                 });
+            tracing::warn!(
+                turn_id,
+                terminal_result_seen = pending.terminal_result_seen,
+                result_is_error = pending.result_is_error,
+                compact_result = ?pending.compact_result,
+                compact_error = ?pending.compact_error,
+                diagnostic = ?pending.diagnostic,
+                boundary = ?pending.boundary.as_ref().map(|boundary| &boundary.uuid),
+                semantic_failure = ?semantic_failure,
+                "Claude compaction terminal diagnostic"
+            );
             let dispatch = if dispatch_uncertain {
                 BackendCompactionDispatchState::MayHaveReachedProvider
             } else {
@@ -2621,6 +2558,29 @@ impl ClaudeInner {
                     terminal_result_seen: pending.terminal_result_seen,
                 },
             };
+            let observation = boundary.and_then(|boundary| {
+                let session_id = state.session_id.clone()?;
+                Some(BackendObservedCompaction {
+                    observation_id: super::compaction::stable_observation_id(
+                        "claude",
+                        &session_id,
+                        &boundary.uuid,
+                    ),
+                    trigger: CompactionTrigger::BackendObservedManual,
+                    method: CompactionMethod::NativeTextCommand,
+                    provider_session_id: Some(SessionId(session_id)),
+                    metrics: boundary.metrics.clone(),
+                    source: BackendCompactionObservationSource::ClaudeBoundary {
+                        boundary_uuid: boundary.uuid.clone(),
+                    },
+                    user_focus: pending.request.focus.clone().map(|text| {
+                        BackendCompactionUserFocus {
+                            text,
+                            provenance: BackendCompactionUserFocusProvenance::TydeRequest,
+                        }
+                    }),
+                })
+            });
             let terminal_tx = pending.terminal_tx.take();
             let timeout_cancel_tx = pending.timeout_cancel_tx.take();
             let waiters = state
@@ -2628,10 +2588,14 @@ impl ClaudeInner {
                 .take()
                 .map(|active| active.quiesced_waiters)
                 .unwrap_or_default();
-            (result, terminal_tx, timeout_cancel_tx, waiters)
+            (result, observation, terminal_tx, timeout_cancel_tx, waiters)
         };
         if let Some(timeout_cancel_tx) = timeout_cancel_tx {
             let _ = timeout_cancel_tx.send(());
+        }
+        if let Some(observation) = observation {
+            self.emitter
+                .compaction_event(&BackendCompactionEvent::Observed(Box::new(observation)));
         }
         if let Some(terminal_tx) = terminal_tx {
             let _ = terminal_tx.send(result.clone());
@@ -2667,14 +2631,62 @@ impl ClaudeInner {
         }
 
         let input_message = build_stream_json_user_message(prompt, images);
-        let written = self
-            .write_process_json_line(&input_message)
-            .await
-            .map_err(TurnStartError::Failed);
-        if written.is_ok() {
-            self.watch_for_skill_verification().await;
+        let stdin = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .as_ref()
+                .map(|runtime| Arc::clone(&runtime.stdin))
+                .ok_or_else(|| {
+                    TurnStartError::Failed("Claude CLI process is not running".to_string())
+                })?
+        };
+        let (resume_bootstrap_generation, resume_bootstrap_rx, written) = {
+            // Keep the bootstrap state locked through the stdin write so the
+            // resume terminal cannot race past waiter registration.
+            let mut state = self.state.lock().await;
+            let (generation, receiver) = if let Some(bootstrap) = state.resume_bootstrap.as_mut() {
+                let (completion, receiver) = oneshot::channel();
+                bootstrap.completions.push(completion);
+                (Some(bootstrap.generation), Some(receiver))
+            } else {
+                (None, None)
+            };
+            let written = write_json_line_to_stdin(&stdin, &input_message).await;
+            if written.is_ok() {
+                state.resume_bootstrap_required = true;
+            }
+            (generation, receiver, written)
+        };
+        if let Err(error) = written {
+            if let Some(generation) = resume_bootstrap_generation {
+                self.fail_resume_bootstrap(generation, &error).await;
+            }
+            return Err(TurnStartError::Failed(error));
         }
-        written
+        if let (Some(generation), Some(receiver)) =
+            (resume_bootstrap_generation, resume_bootstrap_rx)
+        {
+            let inner = Arc::clone(self);
+            tokio::spawn(async move {
+                match tokio::time::timeout(CLAUDE_INITIALIZE_TIMEOUT, receiver).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(error))) => {
+                        tracing::warn!(generation, error, "Claude resume bootstrap failed");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(generation, "Claude resume bootstrap waiter closed");
+                    }
+                    Err(_) => {
+                        let error = format!(
+                            "Timed out waiting for Claude resume bootstrap generation {generation} to reach its next turn boundary"
+                        );
+                        inner.fail_resume_bootstrap(generation, &error).await;
+                    }
+                }
+            });
+        }
+        self.watch_for_skill_verification().await;
+        Ok(())
     }
 
     async fn begin_ask_user_question_control_request(
@@ -2687,6 +2699,9 @@ impl ClaudeInner {
                 .active_turn
                 .as_mut()
                 .ok_or_else(|| "Claude asked a question with no active turn".to_string())?;
+            if active.interrupt_requested {
+                return Err("Claude asked a question after the turn was interrupted".to_string());
+            }
             if active.pending_ask_user_question.is_some() {
                 return Err(
                     "Claude asked a second question before the first was answered".to_string(),
@@ -2700,7 +2715,7 @@ impl ClaudeInner {
             });
         }
 
-        self.emit_idle_if_quiescent();
+        self.emit_typing_status(false);
         Ok(())
     }
 
@@ -2708,13 +2723,17 @@ impl ClaudeInner {
         &self,
         request: ExitPlanModeControlRequest,
     ) -> Result<(), String> {
-        let plan_info = exit_plan_mode_plan_info_from_arguments(&request.input);
         {
             let mut state = self.state.lock().await;
             let active = state
                 .active_turn
                 .as_mut()
                 .ok_or_else(|| "Claude requested plan approval with no active turn".to_string())?;
+            if active.interrupt_requested {
+                return Err(
+                    "Claude requested plan approval after the turn was interrupted".to_string(),
+                );
+            }
             if active.pending_ask_user_question.is_some() || active.pending_exit_plan_mode.is_some()
             {
                 return Err(
@@ -2727,12 +2746,10 @@ impl ClaudeInner {
                 tool_call_id: request.tool_call_id,
                 tool_name: request.tool_name,
                 input: request.input,
-                plan: plan_info.plan,
-                plan_path: plan_info.plan_path,
             });
         }
 
-        self.emit_idle_if_quiescent();
+        self.emit_typing_status(false);
         Ok(())
     }
 
@@ -2742,6 +2759,13 @@ impl ClaudeInner {
         message: String,
     ) -> Result<bool, String> {
         match tool_response {
+            SendMessageToolResponse::AskUserQuestion {
+                tool_call_id,
+                answer,
+            } => {
+                self.answer_pending_ask_user_question(tool_call_id, answer)
+                    .await
+            }
             SendMessageToolResponse::ExitPlanMode {
                 tool_call_id,
                 decision,
@@ -2755,8 +2779,8 @@ impl ClaudeInner {
 
     async fn answer_pending_ask_user_question(
         &self,
+        tool_call_id: String,
         message: String,
-        images: Option<Vec<ImageAttachment>>,
     ) -> Result<bool, String> {
         let _turn_event_guard = self.turn_event_gate.lock().await;
         let (turn_id, pending) = {
@@ -2764,57 +2788,46 @@ impl ClaudeInner {
             let Some(active) = state.active_turn.as_ref() else {
                 return Ok(false);
             };
+            if active.interrupt_requested {
+                return Ok(false);
+            }
             (active.id, active.pending_ask_user_question.clone())
         };
         let Some(pending) = pending else {
             return Ok(false);
         };
+        if pending.tool_call_id != tool_call_id {
+            self.emit_error(&format!(
+                "AskUserQuestion response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {}.",
+                pending.tool_call_id
+            ));
+            return Ok(true);
+        }
 
         let updated_input = ask_user_question_input_with_answer(&pending.input, &message);
         let payload =
             ask_user_question_control_response_payload(&pending.request_id, updated_input.clone());
         if let Err(err) = self.write_process_json_line(&payload).await {
-            self.fail_pending_ask_user_question(
-                turn_id,
-                &format!("Failed to send AskUserQuestion answer to Claude: {err}"),
-            )
-            .await;
-            self.complete_active_turn_with_outcome(
-                turn_id,
-                TurnOutcome::Failed {
+            let error = format!("Failed to send AskUserQuestion answer to Claude: {err}");
+            self.fail_pending_ask_user_question(turn_id, &error).await;
+            let outcome_tx = self.take_active_turn_outcome_sender(turn_id).await;
+            self.retire_process_for_replacement().await;
+            if let Some(outcome_tx) = outcome_tx {
+                let _ = outcome_tx.send(TurnOutcome::Failed {
                     summary: ClaudeStdoutSummary::default(),
-                    error: format!("Failed to send AskUserQuestion answer to Claude: {err}"),
-                },
-            )
-            .await;
-            self.shutdown_process().await;
-            return Ok(true);
+                    error: error.clone(),
+                });
+            }
+            return Err(error);
         }
 
-        #[cfg(test)]
-        pause_after_ask_answer_control_response_write_for_test().await;
-
-        let Some(pending) = self
+        let Some(_) = self
             .take_pending_ask_user_question(turn_id, &pending.request_id)
             .await
         else {
             return Ok(true);
         };
 
-        self.emit_user_message_added(&message, images.as_deref());
-        self.emit_tool_execution_completed(
-            &pending.tool_call_id,
-            &pending.tool_name,
-            true,
-            json!({
-                "kind": "Other",
-                "result": {
-                    "answer": message,
-                    "updated_input": updated_input.clone(),
-                },
-            }),
-            None,
-        );
         self.emit_typing_status(true);
         Ok(true)
     }
@@ -2832,6 +2845,9 @@ impl ClaudeInner {
             let Some(active) = state.active_turn.as_ref() else {
                 return Ok(false);
             };
+            if active.interrupt_requested {
+                return Ok(false);
+            }
             (active.id, active.pending_exit_plan_mode.clone())
         };
         let Some(pending) = pending else {
@@ -2870,48 +2886,18 @@ impl ClaudeInner {
             )
             .await;
             self.shutdown_process().await;
-            return Ok(true);
+            return Err(format!(
+                "Failed to send ExitPlanMode response to Claude: {err}"
+            ));
         }
 
-        let Some(pending) = self
+        let Some(_) = self
             .take_pending_exit_plan_mode(turn_id, &pending.request_id)
             .await
         else {
             return Ok(true);
         };
 
-        let decision_label = match decision {
-            ExitPlanModeDecision::Approve => "approved",
-            ExitPlanModeDecision::Reject => "rejected",
-        };
-        let mut result = serde_json::Map::new();
-        result.insert(
-            "decision".to_string(),
-            Value::String(decision_label.to_string()),
-        );
-        if decision == ExitPlanModeDecision::Reject {
-            result.insert(
-                "feedback".to_string(),
-                Value::String(normalized_feedback.clone()),
-            );
-        }
-        if let Some(plan) = pending.plan {
-            result.insert("plan".to_string(), Value::String(plan));
-        }
-        if let Some(plan_path) = pending.plan_path {
-            result.insert("plan_path".to_string(), Value::String(plan_path));
-        }
-
-        self.emit_tool_execution_completed(
-            &pending.tool_call_id,
-            &pending.tool_name,
-            true,
-            json!({
-                "kind": "Other",
-                "result": Value::Object(result),
-            }),
-            None,
-        );
         self.emit_typing_status(true);
         Ok(true)
     }
@@ -3019,7 +3005,7 @@ impl ClaudeInner {
             return Ok(());
         }
 
-        let config = {
+        let (config, process_generation) = {
             let mut state = self.state.lock().await;
             // A turn reserved just before shutdown must not respawn the CLI
             // process after `shutdown_process` has killed it.
@@ -3027,6 +3013,7 @@ impl ClaudeInner {
                 return Err("Claude backend is shutting down".to_string());
             }
             state.process_generation = state.process_generation.saturating_add(1);
+            let process_generation = state.process_generation;
             state.compact_command_advertised = None;
             state.provider_version = state.installed_provider_version.clone();
             state.compaction_capability = BackendCompactionCapability::unknown(
@@ -3034,7 +3021,7 @@ impl ClaudeInner {
                 None,
                 BackendCompactionCapabilityEvidence::None,
             );
-            ClaudeProcessSpawnConfig {
+            let config = ClaudeProcessSpawnConfig {
                 workspace_root: state.workspace_root.clone(),
                 ssh_host: state.ssh_host.clone(),
                 session_id: if state.ephemeral {
@@ -3063,18 +3050,51 @@ impl ClaudeInner {
                     .skill_plugin
                     .as_ref()
                     .map(|plugin| plugin.root().to_string_lossy().into_owned()),
+            };
+            let requires_resume_bootstrap = config.fork_from_session_id.is_some()
+                || (config.resume_existing_session
+                    && config.session_id.is_some()
+                    && state.resume_bootstrap_required);
+            if requires_resume_bootstrap {
+                state.resume_bootstrap = Some(ClaudeResumeBootstrap {
+                    generation: process_generation,
+                    fork_session: config.fork_from_session_id.is_some(),
+                    completions: Vec::new(),
+                    quarantined_frames: 0,
+                });
+                tracing::info!(
+                    process_generation,
+                    fork = config.fork_from_session_id.is_some(),
+                    "quarantining Claude CLI resume bootstrap until its terminal result"
+                );
+            } else {
+                state.resume_bootstrap = None;
             }
+            (config, process_generation)
         };
 
         // Re-armed per process: each process emits its own `init` frame, and a
         // respawn must be checked against its own rather than inheriting the
         // previous one's verdict.
         self.reset_skill_readiness().await;
-        let runtime = self.spawn_process(config).await?;
-        #[cfg(test)]
-        let spawned_pid = {
-            let mut child = runtime.child.lock().await;
-            child.as_mut().and_then(|child| child.inner().id())
+        let startup_mcp_names = config
+            .startup_mcp_config_json
+            .as_deref()
+            .and_then(|config| serde_json::from_str::<Value>(config).ok())
+            .and_then(|config| config.get("mcpServers").and_then(Value::as_object).cloned())
+            .map(|servers| {
+                servers
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let runtime = match self.spawn_process(config, process_generation).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.fail_resume_bootstrap(process_generation, &error).await;
+                return Err(error);
+            }
         };
         {
             let mut runtime_slot = self.runtime.lock().await;
@@ -3085,9 +3105,6 @@ impl ClaudeInner {
             }
             *runtime_slot = Some(runtime);
         }
-        #[cfg(test)]
-        observe_claude_process_spawned(spawned_pid);
-
         match tokio::time::timeout(
             CLAUDE_INITIALIZE_TIMEOUT,
             self.send_control_request_with_timeout("initialize", CLAUDE_INITIALIZE_TIMEOUT),
@@ -3097,15 +3114,154 @@ impl ClaudeInner {
             Ok(Ok(response)) => {
                 self.configure_capacity_from_initialize(&response).await;
                 self.schedule_capacity_refresh().await;
-                Ok(())
+                if !startup_mcp_names.is_empty()
+                    && let Err(error) = self.await_startup_mcp_ready(&startup_mcp_names).await
+                {
+                    self.shutdown_process().await;
+                    return Err(error);
+                }
             }
             Ok(Err(err)) => {
                 self.shutdown_process().await;
-                Err(err)
+                return Err(err);
             }
             Err(_) => {
                 self.shutdown_process().await;
-                Err("Timed out initializing Claude CLI control protocol".to_string())
+                return Err("Timed out initializing Claude CLI control protocol".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn await_startup_mcp_ready(
+        &self,
+        expected_names: &HashSet<String>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + CLAUDE_INITIALIZE_TIMEOUT;
+        loop {
+            let response = self
+                .send_control_request_with_timeout("mcp_status", CLAUDE_INITIALIZE_TIMEOUT)
+                .await?;
+            let servers = response
+                .get("mcpServers")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "Claude MCP status omitted mcpServers".to_owned())?;
+            let configured = servers
+                .iter()
+                .filter(|server| {
+                    server
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| expected_names.contains(name))
+                })
+                .collect::<Vec<_>>();
+            if configured.len() == expected_names.len()
+                && configured.iter().all(|server| {
+                    server
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
+                })
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Timed out waiting for Claude MCP servers to connect: {response}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn quarantine_resume_bootstrap_frame(
+        &self,
+        process_generation: u64,
+        value: &Value,
+    ) -> bool {
+        let terminal = value.get("type").and_then(Value::as_str) == Some("result");
+        let init = value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("init");
+        let completions = {
+            let mut state = self.state.lock().await;
+            let Some(bootstrap) = state.resume_bootstrap.as_mut() else {
+                let startup_result =
+                    state.resume_empty_result_generation == Some(process_generation) && terminal;
+                let ignore_empty = startup_result
+                    && value
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .is_none_or(|result| result.trim().is_empty());
+                if startup_result {
+                    state.resume_empty_result_generation = None;
+                }
+                return ignore_empty;
+            };
+            if bootstrap.generation != process_generation {
+                return false;
+            }
+            bootstrap.quarantined_frames = bootstrap.quarantined_frames.saturating_add(1);
+            if init {
+                let bootstrap = state
+                    .resume_bootstrap
+                    .take()
+                    .expect("matching Claude resume bootstrap disappeared");
+                if bootstrap.fork_session {
+                    state.resume_empty_result_generation = Some(process_generation);
+                }
+                Some((bootstrap.completions, bootstrap.quarantined_frames))
+            } else {
+                None
+            }
+        };
+        if let Some((completions, quarantined_frames)) = completions {
+            tracing::info!(
+                process_generation,
+                quarantined_frames,
+                "Claude CLI resume bootstrap reached the next turn boundary"
+            );
+            for completion in completions {
+                let _ = completion.send(Ok(()));
+            }
+            false
+        } else {
+            tracing::debug!(
+                process_generation,
+                frame_type = value
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                frame_subtype = value
+                    .get("subtype")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                "quarantined Claude CLI resume bootstrap frame"
+            );
+            true
+        }
+    }
+
+    async fn fail_resume_bootstrap(&self, process_generation: u64, error: &str) {
+        let completions = {
+            let mut state = self.state.lock().await;
+            if state
+                .resume_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.generation == process_generation)
+            {
+                state
+                    .resume_bootstrap
+                    .take()
+                    .map(|bootstrap| bootstrap.completions)
+            } else {
+                None
+            }
+        };
+        if let Some(completions) = completions {
+            tracing::warn!(process_generation, error, "Claude resume bootstrap failed");
+            for completion in completions {
+                let _ = completion.send(Err(error.to_string()));
             }
         }
     }
@@ -3244,14 +3400,27 @@ impl ClaudeInner {
     async fn spawn_process(
         self: &Arc<Self>,
         config: ClaudeProcessSpawnConfig,
+        process_generation: u64,
     ) -> Result<ClaudeProcessRuntime, String> {
         let cli_args = build_claude_cli_args(&config);
         let mut child = if let Some(host) = config.ssh_host.as_deref() {
-            crate::remote::spawn_remote_process(
+            let pinned_model = config.model.as_deref().and_then(normalize_nonempty);
+            let model_env = pinned_model.as_deref().map_or_else(Vec::new, |model| {
+                vec![
+                    ("ANTHROPIC_MODEL", model),
+                    ("CLAUDE_CODE_AUTO_MODE_MODEL", model),
+                    ("CLAUDE_CODE_BG_CLASSIFIER_MODEL", model),
+                    ("CLAUDE_CODE_SUBAGENT_MODEL", model),
+                    ("CLAUDE_CONTEXT_COLLAPSE_MODEL", model),
+                    ("CLAUDE_CODE_NO_MODEL_FALLBACK", "1"),
+                ]
+            });
+            crate::remote::spawn_remote_process_with_env(
                 host,
                 "claude",
                 &cli_args,
                 Some(&config.workspace_root),
+                &model_env,
             )
             .await
             .map_err(|err| format!("Failed to start Claude CLI over SSH: {err}"))?
@@ -3262,6 +3431,15 @@ impl ClaudeInner {
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
+            }
+            if let Some(model) = config.model.as_deref().and_then(normalize_nonempty) {
+                cmd.env("ANTHROPIC_MODEL", &model);
+                cmd.env("CLAUDE_CODE_AUTO_MODE_MODEL", &model);
+                cmd.env("CLAUDE_CODE_BG_CLASSIFIER_MODEL", &model);
+                cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", &model);
+                cmd.env("CLAUDE_CONTEXT_COLLAPSE_MODEL", &model);
+                cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
+                eprintln!("TYDE CLAUDE EXPLICIT MODEL PIN model={model}");
             }
             cmd.current_dir(&config.workspace_root)
                 .stdin(std::process::Stdio::piped())
@@ -3296,6 +3474,7 @@ impl ClaudeInner {
             Arc::clone(self),
             Arc::clone(&control_waiters),
             Arc::clone(&stdin),
+            process_generation,
         ));
         let stderr_task = tokio::spawn(read_claude_stderr_persistent(stderr, Arc::clone(self)));
 
@@ -3400,21 +3579,26 @@ impl ClaudeInner {
     }
 
     async fn complete_active_turn_with_outcome(&self, turn_id: u64, outcome: TurnOutcome) -> bool {
-        let tx = {
-            let mut state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_mut() else {
-                return false;
-            };
-            if active.id != turn_id {
-                return false;
-            }
-            active.outcome_tx.take()
-        };
+        let tx = self.take_active_turn_outcome_sender(turn_id).await;
         if let Some(tx) = tx {
             let _ = tx.send(outcome);
             true
         } else {
             false
+        }
+    }
+
+    async fn take_active_turn_outcome_sender(
+        &self,
+        turn_id: u64,
+    ) -> Option<oneshot::Sender<TurnOutcome>> {
+        {
+            let mut state = self.state.lock().await;
+            let active = state.active_turn.as_mut()?;
+            if active.id != turn_id {
+                return None;
+            }
+            active.outcome_tx.take()
         }
     }
 
@@ -3576,15 +3760,6 @@ impl ClaudeInner {
                 self.report_skill_gap(&target, &message, true).await;
             }
         }
-    }
-
-    /// Current verification state. Nothing in production branches on this any
-    /// more — the reader only needs to know whether the hold is over, which
-    /// `skills_awaiting_verification` answers — but tests assert on which of the
-    /// settled states a session reached.
-    #[cfg(test)]
-    fn skill_readiness_state(&self) -> ClaudeSkillReadiness {
-        self.skill_readiness.borrow().clone()
     }
 
     /// Is this session still waiting to learn whether it has its skills?
@@ -3761,11 +3936,81 @@ impl ClaudeInner {
     }
 
     async fn shutdown_process(&self) {
+        let resume_bootstrap_generation = self
+            .state
+            .lock()
+            .await
+            .resume_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.generation);
+        if let Some(process_generation) = resume_bootstrap_generation {
+            self.fail_resume_bootstrap(
+                process_generation,
+                "Claude process shut down before its resume bootstrap reached a terminal result",
+            )
+            .await;
+        }
+        let runtime = self.runtime.lock().await.take();
+        self.drain_background_tasks();
+        if let Some(runtime) = runtime {
+            runtime.kill().await;
+        }
+    }
+
+    async fn shutdown_process_gracefully(&self) {
+        let mut task_ids = self
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned")
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state.status == BackgroundTaskStatus::Running)
+            .map(|(task_id, _)| task_id.clone())
+            .collect::<Vec<_>>();
+        task_ids.extend(
+            self.native_subagent_tasks
+                .lock()
+                .expect("Claude native subagent task mutex poisoned")
+                .iter()
+                .cloned(),
+        );
+        task_ids.sort();
+        task_ids.dedup();
+        eprintln!("TYDE CLAUDE CLEANUP native_and_background_tasks={task_ids:?}");
+        for task_id in task_ids {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let request = json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": { "subtype": "stop_task", "task_id": task_id },
+            });
+            match self
+                .send_control_request_value(request_id, request, CLAUDE_CONTROL_RESPONSE_TIMEOUT)
+                .await
+            {
+                Ok(response) => {
+                    eprintln!("TYDE CLAUDE CLEANUP stop_task task_id={task_id} response={response}")
+                }
+                Err(err) => tracing::warn!(task_id, "Failed to stop Claude background task: {err}"),
+            }
+        }
+        let runtime = self.runtime.lock().await.take();
+        if let Some(runtime) = runtime {
+            runtime.shutdown().await;
+        }
+        self.drain_background_tasks();
+        self.native_subagent_tasks
+            .lock()
+            .expect("Claude native subagent task mutex poisoned")
+            .clear();
+    }
+
+    async fn retire_process_for_replacement(&self) {
         let runtime = self.runtime.lock().await.take();
         self.drain_background_tasks();
         if let Some(runtime) = runtime {
             runtime.abort_readers();
-            runtime.kill().await;
+            tokio::spawn(runtime.kill());
         }
     }
 
@@ -3836,7 +4081,28 @@ impl ClaudeInner {
 
     async fn cancel_active_turn(&self) {
         let (turn_id, quiesced_rx) = {
+            // Serialize the state transition with interactive responses, but
+            // release the event gate before awaiting provider quiescence: the
+            // stdout result that signals quiescence must acquire this gate.
+            let _turn_event_guard = self.turn_event_gate.lock().await;
             let mut state = self.state.lock().await;
+            let foreground_already_quiescent = self
+                .background_work_active
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.outcome_tx.is_none());
+            if foreground_already_quiescent {
+                drop(state);
+                tracing::info!(
+                    "Claude interrupt observed a quiescent foreground turn while background work continues"
+                );
+                self.emit_operation_cancelled(
+                    "Claude foreground turn already ended; background work continues.",
+                );
+                return;
+            }
             let Some(active) = state.active_turn.as_mut() else {
                 let message = if self
                     .background_work_active
@@ -3847,13 +4113,30 @@ impl ClaudeInner {
                     "No Claude foreground turn was running."
                 };
                 drop(state);
+                tracing::info!(
+                    background_work_active = self
+                        .background_work_active
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "Claude interrupt found no foreground turn"
+                );
                 self.emit_operation_cancelled(message);
                 return;
             };
             let (quiesced_tx, quiesced_rx) = oneshot::channel();
             active.quiesced_waiters.push(quiesced_tx);
             active.interrupt_requested = true;
-            (active.id, quiesced_rx)
+            tracing::info!(
+                turn_id = active.id,
+                "Claude interrupt targeted foreground turn"
+            );
+            let target = (active.id, quiesced_rx);
+            drop(state);
+            // Keep terminalizing pending interactions in the same critical
+            // section that marks the turn interrupted, so no answer can be
+            // written to Claude between those two lifecycle transitions.
+            self.emitter
+                .cancel_pending_foreground_tools("Cancelled by user");
+            target
         };
 
         // Only now, with the turn confirmed interrupted, may verification be
@@ -3956,6 +4239,7 @@ impl ClaudeInner {
             Some(existing) if existing == &session_id => {
                 state.fork_from_session_id = None;
                 state.start_session_fresh = false;
+                state.resume_bootstrap_required = true;
             }
             Some(existing) => {
                 let existing = existing.clone();
@@ -3969,6 +4253,7 @@ impl ClaudeInner {
                 state.session_id = Some(session_id);
                 state.fork_from_session_id = None;
                 state.start_session_fresh = false;
+                state.resume_bootstrap_required = true;
             }
         }
     }
@@ -4048,6 +4333,7 @@ impl ClaudeInner {
             }
             Err(err) => return Err(err.to_string()),
         };
+        let resume_bootstrap_required = claude_replay_requires_resume_bootstrap(&replay.items);
         for item in replay.items {
             match item {
                 ClaudeHistoryReplayItem::Message(message) => {
@@ -4077,6 +4363,7 @@ impl ClaudeInner {
         state.cumulative_usage_complete = replay.cumulative_usage_complete;
         state.conversation_bytes_total = replay.conversation_bytes_total;
         state.start_session_fresh = false;
+        state.resume_bootstrap_required = resume_bootstrap_required;
         Ok(())
     }
 
@@ -4153,6 +4440,30 @@ impl ClaudeInner {
             &tool_call.name,
             claude_tool_request_type(&tool_call.name, &tool_call.arguments),
         );
+        if is_subagent_tool_name(&tool_call.name) {
+            let inserted = self
+                .native_subagent_tasks
+                .lock()
+                .expect("Claude native subagent task mutex poisoned")
+                .insert(tool_call.id.clone());
+            eprintln!(
+                "TYDE CLAUDE NATIVE TASK TRACK request={} inserted={inserted}",
+                tool_call.id
+            );
+        }
+        if is_subagent_tool_name(&tool_call.name)
+            && tool_call
+                .arguments
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && !self.emitter.detach_tool(&tool_call.id)
+        {
+            tracing::warn!(
+                tool_call_id = tool_call.id,
+                "background Agent request could not detach from foreground turn"
+            );
+        }
         self.adopt_background_task_awaiting_tool_request(&tool_call.id);
     }
 
@@ -4174,13 +4485,15 @@ impl ClaudeInner {
             .background_tasks
             .lock()
             .expect("Claude background task mutex poisoned");
-        let Some(entry) = registry
-            .entries
-            .values_mut()
-            .find(|entry| entry.tool_use_id == tool_call_id)
-        else {
+        let Some(task_id) = registry.entries.iter().find_map(|(task_id, entry)| {
+            (entry.tool_use_id == tool_call_id).then(|| task_id.clone())
+        }) else {
             return;
         };
+        let entry = registry
+            .entries
+            .get_mut(&task_id)
+            .expect("background task disappeared while registry was locked");
         if entry.owner.is_some() && entry.tool_name.is_some() {
             return;
         }
@@ -4204,7 +4517,19 @@ impl ClaudeInner {
                 tool_use_id = tool_call_id,
                 "adopted background task on its late tool request"
             );
-            emit_background_task_snapshot(&owner, entry);
+            if !entry.terminal_progress_emitted {
+                emit_background_task_snapshot(&owner, entry);
+                if entry.state.status != BackgroundTaskStatus::Running {
+                    entry.terminal_progress_emitted = true;
+                }
+            }
+            if entry.state.status != BackgroundTaskStatus::Running && !entry.completion_emitted {
+                emit_background_task_completion(&owner, entry);
+                entry.completion_emitted = true;
+            }
+        }
+        if entry.terminal_progress_emitted && entry.completion_emitted {
+            registry.entries.remove(&task_id);
         }
     }
 
@@ -4237,17 +4562,29 @@ impl ClaudeInner {
             success,
             error: error.as_deref(),
         };
-        self.emitter.tool_completed(completed);
+        let pending_before_completion = self.emitter.has_pending_tool_request(tool_call_id);
+        let emitted_message_id = self.emitter.tool_completed(completed);
+        tracing::info!(
+            tool_call_id,
+            tool_name,
+            pending_before_completion,
+            emitted = emitted_message_id.is_some(),
+            "Claude tool completion emission"
+        );
         if let Some(tasks) = task_update {
             self.emitter.task_update(&tasks);
         }
     }
 
     async fn shutdown(&self) {
+        tracing::info!("Claude shutdown starting");
         self.state.lock().await.closing = true;
         self.cancel_skill_watchdog().await;
-        self.cancel_active_turn().await;
-        self.shutdown_process().await;
+        if self.state.lock().await.active_turn.is_some() {
+            self.cancel_active_turn().await;
+        }
+        self.shutdown_process_gracefully().await;
+        tracing::info!("Claude process shutdown completed");
         // Unlink the session plugin root once the CLI that was reading it is
         // gone. Dropping the last `Arc` would do this anyway, but a session can
         // outlive its shutdown in a caller's hands, and leaving a root in
@@ -4258,6 +4595,8 @@ impl ClaudeInner {
         {
             tracing::warn!("Failed to clean up Claude skill plugin: {err}");
         }
+        self.emitter.close("Claude session closed");
+        tracing::info!("Claude shutdown completed");
     }
 
     fn emit_typing_status(&self, typing: bool) {
@@ -4276,16 +4615,17 @@ impl ClaudeInner {
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
-        let image_payload = images
-            .unwrap_or(&[])
-            .iter()
-            .map(|image| {
-                json!({
-                    "media_type": image.media_type,
-                    "data": image.data,
+        let image_payload = images.map(|images| {
+            images
+                .iter()
+                .map(|image| {
+                    json!({
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        });
         self.emitter.user_message(content, image_payload);
     }
 
@@ -4360,11 +4700,7 @@ impl ClaudeInner {
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let images = message
-                .get("images")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let images = message.get("images").and_then(Value::as_array).cloned();
             self.emitter.user_message(content, images);
             return;
         }
@@ -4615,18 +4951,9 @@ async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Resul
 /// "unsupported" rather than assumed working, so the failure surfaces as a
 /// named capability error instead of an opaque CLI exit at spawn time.
 async fn claude_supports_plugin_dir() -> bool {
-    // Cached in production because the CLI does not change under a running
-    // server, and uncached in tests because each test points the binary at its
-    // own fake and a shared cache would leak one test's CLI into another's.
-    #[cfg(not(test))]
-    {
-        static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-        *SUPPORTED.get_or_init(probe_plugin_dir_support).await
-    }
-    #[cfg(test)]
-    {
-        probe_plugin_dir_support().await
-    }
+    // The CLI does not change underneath a running server process.
+    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *SUPPORTED.get_or_init(probe_plugin_dir_support).await
 }
 
 async fn probe_plugin_dir_support() -> bool {
@@ -4705,7 +5032,9 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
 
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
         cli_args.push("--model".to_string());
-        cli_args.push(model_name);
+        cli_args.push(model_name.clone());
+        cli_args.push("--settings".to_string());
+        cli_args.push(serde_json::json!({ "availableModels": [model_name] }).to_string());
     }
 
     if let Some(plugin_root) = config
@@ -4803,7 +5132,11 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
             continue;
         }
         match &server.transport {
-            StartupMcpTransport::Http { url, headers, .. } => {
+            StartupMcpTransport::Http {
+                url,
+                headers,
+                bearer_token_env_var,
+            } => {
                 let trimmed_url = url.trim();
                 if trimmed_url.is_empty() {
                     continue;
@@ -4811,10 +5144,20 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
                 let mut config = serde_json::Map::new();
                 config.insert("type".to_string(), Value::String("http".to_string()));
                 config.insert("url".to_string(), Value::String(trimmed_url.to_string()));
+                let mut headers = headers.clone();
+                if let Some(variable) = bearer_token_env_var
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|variable| !variable.is_empty())
+                    && let Ok(token) = std::env::var(variable)
+                {
+                    headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                    headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+                }
                 if !headers.is_empty() {
                     config.insert(
                         "headers".to_string(),
-                        serde_json::to_value(headers)
+                        serde_json::to_value(&headers)
                             .expect("HashMap<String, String> is always serializable"),
                     );
                 }
@@ -5037,7 +5380,10 @@ async fn sync_persistent_background_activity(
             SubAgentExecution::Background | SubAgentExecution::Unknown
         )
     });
-    let active = bash_active || subagent_active || !workflow_runs.is_empty();
+    let workflow_active = workflow_runs
+        .values()
+        .any(|entry| entry.state.status == WorkflowRunStatus::Running);
+    let active = bash_active || subagent_active || workflow_active;
     if inner.set_background_work_active(active) && !active {
         inner.emit_idle_if_no_active_turn().await;
     }
@@ -5048,6 +5394,7 @@ async fn read_claude_stdout_persistent(
     inner: Arc<ClaudeInner>,
     control_waiters: ClaudeControlWaiters,
     stdin: Arc<Mutex<ChildStdin>>,
+    process_generation: u64,
 ) {
     let mut turn_state = PersistentStdoutTurnState::default();
     let mut lines = BufReader::new(stdout).lines();
@@ -5101,6 +5448,12 @@ async fn read_claude_stdout_persistent(
                                 .await;
                         }
                     }
+                    inner
+                        .fail_resume_bootstrap(
+                            process_generation,
+                            "Claude CLI exited before its resume bootstrap reached a terminal result",
+                        )
+                        .await;
                     // Release anything still held: it is output the user has
                     // not seen yet, and this is the last chance to show it. The
                     // next pass finds the buffer empty and leaves.
@@ -5135,6 +5488,38 @@ async fn read_claude_stdout_persistent(
             continue;
         }
         inner.observe_process_metadata(&value).await;
+        tracing::debug!(
+            process_generation,
+            frame_type = value
+                .get("type")
+                .and_then(|field| field.as_str())
+                .unwrap_or(""),
+            frame_subtype = value
+                .get("subtype")
+                .and_then(|field| field.as_str())
+                .unwrap_or(""),
+            session_id = value
+                .get("session_id")
+                .and_then(|field| field.as_str())
+                .unwrap_or(""),
+            result = value
+                .get("result")
+                .and_then(|field| field.as_str())
+                .unwrap_or(""),
+            "received Claude CLI frame"
+        );
+        if let Some(reported) = claude_init_frame_skills(&value) {
+            inner.record_skill_init_frame(reported).await;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
+            inner.handle_passive_capacity(&value).await;
+        }
+        if inner
+            .quarantine_resume_bootstrap_frame(process_generation, &value)
+            .await
+        {
+            continue;
+        }
 
         // A cancelled turn is checked before anything below can call this a
         // skill problem. The user stopping a turn is not the skills failing,
@@ -5297,6 +5682,11 @@ async fn read_claude_stdout_persistent(
             inner.arm_cli_wake();
         }
         recent_system_subtypes.observe(&value);
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("api_retry")
+        {
+            eprintln!("TYDE CLAUDE RAW API RETRY frame={value}");
+        }
 
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
@@ -5304,6 +5694,7 @@ async fn read_claude_stdout_persistent(
         }
         let handled_background_task = inner.handle_background_task_frame(&value, &subagent_streams);
         if handled_background_task {
+            finalize_ready_background_subagents(&mut subagent_streams);
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
             continue;
         }
@@ -5326,7 +5717,12 @@ async fn read_claude_stdout_persistent(
                 &mut subagent_streams,
             )
             .await;
-            observe_local_agent_task_usage(&value, &mut local_agent_tasks, &mut subagent_streams);
+            observe_local_agent_task_usage(
+                &inner,
+                &value,
+                &mut local_agent_tasks,
+                &mut subagent_streams,
+            );
             known_subagent_ids.extend(subagent_streams.keys().cloned());
             // A background sub-agent completes via `task_notification`, which
             // arrives on the parent stream after the parent's turn `result`.
@@ -5357,19 +5753,6 @@ async fn read_claude_stdout_persistent(
             }
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
             continue;
-        }
-
-        if let Some(ref emitter) = subagent_emitter {
-            detect_subagent_spawns(
-                &value,
-                emitter.as_ref(),
-                &inner.emitter,
-                &mut subagent_streams,
-                &mut pending_subagent_prompts,
-            )
-            .await;
-            known_subagent_ids.extend(subagent_streams.keys().cloned());
-            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
@@ -5443,6 +5826,12 @@ async fn read_claude_stdout_persistent(
         }
 
         let interrupt_requested = inner.active_turn_interrupted(turn_id).await;
+        if value.get("type").and_then(Value::as_str) == Some("user")
+            && phase_has_pending_output(&turn_state.summary, &turn_state.segment)
+        {
+            close_current_phase(&mut turn_state.summary, &mut turn_state.segment, &inner);
+            flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
+        }
         consume_claude_stream_value_with_interrupt(
             &value,
             &mut turn_state.summary,
@@ -5452,6 +5841,19 @@ async fn read_claude_stdout_persistent(
             &mut turn_state.current_message_id,
             interrupt_requested,
         );
+        flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
+        if let Some(ref emitter) = subagent_emitter {
+            detect_subagent_spawns(
+                &value,
+                emitter.as_ref(),
+                &inner.emitter,
+                &mut subagent_streams,
+                &mut pending_subagent_prompts,
+            )
+            .await;
+            known_subagent_ids.extend(subagent_streams.keys().cloned());
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
+        }
         {
             let mut background_tasks = inner
                 .background_tasks
@@ -5472,6 +5874,7 @@ async fn read_claude_stdout_persistent(
 
         if value.get("type").and_then(Value::as_str) == Some("result") {
             flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
+            flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
             let summary = std::mem::take(&mut turn_state.summary);
             turn_state.segment = SegmentState::default();
             turn_state.active_turn_id = None;
@@ -6352,12 +6755,38 @@ async fn fail_pending_control_waiters(control_waiters: &ClaudeControlWaiters, me
 async fn read_claude_stderr_persistent(stderr: ChildStderr, inner: Arc<ClaudeInner>) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("TYDE CLAUDE STDERR {line}");
         tracing::debug!("Claude stderr: {line}");
         inner.emitter.subprocess_stderr(&line);
     }
 }
 
 fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
+    let failed_tool_result = value.get("type").and_then(Value::as_str) == Some("user")
+        && value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && block.get("is_error").and_then(Value::as_bool) == Some(true)
+                })
+            });
+    let failed_task = value.get("type").and_then(Value::as_str) == Some("system")
+        && matches!(
+            value.get("subtype").and_then(Value::as_str),
+            Some("task_updated" | "task_notification")
+        )
+        && matches!(
+            value
+                .get("status")
+                .or_else(|| value.pointer("/patch/status"))
+                .and_then(Value::as_str),
+            Some("failed" | "error" | "killed" | "stopped")
+        );
+    if failed_tool_result || failed_task {
+        stream.execution_failed = true;
+    }
     let mut sa_message_id = stream.message_id.clone();
     consume_claude_stream_value(
         value,
@@ -6373,11 +6802,14 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
         stream.last_tool_name = Some(tool.name.clone());
     }
     maybe_emit_subagent_progress(stream);
+    flush_subagent_progress(stream);
 }
 
 /// Minimum interval between live-status updates on the parent's Task
 /// tool card while routing a sub-agent's events.
 const SUBAGENT_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+const RESUME_REPLAY_SETTLE_QUIET: Duration = Duration::from_secs(1);
+const RESUME_REPLAY_TURN_QUIESCE: Duration = Duration::from_secs(30);
 
 fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolProgressData {
     // The emitted request owns the card's identity. The cached name can be
@@ -6401,6 +6833,13 @@ fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolP
             last_tool_name: stream.last_tool_name.clone(),
             tool_calls: stream.seen_tool_call_ids.len() as u64,
             completed,
+            status: if !completed {
+                protocol::SubAgentProgressStatus::Running
+            } else if stream.execution_failed {
+                protocol::SubAgentProgressStatus::Failed
+            } else {
+                protocol::SubAgentProgressStatus::Completed
+            },
         }),
     }
 }
@@ -6410,8 +6849,42 @@ fn maybe_emit_subagent_progress(stream: &mut SubAgentStream) {
         return;
     }
     stream.last_progress_emit = std::time::Instant::now();
-    let progress = subagent_progress_data(stream, false);
-    stream.parent_emitter.tool_progress(&progress);
+    queue_subagent_progress(stream, false);
+    flush_subagent_progress(stream);
+}
+
+fn queue_subagent_progress(stream: &mut SubAgentStream, completed: bool) {
+    let progress = subagent_progress_data(stream, completed);
+    if !completed
+        && stream
+            .pending_parent_progress
+            .back()
+            .is_some_and(|pending| {
+                matches!(
+                    &pending.update,
+                    ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                        completed: false,
+                        ..
+                    })
+                )
+            })
+    {
+        stream.pending_parent_progress.pop_back();
+    }
+    stream.pending_parent_progress.push_back(progress);
+}
+
+fn flush_subagent_progress(stream: &mut SubAgentStream) -> bool {
+    if !stream
+        .parent_emitter
+        .has_known_tool_request(&stream.parent_tool_use_id)
+    {
+        return false;
+    }
+    for progress in stream.pending_parent_progress.drain(..) {
+        stream.parent_emitter.tool_progress(&progress);
+    }
+    true
 }
 
 fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description: &str) {
@@ -6420,7 +6893,7 @@ fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description:
         return;
     }
     stream.has_explicit_task_prompt = true;
-    stream.inner.emitter.user_message(trimmed, Vec::new());
+    stream.inner.emitter.user_message(trimmed, None);
 }
 
 struct SubAgentSpawnSpec {
@@ -6457,7 +6930,8 @@ async fn ensure_subagent_stream(
             if let Some(tx) = &stream.name_update_tx {
                 let _ = tx.send(name);
             }
-            parent_emitter.tool_progress(&subagent_progress_data(stream, false));
+            queue_subagent_progress(stream, false);
+            flush_subagent_progress(stream);
         }
         return;
     }
@@ -6503,6 +6977,7 @@ async fn ensure_subagent_stream(
         turn_event_gate: Mutex::new(()),
         task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
         background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
+        native_subagent_tasks: StdMutex::new(HashSet::new()),
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
@@ -6538,10 +7013,14 @@ async fn ensure_subagent_stream(
         seen_tool_call_ids: HashSet::new(),
         last_tool_name: None,
         reported_total_tokens: None,
+        execution_failed: false,
+        pending_terminal: None,
+        pending_parent_progress: VecDeque::new(),
     };
     // Unthrottled spawn update: the Task card learns the sub-agent's id
     // (for its "Open agent" link) as soon as the agent exists.
-    parent_emitter.tool_progress(&subagent_progress_data(&mut stream, false));
+    queue_subagent_progress(&mut stream, false);
+    flush_subagent_progress(&mut stream);
     streams.insert(tool_use_id, stream);
 }
 
@@ -6567,6 +7046,7 @@ struct WorkflowRunEntry {
     tool_use_id: String,
     state: WorkflowRunState,
     last_emit: std::time::Instant,
+    pending_snapshots: VecDeque<WorkflowRunState>,
 }
 
 fn map_workflow_agent_status(raw: &str) -> WorkflowAgentStatus {
@@ -6676,13 +7156,97 @@ fn apply_workflow_usage(state: &mut WorkflowRunState, usage: &ClaudeTaskUsage) {
     }
 }
 
-fn emit_workflow_snapshot(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry) {
+fn queue_workflow_snapshot(entry: &mut WorkflowRunEntry) {
+    let snapshot = entry.state.clone();
+    if snapshot.status == WorkflowRunStatus::Running {
+        match entry.pending_snapshots.len() {
+            0 => entry.pending_snapshots.push_back(snapshot),
+            1 if entry.pending_snapshots.back() != Some(&snapshot) => {
+                entry.pending_snapshots.push_back(snapshot);
+            }
+            2.. if entry
+                .pending_snapshots
+                .back()
+                .is_some_and(|queued| queued.status == WorkflowRunStatus::Running) =>
+            {
+                entry.pending_snapshots.pop_back();
+                entry.pending_snapshots.push_back(snapshot);
+            }
+            _ => {}
+        }
+    } else if entry.pending_snapshots.back() != Some(&snapshot) {
+        if entry
+            .pending_snapshots
+            .back()
+            .is_some_and(|queued| queued.status != WorkflowRunStatus::Running)
+        {
+            entry.pending_snapshots.pop_back();
+        }
+        entry.pending_snapshots.push_back(snapshot);
+    }
+
+    while entry.pending_snapshots.len() > 3 {
+        entry.pending_snapshots.remove(1);
+    }
+}
+
+fn flush_workflow_snapshots(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry) -> bool {
+    let request_known = emitter.has_known_tool_request(&entry.tool_use_id);
+    eprintln!(
+        "CLAUDE WORKFLOW FLUSH tool={} known={} queued={} status={:?}",
+        entry.tool_use_id,
+        request_known,
+        entry.pending_snapshots.len(),
+        entry.state.status
+    );
+    if !request_known {
+        tracing::debug!(
+            tool_use_id = entry.tool_use_id,
+            queued_snapshots = entry.pending_snapshots.len(),
+            status = ?entry.state.status,
+            "buffering Workflow progress until its tool request is emitted"
+        );
+        return false;
+    }
+    if !entry.pending_snapshots.is_empty() {
+        tracing::debug!(
+            tool_use_id = entry.tool_use_id,
+            queued_snapshots = entry.pending_snapshots.len(),
+            "flushing buffered Workflow progress after its tool request"
+        );
+    }
+    for snapshot in entry.pending_snapshots.drain(..) {
+        emitter.tool_progress(&ToolProgressData {
+            tool_call_id: entry.tool_use_id.clone(),
+            tool_name: "Workflow".to_string(),
+            update: ToolProgressUpdate::Workflow(snapshot),
+        });
+    }
+    true
+}
+
+fn emit_workflow_snapshot(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry) -> bool {
     entry.last_emit = std::time::Instant::now();
-    emitter.tool_progress(&ToolProgressData {
-        tool_call_id: entry.tool_use_id.clone(),
-        tool_name: "Workflow".to_string(),
-        update: ToolProgressUpdate::Workflow(entry.state.clone()),
-    });
+    queue_workflow_snapshot(entry);
+    flush_workflow_snapshots(emitter, entry)
+}
+
+fn flush_ready_workflow_snapshots(
+    workflow_runs: &mut HashMap<String, WorkflowRunEntry>,
+    emitter: &TurnEmitter,
+) {
+    let mut completed = Vec::new();
+    for (task_id, entry) in workflow_runs.iter_mut() {
+        if flush_workflow_snapshots(emitter, entry)
+            && entry.pending_snapshots.is_empty()
+            && entry.state.status != WorkflowRunStatus::Running
+        {
+            completed.push(task_id.clone());
+        }
+    }
+    for task_id in completed {
+        workflow_runs.remove(&task_id);
+    }
 }
 
 /// Consume a workflow task frame if `value` is one. Returns `true` when
@@ -6738,7 +7302,12 @@ fn handle_workflow_task_frame(
                     agents: Vec::new(),
                 },
                 last_emit: std::time::Instant::now(),
+                pending_snapshots: VecDeque::new(),
             };
+            eprintln!(
+                "CLAUDE WORKFLOW START task={} tool={} name={}",
+                task_id, entry.tool_use_id, entry.state.workflow_name
+            );
             emit_workflow_snapshot(emitter, &mut entry);
             workflow_runs.insert(task_id, entry);
             true
@@ -6749,6 +7318,10 @@ fn handle_workflow_task_frame(
                 // regular paths see the frame.
                 return false;
             };
+            eprintln!(
+                "CLAUDE WORKFLOW PROGRESS task={} tool={}",
+                task_id, entry.tool_use_id
+            );
             let mut transitioned = false;
             for raw_delta in system.workflow_progress.iter().flatten() {
                 match serde_json::from_value::<ClaudeWorkflowAgentDelta>(raw_delta.clone()) {
@@ -6771,9 +7344,13 @@ fn handle_workflow_task_frame(
             true
         }
         ClaudeSystemEvent::TaskNotification => {
-            let Some(mut entry) = workflow_runs.remove(&task_id) else {
+            let Some(entry) = workflow_runs.get_mut(&task_id) else {
                 return false;
             };
+            eprintln!(
+                "CLAUDE WORKFLOW TERMINAL task={} tool={} raw_status={:?}",
+                task_id, entry.tool_use_id, system.status
+            );
             entry.state.status = match system.status.as_deref() {
                 Some("completed") => WorkflowRunStatus::Completed,
                 Some("failed") | Some("error") => WorkflowRunStatus::Failed,
@@ -6783,7 +7360,17 @@ fn handle_workflow_task_frame(
                 }
             };
             entry.state.summary = system.summary.as_deref().and_then(normalize_nonempty);
-            emit_workflow_snapshot(emitter, &mut entry);
+            emit_workflow_snapshot(emitter, entry);
+            if entry.pending_snapshots.is_empty() {
+                workflow_runs.remove(&task_id);
+            } else {
+                tracing::debug!(
+                    task_id,
+                    tool_use_id = entry.tool_use_id,
+                    queued_snapshots = entry.pending_snapshots.len(),
+                    "retaining terminal Workflow progress until its tool request is emitted"
+                );
+            }
             true
         }
         _ => false,
@@ -6912,6 +7499,7 @@ fn refresh_unresolved_background_tasks(
     root_emitter: &Arc<TurnEmitter>,
     subagent_streams: &HashMap<String, SubAgentStream>,
 ) {
+    let mut resolved_terminals = Vec::new();
     for entry in background_tasks
         .values_mut()
         .filter(|entry| entry.owner.is_none() || entry.tool_name.is_none())
@@ -6921,8 +7509,23 @@ fn refresh_unresolved_background_tasks(
         if !was_ready
             && let (Some(owner), Some(_)) = (entry.owner.as_deref(), entry.tool_name.as_deref())
         {
-            emit_background_task_snapshot(owner, entry);
+            if !entry.terminal_progress_emitted {
+                emit_background_task_snapshot(owner, entry);
+                if entry.state.status != BackgroundTaskStatus::Running {
+                    entry.terminal_progress_emitted = true;
+                }
+            }
+            if entry.state.status != BackgroundTaskStatus::Running && !entry.completion_emitted {
+                emit_background_task_completion(owner, entry);
+                entry.completion_emitted = true;
+            }
+            if entry.terminal_progress_emitted && entry.completion_emitted {
+                resolved_terminals.push(entry.state.task_id.clone());
+            }
         }
+    }
+    for task_id in resolved_terminals {
+        background_tasks.remove(&task_id);
     }
 }
 
@@ -7073,15 +7676,14 @@ fn drain_background_task_entries(background_tasks: &mut HashMap<String, Backgrou
         if entry.tool_name.is_none() {
             continue;
         }
-        let stopped_already_emitted =
-            entry.terminal_progress_emitted && entry.state.status == BackgroundTaskStatus::Stopped;
-        entry.state.status = BackgroundTaskStatus::Stopped;
-        entry.state.summary = Some(
-            "Claude process exited before the background command reported final output".to_string(),
-        );
-        entry.state.output_unavailable =
-            Some("Background command output unavailable after Claude process exit".to_string());
-        if !stopped_already_emitted {
+        if !entry.terminal_progress_emitted {
+            entry.state.status = BackgroundTaskStatus::Stopped;
+            entry.state.summary = Some(
+                "Claude process exited before the background command reported final output"
+                    .to_string(),
+            );
+            entry.state.output_unavailable =
+                Some("Background command output unavailable after Claude process exit".to_string());
             entry.terminal_progress_emitted = true;
             emit_background_task_snapshot(owner, &entry);
         }
@@ -7111,7 +7713,7 @@ fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
 /// turn that launched it, and its terminal frames can arrive between
 /// turns where the per-turn path would drop them.
 ///
-/// Captured lifecycles (Claude Code 2.1.217; fixtures in the tests):
+/// Captured lifecycles (Claude Code 2.1.217):
 /// `task_started` (task_type `local_bash`) → on natural completion
 /// `task_updated {patch: {status: "completed"}}` then `task_notification
 /// {status: "completed", summary}` — or, when the session ends while the
@@ -7224,19 +7826,19 @@ fn handle_background_bash_task_frame_with_owners(
                 return true;
             }
             entry.state.status = next_status;
-            if entry.state.status != BackgroundTaskStatus::Running {
-                entry.terminal_progress_emitted = true;
-            }
             if let Some(owner) = entry.owner.as_ref().map(Arc::clone) {
                 emit_background_task_snapshot(&owner, entry);
+                if entry.state.status != BackgroundTaskStatus::Running {
+                    entry.terminal_progress_emitted = true;
+                }
             }
             true
         }
         ClaudeSystemEvent::TaskNotification => {
-            let Some(mut entry) = background_tasks.remove(&task_id) else {
+            let Some(entry) = background_tasks.get_mut(&task_id) else {
                 return false;
             };
-            refresh_background_task_owner(value, &mut entry, root_emitter, subagent_streams);
+            refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
             entry.state.status = match system.status.as_deref() {
                 Some("completed") => BackgroundTaskStatus::Completed,
                 Some("stopped") | Some("killed") => BackgroundTaskStatus::Stopped,
@@ -7261,47 +7863,27 @@ fn handle_background_bash_task_frame_with_owners(
             {
                 if !entry.terminal_progress_emitted {
                     entry.terminal_progress_emitted = true;
+                    emit_background_task_snapshot(owner, entry);
                 }
-                emit_background_task_snapshot(owner, &entry);
                 if !entry.completion_emitted {
                     entry.completion_emitted = true;
-                    emit_background_task_completion(owner, &entry);
+                    emit_background_task_completion(owner, entry);
                 }
             } else {
                 tracing::error!(
                     task_id,
                     tool_use_id = entry.tool_use_id,
                     parent_tool_use_id = entry.parent_tool_use_id.as_deref().unwrap_or(""),
-                    "dropping terminal background task frame because ownership or tool identity remained unresolved"
+                    "retaining terminal background task frame until ownership resolves"
                 );
+            }
+            if entry.terminal_progress_emitted && entry.completion_emitted {
+                background_tasks.remove(&task_id);
             }
             true
         }
         _ => false,
     }
-}
-
-#[cfg(test)]
-fn handle_background_bash_task_frame(
-    value: &Value,
-    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
-    emitter: &Arc<TurnEmitter>,
-) -> bool {
-    if value.get("subtype").and_then(Value::as_str) == Some("task_started")
-        && let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str)
-        && !emitter.has_pending_tool_request(tool_use_id)
-    {
-        emitter.tool_request(
-            tool_use_id,
-            "Bash",
-            json!({
-                "kind": "RunCommand",
-                "command": "test background command",
-                "working_directory": "",
-            }),
-        );
-    }
-    handle_background_bash_task_frame_with_owners(value, background_tasks, emitter, &HashMap::new())
 }
 
 async fn detect_subagent_task_system_spawns(
@@ -7335,6 +7917,9 @@ async fn detect_subagent_task_system_spawns(
         tracing::debug!("ignoring Claude task_started without tool_use_id");
         return;
     };
+    if !parent_emitter.has_known_tool_request(&tool_use_id) {
+        return;
+    }
 
     let task_name = system.description.as_deref().and_then(normalize_nonempty);
     let prompt = system.prompt.as_deref().and_then(normalize_nonempty);
@@ -7373,6 +7958,7 @@ async fn detect_subagent_task_system_spawns(
 /// `usage.total_tokens`. Only that numeric field is authoritative here;
 /// summaries and status prose are never parsed as accounting data.
 fn observe_local_agent_task_usage(
+    inner: &ClaudeInner,
     value: &Value,
     task_to_tool_use: &mut HashMap<String, String>,
     streams: &mut HashMap<String, SubAgentStream>,
@@ -7391,6 +7977,12 @@ fn observe_local_agent_task_usage(
             (system.task_id.as_deref(), system.tool_use_id.as_deref())
     {
         task_to_tool_use.insert(task_id.to_owned(), tool_use_id.to_owned());
+        let mut tasks = inner
+            .native_subagent_tasks
+            .lock()
+            .expect("Claude native subagent task mutex poisoned");
+        tasks.remove(tool_use_id);
+        tasks.insert(task_id.to_owned());
     }
     if !matches!(
         &event,
@@ -7420,6 +8012,11 @@ fn observe_local_agent_task_usage(
     }
     if is_notification && let Some(task_id) = system.task_id {
         task_to_tool_use.remove(&task_id);
+        inner
+            .native_subagent_tasks
+            .lock()
+            .expect("Claude native subagent task mutex poisoned")
+            .remove(&task_id);
     }
 }
 
@@ -7751,8 +8348,8 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
     // the notification has no renderable text/usage).
     stream.inner.emitter.typing_status_changed(false);
     // Unthrottled final update with the closing stats.
-    let progress = subagent_progress_data(&mut stream, true);
-    stream.parent_emitter.tool_progress(&progress);
+    queue_subagent_progress(&mut stream, true);
+    flush_subagent_progress(&mut stream);
 }
 
 fn close_current_subagent_phase(
@@ -7802,17 +8399,65 @@ fn finalize_background_subagent_completion(
     else {
         return;
     };
-    if let Some(stream) = streams.remove(tool_use_id) {
+    if let Some(stream) = streams.get_mut(tool_use_id) {
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("failed");
         // On a completed agent the notification `summary` is the child's
         // final assistant text — the only carrier of it for background
         // agents. Other statuses describe the failure, not the answer.
         // No usage here: the notification reports only an unsplittable
         // total, and fabricating an input/output split would be dishonest.
-        let text = (value.get("status").and_then(Value::as_str) == Some("completed"))
+        let text = (status == "completed")
             .then(|| value.get("summary").and_then(Value::as_str))
             .flatten()
             .map(str::to_owned);
+        stream.pending_terminal = Some((status.to_string(), text));
+    }
+    finalize_ready_background_subagents(streams);
+}
+
+fn finalize_ready_background_subagents(streams: &mut HashMap<String, SubAgentStream>) {
+    let ready = streams
+        .iter()
+        .filter(|(_, stream)| {
+            stream.pending_terminal.is_some() && !stream.inner.emitter.has_pending_detached_tools()
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in ready {
+        let mut stream = streams.remove(&id).expect("ready subagent disappeared");
+        let (status, text) = stream
+            .pending_terminal
+            .take()
+            .expect("ready subagent lost terminal outcome");
+        let succeeded = status == "completed" && !stream.execution_failed;
+        let parent_emitter = stream.parent_emitter.clone();
+        let parent_tool_use_id = stream.parent_tool_use_id.clone();
+        let parent_tool_name = stream.parent_tool_name.clone();
         finalize_subagent_stream(stream, SubAgentFinalOutcome { text, usage: None });
+        if succeeded {
+            let _ = parent_emitter.tool_completed(ToolCompletedPayload {
+                tool_call_id: &parent_tool_use_id,
+                tool_name: &parent_tool_name,
+                tool_result: json!({
+                    "kind": "Other",
+                    "result": { "status": status },
+                }),
+                success: true,
+                error: None,
+            });
+        } else {
+            parent_emitter.fail_pending_tool(
+                &parent_tool_use_id,
+                &if status == "completed" {
+                    "Background agent reported a failed tool execution".to_string()
+                } else {
+                    format!("Background agent ended with status '{status}'")
+                },
+            );
+        }
     }
 }
 
@@ -7958,7 +8603,35 @@ fn consume_claude_stream_value_with_interrupt(
                 | ClaudeSystemEvent::TaskUpdated => {
                     let _ = (&system.task_id, &system.status, &system.summary);
                 }
-                ClaudeSystemEvent::ThinkingTokens | ClaudeSystemEvent::ApiRetry => {}
+                ClaudeSystemEvent::ThinkingTokens => {}
+                ClaudeSystemEvent::ApiRetry => {
+                    let Some(attempt) = system.attempt else {
+                        tracing::warn!(frame = %value, "Claude retry frame omitted attempt");
+                        return;
+                    };
+                    let Some(max_retries) = system.max_retries else {
+                        tracing::warn!(frame = %value, "Claude retry frame omitted max_retries");
+                        return;
+                    };
+                    let Some(backoff_ms) = system.retry_delay_ms else {
+                        tracing::warn!(frame = %value, "Claude retry frame omitted retry_delay_ms");
+                        return;
+                    };
+                    let error = system
+                        .error
+                        .filter(|error| !error.trim().is_empty())
+                        .or_else(|| system.error_status.map(|status| format!("HTTP {status}")));
+                    let Some(error) = error else {
+                        tracing::warn!(frame = %value, "Claude retry frame omitted provider error");
+                        return;
+                    };
+                    inner.emitter.retry_attempt(RetryAttemptPayload {
+                        attempt,
+                        max_retries,
+                        error: &error,
+                        backoff_ms,
+                    });
+                }
                 ClaudeSystemEvent::Unknown(subtype) => {
                     tracing::warn!("Ignoring unrecognized Claude system subtype: {subtype}");
                 }
@@ -8252,6 +8925,7 @@ fn consume_user_tool_result(
         message,
         &summary.tool_name_by_id,
         &summary.tool_call_by_id,
+        Some(&summary.tool_modify_preview_by_id),
     );
     for completion in completions {
         if summary
@@ -8292,7 +8966,7 @@ fn consume_user_tool_result(
             .tool_call_by_id
             .get(&completion.tool_call_id)
             .is_some_and(|tool| {
-                claude_is_run_command_tool_name(&tool.name)
+                (claude_is_run_command_tool_name(&tool.name) || is_subagent_tool_name(&tool.name))
                     && tool
                         .arguments
                         .get("run_in_background")
@@ -9258,72 +9932,6 @@ fn add_token_usage(accumulated: Option<&Value>, usage: &Value) -> Value {
     })
 }
 
-#[cfg(test)]
-fn derive_turn_token_usage(current: &Value, previous: Option<&Value>) -> Option<Value> {
-    let input_tokens = usage_value_u64(current, "input_tokens");
-    let output_tokens = usage_value_u64(current, "output_tokens");
-    let total_tokens = usage_value_u64(current, "total_tokens");
-    let cached_prompt_tokens = usage_value_u64(current, "cached_prompt_tokens");
-    let cache_creation_input_tokens = usage_value_u64(current, "cache_creation_input_tokens");
-    let reasoning_tokens = usage_value_u64(current, "reasoning_tokens");
-    let context_window = current.get("context_window").and_then(Value::as_u64);
-
-    if input_tokens == 0
-        && output_tokens == 0
-        && total_tokens == 0
-        && cached_prompt_tokens == 0
-        && cache_creation_input_tokens == 0
-        && reasoning_tokens == 0
-    {
-        return None;
-    }
-
-    let Some(previous) = previous else {
-        return Some(current.clone());
-    };
-
-    let prev_input_tokens = usage_value_u64(previous, "input_tokens");
-    let prev_output_tokens = usage_value_u64(previous, "output_tokens");
-    let prev_total_tokens = usage_value_u64(previous, "total_tokens");
-    let prev_cached_prompt_tokens = usage_value_u64(previous, "cached_prompt_tokens");
-    let prev_cache_creation_input_tokens = usage_value_u64(previous, "cache_creation_input_tokens");
-    let prev_reasoning_tokens = usage_value_u64(previous, "reasoning_tokens");
-
-    // Claude reports cumulative usage for the whole session.
-    // If counters reset (new session/resume), use current values as-is.
-    if total_tokens < prev_total_tokens {
-        return Some(current.clone());
-    }
-
-    let turn_input_tokens = input_tokens.saturating_sub(prev_input_tokens);
-    let turn_output_tokens = output_tokens.saturating_sub(prev_output_tokens);
-    let turn_total_tokens = total_tokens.saturating_sub(prev_total_tokens);
-    let turn_cached_prompt_tokens = cached_prompt_tokens.saturating_sub(prev_cached_prompt_tokens);
-    let turn_cache_creation_input_tokens =
-        cache_creation_input_tokens.saturating_sub(prev_cache_creation_input_tokens);
-    let turn_reasoning_tokens = reasoning_tokens.saturating_sub(prev_reasoning_tokens);
-
-    if turn_input_tokens == 0
-        && turn_output_tokens == 0
-        && turn_total_tokens == 0
-        && turn_cached_prompt_tokens == 0
-        && turn_cache_creation_input_tokens == 0
-        && turn_reasoning_tokens == 0
-    {
-        return None;
-    }
-
-    Some(json!({
-        "input_tokens": turn_input_tokens,
-        "output_tokens": turn_output_tokens,
-        "total_tokens": turn_total_tokens,
-        "cached_prompt_tokens": turn_cached_prompt_tokens,
-        "cache_creation_input_tokens": turn_cache_creation_input_tokens,
-        "reasoning_tokens": turn_reasoning_tokens,
-        "context_window": context_window,
-    }))
-}
-
 fn extract_result_error(value: &Value) -> Option<String> {
     if let Some(error) = value.get("error") {
         if let Some(message) = error.get("message").and_then(Value::as_str) {
@@ -9564,6 +10172,7 @@ impl ClaudeTaskTracker {
         result: &Value,
     ) -> Option<protocol::TaskList> {
         let pending = self.pending.remove(tool_call_id)?;
+        let before = serde_json::to_value(self.snapshot()).ok()?;
         match pending {
             ClaudePendingTaskCall::Create { local_id }
                 if claude_is_task_create_tool_name(tool_name) =>
@@ -9612,7 +10221,8 @@ impl ClaudeTaskTracker {
             }
             _ => return None,
         }
-        Some(self.snapshot())
+        let snapshot = self.snapshot();
+        (serde_json::to_value(&snapshot).ok()? != before).then_some(snapshot)
     }
 
     fn snapshot(&self) -> protocol::TaskList {
@@ -10177,7 +10787,8 @@ fn claude_modify_preview(tool_name: &str, arguments: &Value) -> Option<ClaudeMod
         "write" => {
             let after = claude_argument_string(arguments, &["content", "text", "new_content"])
                 .unwrap_or_default();
-            (String::new(), after)
+            let before = std::fs::read_to_string(&file_path).unwrap_or_default();
+            (before, after)
         }
         "multiedit" => parse_multiedit_preview(arguments)?,
         "edit" | "notebookedit" => parse_edit_pair(arguments).or_else(|| {
@@ -10235,7 +10846,7 @@ fn claude_ask_user_question_options(value: &Value) -> Vec<protocol::AskUserQuest
         return Vec::new();
     };
 
-    options
+    let parsed = options
         .iter()
         .map(|option| {
             if let Some(label) = option.as_str().and_then(normalize_nonempty) {
@@ -10250,7 +10861,15 @@ fn claude_ask_user_question_options(value: &Value) -> Vec<protocol::AskUserQuest
                 description: claude_argument_string(option, &["description"]),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if parsed.len() == 2
+        && parsed[0].label == CLAUDE_FREE_TEXT_SENTINEL
+        && parsed[1].label == CLAUDE_FREE_TEXT_OTHER
+    {
+        Vec::new()
+    } else {
+        parsed
+    }
 }
 
 fn claude_argument_bool(arguments: &Value, keys: &[&str]) -> Option<bool> {
@@ -10268,8 +10887,18 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
             .or_else(|| claude_argument_string(arguments, &["description"]));
         let name = claude_argument_string(arguments, &["name"])
             .or_else(|| claude_argument_string(arguments, &["description"]));
-        return serde_json::to_value(protocol::ToolRequestType::AgentSpawn { prompt, name })
-            .expect("serialize Claude agent spawn request");
+        let execution_mode =
+            if claude_argument_bool(arguments, &["run_in_background"]).unwrap_or(false) {
+                protocol::AgentExecutionMode::Background
+            } else {
+                protocol::AgentExecutionMode::Foreground
+            };
+        return serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+            prompt,
+            name,
+            execution_mode,
+        })
+        .expect("serialize Claude agent spawn request");
     }
 
     if let Some(preview) = claude_modify_preview(tool_name, arguments) {
@@ -10329,10 +10958,7 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
 
     json!({
         "kind": "Other",
-        "args": {
-            "tool": tool_name,
-            "arguments": arguments,
-        }
+        "args": arguments,
     })
 }
 
@@ -10669,11 +11295,6 @@ async fn load_claude_session_history(
     ))
 }
 
-#[cfg(test)]
-fn parse_claude_session_history_contents(contents: &str) -> Vec<ClaudeHistoryReplayItem> {
-    parse_claude_session_replay(contents).items
-}
-
 fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
     let mut restored = Vec::new();
     let mut cumulative_usage = None;
@@ -10929,6 +11550,7 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             &message_value,
             &tool_name_by_id,
             &tool_call_by_id,
+            None,
         ) {
             if !tool_call_by_id.contains_key(&completion.tool_call_id) {
                 continue;
@@ -11160,6 +11782,7 @@ fn extract_tool_result_events_from_message(
     message: &Value,
     tool_name_by_id: &HashMap<String, String>,
     tool_call_by_id: &HashMap<String, ClaudeToolCall>,
+    tool_modify_preview_by_id: Option<&HashMap<String, ClaudeModifyPreview>>,
 ) -> Vec<ClaudeReplayToolExecution> {
     let Some(content) = message.get("content").and_then(Value::as_array) else {
         return Vec::new();
@@ -11182,9 +11805,14 @@ fn extract_tool_result_events_from_message(
             .get(&tool_call_id)
             .cloned()
             .unwrap_or_else(|| "tool".to_string());
-        let modify_preview = tool_call_by_id
-            .get(&tool_call_id)
-            .and_then(|tool_call| claude_modify_preview(&tool_call.name, &tool_call.arguments));
+        let modify_preview = tool_modify_preview_by_id
+            .and_then(|previews| previews.get(&tool_call_id))
+            .cloned()
+            .or_else(|| {
+                tool_call_by_id.get(&tool_call_id).and_then(|tool_call| {
+                    claude_modify_preview(&tool_call.name, &tool_call.arguments)
+                })
+            });
         let result_text = extract_tool_result_content(block);
         let is_run_command = claude_is_run_command_tool_name(&tool_name);
         let is_read_tool = claude_is_read_tool_name(&tool_name);
@@ -11193,11 +11821,25 @@ fn extract_tool_result_events_from_message(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        if tool_name.starts_with("mcp__") {
+            let normalized = normalize_mcp_call_tool_result(block);
+            events.push(ClaudeReplayToolExecution {
+                tool_call_id,
+                tool_name,
+                success: normalized.success,
+                tool_result: normalized.tool_result,
+                error: normalized.error,
+            });
+            continue;
+        }
+
         if is_error {
             // AskUserQuestion, ExitPlanMode, and EnterPlanMode return is_error in
             // --print mode because they need interactive input. This is expected —
             // treat them as successful end-of-turn signals.
-            if claude_is_user_input_tool_name(&tool_name) {
+            if claude_is_user_input_tool_name(&tool_name)
+                && normalize_tool_name(&tool_name) != "askuserquestion"
+            {
                 let tool_result = if normalize_tool_name(&tool_name) == "exitplanmode" {
                     match exit_plan_mode_plan_info_from_tool_calls(tool_call_by_id.values()) {
                         Some(info) => json!({
@@ -11309,11 +11951,18 @@ fn extract_tool_result_events_from_message(
                 .map(|tool_call| claude_argument_file_paths(&tool_call.arguments))
                 .unwrap_or_default();
             let tool_result = if let [path] = file_paths.as_slice() {
+                eprintln!(
+                    "TYDE CLAUDE READ RESULT path={path:?} result_text={result_text:?} result_bytes={}",
+                    result_text.len()
+                );
+                let bytes = std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(result_text.len() as u64);
                 json!({
                     "kind": "ReadFiles",
                     "files": [{
                         "path": path,
-                        "bytes": result_text.len()
+                        "bytes": bytes
                     }],
                 })
             } else {
@@ -12694,179 +13343,6 @@ pub(crate) fn forward_passive_rate_limit_event(
     true
 }
 
-#[cfg(test)]
-mod capacity_mapping_tests {
-    use super::*;
-
-    #[test]
-    fn initialize_account_distinguishes_subscription_api_key_and_external_provider() {
-        assert_eq!(
-            claude_capacity_access_from_initialize(&json!({"account": {
-                "apiProvider": "firstParty", "subscriptionType": "Claude Max"
-            }})),
-            ClaudeCapacityAccess::Subscription
-        );
-        assert_eq!(
-            claude_capacity_access_from_initialize(&json!({"account": {
-                "apiProvider": "firstParty", "subscriptionType": null
-            }})),
-            ClaudeCapacityAccess::ApiKey
-        );
-        assert_eq!(
-            claude_capacity_access_from_initialize(&json!({"account": {
-                "apiProvider": "bedrock", "subscriptionType": null
-            }})),
-            ClaudeCapacityAccess::ExternalProvider
-        );
-    }
-
-    #[test]
-    fn control_usage_maps_all_cli_reported_limits() {
-        let report = map_claude_control_usage(&json!({
-            "subscription_type": "max",
-            "rate_limits_available": true,
-            "rate_limits": {"limits": [
-                {"kind": "session", "percent": 2,
-                 "resets_at": "2026-07-17T21:20:00.325356+00:00"},
-                {"kind": "weekly_all", "percent": 15,
-                 "resets_at": "2026-07-22T18:00:00.325379+00:00"},
-                {"kind": "weekly_scoped", "percent": 8,
-                 "resets_at": "2026-07-22T18:00:00.325737+00:00",
-                 "scope": {"model": {"display_name": "Fable"}}}
-            ]}
-        }))
-        .expect("authoritative Claude usage");
-        assert_eq!(report.source, CapacitySource::ClaudeControlUsage);
-        assert_eq!(report.coverage, CapacityCoverage::AllVendorBuckets);
-        assert_eq!(report.buckets.len(), 3);
-        assert_eq!(report.buckets[0].label, "session limit");
-        assert_eq!(report.buckets[1].label, "weekly limit");
-        assert_eq!(report.buckets[2].label, "Fable limit");
-        assert!(matches!(
-            report.buckets[2].id,
-            CapacityBucketId::ClaudeModel { ref name } if name == "Fable"
-        ));
-        assert!(matches!(
-            report.buckets[2].measure,
-            CapacityMeasure::UsedPercent {
-                used_percent: 8,
-                remaining_percent: 92,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn control_usage_rejects_partial_or_unavailable_reports() {
-        assert_eq!(
-            map_claude_control_usage(&json!({"rate_limits_available": false})),
-            Err(CapacityUnavailableReason::MalformedReport)
-        );
-        assert_eq!(
-            map_claude_control_usage(&json!({
-                "rate_limits_available": true,
-                "rate_limits": {"limits": [{"kind": "session", "percent": 101}]}
-            })),
-            Err(CapacityUnavailableReason::MalformedReport)
-        );
-    }
-
-    #[test]
-    fn representative_rate_limit_event_converts_fraction_and_drops_internal_overage_fields() {
-        let report = map_passive_rate_limit_event(&json!({
-            "type": "rate_limit_event",
-            "rate_limit_info": {
-                "status": "allowed_warning", "rateLimitType": "seven_day_opus",
-                "utilization": 0.82, "resetsAt": 1_700_000_000,
-                "overageStatus": "rejected", "overagePeriodMonthly": {"utilization": 0.99},
-                "overagePeriodChannel": {"utilization": 0.98}
-            }
-        }))
-        .expect("representative event");
-        assert_eq!(
-            report.coverage,
-            protocol::CapacityCoverage::RepresentativeBucketOnly
-        );
-        assert_eq!(report.buckets.len(), 1);
-        assert_eq!(
-            report.buckets[0].status,
-            Some(protocol::CapacityBucketStatus::AllowedWarning)
-        );
-        assert!(matches!(
-            &report.buckets[0].measure,
-            protocol::CapacityMeasure::UsedPercent {
-                used_percent: 82,
-                remaining_percent: 18,
-                provenance: protocol::ValueProvenance {
-                    vendor_reported: true
-                },
-            }
-        ));
-        assert_eq!(
-            report.buckets[0].measure.used_percent_provenance(),
-            Some(protocol::PercentValueProvenance::VendorReported)
-        );
-        assert_eq!(
-            report.buckets[0].measure.remaining_percent_provenance(),
-            Some(protocol::PercentValueProvenance::DerivedComplement)
-        );
-        assert!(matches!(
-            &report.buckets[0].reset,
-            protocol::CapacityReset::At {
-                at_ms: 1_700_000_000_000
-            }
-        ));
-    }
-
-    #[test]
-    fn malformed_or_out_of_range_rate_limit_event_is_typed_and_sanitized() {
-        assert_eq!(
-            map_passive_rate_limit_event(&json!({"rate_limit_info": {
-                "status":"allowed", "rateLimitType":"five_hour", "utilization":1.01
-            }})),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-        assert_eq!(
-            map_passive_rate_limit_event(&json!({"rate_limit_info": {
-                "status":"allowed", "rateLimitType":"five_hour", "resetsAt":"tomorrow"
-            }})),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-        assert_eq!(
-            map_passive_rate_limit_event(&json!({"rate_limit_info": {
-                "status":"allowed", "rateLimitType":"five_hour", "resetsAt":18446744073709551615_u64
-            }})),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-    }
-
-    #[test]
-    fn overage_bucket_uses_vendor_overage_status_and_reset() {
-        let report = map_passive_rate_limit_event(&json!({"rate_limit_info": {
-            "status":"allowed", "rateLimitType":"overage", "utilization":0.5,
-            "overageStatus":"rejected", "overageResetsAt":42
-        }}))
-        .expect("overage event");
-        assert_eq!(
-            report.buckets[0].status,
-            Some(protocol::CapacityBucketStatus::Rejected)
-        );
-        assert!(matches!(
-            &report.buckets[0].reset,
-            protocol::CapacityReset::At { at_ms: 42_000 }
-        ));
-    }
-
-    #[test]
-    fn overage_included_bucket_keeps_its_distinct_vendor_label() {
-        let report = map_passive_rate_limit_event(&json!({"rate_limit_info": {
-            "status":"allowed", "rateLimitType":"seven_day_overage_included"
-        }}))
-        .expect("overage-included event");
-        assert_eq!(report.buckets[0].label, "Fable 5 limit");
-    }
-}
-
 impl Backend for ClaudeBackend {
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
@@ -12876,12 +13352,26 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::ForegroundSubagents,
+            tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+            tyde_agent_adapter::BackendCapability::ReasoningDeltas,
+            tyde_agent_adapter::BackendCapability::TaskUpdates,
+            tyde_agent_adapter::BackendCapability::WorkflowProgress,
+            tyde_agent_adapter::BackendCapability::UserQuestionRequests,
+            tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
+            tyde_agent_adapter::BackendCapability::GenericModifyFile,
+            tyde_agent_adapter::BackendCapability::GenericReadFiles,
+            tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            tyde_agent_adapter::BackendCapability::CapacityTelemetry,
+            tyde_agent_adapter::BackendCapability::RetryTelemetry,
         ]
         .into()
     }
@@ -13047,14 +13537,46 @@ impl Backend for ClaudeBackend {
             ));
         }
 
-        while let Ok(raw) = raw_events.try_recv() {
-            if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None).await
-            {
-                startup_guard.disarm();
-                session.shutdown().await;
-                return Err("Claude resume event stream closed during replay".to_string());
+        loop {
+            match tokio::time::timeout(RESUME_REPLAY_SETTLE_QUIET, raw_events.recv()).await {
+                Ok(Some(raw)) => {
+                    if !forward_claude_backend_event(
+                        raw,
+                        &events_tx,
+                        &backend_session_id_task,
+                        None,
+                    )
+                    .await
+                    {
+                        startup_guard.disarm();
+                        session.shutdown().await;
+                        return Err("Claude resume event stream closed during replay".to_string());
+                    }
+                }
+                Ok(None) => {
+                    startup_guard.disarm();
+                    session.shutdown().await;
+                    return Err("Claude resume event stream closed during replay".to_string());
+                }
+                Err(_) => {
+                    if session
+                        .inner
+                        .await_active_turn_quiesced(RESUME_REPLAY_TURN_QUIESCE)
+                        .await
+                    {
+                        break;
+                    }
+                }
             }
         }
+        eprintln!(
+            "TYDE CLAUDE RESUME REPLAY SETTLED session={}",
+            backend_session_id_task
+                .lock()
+                .expect("Claude backend session id mutex poisoned")
+                .as_ref()
+                .map_or("<none>", |session_id| session_id.0.as_str()),
+        );
         let _ = resume_replay_complete_tx.send(());
         startup_guard.disarm();
 
@@ -13291,15563 +13813,5 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
     let mut ready_tx = ready_tx.lock().await;
     if let Some(tx) = ready_tx.take() {
         let _ = tx.send(result);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::customization::ResolvedSkill;
-    use crate::backend::{Backend, BackendCompactionAvailability};
-    use protocol::{
-        AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
-        BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,
-        HostSettings, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingState,
-        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath, TeamPresetCatalog,
-        ToolExecutionNormalizationFailure, ToolRequestType, Version, WelcomePayload,
-    };
-    use tokio::sync::oneshot;
-    use tokio::time::{Duration, timeout};
-
-    const FAKE_CLAUDE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
-
-    fn make_image(data: &str, media_type: &str) -> ImageAttachment {
-        ImageAttachment {
-            data: data.to_string(),
-            media_type: media_type.to_string(),
-            name: "image".to_string(),
-            size: data.len() as u64,
-        }
-    }
-
-    fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
-        make_test_inner_with_workspace("/tmp/test-workspace".to_string())
-    }
-
-    fn assert_paired_stream_lifecycle(events: &[Value]) {
-        let mut active_message_id = None;
-        for (index, event) in events.iter().enumerate() {
-            match event_kind(event) {
-                Some("StreamStart") => {
-                    let message_id = event
-                        .pointer("/data/message_id")
-                        .and_then(Value::as_str)
-                        .expect("StreamStart message_id");
-                    assert!(
-                        active_message_id.replace(message_id.to_owned()).is_none(),
-                        "event {index} started {message_id} before ending the active stream"
-                    );
-                }
-                Some("StreamDelta" | "StreamReasoningDelta") => {
-                    let message_id = event
-                        .pointer("/data/message_id")
-                        .and_then(Value::as_str)
-                        .expect("stream delta message_id");
-                    assert_eq!(
-                        active_message_id.as_deref(),
-                        Some(message_id),
-                        "event {index} targeted a stream other than the active stream"
-                    );
-                }
-                Some("StreamEnd") => {
-                    let message_id = event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str)
-                        .expect("StreamEnd message_id");
-                    assert_eq!(
-                        active_message_id.take().as_deref(),
-                        Some(message_id),
-                        "event {index} ended a stream other than the active stream"
-                    );
-                }
-                Some("Error") => panic!("event {index} emitted an Error: {event}"),
-                Some("OperationCancelled") => {
-                    panic!("event {index} cancelled a valid stream lifecycle: {event}")
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            active_message_id.is_none(),
-            "stream lifecycle ended with an unterminated message {active_message_id:?}"
-        );
-    }
-
-    fn assert_complete_stream_lifecycle(events: &[Value]) {
-        assert_paired_stream_lifecycle(events);
-        assert!(
-            events.iter().all(|event| {
-                event
-                    .pointer("/data/tool_result/short_message")
-                    .and_then(Value::as_str)
-                    != Some("Tool result missing")
-            }),
-            "valid tool lifecycle was discarded: {events:?}"
-        );
-    }
-
-    fn assert_claude_protocol_valid(events: &[Value]) {
-        let mut validator = ProtocolValidator::new();
-        let host_stream = StreamPath("/host/local".to_string());
-        let agent_stream = StreamPath("/agent/agent-1/instance-1".to_string());
-        let agent_id = AgentId("agent-1".to_string());
-        let new_agent = NewAgentPayload {
-            agent_id: agent_id.clone(),
-            name: "Test Agent".to_string(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Claude,
-            launch_profile_id: None,
-            workspace_roots: vec!["/tmp".to_string()],
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            workflow: None,
-            created_at_ms: 0,
-            instance_stream: agent_stream.clone(),
-            activity_summary: Default::default(),
-        };
-        let welcome = Envelope::from_payload(
-            host_stream.clone(),
-            FrameKind::Welcome,
-            0,
-            &WelcomePayload {
-                protocol_version: PROTOCOL_VERSION,
-                tyde_version: Version {
-                    major: 0,
-                    minor: 0,
-                    patch: 0,
-                },
-                release_version: None,
-            },
-        )
-        .expect("serialize Welcome");
-        validator
-            .validate_envelope(&welcome)
-            .expect("Welcome validates");
-        let bootstrap = Envelope::from_payload(
-            host_stream,
-            FrameKind::HostBootstrap,
-            1,
-            &HostBootstrapPayload {
-                settings: HostSettings {
-                    enabled_backends: vec![BackendKind::Claude],
-                    default_backend: Some(BackendKind::Claude),
-                    enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    tyde_debug_mcp_enabled: false,
-                    tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
-                    complexity_tiers_enabled: false,
-                    backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: Default::default(),
-                    supervisor: Default::default(),
-                    code_intel: Default::default(),
-                    backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
-                    hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
-                },
-                mobile_access: MobileAccessStatePayload {
-                    broker_status: MobileBrokerStatus::Disabled,
-                    pairing: MobilePairingState::Idle,
-                    paired_devices: vec![],
-                },
-                backend_setup: BackendSetupPayload { backends: vec![] },
-                session_schemas: vec![],
-                backend_config_schemas: vec![],
-                backend_config_snapshots: vec![],
-                launch_profile_catalog: Default::default(),
-                sessions: vec![],
-                session_list: Default::default(),
-                projects: vec![],
-                mcp_servers: vec![],
-                skills: vec![],
-                steering: vec![],
-                custom_agents: vec![],
-                team_preset_catalog: TeamPresetCatalog {
-                    role_presets: vec![],
-                    personality_traits: vec![],
-                    personality_presets: vec![],
-                    team_templates: vec![],
-                },
-                team_drafts: vec![],
-                teams: vec![],
-                team_members: vec![],
-                team_member_bindings: vec![],
-                agents: vec![new_agent.clone()],
-                task_token_usages: Vec::new(),
-                workflow_summaries: vec![],
-                workflow_diagnostics: vec![],
-                workflow_runs: vec![],
-                workflow_locations: vec![],
-                agents_view_preferences: None,
-            },
-        )
-        .expect("serialize HostBootstrap");
-        validator
-            .validate_envelope(&bootstrap)
-            .expect("HostBootstrap validates");
-        let agent_bootstrap = Envelope::from_payload(
-            agent_stream.clone(),
-            FrameKind::AgentBootstrap,
-            0,
-            &AgentBootstrapPayload {
-                events: vec![AgentBootstrapEvent::AgentStart(AgentStartPayload {
-                    agent_id,
-                    name: new_agent.name,
-                    origin: new_agent.origin,
-                    backend_kind: new_agent.backend_kind,
-                    launch_profile_id: None,
-                    workspace_roots: new_agent.workspace_roots,
-                    custom_agent_id: new_agent.custom_agent_id,
-                    team_id: new_agent.team_id,
-                    team_member_id: new_agent.team_member_id,
-                    project_id: new_agent.project_id,
-                    parent_agent_id: new_agent.parent_agent_id,
-                    session_id: None,
-                    workflow: None,
-                    created_at_ms: new_agent.created_at_ms,
-                })],
-                latest_output: Default::default(),
-                turn_active: false,
-            },
-        )
-        .expect("serialize AgentBootstrap");
-        validator
-            .validate_envelope(&agent_bootstrap)
-            .expect("AgentBootstrap validates");
-
-        for (index, event) in events.iter().enumerate() {
-            match event_kind(event) {
-                Some("Error") => panic!("event {index} emitted a backend Error: {event}"),
-                Some("OperationCancelled") => {
-                    panic!("event {index} cancelled the Claude lifecycle: {event}")
-                }
-                _ => {}
-            }
-            let chat_event: ChatEvent =
-                serde_json::from_value(event.clone()).unwrap_or_else(|error| {
-                    panic!(
-                        "event {index} with kind {:?} is not valid ChatEvent JSON: {error}",
-                        event_kind(event)
-                    )
-                });
-            let envelope = Envelope::from_payload(
-                agent_stream.clone(),
-                FrameKind::ChatEvent,
-                index as u64 + 1,
-                &chat_event,
-            )
-            .expect("serialize ChatEvent");
-            validator
-                .validate_envelope(&envelope)
-                .unwrap_or_else(|error| panic!("event {index} violates protocol: {error}"));
-        }
-    }
-
-    fn test_parent_emitter() -> (Arc<TurnEmitter>, mpsc::UnboundedReceiver<Value>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Arc::new(TurnEmitter::new_for_agent(tx, AgentName(CLAUDE_AGENT_NAME))),
-            rx,
-        )
-    }
-
-    fn make_test_inner_with_workspace(
-        workspace_root: String,
-    ) -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let inner = ClaudeInner {
-            emitter: Arc::new(TurnEmitter::new_for_agent(
-                event_tx,
-                AgentName(CLAUDE_AGENT_NAME),
-            )),
-            state: Mutex::new(ClaudeState {
-                workspace_root,
-                ssh_host: None,
-                session_id: None,
-                fork_from_session_id: None,
-                start_session_fresh: false,
-                ephemeral: false,
-                model: None,
-                effort: None,
-                permission_mode: None,
-                startup_mcp_config_json: None,
-                steering_content: None,
-                agent_identity: None,
-                tool_policy: ToolPolicy::Unrestricted,
-                skill_plugin: None,
-                expected_skills: Vec::new(),
-                skill_verification_generation: 0,
-                skill_watchdog: None,
-                cumulative_usage: None,
-                cumulative_usage_complete: true,
-                conversation_bytes_total: 0,
-                active_turn: None,
-                compaction_capability: BackendCompactionCapability::unknown(
-                    BackendCompactionUnknownReason::ProcessNotInitialized,
-                    None,
-                    BackendCompactionCapabilityEvidence::None,
-                ),
-                compact_command_advertised: None,
-                installed_provider_version: None,
-                provider_version: None,
-                process_generation: 0,
-                pending_compaction: None,
-                closing: false,
-                restart_process_after_turn: false,
-                subagent_emitter: None,
-                capacity_access: ClaudeCapacityAccess::Unknown,
-                capacity_refresh_in_flight: false,
-                capacity_report_emitted: false,
-                authoritative_capacity_emitted: false,
-            }),
-            runtime: Mutex::new(None),
-            turn_event_gate: Mutex::new(()),
-            task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-            background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
-            skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
-            skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
-            pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-            background_work_active: std::sync::atomic::AtomicBool::new(false),
-            typing_active: std::sync::atomic::AtomicBool::new(false),
-        };
-        (inner, event_rx)
-    }
-
-    #[test]
-    fn malformed_canonical_claude_request_marks_its_completion() {
-        let (inner, mut rx) = make_test_inner();
-        let tool_call = ClaudeToolCall {
-            id: "claude-normalization".to_owned(),
-            name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
-            arguments: json!({ "agent_id": "agent-a" }),
-        };
-
-        inner.emit_tool_request(&tool_call);
-        inner.emit_tool_execution_completed(
-            &tool_call.id,
-            &tool_call.name,
-            true,
-            json!({ "kind": "Other", "result": { "ok": true } }),
-            None,
-        );
-
-        let mut fallback_request = None;
-        let mut completion = None;
-        while let Ok(raw) = rx.try_recv() {
-            if !matches!(
-                raw.get("kind").and_then(Value::as_str),
-                Some("ToolRequest" | "ToolExecutionCompleted")
-            ) {
-                continue;
-            }
-            let event: ChatEvent =
-                serde_json::from_value(raw).expect("Claude emitter event is a ChatEvent");
-            match event {
-                ChatEvent::ToolRequest(request) => fallback_request = Some(request),
-                ChatEvent::ToolExecutionCompleted(data) => completion = Some(data),
-                _ => {}
-            }
-        }
-        assert!(matches!(
-            fallback_request.expect("fallback tool request").tool_type,
-            ToolRequestType::Other { .. }
-        ));
-        assert_eq!(
-            completion
-                .expect("marked tool completion")
-                .normalization_failure,
-            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
-        );
-    }
-
-    #[test]
-    fn claude_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
-        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
-
-        assert!(Path::new(&root).is_dir());
-        assert!(Path::new(&root).ends_with(Path::new(".tyde").join("claude").join("no-root")));
-    }
-
-    #[test]
-    fn claude_pick_workspace_root_keeps_ssh_only_roots_invalid() {
-        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
-            .expect_err("ssh-only local roots should remain invalid");
-
-        assert!(err.contains("requires at least one local workspace root"));
-    }
-
-    #[tokio::test]
-    async fn cancel_active_turn_waits_until_idle_is_published() {
-        let (inner, mut rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        let (outcome_tx, _outcome_rx) = oneshot::channel();
-
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 42,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-
-        let (done_tx, mut done_rx) = oneshot::channel();
-        let cancel_inner = Arc::clone(&inner);
-        tokio::spawn(async move {
-            cancel_inner.cancel_active_turn().await;
-            let _ = done_tx.send(());
-        });
-
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if inner
-                    .state
-                    .lock()
-                    .await
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|active| active.interrupt_requested)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("interrupt flag should be set");
-        assert!(
-            timeout(Duration::from_millis(50), &mut done_rx)
-                .await
-                .is_err(),
-            "interrupt must not resolve while active_turn is still set"
-        );
-
-        let waiters = inner.clear_active_turn(42).await;
-        assert!(
-            inner.state.lock().await.active_turn.is_none(),
-            "active turn should be cleared before publishing idle"
-        );
-        assert!(
-            timeout(Duration::from_millis(50), &mut done_rx)
-                .await
-                .is_err(),
-            "interrupt must not resolve before OperationCancelled publishes idle"
-        );
-
-        inner.emit_operation_cancelled("Claude turn cancelled.");
-        assert!(
-            timeout(Duration::from_millis(50), &mut done_rx)
-                .await
-                .is_err(),
-            "interrupt must not resolve before quiescence waiters are notified"
-        );
-        notify_turn_quiesced(waiters);
-
-        timeout(Duration::from_secs(1), done_rx)
-            .await
-            .expect("interrupt should resolve after idle is published")
-            .expect("interrupt completion channel should stay open");
-        let cancelled = rx.recv().await.expect("cancelled event");
-        assert_eq!(event_kind(&cancelled), Some("OperationCancelled"));
-        let idle = rx.recv().await.expect("idle event");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
-        assert!(
-            rx.try_recv().is_err(),
-            "cancelled turn should emit one idle"
-        );
-    }
-
-    #[tokio::test]
-    async fn operation_cancelled_after_mid_turn_stream_start_synthesizes_stream_end() {
-        // Regression: when a cancel arrives after a mid-turn segment StreamStart
-        // but before any content for that segment was emitted, the backend used
-        // to emit OperationCancelled with no closing StreamEnd. That tripped
-        // the protocol validator on the next turn's StreamStart. Per the
-        // protocol spec (ChatEvent::OperationCancelled doc), cancel must first
-        // close any open stream.
-        let (inner, mut rx) = make_test_inner();
-        inner.emit_stream_start("claude-msg-1-seg-1", None);
-        let _ = rx.recv().await.expect("stream_start");
-        inner.emit_operation_cancelled("Claude turn cancelled.");
-        let first = rx.recv().await.expect("first event after cancel");
-        assert_eq!(event_kind(&first), Some("StreamEnd"));
-        let second = rx.recv().await.expect("second event after cancel");
-        assert_eq!(event_kind(&second), Some("OperationCancelled"));
-    }
-
-    #[tokio::test]
-    async fn terminal_cancel_emits_stream_end_then_tool_completed_then_cancelled() {
-        // Full spec ordering: mid-turn, a segment StreamStart fires and a
-        // tool_use arrives. Cancel races before the tool executes. The
-        // terminal handler must emit events in this exact order:
-        //   StreamEnd → ToolExecutionCompleted → OperationCancelled
-        // (see ChatEvent docs in protocol/src/types.rs).
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        // Previous phase emitted a StreamEnd — simulate its effect.
-        summary.emitted_phase_count = 1;
-        // Mid-turn, Claude starts a new segment.
-        inner.emit_stream_start("claude-msg-1-seg-1", None);
-        let _ = rx.recv().await;
-
-        // Inject an unresolved tool request for that segment.
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": "toolu_cancelled",
-                        "name": "Bash",
-                        "input": { "command": "sleep 9999" }
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        // Drain anything consume_claude_stream_value emitted (nothing expected
-        // here, but don't leak into the cancel sequence below).
-        while rx.try_recv().is_ok() {}
-
-        // Cancel fires the terminal path.
-        inner
-            .emit_terminal_phase_or_placeholder(
-                &mut summary,
-                ClaudeTerminalPhaseOptions {
-                    turn_id: 1,
-                    cancelled: true,
-                    ..ClaudeTerminalPhaseOptions::default()
-                },
-            )
-            .await;
-        inner.emit_operation_cancelled("Claude turn cancelled.");
-
-        let first = rx.recv().await.expect("first");
-        assert_eq!(event_kind(&first), Some("StreamEnd"));
-        let second = rx.recv().await.expect("second");
-        assert_eq!(event_kind(&second), Some("ToolRequest"));
-        let third = rx.recv().await.expect("third");
-        assert_eq!(event_kind(&third), Some("ToolExecutionCompleted"));
-        assert_eq!(
-            third
-                .pointer("/data/tool_result/kind")
-                .and_then(Value::as_str),
-            Some("Cancelled")
-        );
-        assert_eq!(
-            third.pointer("/data/success").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(third.pointer("/data/tool_result/exit_code").is_none());
-        assert!(third.pointer("/data/tool_result/stderr").is_none());
-        let fourth = rx.recv().await.expect("fourth");
-        assert_eq!(event_kind(&fourth), Some("OperationCancelled"));
-    }
-
-    #[tokio::test]
-    async fn interrupt_control_prose_is_not_fabricated_as_command_failure() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-cancel".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu-interrupted-bash",
-                        "name": "Bash",
-                        "input": {"command": "sleep 9999"}
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_claude_stream_value_with_interrupt(
-            &json!({
-                "type": "user",
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu-interrupted-bash",
-                        "is_error": true,
-                        "content": "You have 8168 weighted tokens left"
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-            true,
-        );
-
-        assert!(
-            summary
-                .unresolved_tool_requests
-                .contains_key("toolu-interrupted-bash"),
-            "the cancellation tail must retain ownership of the pending tool"
-        );
-        inner
-            .emit_terminal_phase_or_placeholder(
-                &mut summary,
-                ClaudeTerminalPhaseOptions {
-                    turn_id: 1,
-                    cancelled: true,
-                    ..ClaudeTerminalPhaseOptions::default()
-                },
-            )
-            .await;
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let completions = events
-            .iter()
-            .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-            .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 1);
-        assert_eq!(
-            completions[0]
-                .pointer("/data/tool_result/kind")
-                .and_then(Value::as_str),
-            Some("Cancelled")
-        );
-        let encoded = completions[0].to_string();
-        assert!(!encoded.contains("weighted tokens"));
-        assert!(!encoded.contains("exit_code"));
-        assert!(!encoded.contains("stderr"));
-    }
-
-    #[tokio::test]
-    async fn operation_cancelled_without_open_stream_does_not_synthesize_stream_end() {
-        let (inner, mut rx) = make_test_inner();
-        inner.emit_operation_cancelled("Claude turn cancelled.");
-        // Protocol contract: cancel without an open stream emits the
-        // OperationCancelled → TypingStatusChanged(false) tail only —
-        // no synthesized StreamEnd.
-        let first = rx.recv().await.expect("OperationCancelled");
-        assert_eq!(event_kind(&first), Some("OperationCancelled"));
-        let second = rx.recv().await.expect("TypingStatusChanged");
-        assert_eq!(event_kind(&second), Some("TypingStatusChanged"));
-        assert!(rx.try_recv().is_err(), "no synthesized StreamEnd expected");
-    }
-
-    #[test]
-    fn claude_optional_session_settings_have_no_schema_defaults() {
-        let schema = ClaudeBackend::session_settings_schema();
-
-        let model_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("Claude schema should include model");
-        let effort_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "effort")
-            .expect("Claude schema should include effort");
-
-        match &model_field.field_type {
-            SessionSettingFieldType::Select {
-                default, nullable, ..
-            } => {
-                assert!(*nullable, "Claude model should remain optional");
-                assert_eq!(
-                    default, &None,
-                    "Claude model should stay unset until explicitly chosen"
-                );
-            }
-            other => panic!("expected Claude model field to be Select, got {other:?}"),
-        }
-
-        match &effort_field.field_type {
-            SessionSettingFieldType::Select {
-                options,
-                default,
-                nullable,
-            } => {
-                assert!(*nullable, "Claude effort should remain optional");
-                assert_eq!(
-                    default, &None,
-                    "Claude effort should stay unset until explicitly chosen"
-                );
-                assert_eq!(
-                    options
-                        .iter()
-                        .map(|option| (option.value.as_str(), option.label.as_str()))
-                        .collect::<Vec<_>>(),
-                    vec![
-                        ("low", "Low"),
-                        ("medium", "Medium"),
-                        ("high", "High"),
-                        ("xhigh", "XHigh"),
-                        ("max", "Max"),
-                    ]
-                );
-            }
-            other => panic!("expected Claude effort field to be Select, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn claude_resolve_session_settings_leaves_optional_fields_unset_by_default() {
-        let resolved = resolve_session_settings(&BackendSpawnConfig::default());
-        assert!(
-            resolved.0.is_empty(),
-            "Claude should not inject model or effort when the user left them unset"
-        );
-    }
-
-    #[test]
-    fn claude_cost_hint_still_sets_explicit_session_settings() {
-        let resolved = resolve_session_settings(&BackendSpawnConfig {
-            cost_hint: Some(SpawnCostHint::Low),
-            ..BackendSpawnConfig::default()
-        });
-
-        assert_eq!(
-            resolved.0.get("model"),
-            Some(&SessionSettingValue::String("haiku".to_string()))
-        );
-        assert_eq!(
-            resolved.0.get("effort"),
-            Some(&SessionSettingValue::String("low".to_string()))
-        );
-
-        let resolved = resolve_session_settings(&BackendSpawnConfig {
-            cost_hint: Some(SpawnCostHint::High),
-            ..BackendSpawnConfig::default()
-        });
-
-        assert_eq!(
-            resolved.0.get("model"),
-            Some(&SessionSettingValue::String("opus".to_string()))
-        );
-        assert_eq!(
-            resolved.0.get("effort"),
-            Some(&SessionSettingValue::String("max".to_string()))
-        );
-    }
-
-    #[test]
-    fn claude_medium_cost_hint_is_a_no_op() {
-        let resolved = resolve_session_settings(&BackendSpawnConfig {
-            cost_hint: Some(SpawnCostHint::Medium),
-            ..BackendSpawnConfig::default()
-        });
-
-        assert_eq!(resolved.0.get("model"), None);
-        assert_eq!(resolved.0.get("effort"), None);
-    }
-
-    #[test]
-    fn claude_read_only_access_mode_keeps_unrestricted_permissions() {
-        assert_eq!(
-            claude_permission_mode_for_access_mode(BackendAccessMode::ReadOnly),
-            "bypassPermissions"
-        );
-        assert_eq!(
-            claude_permission_mode_for_access_mode(BackendAccessMode::Unrestricted),
-            "bypassPermissions"
-        );
-    }
-
-    #[test]
-    fn claude_read_only_steering_includes_shared_advisory() {
-        let steering = claude_steering_content(
-            &BackendSpawnConfig {
-                resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                    access_mode: BackendAccessMode::ReadOnly,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ClaudeSkillSteering::None,
-        )
-        .expect("steering")
-        .expect("read-only advisory");
-
-        assert!(steering.contains("Backend access mode is read-only (best effort)"));
-        assert!(steering.contains("do not create, edit, or delete files"));
-    }
-
-    /// A spawn config with only the fields a skill test cares about set.
-    fn skill_spawn_config(skill_plugin_root: Option<String>) -> ClaudeProcessSpawnConfig {
-        ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: None,
-            fork_from_session_id: None,
-            resume_existing_session: false,
-            ephemeral: false,
-            model: None,
-            effort: None,
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root,
-        }
-    }
-
-    fn skill_fixture(dir: &std::path::Path, name: &str, body: &str) -> ResolvedSkill {
-        let source_dir = dir.join(name);
-        std::fs::create_dir_all(&source_dir).expect("create skill dir");
-        let skill_md_path = source_dir.join("SKILL.md");
-        std::fs::write(&skill_md_path, body).expect("write SKILL.md");
-        // `path_only` is the only public constructor: a natively discovered
-        // skill carries locations, never text. The fixture used to pass an
-        // empty body, which said the same thing less precisely.
-        ResolvedSkill::path_only(
-            protocol::Skill {
-                id: protocol::SkillId(name.to_string()),
-                name: name.to_string(),
-                title: None,
-                description: Some(format!("{name} summary")),
-            },
-            source_dir,
-            skill_md_path,
-        )
-    }
-
-    fn prepared_wrapper_frontmatter(
-        exposure: &ClaudeSkillExposure,
-        wrapper_name: &str,
-    ) -> serde_yaml::Mapping {
-        let plugin = exposure.plugin.as_ref().expect("prepared plugin");
-        let raw = std::fs::read_to_string(
-            plugin
-                .root()
-                .join("skills")
-                .join(wrapper_name)
-                .join("SKILL.md"),
-        )
-        .expect("prepared wrapper");
-        let rest = raw.strip_prefix("---\n").expect("frontmatter opener");
-        let (frontmatter, _) = rest.split_once("\n---\n").expect("frontmatter closer");
-        match serde_yaml::from_str(frontmatter).expect("valid wrapper YAML") {
-            serde_yaml::Value::Mapping(mapping) => mapping,
-            other => panic!("wrapper frontmatter is not a mapping: {other:?}"),
-        }
-    }
-
-    fn spawn_config_with_skills(
-        skills: Vec<ResolvedSkill>,
-        skill_selection: SkillSelection,
-    ) -> BackendSpawnConfig {
-        BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                skills,
-                skill_selection,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    fn prepared(name: &str) -> PreparedSkill {
-        PreparedSkill {
-            name: name.to_string(),
-            namespaced: format!("tyde-skills:{name}"),
-            source_name: name.to_string(),
-            description: Some(format!("{name} summary")),
-        }
-    }
-
-    #[test]
-    fn claude_cli_args_pass_the_session_plugin_root_with_the_documented_flag() {
-        let args = build_claude_cli_args(&skill_spawn_config(Some(
-            "/tmp/tyde-claude-skills-abc".to_string(),
-        )));
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--plugin-dir" && pair[1] == "/tmp/tyde-claude-skills-abc"),
-            "expected the documented plugin flag, got {args:?}"
-        );
-        assert!(
-            !args.iter().any(|arg| arg == "--plugin-dir-no-mcp"),
-            "the undocumented flag cannot be probed, so it is not used: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|arg| arg == "--add-dir"),
-            "the plugin root must not also be granted as a filesystem root"
-        );
-    }
-
-    #[test]
-    fn claude_cli_args_omit_the_plugin_flag_without_a_root() {
-        let args = build_claude_cli_args(&skill_spawn_config(None));
-
-        assert!(
-            !args.iter().any(|arg| arg.starts_with("--plugin-dir")),
-            "a session with no exposed skill must not point the CLI at a root: {args:?}"
-        );
-    }
-
-    #[test]
-    fn default_sessions_get_guidance_without_bodies_or_enumeration() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![
-            skill_fixture(
-                tmp.path(),
-                "alpha",
-                "---\nname: alpha\n---\nBODYMARK-11aa22\n",
-            ),
-            skill_fixture(
-                tmp.path(),
-                "beta",
-                "---\nname: beta\n---\nBODYMARK-33bb44\n",
-            ),
-        ];
-        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
-
-        let steering = claude_steering_content(
-            &config,
-            ClaudeSkillSteering::Native(
-                SkillSelection::AllInstalled,
-                vec![prepared("alpha"), prepared("beta")],
-            ),
-        )
-        .expect("steering")
-        .expect("skill guidance");
-
-        assert!(steering.contains("tyde-skills:<name>"));
-        assert!(
-            !steering.contains("BODYMARK-11aa22") && !steering.contains("BODYMARK-33bb44"),
-            "no body may reach the system prompt: {steering}"
-        );
-        assert!(
-            !steering.contains("Skill: "),
-            "the legacy per-skill block must be gone: {steering}"
-        );
-        assert!(
-            !steering.contains("alpha") && !steering.contains("beta"),
-            "the Default overlay must not enumerate installed skills: {steering}"
-        );
-    }
-
-    #[test]
-    fn explicit_selections_name_their_skills_without_bodies() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "lint",
-            "---\nname: lint\n---\nBODYMARK-55cc66\n",
-        )];
-        let config = spawn_config_with_skills(skills, SkillSelection::Explicit);
-
-        let steering = claude_steering_content(
-            &config,
-            ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("lint")]),
-        )
-        .expect("steering")
-        .expect("skill listing");
-
-        assert!(steering.contains("lint"), "{steering}");
-        assert!(steering.contains("lint summary"), "{steering}");
-        assert!(!steering.contains("BODYMARK-55cc66"), "{steering}");
-        assert!(!steering.contains("Skill: "), "{steering}");
-    }
-
-    #[test]
-    fn the_overlay_names_only_skills_that_actually_materialized() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![
-            skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n"),
-            skill_fixture(tmp.path(), "broken", "---\nname: broken\n---\nbody\n"),
-        ];
-        let config = spawn_config_with_skills(skills, SkillSelection::Explicit);
-
-        // `broken` was selected but refused; only `good` was prepared.
-        let steering = claude_steering_content(
-            &config,
-            ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("good")]),
-        )
-        .expect("steering")
-        .expect("skill listing");
-
-        assert!(steering.contains("good"), "{steering}");
-        assert!(
-            !steering.contains("broken"),
-            "a refused skill must never be advertised to the model: {steering}"
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_exposed_skill_emits_no_skill_section() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nBODYMARK-77dd88\n",
-        )];
-        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
-
-        assert!(
-            claude_steering_content(&config, ClaudeSkillSteering::None)
-                .expect("steering")
-                .is_none(),
-            "a refused-everything session must not invent a skills section"
-        );
-    }
-
-    /// A fake `claude` that answers only the two zero-provider local commands
-    /// `claude_prepare_skills` runs: `--help` (capability probe) and
-    /// `plugin list --json` (pre-start inventory).
-    ///
-    /// Every `claude_prepare_skills` test goes through this, so none of them
-    /// depends on a Claude CLI being installed, on its version, or on the user's
-    /// real plugin configuration. `--plugin-dir <root>` is echoed straight back
-    /// as the loaded plugin's `installPath`, which is what the real CLI reports.
-    #[cfg(unix)]
-    struct FakeClaudeCli {
-        _workspace: tempfile::TempDir,
-        _claude_home: tempfile::TempDir,
-        workspace_root: String,
-        previous_bin: Option<std::ffi::OsString>,
-        previous_config_dir: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl FakeClaudeCli {
-        /// `supports_plugin_dir` controls the `--help` answer; `inventory`
-        /// controls what `plugin list --json` prints (`None` = report the root
-        /// that was passed, which is the success case).
-        fn install(supports_plugin_dir: bool, inventory: Option<&str>) -> Self {
-            let workspace = tempfile::tempdir().expect("workspace tempdir");
-            let claude_home = tempfile::tempdir().expect("claude home tempdir");
-            let fake = workspace.path().join("fake-claude-prepare.py");
-            let help_line = if supports_plugin_dir {
-                "  --plugin-dir <path>   Load a plugin from a directory"
-            } else {
-                "  --add-dir <path>      Additional directories"
-            };
-            // Both are emitted as JSON string literals, which are also valid
-            // Python literals, so nothing in a path or a fixture can break the
-            // generated script.
-            let quoted_help = serde_json::to_string(help_line).expect("quote help line");
-            let inventory_expr = match inventory {
-                Some(literal) => serde_json::to_string(literal).expect("quote inventory"),
-                None => "json.dumps([{\"id\": \"tyde-skills@inline\", \"version\": \"0.0.0\", \
-                         \"scope\": \"session\", \"enabled\": True, \"installPath\": plugin_dir}])"
-                    .to_string(),
-            };
-            std::fs::write(
-                &fake,
-                format!(
-                    r#"#!/usr/bin/env python3
-import json
-import sys
-
-argv = sys.argv[1:]
-plugin_dir = None
-if "--plugin-dir" in argv:
-    plugin_dir = argv[argv.index("--plugin-dir") + 1]
-
-if "--help" in argv:
-    print("Usage: claude [options]")
-    print({quoted_help})
-    sys.exit(0)
-
-if "plugin" in argv and "list" in argv:
-    print({inventory_expr})
-    sys.exit(0)
-
-sys.exit(1)
-"#,
-                    quoted_help = quoted_help,
-                    inventory_expr = inventory_expr,
-                ),
-            )
-            .expect("write fake claude");
-            make_executable(&fake);
-
-            let previous_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-            let previous_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-            unsafe {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-                std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-            }
-            let workspace_root = workspace.path().to_string_lossy().to_string();
-            Self {
-                _workspace: workspace,
-                _claude_home: claude_home,
-                workspace_root,
-                previous_bin,
-                previous_config_dir,
-            }
-        }
-
-        fn workspace(&self) -> &str {
-            &self.workspace_root
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for FakeClaudeCli {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous_bin.take() {
-                    Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
-                    None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
-                }
-                match self.previous_config_dir.take() {
-                    Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_explicit_selection_with_full_frontmatter_prepares_successfully() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(true, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let incident = skill_fixture(
-            tmp.path(),
-            "axdb-ops",
-            concat!(
-                "---\n",
-                "name: source-name\n",
-                "allowed-tools: [Read, Grep, \"Bash(git *)\"]\n",
-                "user-invocable: true\n",
-                "hooks:\n",
-                "  PreToolUse:\n",
-                "    - matcher: Bash\n",
-                "      hooks: [{type: command, command: echo checked}]\n",
-                "some-future-field: {enabled: false}\n",
-                "---\n",
-                "body\n"
-            ),
-        );
-        let config = spawn_config_with_skills(vec![incident], SkillSelection::Explicit);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert_eq!(exposure.expected, ["tyde-skills:axdb-ops"]);
-        assert!(exposure.degraded_notice.is_none());
-        assert_eq!(
-            prepared_wrapper_frontmatter(&exposure, "axdb-ops")
-                .get("description")
-                .and_then(|value| value.as_str()),
-            Some("axdb-ops summary"),
-            "Explicit preparation must inject the real store description fallback"
-        );
-        match steering {
-            ClaudeSkillSteering::Native(SkillSelection::Explicit, prepared) => {
-                assert_eq!(prepared.len(), 1);
-                assert_eq!(prepared[0].name, "axdb-ops");
-            }
-            other => panic!("expected explicit native steering, got {other:?}"),
-        }
-    }
-
-    /// An explicit selection degrades like every other one. A custom agent short
-    /// a skill is still the agent the user asked for, and refusing to start
-    /// takes away the whole session over one unreadable file — so the skill is
-    /// dropped, named, and the reason kept.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_explicit_selection_degrades_visibly_rather_than_refusing_to_start() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(true, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(
-            tmp.path(),
-            "broken",
-            "---\nname: broken\nsequence: [never closed\n---\nb\n",
-        );
-        let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert!(exposure.plugin.is_none());
-        assert!(exposure.expected.is_empty());
-        let notice = exposure
-            .degraded_notice
-            .as_deref()
-            .expect("dropping an explicitly selected skill must be user-visible");
-        assert!(notice.contains("broken"), "{notice}");
-        assert!(
-            notice.contains("not valid YAML"),
-            "the notice must keep the reason, not just the name: {notice}"
-        );
-        assert!(
-            matches!(steering, ClaudeSkillSteering::None),
-            "a skill that was not materialized must not be named to the model: {steering:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_default_selection_degrades_visibly_and_keeps_the_rest() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(true, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let good = skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n");
-        let broken = skill_fixture(tmp.path(), "broken", "---\njust a scalar\n---\nbody\n");
-        let config = spawn_config_with_skills(vec![good, broken], SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert_eq!(exposure.expected, ["tyde-skills:good"]);
-        let notice = exposure
-            .degraded_notice
-            .as_deref()
-            .expect("degradation must be user-visible");
-        assert!(notice.contains("broken"), "{notice}");
-        assert!(notice.contains("not a YAML mapping"), "{notice}");
-        assert!(
-            !notice.contains("'good'"),
-            "a skill that worked must not be reported as omitted: {notice}"
-        );
-        match steering {
-            ClaudeSkillSteering::Native(_, prepared) => {
-                assert_eq!(prepared.len(), 1);
-                assert_eq!(prepared[0].name, "good");
-            }
-            other => panic!("expected native steering, got {other:?}"),
-        }
-        assert_eq!(
-            prepared_wrapper_frontmatter(&exposure, "good")
-                .get("description")
-                .and_then(|value| value.as_str()),
-            Some("good summary"),
-            "Default preparation must inject the real store description fallback"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_default_selection_with_nothing_usable_still_reports_why() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(true, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(
-            tmp.path(),
-            "broken",
-            "---\nname: broken\nbody without a closing delimiter\n",
-        );
-        let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert!(exposure.plugin.is_none());
-        assert!(exposure.expected.is_empty());
-        assert!(
-            exposure
-                .degraded_notice
-                .as_deref()
-                .expect("a notice")
-                .contains("broken"),
-            "starting with no skills must never be silent"
-        );
-        assert!(
-            exposure
-                .degraded_notice
-                .as_deref()
-                .expect("a notice")
-                .contains("never closed")
-        );
-        assert!(matches!(steering, ClaudeSkillSteering::None));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_cli_without_plugin_dir_starts_without_skills_rather_than_inlining() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(false, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
-        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert!(exposure.expected.is_empty());
-        assert!(matches!(steering, ClaudeSkillSteering::None));
-        let notice = exposure
-            .degraded_notice
-            .as_deref()
-            .expect("an incapable CLI must be reported, not silently tolerated");
-        assert!(notice.contains("--plugin-dir"), "{notice}");
-        assert!(
-            notice.contains("will not fall back"),
-            "the notice must say there is no body-inlining fallback: {notice}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_preflight_that_does_not_report_our_root_starts_without_skills() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        // The CLI claims to have loaded the plugin from somewhere else.
-        let cli = FakeClaudeCli::install(
-            true,
-            Some(
-                r#"[{"id": "tyde-skills@inline", "enabled": true, "installPath": "/definitely/elsewhere"}]"#,
-            ),
-        );
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
-        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        // A plugin loaded from elsewhere is not this session's, so the session
-        // must not claim these skills — but it still starts, and says why.
-        assert!(exposure.expected.is_empty());
-        assert!(matches!(steering, ClaudeSkillSteering::None));
-        let notice = exposure.degraded_notice.as_deref().expect("a notice");
-        assert!(
-            notice.contains("could not resolve") || notice.contains("not from this session's root"),
-            "{notice}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_preflight_reporting_plugin_errors_starts_without_skills() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(
-            true,
-            Some(
-                r#"[{"id": "tyde-skills@inline", "enabled": true, "errors": ["skill alpha is invalid"]}]"#,
-            ),
-        );
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
-        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert!(exposure.expected.is_empty());
-        assert!(matches!(steering, ClaudeSkillSteering::None));
-        let notice = exposure
-            .degraded_notice
-            .as_deref()
-            .expect("reported problems must reach the user");
-        assert!(notice.contains("problem(s) loading"), "{notice}");
-        assert!(
-            notice.contains("skill alpha is invalid"),
-            "the CLI's own complaint must survive into the notice: {notice}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_local_session_is_never_changed_by_a_remote_looking_root() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let cli = FakeClaudeCli::install(true, None);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nBODYMARK-eeff00\n",
-        )];
-        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
-
-        // Remoteness is the ssh host the low-level spawn was given, not the
-        // shape of the workspace roots. `None` here means local, and a local
-        // session gets native discovery whatever the roots look like.
-        let (_, steering) = claude_prepare_skills(&config, None, cli.workspace()).await;
-
-        assert!(
-            matches!(steering, ClaudeSkillSteering::Native(..)),
-            "a local session must use native discovery, got {steering:?}"
-        );
-    }
-
-    /// Remote Claude sessions cannot have native skills, and Tyde no longer
-    /// pretends otherwise: there is no inline-body fallback, because the branch
-    /// that claimed to provide one was unreachable from every production entry
-    /// point. The session runs on the remote host without them and says so,
-    /// rather than making a remote workspace unusable to a skill-bearing agent.
-    #[tokio::test]
-    async fn a_remote_skill_bearing_session_starts_without_skills_and_says_so() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nb\n",
-        )];
-        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
-
-        // No fake CLI needed: this decides before any local command runs.
-        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp").await;
-
-        assert!(exposure.plugin.is_none());
-        assert!(exposure.expected.is_empty());
-        assert!(
-            matches!(steering, ClaudeSkillSteering::None),
-            "the model must not be told about skills the remote CLI cannot read: {steering:?}"
-        );
-        let notice = exposure.degraded_notice.as_deref().expect("a notice");
-        assert!(notice.contains("build-host"), "{notice}");
-        assert!(
-            !notice.contains("Skill: "),
-            "no inline-body fallback is offered: {notice}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_remote_session_without_skills_is_unaffected() {
-        let config = spawn_config_with_skills(Vec::new(), SkillSelection::AllInstalled);
-
-        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp").await;
-
-        assert!(exposure.plugin.is_none());
-        assert!(matches!(steering, ClaudeSkillSteering::None));
-    }
-    #[test]
-    fn init_frame_skills_distinguish_absent_from_malformed() {
-        let with_skills = json!({
-            "type": "system",
-            "subtype": "init",
-            "skills": ["tyde-skills:alpha", "code-review"],
-        });
-        assert_eq!(
-            claude_init_frame_skills(&with_skills),
-            Some(Ok(Some(vec![
-                "tyde-skills:alpha".to_string(),
-                "code-review".to_string()
-            ])))
-        );
-
-        assert_eq!(
-            claude_init_frame_skills(&json!({"type": "system", "subtype": "init"})),
-            Some(Ok(None)),
-            "an init frame with no skills field is reported as absent, not as empty"
-        );
-
-        let not_an_array = claude_init_frame_skills(&json!({
-            "type": "system", "subtype": "init", "skills": "alpha",
-        }));
-        assert!(
-            matches!(not_an_array, Some(Err(ref m)) if m.contains("not an array")),
-            "{not_an_array:?}"
-        );
-
-        let not_strings = claude_init_frame_skills(&json!({
-            "type": "system", "subtype": "init", "skills": [1, 2],
-        }));
-        assert!(
-            matches!(not_strings, Some(Err(ref m)) if m.contains("not a string")),
-            "{not_strings:?}"
-        );
-
-        assert_eq!(
-            claude_init_frame_skills(&json!({"type": "system", "subtype": "status"})),
-            None
-        );
-        assert_eq!(
-            claude_init_frame_skills(&json!({"type": "assistant", "skills": ["x"]})),
-            None,
-            "only the CLI's own init frame reports loaded skills"
-        );
-    }
-
-    /// Build an inner whose session expects `expected`, as materialization would.
-    async fn inner_expecting_skills(
-        expected: &[&str],
-    ) -> (Arc<ClaudeInner>, mpsc::UnboundedReceiver<Value>) {
-        let (inner, rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        // The same call `spawn_with_mode` makes. Setting `expected_skills` by
-        // hand and then nudging readiness separately is what let the harness
-        // report a state production never produces.
-        inner
-            .arm_skill_verification(expected.iter().map(|name| name.to_string()).collect())
-            .await;
-        (inner, rx)
-    }
-
-    /// Drain the emitter and return the text of every user-visible notice.
-    fn drained_notices(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
-        let mut notices = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            assert_ne!(
-                event_kind(&event),
-                Some("Error"),
-                "a skill gap is a notice, not a failed turn: {event}"
-            );
-            if event_kind(&event) == Some("SubprocessStderr") {
-                notices.push(
-                    event
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                );
-            }
-        }
-        notices
-    }
-
-    #[tokio::test]
-    async fn a_confirmed_init_frame_leaves_the_session_running() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
-
-        inner
-            .record_skill_init_frame(Ok(Some(vec![
-                "tyde-skills:a".to_string(),
-                "tyde-skills:b".to_string(),
-                "unrelated".to_string(),
-            ])))
-            .await;
-
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
-        assert!(
-            drained_notices(&mut rx).is_empty(),
-            "a session that got everything it asked for must say nothing"
-        );
-    }
-
-    /// Every one of these leaves the session short of what Tyde materialized,
-    /// and every one is a notice rather than a dead session: the user keeps the
-    /// turn, the process, and every skill that did arrive, and is told exactly
-    /// which one did not. Killing the session instead — the previous behaviour —
-    /// spent the whole conversation to report one name.
-    #[tokio::test]
-    async fn every_init_frame_gap_is_reported_and_the_session_survives() {
-        for (label, reported, expected_fragment) in [
-            (
-                "a dropped skill",
-                Ok(Some(vec!["tyde-skills:a".to_string()])),
-                "tyde-skills:b",
-            ),
-            ("no skills field at all", Ok(None), "'skills' field"),
-            (
-                "a namespace collision",
-                Ok(Some(vec![
-                    "tyde-skills:a".to_string(),
-                    "tyde-skills:a".to_string(),
-                    "tyde-skills:b".to_string(),
-                ])),
-                "collides",
-            ),
-            (
-                "a malformed skills field",
-                Err(
-                    "Claude's init frame reported a 'skills' field that is not an array"
-                        .to_string(),
-                ),
-                "not an array",
-            ),
-        ] {
-            let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
-
-            inner.record_skill_init_frame(reported).await;
-
-            match inner.skill_readiness_state() {
-                ClaudeSkillReadiness::Degraded(message) => assert!(
-                    message.contains(expected_fragment),
-                    "{label}: {message:?} lacks {expected_fragment:?}"
-                ),
-                other => panic!("{label}: expected Degraded, got {other:?}"),
-            }
-            let notices = drained_notices(&mut rx);
-            assert!(
-                notices
-                    .iter()
-                    .any(|notice| notice.contains(expected_fragment)),
-                "{label}: the user must be told, not just the log: {notices:?}"
-            );
-        }
-    }
-
-    /// The reported case: Claude keeps its own same-named skill and silently
-    /// drops the plugin copy. The capability is still there under Claude's id,
-    /// so the notice says which id works instead of pretending the skill is gone.
-    #[tokio::test]
-    async fn a_skill_superseded_by_claudes_own_copy_names_the_id_that_works() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:axdb-ops"]).await;
-
-        inner
-            .record_skill_init_frame(Ok(Some(vec![
-                "axdb-ops".to_string(),
-                "code-review".to_string(),
-            ])))
-            .await;
-
-        let message = match inner.skill_readiness_state() {
-            ClaudeSkillReadiness::Degraded(message) => message,
-            other => panic!("a superseded skill is a notice, got {other:?}"),
-        };
-        assert!(message.contains("tyde-skills:axdb-ops"), "{message}");
-        assert!(
-            message.contains("loaded as 'axdb-ops'"),
-            "the notice must name the id that resolves: {message}"
-        );
-        assert!(
-            !message.contains("did not load"),
-            "a skill Claude kept under its own name is not missing: {message}"
-        );
-        assert!(
-            drained_notices(&mut rx)
-                .iter()
-                .any(|notice| notice.contains("axdb-ops")),
-            "the collision must reach the user"
-        );
-    }
-
-    /// A skill gap says nothing about the model's answer, so the turn it lands
-    /// in keeps its outcome sender and completes on its own terms.
-    #[tokio::test]
-    async fn a_skill_gap_leaves_the_turn_in_flight_alone() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a"]).await;
-        let (outcome_tx, mut outcome_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 77,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-
-        inner.record_skill_init_frame(Ok(Some(Vec::new()))).await;
-
-        assert!(
-            inner
-                .state
-                .lock()
-                .await
-                .active_turn
-                .as_ref()
-                .expect("the turn is still active")
-                .outcome_tx
-                .is_some(),
-            "the turn's outcome must still be the turn's to settle"
-        );
-        assert!(
-            matches!(
-                outcome_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "a skill gap must not resolve the turn"
-        );
-        assert!(
-            drained_notices(&mut rx)
-                .iter()
-                .any(|notice| notice.contains("tyde-skills:a")),
-            "the missing skill must still be named to the user"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_session_without_skills_ignores_init_frames_entirely() {
-        let (inner, mut rx) = make_test_inner();
-        let inner = Arc::new(inner);
-
-        inner.record_skill_init_frame(Ok(None)).await;
-
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::NotRequired
-        );
-        assert!(drained_notices(&mut rx).is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_respawn_re_arms_verification_and_reuses_the_same_root() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nb\n",
-        )];
-        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
-        let plugin = Arc::new(outcome.plugin.expect("a plugin"));
-        let root = plugin.root().to_path_buf();
-
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        inner.state.lock().await.skill_plugin = Some(Arc::clone(&plugin));
-
-        inner
-            .record_skill_init_frame(Ok(Some(vec!["tyde-skills:alpha".to_string()])))
-            .await;
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
-
-        // A respawn re-arms: the previous process's confirmation does not carry,
-        // and the new process is judged on its own frame.
-        inner.reset_skill_readiness().await;
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
-
-        // ...and it points at the same root the session already materialized.
-        let rebuilt = inner
-            .state
-            .lock()
-            .await
-            .skill_plugin
-            .as_ref()
-            .map(|plugin| plugin.root().to_string_lossy().into_owned());
-        assert_eq!(rebuilt, Some(root.to_string_lossy().into_owned()));
-        assert!(root.exists(), "a respawn must not have unlinked the root");
-
-        inner
-            .record_skill_init_frame(Ok(Some(vec!["tyde-skills:alpha".to_string()])))
-            .await;
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
-    }
-
-    #[test]
-    fn the_plugin_inventory_check_accepts_only_this_sessions_root() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("root");
-        std::fs::create_dir_all(&root).expect("root");
-        let ok = format!(
-            r#"[{{"id":"rust-analyzer-lsp@claude-plugins-official","enabled":true}},
-                {{"id":"tyde-skills@inline","enabled":true,"installPath":{}}}]"#,
-            serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
-        );
-        verify_plugin_inventory(&ok, &root).expect("a loaded plugin at our root passes");
-
-        let missing = r#"[{"id":"rust-analyzer-lsp@claude-plugins-official","enabled":true}]"#;
-        let err = verify_plugin_inventory(missing, &root).expect_err("absent plugin");
-        assert!(err.contains("did not load"), "{err}");
-
-        let disabled = format!(
-            r#"[{{"id":"tyde-skills@inline","enabled":false,"installPath":{}}}]"#,
-            serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
-        );
-        let err = verify_plugin_inventory(&disabled, &root).expect_err("disabled plugin");
-        assert!(err.contains("disabled"), "{err}");
-
-        let elsewhere =
-            r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/somewhere/else"}]"#;
-        let err = verify_plugin_inventory(elsewhere, &root).expect_err("another root");
-        assert!(err.contains("not from this session's root"), "{err}");
-
-        let duplicated = format!(
-            r#"[{{"id":"tyde-skills@inline","enabled":true,"installPath":{root}}},
-                {{"id":"tyde-skills@inline","enabled":true,"installPath":{root}}}]"#,
-            root = serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
-        );
-        let err = verify_plugin_inventory(&duplicated, &root).expect_err("ambiguous inventory");
-        assert!(
-            err.contains("2 plugins under the id"),
-            "two entries under our id is ambiguous, not a pass: {err}"
-        );
-
-        let with_errors = format!(
-            r#"[{{"id":"tyde-skills@inline","enabled":true,"installPath":{root},
-                 "errors":["skill alpha is invalid"]}}]"#,
-            root = serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
-        );
-        let err = verify_plugin_inventory(&with_errors, &root).expect_err("reported problems");
-        assert!(err.contains("problem(s) loading"), "{err}");
-        assert!(err.contains("skill alpha is invalid"), "{err}");
-
-        let unresolvable =
-            r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/no/such/path/here"}]"#;
-        let err = verify_plugin_inventory(unresolvable, &root).expect_err("unresolvable path");
-        assert!(err.contains("could not resolve"), "{err}");
-
-        let err = verify_plugin_inventory("not json", &root).expect_err("unparseable");
-        assert!(err.contains("not valid JSON"), "{err}");
-
-        let err = verify_plugin_inventory(r#"{"id":"x"}"#, &root).expect_err("not an array");
-        assert!(err.contains("not a JSON array"), "{err}");
-    }
-
-    /// A fake CLI that behaves the way the real one does: it emits its
-    /// `system`/`init` frame **in response to the first user message**, not at
-    /// boot. Anything that waited for the frame before writing a prompt would
-    /// deadlock against this, which is exactly why the wait was removed.
-    /// What the fake CLI does when it receives the first user frame.
-    #[cfg(unix)]
-    #[derive(Clone, Copy, Debug)]
-    enum FakeInitBehaviour {
-        /// Report these skills, then produce model output. The normal case.
-        Reports(&'static str),
-        /// Produce model output and never report skills at all.
-        OmitsInit,
-        /// Produce model output *before* the init frame, so the reader must
-        /// hold that output back and replay it after verification.
-        AssistantBeforeInit(&'static str),
-        /// End the turn with a `result` and no init frame.
-        ResultBeforeInit,
-        /// Say nothing at all: no init frame, no output, no result.
-        SaysNothing,
-        /// Send an inbound control request before the init frame — an action
-        /// the session would be taking on unverified skills.
-        ControlRequestBeforeInit,
-        /// Flood output and never report, to trip the hold-back bounds.
-        FloodsWithoutInit,
-    }
-
-    #[cfg(unix)]
-    async fn run_init_after_prompt_fake(
-        reported_skills: &str,
-    ) -> (String, Vec<Value>, ClaudeSkillReadiness) {
-        run_fake_with_behaviour(FakeInitBehaviour::Reports(match reported_skills {
-            r#"["tyde-skills:alpha"]"# => r#"["tyde-skills:alpha"]"#,
-            _ => r#"["something-else"]"#,
-        }))
-        .await
-    }
-
-    #[cfg(unix)]
-    impl FakeInitBehaviour {
-        fn tag(self) -> &'static str {
-            match self {
-                Self::Reports(_) => "reports",
-                Self::ControlRequestBeforeInit => "control_before_init",
-                Self::FloodsWithoutInit => "floods_without_init",
-                Self::OmitsInit => "omits_init",
-                Self::AssistantBeforeInit(_) => "assistant_before_init",
-                Self::ResultBeforeInit => "result_before_init",
-                Self::SaysNothing => "says_nothing",
-            }
-        }
-
-        fn reported_skills(self) -> &'static str {
-            match self {
-                Self::Reports(skills) | Self::AssistantBeforeInit(skills) => skills,
-                _ => "[]",
-            }
-        }
-
-        /// The terminal outcome this behaviour must deliver. Asserting the class
-        /// is what stops a dropped sender from passing as delivery:
-        /// `Ok(Err(RecvError))` is a drop, and a drop carries no outcome at all.
-        ///
-        /// Every behaviour that ends its turn now *completes* it. A skill Tyde
-        /// could not confirm never fails a turn — the previous contract turned
-        /// each of these into a synthesised failure, which is what made one
-        /// dropped skill cost the whole session.
-        fn expected_terminal(self) -> ExpectedTerminal {
-            match self {
-                Self::Reports(_) | Self::AssistantBeforeInit(_) => ExpectedTerminal::Completed,
-                Self::OmitsInit | Self::ResultBeforeInit => ExpectedTerminal::Completed,
-                // These three never end their turn: the fake stops talking
-                // without a `result`. Nothing may synthesise a terminal outcome
-                // on their behalf — the session stays open, exactly as it would
-                // with a real CLI that is still thinking.
-                Self::ControlRequestBeforeInit | Self::FloodsWithoutInit | Self::SaysNothing => {
-                    ExpectedTerminal::StaysOpen
-                }
-            }
-        }
-
-        /// The fragment the user-visible skill notice must contain, or `None`
-        /// when this behaviour gave Tyde everything it expected.
-        fn expected_notice(self) -> Option<&'static str> {
-            if self.reported_skills().contains("tyde-skills:alpha") {
-                return None;
-            }
-            Some(match self {
-                Self::Reports(_) | Self::AssistantBeforeInit(_) => "did not load",
-                Self::OmitsInit | Self::ResultBeforeInit => "without reporting",
-                Self::ControlRequestBeforeInit => "control request",
-                Self::FloodsWithoutInit => "bytes of output",
-                Self::SaysNothing => "startup timeout",
-            })
-        }
-
-        /// The last log entry this behaviour is expected to write, or `None`
-        /// when it writes nothing after the prompt.
-        fn final_marker(self) -> Option<&'static str> {
-            match self {
-                Self::Reports(_) | Self::AssistantBeforeInit(_) | Self::OmitsInit => Some("RESULT"),
-                Self::ResultBeforeInit => Some("RESULT"),
-                Self::ControlRequestBeforeInit => Some("CONTROL_REQUEST"),
-                Self::FloodsWithoutInit => Some("FLOOD_DONE"),
-                Self::SaysNothing => None,
-            }
-        }
-    }
-
-    /// What a fake behaviour's turn must resolve to.
-    #[cfg(unix)]
-    #[derive(Clone, Copy, Debug)]
-    enum ExpectedTerminal {
-        Completed,
-        /// The turn stays open because the CLI never ended it. Tyde must not
-        /// invent an outcome for it.
-        StaysOpen,
-    }
-
-    /// Turn id the fake harness registers. Named so the clear-up at the end of
-    /// the helper cannot drift from the registration at the start.
-    #[cfg(unix)]
-    const FAKE_TURN_ID: u64 = 1;
-
-    #[cfg(unix)]
-    async fn run_fake_with_behaviour(
-        behaviour: FakeInitBehaviour,
-    ) -> (String, Vec<Value>, ClaudeSkillReadiness) {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        // Serialized rather than interpolated raw: a JSON string literal is also
-        // a valid Python literal, so the tag cannot terminate the string or
-        // inject anything into the generated script.
-        let quoted_behaviour = serde_json::to_string(behaviour.tag()).expect("quote behaviour tag");
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-init-after-prompt.py");
-        let log = workspace.path().join("fake-claude-init-after-prompt.log");
-        std::fs::write(
-            &fake,
-            format!(
-                r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def note(entry):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(entry + "\n")
-
-for raw_line in sys.stdin:
-    value = json.loads(raw_line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {{}})
-        if request.get("subtype") == "initialize":
-            note("INITIALIZE")
-            request_id = value.get("request_id") or request.get("request_id")
-            print(json.dumps({{
-                "type": "control_response",
-                "response": {{
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {{}},
-                }},
-            }}), flush=True)
-        continue
-    if value.get("type") == "user":
-        note("PROMPT")
-        behaviour = {quoted_behaviour}
-        init_frame = json.dumps({{
-            "type": "system",
-            "subtype": "init",
-            "session_id": "init-after-prompt",
-            "skills": {reported_skills},
-        }})
-        # Two messages with different ids, because that is what makes the
-        # first one's phase close and be emitted. `start_turn` emits a turn's
-        # opening StreamStart before the process speaks, so the reducer only
-        # emits for *subsequent* phases; a lone assistant frame accumulates into
-        # the turn summary and is rendered from the outcome, never from an
-        # event. A real turn that says anything and then continues looks exactly
-        # like this.
-        assistant = json.dumps({{
-            "type": "assistant",
-            "message": {{
-                "id": "msg_fake_1",
-                "role": "assistant",
-                "content": [{{"type": "text", "text": "MODEL-OUTPUT-SENTINEL"}}],
-            }},
-        }})
-        assistant_next = json.dumps({{
-            "type": "assistant",
-            "message": {{
-                "id": "msg_fake_2",
-                "role": "assistant",
-                "content": [{{"type": "text", "text": "MODEL-OUTPUT-TAIL"}}],
-            }},
-        }})
-        result = json.dumps({{"type": "result", "subtype": "success", "is_error": False}})
-        if behaviour == "reports":
-            # The real CLI reports its loaded skills at the head of the
-            # response to the first user message -- never before one.
-            print(init_frame, flush=True); note("INIT_FRAME")
-            print(assistant, flush=True); note("MODEL_OUTPUT")
-            print(result, flush=True); note("RESULT")
-        elif behaviour == "assistant_before_init":
-            print(assistant, flush=True)
-            print(assistant_next, flush=True); note("MODEL_OUTPUT")
-            print(init_frame, flush=True); note("INIT_FRAME")
-            print(result, flush=True); note("RESULT")
-        elif behaviour == "omits_init":
-            # Two ids, for the same reason `assistant_before_init` uses two: a
-            # lone assistant frame accumulates into the turn summary, and only a
-            # following phase makes the first one's text an emitted event. The
-            # test asserts the user *sees* the output, so it has to be emitted.
-            print(assistant, flush=True); note("MODEL_OUTPUT")
-            print(assistant_next, flush=True)
-            print(result, flush=True); note("RESULT")
-        elif behaviour == "result_before_init":
-            print(result, flush=True); note("RESULT")
-        elif behaviour == "control_before_init":
-            print(json.dumps({{
-                "type": "control_request",
-                "request_id": "req_pre_init",
-                "request": {{"subtype": "can_use_tool", "tool_name": "Bash"}},
-            }}), flush=True)
-            note("CONTROL_REQUEST")
-        elif behaviour == "floods_without_init":
-            for n in range(40):
-                print(assistant, flush=True)
-            # A second id closes the flood's phase, so the output released at
-            # the buffer bound is observable as an event rather than sitting in
-            # a turn summary that never arrives.
-            print(assistant_next, flush=True)
-            note("FLOOD_DONE")
-        # "says_nothing" falls through: no frames at all.
-"#,
-                quoted_behaviour = quoted_behaviour,
-                reported_skills = behaviour.reported_skills(),
-            ),
-        )
-        .expect("write init-after-prompt fake");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-
-        let (inner, mut rx) =
-            make_test_inner_with_workspace(workspace.path().to_string_lossy().to_string());
-        let inner = Arc::new(inner);
-        inner
-            .arm_skill_verification(vec!["tyde-skills:alpha".to_string()])
-            .await;
-        // The stdout reducer drops every assistant frame when no turn is
-        // active (`prepare_persistent_stdout_turn` returns `None`), so this
-        // helper has to register one. It writes its prompt directly rather than
-        // through `run_turn`, so it also has to take on `run_turn`'s
-        // responsibilities: own the outcome receiver, wait for terminal
-        // delivery, and clear the turn — notifying its quiesced waiters —
-        // before shutting down. A turn installed with `outcome_tx: None` can
-        // never deliver, and leaving one behind is what wedged `shutdown`.
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: FAKE_TURN_ID,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-        // `start_turn` opens the turn's stream before the process is allowed to
-        // speak, which is why `SegmentState::default()` has
-        // `awaiting_stream_start: false` — the reducer ends its first phase into
-        // a stream that is already open. This helper stands in for `start_turn`,
-        // so it has to open that stream too, under the same id
-        // `prepare_persistent_stdout_turn` will derive
-        // (`claude-msg-{turn_id}`). Without it the first `StreamEnd` has no
-        // stream to close and the emitter reports a stream-identity violation
-        // instead of the model's output.
-        inner.emit_stream_start(&format!("claude-msg-{FAKE_TURN_ID}"), None);
-
-        // Startup must complete without ever waiting on the init frame.
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            inner.ensure_process_ready(),
-        )
-        .await
-        .expect("startup must not deadlock waiting for an init frame");
-        ready.expect("startup succeeds; skills are checked after the first prompt");
-
-        // Now send the first user message, which is what makes the CLI report.
-        inner
-            .write_process_json_line(&build_stream_json_user_message("hello", &[]))
-            .await
-            .expect("write the first prompt");
-        // The production turn path arms this immediately after the write; this
-        // helper bypasses that path, so it arms it explicitly.
-        inner.watch_for_skill_verification().await;
-
-        // Wait for the fake to finish speaking, then let the reader drain.
-        if let Some(marker) = behaviour.final_marker() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                if std::fs::read_to_string(&log)
-                    .unwrap_or_default()
-                    .contains(marker)
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
-        // A silent CLI is resolved by the watchdog rather than by a frame, so
-        // wait for the state to settle instead of for a log line.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if !inner.skills_awaiting_verification() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-        // Terminal delivery, bounded, and unwrapped through *both* layers. The
-        // timeout layer says the turn resolved at all; the oneshot layer says
-        // it resolved by being *sent*. `Ok(Err(RecvError))` is a dropped
-        // sender — the turn died without an outcome — and treating that as
-        // delivery is exactly how a lost settle would go unnoticed.
-        let mut outcome_rx = outcome_rx;
-        match behaviour.expected_terminal() {
-            ExpectedTerminal::Completed => {
-                let delivered = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    outcome_rx,
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("{behaviour:?}: the turn must reach a terminal outcome, not hang")
-                })
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "{behaviour:?}: the turn's outcome sender was dropped; a drop is not \
-                             a delivery"
-                    )
-                });
-                match delivered {
-                    TurnOutcome::Completed { .. } => {}
-                    TurnOutcome::Failed { error, .. } => panic!(
-                        "{behaviour:?}: an unconfirmed skill must not fail the turn, got {error:?}"
-                    ),
-                    TurnOutcome::Cancelled { .. } => {
-                        panic!("{behaviour:?}: nobody cancelled this turn")
-                    }
-                }
-            }
-            ExpectedTerminal::StaysOpen => {
-                assert!(
-                    matches!(
-                        outcome_rx.try_recv(),
-                        Err(oneshot::error::TryRecvError::Empty)
-                    ),
-                    "{behaviour:?}: the CLI never ended this turn, so Tyde must not either"
-                );
-            }
-        }
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        if let Some(fragment) = behaviour.expected_notice() {
-            let notices: Vec<&str> = events
-                .iter()
-                .filter(|event| event_kind(event) == Some("SubprocessStderr"))
-                .filter_map(|event| event.get("data").and_then(Value::as_str))
-                .collect();
-            assert!(
-                notices.iter().any(|notice| notice.contains(fragment)),
-                "{behaviour:?}: the user must be told about {fragment:?}, got {notices:?}"
-            );
-        }
-        let state = inner.skill_readiness_state();
-
-        // Clear the turn and release its waiters, exactly as `run_turn` does,
-        // so `shutdown` has nothing left to wait on.
-        for waiter in inner.clear_active_turn(FAKE_TURN_ID).await {
-            let _ = waiter.send(());
-        }
-        inner.shutdown().await;
-
-        unsafe {
-            if let Some(value) = previous_claude_bin {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
-            } else {
-                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            }
-            if let Some(value) = previous_fake_log {
-                std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value);
-            } else {
-                std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-            }
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-        let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
-        (log_contents, events, state)
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn startup_does_not_deadlock_when_init_follows_the_first_prompt() {
-        let (log, _events, _state) = run_init_after_prompt_fake(r#"["tyde-skills:alpha"]"#).await;
-
-        // The ordering the real CLI uses: prompt first, then the init frame.
-        let prompt = log.find("PROMPT").expect("a prompt was written");
-        let init = log.find("INIT_FRAME").expect("an init frame followed it");
-        assert!(
-            prompt < init,
-            "this fake reports skills only after a prompt; startup must not wait for it: {log:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn output_emitted_before_the_init_frame_is_held_back_and_then_replayed() {
-        let (log, events, _state) = run_fake_with_behaviour(
-            FakeInitBehaviour::AssistantBeforeInit(r#"["tyde-skills:alpha"]"#),
-        )
-        .await;
-
-        // The CLI spoke before it reported, which is the case the hold-back
-        // buffer exists for.
-        let output = log.find("MODEL_OUTPUT").expect("the model spoke");
-        let init = log.find("INIT_FRAME").expect("the init frame followed");
-        assert!(output < init, "this fake speaks before reporting: {log:?}");
-
-        // Verification passed, so the held-back output is not lost — it is
-        // replayed once the session is known to be sound.
-        let rendered = serde_json::to_string(&events).expect("events");
-        assert!(
-            rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "confirmed output must be replayed, not dropped: {rendered}"
-        );
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a confirmed session must not report an error: {kinds:?}"
-        );
-    }
-
-    /// The existing replay test pins *presence*. This pins what presence cannot
-    /// distinguish: replayed frames keep the stream identity they would have
-    /// had live, they arrive exactly once, and they arrive before anything
-    /// derived from the frames that followed them.
-    ///
-    /// The fake emits two assistant messages with **explicitly distinct ids**
-    /// (`msg_fake_1`, `msg_fake_2`) before the init frame. Both are held back;
-    /// the second closes the first's phase on replay, which is the only thing
-    /// that turns buffered text into an emitted `StreamEnd`. A replay that lost
-    /// or rewrote the id would surface as a stream-identity violation rather
-    /// than as output, so asserting no such error is asserting identity
-    /// survived the round trip.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn replayed_output_keeps_its_identity_arrives_once_and_in_order() {
-        let (_log, events, _state) = run_fake_with_behaviour(
-            FakeInitBehaviour::AssistantBeforeInit(r#"["tyde-skills:alpha"]"#),
-        )
-        .await;
-
-        let rendered: Vec<String> = events
-            .iter()
-            .map(|event| serde_json::to_string(event).expect("event"))
-            .collect();
-
-        // Identity survived: no violation reached the user in place of output.
-        let violations: Vec<&String> = rendered
-            .iter()
-            .filter(|event| event.contains("Stream identity violation"))
-            .collect();
-        assert!(
-            violations.is_empty(),
-            "replayed frames must keep a usable stream identity: {violations:?}"
-        );
-
-        let sentinel_positions: Vec<usize> = rendered
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| event.contains("MODEL-OUTPUT-SENTINEL"))
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(
-            sentinel_positions.len(),
-            1,
-            "held output must be replayed exactly once, got {sentinel_positions:?} in {rendered:?}"
-        );
-
-        // The init frame is the only one carrying `session_id`, so the
-        // `SessionStarted` it produces marks where the confirming frame was
-        // handled. The replayed output must precede it.
-        let session_started = rendered
-            .iter()
-            .position(|event| event.contains("SessionStarted"))
-            .expect("the init frame is handled after the replay");
-        assert!(
-            sentinel_positions[0] < session_started,
-            "replayed output must arrive before the frame that confirmed it: {rendered:?}"
-        );
-    }
-
-    /// The hold-back buffer exists to order the notice against the output, not
-    /// to decide whether the output is real. Output the model produced is the
-    /// model's answer whether or not every skill arrived, so a gap replays it
-    /// exactly like a clean verification does — the alternative silently ate a
-    /// turn the user had already paid for.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn output_held_back_before_a_gap_is_replayed_not_discarded() {
-        let (log, events, _state) =
-            run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(r#"["other"]"#)).await;
-
-        assert!(
-            log.contains("MODEL_OUTPUT") && log.contains("INIT_FRAME"),
-            "{log:?}"
-        );
-        let rendered = serde_json::to_string(&events).expect("events");
-        assert!(
-            rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "output held back before a gap must still reach the user: {rendered}"
-        );
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a missing skill is a notice, not a failed turn: {kinds:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_cli_that_never_reports_skills_still_renders_and_says_so() {
-        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::OmitsInit).await;
-
-        assert!(log.contains("MODEL_OUTPUT"), "the fake did speak: {log:?}");
-        assert!(!log.contains("INIT_FRAME"), "but never reported: {log:?}");
-        let rendered = serde_json::to_string(&events).expect("events");
-        assert!(
-            rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "unconfirmed is not the same as untrustworthy; the answer still shows: {rendered}"
-        );
-        // The notice itself is asserted by the harness via `expected_notice`.
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(!kinds.contains(&Some("Error")), "{kinds:?}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_turn_that_ends_without_an_init_frame_completes_with_a_notice() {
-        let (log, events, state) =
-            run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
-
-        assert!(log.contains("RESULT"), "{log:?}");
-        assert!(!log.contains("INIT_FRAME"), "{log:?}");
-        match state {
-            ClaudeSkillReadiness::Degraded(message) => {
-                assert!(message.contains("without reporting"), "{message}")
-            }
-            other => panic!("an unreported turn must settle as Degraded, got {other:?}"),
-        }
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a turn that ends unverified still ended: {kinds:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_silent_cli_is_reported_by_the_verification_watchdog() {
-        // Nothing at all comes back after the prompt: no init frame, no output,
-        // no result. Only the timeout can resolve this.
-        let (log, events, state) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
-
-        assert!(log.contains("PROMPT"), "{log:?}");
-        assert!(!log.contains("INIT_FRAME"), "{log:?}");
-        match state {
-            ClaudeSkillReadiness::Degraded(message) => assert!(
-                message.contains("within the startup timeout"),
-                "a silent CLI must not leave the session waiting forever: {message}"
-            ),
-            other => panic!("the watchdog must settle verification, got {other:?}"),
-        }
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a CLI that has not reported yet has not failed: {kinds:?}"
-        );
-    }
-
-    /// Every terminal path must leave a *reason*, not just a dead process.
-    /// `Pending` after the fact would mean a later reader cannot tell "still
-    /// waiting" from "already gave up".
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn every_terminal_pending_path_records_a_failure_reason() {
-        for (label, behaviour, fragment) in [
-            (
-                "a silent CLI",
-                FakeInitBehaviour::SaysNothing,
-                "within the startup timeout",
-            ),
-            (
-                "a turn that ends unverified",
-                FakeInitBehaviour::ResultBeforeInit,
-                "without reporting",
-            ),
-            (
-                "a CLI that never reports",
-                FakeInitBehaviour::OmitsInit,
-                "without reporting",
-            ),
-        ] {
-            let (_log, _events, state) = run_fake_with_behaviour(behaviour).await;
-
-            match state {
-                ClaudeSkillReadiness::Degraded(message) => assert!(
-                    message.contains(fragment),
-                    "{label}: {message:?} lacks {fragment:?}"
-                ),
-                other => panic!("{label}: expected Failed with a reason, got {other:?}"),
-            }
-        }
-    }
-
-    /// An inbound control request before the init frame carries a request id the
-    /// CLI is blocking on, so it can never be buffered — holding one is a hang.
-    /// It also means the init frame is not coming, so verification settles with
-    /// a notice and the request is answered. Killing the session instead left
-    /// the user with neither an answer nor their turn.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_control_request_before_the_init_frame_is_answered_with_a_notice() {
-        let (log, events, state) =
-            run_fake_with_behaviour(FakeInitBehaviour::ControlRequestBeforeInit).await;
-
-        assert!(log.contains("CONTROL_REQUEST"), "{log:?}");
-        assert!(!log.contains("INIT_FRAME"), "{log:?}");
-        match state {
-            ClaudeSkillReadiness::Degraded(message) => {
-                assert!(message.contains("control request"), "{message}");
-                assert!(message.contains("can_use_tool"), "{message}");
-            }
-            other => panic!("expected Degraded, got {other:?}"),
-        }
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "an unconfirmed session is not a failed one: {kinds:?}"
-        );
-    }
-
-    /// The bound is about memory, not trust: past it, Tyde stops holding output
-    /// and lets it through, rather than deleting what the model already said.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn unbounded_output_without_an_init_frame_stops_holding_and_renders() {
-        let (log, events, state) =
-            run_fake_with_behaviour(FakeInitBehaviour::FloodsWithoutInit).await;
-
-        assert!(log.contains("FLOOD_DONE"), "{log:?}");
-        match state {
-            ClaudeSkillReadiness::Degraded(message) => assert!(
-                message.contains("frames or") && message.contains("bytes of output"),
-                "{message}"
-            ),
-            other => panic!("expected Degraded once the buffer bound was hit, got {other:?}"),
-        }
-        let rendered = serde_json::to_string(&events).expect("events");
-        assert!(
-            rendered.contains("MODEL-OUTPUT-SENTINEL"),
-            "output past the bound must be released, not dropped: {rendered}"
-        );
-    }
-
-    /// A watchdog from a killed process must not kill its replacement.
-    #[tokio::test]
-    async fn a_stale_watchdog_cannot_terminate_a_later_process() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-
-        // Arm a watchdog, then respawn: `reset_skill_readiness` bumps the
-        // generation, which is what makes the old timer inert.
-        inner.watch_for_skill_verification().await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let armed_generation = inner.state.lock().await.skill_verification_generation;
-        inner.reset_skill_readiness().await;
-        let new_generation = inner.state.lock().await.skill_verification_generation;
-        assert_ne!(
-            armed_generation, new_generation,
-            "a respawn must move the generation on"
-        );
-
-        // Well past the watchdog interval, the replacement is untouched.
-        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::Pending,
-            "the replacement process must still be waiting on its own init frame"
-        );
-        // Bind the owner before borrowing from it: the intermediate
-        // `Vec<Option<String>>` used to be a temporary, dropped at the end of
-        // the statement while `kinds` still referenced it.
-        let owned_kinds: Vec<Option<String>> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| event_kind(&event).map(str::to_string))
-            .collect();
-        let kinds: Vec<Option<&str>> = owned_kinds.iter().map(|kind| kind.as_deref()).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a stale watchdog must not report anything: {kinds:?}"
-        );
-    }
-
-    /// Cancelling a turn is the user's doing. The terminal frames that follow
-    /// must report cancellation, never a skill failure.
-    /// Register an interrupted turn that can actually deliver its outcome.
-    ///
-    /// The receiver is handed back so the caller keeps it alive: a turn whose
-    /// receiver has been dropped is indistinguishable from one that delivered,
-    /// which is the confusion this helper exists to prevent.
-    async fn install_interrupted_turn(
-        inner: &Arc<ClaudeInner>,
-        id: u64,
-    ) -> oneshot::Receiver<TurnOutcome> {
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        let mut state = inner.state.lock().await;
-        state.active_turn = Some(ActiveTurn {
-            id,
-            owner: ClaudeTurnOwner::User,
-            outcome_tx: Some(outcome_tx),
-            interrupt_requested: true,
-            pending_ask_user_question: None,
-            pending_exit_plan_mode: None,
-            quiesced_waiters: Vec::new(),
-        });
-        outcome_rx
-    }
-
-    /// Install a turn that can deliver, not yet interrupted.
-    async fn install_live_turn(
-        inner: &Arc<ClaudeInner>,
-        id: u64,
-    ) -> oneshot::Receiver<TurnOutcome> {
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        let mut state = inner.state.lock().await;
-        state.active_turn = Some(ActiveTurn {
-            id,
-            owner: ClaudeTurnOwner::User,
-            outcome_tx: Some(outcome_tx),
-            interrupt_requested: false,
-            pending_ask_user_question: None,
-            pending_exit_plan_mode: None,
-            quiesced_waiters: Vec::new(),
-        });
-        outcome_rx
-    }
-
-    /// Cancel and skill-failure both take the state lock, so they linearize.
-    /// This is the interleaving where the cancel gets there first: the failure
-    /// must decline outright — no error to the user, and the turn's sender left
-    /// for the cancel path to resolve.
-    #[tokio::test]
-    async fn a_cancel_that_wins_the_race_blocks_the_skill_failure() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let mut outcome_rx = install_live_turn(&inner, 31).await;
-        // The failure is decided against this identity...
-        let target = inner.current_skill_failure_target().await;
-
-        // ...but the cancel commits first.
-        inner
-            .state
-            .lock()
-            .await
-            .active_turn
-            .as_mut()
-            .unwrap()
-            .interrupt_requested = true;
-        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
-
-        inner
-            .report_skill_gap(&target, "stale decision", true)
-            .await;
-
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::Pending,
-            "a cancel that wins must leave verification unresolved, not failed"
-        );
-        assert!(
-            matches!(
-                outcome_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "the losing failure must not take the cancelled turn's sender"
-        );
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            kinds.push(event_kind(&event).map(str::to_string));
-        }
-        assert!(
-            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
-            "a losing failure must emit nothing: {kinds:?}"
-        );
-    }
-
-    /// The other interleaving: the gap commits first, so the cancel finds
-    /// nothing left to abandon. The gap still does not touch the turn — it
-    /// settles verification and nothing else.
-    #[tokio::test]
-    async fn a_skill_gap_that_wins_the_race_blocks_the_cancel() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let mut outcome_rx = install_live_turn(&inner, 32).await;
-        let target = inner.current_skill_failure_target().await;
-
-        inner
-            .report_skill_gap(&target, "the CLI dropped a skill", true)
-            .await;
-
-        match inner.skill_readiness_state() {
-            ClaudeSkillReadiness::Degraded(message) => {
-                assert!(message.contains("the CLI dropped a skill"), "{message}")
-            }
-            other => panic!("expected Degraded, got {other:?}"),
-        }
-        assert!(
-            matches!(
-                outcome_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "a skill gap settles verification, never the turn"
-        );
-
-        // The cancel arrives second and finds verification already settled.
-        inner
-            .state
-            .lock()
-            .await
-            .active_turn
-            .as_mut()
-            .unwrap()
-            .interrupt_requested = true;
-        assert!(
-            !inner.abandon_skill_verification_for_cancelled_turn().await,
-            "there is nothing pending left to abandon"
-        );
-    }
-
-    /// A decision made for an earlier process, or an earlier turn, must never
-    /// settle whatever happens to be current when it finally commits.
-    #[tokio::test]
-    async fn a_stale_skill_failure_cannot_settle_a_newer_turn() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let _old_turn = install_live_turn(&inner, 41).await;
-        let stale = inner.current_skill_failure_target().await;
-
-        // A new process: new generation, re-armed verification.
-        inner.reset_skill_readiness().await;
-        // ...carrying a different turn.
-        let mut new_turn = install_live_turn(&inner, 42).await;
-
-        inner
-            .report_skill_gap(&stale, "decided for the previous process", true)
-            .await;
-
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::Pending,
-            "a stale decision must not fail the new process"
-        );
-        assert!(
-            matches!(
-                new_turn.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "a stale decision must not take the new turn's sender"
-        );
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            kinds.push(event_kind(&event).map(str::to_string));
-        }
-        assert!(
-            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
-            "{kinds:?}"
-        );
-
-        // Same generation, different turn: also declined.
-        let same_generation_wrong_turn = SkillFailureTarget {
-            generation: inner.state.lock().await.skill_verification_generation,
-            turn_id: Some(41),
-        };
-        inner
-            .report_skill_gap(&same_generation_wrong_turn, "wrong turn", true)
-            .await;
-        assert!(
-            matches!(
-                new_turn.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "a decision about turn 41 must not settle turn 42"
-        );
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
-    }
-
-    /// Abandonment must never fire without a turn that was actually cancelled.
-    /// Doing so would suppress the terminal paths for a session nobody
-    /// cancelled — a silent way to lose a real skill failure.
-    #[tokio::test]
-    async fn abandonment_refuses_to_act_without_a_cancelled_turn() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-
-        assert!(
-            !inner.abandon_skill_verification_for_cancelled_turn().await,
-            "no active turn at all means nothing to abandon"
-        );
-        assert!(
-            inner.skills_awaiting_verification(),
-            "verification must still be live"
-        );
-
-        // An active turn that has *not* been interrupted is equally not a cancel.
-        let (outcome_tx, _outcome_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 7,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-
-        assert!(
-            !inner.abandon_skill_verification_for_cancelled_turn().await,
-            "an uninterrupted turn is not a cancel"
-        );
-        assert!(inner.skills_awaiting_verification());
-    }
-
-    /// A watchdog that wins must run its report to completion — settling
-    /// verification and disowning its own handle — rather than aborting itself
-    /// partway through. What it must *not* do is settle the turn.
-    #[tokio::test]
-    async fn a_watchdog_reports_without_settling_the_turn() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let (outcome_tx, mut outcome_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 55,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-        inner.watch_for_skill_verification().await;
-
-        // Settled by the timer, not by a frame: poll the state it owns rather
-        // than a turn outcome it must never send.
-        let deadline = std::time::Instant::now() + CLAUDE_SKILL_VERIFICATION_TIMEOUT * 8;
-        while std::time::Instant::now() < deadline && inner.skills_awaiting_verification() {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        match inner.skill_readiness_state() {
-            ClaudeSkillReadiness::Degraded(message) => assert!(
-                message.contains("within the startup timeout"),
-                "the watchdog must record why it fired: {message}"
-            ),
-            other => panic!("the watchdog must settle verification, got {other:?}"),
-        }
-        assert!(
-            matches!(
-                outcome_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "a CLI that has not reported its skills has not failed the turn"
-        );
-        assert!(
-            drained_notices(&mut rx)
-                .iter()
-                .any(|notice| notice.contains("within the startup timeout")),
-            "the timeout must reach the user, not just the log"
-        );
-        assert!(
-            inner.state.lock().await.skill_watchdog.is_none(),
-            "the watchdog must have disowned its own handle"
-        );
-    }
-
-    /// A process whose verification was abandoned can never report, so it must
-    /// not be reused by a later turn.
-    #[tokio::test]
-    async fn a_cancelled_process_is_retired_rather_than_reused() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let _outcome_rx = install_interrupted_turn(&inner, 71).await;
-        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
-
-        // A new process arms afresh: abandonment is cleared and the generation
-        // moves on, so the retired process's state cannot leak into it.
-        let before = inner.state.lock().await.skill_verification_generation;
-        inner.reset_skill_readiness().await;
-        let after = inner.state.lock().await.skill_verification_generation;
-
-        assert_ne!(before, after, "a new process must get a new generation");
-        assert!(
-            inner.skills_awaiting_verification(),
-            "a fresh process is verifiable again; abandonment does not carry over"
-        );
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
-    }
-
-    /// The terminal paths — a `result` frame, EOF, the watchdog — all gate on
-    /// `skills_awaiting_verification`. After a cancel that must be false, or
-    /// each of them would turn the user's own cancel into a skill failure.
-    #[tokio::test]
-    async fn no_terminal_path_fires_after_a_cancel() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        inner.watch_for_skill_verification().await;
-        let _outcome_rx = install_interrupted_turn(&inner, 92).await;
-        assert!(
-            inner.skills_awaiting_verification(),
-            "armed and waiting before the cancel"
-        );
-
-        assert!(
-            inner.abandon_skill_verification_for_cancelled_turn().await,
-            "an interrupted turn is exactly the condition abandonment acts on"
-        );
-
-        assert!(
-            !inner.skills_awaiting_verification(),
-            "a cancelled turn leaves nothing for a result frame, EOF, or the watchdog to act on"
-        );
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::Pending,
-            "suppressing the terminal paths must not be done by failing the session"
-        );
-        // Well past the watchdog interval, nothing has fired.
-        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            kinds.push(event_kind(&event).map(str::to_string));
-        }
-        assert!(
-            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
-            "no terminal path may report a skill error after a cancel: {kinds:?}"
-        );
-    }
-
-    /// Arming after a cancel must not resurrect the watchdog for the same
-    /// process: the `init` frame only follows the first user message, so a
-    /// cancelled turn's process will never report one.
-    #[tokio::test]
-    async fn a_cancel_cannot_be_undone_by_re_arming_the_same_process() {
-        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        let _outcome_rx = install_interrupted_turn(&inner, 93).await;
-        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
-
-        inner.watch_for_skill_verification().await;
-
-        assert!(
-            inner.state.lock().await.skill_watchdog.is_none(),
-            "arming must be refused while a cancel is in effect"
-        );
-        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
-        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
-    }
-
-    #[tokio::test]
-    async fn cancelling_before_the_init_frame_is_never_a_skill_error() {
-        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        inner.watch_for_skill_verification().await;
-        let _outcome_rx = install_interrupted_turn(&inner, 91).await;
-
-        inner.abandon_skill_verification_for_cancelled_turn().await;
-
-        // The watchdog is gone and cannot fire on the cancelled turn.
-        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
-        assert_eq!(
-            inner.skill_readiness_state(),
-            ClaudeSkillReadiness::Pending,
-            "a cancel leaves verification unresolved, not failed"
-        );
-        assert!(
-            inner.state.lock().await.skill_watchdog.is_none(),
-            "a cancel must stop the watchdog"
-        );
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            kinds.push(event_kind(&event).map(str::to_string));
-        }
-        assert!(
-            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
-            "cancellation must not surface as a skill error: {kinds:?}"
-        );
-    }
-
-    /// The end-to-end shape of the reported bug: the CLI reports a skill set
-    /// that does not include Tyde's, and the session carries on. The gap reaches
-    /// the user as a notice naming the skill — the harness asserts that — and
-    /// the turn is neither failed nor emptied.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_gap_detected_after_the_prompt_is_reported_without_killing_the_session() {
-        let (log, events, state) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
-
-        assert!(log.contains("INIT_FRAME"), "{log:?}");
-        assert!(
-            log.contains("RESULT"),
-            "the session must be allowed to finish its turn: {log:?}"
-        );
-        match state {
-            ClaudeSkillReadiness::Degraded(message) => {
-                assert!(message.contains("tyde-skills:alpha"), "{message}")
-            }
-            other => panic!("a dropped skill must settle as Degraded, got {other:?}"),
-        }
-        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(
-            !kinds.contains(&Some("Error")),
-            "a dropped skill is not a failed turn: {kinds:?}"
-        );
-    }
-    #[tokio::test]
-    async fn shutdown_unlinks_the_plugin_root_but_not_its_targets() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nb\n",
-        )];
-        std::fs::write(skills[0].source_dir.join("art.md"), "art").expect("resource");
-        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
-        let plugin = Arc::new(outcome.plugin.expect("a plugin"));
-        let root = plugin.root().to_path_buf();
-
-        let (inner, _rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        inner.state.lock().await.skill_plugin = Some(plugin);
-
-        inner.shutdown().await;
-
-        assert!(!root.exists(), "shutdown must unlink the session root");
-        assert!(
-            skills[0].skill_md_path.exists(),
-            "cleanup must never reach the skill store"
-        );
-        assert_eq!(
-            std::fs::read_to_string(skills[0].source_dir.join("art.md")).expect("target survives"),
-            "art",
-            "unlinking a resource link must not delete its target"
-        );
-        assert!(
-            inner.state.lock().await.skill_plugin.is_none(),
-            "shutdown must release the plugin so a later drop is a no-op"
-        );
-    }
-    #[test]
-    fn claude_cli_args_resume_valid_session_with_resume() {
-        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: Some("valid-session".to_string()),
-            fork_from_session_id: None,
-            resume_existing_session: true,
-            ephemeral: false,
-            model: None,
-            effort: None,
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root: None,
-        });
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--resume" && pair[1] == "valid-session")
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair[0] == "--session-id" && pair[1] == "valid-session"),
-            "valid resumes should keep using Claude's --resume path"
-        );
-    }
-
-    #[test]
-    fn claude_cli_args_serialize_xhigh_exactly() {
-        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: None,
-            fork_from_session_id: None,
-            resume_existing_session: false,
-            ephemeral: true,
-            model: None,
-            effort: Some(ClaudeEffort::XHigh),
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root: None,
-        });
-
-        let effort_pairs = args
-            .windows(2)
-            .filter(|pair| pair[0] == "--effort")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            effort_pairs.len(),
-            1,
-            "Claude argv should contain exactly one effort pair"
-        );
-        assert_eq!(effort_pairs[0][1], "xhigh");
-    }
-
-    #[test]
-    fn claude_cli_args_omit_unset_effort() {
-        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: None,
-            fork_from_session_id: None,
-            resume_existing_session: false,
-            ephemeral: true,
-            model: None,
-            effort: None,
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root: None,
-        });
-
-        assert!(!args.iter().any(|arg| arg == "--effort"));
-    }
-
-    #[test]
-    fn claude_cli_args_fork_uses_parent_resume_without_preseed() {
-        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: None,
-            fork_from_session_id: Some("parent-session".to_string()),
-            resume_existing_session: true,
-            ephemeral: false,
-            model: None,
-            effort: None,
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root: None,
-        });
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--resume" && pair[1] == "parent-session")
-        );
-        assert!(args.iter().any(|arg| arg == "--fork-session"));
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair[0] == "--session-id" && pair[1] == "parent-session"),
-            "forks must not pre-seed the parent id as the child session id"
-        );
-    }
-
-    #[test]
-    fn claude_cli_args_recovered_missing_session_starts_fresh() {
-        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
-            workspace_root: "/tmp/workspace".to_string(),
-            ssh_host: None,
-            session_id: Some("stale-session".to_string()),
-            fork_from_session_id: None,
-            resume_existing_session: false,
-            ephemeral: false,
-            model: None,
-            effort: None,
-            permission_mode: None,
-            startup_mcp_config_json: None,
-            steering_content: None,
-            agent_identity: None,
-            tool_policy: ToolPolicy::Unrestricted,
-            skill_plugin_root: None,
-        });
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--session-id" && pair[1] == "stale-session"),
-            "missing-session recovery should create a fresh Claude CLI session under the same id"
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair[0] == "--resume" && pair[1] == "stale-session"),
-            "missing-session recovery must not pass the stale id back through --resume"
-        );
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestSubAgentSpawnRecord {
-        tool_use_id: String,
-        name: String,
-        description: String,
-        agent_type: String,
-        session_id_hint: Option<protocol::SessionId>,
-        agent_id: protocol::AgentId,
-    }
-
-    #[derive(Clone, Default)]
-    struct TestSubAgentEmitter {
-        next_id: Arc<AtomicU64>,
-        spawns: Arc<std::sync::Mutex<Vec<TestSubAgentSpawnRecord>>>,
-        event_receivers:
-            Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedReceiver<protocol::ChatEvent>>>>,
-    }
-
-    impl TestSubAgentEmitter {
-        fn spawn_records(&self) -> Vec<TestSubAgentSpawnRecord> {
-            self.spawns.lock().expect("spawn record mutex").clone()
-        }
-
-        fn take_event_rx(&self, tool_use_id: &str) -> mpsc::UnboundedReceiver<protocol::ChatEvent> {
-            self.event_receivers
-                .lock()
-                .expect("event receiver mutex")
-                .remove(tool_use_id)
-                .expect("sub-agent event receiver should exist")
-        }
-    }
-
-    async fn recv_child_chat_event(
-        rx: &mut mpsc::UnboundedReceiver<protocol::ChatEvent>,
-        context: &str,
-    ) -> protocol::ChatEvent {
-        timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{context} should arrive"))
-            .unwrap_or_else(|| panic!("{context} channel closed"))
-    }
-
-    impl SubAgentEmitter for TestSubAgentEmitter {
-        fn on_subagent_spawned(
-            &self,
-            tool_use_id: String,
-            name: String,
-            description: String,
-            agent_type: String,
-            session_id_hint: Option<protocol::SessionId>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
-        > {
-            let agent_id = protocol::AgentId(format!(
-                "test-subagent-{}",
-                self.next_id.fetch_add(1, Ordering::SeqCst)
-            ));
-            let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let (model_usage_tx, mut model_usage_rx) = mpsc::unbounded_channel();
-            let (total_usage_tx, mut total_usage_rx) = mpsc::unbounded_channel();
-            tokio::spawn(async move { while model_usage_rx.recv().await.is_some() {} });
-            tokio::spawn(async move { while total_usage_rx.recv().await.is_some() {} });
-            self.event_receivers
-                .lock()
-                .expect("event receiver mutex")
-                .insert(tool_use_id.clone(), event_rx);
-            self.spawns
-                .lock()
-                .expect("spawn record mutex")
-                .push(TestSubAgentSpawnRecord {
-                    tool_use_id,
-                    name,
-                    description,
-                    agent_type,
-                    session_id_hint,
-                    agent_id: agent_id.clone(),
-                });
-            Box::pin(async move {
-                Ok(SubAgentHandle {
-                    event_tx,
-                    model_usage_tx,
-                    total_usage_tx,
-                    agent_id,
-                    name_update_tx: None,
-                })
-            })
-        }
-    }
-
-    fn event_kind(event: &Value) -> Option<&str> {
-        event.get("kind").and_then(Value::as_str)
-    }
-
-    async fn recv_until_kind(rx: &mut mpsc::UnboundedReceiver<Value>, expected: &str) -> Value {
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = rx
-                    .recv()
-                    .await
-                    .expect("Claude event channel should stay open");
-                if event_kind(&event) == Some(expected) {
-                    return event;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {expected}"))
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resume_session_missing_history_marks_session_for_fresh_start() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-
-        let (inner, mut rx) =
-            make_test_inner_with_workspace(workspace.path().to_string_lossy().to_string());
-        let inner = Arc::new(inner);
-
-        inner
-            .resume_session("stale-missing-session".to_string())
-            .await
-            .expect("missing Claude history should recover");
-
-        let session_started = rx.recv().await.expect("session started event");
-        assert_eq!(event_kind(&session_started), Some("SessionStarted"));
-        let cleared = rx.recv().await.expect("conversation cleared event");
-        assert_eq!(event_kind(&cleared), Some("ConversationCleared"));
-        let idle = rx.recv().await.expect("idle event");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        let warning = rx.recv().await.expect("warning event");
-        assert_eq!(event_kind(&warning), Some("MessageAdded"));
-        assert_eq!(
-            warning
-                .get("data")
-                .and_then(|data| data.get("sender"))
-                .and_then(Value::as_str),
-            Some("Warning")
-        );
-        assert!(
-            warning
-                .get("data")
-                .and_then(|data| data.get("content"))
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("Starting a fresh Claude session"))
-        );
-
-        {
-            let state = inner.state.lock().await;
-            assert_eq!(state.session_id.as_deref(), Some("stale-missing-session"));
-            assert!(
-                state.start_session_fresh,
-                "next Claude process should use --session-id instead of --resume"
-            );
-            assert_eq!(state.cumulative_usage, None);
-            assert_eq!(state.conversation_bytes_total, 0);
-        }
-
-        unsafe {
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-    }
-
-    struct AskAnswerRaceHookGuard;
-
-    impl Drop for AskAnswerRaceHookGuard {
-        fn drop(&mut self) {
-            *ASK_ANSWER_RACE_HOOK
-                .lock()
-                .expect("AskUserQuestion answer race hook mutex poisoned") = None;
-        }
-    }
-
-    fn install_ask_answer_race_hook() -> (
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-        AskAnswerRaceHookGuard,
-    ) {
-        let after_write = Arc::new(tokio::sync::Notify::new());
-        let resume = Arc::new(tokio::sync::Notify::new());
-        *ASK_ANSWER_RACE_HOOK
-            .lock()
-            .expect("AskUserQuestion answer race hook mutex poisoned") = Some(AskAnswerRaceHook {
-            after_write: Arc::clone(&after_write),
-            resume: Arc::clone(&resume),
-        });
-        (after_write, resume, AskAnswerRaceHookGuard)
-    }
-
-    #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .unwrap_or_else(|err| panic!("stat fake Claude script {}: {err}", path.display()))
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions)
-            .unwrap_or_else(|err| panic!("chmod fake Claude script {}: {err}", path.display()));
-    }
-
-    fn stream_end_message(event: &Value) -> &Value {
-        event
-            .get("data")
-            .and_then(|data| data.get("message"))
-            .expect("stream end message")
-    }
-
-    fn write_fake_exit_plan_mode_script(fake: &Path) {
-        std::fs::write(
-            fake,
-            r##"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-exit-plan-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-plan_path = "/repo/.claude/plans/test-plan.md"
-plan_content = "# Plan\n\nDo the work.\nRun the tests."
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") == "control_response":
-        response = value.get("response", {})
-        if response.get("request_id") == "plan-1":
-            control = response.get("response", {})
-            behavior = control.get("behavior")
-            updated = control.get("updatedInput") or {}
-            feedback = control.get("message") or control.get("feedback") or ""
-            if behavior == "allow":
-                text = "plan approved: " + (updated.get("plan") or "")
-            else:
-                text = "plan rejected: " + feedback
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "message_start",
-                    "message": {"id": "plan-answer-msg", "model": "fake-model", "usage": {"input_tokens": 2}},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": text},
-                },
-            })
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-            emit({
-                "type": "result",
-                "subtype": "success",
-                "is_error": False,
-                "result": text,
-                "session_id": session_id,
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-            })
-        continue
-    if value.get("type") == "user":
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "message_start",
-                "message": {"id": "plan-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
-            },
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_write",
-                    "name": "Write",
-                    "input": {
-                        "file_path": plan_path,
-                        "content": plan_content,
-                    },
-                },
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_exit",
-                    "name": "ExitPlanMode",
-                    "input": {},
-                },
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 1}})
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-        emit({
-            "type": "control_request",
-            "request_id": "plan-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "ExitPlanMode",
-                "tool_call_id": "toolu_exit",
-                "input": {},
-            },
-        })
-"##,
-        )
-        .expect("write fake Claude ExitPlanMode script");
-        #[cfg(unix)]
-        make_executable(fake);
-    }
-
-    fn stream_end_tool_call_ids(event: &Value) -> Vec<String> {
-        stream_end_message(event)
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .expect("stream end tool_calls")
-            .iter()
-            .filter_map(|tool_call| {
-                tool_call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string())
-            })
-            .collect()
-    }
-
-    fn stream_end_usage_scope_total_tokens(event: &Value, scope: &str) -> Option<u64> {
-        stream_end_message(event)
-            .get("token_usage")
-            .and_then(|usage| usage.get(scope))
-            .and_then(|scope| scope.get("usage"))
-            .and_then(|usage| usage.get("total_tokens"))
-            .and_then(Value::as_u64)
-    }
-
-    fn stream_end_request_total_tokens(event: &Value) -> Option<u64> {
-        stream_end_usage_scope_total_tokens(event, "request")
-    }
-
-    fn stream_end_turn_total_tokens(event: &Value) -> Option<u64> {
-        stream_end_usage_scope_total_tokens(event, "turn")
-    }
-
-    fn stream_end_cumulative_total_tokens(event: &Value) -> Option<u64> {
-        stream_end_usage_scope_total_tokens(event, "cumulative")
-    }
-
-    #[test]
-    fn subagent_final_stream_end_uses_child_result_usage() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (child_inner, mut child_rx) = make_test_inner();
-            let child_inner = Arc::new(child_inner);
-            let message_id = "subagent-toolu_1-seg-1";
-            child_inner.emit_stream_start(message_id, Some("claude-test".to_string()));
-            let stream_start = child_rx.recv().await.expect("child StreamStart");
-            assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-            assert_eq!(
-                stream_start
-                    .get("data")
-                    .and_then(|data| data.get("message_id"))
-                    .and_then(Value::as_str),
-                Some(message_id)
-            );
-            let (parent_emitter, _parent_rx) = test_parent_emitter();
-            let mut stream = SubAgentStream {
-                summary: ClaudeStdoutSummary {
-                    streamed_text: "child done".to_string(),
-                    model: Some("claude-test".to_string()),
-                    usage: Some(json!({
-                        "input_tokens": 2,
-                        "output_tokens": 3,
-                        "total_tokens": 5,
-                        "cached_prompt_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "reasoning_tokens": 0
-                    })),
-                    result_turn_usage: Some(json!({
-                        "input_tokens": 7,
-                        "output_tokens": 10,
-                        "total_tokens": 17,
-                        "cached_prompt_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "reasoning_tokens": 0
-                    })),
-                    ..ClaudeStdoutSummary::default()
-                },
-                segment: SegmentState::default(),
-                message_id: message_id.to_string(),
-                has_explicit_task_prompt: false,
-                inner: child_inner,
-                parent_tool_use_id: "toolu_1".to_string(),
-                parent_tool_name: "Task".to_string(),
-                agent_id: protocol::AgentId("child-agent".to_string()),
-                agent_name: "Child".to_string(),
-                name_update_tx: None,
-                parent_emitter,
-                last_progress_emit: std::time::Instant::now(),
-                execution: SubAgentExecution::Foreground,
-                seen_tool_call_ids: HashSet::new(),
-                last_tool_name: None,
-                reported_total_tokens: None,
-            };
-
-            close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
-
-            let stream_end = child_rx.recv().await.expect("child StreamEnd");
-            assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-            assert_eq!(
-                stream_end_message(&stream_end)
-                    .get("message_id")
-                    .and_then(Value::as_str),
-                Some(message_id)
-            );
-            assert_eq!(stream_end_request_total_tokens(&stream_end), Some(5));
-            assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(17));
-            assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(17));
-            assert!(
-                child_rx.try_recv().is_err(),
-                "child phase should not emit an identity error or cancellation"
-            );
-        });
-    }
-
-    #[test]
-    fn subagent_final_stream_end_uses_accumulated_request_usage_without_result() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (child_inner, mut child_rx) = make_test_inner();
-            let child_inner = Arc::new(child_inner);
-            let message_id = "subagent-toolu_1-seg-1";
-            child_inner.emit_stream_start(message_id, Some("claude-test".to_string()));
-            let stream_start = child_rx.recv().await.expect("child StreamStart");
-            assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-            assert_eq!(
-                stream_start
-                    .get("data")
-                    .and_then(|data| data.get("message_id"))
-                    .and_then(Value::as_str),
-                Some(message_id)
-            );
-            let mut summary = ClaudeStdoutSummary {
-                streamed_text: "child done".to_string(),
-                model: Some("claude-test".to_string()),
-                usage: Some(json!({
-                    "input_tokens": 2,
-                    "output_tokens": 29,
-                    "total_tokens": 31,
-                    "cached_prompt_tokens": 0,
-                    "cache_creation_input_tokens": 12_969,
-                    "reasoning_tokens": 4
-                })),
-                ..ClaudeStdoutSummary::default()
-            };
-            let mut segment = SegmentState::default();
-
-            close_current_subagent_phase(&mut summary, &mut segment, &child_inner);
-
-            let stream_end = child_rx.recv().await.expect("child StreamEnd");
-            assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-            assert_eq!(
-                stream_end_message(&stream_end)
-                    .get("message_id")
-                    .and_then(Value::as_str),
-                Some(message_id)
-            );
-            assert_eq!(stream_end_request_total_tokens(&stream_end), Some(31));
-            assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
-            assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(31));
-            assert_eq!(
-                stream_end
-                    .get("data")
-                    .and_then(|data| data.get("message"))
-                    .and_then(|data| data.get("token_usage"))
-                    .and_then(|usage| usage.get("turn"))
-                    .and_then(|scope| scope.get("usage"))
-                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
-                    .and_then(Value::as_u64),
-                Some(12_969)
-            );
-
-            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-            let session_id = Arc::new(std::sync::Mutex::new(None));
-            assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
-            let BackendEvent::Chat(event) =
-                events_rx.recv().await.expect("adapted child StreamEnd")
-            else {
-                panic!("expected adapted child chat event");
-            };
-            let task_usage = crate::agent::task_usage_scope_from_chat_events_for_test(
-                BackendKind::Claude,
-                [event],
-            );
-            let protocol::TaskTokenUsageScope::Known { usage } = task_usage else {
-                panic!("Claude child fallback should produce known public task usage");
-            };
-            assert_eq!(usage.total_tokens, 31);
-            assert_eq!(usage.input_tokens, Some(2));
-            assert_eq!(usage.output_tokens, Some(29));
-            assert_eq!(usage.cached_prompt_tokens, Some(0));
-            assert_eq!(usage.cache_creation_input_tokens, Some(12_969));
-            assert!(
-                child_rx.try_recv().is_err(),
-                "child phase should not emit an identity error or cancellation"
-            );
-        });
-    }
-
-    fn usage_only_subagent_stream(
-        tool_use_id: &str,
-        accumulated: bool,
-    ) -> (SubAgentStream, mpsc::UnboundedReceiver<Value>) {
-        let (child_inner, child_rx) = make_test_inner();
-        let usage = json!({
-            "input_tokens": 2,
-            "output_tokens": 29,
-            "total_tokens": 31,
-            "cached_prompt_tokens": 0,
-            "cache_creation_input_tokens": 12_969,
-            "reasoning_tokens": 0
-        });
-        let summary = if accumulated {
-            ClaudeStdoutSummary {
-                accumulated_request_usage: Some(usage),
-                ..ClaudeStdoutSummary::default()
-            }
-        } else {
-            ClaudeStdoutSummary {
-                usage: Some(usage),
-                ..ClaudeStdoutSummary::default()
-            }
-        };
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        (
-            SubAgentStream {
-                summary,
-                segment: SegmentState {
-                    awaiting_stream_start: true,
-                    ..SegmentState::default()
-                },
-                message_id: format!("subagent-{tool_use_id}"),
-                has_explicit_task_prompt: false,
-                inner: Arc::new(child_inner),
-                parent_tool_use_id: tool_use_id.to_string(),
-                parent_tool_name: "Task".to_string(),
-                agent_id: protocol::AgentId(format!("child-{tool_use_id}")),
-                agent_name: "Child".to_string(),
-                name_update_tx: None,
-                parent_emitter,
-                last_progress_emit: std::time::Instant::now(),
-                execution: SubAgentExecution::Unknown,
-                seen_tool_call_ids: HashSet::new(),
-                last_tool_name: None,
-                reported_total_tokens: None,
-            },
-            child_rx,
-        )
-    }
-
-    #[test]
-    fn subagent_teardown_closes_whitespace_only_stream() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (mut stream, mut child_rx) =
-                usage_only_subagent_stream("toolu-whitespace-child", false);
-            stream.summary = ClaudeStdoutSummary::default();
-            let child_emitter = stream.inner.emitter.clone();
-
-            consume_subagent_event(
-                &mut stream,
-                &json!({
-                    "type": "stream_event",
-                    "event": {
-                        "type": "message_start",
-                        "message": {
-                            "id": "provider-child-message",
-                            "model": "claude-test"
-                        }
-                    }
-                }),
-            );
-            consume_subagent_event(
-                &mut stream,
-                &json!({
-                    "type": "stream_event",
-                    "event": {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "text",
-                            "text": " \n "
-                        }
-                    }
-                }),
-            );
-            assert!(child_emitter.is_stream_open());
-
-            finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
-
-            let events = std::iter::from_fn(|| child_rx.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event_kind(event) == Some("StreamStart"))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event_kind(event) == Some("StreamEnd"))
-                    .count(),
-                1
-            );
-            let stream_end = events
-                .iter()
-                .find(|event| event_kind(event) == Some("StreamEnd"))
-                .expect("subagent teardown StreamEnd");
-            assert_eq!(
-                stream_end_message(stream_end)
-                    .get("content")
-                    .and_then(Value::as_str),
-                Some("")
-            );
-            assert_paired_stream_lifecycle(&events);
-            assert_claude_protocol_valid(&events);
-            assert!(
-                !child_emitter.is_stream_open(),
-                "subagent teardown must close a whitespace-only child stream"
-            );
-        });
-    }
-
-    #[test]
-    fn subagent_teardown_closes_retained_pending_tool_stream() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (mut stream, mut child_rx) =
-                usage_only_subagent_stream("toolu-incomplete-child", false);
-            stream.summary = ClaudeStdoutSummary::default();
-            let child_emitter = stream.inner.emitter.clone();
-
-            consume_subagent_event(
-                &mut stream,
-                &json!({
-                    "type": "stream_event",
-                    "event": {
-                        "type": "message_start",
-                        "message": {
-                            "id": "provider-child-message",
-                            "model": "claude-test"
-                        }
-                    }
-                }),
-            );
-            consume_subagent_event(
-                &mut stream,
-                &json!({
-                    "type": "stream_event",
-                    "event": {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": "toolu_child_incomplete",
-                            "name": "EmptyTool",
-                            "input": {}
-                        }
-                    }
-                }),
-            );
-            consume_subagent_event(
-                &mut stream,
-                &json!({
-                    "type": "stream_event",
-                    "event": {
-                        "type": "content_block_stop",
-                        "index": 0
-                    }
-                }),
-            );
-            assert!(stream.segment.pending_tool_uses.contains_key(&0));
-
-            finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
-
-            let events = std::iter::from_fn(|| child_rx.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event_kind(event) == Some("ToolRequest")
-                            && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                                == Some("toolu_child_incomplete")
-                    })
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event_kind(event) == Some("ToolExecutionCompleted")
-                            && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                                == Some("toolu_child_incomplete")
-                            && event.pointer("/data/success").and_then(Value::as_bool)
-                                == Some(false)
-                            && event
-                                .pointer("/data/tool_result/short_message")
-                                .and_then(Value::as_str)
-                                == Some("Tool result missing")
-                    })
-                    .count(),
-                1
-            );
-            assert_paired_stream_lifecycle(&events);
-            assert_claude_protocol_valid(&events);
-            assert!(
-                !child_emitter.is_stream_open(),
-                "subagent teardown must not leave its retained-pending stream open"
-            );
-            assert!(
-                !child_emitter.has_pending_tool_request("toolu_child_incomplete"),
-                "subagent teardown must complete its fallback-emitted tool request"
-            );
-        });
-    }
-
-    #[test]
-    fn subagent_progress_preserves_parent_tool_identity() {
-        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-agent", false);
-        stream.parent_tool_name = "Agent".to_owned();
-
-        let progress = subagent_progress_data(&mut stream, false);
-        assert_eq!(progress.tool_call_id, "toolu-agent");
-        assert_eq!(progress.tool_name, "Agent");
-    }
-
-    #[test]
-    fn local_agent_progress_correlates_task_id_and_emits_total_only_usage() {
-        let (stream, mut child_rx) = usage_only_subagent_stream("toolu-local", false);
-        let mut streams = HashMap::from([("toolu-local".to_owned(), stream)]);
-        let mut task_to_tool_use = HashMap::new();
-
-        observe_local_agent_task_usage(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "task-local",
-                "tool_use_id": "toolu-local",
-                "task_type": "local_agent"
-            }),
-            &mut task_to_tool_use,
-            &mut streams,
-        );
-        observe_local_agent_task_usage(
-            &json!({
-                "type": "system",
-                "subtype": "task_progress",
-                "task_id": "task-local",
-                "usage": { "tool_uses": 2, "duration_ms": 900 }
-            }),
-            &mut task_to_tool_use,
-            &mut streams,
-        );
-        assert!(
-            child_rx.try_recv().is_err(),
-            "a frame without total_tokens must not fabricate usage"
-        );
-        observe_local_agent_task_usage(
-            &json!({
-                "type": "system",
-                "subtype": "task_progress",
-                "task_id": "task-local",
-                "usage": {
-                    "total_tokens": 47,
-                    "tool_uses": 3,
-                    "duration_ms": 1200
-                }
-            }),
-            &mut task_to_tool_use,
-            &mut streams,
-        );
-
-        let total = child_rx
-            .try_recv()
-            .expect("total-only usage event should be emitted");
-        assert_eq!(
-            total.get("kind").and_then(Value::as_str),
-            Some("TotalOnlyTokenUsage")
-        );
-        assert_eq!(
-            total.pointer("/data/total_tokens").and_then(Value::as_u64),
-            Some(47)
-        );
-        assert!(child_rx.try_recv().is_err());
-
-        observe_local_agent_task_usage(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "task-local",
-                "status": "completed",
-                "usage": { "total_tokens": 53 }
-            }),
-            &mut task_to_tool_use,
-            &mut streams,
-        );
-        assert!(!task_to_tool_use.contains_key("task-local"));
-        let terminal_total = child_rx
-            .try_recv()
-            .expect("notification aggregate should update total-only usage");
-        assert_eq!(
-            terminal_total
-                .pointer("/data/total_tokens")
-                .and_then(Value::as_u64),
-            Some(53)
-        );
-    }
-
-    #[test]
-    fn subagent_progress_retains_tool_telemetry_after_phase_reset() {
-        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-agent", false);
-
-        consume_subagent_event(
-            &mut stream,
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu-child-bash",
-                        "name": "Bash",
-                        "input": {"command": "pwd"}
-                    }]
-                }
-            }),
-        );
-        consume_subagent_event(
-            &mut stream,
-            &json!({
-                "type": "user",
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu-child-bash",
-                        "is_error": false,
-                        "content": "ok"
-                    }]
-                }
-            }),
-        );
-
-        assert!(
-            stream.summary.tool_calls.is_empty(),
-            "the phase-local tool list should have reset"
-        );
-        let progress = subagent_progress_data(&mut stream, true);
-        let ToolProgressUpdate::SubAgent(progress) = progress.update else {
-            panic!("expected sub-agent progress");
-        };
-        assert_eq!(progress.tool_calls, 1);
-        assert_eq!(progress.last_tool_name.as_deref(), Some("Bash"));
-    }
-
-    #[tokio::test]
-    async fn later_claude_spawn_metadata_enriches_only_generic_child_name() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-name", false);
-        stream.agent_name = "Agent".to_owned();
-        let (name_tx, mut name_rx) = mpsc::unbounded_channel();
-        stream.name_update_tx = Some(name_tx);
-        let mut streams = HashMap::from([("toolu-name".to_owned(), stream)]);
-
-        ensure_subagent_stream(
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            SubAgentSpawnSpec {
-                tool_use_id: "toolu-name".to_owned(),
-                parent_tool_name: Some("Agent".to_owned()),
-                name: "Review Authentication".to_owned(),
-                description: "Inspect the authentication flow".to_owned(),
-                agent_type: "general-purpose".to_owned(),
-                session_id_hint: None,
-                execution: SubAgentExecution::Foreground,
-            },
-        )
-        .await;
-        assert_eq!(
-            streams.get("toolu-name").unwrap().agent_name,
-            "Review Authentication"
-        );
-        assert_eq!(name_rx.try_recv().unwrap(), "Review Authentication");
-
-        ensure_subagent_stream(
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            SubAgentSpawnSpec {
-                tool_use_id: "toolu-name".to_owned(),
-                parent_tool_name: None,
-                name: "Agent".to_owned(),
-                description: String::new(),
-                agent_type: "local_agent".to_owned(),
-                session_id_hint: None,
-                execution: SubAgentExecution::Unknown,
-            },
-        )
-        .await;
-        assert_eq!(
-            streams.get("toolu-name").unwrap().agent_name,
-            "Review Authentication"
-        );
-        assert!(name_rx.try_recv().is_err());
-        assert!(
-            emitter.spawn_records().is_empty(),
-            "enrichment must not register a duplicate child"
-        );
-    }
-
-    async fn assert_usage_only_child_terminal_is_known(
-        child_rx: &mut mpsc::UnboundedReceiver<Value>,
-    ) {
-        let stream_start = child_rx.recv().await.expect("usage-only StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        let message_id = stream_start
-            .get("data")
-            .and_then(|data| data.get("message_id"))
-            .and_then(Value::as_str)
-            .expect("usage-only stream identity")
-            .to_string();
-
-        let stream_end = child_rx.recv().await.expect("usage-only StreamEnd");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_message(&stream_end)
-                .get("message_id")
-                .and_then(Value::as_str),
-            Some(message_id.as_str())
-        );
-        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
-        assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(31));
-        let idle = child_rx.recv().await.expect("usage-only child idle");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
-        assert!(
-            child_rx.try_recv().is_err(),
-            "usage-only completion should end with one explicit idle marker"
-        );
-
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let session_id = Arc::new(std::sync::Mutex::new(None));
-        assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
-        let BackendEvent::Chat(event) = events_rx.recv().await.expect("adapted terminal StreamEnd")
-        else {
-            panic!("expected adapted terminal chat event");
-        };
-        let usage =
-            crate::agent::task_usage_scope_from_chat_events_for_test(BackendKind::Claude, [event]);
-        assert!(matches!(
-            usage,
-            protocol::TaskTokenUsageScope::Known { usage }
-                if usage.total_tokens == 31
-                    && usage.output_tokens == Some(29)
-                    && usage.cache_creation_input_tokens == Some(12_969)
-        ));
-    }
-
-    #[tokio::test]
-    async fn task_notification_emits_usage_terminal_without_renderable_payload() {
-        for (status, accumulated) in [
-            ("completed", true),
-            ("failed", false),
-            ("error", false),
-            ("cancelled", false),
-        ] {
-            let tool_use_id = format!("toolu-{status}");
-            let (stream, mut child_rx) = usage_only_subagent_stream(&tool_use_id, accumulated);
-            let mut streams = HashMap::from([(tool_use_id.clone(), stream)]);
-
-            finalize_background_subagent_completion(
-                &json!({
-                    "type": "system",
-                    "subtype": "task_notification",
-                    "tool_use_id": tool_use_id,
-                    "status": status
-                }),
-                &mut streams,
-            );
-
-            assert!(streams.is_empty());
-            assert_usage_only_child_terminal_is_known(&mut child_rx).await;
-        }
-    }
-
-    /// The CLI never forwards a sub-agent's final assistant turn as a
-    /// correlated frame (verified against 2.1.217): the text and last-call
-    /// usage exist only in the parent's Task `tool_use_result`. Finalizing
-    /// a foreground child must materialize both in the child's chat.
-    #[tokio::test]
-    async fn foreground_task_result_materializes_final_child_message() {
-        let (mut stream, mut child_rx) = usage_only_subagent_stream("toolu_task_fg", true);
-        stream.execution = SubAgentExecution::Foreground;
-        let mut streams = HashMap::from([("toolu_task_fg".to_string(), stream)]);
-
-        // Captured 2.1.217 frame shape (trimmed): the message block carries
-        // the text plus an agentId/usage postscript; `tool_use_result` is
-        // the authoritative final content and usage.
-        detect_subagent_completions(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "tool_use_id": "toolu_task_fg",
-                        "type": "tool_result",
-                        "content": [
-                            {"type": "text", "text": "qa-child-done"},
-                            {"type": "text", "text": "agentId: aa62c69 (use SendMessage...)\n<usage>subagent_tokens: 8512</usage>"}
-                        ]
-                    }]
-                },
-                "tool_use_result": {
-                    "status": "completed",
-                    "agentId": "aa62c69",
-                    "content": [{"type": "text", "text": "qa-child-done"}],
-                    "usage": {
-                        "input_tokens": 2,
-                        "output_tokens": 8,
-                        "cache_read_input_tokens": 8398,
-                        "cache_creation_input_tokens": 104
-                    }
-                }
-            }),
-            &mut streams,
-        )
-        .await;
-        assert!(streams.is_empty(), "foreground stream is finalized");
-
-        let stream_start = child_rx.recv().await.expect("final message StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        let stream_end = child_rx.recv().await.expect("final message StreamEnd");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        let message = stream_end_message(&stream_end);
-        assert_eq!(
-            message.get("content").and_then(Value::as_str),
-            Some("qa-child-done"),
-            "the child's final text renders, not an empty placeholder"
-        );
-        // Turn usage = accumulated intermediate calls (2/29/31) + the final
-        // call (2/8/10 after normalization) — the output tokens that used
-        // to go unreported.
-        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(41));
-    }
-
-    /// A background sub-agent's final text arrives only in its completion
-    /// `task_notification` summary; finalization must render it.
-    #[tokio::test]
-    async fn background_notification_materializes_final_child_message() {
-        let (stream, mut child_rx) = usage_only_subagent_stream("toolu_task_bg", true);
-        let mut streams = HashMap::from([("toolu_task_bg".to_string(), stream)]);
-
-        finalize_background_subagent_completion(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "aa62c69083a72aa6f",
-                "tool_use_id": "toolu_task_bg",
-                "status": "completed",
-                "summary": "qa-child-done",
-            }),
-            &mut streams,
-        );
-        assert!(streams.is_empty());
-
-        let stream_start = child_rx.recv().await.expect("final message StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        let stream_end = child_rx.recv().await.expect("final message StreamEnd");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_message(&stream_end)
-                .get("content")
-                .and_then(Value::as_str),
-            Some("qa-child-done")
-        );
-        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
-        let idle = child_rx.recv().await.expect("background child idle");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
-    }
-
-    #[tokio::test]
-    async fn stdout_eof_emits_tool_only_usage_terminal_without_renderable_payload() {
-        let (stream, mut child_rx) = usage_only_subagent_stream("toolu-eof", true);
-
-        finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
-
-        assert_usage_only_child_terminal_is_known(&mut child_rx).await;
-    }
-
-    fn emit_test_phase_end(inner: &ClaudeInner, summary: &mut ClaudeStdoutSummary) {
-        let phase = take_phase_emission(summary).expect("phase emission");
-        let tool_calls = phase
-            .tool_calls
-            .iter()
-            .map(|tool| {
-                json!({
-                    "id": tool.id,
-                    "name": tool.name,
-                    "arguments": tool.arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-        inner.emit_stream_end(
-            phase.text,
-            phase.model,
-            ClaudeMessageUsage {
-                request: phase.usage,
-                turn: None,
-                cumulative: None,
-            },
-            phase.reasoning,
-            tool_calls,
-            None,
-        );
-    }
-
-    #[test]
-    fn build_stream_json_user_message_includes_text_and_images() {
-        let images = vec![
-            make_image("base64-image", "image/jpeg"),
-            make_image("   ", "image/png"),
-        ];
-        let payload = build_stream_json_user_message("hello", &images);
-        let content = payload
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_array)
-            .expect("content blocks");
-
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0].get("type").and_then(Value::as_str), Some("text"));
-        assert_eq!(
-            content[0].get("text").and_then(Value::as_str),
-            Some("hello")
-        );
-        assert_eq!(
-            content[1].get("type").and_then(Value::as_str),
-            Some("image")
-        );
-        assert_eq!(
-            content[1]
-                .get("source")
-                .and_then(|source| source.get("media_type"))
-                .and_then(Value::as_str),
-            Some("image/jpeg")
-        );
-        assert_eq!(
-            content[1]
-                .get("source")
-                .and_then(|source| source.get("data"))
-                .and_then(Value::as_str),
-            Some("base64-image")
-        );
-    }
-
-    #[test]
-    fn build_stream_json_user_message_allows_image_only_input() {
-        let images = vec![make_image("base64-image", "image/png")];
-        let payload = build_stream_json_user_message("", &images);
-        let content = payload
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_array)
-            .expect("content blocks");
-
-        assert_eq!(content.len(), 1);
-        assert_eq!(
-            content[0].get("type").and_then(Value::as_str),
-            Some("image")
-        );
-        assert_eq!(
-            content[0]
-                .get("source")
-                .and_then(|source| source.get("media_type"))
-                .and_then(Value::as_str),
-            Some("image/png")
-        );
-        assert_eq!(
-            content[0]
-                .get("source")
-                .and_then(|source| source.get("data"))
-                .and_then(Value::as_str),
-            Some("base64-image")
-        );
-    }
-
-    #[test]
-    fn control_request_detects_ask_user_question_for_bridge() {
-        let value = json!({
-            "type": "control_request",
-            "request_id": "req-ask",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": {
-                    "questions": [{
-                        "question": "Continue?",
-                        "options": [{ "id": "yes", "label": "Yes" }],
-                    }],
-                    "answers": {
-                        "question-1": "Yes",
-                    },
-                },
-            },
-        });
-        let request =
-            ask_user_question_control_request(&value).expect("AskUserQuestion bridge request");
-
-        assert_eq!(request.request_id, "req-ask");
-        assert_eq!(request.tool_call_id, "toolu_ask");
-        assert_eq!(request.tool_name, "AskUserQuestion");
-        assert_eq!(
-            request
-                .input
-                .pointer("/questions/0/question")
-                .and_then(Value::as_str),
-            Some("Continue?")
-        );
-        let fallback_payload =
-            control_response_payload_for_request(&value).expect("fallback response payload");
-        assert_eq!(
-            fallback_payload
-                .pointer("/response/response/behavior")
-                .and_then(Value::as_str),
-            Some("deny")
-        );
-    }
-
-    #[test]
-    fn control_request_detects_exit_plan_mode_for_bridge() {
-        let value = json!({
-            "type": "control_request",
-            "request_id": "req-plan",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "ExitPlanMode",
-                "tool_call_id": "toolu_exit",
-                "input": {
-                    "plan": "# Plan\n\nDo the work.",
-                    "planFilePath": "/repo/.claude/plans/test.md",
-                },
-            },
-        });
-        let request = exit_plan_mode_control_request(&value).expect("ExitPlanMode bridge request");
-
-        assert_eq!(request.request_id, "req-plan");
-        assert_eq!(request.tool_call_id, "toolu_exit");
-        assert_eq!(request.tool_name, "ExitPlanMode");
-        assert_eq!(
-            request.input.get("plan").and_then(Value::as_str),
-            Some("# Plan\n\nDo the work.")
-        );
-        let fallback_payload =
-            control_response_payload_for_request(&value).expect("fallback response payload");
-        assert_eq!(
-            fallback_payload
-                .pointer("/response/response/behavior")
-                .and_then(Value::as_str),
-            Some("deny")
-        );
-    }
-
-    #[test]
-    fn control_request_allows_non_interactive_tool_permissions() {
-        let input = json!({ "command": "echo ok" });
-        let payload = control_response_payload_for_request(&json!({
-            "type": "control_request",
-            "request_id": "req-bash",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "Bash",
-                "input": input,
-            },
-        }))
-        .expect("control response payload");
-
-        let response = payload
-            .get("response")
-            .and_then(|response| response.get("response"))
-            .expect("nested response");
-        assert_eq!(
-            response.get("behavior").and_then(Value::as_str),
-            Some("allow")
-        );
-        assert_eq!(response.get("updatedInput"), Some(&input));
-    }
-
-    #[test]
-    fn exit_plan_mode_response_payloads_match_claude_permissions() {
-        let input = json!({"plan": "# Plan"});
-        let approve = exit_plan_mode_control_response_payload(
-            "req-plan",
-            ExitPlanModeDecision::Approve,
-            input.clone(),
-            "",
-        );
-        assert_eq!(
-            approve
-                .pointer("/response/response/behavior")
-                .and_then(Value::as_str),
-            Some("allow")
-        );
-        assert_eq!(
-            approve.pointer("/response/response/updatedInput"),
-            Some(&input)
-        );
-
-        let reject = exit_plan_mode_control_response_payload(
-            "req-plan",
-            ExitPlanModeDecision::Reject,
-            input,
-            "Needs tests",
-        );
-        assert_eq!(
-            reject
-                .pointer("/response/response/behavior")
-                .and_then(Value::as_str),
-            Some("deny")
-        );
-        assert_eq!(
-            reject
-                .pointer("/response/response/message")
-                .and_then(Value::as_str),
-            Some("Needs tests")
-        );
-    }
-
-    #[test]
-    fn ask_user_question_answer_uses_question_text_key() {
-        let input = json!({
-            "questions": [{
-                "id": "choice",
-                "question": "Which choice?",
-                "header": "Choice",
-                "options": [{"label": "Blue"}, {"label": "Green"}],
-            }]
-        });
-
-        let updated = ask_user_question_input_with_answer(&input, "Choice: Blue");
-
-        assert_eq!(
-            updated
-                .pointer("/answers/Which choice?")
-                .and_then(Value::as_str),
-            Some("Blue")
-        );
-        assert!(updated.get("answer").is_none());
-        assert!(updated.get("answersText").is_none());
-    }
-
-    #[tokio::test]
-    async fn emit_user_message_added_emits_user_message_with_images() {
-        let (inner, mut rx) = make_test_inner();
-        let images = vec![make_image("base64-image", "image/png")];
-
-        inner.emit_user_message_added("hello", Some(&images));
-
-        let event = rx.recv().await.expect("message event");
-        assert_eq!(
-            event.get("kind").and_then(Value::as_str),
-            Some("MessageAdded")
-        );
-        assert_eq!(
-            event
-                .get("data")
-                .and_then(|data| data.get("sender"))
-                .and_then(Value::as_str),
-            Some("User")
-        );
-        assert_eq!(
-            event
-                .get("data")
-                .and_then(|data| data.get("content"))
-                .and_then(Value::as_str),
-            Some("hello")
-        );
-        let images = event
-            .get("data")
-            .and_then(|data| data.get("images"))
-            .and_then(Value::as_array)
-            .expect("images");
-        assert_eq!(images.len(), 1);
-        assert_eq!(
-            images[0].get("media_type").and_then(Value::as_str),
-            Some("image/png")
-        );
-        assert_eq!(
-            images[0].get("data").and_then(Value::as_str),
-            Some("base64-image")
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_persistent_claude_process_handles_interrupt_and_follow_up() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude.py");
-        let log = workspace.path().join("fake-claude.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-turn = 0
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        subtype = request.get("subtype")
-        emit({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": {} if subtype == "initialize" else None,
-            },
-        })
-        if subtype == "interrupt":
-            emit({
-                "type": "result",
-                "subtype": "error_during_execution",
-                "is_error": True,
-                "result": None,
-                "session_id": session_id,
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            })
-        continue
-
-    if value.get("type") != "user":
-        continue
-    turn += 1
-    if turn == 1:
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "message_start",
-                "message": {"id": "fake-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
-            },
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": "working"},
-            },
-        })
-        continue
-
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "fake-msg-2", "model": "fake-model", "usage": {"input_tokens": 2}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "follow-up ok"},
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "follow-up ok",
-        "session_id": session_id,
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-    })
-"#,
-        )
-        .expect("write fake Claude script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions).expect("chmod fake Claude script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "please wait for an interrupt".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send first fake turn");
-
-        let first_delta = recv_until_kind(&mut rx, "StreamDelta").await;
-        assert_eq!(
-            first_delta
-                .get("data")
-                .and_then(|data| data.get("text"))
-                .and_then(Value::as_str),
-            Some("working")
-        );
-
-        timeout(
-            Duration::from_secs(2),
-            handle.execute(SessionCommand::CancelConversation),
-        )
-        .await
-        .expect("fake interrupt should quiesce")
-        .expect("fake interrupt command should succeed");
-        let cancelled = recv_until_kind(&mut rx, "OperationCancelled").await;
-        assert_eq!(event_kind(&cancelled), Some("OperationCancelled"));
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "follow up".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send fake follow-up");
-        let follow_up_end = recv_until_kind(&mut rx, "StreamEnd").await;
-        assert_eq!(
-            stream_end_message(&follow_up_end)
-                .get("content")
-                .and_then(Value::as_str),
-            Some("follow-up ok")
-        );
-        let idle = recv_until_kind(&mut rx, "TypingStatusChanged").await;
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
-
-        session.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude log");
-        assert_eq!(log_contents.matches("START ").count(), 1);
-        assert!(log_contents.contains("\"subtype\":\"initialize\""));
-        assert!(log_contents.contains("\"subtype\":\"interrupt\""));
-        assert_eq!(log_contents.matches("\"type\":\"user\"").count(), 2);
-    }
-
-    /// End-to-end replay of the frame ordering captured when a background
-    /// command starts alongside another task. The capture puts `task_started`
-    /// and the `tool_result` before `message_delta`/`message_stop`, so ownership
-    /// cannot be resolved from the tool request at `task_started` time. The
-    /// client must still receive the `Running` snapshot the tray renders.
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_concurrent_background_launch_publishes_running_snapshot() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-concurrent-bg.py");
-        let log = workspace.path().join("fake-claude-concurrent-bg.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-args = sys.argv[1:]
-session_id = "fake-concurrent-bg"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-TOOL = "toolu_concurrent_bg_probe"
-WATCH = "toolu_concurrent_bg_watch"
-LATE = "toolu_concurrent_bg_late"
-INPUT = {
-    "command": "sleep 30; echo done",
-    "description": "probe",
-    "run_in_background": True,
-}
-LATE_INPUT = {
-    "command": "sleep 60; echo late",
-    "description": "late probe",
-    "run_in_background": True,
-}
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-def arm_watcher():
-    # Turn 1 arms a long-lived watcher. Its tool call is NOT run_in_background
-    # (so Tyde completes rather than detaches it), but the CLI still registers
-    # the watcher as a `local_bash` background task that outlives the turn.
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "watch-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "tool_use",
-                "id": WATCH,
-                "name": "Monitor",
-                "input": {},
-                "caller": {"type": "direct"},
-            },
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "input_json_delta",
-                "partial_json": json.dumps({"command": "tail -f /dev/null", "description": "watch"}),
-            },
-        },
-    })
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "watch-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{
-                "type": "tool_use",
-                "id": WATCH,
-                "name": "Monitor",
-                "input": {"command": "tail -f /dev/null", "description": "watch"},
-                "caller": {"type": "direct"},
-            }],
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-    emit({
-        "type": "system",
-        "subtype": "background_tasks_changed",
-        "session_id": session_id,
-        "tasks": [{"task_id": "watchtask", "task_type": "local_bash", "description": "watch"}],
-    })
-    emit({
-        "type": "system",
-        "subtype": "task_started",
-        "session_id": session_id,
-        "task_id": "watchtask",
-        "tool_use_id": WATCH,
-        "description": "watch",
-        "task_type": "local_bash",
-    })
-    emit({
-        "type": "user",
-        "session_id": session_id,
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": WATCH,
-                "content": "Monitor started (task watchtask).",
-            }],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "watcher armed",
-        "session_id": session_id,
-        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
-    })
-    time.sleep(0.1)
-    emit({
-        "type": "system",
-        "subtype": "task_notification",
-        "session_id": session_id,
-        "task_id": "watchtask",
-        "tool_use_id": WATCH,
-        "parent_tool_use_id": "fixture_no_wake",
-        "status": "stopped",
-        "summary": "watcher stopped",
-    })
-
-def launch_at_finalization():
-    # Turn 3 models the window the per-frame ownership retry cannot cover: the
-    # tool_use block never closes before the turn's `result`, so Tyde first
-    # materializes the tool request from `flush_pending_tool_uses_with_fallback`
-    # during turn finalization -- after the last per-frame retry, with no
-    # further frame left to retry on. Synthetic ordering rather than a captured
-    # stream; what it pins is that ownership must not depend on *when* the
-    # launching tool request lands.
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "late-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "tool_use",
-                "id": LATE,
-                "name": "Bash",
-                "input": {},
-                "caller": {"type": "direct"},
-            },
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": json.dumps(LATE_INPUT)},
-        },
-    })
-    emit({
-        "type": "system",
-        "subtype": "background_tasks_changed",
-        "session_id": session_id,
-        "tasks": [
-            {"task_id": "watchtask", "task_type": "local_bash", "description": "watch"},
-            {"task_id": "latetask", "task_type": "local_bash", "description": "late probe"},
-        ],
-    })
-    emit({
-        "type": "system",
-        "subtype": "task_started",
-        "session_id": session_id,
-        "task_id": "latetask",
-        "tool_use_id": LATE,
-        "description": "late probe",
-        "task_type": "local_bash",
-    })
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "late launch",
-        "session_id": session_id,
-        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
-    })
-    time.sleep(0.1)
-    emit({
-        "type": "system",
-        "subtype": "task_notification",
-        "session_id": session_id,
-        "task_id": "latetask",
-        "tool_use_id": LATE,
-        "parent_tool_use_id": "fixture_no_wake",
-        "status": "stopped",
-        "summary": "late probe stopped",
-    })
-
-log("START " + " ".join(args))
-turn = 0
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    turn += 1
-    if turn == 1:
-        arm_watcher()
-        continue
-    if turn == 3:
-        launch_at_finalization()
-        continue
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "bg-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "tool_use",
-                "id": TOOL,
-                "name": "Bash",
-                "input": {},
-                "caller": {"type": "direct"},
-            },
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": json.dumps(INPUT)},
-        },
-    })
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "bg-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{
-                "type": "tool_use",
-                "id": TOOL,
-                "name": "Bash",
-                "input": INPUT,
-                "caller": {"type": "direct"},
-            }],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "content_block_stop", "index": 0},
-    })
-    # A second task is already running; that is what pulls the task frames and
-    # the tool_result ahead of message_delta/message_stop.
-    emit({
-        "type": "system",
-        "subtype": "background_tasks_changed",
-        "session_id": session_id,
-        "tasks": [
-            {"task_id": "watchtask", "task_type": "local_bash", "description": "watch"},
-            {"task_id": "bgtask", "task_type": "local_bash", "description": "probe"},
-        ],
-    })
-    emit({
-        "type": "system",
-        "subtype": "task_started",
-        "session_id": session_id,
-        "task_id": "bgtask",
-        "tool_use_id": TOOL,
-        "description": "probe",
-        "task_type": "local_bash",
-    })
-    emit({
-        "type": "user",
-        "session_id": session_id,
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": TOOL,
-                "content": "Command running in background with ID: bgtask.",
-            }],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "launched",
-        "session_id": session_id,
-        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
-    })
-    emit({
-        "type": "system",
-        "subtype": "task_notification",
-        "session_id": session_id,
-        "task_id": "bgtask",
-        "tool_use_id": TOOL,
-        "parent_tool_use_id": "fixture_no_wake",
-        "status": "stopped",
-        "summary": "probe stopped",
-    })
-"#,
-        )
-        .expect("write fake concurrent background Claude script");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
-        // the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "arm the watcher".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send watcher turn");
-        // The fixture terminates its watcher before accepting the next user
-        // turn. Typing now remains active for observed background work, so the
-        // old fixture behavior of waiting for idle while leaving it running
-        // contradicted the backend contract. The next turn still replays the
-        // captured concurrent-task frame ordering above.
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let event = rx
-                    .recv()
-                    .await
-                    .expect("Claude event channel should stay open");
-                if event_kind(&event) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false)
-                {
-                    return;
-                }
-            }
-        })
-        .await
-        .expect("watcher turn should go idle");
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "launch a background command".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send background launch turn");
-
-        let mut seen = Vec::new();
-        let running = timeout(Duration::from_secs(5), async {
-            loop {
-                let event = rx
-                    .recv()
-                    .await
-                    .expect("Claude event channel should stay open");
-                if event_kind(&event) != Some("ToolProgress") {
-                    seen.push(event_kind(&event).unwrap_or("?").to_owned());
-                    continue;
-                }
-                let data: ToolProgressData =
-                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                        .expect("ToolProgress payload parses");
-                if let ToolProgressUpdate::BackgroundTask(state) = data.update
-                    && state.status == BackgroundTaskStatus::Running
-                {
-                    return (data.tool_call_id, state);
-                }
-            }
-        })
-        .await;
-
-        // Turn 3: the launching tool request only materializes during turn
-        // finalization, which is past the last per-frame ownership retry.
-        let late = if running.is_ok() {
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    let event = rx
-                        .recv()
-                        .await
-                        .expect("Claude event channel should stay open");
-                    if event_kind(&event) == Some("TypingStatusChanged")
-                        && event.get("data").and_then(Value::as_bool) == Some(false)
-                    {
-                        return;
-                    }
-                }
-            })
-            .await
-            .expect("background launch turn should go idle");
-            handle
-                .execute(SessionCommand::SendMessage {
-                    message: "launch one more background command".to_string(),
-                    images: None,
-                })
-                .await
-                .expect("send late background launch turn");
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    let event = rx
-                        .recv()
-                        .await
-                        .expect("Claude event channel should stay open");
-                    if event_kind(&event) != Some("ToolProgress") {
-                        continue;
-                    }
-                    let data: ToolProgressData =
-                        serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                            .expect("ToolProgress payload parses");
-                    if let ToolProgressUpdate::BackgroundTask(state) = data.update
-                        && state.status == BackgroundTaskStatus::Running
-                        && data.tool_call_id == "toolu_concurrent_bg_late"
-                    {
-                        return state;
-                    }
-                }
-            })
-            .await
-            .ok()
-        } else {
-            None
-        };
-
-        session.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before other tests run through this section.
-        unsafe {
-            match previous_claude_bin {
-                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
-                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
-            }
-            match previous_fake_log {
-                Some(value) => std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value),
-                None => std::env::remove_var("TYDE_FAKE_CLAUDE_LOG"),
-            }
-        }
-
-        let (tool_call_id, state) = running.unwrap_or_else(|_| {
-            panic!(
-                "a background command launched alongside a running task published no Running \
-                 snapshot, so the in-flight tray has no row to render; saw {seen:?}"
-            )
-        });
-        assert_eq!(tool_call_id, "toolu_concurrent_bg_probe");
-        assert_eq!(state.status, BackgroundTaskStatus::Running);
-
-        let late = late.expect(
-            "a background command whose tool request only lands during turn finalization \
-             published no Running snapshot, so the in-flight tray has no row to render",
-        );
-        assert_eq!(late.status, BackgroundTaskStatus::Running);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_resume_missing_history_starts_fresh_and_accepts_follow_up() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-stale-resume.py");
-        let log = workspace.path().join("fake-claude-stale-resume.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-stale-resume-default"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    emit({
-        "type": "system",
-        "subtype": "init",
-        "session_id": session_id,
-        "model": "fake-model",
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "fresh-resume-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "fresh follow-up ok"},
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "fresh follow-up ok",
-        "session_id": session_id,
-        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
-    })
-"#,
-        )
-        .expect("write fake Claude stale resume script");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-
-        let stale_session_id = protocol::SessionId("stale-missing-session".to_string());
-        let (backend, mut events) = ClaudeBackend::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            stale_session_id,
-        )
-        .await
-        .expect("resume should recover missing Claude history");
-
-        let warning = timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                if let protocol::ChatEvent::MessageAdded(message) = event
-                    && matches!(message.sender, protocol::MessageSender::Warning)
-                {
-                    return message;
-                }
-            }
-        })
-        .await
-        .expect("missing-session warning should be emitted");
-        assert!(warning.content.contains("Starting a fresh Claude session"));
-
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: "follow up after stale resume".to_string(),
-                        images: None,
-                        origin: None,
-                        tool_response: None,
-                    },
-                ))
-                .await,
-            "backend should remain alive after missing-session recovery"
-        );
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event after follow-up");
-                if let protocol::ChatEvent::StreamEnd(end) = event
-                    && end.message.content == "fresh follow-up ok"
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("fresh follow-up should complete");
-
-        backend.shutdown().await;
-        unsafe {
-            if let Some(value) = previous_claude_bin {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
-            } else {
-                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            }
-            if let Some(value) = previous_fake_log {
-                std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value);
-            } else {
-                std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-            }
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-
-        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude stale log");
-        let start_line = log_contents
-            .lines()
-            .find(|line| line.starts_with("START "))
-            .expect("fake Claude process should start after follow-up");
-        assert!(
-            start_line.contains("--session-id stale-missing-session"),
-            "fresh recovery should start Claude with the stale id as a new session: {start_line}"
-        );
-        assert!(
-            !start_line.contains("--resume"),
-            "fresh recovery must not ask Claude CLI to resume the missing jsonl: {start_line}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resumed_backend_finishes_delayed_initialization_before_replay_barrier_starts() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-delayed-init.py");
-        let log = workspace.path().join("fake-claude-delayed-init.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-for raw_line in sys.stdin:
-    value = json.loads(raw_line)
-    if value.get("type") != "control_request":
-        continue
-    request = value.get("request", {})
-    if request.get("subtype") != "initialize":
-        continue
-    request_id = value.get("request_id") or request.get("request_id")
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write("INIT_START\n")
-    time.sleep(0.1)
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write("INIT_DONE\n")
-    print(json.dumps({
-        "type": "control_response",
-        "response": {
-            "subtype": "success",
-            "request_id": request_id,
-            "response": {},
-        },
-    }), flush=True)
-"#,
-        )
-        .expect("write delayed initialize fake");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-
-        let (backend, mut events) = ClaudeBackend::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SessionId("delayed-valid-init".to_string()),
-        )
-        .await
-        .expect("delayed valid initialization should complete");
-        let log_contents = std::fs::read_to_string(&log).expect("read delayed init log");
-        assert!(log_contents.contains("INIT_START\nINIT_DONE\n"));
-        let mut replay_complete = events
-            .take_resume_replay_complete()
-            .expect("Claude resume replay barrier");
-        assert_eq!(replay_complete.try_recv(), Ok(()));
-
-        backend.shutdown().await;
-        unsafe {
-            if let Some(value) = previous_claude_bin {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
-            } else {
-                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            }
-            if let Some(value) = previous_fake_log {
-                std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value);
-            } else {
-                std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-            }
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn dropping_resumed_backend_startup_cleans_claude_process_guard() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-stalled-init.py");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-import time
-
-for raw_line in sys.stdin:
-    value = json.loads(raw_line)
-    request = value.get("request", {})
-    if value.get("type") == "control_request" and request.get("subtype") == "initialize":
-        while True:
-            time.sleep(1)
-"#,
-        )
-        .expect("write stalled initialize fake");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-        let (spawned_tx, mut spawned_rx) = oneshot::channel();
-        *CLAUDE_PROCESS_SPAWN_OBSERVER
-            .lock()
-            .expect("Claude process spawn observer mutex poisoned") = Some(spawned_tx);
-        let mut startup = Box::pin(ClaudeBackend::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SessionId("cancelled-delayed-init".to_owned()),
-        ));
-        let pid = timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
-            tokio::select! {
-                biased;
-                pid = &mut spawned_rx => pid.expect("Claude spawn observer must retain PID sender"),
-                _ = startup.as_mut() => {
-                    panic!("Claude resume completed before stalled initialization cancellation")
-                }
-            }
-        })
-        .await
-        .expect("Claude resume must spawn its persistent process")
-        .to_string();
-        let is_running = |pid: &str| {
-            std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        };
-        assert!(is_running(&pid), "fixture Claude process must be running");
-
-        drop(startup);
-
-        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
-            while is_running(&pid) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("dropping resume startup must trigger the Claude session guard");
-        assert!(
-            !is_running(&pid),
-            "dropping resume startup must trigger the Claude session guard"
-        );
-
-        unsafe {
-            if let Some(value) = previous_claude_bin {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
-            } else {
-                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            }
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resumed_backend_surfaces_initialize_failure_before_replay_barrier() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-init-failure.py");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-for raw_line in sys.stdin:
-    value = json.loads(raw_line)
-    if value.get("type") != "control_request":
-        continue
-    request = value.get("request", {})
-    if request.get("subtype") != "initialize":
-        continue
-    request_id = value.get("request_id") or request.get("request_id")
-    print(json.dumps({
-        "type": "control_response",
-        "response": {
-            "subtype": "error",
-            "request_id": request_id,
-            "error": {"message": "deliberate initialize rejection"},
-        },
-    }), flush=True)
-"#,
-        )
-        .expect("write failed initialize fake");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
-        }
-
-        let error = match ClaudeBackend::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SessionId("failed-valid-init".to_string()),
-        )
-        .await
-        {
-            Ok(_) => panic!("initialize rejection must fail resume"),
-            Err(error) => error,
-        };
-        assert!(error.contains("Failed to initialize resumed Claude session"));
-        assert!(error.contains("deliberate initialize rejection"));
-
-        unsafe {
-            if let Some(value) = previous_claude_bin {
-                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
-            } else {
-                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            }
-            if let Some(value) = previous_claude_config_dir {
-                std::env::set_var("CLAUDE_CONFIG_DIR", value);
-            } else {
-                std::env::remove_var("CLAUDE_CONFIG_DIR");
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_exit_plan_mode_control_request_waits_for_approval_message() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-exit-plan.py");
-        let log = workspace.path().join("fake-claude-exit-plan.log");
-        write_fake_exit_plan_mode_script(&fake);
-
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "plan first".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        let mut saw_pause = false;
-        let tool_request = timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                match event {
-                    protocol::ChatEvent::ToolRequest(request)
-                        if request.tool_call_id == "toolu_exit" =>
-                    {
-                        return request;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(false) => {
-                        saw_pause = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("ExitPlanMode ToolRequest should arrive");
-
-        assert_eq!(tool_request.tool_name, "ExitPlanMode");
-        let protocol::ToolRequestType::ExitPlanMode { plan, plan_path } = tool_request.tool_type
-        else {
-            panic!("expected ExitPlanMode tool request");
-        };
-        assert_eq!(
-            plan.as_deref(),
-            Some("# Plan\n\nDo the work.\nRun the tests.")
-        );
-        assert_eq!(
-            plan_path.as_deref(),
-            Some("/repo/.claude/plans/test-plan.md")
-        );
-
-        timeout(Duration::from_secs(2), async {
-            while !saw_pause {
-                if let protocol::ChatEvent::TypingStatusChanged(false) =
-                    events.recv().await.expect("backend event")
-                {
-                    saw_pause = true;
-                }
-            }
-        })
-        .await
-        .expect("ExitPlanMode should pause typing while waiting for approval");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let log_before_approval =
-            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
-        assert!(
-            !log_before_approval.contains("\"request_id\":\"plan-1\"")
-                && !log_before_approval.contains("\"request_id\": \"plan-1\""),
-            "ExitPlanMode control_response must wait for user approval; log={log_before_approval}"
-        );
-
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: String::new(),
-                        images: None,
-                        origin: None,
-                        tool_response: Some(protocol::SendMessageToolResponse::ExitPlanMode {
-                            tool_call_id: "toolu_exit".to_string(),
-                            decision: protocol::ExitPlanModeDecision::Approve,
-                            feedback: None,
-                        }),
-                    },
-                ))
-                .await,
-            "backend should accept ExitPlanMode approval"
-        );
-
-        let mut saw_completion = false;
-        let mut saw_typing_restart = false;
-        let mut saw_answer = false;
-        timeout(Duration::from_secs(2), async {
-            while !(saw_completion && saw_typing_restart && saw_answer) {
-                let event = events.recv().await.expect("backend event after approval");
-                match event {
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_exit" =>
-                    {
-                        assert!(completion.success);
-                        let protocol::ToolExecutionResult::Other { result } =
-                            &completion.tool_result
-                        else {
-                            panic!("expected Other result");
-                        };
-                        assert_eq!(
-                            result.get("decision").and_then(Value::as_str),
-                            Some("approved")
-                        );
-                        saw_completion = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(true) => {
-                        saw_typing_restart = true;
-                    }
-                    protocol::ChatEvent::StreamEnd(end)
-                        if end.message.content.contains("plan approved: # Plan") =>
-                    {
-                        saw_answer = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("approval should release Claude control_request");
-
-        backend.shutdown().await;
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_after_approval =
-            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
-        assert!(log_after_approval.contains("\"request_id\":\"plan-1\""));
-        assert!(log_after_approval.contains("\"behavior\":\"allow\""));
-        assert!(log_after_approval.contains("\"updatedInput\""));
-        assert!(log_after_approval.contains("Run the tests."));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_exit_plan_mode_reject_sends_deny_feedback() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-exit-plan-reject.py");
-        let log = workspace.path().join("fake-claude-exit-plan-reject.log");
-        write_fake_exit_plan_mode_script(&fake);
-
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "plan first".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                if matches!(
-                    event,
-                    protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
-                        ref tool_call_id,
-                        ..
-                    }) if tool_call_id == "toolu_exit"
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("ExitPlanMode ToolRequest should arrive");
-
-        let feedback = "Please add a rollback step.";
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: String::new(),
-                        images: None,
-                        origin: None,
-                        tool_response: Some(protocol::SendMessageToolResponse::ExitPlanMode {
-                            tool_call_id: "toolu_exit".to_string(),
-                            decision: protocol::ExitPlanModeDecision::Reject,
-                            feedback: Some(feedback.to_string()),
-                        }),
-                    },
-                ))
-                .await,
-            "backend should accept ExitPlanMode rejection"
-        );
-
-        let mut saw_completion = false;
-        let mut saw_typing_restart = false;
-        let mut saw_answer = false;
-        timeout(Duration::from_secs(2), async {
-            while !(saw_completion && saw_typing_restart && saw_answer) {
-                let event = events.recv().await.expect("backend event after rejection");
-                match event {
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_exit" =>
-                    {
-                        assert!(completion.success);
-                        let protocol::ToolExecutionResult::Other { result } =
-                            &completion.tool_result
-                        else {
-                            panic!("expected Other result");
-                        };
-                        assert_eq!(
-                            result.get("decision").and_then(Value::as_str),
-                            Some("rejected")
-                        );
-                        assert_eq!(
-                            result.get("feedback").and_then(Value::as_str),
-                            Some(feedback)
-                        );
-                        saw_completion = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(true) => {
-                        saw_typing_restart = true;
-                    }
-                    protocol::ChatEvent::StreamEnd(end)
-                        if end.message.content.contains("plan rejected: Please add") =>
-                    {
-                        saw_answer = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("rejection should release Claude control_request");
-
-        backend.shutdown().await;
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_after_rejection =
-            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
-        assert!(log_after_rejection.contains("\"behavior\":\"deny\""));
-        assert!(log_after_rejection.contains("\"message\":\"Please add a rollback step.\""));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_ask_user_question_control_request_waits_for_answer_message() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-ask.py");
-        let log = workspace.path().join("fake-claude-ask.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-ask-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") == "control_response":
-        response = value.get("response", {})
-        if response.get("request_id") == "ask-1":
-            control = response.get("response", {})
-            updated = control.get("updatedInput", {})
-            answer = updated.get("answers", {}).get("Which choice?", "")
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "message_start",
-                    "message": {"id": "ask-answer-msg", "model": "fake-model", "usage": {"input_tokens": 2}},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "answer accepted: " + answer},
-                },
-            })
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-            emit({
-                "type": "result",
-                "subtype": "success",
-                "is_error": False,
-                "result": "answer accepted: " + answer,
-                "session_id": session_id,
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-            })
-        continue
-    if value.get("type") == "user":
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        question_input = {
-            "questions": [{
-                "id": "choice",
-                "question": "Which choice?",
-                "header": "Choice",
-                "options": [{"label": "Blue"}, {"label": "Green"}],
-                "multiSelect": False,
-            }],
-        }
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "message_start",
-                "message": {"id": "ask-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
-            },
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": "Need a choice before I continue."},
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_ask",
-                    "name": "AskUserQuestion",
-                    "input": question_input,
-                },
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 1}})
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-        emit({
-            "type": "control_request",
-            "request_id": "ask-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": question_input,
-            },
-        })
-	"#,
-        )
-        .expect("write fake Claude AskUserQuestion script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude AskUserQuestion script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude AskUserQuestion script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "ask me before continuing".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        let mut events_before_question = Vec::new();
-        let tool_request = timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                events_before_question.push(event.clone());
-                if let protocol::ChatEvent::ToolRequest(request) = event {
-                    return request;
-                }
-            }
-        })
-        .await
-        .expect("AskUserQuestion ToolRequest should arrive");
-        assert_eq!(tool_request.tool_call_id, "toolu_ask");
-        assert_eq!(tool_request.tool_name, "AskUserQuestion");
-        assert!(matches!(
-            tool_request.tool_type,
-            protocol::ToolRequestType::AskUserQuestion { .. }
-        ));
-        let stream_ends_before_question = events_before_question
-            .iter()
-            .filter_map(|event| match event {
-                protocol::ChatEvent::StreamEnd(end) => Some(end),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            stream_ends_before_question.len(),
-            1,
-            "AskUserQuestion preamble/tool_use should close exactly one stream phase before the ToolRequest"
-        );
-        assert_eq!(
-            stream_ends_before_question[0].message.content,
-            "Need a choice before I continue."
-        );
-        let tool_call_ids = stream_ends_before_question[0]
-            .message
-            .tool_calls
-            .iter()
-            .map(|tool| tool.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(tool_call_ids, vec!["toolu_ask"]);
-        assert_eq!(
-            events_before_question
-                .iter()
-                .filter(|event| matches!(event, protocol::ChatEvent::ToolRequest(request) if request.tool_call_id == "toolu_ask"))
-                .count(),
-            1,
-            "AskUserQuestion bridge must not duplicate a streamed ToolRequest"
-        );
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let log_before_answer =
-            std::fs::read_to_string(&log).expect("read fake Claude AskUserQuestion log");
-        assert!(
-            !log_before_answer.contains("\"request_id\":\"ask-1\"")
-                && !log_before_answer.contains("\"request_id\": \"ask-1\""),
-            "AskUserQuestion control_response must wait for a user answer; log={log_before_answer}"
-        );
-
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: "Choice: Blue".to_string(),
-                        images: None,
-                        origin: None,
-                        tool_response: None,
-                    },
-                ))
-                .await,
-            "backend should accept AskUserQuestion answer"
-        );
-
-        let mut saw_completion = false;
-        let mut saw_answer = false;
-        let mut saw_idle = false;
-        let mut duplicate_tool_requests_after_answer = 0;
-        timeout(Duration::from_secs(2), async {
-            while !(saw_completion && saw_answer && saw_idle) {
-                let event = events.recv().await.expect("backend event after answer");
-                match event {
-                    protocol::ChatEvent::ToolRequest(request)
-                        if request.tool_call_id == "toolu_ask" =>
-                    {
-                        duplicate_tool_requests_after_answer += 1;
-                    }
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_ask" =>
-                    {
-                        assert!(completion.success);
-                        saw_completion = true;
-                    }
-                    protocol::ChatEvent::StreamEnd(end)
-                        if end.message.content.contains("answer accepted: Blue") =>
-                    {
-                        saw_answer = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(false) => {
-                        saw_idle = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("answer should release Claude control_request");
-        assert_eq!(
-            duplicate_tool_requests_after_answer, 0,
-            "AskUserQuestion answer path must not emit a duplicate ToolRequest"
-        );
-
-        backend.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_after_answer =
-            std::fs::read_to_string(&log).expect("read fake Claude AskUserQuestion log");
-        assert!(log_after_answer.contains("\"request_id\":\"ask-1\""));
-        assert!(log_after_answer.contains("Which choice?"));
-        assert!(log_after_answer.contains("Blue"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_ask_user_question_answer_continuation_waits_for_tool_completion() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-ask-race.py");
-        let log = workspace.path().join("fake-claude-ask-race.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-ask-race-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") == "control_response":
-        response = value.get("response", {})
-        if response.get("request_id") == "ask-1":
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "message_start",
-                    "message": {"id": "ask-race-answer-msg", "model": "fake-model", "usage": {"input_tokens": 2}},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            })
-            emit({
-                "type": "stream_event",
-                "session_id": session_id,
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "answer accepted after race"},
-                },
-            })
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-            emit({
-                "type": "result",
-                "subtype": "success",
-                "is_error": False,
-                "result": "answer accepted after race",
-                "session_id": session_id,
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-            })
-        continue
-    if value.get("type") == "user":
-        question_input = {
-            "questions": [{
-                "id": "choice",
-                "question": "Which choice?",
-                "header": "Choice",
-                "options": [{"label": "Blue"}, {"label": "Green"}],
-                "multiSelect": False,
-            }],
-        }
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "message_start",
-                "message": {"id": "ask-race-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
-            },
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": "Need a choice first."},
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_ask",
-                    "name": "AskUserQuestion",
-                    "input": question_input,
-                },
-            },
-        })
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 1}})
-        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-        emit({
-            "type": "control_request",
-            "request_id": "ask-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": question_input,
-            },
-        })
-"#,
-        )
-        .expect("write fake Claude AskUserQuestion race script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude AskUserQuestion race script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude AskUserQuestion race script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "ask me before racing".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                if matches!(
-                    event,
-                    protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
-                        ref tool_call_id,
-                        ..
-                    }) if tool_call_id == "toolu_ask"
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("AskUserQuestion ToolRequest should arrive");
-
-        let (after_write, resume_answer, _hook_guard) = install_ask_answer_race_hook();
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: "Choice: Blue".to_string(),
-                        images: None,
-                        origin: None,
-                        tool_response: None,
-                    },
-                ))
-                .await,
-            "backend should accept AskUserQuestion answer"
-        );
-        timeout(Duration::from_secs(2), after_write.notified())
-            .await
-            .expect("answer path should pause after writing control_response");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        resume_answer.notify_one();
-
-        let mut events_after_answer = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event after answer");
-                let done = matches!(
-                    &event,
-                    protocol::ChatEvent::StreamEnd(end)
-                        if end.message.content.contains("answer accepted after race")
-                );
-                events_after_answer.push(event);
-                if done {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("answer continuation should complete");
-
-        let ask_completions = events_after_answer
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                protocol::ChatEvent::ToolExecutionCompleted(completion)
-                    if completion.tool_call_id == "toolu_ask" =>
-                {
-                    Some((index, completion))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ask_completions.len(),
-            1,
-            "AskUserQuestion answer should emit exactly one completion: {events_after_answer:?}"
-        );
-        assert!(
-            ask_completions[0].1.success,
-            "AskUserQuestion completion must be successful before continuation"
-        );
-        let first_continuation_stream_index = events_after_answer
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    protocol::ChatEvent::StreamStart(_)
-                        | protocol::ChatEvent::StreamDelta(_)
-                        | protocol::ChatEvent::StreamEnd(_)
-                )
-            })
-            .expect("continuation stream event should be present");
-        assert!(
-            ask_completions[0].0 < first_continuation_stream_index,
-            "AskUserQuestion completion must precede continuation stream events: {events_after_answer:?}"
-        );
-
-        backend.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_claude_exit_without_stdout_result_fails_active_turn() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-exit-no-result.py");
-        let log = workspace.path().join("fake-claude-exit-no-result.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(sys.argv[1:]))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") == "user":
-        sys.exit(0)
-"#,
-        )
-        .expect("write fake Claude exit script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude exit script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions).expect("chmod fake Claude exit script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "exit before result".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send fake turn");
-
-        let mut saw_error = false;
-        let mut saw_idle = false;
-        let mut saw_stream_end = false;
-        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
-            while !(saw_error && saw_idle) {
-                let event = rx.recv().await.expect("backend event");
-                match event_kind(&event) {
-                    Some("StreamEnd") => {
-                        saw_stream_end = true;
-                    }
-                    Some("Error")
-                        if event
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .is_some_and(|message| {
-                                message.contains("Claude process exited before returning a result")
-                            }) =>
-                    {
-                        saw_error = true;
-                    }
-                    Some("TypingStatusChanged")
-                        if event.get("data").and_then(Value::as_bool) == Some(false) =>
-                    {
-                        saw_idle = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("active turn should fail and publish idle after Claude exits");
-        assert!(
-            saw_stream_end,
-            "failed active turn should close the open stream before publishing idle"
-        );
-
-        session.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude exit log");
-        assert!(log_contents.contains("\"subtype\":\"initialize\""));
-        assert!(log_contents.contains("\"type\":\"user\""));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_claude_busy_send_hands_message_back_and_redispatch_delivers() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-busy-queue.py");
-        let log = workspace.path().join("fake-claude-busy-queue.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-busy-queue-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-turn = 0
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        subtype = request.get("subtype")
-        emit({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": {} if subtype == "initialize" else None,
-            },
-        })
-        if subtype == "interrupt":
-            emit({
-                "type": "result",
-                "subtype": "error_during_execution",
-                "is_error": True,
-                "result": None,
-                "session_id": session_id,
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            })
-        continue
-
-    if value.get("type") != "user":
-        continue
-    turn += 1
-    if turn == 1:
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "message_start",
-                "message": {"id": "fake-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
-            },
-        })
-        emit({
-            "type": "stream_event",
-            "session_id": session_id,
-            "event": {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": "working"},
-            },
-        })
-        continue
-
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "fake-msg-2", "model": "fake-model", "usage": {"input_tokens": 2}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "queued follow-up ok"},
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "queued follow-up ok",
-        "session_id": session_id,
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-    })
-"#,
-        )
-        .expect("write fake Claude busy-queue script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude busy-queue script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude busy-queue script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "first turn".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send first fake turn");
-
-        let first_delta = recv_until_kind(&mut rx, "StreamDelta").await;
-        assert_eq!(
-            first_delta
-                .get("data")
-                .and_then(|data| data.get("text"))
-                .and_then(Value::as_str),
-            Some("working")
-        );
-
-        // Send while the first turn is mid-stream: admission must hand the
-        // message back as Busy without consuming it — no user bubble, no
-        // error card, nothing written to the CLI.
-        let busy_payload = protocol::SendMessagePayload {
-            message: "queued follow up".to_string(),
-            images: None,
-            origin: None,
-            tool_response: None,
-        };
-        let outcome = handle
-            .send_message_with_outcome(busy_payload.clone())
-            .await
-            .expect("busy admission must not error");
-        assert!(
-            matches!(outcome, ClaudeSendAdmission::Busy),
-            "a send during an active turn must be handed back as Busy"
-        );
-        while let Ok(event) = rx.try_recv() {
-            assert_ne!(
-                event_kind(&event),
-                Some("Error"),
-                "a busy hand-back must not emit an error card: {event}"
-            );
-            assert!(
-                !event.to_string().contains("queued follow up"),
-                "a busy hand-back must not surface the message in any event: {event}"
-            );
-        }
-        {
-            let log_contents =
-                std::fs::read_to_string(&log).expect("read fake Claude busy-handback log");
-            assert!(
-                !log_contents.contains("queued follow up"),
-                "a busy hand-back must not reach the Claude CLI: {log_contents}"
-            );
-        }
-
-        // End the first turn, then redispatch the retained payload exactly as
-        // the agent actor does after requeueing it.
-        timeout(
-            Duration::from_secs(2),
-            handle.execute(SessionCommand::CancelConversation),
-        )
-        .await
-        .expect("fake interrupt should quiesce")
-        .expect("fake interrupt command should succeed");
-
-        let outcome = handle
-            .send_message_with_outcome(busy_payload)
-            .await
-            .expect("redispatch must not error");
-        assert!(
-            matches!(outcome, ClaudeSendAdmission::Handled),
-            "the redispatched message must start a turn once the backend is idle"
-        );
-
-        let mut saw_user_bubble = false;
-        let mut saw_stream_end = false;
-        timeout(Duration::from_secs(10), async {
-            while !(saw_user_bubble && saw_stream_end) {
-                let event = rx.recv().await.expect("backend event");
-                match event_kind(&event) {
-                    Some("Error") => {
-                        panic!("the redispatched message must not produce an Error event: {event}");
-                    }
-                    Some("MessageAdded") if event.to_string().contains("queued follow up") => {
-                        saw_user_bubble = true;
-                    }
-                    Some("StreamEnd")
-                        if event
-                            .get("data")
-                            .and_then(|data| data.get("message"))
-                            .and_then(|message| message.get("content"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|content| content.contains("queued follow-up ok")) =>
-                    {
-                        saw_stream_end = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("the redispatched message should run as its own turn with a user bubble");
-
-        session.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_contents =
-            std::fs::read_to_string(&log).expect("read fake Claude busy-handback log");
-        assert!(
-            log_contents.contains("queued follow up"),
-            "the redispatched message must reach the Claude CLI: {log_contents}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_claude_exit_while_ask_user_question_pending_fails_tool() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-ask-exit.py");
-        let log = workspace.path().join("fake-claude-ask-exit.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-ask-exit-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") == "user":
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "control_request",
-            "request_id": "ask-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": {
-                    "questions": [{
-                        "id": "choice",
-                        "question": "Which choice?",
-                        "options": [{"label": "Blue"}, {"label": "Green"}],
-                        "multiSelect": False,
-                    }],
-                },
-            },
-        })
-        sys.exit(0)
-"#,
-        )
-        .expect("write fake Claude AskUserQuestion exit script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude AskUserQuestion exit script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude AskUserQuestion exit script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "ask then exit".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        let mut saw_request = false;
-        let mut saw_failed_completion = false;
-        let mut saw_error = false;
-        let mut saw_idle = false;
-        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
-            while !(saw_request && saw_failed_completion && saw_error && saw_idle) {
-                let event = events.recv().await.expect("backend event");
-                match event {
-                    protocol::ChatEvent::ToolRequest(request)
-                        if request.tool_call_id == "toolu_ask" =>
-                    {
-                        saw_request = true;
-                    }
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_ask" =>
-                    {
-                        assert!(!completion.success);
-                        assert!(
-                            completion.error.as_deref().is_some_and(
-                                |error| error.contains("exited before returning a result")
-                            ),
-                            "unexpected AskUserQuestion failure: {completion:?}"
-                        );
-                        saw_failed_completion = true;
-                    }
-                    protocol::ChatEvent::MessageAdded(message)
-                        if matches!(message.sender, protocol::MessageSender::Error)
-                            && message
-                                .content
-                                .contains("Claude process exited before returning a result") =>
-                    {
-                        saw_error = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(false) => {
-                        saw_idle = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("pending AskUserQuestion should fail when Claude exits");
-
-        backend.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-    }
-
-    #[tokio::test]
-    async fn ask_user_question_answer_write_failure_emits_failed_completion_only() {
-        let (inner, mut rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 4242,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: Some(PendingAskUserQuestionControl {
-                    request_id: "ask-1".to_string(),
-                    tool_call_id: "toolu_ask".to_string(),
-                    tool_name: "AskUserQuestion".to_string(),
-                    input: json!({
-                        "questions": [{
-                            "id": "choice",
-                            "question": "Which choice?",
-                            "options": [{"label": "Blue"}],
-                        }],
-                    }),
-                }),
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-
-        let handled = inner
-            .answer_pending_ask_user_question("Choice: Blue".to_string(), None)
-            .await
-            .expect("missing runtime write failure should be scoped to the active turn");
-        assert!(
-            handled,
-            "failed AskUserQuestion answer should consume the input"
-        );
-
-        let completion = recv_until_kind(&mut rx, "ToolExecutionCompleted").await;
-        assert_eq!(
-            completion
-                .pointer("/data/tool_call_id")
-                .and_then(Value::as_str),
-            Some("toolu_ask")
-        );
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(
-            completion
-                .pointer("/data/error")
-                .and_then(Value::as_str)
-                .is_some_and(|message| message.contains("Failed to send AskUserQuestion answer"))
-        );
-        while let Ok(event) = rx.try_recv() {
-            assert!(
-                !(event_kind(&event) == Some("ToolExecutionCompleted")
-                    && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)),
-                "write failure must not emit a false successful completion: {event}"
-            );
-        }
-
-        let outcome = timeout(Duration::from_secs(1), outcome_rx)
-            .await
-            .expect("failed answer write should complete active turn")
-            .expect("turn outcome sender should remain alive");
-        match outcome {
-            TurnOutcome::Failed { error, .. } => {
-                assert!(error.contains("Failed to send AskUserQuestion answer"));
-            }
-            _ => panic!("failed answer write should fail the active turn"),
-        }
-        let pending = {
-            let state = inner.state.lock().await;
-            state
-                .active_turn
-                .as_ref()
-                .and_then(|turn| turn.pending_ask_user_question.as_ref())
-                .is_some()
-        };
-        assert!(!pending, "failed write should drain the pending question");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_ask_user_question_answer_write_failure_keeps_backend_loop_alive() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-ask-write-fail.py");
-        let log = workspace.path().join("fake-claude-ask-write-fail.log");
-        let state_file = workspace.path().join("fake-claude-ask-write-fail.state");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-args = sys.argv[1:]
-session_id = "fake-ask-write-fail-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-state_path = os.environ["TYDE_FAKE_CLAUDE_STATE"]
-
-try:
-    with open(state_path, "r", encoding="utf-8") as handle:
-        process_number = int(handle.read().strip()) + 1
-except Exception:
-    process_number = 1
-with open(state_path, "w", encoding="utf-8") as handle:
-    handle.write(str(process_number))
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + str(process_number) + " " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    emit({
-        "type": "system",
-        "subtype": "init",
-        "session_id": session_id,
-        "model": "fake-model",
-    })
-    if process_number == 1:
-        emit({
-            "type": "control_request",
-            "request_id": "ask-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": {
-                    "questions": [{
-                        "id": "choice",
-                        "question": "Which choice?",
-                        "options": [{"label": "Blue"}, {"label": "Green"}],
-                        "multiSelect": False,
-                    }],
-                },
-            },
-        })
-        os.close(0)
-        log("STDIN_CLOSED " + str(process_number))
-        time.sleep(60)
-        sys.exit(0)
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "write-fail-followup-msg", "model": "fake-model", "usage": {"input_tokens": 2}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "follow-up after write failure ok"},
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "follow-up after write failure ok",
-        "session_id": session_id,
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-    })
-"#,
-        )
-        .expect("write fake Claude AskUserQuestion write failure script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude AskUserQuestion write failure script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude AskUserQuestion write failure script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-            std::env::set_var("TYDE_FAKE_CLAUDE_STATE", &state_file);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "ask then close stdin".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                if matches!(
-                    event,
-                    protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
-                        ref tool_call_id,
-                        ..
-                    }) if tool_call_id == "toolu_ask"
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("AskUserQuestion ToolRequest should arrive");
-
-        // Receiving the ToolRequest proves only that stdout was flushed; the
-        // fake closes stdin afterward. Wait for its retained marker so this
-        // test exercises an actual broken pipe instead of racing that close.
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if std::fs::read_to_string(&log)
-                    .unwrap_or_default()
-                    .contains("STDIN_CLOSED 1")
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
-            panic!("fake Claude must close stdin before the answer: {log_contents}");
-        });
-
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: "Choice: Blue".to_string(),
-                        images: None,
-                        origin: None,
-                        tool_response: None,
-                    },
-                ))
-                .await,
-            "backend should accept answer even when Claude stdin is closed"
-        );
-
-        let mut saw_failed_completion = false;
-        let mut saw_idle = false;
-        timeout(Duration::from_secs(2), async {
-            while !(saw_failed_completion && saw_idle) {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("backend event after write failure");
-                match event {
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_ask" =>
-                    {
-                        assert!(!completion.success);
-                        assert!(
-                            completion.error.as_deref().is_some_and(
-                                |error| error.contains("Failed to send AskUserQuestion answer")
-                            ),
-                            "unexpected write-failure completion: {completion:?}"
-                        );
-                        saw_failed_completion = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(false) => {
-                        saw_idle = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("write failure should fail only the active turn");
-
-        assert!(
-            backend
-                .send(protocol::AgentInput::SendMessage(
-                    protocol::SendMessagePayload {
-                        message: "follow up after write failure".to_string(),
-                        images: None,
-                        origin: None,
-                        tool_response: None,
-                    },
-                ))
-                .await,
-            "backend loop should remain alive after AskUserQuestion answer write failure"
-        );
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event after follow-up");
-                if let protocol::ChatEvent::StreamEnd(end) = event
-                    && end
-                        .message
-                        .content
-                        .contains("follow-up after write failure ok")
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("follow-up should respawn Claude and complete after write failure");
-
-        backend.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-            std::env::remove_var("TYDE_FAKE_CLAUDE_STATE");
-        }
-
-        let log_contents =
-            std::fs::read_to_string(&log).expect("read fake Claude write failure log");
-        assert_eq!(
-            log_contents.matches("START ").count(),
-            2,
-            "follow-up should start a replacement Claude process: {log_contents}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fake_claude_interrupt_while_ask_user_question_pending_quiesces() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-ask-interrupt.py");
-        let log = workspace.path().join("fake-claude-ask-interrupt.log");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-ask-interrupt-session"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
-
-def log(message):
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-log("START " + " ".join(args))
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    log("IN " + line)
-    value = json.loads(line)
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        subtype = request.get("subtype")
-        if subtype == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        elif subtype == "interrupt":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": None,
-                },
-            })
-            emit({
-                "type": "result",
-                "subtype": "error_during_execution",
-                "is_error": True,
-                "result": None,
-                "session_id": session_id,
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            })
-        continue
-    if value.get("type") == "user":
-        emit({
-            "type": "system",
-            "subtype": "init",
-            "session_id": session_id,
-            "model": "fake-model",
-        })
-        emit({
-            "type": "control_request",
-            "request_id": "ask-1",
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "AskUserQuestion",
-                "tool_call_id": "toolu_ask",
-                "input": {
-                    "questions": [{
-                        "id": "choice",
-                        "question": "Which choice?",
-                        "options": [{"label": "Blue"}, {"label": "Green"}],
-                        "multiSelect": False,
-                    }],
-                },
-            },
-        })
-"#,
-        )
-        .expect("write fake Claude AskUserQuestion interrupt script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake)
-                .expect("stat fake Claude AskUserQuestion interrupt script")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions)
-                .expect("chmod fake Claude AskUserQuestion interrupt script");
-        }
-
-        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
-        // where the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
-        }
-
-        let (backend, mut events) = ClaudeBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                cost_hint: Some(protocol::SpawnCostHint::Low),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "ask then interrupt".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Claude backend");
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let event = events.recv().await.expect("backend event");
-                if matches!(
-                    event,
-                    protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
-                        ref tool_call_id,
-                        ..
-                    }) if tool_call_id == "toolu_ask"
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("AskUserQuestion ToolRequest should arrive before interrupt");
-
-        let interrupted = timeout(Duration::from_secs(2), backend.interrupt())
-            .await
-            .expect("interrupt should quiesce");
-        assert!(interrupted, "interrupt command should report success");
-
-        let mut saw_failed_completion = false;
-        let mut saw_cancelled = false;
-        let mut saw_idle = false;
-        timeout(Duration::from_secs(2), async {
-            while !(saw_failed_completion && saw_cancelled && saw_idle) {
-                let event = events.recv().await.expect("backend event after interrupt");
-                match event {
-                    protocol::ChatEvent::ToolExecutionCompleted(completion)
-                        if completion.tool_call_id == "toolu_ask" =>
-                    {
-                        assert!(!completion.success);
-                        assert!(
-                            completion
-                                .error
-                                .as_deref()
-                                .is_some_and(|error| error.contains("cancelled")),
-                            "unexpected AskUserQuestion cancel failure: {completion:?}"
-                        );
-                        saw_failed_completion = true;
-                    }
-                    protocol::ChatEvent::OperationCancelled(_) => {
-                        saw_cancelled = true;
-                    }
-                    protocol::ChatEvent::TypingStatusChanged(false) => {
-                        saw_idle = true;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("interrupt with pending AskUserQuestion should quiesce");
-
-        backend.shutdown().await;
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
-        // environment before allowing other tests to run through this section.
-        unsafe {
-            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
-            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
-        }
-
-        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude interrupt log");
-        assert!(log_contents.contains("\"subtype\":\"interrupt\""));
-        assert!(
-            !log_contents.contains("\"request_id\":\"ask-1\"")
-                && !log_contents.contains("\"request_id\": \"ask-1\""),
-            "AskUserQuestion should not be answered by interrupt: {log_contents}"
-        );
-    }
-
-    #[test]
-    fn parse_claude_session_history_replays_tool_events_in_order() {
-        let contents = format!(
-            "{}\n{}\n",
-            json!({
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "model": "claude-opus-4-6",
-                    "content": [
-                        { "type": "text", "text": "Running tool" },
-                        { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls -la" } }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "toolu_1", "content": [{ "type": "text", "text": "ok" }] }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        assert_eq!(replay.len(), 3);
-
-        let assistant_message = match &replay[0] {
-            ClaudeHistoryReplayItem::Message(message) => message,
-            _ => panic!("first replay item should be assistant message"),
-        };
-        let message_tool_calls = assistant_message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .expect("message tool_calls");
-        assert_eq!(message_tool_calls.len(), 1);
-        assert_eq!(
-            message_tool_calls[0].get("id").and_then(Value::as_str),
-            Some("toolu_1")
-        );
-
-        let tool_request = match &replay[1] {
-            ClaudeHistoryReplayItem::ToolRequest(tool_call) => tool_call,
-            _ => panic!("second replay item should be tool request"),
-        };
-        assert_eq!(tool_request.id, "toolu_1");
-        assert_eq!(tool_request.name, "Bash");
-
-        let completion = match &replay[2] {
-            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => completion,
-            _ => panic!("third replay item should be tool completion"),
-        };
-        assert!(completion.success);
-        assert_eq!(completion.tool_call_id, "toolu_1");
-        assert_eq!(completion.tool_name, "Bash");
-        assert_eq!(
-            completion.tool_result.get("kind").and_then(Value::as_str),
-            Some("RunCommand")
-        );
-        assert_eq!(
-            completion
-                .tool_result
-                .get("exit_code")
-                .and_then(Value::as_i64),
-            Some(0)
-        );
-        assert_eq!(
-            completion.tool_result.get("stdout").and_then(Value::as_str),
-            Some("ok")
-        );
-    }
-
-    #[test]
-    fn parse_claude_session_history_defers_out_of_order_tool_result_until_request() {
-        let tool_id = "toolu_out_of_order";
-        let assistant_uuid = "assistant-tool-use";
-        let contents = format!(
-            "{}\n{}\n",
-            json!({
-                "type": "user",
-                "uuid": "tool-result",
-                "parentUuid": assistant_uuid,
-                "sourceToolAssistantUUID": assistant_uuid,
-                "timestamp": "2026-04-26T19:37:44.099Z",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": [
-                                { "type": "text", "text": "Found 1 file\nrelay-protocol/src/lib.rs" }
-                            ]
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "uuid": assistant_uuid,
-                "timestamp": "2026-04-26T19:37:44.091Z",
-                "message": {
-                    "role": "assistant",
-                    "model": "claude-opus-4-7",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": "Grep",
-                            "input": {
-                                "pattern": "MobilePairingQrPayload",
-                                "path": "/Users/mike/Tyde2/relay-protocol/src",
-                                "output_mode": "files_with_matches"
-                            }
-                        }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        assert_eq!(replay.len(), 3);
-
-        match &replay[0] {
-            ClaudeHistoryReplayItem::Message(message) => {
-                let tool_calls = message
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .expect("message tool_calls");
-                assert_eq!(tool_calls.len(), 1);
-                assert_eq!(
-                    tool_calls[0].get("id").and_then(Value::as_str),
-                    Some(tool_id)
-                );
-            }
-            _ => panic!("first replay item should be assistant message"),
-        }
-
-        let tool_request = match &replay[1] {
-            ClaudeHistoryReplayItem::ToolRequest(tool_call) => tool_call,
-            _ => panic!("second replay item should be tool request"),
-        };
-        assert_eq!(tool_request.id, tool_id);
-        assert_eq!(tool_request.name, "Grep");
-
-        let completion = match &replay[2] {
-            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => completion,
-            _ => panic!("third replay item should be tool completion"),
-        };
-        assert!(completion.success);
-        assert_eq!(completion.tool_call_id, tool_id);
-        assert_eq!(completion.tool_name, "Grep");
-    }
-
-    #[test]
-    fn parse_claude_session_history_skips_tool_result_without_matching_request() {
-        let contents = format!(
-            "{}\n",
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_missing",
-                            "content": [{ "type": "text", "text": "orphaned result" }]
-                        }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        assert!(
-            replay.is_empty(),
-            "orphaned tool results should not replay as unknown completions"
-        );
-    }
-
-    #[test]
-    fn parse_claude_session_history_auto_closes_abandoned_tool_before_user_message() {
-        let tool_id = "toolu_abandoned";
-        let contents = format!(
-            "{}\n{}\n",
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_abandoned",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": "Bash",
-                            "input": { "command": "sleep 10" }
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": "interrupting with a new prompt" }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        assert_eq!(replay.len(), 4);
-
-        assert!(matches!(&replay[0], ClaudeHistoryReplayItem::Message(_)));
-        assert!(matches!(
-            &replay[1],
-            ClaudeHistoryReplayItem::ToolRequest(_)
-        ));
-        let completion = match &replay[2] {
-            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => completion,
-            _ => panic!("third replay item should auto-close the abandoned tool"),
-        };
-        assert_eq!(completion.tool_call_id, tool_id);
-        assert_eq!(completion.tool_name, "Bash");
-        assert!(!completion.success);
-        assert_eq!(
-            completion.tool_result.get("kind").and_then(Value::as_str),
-            Some("Error")
-        );
-        assert!(matches!(&replay[3], ClaudeHistoryReplayItem::Message(_)));
-    }
-
-    #[test]
-    fn parse_claude_session_history_suppresses_late_result_after_auto_close() {
-        let tool_id = "toolu_late_result";
-        let contents = format!(
-            "{}\n{}\n{}\n",
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_late_result",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": "Bash",
-                            "input": { "command": "sleep 10" }
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": "new prompt before result arrives" }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": "late output"
-                        }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        let completions = replay
-            .iter()
-            .filter(|item| matches!(item, ClaudeHistoryReplayItem::ToolExecutionCompleted(_)))
-            .count();
-        assert_eq!(completions, 1, "late completion should be suppressed");
-
-        let completion = replay.iter().find_map(|item| match item {
-            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => Some(completion),
-            _ => None,
-        });
-        let completion = completion.expect("synthetic completion");
-        assert_eq!(completion.tool_call_id, tool_id);
-        assert!(!completion.success);
-    }
-
-    #[test]
-    fn parse_claude_session_history_replays_split_assistant_tools_as_one_turn() {
-        let contents = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_split",
-                    "role": "assistant",
-                    "content": [
-                        { "type": "text", "text": "checking several things" }
-                    ]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_split",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_a",
-                            "name": "Bash",
-                            "input": { "command": "git log --oneline -1" }
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_split",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_b",
-                            "name": "Bash",
-                            "input": { "command": "git status --short" }
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "toolu_b", "content": "clean" }
-                    ]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "msg_split",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_c",
-                            "name": "Grep",
-                            "input": { "pattern": "needle", "path": "/tmp" }
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "toolu_a", "content": "abc123" }
-                    ]
-                }
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "toolu_c", "content": "match" }
-                    ]
-                }
-            })
-        );
-
-        let replay = parse_claude_session_history_contents(&contents);
-        let messages = replay
-            .iter()
-            .filter(|item| matches!(item, ClaudeHistoryReplayItem::Message(_)))
-            .count();
-        let requests = replay
-            .iter()
-            .filter(|item| matches!(item, ClaudeHistoryReplayItem::ToolRequest(_)))
-            .count();
-        let completions = replay
-            .iter()
-            .filter_map(|item| match item {
-                ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => Some(completion),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(messages, 1);
-        assert_eq!(requests, 3);
-        assert_eq!(completions.len(), 3);
-        assert!(
-            completions.iter().all(|completion| completion.success),
-            "split same-message tool calls should not be auto-closed"
-        );
-    }
-
-    #[tokio::test]
-    async fn top_level_assistant_boundaries_emit_separate_stream_ends_without_raw_cumulative_usage()
-    {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        inner.emit_stream_start(&base_id, None);
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("initial stream start")),
-            Some("StreamStart")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "id": "assistant-msg-1",
-                    "role": "assistant",
-                    "model": "claude-opus-4-6",
-                    "usage": {
-                        "input_tokens": 100,
-                        "output_tokens": 20,
-                        "total_tokens": 120
-                    },
-                    "content": [
-                        { "type": "text", "text": "First answer" }
-                    ]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        assert!(rx.try_recv().is_err());
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "id": "assistant-msg-2",
-                    "role": "assistant",
-                    "model": "claude-opus-4-6",
-                    "usage": {
-                        "input_tokens": 250,
-                        "output_tokens": 50,
-                        "total_tokens": 300
-                    },
-                    "content": [
-                        { "type": "text", "text": "Second answer" }
-                    ]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let first_end = rx.recv().await.expect("first stream end");
-        assert_eq!(event_kind(&first_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_message(&first_end)
-                .get("content")
-                .and_then(Value::as_str),
-            Some("First answer")
-        );
-        assert_eq!(stream_end_request_total_tokens(&first_end), Some(120));
-        assert_eq!(stream_end_turn_total_tokens(&first_end), None);
-
-        let second_start = rx.recv().await.expect("second stream start");
-        assert_eq!(event_kind(&second_start), Some("StreamStart"));
-        assert_eq!(
-            second_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some("claude-msg-1-seg-1")
-        );
-
-        emit_test_phase_end(&inner, &mut summary);
-        let second_end = rx.recv().await.expect("second stream end");
-        assert_eq!(event_kind(&second_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_message(&second_end)
-                .get("content")
-                .and_then(Value::as_str),
-            Some("Second answer")
-        );
-        assert_eq!(stream_end_request_total_tokens(&second_end), Some(300));
-        assert_eq!(stream_end_turn_total_tokens(&second_end), None);
-    }
-
-    #[tokio::test]
-    async fn terminal_context_breakdown_uses_per_call_usage_not_turn_delta() {
-        // Regression: the Context Usage bar derives from `context_breakdown`.
-        // The breakdown must reflect the last API call's prompt footprint
-        // (`summary.usage`, bounded by the context window), NOT `turn_usage`
-        // — the per-turn delta of Claude's session-cumulative counter, which
-        // sums input tokens across every API call in a multi-step turn and
-        // overflows the window (e.g. 14.5M against a 1M window pins the bar
-        // to 100%).
-        let (inner, mut rx) = make_test_inner();
-        // Last API call actually consumed 250 input tokens (the context fill).
-        let mut summary = ClaudeStdoutSummary {
-            streamed_text: "Final answer".to_string(),
-            model: Some("claude-opus-4-6".to_string()),
-            usage: Some(json!({
-                "input_tokens": 250,
-                "output_tokens": 50,
-                "total_tokens": 300,
-            })),
-            ..Default::default()
-        };
-
-        inner.emit_stream_start("claude-msg-1", None);
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("stream start")),
-            Some("StreamStart")
-        );
-
-        // Per-turn delta summed across the whole agentic turn — must NOT drive
-        // the breakdown.
-        let turn_usage = ClaudeTurnUsage {
-            turn: json!({
-                "input_tokens": 14_000_000,
-                "output_tokens": 500_000,
-                "total_tokens": 14_500_000,
-            }),
-            cumulative: Some(json!({
-                "input_tokens": 14_000_000,
-                "output_tokens": 500_000,
-                "total_tokens": 14_500_000,
-            })),
-        };
-        inner
-            .emit_terminal_phase_or_placeholder(
-                &mut summary,
-                ClaudeTerminalPhaseOptions {
-                    turn_id: 1,
-                    known_context_window: Some(1_000_000),
-                    turn_usage: Some(turn_usage),
-                    ..ClaudeTerminalPhaseOptions::default()
-                },
-            )
-            .await;
-
-        let end = rx.recv().await.expect("stream end");
-        assert_eq!(event_kind(&end), Some("StreamEnd"));
-        let message = stream_end_message(&end);
-
-        // Context breakdown reflects the per-call usage (250), not the 14M delta.
-        let breakdown_input = message
-            .get("context_breakdown")
-            .and_then(|bd| bd.get("input_tokens"))
-            .and_then(Value::as_u64);
-        assert_eq!(breakdown_input, Some(250));
-
-        // The turn scope still carries the per-turn delta.
-        assert_eq!(stream_end_request_total_tokens(&end), Some(300));
-        assert_eq!(stream_end_turn_total_tokens(&end), Some(14_500_000));
-        assert_eq!(stream_end_cumulative_total_tokens(&end), Some(14_500_000));
-    }
-
-    #[tokio::test]
-    async fn streamed_tool_use_emits_stream_end_then_tool_lifecycle_before_next_stream_start() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        inner.emit_stream_start(&base_id, None);
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("initial stream start")),
-            Some("StreamStart")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": "assistant-msg-1",
-                        "model": "claude-opus-4-6",
-                        "usage": {
-                            "input_tokens": 80,
-                            "output_tokens": 0,
-                            "total_tokens": 80
-                        }
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": "toolu_edit",
-                        "name": "Edit",
-                        "input": {}
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        assert!(rx.try_recv().is_err());
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": "{\"file_path\":\"/tmp/example.txt\",\"old_string\":\"old line\",\"new_string\":\"new line\"}"
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert!(rx.try_recv().is_err());
-
-        // content_block_stop finalises the tool_use block
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_stop",
-                    "index": 0
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // message_stop closes the phase: StreamEnd (with tool calls) then ToolRequest
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_stop"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let stream_end = rx.recv().await.expect("stream end at message_stop");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_tool_call_ids(&stream_end),
-            vec!["toolu_edit".to_string()]
-        );
-        assert_eq!(stream_end_request_total_tokens(&stream_end), Some(80));
-        assert_eq!(stream_end_turn_total_tokens(&stream_end), None);
-
-        let tool_request = rx.recv().await.expect("tool request after stream end");
-        assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_type"))
-                .and_then(|tool_type| tool_type.get("kind"))
-                .and_then(Value::as_str),
-            Some("ModifyFile")
-        );
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_type"))
-                .and_then(|tool_type| tool_type.get("file_path"))
-                .and_then(Value::as_str),
-            Some("/tmp/example.txt")
-        );
-
-        // Tool result arrives — phase already closed, only ToolExecutionCompleted
-        consume_claude_stream_value(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_edit",
-                            "content": "ok"
-                        }
-                    ]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let completion = rx.recv().await.expect("tool completion event");
-        assert_eq!(event_kind(&completion), Some("ToolExecutionCompleted"));
-        assert_eq!(
-            completion
-                .get("data")
-                .and_then(|data| data.get("tool_call_id"))
-                .and_then(Value::as_str),
-            Some("toolu_edit")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": "assistant-msg-2",
-                        "model": "claude-opus-4-6",
-                        "usage": {
-                            "input_tokens": 120,
-                            "output_tokens": 20,
-                            "total_tokens": 140
-                        }
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let next_stream_start = rx.recv().await.expect("next stream start");
-        assert_eq!(event_kind(&next_stream_start), Some("StreamStart"));
-        assert_eq!(
-            next_stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some("claude-msg-1-seg-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn content_block_stop_keeps_tool_use_when_arguments_are_missing() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        inner.emit_stream_start("claude-msg", Some("claude-test".to_string()));
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("stream start")),
-            Some("StreamStart")
-        );
-        segment.pending_tool_uses.insert(
-            4,
-            PendingClaudeToolUse {
-                id: "toolu_task".to_string(),
-                name: "TaskCreate".to_string(),
-                arguments: json!({}),
-                partial_json: String::new(),
-                request_emitted: false,
-            },
-        );
-
-        finish_pending_tool_use(&mut summary, &mut segment, 4);
-        assert!(summary.tool_calls.is_empty());
-        assert!(segment.pending_tool_uses.contains_key(&4));
-        let mut current_id = "claude-msg".to_string();
-        consume_assistant_message(
-            &json!({
-                "message": {
-                    "id": "provider-message",
-                    "model": "claude-test",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu_task",
-                        "name": "TaskCreate",
-                        "input": {"subject": "Recovered task"}
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            "claude-msg",
-            &mut current_id,
-        );
-        assert_eq!(summary.tool_calls.len(), 1);
-        assert_eq!(summary.tool_calls[0].id, "toolu_task");
-        assert_eq!(summary.tool_calls[0].name, "TaskCreate");
-        assert_eq!(
-            summary.tool_calls[0].arguments,
-            json!({"subject": "Recovered task"})
-        );
-        assert!(segment.pending_tool_uses.is_empty());
-        close_current_phase(&mut summary, &mut segment, &inner);
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("stream end")),
-            Some("StreamEnd")
-        );
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("task update")),
-            Some("TaskUpdate")
-        );
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("tool request")),
-            Some("ToolRequest")
-        );
-    }
-
-    #[tokio::test]
-    async fn retained_pending_tool_phase_closes_before_next_stream() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg".to_string();
-        let mut current_id = base_id.clone();
-        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
-
-        consume_stream_event(
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": "provider-message-1",
-                    "model": "claude-test"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_incomplete",
-                    "name": "TaskCreate",
-                    "input": {}
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({"type": "content_block_stop", "index": 0}),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        assert!(segment.pending_tool_uses.contains_key(&0));
-
-        consume_stream_event(
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": "provider-message-2",
-                    "model": "claude-test"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_complete",
-                    "name": "TaskCreate",
-                    "input": {"subject": "Complete task"}
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        assert!(
-            segment.pending_tool_uses.contains_key(&0),
-            "provider block indexes restart per message and must not erase a different retained tool"
-        );
-        consume_stream_event(
-            &json!({"type": "message_stop"}),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_user_tool_result(
-            &json!({
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_complete",
-                        "content": "Task created"
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            false,
-        );
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolRequest")
-                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                            == Some("toolu_complete")
-                })
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolExecutionCompleted")
-                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                            == Some("toolu_complete")
-                        && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)
-                })
-                .count(),
-            1
-        );
-        assert_complete_stream_lifecycle(&events);
-        assert_claude_protocol_valid(&events);
-    }
-
-    #[tokio::test]
-    async fn terminal_retained_tool_phase_has_a_matching_stream_lifecycle() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-terminal".to_string();
-        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
-        segment.pending_tool_uses.insert(
-            0,
-            PendingClaudeToolUse {
-                id: "toolu_incomplete".to_string(),
-                name: "EmptyTool".to_string(),
-                arguments: json!({}),
-                partial_json: String::new(),
-                request_emitted: false,
-            },
-        );
-        register_tool_call_for_phase(
-            &mut summary,
-            &mut segment,
-            ClaudeToolCall {
-                id: "toolu_complete".to_string(),
-                name: "CompleteTool".to_string(),
-                arguments: json!({"value": "ok"}),
-            },
-        );
-        close_current_phase(&mut summary, &mut segment, &inner);
-        consume_user_tool_result(
-            &json!({
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_complete",
-                        "content": "done"
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            false,
-        );
-        assert!(segment.pending_tool_uses.contains_key(&0));
-
-        flush_pending_tool_uses_with_fallback(&mut summary, &mut segment);
-        assert!(segment.pending_tool_uses.is_empty());
-        assert_eq!(
-            summary
-                .tool_calls
-                .iter()
-                .find(|tool| tool.id == "toolu_incomplete")
-                .map(|tool| &tool.arguments),
-            Some(&json!({}))
-        );
-        inner
-            .emit_terminal_phase_or_placeholder(
-                &mut summary,
-                ClaudeTerminalPhaseOptions {
-                    turn_id: 1,
-                    ..ClaudeTerminalPhaseOptions::default()
-                },
-            )
-            .await;
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event_kind(event) == Some("StreamStart"))
-                .count(),
-            2
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event_kind(event) == Some("StreamEnd"))
-                .count(),
-            2
-        );
-        assert_eq!(
-            events
-                .iter()
-                .rev()
-                .find(|event| event_kind(event) == Some("StreamStart"))
-                .and_then(|event| event.pointer("/data/message_id"))
-                .and_then(Value::as_str),
-            Some("claude-msg-1-terminal")
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolRequest")
-                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                            == Some("toolu_incomplete")
-                })
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolExecutionCompleted")
-                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                            == Some("toolu_incomplete")
-                        && event
-                            .pointer("/data/tool_result/short_message")
-                            .and_then(Value::as_str)
-                            == Some("Tool result missing")
-                })
-                .count(),
-            1
-        );
-        assert_paired_stream_lifecycle(&events);
-        assert_claude_protocol_valid(&events);
-    }
-
-    #[tokio::test]
-    async fn whitespace_phase_closes_before_next_stream() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg".to_string();
-        let mut current_id = base_id.clone();
-        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
-
-        consume_stream_event(
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": "provider-message-1",
-                    "model": "claude-test"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "text",
-                    "text": " \n "
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": "provider-message-2",
-                    "model": "claude-test"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "text",
-                    "text": "Complete response"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        close_current_phase(&mut summary, &mut segment, &inner);
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        assert_complete_stream_lifecycle(&events);
-        assert_claude_protocol_valid(&events);
-    }
-
-    #[tokio::test]
-    async fn content_block_opens_phase_when_message_start_is_omitted() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary {
-            model: Some("claude-test".to_string()),
-            ..ClaudeStdoutSummary::default()
-        };
-        let mut segment = SegmentState {
-            awaiting_stream_start: true,
-            ..SegmentState::default()
-        };
-        let base_id = "claude-msg".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_stream_event(
-            &json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_task",
-                    "name": "TaskCreate",
-                    "input": {"subject": "Next task"}
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_stream_event(
-            &json!({"type": "message_stop"}),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            kinds.push(event_kind(&event).unwrap_or_default().to_string());
-        }
-        assert_eq!(kinds.first().map(String::as_str), Some("StreamStart"));
-        assert!(kinds.iter().any(|kind| kind == "StreamEnd"));
-        assert!(kinds.iter().any(|kind| kind == "ToolRequest"));
-        assert!(!kinds.iter().any(|kind| kind == "Error"));
-    }
-
-    #[tokio::test]
-    async fn unresolved_streamed_tool_request_is_auto_closed_before_next_stream_start() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        inner.emit_stream_start(&base_id, None);
-        assert_eq!(
-            event_kind(&rx.recv().await.expect("initial stream start")),
-            Some("StreamStart")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": "assistant-msg-1",
-                        "model": "claude-opus-4-6"
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": "toolu_orphan",
-                        "name": "Grep",
-                        "input": {
-                            "pattern": "needle",
-                            "path": "/tmp"
-                        }
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_stop"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let stream_end = rx.recv().await.expect("stream end for tool phase");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_tool_call_ids(&stream_end),
-            vec!["toolu_orphan".to_string()]
-        );
-
-        let tool_request = rx.recv().await.expect("tool request");
-        assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_call_id"))
-                .and_then(Value::as_str),
-            Some("toolu_orphan")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": "assistant-msg-2",
-                        "model": "claude-opus-4-6"
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let auto_completion = rx
-            .recv()
-            .await
-            .expect("synthetic tool completion before next stream");
-        assert_eq!(event_kind(&auto_completion), Some("ToolExecutionCompleted"));
-        assert_eq!(
-            auto_completion
-                .get("data")
-                .and_then(|data| data.get("tool_call_id"))
-                .and_then(Value::as_str),
-            Some("toolu_orphan")
-        );
-        assert_eq!(
-            auto_completion
-                .get("data")
-                .and_then(|data| data.get("success"))
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-
-        let next_stream_start = rx.recv().await.expect("next stream start");
-        assert_eq!(event_kind(&next_stream_start), Some("StreamStart"));
-        assert_eq!(
-            next_stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some("claude-msg-1-seg-1")
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_orphan",
-                            "content": "late result"
-                        }
-                    ]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "late real completion after synthetic auto-close should be suppressed"
-        );
-    }
-
-    #[tokio::test]
-    async fn wrapped_event_envelope_emits_reasoning_delta() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-        inner.emit_stream_start(&base_id, None);
-        let stream_start = rx.recv().await.expect("turn StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        assert_eq!(
-            stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some(base_id.as_str())
-        );
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "event",
-                "event": "content_block_delta",
-                "data": {
-                    "index": 0,
-                    "delta": {
-                        "type": "thinking_delta",
-                        "text": "Checking workspace constraints."
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(
-            summary.best_reasoning(),
-            Some("Checking workspace constraints.".to_string())
-        );
-        let event = rx.recv().await.expect("reasoning stream event");
-        assert_eq!(
-            event.get("kind").and_then(Value::as_str),
-            Some("StreamReasoningDelta")
-        );
-        assert_eq!(
-            event
-                .get("data")
-                .and_then(|data| data.get("text"))
-                .and_then(Value::as_str),
-            Some("Checking workspace constraints.")
-        );
-        assert_eq!(
-            event
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some(base_id.as_str())
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "wrapped reasoning should not emit an identity error or cancellation"
-        );
-    }
-
-    #[test]
-    fn stream_event_with_string_name_is_consumed() {
-        let (inner, _rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "stream_event",
-                "event": "content_block_delta",
-                "data": {
-                    "index": 0,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": "hello"
-                    }
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(summary.streamed_text, "hello");
-    }
-
-    #[test]
-    fn collect_tool_use_blocks_handles_stream_event_string_envelope() {
-        let payload = json!({
-            "type": "stream_event",
-            "event": "content_block_start",
-            "data": {
-                "index": 0,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "toolu_spawn",
-                    "name": "Task",
-                    "input": { "description": "Spawn test sub-agent" }
-                }
-            }
-        });
-
-        let blocks = collect_tool_use_blocks(&payload);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(
-            blocks[0].get("id").and_then(Value::as_str),
-            Some("toolu_spawn")
-        );
-        assert_eq!(blocks[0].get("name").and_then(Value::as_str), Some("Task"));
-    }
-
-    #[test]
-    fn direct_stream_event_type_is_consumed() {
-        let (inner, _rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "text_delta",
-                    "text": "world"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(summary.streamed_text, "world");
-    }
-
-    // ---- Workflow task-frame reducer (fixtures from a live CLI probe) ----
-
-    fn recv_tool_progress(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<WorkflowRunState> {
-        let mut snapshots = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if event.get("kind").and_then(Value::as_str) != Some("ToolProgress") {
-                continue;
-            }
-            let data: ToolProgressData =
-                serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                    .expect("ToolProgress payload parses");
-            assert_eq!(data.tool_call_id, "toolu_wf");
-            assert_eq!(data.tool_name, "Workflow");
-            let ToolProgressUpdate::Workflow(state) = data.update else {
-                panic!("expected Workflow update");
-            };
-            snapshots.push(state);
-        }
-        snapshots
-    }
-
-    fn workflow_started_frame() -> Value {
-        json!({
-            "type": "system",
-            "subtype": "task_started",
-            "task_id": "task-wf",
-            "tool_use_id": "toolu_wf",
-            "description": "Probe: two agents reply hello",
-            "task_type": "local_workflow",
-            "workflow_name": "wfprobe",
-            "prompt": "export const meta = { name: 'wfprobe' }",
-        })
-    }
-
-    fn workflow_progress_frame(deltas: Value, total_tokens: u64) -> Value {
-        json!({
-            "type": "system",
-            "subtype": "task_progress",
-            "task_id": "task-wf",
-            "tool_use_id": "toolu_wf",
-            "summary": "Probe: two agents reply hello",
-            "usage": {"total_tokens": total_tokens, "tool_uses": 0, "duration_ms": 1586},
-            "workflow_progress": deltas,
-        })
-    }
-
-    fn agent_delta(index: u64, label: &str, state: &str) -> Value {
-        json!({
-            "type": "workflow_agent",
-            "index": index,
-            "label": label,
-            "phaseIndex": 1,
-            "phaseTitle": "Probe",
-            "agentId": format!("a{index}"),
-            "model": "claude-opus-4-8[1m]",
-            "state": state,
-            "attempt": 1,
-            "promptPreview": "Reply with exactly the word hello",
-            "tokens": 6539,
-            "toolCalls": 0,
-            "durationMs": 1562,
-            "resultPreview": "hello",
-        })
-    }
-
-    #[test]
-    fn workflow_task_frames_reduce_to_snapshots() {
-        let (inner, mut rx) = make_test_inner();
-        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
-
-        assert!(handle_workflow_task_frame(
-            &workflow_started_frame(),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(handle_workflow_task_frame(
-            &workflow_progress_frame(
-                json!([
-                    agent_delta(1, "probe-1", "start"),
-                    agent_delta(2, "probe-2", "start")
-                ]),
-                6539,
-            ),
-            &mut runs,
-            &inner.emitter,
-        ));
-        // Progress without a state transition inside the throttle window
-        // must not emit.
-        assert!(handle_workflow_task_frame(
-            &workflow_progress_frame(json!([agent_delta(2, "probe-2", "progress")]), 9000),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(handle_workflow_task_frame(
-            &workflow_progress_frame(json!([agent_delta(2, "probe-2", "done")]), 10000),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(handle_workflow_task_frame(
-            &workflow_progress_frame(json!([agent_delta(1, "probe-1", "done")]), 13078),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(handle_workflow_task_frame(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "task-wf",
-                "tool_use_id": "toolu_wf",
-                "status": "completed",
-                "summary": "Dynamic workflow completed",
-            }),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(runs.is_empty(), "run is dropped after its notification");
-
-        let snapshots = recv_tool_progress(&mut rx);
-        // started + both-start + probe-2-done + probe-1-done + notification.
-        assert_eq!(snapshots.len(), 5);
-
-        let first = &snapshots[0];
-        assert_eq!(first.workflow_name, "wfprobe");
-        assert_eq!(
-            first.script.as_deref(),
-            Some("export const meta = { name: 'wfprobe' }")
-        );
-        assert_eq!(first.status, WorkflowRunStatus::Running);
-        assert!(first.agents.is_empty());
-
-        let last = snapshots.last().unwrap();
-        assert_eq!(last.status, WorkflowRunStatus::Completed);
-        assert_eq!(last.summary.as_deref(), Some("Dynamic workflow completed"));
-        assert_eq!(last.total_tokens, 13078);
-        assert_eq!(last.agents.len(), 2);
-        assert_eq!(last.agents[0].index, 1);
-        assert_eq!(last.agents[0].label, "probe-1");
-        assert_eq!(last.agents[0].state, WorkflowAgentStatus::Done);
-        assert_eq!(last.agents[0].phase_title.as_deref(), Some("Probe"));
-        assert_eq!(last.agents[0].result_preview.as_deref(), Some("hello"));
-        assert_eq!(last.agents[1].state, WorkflowAgentStatus::Done);
-    }
-
-    #[test]
-    fn workflow_malformed_deltas_and_unknown_states_are_tolerated() {
-        let (inner, mut rx) = make_test_inner();
-        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
-
-        handle_workflow_task_frame(&workflow_started_frame(), &mut runs, &inner.emitter);
-        assert!(handle_workflow_task_frame(
-            &workflow_progress_frame(
-                json!([
-                    {"type": "workflow_agent"},               // no index
-                    {"type": "something_else", "index": 9},   // not an agent
-                    "not even an object",
-                    agent_delta(1, "probe-1", "some_future_state"),
-                ]),
-                100,
-            ),
-            &mut runs,
-            &inner.emitter,
-        ));
-
-        let snapshots = recv_tool_progress(&mut rx);
-        let last = snapshots.last().unwrap();
-        assert_eq!(last.agents.len(), 1);
-        assert_eq!(last.agents[0].state, WorkflowAgentStatus::Unknown);
-    }
-
-    #[test]
-    fn non_workflow_task_frames_fall_through() {
-        let (inner, mut rx) = make_test_inner();
-        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
-
-        // A local_agent task_started belongs to the subagent path.
-        assert!(!handle_workflow_task_frame(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "task-agent",
-                "tool_use_id": "toolu_task",
-                "task_type": "local_agent",
-            }),
-            &mut runs,
-            &inner.emitter,
-        ));
-        // Progress for an untracked task is not ours either.
-        assert!(!handle_workflow_task_frame(
-            &workflow_progress_frame(json!([]), 1),
-            &mut runs,
-            &inner.emitter,
-        ));
-        assert!(recv_tool_progress(&mut rx).is_empty());
-    }
-
-    // ---- Background bash task-frame reducer (fixtures captured from a
-    // live CLI 2.1.217 probe; see handle_background_bash_task_frame) ----
-
-    fn recv_background_snapshots(
-        rx: &mut mpsc::UnboundedReceiver<Value>,
-    ) -> Vec<BackgroundTaskState> {
-        let mut snapshots = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if event.get("kind").and_then(Value::as_str) != Some("ToolProgress") {
-                continue;
-            }
-            let data: ToolProgressData =
-                serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                    .expect("ToolProgress payload parses");
-            assert_eq!(data.tool_call_id, "toolu_01Ay3XKHPknVQCy2L7zkvvH6");
-            assert_eq!(data.tool_name, "Bash");
-            let ToolProgressUpdate::BackgroundTask(state) = data.update else {
-                panic!("expected BackgroundTask update");
-            };
-            snapshots.push(state);
-        }
-        snapshots
-    }
-
-    fn bash_task_started_frame() -> Value {
-        json!({
-            "type": "system",
-            "subtype": "task_started",
-            "task_id": "b4r45rw5t",
-            "tool_use_id": "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
-            "description": "Sleep 10 seconds then echo marker",
-            "task_type": "local_bash",
-            "uuid": "22004eab-f638-49f8-a39e-5a0bc878ee06",
-            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
-        })
-    }
-
-    fn bash_task_updated_frame(status: &str) -> Value {
-        json!({
-            "type": "system",
-            "subtype": "task_updated",
-            "task_id": "b4r45rw5t",
-            "patch": {"status": status, "end_time": 1784721586519_u64},
-            "uuid": "e886ecc0-1333-447d-8bd7-dac590c588e4",
-            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
-        })
-    }
-
-    fn bash_task_notification_frame(status: &str, summary: &str) -> Value {
-        bash_task_notification_frame_with_output(status, summary, "/tmp/tasks/b4r45rw5t.output")
-    }
-
-    fn bash_task_notification_frame_with_output(
-        status: &str,
-        summary: &str,
-        output_file: &str,
-    ) -> Value {
-        json!({
-            "type": "system",
-            "subtype": "task_notification",
-            "task_id": "b4r45rw5t",
-            "tool_use_id": "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
-            "status": status,
-            "output_file": output_file,
-            "summary": summary,
-            "uuid": "afd817b8-9970-481d-98ae-afbea37a4c2b",
-            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
-        })
-    }
-
-    fn register_shared_background_task(inner: &ClaudeInner) {
-        inner.emitter.tool_request(
-            "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
-            "Bash",
-            json!({
-                "kind": "RunCommand",
-                "command": "test background command",
-                "working_directory": "",
-            }),
-        );
-        assert!(inner.handle_background_task_frame(&bash_task_started_frame(), &HashMap::new(),));
-    }
-
-    struct ReaderAbortProbe {
-        inner: std::sync::Weak<ClaudeInner>,
-        owner_active_tx: Option<oneshot::Sender<bool>>,
-    }
-
-    impl Drop for ReaderAbortProbe {
-        fn drop(&mut self) {
-            let owner_active = self.inner.upgrade().is_some_and(|inner| {
-                inner
-                    .background_tasks
-                    .lock()
-                    .expect("Claude background task mutex poisoned")
-                    .owner_active
-            });
-            if let Some(tx) = self.owner_active_tx.take() {
-                let _ = tx.send(owner_active);
-            }
-        }
-    }
-
-    async fn install_test_process_runtime(inner: &Arc<ClaudeInner>) -> oneshot::Receiver<bool> {
-        let mut command = Command::new("cat");
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command.group_spawn().expect("spawn test Claude owner");
-        let stdin = child.inner().stdin.take().expect("test stdin");
-        let stdout = child.inner().stdout.take().expect("test stdout");
-        let stderr = child.inner().stderr.take().expect("test stderr");
-        let (owner_active_tx, owner_active_rx) = oneshot::channel();
-        let (reader_started_tx, reader_started_rx) = oneshot::channel();
-        let probe_inner = Arc::downgrade(inner);
-        let stdout_task = tokio::spawn(async move {
-            let _stdout = stdout;
-            let _probe = ReaderAbortProbe {
-                inner: probe_inner,
-                owner_active_tx: Some(owner_active_tx),
-            };
-            let _ = reader_started_tx.send(());
-            std::future::pending::<()>().await;
-        });
-        let stderr_task = tokio::spawn(async move {
-            let _stderr = stderr;
-            std::future::pending::<()>().await;
-        });
-        reader_started_rx.await.expect("test reader starts");
-        *inner.runtime.lock().await = Some(ClaudeProcessRuntime {
-            stdin: Arc::new(Mutex::new(stdin)),
-            child: Arc::new(Mutex::new(Some(child))),
-            control_waiters: Arc::new(Mutex::new(HashMap::new())),
-            stdout_task,
-            stderr_task,
-        });
-        owner_active_rx
-    }
-
-    #[test]
-    fn background_bash_parent_id_accepts_nested_system_shapes() {
-        assert_eq!(
-            background_task_parent_tool_use_id(&json!({
-                "data": { "parent_tool_use_id": "toolu_child" }
-            })),
-            Some("toolu_child")
-        );
-        assert_eq!(
-            background_task_parent_tool_use_id(&json!({
-                "message": { "parent_tool_use_id": "toolu_child" }
-            })),
-            Some("toolu_child")
-        );
-    }
-
-    /// Frames captured from a live CLI 2.1.220 probe
-    /// (`/tmp/bg-frame-probe/two_turns.jsonl`) for one turn that launches a
-    /// background Bash *while another background task is already running*.
-    /// The concurrent task reorders the stream: `task_started` and the
-    /// `tool_result` both arrive **before** `message_delta`/`message_stop`,
-    /// whereas the single-task ordering puts `message_stop` first.
-    fn concurrent_background_launch_frames(tool_use_id: &str) -> Vec<Value> {
-        let message_id = "msg_011CdV5gZSj3zWvJFWn48x9t";
-        vec![
-            json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "claude-haiku-4-5-20251001",
-                        "content": [],
-                    },
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_start",
-                    "index": 1,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": "Bash",
-                        "input": {},
-                        "caller": {"type": "direct"},
-                    },
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 1,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": "{\"command\": \"sleep 30; echo done\", \
-                                          \"run_in_background\": true, \
-                                          \"description\": \"Sleep for 30 seconds then echo done\"}",
-                    },
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-haiku-4-5-20251001",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": "Bash",
-                        "input": {
-                            "command": "sleep 30; echo done",
-                            "description": "Sleep for 30 seconds then echo done",
-                            "run_in_background": true,
-                        },
-                        "caller": {"type": "direct"},
-                    }],
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "stream_event",
-                "event": {"type": "content_block_stop", "index": 1},
-                "parent_tool_use_id": Value::Null,
-            }),
-            // A second task ("probe") is already running — this is what
-            // reorders everything below ahead of message_stop.
-            json!({
-                "type": "system",
-                "subtype": "background_tasks_changed",
-                "tasks": [
-                    {"task_id": "br9licaun", "task_type": "local_bash", "description": "probe"},
-                    {
-                        "task_id": "br8yx57k1",
-                        "task_type": "local_bash",
-                        "description": "Sleep for 30 seconds then echo done",
-                    },
-                ],
-            }),
-            json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "br8yx57k1",
-                "tool_use_id": tool_use_id,
-                "description": "Sleep for 30 seconds then echo done",
-                "task_type": "local_bash",
-            }),
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": "Command running in background with ID: br8yx57k1. \
-                                    Output is being written to: /tmp/tasks/br8yx57k1.output.",
-                    }],
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "tool_use"},
-                },
-                "parent_tool_use_id": Value::Null,
-            }),
-            json!({
-                "type": "stream_event",
-                "event": {"type": "message_stop"},
-                "parent_tool_use_id": Value::Null,
-            }),
-        ]
-    }
-
-    /// The tray row for a background command must survive the reordered
-    /// stream a *concurrent* background task produces. This replays the
-    /// reader loop's pre-gate → consume → refresh sequence over captured
-    /// frames; the contract is that a `Running` snapshot reaches the client,
-    /// which is exactly what `InflightTray::compute_snapshot` renders from.
-    #[test]
-    fn concurrent_background_launch_still_emits_running_snapshot() {
-        let (inner, mut rx) = make_test_inner();
-        inner.activate_background_task_owner();
-        let tool_use_id = "toolu_015a12ViCe4M3D4j3pDzUFca";
-
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_message_id = "claude-msg-1".to_string();
-        let mut current_message_id = base_message_id.clone();
-
-        for value in concurrent_background_launch_frames(tool_use_id) {
-            if inner.handle_background_task_frame(&value, &HashMap::new()) {
-                continue;
-            }
-            consume_claude_stream_value(
-                &value,
-                &mut summary,
-                &mut segment,
-                &inner,
-                &base_message_id,
-                &mut current_message_id,
-            );
-            let mut registry = inner
-                .background_tasks
-                .lock()
-                .expect("Claude background task mutex poisoned");
-            refresh_unresolved_background_tasks(
-                &value,
-                &mut registry.entries,
-                &inner.emitter,
-                &HashMap::new(),
-            );
-        }
-
-        let running = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter(|event| event_kind(event) == Some("ToolProgress"))
-            .filter_map(|event| {
-                let data: ToolProgressData =
-                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                        .expect("ToolProgress payload parses");
-                match data.update {
-                    ToolProgressUpdate::BackgroundTask(state) => Some((data.tool_call_id, state)),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            running.iter().any(|(call_id, state)| call_id == tool_use_id
-                && state.status == BackgroundTaskStatus::Running),
-            "a background command launched alongside another running task must still \
-             publish a Running snapshot for the tray; got {running:?}"
-        );
-    }
-
-    #[test]
-    fn background_bash_completion_lifecycle_reduces_to_snapshots() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-
-        assert!(handle_background_bash_task_frame(
-            &bash_task_started_frame(),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(handle_background_bash_task_frame(
-            &bash_task_updated_frame("completed"),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(handle_background_bash_task_frame(
-            &bash_task_notification_frame(
-                "completed",
-                "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)",
-            ),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(tasks.is_empty(), "task is dropped after its notification");
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let snapshots = events
-            .iter()
-            .filter(|event| event_kind(event) == Some("ToolProgress"))
-            .map(|event| {
-                let data: ToolProgressData =
-                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
-                        .expect("ToolProgress payload parses");
-                let ToolProgressUpdate::BackgroundTask(state) = data.update else {
-                    panic!("expected BackgroundTask update");
-                };
-                state
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            snapshots.len(),
-            3,
-            "task_updated owns the terminal transition and notification enriches its payload"
-        );
-        assert_eq!(snapshots[0].status, BackgroundTaskStatus::Running);
-        assert_eq!(
-            snapshots[0].description.as_deref(),
-            Some("test background command")
-        );
-        assert_eq!(snapshots[1].status, BackgroundTaskStatus::Completed);
-        let last = snapshots.last().unwrap();
-        assert_eq!(last.status, BackgroundTaskStatus::Completed);
-        assert_eq!(
-            last.summary.as_deref(),
-            Some(
-                "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)"
-            ),
-            "the notification snapshot remains self-describing"
-        );
-        assert_eq!(
-            last.output_unavailable.as_deref(),
-            Some("Claude command output file was unavailable"),
-            "the notification must preserve why structured output could not be captured"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-                .count(),
-            1,
-            "task_notification must complete the detached launch exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_task_update_releases_activity_before_notification() {
-        let (inner, mut rx) = make_test_inner();
-        inner.emit_typing_status(true);
-        register_shared_background_task(&inner);
-        sync_persistent_background_activity(&inner, &HashMap::new(), &HashMap::new()).await;
-        while rx.try_recv().is_ok() {}
-
-        assert!(
-            inner.handle_background_task_frame(
-                &bash_task_updated_frame("completed"),
-                &HashMap::new(),
-            )
-        );
-        sync_persistent_background_activity(&inner, &HashMap::new(), &HashMap::new()).await;
-
-        let registry = inner
-            .background_tasks
-            .lock()
-            .expect("Claude background task mutex poisoned");
-        assert_eq!(registry.entries.len(), 1, "notification still owns cleanup");
-        assert!(
-            registry
-                .entries
-                .values()
-                .all(|entry| entry.state.status == BackgroundTaskStatus::Completed)
-        );
-        drop(registry);
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events.iter().any(|event| {
-                event_kind(event) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false)
-            }),
-            "a terminal task is not active work while its notification is pending: {events:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn background_bash_owner_loss_requires_stopped_and_completion_once() {
-        for cause in ["stdout EOF", "explicit shutdown with reader abort"] {
-            let (inner, mut rx) = make_test_inner();
-            let inner = Arc::new(inner);
-            let owner_active_at_abort = install_test_process_runtime(&inner).await;
-            register_shared_background_task(&inner);
-            assert!(
-                inner.emitter.detach_tool("toolu_01Ay3XKHPknVQCy2L7zkvvH6"),
-                "fixture must model a pending detached launch"
-            );
-            let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-
-            match cause {
-                "stdout EOF" => inner.mark_process_exited().await,
-                "explicit shutdown with reader abort" => inner.shutdown_process().await,
-                _ => unreachable!(),
-            }
-            assert!(
-                !timeout(Duration::from_secs(2), owner_active_at_abort)
-                    .await
-                    .expect("reader abort probe")
-                    .expect("reader abort owner state"),
-                "{cause} must make the owner inactive before its reader can finish"
-            );
-
-            let terminal = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(
-                terminal
-                    .iter()
-                    .filter(|event| {
-                        event_kind(event) == Some("ToolProgress")
-                            && event.pointer("/data/update/status").and_then(Value::as_str)
-                                == Some("stopped")
-                    })
-                    .count(),
-                1,
-                "{cause} must retire Running exactly once"
-            );
-            assert_eq!(
-                terminal
-                    .iter()
-                    .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-                    .count(),
-                1,
-                "{cause} must complete the detached launch exactly once"
-            );
-
-            inner.shutdown_process().await;
-            let duplicate = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert!(duplicate.iter().all(|event| {
-                event_kind(event) != Some("ToolProgress")
-                    && event_kind(event) != Some("ToolExecutionCompleted")
-            }));
-            assert!(
-                inner.handle_background_task_frame(&bash_task_started_frame(), &HashMap::new(),)
-            );
-            assert!(
-                inner
-                    .background_tasks
-                    .lock()
-                    .expect("Claude background task mutex poisoned")
-                    .entries
-                    .is_empty(),
-                "{cause} must reject a post-drain background start"
-            );
-        }
-    }
-
-    #[test]
-    fn background_bash_turn_end_and_interrupt_preserve_running() {
-        let (inner, mut rx) = make_test_inner();
-        register_shared_background_task(&inner);
-        assert!(inner.emitter.detach_tool("toolu_01Ay3XKHPknVQCy2L7zkvvH6"));
-        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-
-        inner.emitter.typing_status_changed(false);
-        inner.emitter.operation_cancelled("Operation cancelled");
-        let boundary = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            inner
-                .background_tasks
-                .lock()
-                .expect("Claude background task mutex poisoned")
-                .entries
-                .contains_key("b4r45rw5t")
-        );
-        assert!(boundary.iter().all(|event| {
-            event_kind(event) != Some("ToolProgress")
-                && event_kind(event) != Some("ToolExecutionCompleted")
-        }));
-    }
-
-    #[test]
-    fn background_bash_terminal_status_cannot_regress_to_running() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
-        handle_background_bash_task_frame(
-            &bash_task_updated_frame("failed"),
-            &mut tasks,
-            &inner.emitter,
-        );
-        handle_background_bash_task_frame(
-            &bash_task_updated_frame("running"),
-            &mut tasks,
-            &inner.emitter,
-        );
-
-        assert_eq!(
-            tasks
-                .get("b4r45rw5t")
-                .expect("background task remains registered")
-                .state
-                .status,
-            BackgroundTaskStatus::Failed,
-            "an invalid provider regression must not resurrect a terminal row"
-        );
-        let statuses = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter(|event| event_kind(event) == Some("ToolProgress"))
-            .filter_map(|event| {
-                event
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(statuses, ["running", "failed"]);
-    }
-
-    #[tokio::test]
-    async fn background_bash_owner_loss_overrides_unconfirmed_completion() {
-        let (inner, mut rx) = make_test_inner();
-        register_shared_background_task(&inner);
-        {
-            let mut tasks = inner
-                .background_tasks
-                .lock()
-                .expect("Claude background task mutex poisoned");
-            handle_background_bash_task_frame(
-                &bash_task_updated_frame("completed"),
-                &mut tasks.entries,
-                &inner.emitter,
-            );
-        }
-        assert!(inner.emitter.detach_tool("toolu_01Ay3XKHPknVQCy2L7zkvvH6"));
-        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-
-        inner.mark_process_exited().await;
-
-        let terminal = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(
-            terminal
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolProgress")
-                        && event.pointer("/data/update/status").and_then(Value::as_str)
-                            == Some("stopped")
-                        && event
-                            .pointer("/data/update/output_unavailable")
-                            .and_then(Value::as_str)
-                            .is_some()
-                })
-                .count(),
-            1,
-            "owner loss must correct an unconfirmed terminal patch to Stopped with unavailable output"
-        );
-        let completion = terminal
-            .iter()
-            .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-            .expect("owner loss completes the detached tool");
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/kind")
-                .and_then(Value::as_str),
-            Some("Cancelled")
-        );
-    }
-
-    #[test]
-    fn background_task_progress_preserves_monitor_tool_identity() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "monitor-task",
-                "tool_use_id": "toolu_monitor",
-                "description": "wait for completion",
-                "task_type": "local_bash",
-            }),
-            &mut tasks,
-            &inner.emitter,
-            &HashMap::new(),
-        ));
-        assert!(
-            tasks
-                .get("monitor-task")
-                .expect("registered task")
-                .owner
-                .is_none(),
-            "Claude may announce the task before its tool request"
-        );
-
-        let assistant = json!({
-            "type": "assistant",
-            "message": {
-                "content": [{
-                    "type": "tool_use",
-                    "id": "toolu_monitor",
-                    "name": "Monitor",
-                    "input": {
-                        "command": "until test -f /tmp/done; do sleep 1; done",
-                        "persistent": false,
-                    },
-                }],
-            },
-        });
-        inner.emitter.tool_request(
-            "toolu_monitor",
-            "Monitor",
-            claude_tool_request_type(
-                "Monitor",
-                assistant.pointer("/message/content/0/input").unwrap(),
-            ),
-        );
-        refresh_unresolved_background_tasks(
-            &assistant,
-            &mut tasks,
-            &inner.emitter,
-            &HashMap::new(),
-        );
-        assert_eq!(
-            tasks
-                .get("monitor-task")
-                .and_then(|entry| entry.state.description.as_deref()),
-            Some("until test -f /tmp/done; do sleep 1; done"),
-            "the task title comes from the normalized request, not model prose"
-        );
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "monitor-task",
-                "status": "stopped",
-                "summary": "Monitor stopped",
-            }),
-            &mut tasks,
-            &inner.emitter,
-            &HashMap::new(),
-        ));
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events
-                .iter()
-                .all(|event| event_kind(event) != Some("Error")),
-            "background progress must not conflict with the originating Monitor request"
-        );
-        let progress = events
-            .iter()
-            .find(|event| event_kind(event) == Some("ToolProgress"))
-            .expect("background Monitor progress");
-        assert_eq!(
-            progress.pointer("/data/tool_name").and_then(Value::as_str),
-            Some("Monitor")
-        );
-        assert_eq!(
-            progress
-                .pointer("/data/update/status")
-                .and_then(Value::as_str),
-            Some("running")
-        );
-        assert!(events.iter().any(|event| {
-            event_kind(event) == Some("ToolProgress")
-                && event.pointer("/data/update/status").and_then(Value::as_str) == Some("stopped")
-        }));
-    }
-
-    #[test]
-    fn background_task_resolves_after_monitor_start_response() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        inner.emitter.tool_request(
-            "toolu_monitor",
-            "Monitor",
-            json!({
-                "kind": "Other",
-                "args": {
-                    "command": "until test -f /tmp/done; do sleep 1; done",
-                    "persistent": false,
-                },
-            }),
-        );
-        inner.emitter.tool_completed(ToolCompletedPayload {
-            tool_call_id: "toolu_monitor",
-            tool_name: "Monitor",
-            tool_result: json!({
-                "kind": "Other",
-                "result": "Monitor started",
-            }),
-            success: true,
-            error: None,
-        });
-
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "monitor-task",
-                "tool_use_id": "toolu_monitor",
-                "description": "wait for completion",
-                "task_type": "local_bash",
-            }),
-            &mut tasks,
-            &inner.emitter,
-            &HashMap::new(),
-        ));
-        let task = tasks.get("monitor-task").expect("registered task");
-        assert!(task.owner.is_some());
-        assert_eq!(task.tool_name.as_deref(), Some("Monitor"));
-        assert_eq!(
-            task.state.description.as_deref(),
-            Some("until test -f /tmp/done; do sleep 1; done")
-        );
-
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "monitor-task",
-                "status": "completed",
-                "summary": "Monitor completed",
-            }),
-            &mut tasks,
-            &inner.emitter,
-            &HashMap::new(),
-        ));
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.iter().any(|event| {
-            event_kind(event) == Some("ToolProgress")
-                && event.pointer("/data/tool_name").and_then(Value::as_str) == Some("Monitor")
-                && event.pointer("/data/update/status").and_then(Value::as_str) == Some("completed")
-        }));
-    }
-
-    #[test]
-    fn background_bash_notification_emits_authoritative_terminal_completion() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        let temp = tempfile::tempdir().expect("temp output dir");
-        let output_file = temp.path().join("background-output.json");
-        std::fs::write(
-            &output_file,
-            br#"{"exit_code":7,"stdout":"partial output","stderr":"command failed"}"#,
-        )
-        .expect("write structured command output");
-
-        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
-        handle_background_bash_task_frame(
-            &bash_task_notification_frame_with_output(
-                "completed",
-                "Background command finished",
-                output_file.to_str().expect("utf-8 output path"),
-            ),
-            &mut tasks,
-            &inner.emitter,
-        );
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let completion = events
-            .iter()
-            .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-            .expect("terminal notification should complete the launch tool");
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/kind")
-                .and_then(Value::as_str),
-            Some("RunCommand")
-        );
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/exit_code")
-                .and_then(Value::as_i64),
-            Some(7)
-        );
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/stdout")
-                .and_then(Value::as_str),
-            Some("partial output")
-        );
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/stderr")
-                .and_then(Value::as_str),
-            Some("command failed")
-        );
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(false)
-        );
-        let terminal_progress = events
-            .iter()
-            .rfind(|event| event_kind(event) == Some("ToolProgress"))
-            .expect("terminal progress should remain available to the card");
-        assert_eq!(
-            terminal_progress
-                .pointer("/data/update/status")
-                .and_then(Value::as_str),
-            Some("completed")
-        );
-        assert_eq!(
-            terminal_progress
-                .pointer("/data/update/summary")
-                .and_then(Value::as_str),
-            Some("Background command finished")
-        );
-    }
-
-    #[test]
-    fn background_bash_structured_success_output_reaches_terminal_result() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        let temp = tempfile::tempdir().expect("temp output dir");
-        let output_file = temp.path().join("background-output.json");
-        std::fs::write(
-            &output_file,
-            br#"{"exit_code":0,"stdout":"finished work","stderr":""}"#,
-        )
-        .expect("write structured command output");
-
-        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
-        handle_background_bash_task_frame(
-            &bash_task_notification_frame_with_output(
-                "completed",
-                "Background command finished",
-                output_file.to_str().expect("utf-8 output path"),
-            ),
-            &mut tasks,
-            &inner.emitter,
-        );
-
-        let completion = std::iter::from_fn(|| rx.try_recv().ok())
-            .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
-            .expect("terminal completion");
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/stdout")
-                .and_then(Value::as_str),
-            Some("finished work")
-        );
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn background_bash_missing_output_is_explicit_without_leaking_path() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
-        handle_background_bash_task_frame(
-            &bash_task_notification_frame("completed", "Background command finished"),
-            &mut tasks,
-            &inner.emitter,
-        );
-
-        let snapshots = recv_background_snapshots(&mut rx);
-        let terminal = snapshots.last().expect("terminal snapshot");
-        assert_eq!(
-            terminal.summary.as_deref(),
-            Some("Background command finished")
-        );
-        let unavailable = terminal
-            .output_unavailable
-            .as_deref()
-            .expect("missing output must be explicit");
-        assert!(unavailable.contains("unavailable"));
-        assert!(!unavailable.contains("/tmp/"));
-    }
-
-    #[tokio::test]
-    async fn background_child_bash_completion_uses_child_detached_request() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, mut parent_events) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant",
-                "message": { "content": [{
-                    "type": "tool_use",
-                    "id": "toolu_child",
-                    "name": "Agent",
-                    "input": {
-                        "description": "Run a delayed command",
-                        "prompt": "Run a delayed command",
-                        "run_in_background": true
-                    }
-                }]}
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-
-        let mut tasks = HashMap::new();
-        // Live Claude may publish task_started before the child's correlated
-        // Bash tool_use, and may omit parent_tool_use_id. Keep the task
-        // unresolved until later frames provide positive ownership evidence.
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "child-task",
-                "tool_use_id": "toolu_child_bash",
-                "task_type": "local_bash"
-            }),
-            &mut tasks,
-            &parent_emitter,
-            &streams,
-        ));
-        assert!(
-            tasks
-                .get("child-task")
-                .expect("registered task")
-                .owner
-                .is_none()
-        );
-
-        consume_subagent_event(
-            streams.get_mut("toolu_child").expect("child stream"),
-            &json!({
-                "type": "assistant",
-                "parent_tool_use_id": "toolu_child",
-                "message": { "content": [{
-                    "type": "tool_use",
-                    "id": "toolu_child_bash",
-                    "name": "Bash",
-                    "input": { "command": "sleep 1", "run_in_background": true }
-                }]}
-            }),
-        );
-
-        consume_subagent_event(
-            streams.get_mut("toolu_child").expect("child stream"),
-            &json!({
-                "type": "user",
-                "parent_tool_use_id": "toolu_child",
-                "message": { "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_child_bash",
-                    "is_error": false,
-                    "content": "Command running in background"
-                }]}
-            }),
-        );
-        assert!(
-            streams
-                .get("toolu_child")
-                .expect("child stream")
-                .inner
-                .emitter
-                .has_pending_tool_request("toolu_child_bash")
-        );
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "task_id": "child-task",
-                "tool_use_id": "toolu_child_bash",
-                "status": "completed",
-                "summary": "Background command finished"
-            }),
-            &mut tasks,
-            &parent_emitter,
-            &streams,
-        ));
-
-        let mut child_events = emitter.take_event_rx("toolu_child");
-        let completion = timeout(Duration::from_secs(1), async {
-            loop {
-                if let protocol::ChatEvent::ToolExecutionCompleted(completion) =
-                    child_events.recv().await.expect("child event channel")
-                {
-                    break completion;
-                }
-            }
-        })
-        .await
-        .expect("child Bash completion");
-        assert_eq!(completion.tool_call_id, "toolu_child_bash");
-        assert!(completion.success);
-        assert!(matches!(
-            completion.tool_result,
-            protocol::ToolExecutionResult::RunCommand { exit_code: 0, .. }
-        ));
-
-        let child = streams.get("toolu_child").expect("child stream");
-        child.inner.emitter.tool_request(
-            "toolu_child_bash_cancelled",
-            "Bash",
-            claude_tool_request_type(
-                "Bash",
-                &json!({ "command": "sleep 30", "run_in_background": true }),
-            ),
-        );
-        assert!(
-            child
-                .inner
-                .emitter
-                .detach_tool("toolu_child_bash_cancelled")
-        );
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system", "subtype": "task_started",
-                "task_id": "child-task-cancelled",
-                "tool_use_id": "toolu_child_bash_cancelled",
-                "task_type": "local_bash",
-                "parent_tool_use_id": "toolu_mismatched_parent"
-            }),
-            &mut tasks,
-            &parent_emitter,
-            &streams,
-        ));
-        assert!(handle_background_bash_task_frame_with_owners(
-            &json!({
-                "type": "system", "subtype": "task_notification",
-                "task_id": "child-task-cancelled",
-                "tool_use_id": "toolu_child_bash_cancelled",
-                "status": "stopped",
-                "summary": "Background command stopped"
-            }),
-            &mut tasks,
-            &parent_emitter,
-            &streams,
-        ));
-        let cancelled = timeout(Duration::from_secs(1), async {
-            loop {
-                if let protocol::ChatEvent::ToolExecutionCompleted(completion) =
-                    child_events.recv().await.expect("child event channel")
-                    && completion.tool_call_id == "toolu_child_bash_cancelled"
-                {
-                    break completion;
-                }
-            }
-        })
-        .await
-        .expect("child Bash cancellation");
-        assert!(!cancelled.success);
-        assert!(matches!(
-            cancelled.tool_result,
-            protocol::ToolExecutionResult::Cancelled { .. }
-        ));
-
-        while let Ok(event) = parent_events.try_recv() {
-            assert_ne!(
-                event.pointer("/data/tool_call_id").and_then(Value::as_str),
-                Some("toolu_child_bash"),
-                "child Bash completion must never synthesize a root-owned request"
-            );
-        }
-    }
-
-    #[test]
-    fn background_bash_launch_ack_does_not_complete_running_tool() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-bg".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu-bg-bash",
-                        "name": "Bash",
-                        "input": {
-                            "command": "sleep 10",
-                            "run_in_background": true
-                        }
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-        consume_claude_stream_value(
-            &json!({
-                "type": "user",
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu-bg-bash",
-                        "is_error": false,
-                        "content": "Command running in background"
-                    }]
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events
-                .iter()
-                .any(|event| event_kind(event) == Some("ToolRequest"))
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| event_kind(event) != Some("ToolExecutionCompleted")),
-            "the launch acknowledgement is not a terminal process result"
-        );
-    }
-
-    #[test]
-    fn background_bash_teardown_kill_maps_to_stopped() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-
-        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
-        assert!(handle_background_bash_task_frame(
-            &bash_task_updated_frame("killed"),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(handle_background_bash_task_frame(
-            &bash_task_notification_frame("stopped", "Sleep 10 seconds then echo marker"),
-            &mut tasks,
-            &inner.emitter,
-        ));
-
-        let snapshots = recv_background_snapshots(&mut rx);
-        assert_eq!(
-            snapshots.len(),
-            3,
-            "the notification adds the summary/output snapshot unavailable to task_updated"
-        );
-        assert_eq!(snapshots[1].status, BackgroundTaskStatus::Stopped);
-        assert_eq!(snapshots[2].status, BackgroundTaskStatus::Stopped);
-        assert_eq!(
-            snapshots[2].summary.as_deref(),
-            Some("Sleep 10 seconds then echo marker")
-        );
-    }
-
-    #[test]
-    fn background_bash_ignores_foreign_task_frames() {
-        let (inner, mut rx) = make_test_inner();
-        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-
-        // Agent and workflow tasks belong to other reducers.
-        assert!(!handle_background_bash_task_frame(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "task_id": "task-agent",
-                "tool_use_id": "toolu_task",
-                "task_type": "local_agent",
-            }),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        // task_updated / task_notification carry no task_type; ones for
-        // task_ids we never registered must fall through untouched.
-        assert!(!handle_background_bash_task_frame(
-            &bash_task_updated_frame("completed"),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(!handle_background_bash_task_frame(
-            &bash_task_notification_frame("completed", "done"),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        // The background_tasks_changed roster snapshot has no task_id and
-        // is not consumed by this reducer.
-        assert!(!handle_background_bash_task_frame(
-            &json!({
-                "type": "system",
-                "subtype": "background_tasks_changed",
-                "tasks": [{"task_id": "b4r45rw5t", "task_type": "local_bash"}],
-            }),
-            &mut tasks,
-            &inner.emitter,
-        ));
-        assert!(recv_background_snapshots(&mut rx).is_empty());
-    }
-
-    #[test]
-    fn compact_boundary_system_event_is_recognized() {
-        let (inner, _rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "system",
-                "subtype": "compact_boundary",
-                "compact_metadata": {
-                    "pre_tokens": 1234,
-                    "trigger": "manual"
-                }
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert!(matches!(
-            summary.control_event,
-            Some(ClaudeControlEvent::ConversationCompacted)
-        ));
-    }
-
-    #[test]
-    fn task_started_system_event_is_recognized_without_affecting_root_summary() {
-        let (inner, _rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Explore remote host connection code",
-                "prompt": "Trace the end-to-end flow",
-                "session_id": "test-session",
-                "task_id": "task-123",
-                "task_type": "local_agent",
-                "tool_use_id": "toolu_123"
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(summary.session_id.as_deref(), Some("test-session"));
-        assert!(summary.control_event.is_none());
-    }
-
-    #[tokio::test]
-    async fn task_started_local_agent_registers_subagent_and_routes_parent_events() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Explore remote host connection code",
-                "prompt": "Trace the end-to-end flow",
-                "session_id": "test-session",
-                "task_id": "task-123",
-                "task_type": "local_agent",
-                "tool_use_id": "toolu_123"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-
-        let spawn_records = emitter.spawn_records();
-        assert_eq!(spawn_records.len(), 1);
-        assert_eq!(spawn_records[0].tool_use_id, "toolu_123");
-        assert_eq!(spawn_records[0].name, "Explore remote host connection code");
-        assert_eq!(spawn_records[0].description, "Trace the end-to-end flow");
-        assert_eq!(spawn_records[0].agent_type, "local_agent");
-        assert!(streams.contains_key("toolu_123"));
-
-        let mut child_events = emitter.take_event_rx("toolu_123");
-        let prompt_event = recv_child_chat_event(&mut child_events, "task prompt event").await;
-        let protocol::ChatEvent::MessageAdded(prompt_message) = prompt_event else {
-            panic!("expected initial child MessageAdded event");
-        };
-        assert_eq!(prompt_message.content, "Trace the end-to-end flow");
-
-        let stream = streams.get_mut("toolu_123").expect("sub-agent stream");
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "content_block_start",
-                "parent_tool_use_id": "toolu_123",
-                "index": 0,
-                "content_block": {
-                    "type": "text",
-                    "text": "child says hello"
-                }
-            }),
-        );
-
-        let stream_start = recv_child_chat_event(&mut child_events, "child stream start").await;
-        let protocol::ChatEvent::StreamStart(start) = stream_start else {
-            panic!("expected child StreamStart event");
-        };
-        assert!(
-            start.message_id.is_some(),
-            "child stream start should carry a message id"
-        );
-
-        let stream_delta = recv_child_chat_event(&mut child_events, "child stream delta").await;
-        let protocol::ChatEvent::StreamDelta(delta) = stream_delta else {
-            panic!("expected child StreamDelta event");
-        };
-        assert_eq!(delta.text, "child says hello");
-
-        let mut pending_prompts = HashMap::new();
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant", "message": { "content": [{
-                    "type": "tool_use", "id": "toolu_123", "name": "Agent",
-                    "input": {
-                        "prompt": "Trace the end-to-end flow",
-                        "run_in_background": false
-                    }
-                }]}
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-
-        detect_subagent_completions(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_123",
-                        "is_error": false,
-                        "content": "child final response"
-                    }]
-                }
-            }),
-            &mut streams,
-        )
-        .await;
-
-        let stream_end = recv_child_chat_event(&mut child_events, "child stream end").await;
-        let protocol::ChatEvent::StreamEnd(end) = stream_end else {
-            panic!("expected child StreamEnd event");
-        };
-        assert_eq!(end.message.content, "child says hello");
-
-        assert!(
-            streams.is_empty(),
-            "sub-agent stream should be removed after tool_result completion"
-        );
-    }
-
-    fn drain_parent_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        events
-    }
-
-    fn assert_no_error_events(events: &[Value]) {
-        let errors: Vec<&Value> = events
-            .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
-            .collect();
-        assert!(errors.is_empty(), "unexpected Error events: {errors:?}");
-    }
-
-    fn tool_progress_names(events: &[Value]) -> Vec<String> {
-        events
-            .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-            .filter_map(|event| event["data"]["tool_name"].as_str().map(str::to_owned))
-            .collect()
-    }
-
-    /// Captured 2026-08-03 regression (beta.51, claude-fable-5): the model
-    /// continues an existing agent with the CLI-native SendMessage tool and
-    /// the CLI anchors the continuation's `task_started` local_agent frame
-    /// to the SendMessage call's tool_use_id. Lazy registration defaulted
-    /// the parent tool name to "Task", so every progress frame desynced
-    /// from the emitted SendMessage request and the emitter surfaced "Tool
-    /// progress identity mismatch" Error cards in the user's chat. The
-    /// emitted request is authoritative: registration and every emission
-    /// must adopt it, and this replay must produce no Error events.
-    #[tokio::test]
-    async fn sendmessage_continuation_adopts_request_identity_without_errors() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, mut parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-
-        // The SendMessage tool_use block reaches the emitter first: a
-        // request card named SendMessage owns the tool_use_id.
-        parent_emitter.tool_request(
-            "toolu_sendmsg",
-            "SendMessage",
-            json!({"kind": "Other", "args": {"agent_id": "aa62c69", "message": "keep going"}}),
-        );
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Continue child agent",
-                "prompt": "keep going",
-                "session_id": "test-session",
-                "task_id": "task-send-1",
-                "task_type": "local_agent",
-                "tool_use_id": "toolu_sendmsg"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-
-        let stream = streams
-            .get_mut("toolu_sendmsg")
-            .expect("continuation stream should register");
-        assert_eq!(stream.parent_tool_name, "SendMessage");
-
-        // A stale cached identity must not survive emission: progress
-        // re-resolves against the emitted request every time.
-        stream.parent_tool_name = "Task".to_owned();
-        let progress = subagent_progress_data(stream, false);
-        assert_eq!(progress.tool_name, "SendMessage");
-        parent_emitter.tool_progress(&progress);
-
-        let events = drain_parent_events(&mut parent_rx);
-        assert_no_error_events(&events);
-        let names = tool_progress_names(&events);
-        assert!(
-            !names.is_empty(),
-            "expected ToolProgress frames, got {events:?}"
-        );
-        assert!(
-            names.iter().all(|name| name == "SendMessage"),
-            "all progress must carry the request identity, got {names:?}"
-        );
-    }
-
-    /// Every agent-control call the CLI can anchor a local_agent task to
-    /// must keep progress identity aligned with its emitted request. The
-    /// beta.41 identity fix covered local_bash owners only; this table pins
-    /// the local_agent owners so extending to the CLI's next task anchor is
-    /// mechanical rather than a rediscovery.
-    #[tokio::test]
-    async fn local_agent_task_identity_follows_emitted_request_for_all_owners() {
-        for owner in ["Task", "Agent", "SendMessage"] {
-            let emitter = TestSubAgentEmitter::default();
-            let (parent_emitter, mut parent_rx) = test_parent_emitter();
-            let mut streams = HashMap::new();
-            let tool_use_id = format!("toolu_{}", owner.to_ascii_lowercase());
-
-            parent_emitter.tool_request(&tool_use_id, owner, json!({"kind": "Other", "args": {}}));
-
-            detect_subagent_task_system_spawns(
-                &json!({
-                    "type": "system",
-                    "subtype": "task_started",
-                    "description": "child work",
-                    "prompt": "do the thing",
-                    "session_id": "test-session",
-                    "task_id": format!("task-{owner}"),
-                    "task_type": "local_agent",
-                    "tool_use_id": tool_use_id.clone()
-                }),
-                &emitter,
-                &parent_emitter,
-                &mut streams,
-            )
-            .await;
-
-            let stream = streams.get(&tool_use_id).expect("stream should register");
-            assert_eq!(stream.parent_tool_name, owner, "owner {owner}");
-
-            let events = drain_parent_events(&mut parent_rx);
-            assert_no_error_events(&events);
-            let names = tool_progress_names(&events);
-            assert!(
-                names.iter().all(|name| name == owner),
-                "owner {owner}: progress must match its request, got {names:?}"
-            );
-        }
-    }
-
-    /// Frame reordering: `task_started` can precede the owning tool_use
-    /// block (observed for background tasks; same seam). The stream seeds
-    /// with "Task", and the first post-request emission adopts the real
-    /// owner — never surfacing an Error event in between.
-    #[tokio::test]
-    async fn local_agent_task_without_request_seeds_task_then_adopts_owner() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, mut parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Continue child agent",
-                "prompt": "keep going",
-                "session_id": "test-session",
-                "task_id": "task-race",
-                "task_type": "local_agent",
-                "tool_use_id": "toolu_race"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-
-        let stream = streams
-            .get_mut("toolu_race")
-            .expect("stream should register");
-        assert_eq!(stream.parent_tool_name, "Task");
-
-        // The SendMessage request card arrives late; the next emission
-        // adopts it.
-        parent_emitter.tool_request(
-            "toolu_race",
-            "SendMessage",
-            json!({"kind": "Other", "args": {}}),
-        );
-        let progress = subagent_progress_data(stream, false);
-        assert_eq!(progress.tool_name, "SendMessage");
-        parent_emitter.tool_progress(&progress);
-
-        let events = drain_parent_events(&mut parent_rx);
-        assert_no_error_events(&events);
-    }
-
-    #[tokio::test]
-    async fn background_subagent_survives_launch_tool_result_until_task_notification() {
-        // Reproduces the real background-agent event ordering: the parent's
-        // synthetic launch tool_result arrives BEFORE the sub-agent's own
-        // output, so tearing the stream down on that tool_result drops the
-        // real sub-agent output. The stream must instead survive until the
-        // `task_notification` completion frame.
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-
-        // Parent spawns a background Agent (run_in_background: true).
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu_bg",
-                        "name": "Agent",
-                        "input": {
-                            "description": "Compute 2+2",
-                            "prompt": "Compute 2+2",
-                            "subagent_type": "general-purpose",
-                            "run_in_background": true
-                        }
-                    }]
-                }
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-
-        assert!(streams.contains_key("toolu_bg"));
-        assert!(
-            streams.get("toolu_bg").expect("stream").execution == SubAgentExecution::Background,
-            "run_in_background tool_use must mark the stream as background"
-        );
-
-        // The synthetic launch tool_result arrives immediately — it must NOT
-        // finalize a background stream.
-        detect_subagent_completions(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_bg",
-                        "is_error": false,
-                        "content": "The agent is working in the background. You will be notified automatically when it completes."
-                    }]
-                }
-            }),
-            &mut streams,
-        )
-        .await;
-        assert!(
-            streams.contains_key("toolu_bg"),
-            "background sub-agent stream must survive its launch tool_result"
-        );
-
-        // The sub-agent's real output streams afterwards and still routes.
-        let stream = streams.get_mut("toolu_bg").expect("stream");
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "content_block_start",
-                "parent_tool_use_id": "toolu_bg",
-                "index": 0,
-                "content_block": { "type": "text", "text": "4" }
-            }),
-        );
-
-        // The task_notification completion frame finalizes the stream.
-        finalize_background_subagent_completion(
-            &json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "tool_use_id": "toolu_bg",
-                "status": "completed"
-            }),
-            &mut streams,
-        );
-        assert!(
-            streams.is_empty(),
-            "background sub-agent stream should be removed on task_notification"
-        );
-    }
-
-    #[tokio::test]
-    async fn omitted_background_flag_uses_cli_task_lifecycle() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-        let spawn = json!({
-            "type": "assistant",
-            "message": { "content": [{
-                "type": "tool_use", "id": "toolu_default", "name": "Agent",
-                "input": { "description": "Inspect", "prompt": "Inspect code" }
-            }]}
-        });
-
-        detect_subagent_spawns(
-            &spawn,
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-        assert_eq!(
-            streams.get("toolu_default").expect("stream").execution,
-            SubAgentExecution::Unknown
-        );
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system", "subtype": "task_started",
-                "task_type": "local_agent", "tool_use_id": "toolu_default"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-        assert_eq!(
-            streams.get("toolu_default").expect("stream").execution,
-            SubAgentExecution::Unknown
-        );
-
-        detect_subagent_completions(
-            &json!({
-                "type": "user", "message": { "content": [{
-                    "type": "tool_result", "tool_use_id": "toolu_default",
-                    "content": "The agent is working in the background. You will be notified automatically when it completes."
-                }]}
-            }),
-            &mut streams,
-        )
-        .await;
-        assert!(streams.contains_key("toolu_default"));
-
-        let stream = streams.get_mut("toolu_default").expect("stream");
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "content_block_start", "parent_tool_use_id": "toolu_default",
-                "index": 0,
-                "content_block": {"type": "text", "text": "tool-first complete"}
-            }),
-        );
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "result", "parent_tool_use_id": "toolu_default",
-                "result": "tool-first complete",
-                "usage": {"input_tokens": 12, "output_tokens": 3}
-            }),
-        );
-        finalize_background_subagent_completion(
-            &json!({
-                "type": "system", "subtype": "task_notification",
-                "tool_use_id": "toolu_default", "status": "completed"
-            }),
-            &mut streams,
-        );
-        assert!(streams.is_empty());
-
-        let mut child_events = emitter.take_event_rx("toolu_default");
-        let mut saw_output = false;
-        let mut saw_known_usage = false;
-        for _ in 0..8 {
-            let event = recv_child_chat_event(&mut child_events, "tool-first child event").await;
-            match event {
-                protocol::ChatEvent::StreamDelta(delta) => {
-                    saw_output |= delta.text.contains("tool-first complete");
-                }
-                protocol::ChatEvent::StreamEnd(end) => {
-                    saw_known_usage |= end
-                        .message
-                        .token_usage
-                        .as_ref()
-                        .and_then(|usage| usage.turn.known_usage())
-                        .is_some_and(|usage| usage.total_tokens == 15);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_output);
-        assert!(saw_known_usage);
-    }
-
-    #[tokio::test]
-    async fn task_started_before_omitted_tool_input_survives_launch_and_reports_usage() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system", "subtype": "task_started",
-                "task_type": "local_agent", "tool_use_id": "toolu_task_first",
-                "prompt": "Inspect code"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant", "message": { "content": [{
-                    "type": "tool_use", "id": "toolu_task_first", "name": "Agent",
-                    "input": { "prompt": "Inspect code" }
-                }]}
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-        assert_eq!(
-            streams.get("toolu_task_first").expect("stream").execution,
-            SubAgentExecution::Unknown
-        );
-        detect_subagent_completions(
-            &json!({
-                "type": "user", "message": { "content": [{
-                    "type": "tool_result", "tool_use_id": "toolu_task_first",
-                    "content": "The agent is working in the background. You will be notified automatically when it completes."
-                }]}
-            }),
-            &mut streams,
-        )
-        .await;
-        assert!(streams.contains_key("toolu_task_first"));
-
-        let stream = streams.get_mut("toolu_task_first").expect("stream");
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "content_block_start", "parent_tool_use_id": "toolu_task_first",
-                "index": 0,
-                "content_block": {"type": "text", "text": "inspection complete"}
-            }),
-        );
-        consume_subagent_event(
-            stream,
-            &json!({
-                "type": "result", "parent_tool_use_id": "toolu_task_first",
-                "result": "inspection complete",
-                "usage": {"input_tokens": 20, "output_tokens": 5}
-            }),
-        );
-        finalize_background_subagent_completion(
-            &json!({
-                "type": "system", "subtype": "task_notification",
-                "tool_use_id": "toolu_task_first", "status": "completed"
-            }),
-            &mut streams,
-        );
-        assert!(streams.is_empty());
-
-        let mut child_events = emitter.take_event_rx("toolu_task_first");
-        let mut saw_output = false;
-        let mut saw_known_usage = false;
-        for _ in 0..8 {
-            let event = recv_child_chat_event(&mut child_events, "task-first child event").await;
-            match event {
-                protocol::ChatEvent::StreamDelta(delta) => {
-                    saw_output |= delta.text.contains("inspection complete");
-                }
-                protocol::ChatEvent::StreamEnd(end) => {
-                    saw_known_usage |= end
-                        .message
-                        .token_usage
-                        .as_ref()
-                        .and_then(|usage| usage.turn.known_usage())
-                        .is_some_and(|usage| usage.total_tokens == 25);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_output);
-        assert!(saw_known_usage);
-    }
-
-    #[tokio::test]
-    async fn explicit_foreground_subagent_finishes_on_tool_result() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant", "message": { "content": [{
-                    "type": "tool_use", "id": "toolu_sync", "name": "Agent",
-                    "input": { "prompt": "Inspect", "run_in_background": false }
-                }]}
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-        detect_subagent_completions(
-            &json!({
-                "type": "user", "message": { "content": [{
-                    "type": "tool_result", "tool_use_id": "toolu_sync", "content": "done"
-                }]}
-            }),
-            &mut streams,
-        )
-        .await;
-        assert!(streams.is_empty());
-    }
-
-    #[test]
-    fn correlated_frames_distinguish_skills_from_orphaned_children() {
-        let streams = HashMap::new();
-        let known = HashSet::from(["toolu_child".to_owned()]);
-        assert_eq!(
-            classify_subagent_correlation(&streams, &known, "toolu_skill"),
-            SubAgentCorrelation::Unowned
-        );
-        assert_eq!(
-            classify_subagent_correlation(&streams, &known, "toolu_child"),
-            SubAgentCorrelation::Orphaned
-        );
-    }
-
-    #[test]
-    fn correlated_skill_is_nonterminal_while_orphan_is_contextual_diagnostic() {
-        let (parent_emitter, mut parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let known = HashSet::from(["toolu_child".to_owned()]);
-
-        handle_correlated_subagent_event(
-            &mut streams,
-            &known,
-            &parent_emitter,
-            "toolu_skill",
-            &json!({"type": "assistant", "parent_tool_use_id": "toolu_skill"}),
-        );
-        assert!(parent_rx.try_recv().is_err());
-
-        handle_correlated_subagent_event(
-            &mut streams,
-            &known,
-            &parent_emitter,
-            "toolu_child",
-            &json!({"type": "assistant", "parent_tool_use_id": "toolu_child"}),
-        );
-        let diagnostic = parent_rx.try_recv().expect("orphan diagnostic");
-        assert_eq!(
-            diagnostic.get("kind").and_then(Value::as_str),
-            Some("SubprocessStderr")
-        );
-        assert!(
-            diagnostic
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|message| message.contains("parent_tool_use_id=toolu_child"))
-        );
-    }
-
-    #[tokio::test]
-    async fn task_started_local_bash_does_not_register_subagent() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Run git status",
-                "prompt": "Run git status in the repo",
-                "task_id": "task-bash",
-                "task_type": "local_bash",
-                "tool_use_id": "toolu_bash"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-
-        assert!(streams.is_empty());
-        assert!(emitter.spawn_records().is_empty());
-    }
-
-    #[tokio::test]
-    async fn task_started_dedupes_with_later_tool_use_spawn() {
-        let emitter = TestSubAgentEmitter::default();
-        let (parent_emitter, _parent_rx) = test_parent_emitter();
-        let mut streams = HashMap::new();
-        let mut pending_prompts = HashMap::new();
-
-        detect_subagent_task_system_spawns(
-            &json!({
-                "type": "system",
-                "subtype": "task_started",
-                "description": "Explore remote host connection code",
-                "prompt": "Trace the end-to-end flow",
-                "task_id": "task-123",
-                "task_type": "local_agent",
-                "tool_use_id": "toolu_123"
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-        )
-        .await;
-
-        let mut child_events = emitter.take_event_rx("toolu_123");
-        let prompt_event =
-            recv_child_chat_event(&mut child_events, "initial task prompt event").await;
-        let protocol::ChatEvent::MessageAdded(prompt_message) = prompt_event else {
-            panic!("expected initial child MessageAdded event");
-        };
-        assert_eq!(prompt_message.content, "Trace the end-to-end flow");
-
-        detect_subagent_spawns(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu_123",
-                        "name": "Task",
-                        "input": {
-                            "description": "Explore remote host connection code",
-                            "prompt": "Trace the end-to-end flow",
-                            "subagent_type": "local_agent"
-                        }
-                    }]
-                }
-            }),
-            &emitter,
-            &parent_emitter,
-            &mut streams,
-            &mut pending_prompts,
-        )
-        .await;
-
-        assert_eq!(
-            emitter.spawn_records().len(),
-            1,
-            "tool_use fallback should reuse the task_started registration"
-        );
-        assert_eq!(streams.len(), 1);
-        assert!(
-            timeout(Duration::from_millis(100), child_events.recv())
-                .await
-                .is_err(),
-            "deduped tool_use spawn should not emit a duplicate prompt"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_boundary_closes_existing_stream_without_chat_notice() {
-        let (inner, mut rx) = make_test_inner();
-        let message_id = "claude-msg-compact";
-        inner.emit_stream_start(message_id, None);
-
-        let stream_start = rx.recv().await.expect("stream start");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        assert_eq!(
-            stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some(message_id)
-        );
-
-        let mut summary = ClaudeStdoutSummary {
-            control_event: Some(ClaudeControlEvent::ConversationCompacted),
-            ..ClaudeStdoutSummary::default()
-        };
-
-        let emitted = inner
-            .emit_terminal_phase_or_placeholder(
-                &mut summary,
-                ClaudeTerminalPhaseOptions {
-                    turn_id: 1,
-                    ..ClaudeTerminalPhaseOptions::default()
-                },
-            )
-            .await;
-        assert!(
-            emitted,
-            "compact boundary should count as a recognized completion"
-        );
-
-        let stream_end = rx.recv().await.expect("stream end");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_message(&stream_end)
-                .get("message_id")
-                .and_then(Value::as_str),
-            Some(message_id)
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "compact boundary should not emit an identity error"
-        );
-    }
-
-    fn make_live_test_inner(
-        workspace_root: String,
-    ) -> (Arc<ClaudeInner>, mpsc::UnboundedReceiver<Value>) {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        (
-            Arc::new(ClaudeInner {
-                emitter: Arc::new(TurnEmitter::new_for_agent(
-                    event_tx,
-                    AgentName(CLAUDE_AGENT_NAME),
-                )),
-                state: Mutex::new(ClaudeState {
-                    workspace_root,
-                    ssh_host: None,
-                    session_id: None,
-                    fork_from_session_id: None,
-                    start_session_fresh: false,
-                    ephemeral: true,
-                    model: None,
-                    effort: Some(ClaudeEffort::High),
-                    permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
-                    startup_mcp_config_json: None,
-                    steering_content: None,
-                    agent_identity: None,
-                    tool_policy: ToolPolicy::Unrestricted,
-                    skill_plugin: None,
-                    expected_skills: Vec::new(),
-                    skill_verification_generation: 0,
-                    skill_watchdog: None,
-                    cumulative_usage: None,
-                    cumulative_usage_complete: true,
-                    conversation_bytes_total: 0,
-                    active_turn: None,
-                    compaction_capability: BackendCompactionCapability::unknown(
-                        BackendCompactionUnknownReason::ProcessNotInitialized,
-                        None,
-                        BackendCompactionCapabilityEvidence::None,
-                    ),
-                    compact_command_advertised: None,
-                    installed_provider_version: None,
-                    provider_version: None,
-                    process_generation: 0,
-                    pending_compaction: None,
-                    closing: false,
-                    restart_process_after_turn: false,
-                    subagent_emitter: None,
-                    capacity_access: ClaudeCapacityAccess::Unknown,
-                    capacity_refresh_in_flight: false,
-                    capacity_report_emitted: false,
-                    authoritative_capacity_emitted: false,
-                }),
-                runtime: Mutex::new(None),
-                turn_event_gate: Mutex::new(()),
-                task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-                background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
-                skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
-                skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
-                pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-                background_work_active: std::sync::atomic::AtomicBool::new(false),
-                typing_active: std::sync::atomic::AtomicBool::new(false),
-            }),
-            event_rx,
-        )
-    }
-
-    async fn run_live_claude_turn(
-        prompt: &str,
-        effort: &str,
-        session_id: Option<String>,
-        ephemeral: bool,
-    ) -> TurnOutcome {
-        let workspace_root = std::env::var("TYDE_CLAUDE_TEST_WORKSPACE")
-            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
-        let (inner, _rx) = make_live_test_inner(workspace_root.clone());
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let outcome = inner
-            .run_turn(
-                RunTurnParams {
-                    message_id: "claude-live-integration-msg-1",
-                    workspace_root: &workspace_root,
-                    ssh_host: None,
-                    prompt,
-                    images: &[],
-                    session_id,
-                    ephemeral,
-                    model: None,
-                    effort: Some(ClaudeEffort::parse(effort).expect("valid live test effort")),
-                    permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
-                    startup_mcp_config_json: None,
-                    steering_content: None,
-                    agent_identity: None,
-                    tool_policy: ToolPolicy::Unrestricted,
-                },
-                cancel_rx,
-            )
-            .await;
-        drop(cancel_tx);
-        outcome
-    }
-
-    const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
-    const RUN_CLAUDE_INTEGRATION_ENV: &str = "TYDE_RUN_CLAUDE_INTEGRATION";
-
-    fn live_claude_tests_enabled() -> bool {
-        std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
-            || std::env::var(RUN_CLAUDE_INTEGRATION_ENV).ok().as_deref() == Some("1")
-    }
-
-    fn live_test_workspace_root() -> String {
-        std::env::var("TYDE_CLAUDE_TEST_WORKSPACE")
-            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
-    }
-
-    fn skip_live_claude_test() {
-        eprintln!(
-            "Skipping live Claude integration test; set {RUN_REAL_AI_TESTS_ENV}=1 or {RUN_CLAUDE_INTEGRATION_ENV}=1"
-        );
-    }
-
-    fn format_live_events(events: &[Value]) -> String {
-        serde_json::to_string_pretty(&Value::Array(events.to_vec()))
-            .unwrap_or_else(|_| format!("{events:?}"))
-    }
-
-    async fn collect_live_claude_events(prompt: &str, workspace_root: String) -> Vec<Value> {
-        let (inner, mut rx) = make_live_test_inner(workspace_root);
-        inner.clone().start_turn(prompt.to_string(), None).await;
-
-        let mut events = Vec::new();
-        loop {
-            let event = timeout(Duration::from_secs(180), rx.recv())
-                .await
-                .expect("timed out waiting for live Claude event")
-                .expect("live Claude event channel closed");
-            let is_done = event_kind(&event) == Some("TypingStatusChanged")
-                && event.get("data").and_then(Value::as_bool) == Some(false);
-            events.push(event);
-            if is_done {
-                break;
-            }
-        }
-
-        events
-    }
-
-    #[tokio::test]
-    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_turn_succeeds_at_high_effort() {
-        if !live_claude_tests_enabled() {
-            skip_live_claude_test();
-            return;
-        }
-
-        let prompt = "Think carefully about this arithmetic problem and provide the final numeric answer at the end: (37 * 29) + 14.";
-        match run_live_claude_turn(prompt, "high", None, true).await {
-            TurnOutcome::Completed { summary, .. } => {
-                assert!(
-                    !summary.best_text().trim().is_empty(),
-                    "Expected non-empty assistant text from live Claude turn"
-                );
-                assert!(
-                    summary.usage.is_some() || summary.result_turn_usage.is_some(),
-                    "Expected token usage from live Claude turn at high effort"
-                );
-            }
-            TurnOutcome::Failed { error, .. } => {
-                panic!("Live Claude integration turn failed: {error}");
-            }
-            TurnOutcome::Cancelled { .. } => {
-                panic!("Live Claude integration turn was unexpectedly cancelled");
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_workflow_emits_tool_progress_snapshots() {
-        if !live_claude_tests_enabled() {
-            skip_live_claude_test();
-            return;
-        }
-
-        let prompt = "Use the Workflow tool (I explicitly request a workflow) with a trivial \
-            script: meta name wfprobe, one phase titled Probe, spawn 2 agents in parallel whose \
-            prompts are \"Reply with exactly the word hello and nothing else; do not use any \
-            tools.\" Wait for the task notification, then reply with the single word done. \
-            ultracode";
-        // Don't stop at the end of the turn: the model typically returns
-        // while the workflow is still running in the background, and the
-        // remaining ToolProgress snapshots arrive BETWEEN turns. That
-        // post-turn flow is exactly what this test exists to prove.
-        let (inner, mut rx) = make_live_test_inner(live_test_workspace_root());
-        inner.clone().start_turn(prompt.to_string(), None).await;
-
-        let mut events = Vec::new();
-        let mut snapshots: Vec<WorkflowRunState> = Vec::new();
-        loop {
-            let event = timeout(Duration::from_secs(300), rx.recv())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "timed out waiting for completed workflow snapshot; events: {}",
-                        format_live_events(&events)
-                    )
-                })
-                .expect("live Claude event channel closed");
-            events.push(event.clone());
-            if event_kind(&event) != Some("ToolProgress") {
-                continue;
-            }
-            let Ok(data) = serde_json::from_value::<ToolProgressData>(
-                event.get("data").cloned().unwrap_or(Value::Null),
-            ) else {
-                continue;
-            };
-            if let ToolProgressUpdate::Workflow(state) = data.update {
-                let finished = state.status != WorkflowRunStatus::Running;
-                snapshots.push(state);
-                if finished {
-                    break;
-                }
-            }
-        }
-
-        assert!(
-            !snapshots.is_empty(),
-            "expected live workflow ToolProgress snapshots; events: {}",
-            format_live_events(&events)
-        );
-        let last = snapshots.last().unwrap();
-        assert_eq!(
-            last.status,
-            WorkflowRunStatus::Completed,
-            "final snapshot should be completed; events: {}",
-            format_live_events(&events)
-        );
-        assert!(
-            last.agents.len() >= 2
-                && last
-                    .agents
-                    .iter()
-                    .all(|agent| agent.state == WorkflowAgentStatus::Done),
-            "both workflow agents should finish; final snapshot: {last:?}"
-        );
-        assert!(last.total_tokens > 0, "usage folded into final snapshot");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_resume_reports_aggregate_turn_usage() {
-        if !live_claude_tests_enabled() {
-            skip_live_claude_test();
-            return;
-        }
-
-        let first = run_live_claude_turn(
-            "Briefly explain what a Rust borrow checker does.",
-            "high",
-            None,
-            false,
-        )
-        .await;
-        let first_summary = match first {
-            TurnOutcome::Completed { summary, .. } => summary,
-            TurnOutcome::Failed { error, .. } => {
-                panic!("Initial live Claude resume turn failed: {error}");
-            }
-            TurnOutcome::Cancelled { .. } => {
-                panic!("Initial live Claude resume turn was unexpectedly cancelled");
-            }
-        };
-
-        let session_id = first_summary
-            .session_id
-            .clone()
-            .filter(|id| !id.trim().is_empty())
-            .expect("Expected Claude to return a non-empty session_id for resume test");
-
-        let second = run_live_claude_turn(
-            "Now in one sentence summarize your previous answer.",
-            "high",
-            Some(session_id.clone()),
-            false,
-        )
-        .await;
-        let second_summary = match second {
-            TurnOutcome::Completed { summary, .. } => summary,
-            TurnOutcome::Failed { error, .. } => {
-                panic!("Follow-up live Claude resume turn failed: {error}");
-            }
-            TurnOutcome::Cancelled { .. } => {
-                panic!("Follow-up live Claude resume turn was unexpectedly cancelled");
-            }
-        };
-
-        assert_eq!(
-            second_summary.session_id.as_deref(),
-            Some(session_id.as_str()),
-            "Expected resumed turn to keep the same Claude session_id"
-        );
-
-        assert!(
-            !second_summary.best_text().trim().is_empty(),
-            "Expected non-empty assistant text on resumed Claude turn at high effort"
-        );
-
-        let request_total = second_summary
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.get("total_tokens"))
-            .and_then(Value::as_u64)
-            .expect("Expected per-request usage.total_tokens on resumed turn");
-        let turn_total = second_summary
-            .result_turn_usage
-            .as_ref()
-            .and_then(|usage| usage.get("total_tokens"))
-            .and_then(Value::as_u64)
-            .expect("Expected aggregate turn usage.total_tokens from result event");
-        eprintln!(
-            "LIVE_CLAUDE_TOKEN_USAGE first_request={} first_turn={} second_request={} second_turn={}",
-            first_summary
-                .usage
-                .as_ref()
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".to_string()),
-            first_summary
-                .result_turn_usage
-                .as_ref()
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".to_string()),
-            second_summary
-                .usage
-                .as_ref()
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".to_string()),
-            second_summary
-                .result_turn_usage
-                .as_ref()
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".to_string())
-        );
-        assert!(
-            turn_total >= request_total,
-            "Expected aggregate turn usage ({turn_total}) to be >= latest request usage ({request_total})"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_tool_turn_emits_stream_end_before_tool_events() {
-        if !live_claude_tests_enabled() {
-            skip_live_claude_test();
-            return;
-        }
-
-        let workspace_root = live_test_workspace_root();
-        let marker = format!("claude-live-tool-marker-{}", unix_now_ms());
-        let file_name = format!(".tyde-live-tool-order-{}.txt", unix_now_ms());
-        let file_path = Path::new(&workspace_root).join(&file_name);
-        tokio_fs::write(&file_path, format!("{marker}\n"))
-            .await
-            .expect("write live tool-order fixture file");
-
-        let prompt = format!(
-            "Use the Read tool exactly once to read the file `{file_name}` in the current working directory. Do not guess or answer from memory. After the tool finishes, reply with only the exact file contents."
-        );
-        let events = collect_live_claude_events(&prompt, workspace_root.clone()).await;
-        let _ = tokio_fs::remove_file(&file_path).await;
-        let events_dump = format_live_events(&events);
-
-        let stream_end_index = events
-            .iter()
-            .position(|event| {
-                event_kind(event) == Some("StreamEnd")
-                    && !stream_end_tool_call_ids(event).is_empty()
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "Expected a StreamEnd with tool_calls in live Claude tool turn. Events:\n{events_dump}"
-                )
-            });
-        let tool_call_ids = stream_end_tool_call_ids(&events[stream_end_index]);
-        let first_tool_call_id = tool_call_ids
-            .first()
-            .cloned()
-            .expect("Expected at least one live tool call id");
-        let tool_request_index = events
-            .iter()
-            .position(|event| {
-                event_kind(event) == Some("ToolRequest")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        == Some(first_tool_call_id.as_str())
-            })
-            .unwrap_or_else(|| {
-                panic!("Expected ToolRequest for live Claude tool call. Events:\n{events_dump}")
-            });
-        let completion_index = events
-            .iter()
-            .position(|event| {
-                event_kind(event) == Some("ToolExecutionCompleted")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        == Some(first_tool_call_id.as_str())
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "Expected ToolExecutionCompleted for live Claude tool call. Events:\n{events_dump}"
-                )
-            });
-        let next_stream_start_index = events
-            .iter()
-            .enumerate()
-            .skip(completion_index + 1)
-            .find_map(|(index, event)| {
-                (event_kind(event) == Some("StreamStart")).then_some(index)
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "Expected a follow-up StreamStart after live tool completion. Events:\n{events_dump}"
-                )
-            });
-
-        assert!(
-            stream_end_index < tool_request_index,
-            "Expected StreamEnd with tool_calls to occur before ToolRequest. Events:\n{events_dump}"
-        );
-        assert!(
-            tool_request_index < completion_index,
-            "Expected ToolRequest to occur before ToolExecutionCompleted. Events:\n{events_dump}"
-        );
-        assert!(
-            completion_index < next_stream_start_index,
-            "Expected next StreamStart after ToolExecutionCompleted. Events:\n{events_dump}"
-        );
-    }
-
-    /// Replays the frame shape captured from Claude Code 2.1.220 when a
-    /// background task completes: the launching turn's `result`, then the
-    /// task's terminal notification, then a full `init` + assistant +
-    /// `result` sequence the CLI produced on its own initiative. Unlike the
-    /// live test this runs inside `./dev.sh check`, which is what the original
-    /// regression escaped through — its live regression test was `#[ignore]`d
-    /// and therefore invisible to both mandatory gates.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fake_background_task_completion_adopts_a_wake_turn() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-wake.py");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-wake"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-def turn(message_id, text, output_tokens, turn_usage):
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": message_id, "model": "fake-model", "usage": {"input_tokens": 7}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
-    })
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{"type": "text", "text": text}],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "content_block_stop", "index": 0},
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_delta",
-            "usage": {"input_tokens": 7, "output_tokens": output_tokens},
-        },
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    # Claude reports `result` usage per turn, not session-cumulative (verified
-    # against a captured 2.1.220 stream, where the second turn's input_tokens
-    # is smaller than the first's). Tyde accumulates it into the session total.
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "session_id": session_id,
-        "result": text,
-        "usage": turn_usage,
-    })
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        value = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    emit({
-        "type": "system",
-        "subtype": "task_started",
-        "session_id": session_id,
-        "task_id": "waketask",
-        "task_type": "local_bash",
-        "tool_use_id": "toolu_wake_probe",
-    })
-    turn("launch-msg", "LAUNCHED", 3,
-         {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
-    # The launching turn is over. The task completing is what makes the real
-    # CLI wake the model, so the notification precedes the unsolicited turn.
-    emit({
-        "type": "system",
-        "subtype": "task_notification",
-        "session_id": session_id,
-        "task_id": "waketask",
-        "tool_use_id": "toolu_wake_probe",
-        "status": "completed",
-        "summary": 'Background command "probe" completed (exit code 0)',
-    })
-    turn("wake-msg", "the background command finished", 11,
-         {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18})
-"#,
-        )
-        .expect("write fake claude");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
-        // the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "launch a background command".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send launching turn");
-
-        let mut events: Vec<Value> = Vec::new();
-        let collected = timeout(Duration::from_secs(20), async {
-            let mut completed_turns = 0usize;
-            loop {
-                let event = rx
-                    .recv()
-                    .await
-                    .expect("Claude event channel should stay open");
-                if event_kind(&event) == Some("StreamEnd") {
-                    completed_turns += 1;
-                }
-                let idle = event_kind(&event) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false);
-                events.push(event);
-                if idle && completed_turns == 2 {
-                    return;
-                }
-            }
-        })
-        .await;
-
-        unsafe {
-            match previous_claude_bin {
-                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
-                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
-            }
-        }
-
-        let dump = format_live_events(&events);
-        collected.unwrap_or_else(|_| {
-            panic!("the wake turn never reached the client. Events:\n{dump}");
-        });
-
-        let stream_ends: Vec<&Value> = events
-            .iter()
-            .filter(|event| event_kind(event) == Some("StreamEnd"))
-            .collect();
-        assert_eq!(
-            stream_ends.len(),
-            2,
-            "expected the launching turn and the wake turn. Events:\n{dump}"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("TypingStatusChanged")
-                        && event.get("data").and_then(Value::as_bool) == Some(false)
-                })
-                .count(),
-            2,
-            "terminal background work ends one active interval and the CLI wake owns another. \
-             Events:\n{dump}"
-        );
-        assert_eq!(
-            stream_end_message(stream_ends[0])
-                .get("content")
-                .and_then(Value::as_str),
-            Some("LAUNCHED")
-        );
-        assert_eq!(
-            stream_end_message(stream_ends[1])
-                .get("content")
-                .and_then(Value::as_str),
-            Some("the background command finished"),
-            "the wake turn must carry the model's own content. Events:\n{dump}"
-        );
-        // The wake turn's tokens are real spend and belong to a real turn;
-        // dropping the turn used to drop its usage silently too.
-        assert_eq!(
-            stream_end_turn_total_tokens(stream_ends[0]),
-            Some(10),
-            "the launching turn's own usage. Events:\n{dump}"
-        );
-        assert_eq!(
-            stream_end_turn_total_tokens(stream_ends[1]),
-            Some(18),
-            "the wake turn must report its own usage. Events:\n{dump}"
-        );
-        // And it must land in the session total exactly once — a wake turn
-        // counted twice, or not at all, is invisible in the footer.
-        assert_eq!(
-            stream_end_cumulative_total_tokens(stream_ends[1]),
-            Some(28),
-            "the wake turn must accumulate into the session total exactly once. \
-             Events:\n{dump}"
-        );
-    }
-
-    /// The reason a wake turn must be adopted as a *turn*, rather than
-    /// summarized into a progress notice, is that the model can act in it. A
-    /// wake turn that renders text but silently swallows its tool calls would
-    /// leave the agent doing work the transcript never shows.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_wake_turn_can_call_tools() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-wake-tool.py");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-wake-tool"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-
-TOOL = "toolu_wake_followup"
-INPUT = {"command": "cat /tmp/probe.out", "description": "read the probe output"}
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-def launching_turn():
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "launch-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{"type": "text", "text": "LAUNCHED"}],
-        },
-    })
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "session_id": session_id,
-        "result": "LAUNCHED",
-        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
-    })
-
-def wake_turn_with_tool():
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "message_start",
-            "message": {"id": "wake-msg", "model": "fake-model", "usage": {"input_tokens": 5}},
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "tool_use",
-                "id": TOOL,
-                "name": "Bash",
-                "input": {},
-                "caller": {"type": "direct"},
-            },
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": json.dumps(INPUT)},
-        },
-    })
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "wake-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{
-                "type": "tool_use",
-                "id": TOOL,
-                "name": "Bash",
-                "input": INPUT,
-                "caller": {"type": "direct"},
-            }],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "content_block_stop", "index": 0},
-    })
-    # The CLI runs its own tools and reports the result back on the stream.
-    emit({
-        "type": "user",
-        "session_id": session_id,
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": TOOL,
-                "content": "PROBE_OUTPUT",
-                "is_error": False,
-            }],
-        },
-    })
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "message_delta", "usage": {"input_tokens": 5, "output_tokens": 6}},
-    })
-    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
-    emit({
-        "type": "result",
-        "subtype": "success",
-        "session_id": session_id,
-        "result": "read the probe output",
-        "usage": {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
-    })
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        value = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    emit({
-        "type": "system",
-        "subtype": "task_started",
-        "session_id": session_id,
-        "task_id": "waketask",
-        "task_type": "local_bash",
-        "tool_use_id": "toolu_wake_probe",
-    })
-    launching_turn()
-    emit({
-        "type": "system",
-        "subtype": "task_notification",
-        "session_id": session_id,
-        "task_id": "waketask",
-        "tool_use_id": "toolu_wake_probe",
-        "status": "completed",
-        "summary": 'Background command "probe" completed (exit code 0)',
-    })
-    wake_turn_with_tool()
-"#,
-        )
-        .expect("write fake claude");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
-        // the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "launch a background command".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send launching turn");
-
-        let mut events: Vec<Value> = Vec::new();
-        let collected = timeout(Duration::from_secs(20), async {
-            let mut saw_wake_tool_completion = false;
-            loop {
-                let event = rx
-                    .recv()
-                    .await
-                    .expect("Claude event channel should stay open");
-                saw_wake_tool_completion |= event_kind(&event) == Some("ToolExecutionCompleted")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        == Some("toolu_wake_followup");
-                let idle = event_kind(&event) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false);
-                events.push(event);
-                if idle && saw_wake_tool_completion {
-                    return;
-                }
-            }
-        })
-        .await;
-
-        unsafe {
-            match previous_claude_bin {
-                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
-                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
-            }
-        }
-
-        let dump = format_live_events(&events);
-        collected.unwrap_or_else(|_| {
-            panic!("the wake turn never reached the client. Events:\n{dump}");
-        });
-
-        let tool_request = events
-            .iter()
-            .find(|event| {
-                event_kind(event) == Some("ToolRequest")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        == Some("toolu_wake_followup")
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "the wake turn's tool call never reached the client — adopting the turn \
-                     is pointless if the model's actions are invisible. Events:\n{dump}"
-                );
-            });
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_name"))
-                .and_then(Value::as_str),
-            Some("Bash")
-        );
-        assert!(
-            events.iter().any(|event| {
-                event_kind(event) == Some("ToolExecutionCompleted")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        == Some("toolu_wake_followup")
-            }),
-            "the wake turn's tool must reach a terminal state. Events:\n{dump}"
-        );
-    }
-
-    /// The wake token is the necessary condition: turn-start-shaped frames
-    /// trailing a finished turn, with no completion to justify them, must not
-    /// open a phantom turn.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fake_stray_frames_after_result_do_not_open_a_turn() {
-        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let fake = workspace.path().join("fake-claude-stray.py");
-        std::fs::write(
-            &fake,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-args = sys.argv[1:]
-session_id = "fake-stray"
-if "--session-id" in args:
-    session_id = args[args.index("--session-id") + 1]
-elif "--resume" in args:
-    session_id = args[args.index("--resume") + 1]
-
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        value = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if value.get("type") == "control_request":
-        request = value.get("request", {})
-        request_id = value.get("request_id") or request.get("request_id")
-        if request.get("subtype") == "initialize":
-            emit({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": {},
-                },
-            })
-        continue
-    if value.get("type") != "user":
-        continue
-    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "only-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{"type": "text", "text": "ANSWER"}],
-        },
-    })
-    emit({"type": "result", "subtype": "success", "session_id": session_id, "result": "ANSWER"})
-    # No task completed, so nothing justifies a new turn. These trail the
-    # finished turn and must be dropped, not adopted.
-    emit({
-        "type": "stream_event",
-        "session_id": session_id,
-        "event": {"type": "message_stop"},
-    })
-    emit({
-        "type": "assistant",
-        "session_id": session_id,
-        "message": {
-            "id": "stray-msg",
-            "type": "message",
-            "role": "assistant",
-            "model": "fake-model",
-            "content": [{"type": "text", "text": "STRAY"}],
-        },
-    })
-"#,
-        )
-        .expect("write fake claude");
-        make_executable(&fake);
-
-        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
-        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
-        // the process-global environment points at the fake binary.
-        unsafe {
-            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
-        }
-
-        let (session, mut rx) = ClaudeSession::spawn(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            None,
-            ToolPolicy::Unrestricted,
-            BackendAccessMode::Unrestricted,
-        )
-        .await
-        .expect("spawn fake Claude session");
-        session
-            .inner
-            .ensure_process_ready()
-            .await
-            .expect("initialize persistent fake Claude process");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "answer once".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send the only turn");
-
-        let mut events: Vec<Value> = Vec::new();
-        let _ = timeout(Duration::from_secs(5), async {
-            loop {
-                let Some(event) = rx.recv().await else {
-                    return;
-                };
-                events.push(event);
-            }
-        })
-        .await;
-
-        unsafe {
-            match previous_claude_bin {
-                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
-                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
-            }
-        }
-
-        let dump = format_live_events(&events);
-        let stream_ends = events
-            .iter()
-            .filter(|event| event_kind(event) == Some("StreamEnd"))
-            .count();
-        assert_eq!(
-            stream_ends, 1,
-            "stray frames after a result must not open a second turn. Events:\n{dump}"
-        );
-        assert!(
-            !events.iter().any(|event| {
-                event_kind(event) == Some("StreamEnd")
-                    && stream_end_message(event)
-                        .get("content")
-                        .and_then(Value::as_str)
-                        == Some("STRAY")
-            }),
-            "stray content must never reach the client. Events:\n{dump}"
-        );
-    }
-
-    /// A wake arriving after shutdown must not open a turn — the guard that
-    /// `bd390355` added and that restoring the pre-`bd390355` implementation
-    /// would have silently reverted.
-    #[tokio::test]
-    async fn closing_backend_refuses_a_cli_initiated_turn() {
-        let (inner, mut rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            state.closing = true;
-        }
-
-        assert!(
-            inner.begin_cli_initiated_turn().await.is_none(),
-            "a closing backend must not open a CLI-initiated turn"
-        );
-        assert!(
-            inner.state.lock().await.active_turn.is_none(),
-            "no turn may be installed by a refused wake"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "a refused wake must emit nothing to the client"
-        );
-    }
-
-    /// An already-active turn owns the stream; a wake must not open a second
-    /// one on top of it.
-    #[tokio::test]
-    async fn active_turn_blocks_a_cli_initiated_turn() {
-        let (inner, _rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            let (outcome_tx, _outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: 7,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-
-        assert!(inner.begin_cli_initiated_turn().await.is_none());
-        assert_eq!(
-            inner.state.lock().await.active_turn.as_ref().map(|a| a.id),
-            Some(7),
-            "the live turn must be left untouched"
-        );
-    }
-
-    /// A turn that has already handed off its outcome is finished even though
-    /// its finalizer has not cleared it yet. Frames arriving in that window
-    /// must not be consumed against the closed turn's message id.
-    #[tokio::test]
-    async fn a_turn_that_handed_off_its_outcome_stops_accepting_frames() {
-        let (inner, _rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            let (outcome_tx, _outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: 11,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-        let mut turn_state = PersistentStdoutTurnState::default();
-        assert_eq!(
-            prepare_persistent_stdout_turn(&inner, &mut turn_state)
-                .await
-                .map(|(id, _, _)| id),
-            Some(11),
-            "a live turn still owns the stream"
-        );
-
-        inner
-            .complete_active_turn_with_outcome(
-                11,
-                TurnOutcome::Completed {
-                    summary: ClaudeStdoutSummary::default(),
-                    model_hint: None,
-                },
-            )
-            .await;
-
-        assert!(
-            prepare_persistent_stdout_turn(&inner, &mut turn_state)
-                .await
-                .is_none(),
-            "a turn that produced its result must not absorb further frames"
-        );
-    }
-
-    #[tokio::test]
-    async fn active_turn_frames_do_not_consume_a_pending_wake() {
-        let (inner, _rx) = make_test_inner();
-        let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            let (outcome_tx, _outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: 12,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
-        inner.arm_cli_wake();
-
-        let mut turn_state = PersistentStdoutTurnState::default();
-        assert!(
-            prepare_persistent_stdout_turn(&inner, &mut turn_state)
-                .await
-                .is_some()
-        );
-        assert!(
-            inner.has_pending_cli_wake(),
-            "a task notification can precede the launching turn's remaining frames"
-        );
-    }
-
-    #[test]
-    fn idle_is_suppressed_until_provider_work_is_quiescent() {
-        let (inner, mut rx) = make_test_inner();
-        inner.emit_typing_status(true);
-        let _ = rx.try_recv().expect("active marker");
-
-        inner.set_background_work_active(true);
-        inner.emit_idle_if_quiescent();
-        assert!(rx.try_recv().is_err());
-
-        inner.set_background_work_active(false);
-        inner.arm_cli_wake();
-        inner.emit_idle_if_quiescent();
-        let idle = rx
-            .try_recv()
-            .expect("a possible future wake is not active provider work");
-        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
-        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
-
-        assert!(inner.take_pending_cli_wake());
-        inner.emit_idle_if_quiescent();
-        assert!(rx.try_recv().is_err(), "idle is not emitted twice");
-    }
-
-    #[test]
-    fn is_cli_turn_start_event_classifies_frames() {
-        // Fresh turn content opens a CLI-initiated turn.
-        assert!(is_cli_turn_start_event(&json!({"type": "assistant"})));
-        assert!(is_cli_turn_start_event(
-            &json!({"type": "system", "subtype": "init"})
-        ));
-        assert!(is_cli_turn_start_event(&json!({"type": "stream_event"})));
-        assert!(is_cli_turn_start_event(&json!({"type": "message_start"})));
-
-        // Terminal / non-content frames must NOT spawn an empty turn.
-        assert!(!is_cli_turn_start_event(&json!({"type": "result"})));
-        assert!(!is_cli_turn_start_event(&json!({"type": "user"})));
-        assert!(!is_cli_turn_start_event(
-            &json!({"type": "system", "subtype": "task_notification"})
-        ));
-        assert!(!is_cli_turn_start_event(
-            &json!({"type": "rate_limit_event"})
-        ));
-    }
-
-    /// The wake token is what separates a real CLI wake from a stray frame
-    /// trailing a finished turn, so what arms it is load-bearing.
-    #[test]
-    fn only_root_owned_task_notifications_arm_the_cli_wake() {
-        assert!(claude_frame_arms_cli_wake(&json!({
-            "type": "system",
-            "subtype": "task_notification",
-            "task_id": "bmv4kco4r",
-            "status": "completed",
-        })));
-        // An unrecognized status must still arm: failing closed here costs the
-        // whole wake turn, which is the bug this exists to prevent.
-        assert!(claude_frame_arms_cli_wake(&json!({
-            "type": "system",
-            "subtype": "task_notification",
-            "status": "some-future-status",
-        })));
-
-        // A task owned by a sub-agent wakes that sub-agent's stream, not the
-        // root — in all three shapes the parent id is carried in.
-        for parented in [
-            json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "status": "completed",
-                "parent_tool_use_id": "toolu_parent",
-            }),
-            json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "status": "completed",
-                "data": { "parent_tool_use_id": "toolu_parent" },
-            }),
-            json!({
-                "type": "system",
-                "subtype": "task_notification",
-                "status": "completed",
-                "message": { "parent_tool_use_id": "toolu_parent" },
-            }),
-        ] {
-            assert!(
-                !claude_frame_arms_cli_wake(&parented),
-                "sub-agent-owned notification must not arm the root wake: {parented}"
-            );
-        }
-
-        // Non-terminal task frames are not wake triggers.
-        assert!(!claude_frame_arms_cli_wake(&json!({
-            "type": "system",
-            "subtype": "task_started",
-            "task_type": "local_bash",
-        })));
-        assert!(!claude_frame_arms_cli_wake(&json!({
-            "type": "system",
-            "subtype": "init",
-        })));
-    }
-
-    /// A dropped wake is ~8 frames; warning per frame would bury the signal.
-    #[test]
-    fn dropped_turn_start_warns_once_per_burst() {
-        let mut log = DroppedTurnStartLog::default();
-        log.observe(&json!({"type": "system", "subtype": "task_notification"}));
-        log.observe(&json!({"type": "system", "subtype": "init"}));
-        assert_eq!(log.recent.len(), 2);
-
-        log.warn_once_on_dropped_turn_start(&json!({"type": "system", "subtype": "init"}));
-        assert!(log.warned);
-        log.warn_once_on_dropped_turn_start(&json!({"type": "assistant"}));
-        assert!(
-            log.warned,
-            "the burst must stay warned, not re-warn per frame"
-        );
-
-        // A turn-terminal frame ends the burst and re-arms the warning.
-        log.observe(&json!({"type": "result"}));
-        assert!(!log.warned);
-        assert!(log.recent.is_empty());
-    }
-
-    /// Haiku is enough to prove the wake path: the assertion is about which
-    /// frames Tyde materializes, not about reasoning quality.
-    const LIVE_WAKE_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
-
-    fn live_background_task_status(event: &Value) -> Option<BackgroundTaskStatus> {
-        if event_kind(event) != Some("ToolProgress") {
-            return None;
-        }
-        let data: ToolProgressData = serde_json::from_value(event.get("data").cloned()?).ok()?;
-        match data.update {
-            ToolProgressUpdate::BackgroundTask(state) => Some(state.status),
-            _ => None,
-        }
-    }
-
-    /// When a background task finishes, the CLI wakes the model and runs a
-    /// *new* turn that no user message initiated. That wake turn is the only
-    /// mechanism by which the model can act on a background result at all —
-    /// it can call tools, not just narrate — so Tyde has to materialize it as
-    /// a turn instead of dropping it for lack of an owner.
-    #[tokio::test]
-    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_background_task_completion_wakes_a_new_turn() {
-        if !live_claude_tests_enabled() {
-            skip_live_claude_test();
-            return;
-        }
-
-        let (inner, mut rx) = make_live_test_inner(live_test_workspace_root());
-        {
-            let mut state = inner.state.lock().await;
-            state.model = Some(LIVE_WAKE_PROBE_MODEL.to_string());
-            state.effort = None;
-        }
-
-        let prompt = "Use the Bash tool exactly once, with run_in_background set to true, to \
-            run `sleep 20 && echo TYDE_WAKE_PROBE_DONE`. Do not wait for it, do not poll it, \
-            and do not read its output. Immediately reply with the single word LAUNCHED and \
-            end your turn.";
-        inner.clone().start_turn(prompt.to_string(), None).await;
-
-        let mut events: Vec<Value> = Vec::new();
-        let mut first_turn_idle: Option<usize> = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let Ok(Some(event)) = timeout(remaining, rx.recv()).await else {
-                break;
-            };
-            let kind = event_kind(&event).map(str::to_string);
-            let idle = kind.as_deref() == Some("TypingStatusChanged")
-                && event.get("data").and_then(Value::as_bool) == Some(false);
-            events.push(event);
-            if idle && first_turn_idle.is_none() {
-                first_turn_idle = Some(events.len() - 1);
-                continue;
-            }
-            // The wake turn has landed once a second assistant message closes.
-            if first_turn_idle.is_some() && kind.as_deref() == Some("StreamEnd") {
-                break;
-            }
-        }
-
-        let dump = format_live_events(&events);
-        let first_turn_idle = first_turn_idle.unwrap_or_else(|| {
-            panic!("The launching turn never went idle. Events:\n{dump}");
-        });
-
-        // Precondition, not the claim under test: if the model ran the command
-        // in the foreground there is no background completion to wake on, and
-        // a failure below would say nothing about Tyde.
-        assert!(
-            events
-                .iter()
-                .any(|event| live_background_task_status(event).is_some()),
-            "Precondition failed: the model never launched a background task, so no wake \
-             could occur. Events:\n{dump}"
-        );
-
-        let wake_start = events
-            .iter()
-            .enumerate()
-            .skip(first_turn_idle + 1)
-            .find(|(_, event)| event_kind(event) == Some("StreamStart"))
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| {
-                panic!(
-                    "The background task completed and the CLI woke the model, but Tyde \
-                     materialized no turn for it: no StreamStart follows the launching turn. \
-                     Events:\n{dump}"
-                );
-            });
-        let wake_end = events
-            .iter()
-            .enumerate()
-            .skip(wake_start + 1)
-            .find(|(_, event)| event_kind(event) == Some("StreamEnd"))
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| {
-                panic!("The wake turn opened but never closed. Events:\n{dump}");
-            });
-
-        let wake_text = stream_end_message(&events[wake_end])
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            !wake_text.trim().is_empty(),
-            "The wake turn produced an empty assistant message. Events:\n{dump}"
-        );
-    }
-
-    #[test]
-    fn parse_claude_session_replay_restores_result_usage_and_history_bytes() {
-        let contents = format!(
-            "{}\n{}\n{}\n",
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{ "type": "text", "text": "Question" }]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "Answer" }]
-                }
-            }),
-            json!({
-                "type": "result",
-                "usage": {
-                    "input_tokens": 1200,
-                    "output_tokens": 80,
-                    "total_tokens": 1280,
-                    "cache_read_input_tokens": 5000
-                }
-            })
-        );
-
-        let replay = parse_claude_session_replay(&contents);
-        assert_eq!(replay.items.len(), 2);
-        assert_eq!(
-            replay.conversation_bytes_total,
-            "Question".len() as u64 + "Answer".len() as u64
-        );
-        let usage = replay
-            .cumulative_usage
-            .as_ref()
-            .expect("last cumulative usage");
-        assert_eq!(
-            usage.get("input_tokens").and_then(Value::as_u64),
-            Some(1200)
-        );
-        assert_eq!(
-            usage.get("cached_prompt_tokens").and_then(Value::as_u64),
-            Some(5000)
-        );
-    }
-
-    #[test]
-    fn replay_filters_compaction_bookkeeping_but_keeps_ordered_boundary() {
-        let contents = [
-            json!({"type":"user","message":{"role":"user","content":"before"}}),
-            json!({"type":"user","isMeta":true,"message":{"role":"user","content":"hidden"}}),
-            json!({"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"}}),
-            json!({
-                "type":"system",
-                "subtype":"compact_boundary",
-                "uuid":"boundary-1",
-                "sessionId":"session-1",
-                "compactMetadata":{"trigger":"manual","preTokens":100,"postTokens":20}
-            }),
-            json!({"type":"assistant","isCompactSummary":true,"message":{"role":"assistant","content":"secret summary"}}),
-            json!({"type":"assistant","message":{"role":"assistant","content":"after"}}),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let replay = parse_claude_session_replay(&contents);
-        assert_eq!(replay.items.len(), 3);
-        assert!(matches!(
-            &replay.items[1],
-            ClaudeHistoryReplayItem::Compaction(observed)
-                if observed.observation_id.0 == "claude:session-1:boundary-1"
-                    && observed.metrics.after_tokens == Some(20)
-        ));
-    }
-
-    #[test]
-    fn compaction_capability_uses_advertised_command_not_version() {
-        for version in [
-            None,
-            Some("999.0.0"),
-            Some("999.0.0-nightly.1"),
-            Some("development"),
-            Some("malformed version output"),
-        ] {
-            let capability = claude_compaction_capability(Some(true), version);
-            assert!(matches!(
-                capability.availability,
-                BackendCompactionAvailability::Native {
-                    mechanism: BackendCompactionMechanism::InterceptedTextCommand
-                }
-            ));
-            assert_eq!(
-                capability.provider_version.as_deref(),
-                version.map(str::trim)
-            );
-        }
-        assert!(matches!(
-            claude_compaction_capability(Some(false), Some("999.0.0")).availability,
-            BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::ProviderDisabledCommand
-            }
-        ));
-        assert!(matches!(
-            claude_compaction_capability(None, Some("999.0.0")).availability,
-            BackendCompactionAvailability::Unknown {
-                reason: BackendCompactionUnknownReason::ProcessNotInitialized
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn installed_version_enables_capability_after_initialize_before_any_turn() {
-        let (inner, _events) = make_test_inner();
-        let session = ClaudeSession {
-            inner: Arc::new(inner),
-        };
-        session
-            .seed_installed_provider_version(Some("2.1.220 (Claude Code)".to_owned()))
-            .await;
-        session
-            .inner
-            .configure_capacity_from_initialize(&json!({
-                "commands": [{"name": "compact"}],
-                "account": {}
-            }))
-            .await;
-
-        let capability = session.command_handle().compaction_capability();
-        assert!(matches!(
-            capability.availability,
-            BackendCompactionAvailability::Native { .. }
-        ));
-        assert_eq!(
-            capability.provider_version.as_deref(),
-            Some("2.1.220 (Claude Code)")
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_focus_and_closed_backend_do_not_authorize_fallback() {
-        let request = |focus: Option<String>| BackendCompactionRequest {
-            operation_id: protocol::CompactionOperationId("compact-policy".to_owned()),
-            trigger: CompactionTrigger::UserRequested,
-            focus,
-            transcript_authoritative: true,
-        };
-        let (inner, _events) = make_test_inner();
-        let inner = Arc::new(inner);
-        let invalid = Arc::clone(&inner)
-            .begin_compaction(request(Some("x".repeat(4_097))))
-            .await;
-        assert!(matches!(
-            invalid,
-            BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::InvalidFocus,
-                fallback_safe: false,
-            }
-        ));
-
-        inner.state.lock().await.closing = true;
-        let closed = Arc::clone(&inner).begin_compaction(request(None)).await;
-        assert!(matches!(
-            closed,
-            BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                fallback_safe: false,
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn manual_boundary_plus_terminal_succeeds_without_typed_success() {
-        let (inner, mut events) = make_test_inner();
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        let (timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.session_id = Some("session-compact".to_string());
-            state.active_turn = Some(ActiveTurn {
-                id: 77,
-                owner: ClaudeTurnOwner::Compaction(protocol::CompactionOperationId(
-                    "compact-op".to_string(),
-                )),
-                outcome_tx: None,
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            let process_generation = state.process_generation;
-            state.pending_compaction = Some(PendingClaudeCompaction {
-                request: BackendCompactionRequest {
-                    operation_id: protocol::CompactionOperationId("compact-op".to_string()),
-                    trigger: CompactionTrigger::UserRequested,
-                    focus: None,
-                    transcript_authoritative: true,
-                },
-                terminal_tx: Some(terminal_tx),
-                timeout_cancel_tx: Some(timeout_cancel_tx),
-                turn_id: 77,
-                process_generation,
-                dispatched_at: std::time::Instant::now(),
-                write_completed: true,
-                boundary: None,
-                compact_result: None,
-                compact_error: None,
-                terminal_result_seen: false,
-                result_is_error: false,
-                diagnostic: None,
-            });
-        }
-        inner
-            .observe_compaction_frame(
-                77,
-                &json!({
-                    "type":"system",
-                    "subtype":"compact_boundary",
-                    "uuid":"boundary-compact",
-                    "session_id":"session-compact",
-                    "compact_metadata":{"trigger":"manual","pre_tokens":100,"post_tokens":20}
-                }),
-            )
-            .await;
-        inner
-            .observe_compaction_frame(
-                77,
-                &json!({"type":"result","session_id":"session-compact","is_error":false}),
-            )
-            .await;
-        let returned = inner
-            .finish_compaction(
-                77,
-                BackendCompactionFailureKind::ProtocolViolation,
-                None,
-                false,
-            )
-            .await
-            .expect("correlated result");
-        let terminal = terminal_rx.await.expect("terminal oneshot");
-        timeout_cancel_rx
-            .await
-            .expect("terminal settlement must cancel its timeout task");
-        assert_eq!(returned, terminal);
-        assert!(terminal.outcome.is_ok());
-        assert_eq!(terminal.mutation, BackendCompactionMutationState::Completed);
-        assert!(
-            events.try_recv().is_err(),
-            "structured Claude compaction must emit no public stream lifecycle"
-        );
-    }
-
-    #[test]
-    fn parse_claude_session_replay_sums_unique_model_requests_once() {
-        let first = json!({
-            "type": "assistant",
-            "message": {
-                "id": "msg-first",
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "Working" }],
-                "usage": {
-                    "input_tokens": 2,
-                    "output_tokens": 10,
-                    "cache_read_input_tokens": 1_000,
-                    "cache_creation_input_tokens": 200,
-                    "reasoning_tokens": 3
-                }
-            }
-        });
-        let duplicate = json!({
-            "type": "assistant",
-            "message": {
-                "id": "msg-first",
-                "role": "assistant",
-                "content": [{ "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a"} }],
-                "usage": first["message"]["usage"].clone()
-            }
-        });
-        let second = json!({
-            "type": "assistant",
-            "message": {
-                "id": "msg-second",
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "Done" }],
-                "usage": {
-                    "input_tokens": 4,
-                    "output_tokens": 20,
-                    "cache_read_input_tokens": 2_000,
-                    "cache_creation_input_tokens": 300,
-                    "reasoning_tokens": 5
-                }
-            }
-        });
-        let replay = parse_claude_session_replay(&format!("{first}\n{duplicate}\n{second}\n"));
-        let usage = replay.cumulative_usage.expect("reconstructed usage");
-
-        assert_eq!(usage_value_u64(&usage, "input_tokens"), 6);
-        assert_eq!(usage_value_u64(&usage, "output_tokens"), 30);
-        assert_eq!(usage_value_u64(&usage, "total_tokens"), 36);
-        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 3_000);
-        assert_eq!(usage_value_u64(&usage, "cache_creation_input_tokens"), 500);
-        assert_eq!(usage_value_u64(&usage, "reasoning_tokens"), 8);
-        assert!(replay.cumulative_usage_complete);
-    }
-
-    #[test]
-    fn parse_claude_session_replay_combines_result_and_assistant_only_invocations() {
-        let contents = [
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "result-backed-request",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "first" }],
-                    "usage": { "input_tokens": 2, "output_tokens": 3 }
-                }
-            }),
-            json!({
-                "type": "result",
-                "subtype": "success",
-                "usage": { "input_tokens": 4, "output_tokens": 6 }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "cancelled-request",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "partial" }],
-                    "usage": {
-                        "input_tokens": 7,
-                        "output_tokens": 13,
-                        "cache_read_input_tokens": 100,
-                        "reasoning_tokens": 5
-                    }
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "id": "cancelled-request",
-                    "role": "assistant",
-                    "content": [{ "type": "tool_use", "id": "toolu_cancel", "name": "Read", "input": {"file_path": "a"} }],
-                    "usage": {
-                        "input_tokens": 7,
-                        "output_tokens": 13,
-                        "cache_read_input_tokens": 100,
-                        "reasoning_tokens": 5
-                    }
-                }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let replay = parse_claude_session_replay(&contents);
-        let usage = replay.cumulative_usage.expect("mixed replay usage");
-        assert!(replay.cumulative_usage_complete);
-        assert_eq!(usage_value_u64(&usage, "input_tokens"), 11);
-        assert_eq!(usage_value_u64(&usage, "output_tokens"), 19);
-        assert_eq!(usage_value_u64(&usage, "total_tokens"), 30);
-        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 100);
-        assert_eq!(usage_value_u64(&usage, "reasoning_tokens"), 5);
-    }
-
-    #[test]
-    fn replay_user_prompt_boundary_commits_assistant_only_before_later_result() {
-        let assistant_a = json!({
-            "type": "assistant",
-            "message": {
-                "id": "request-a",
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "cancelled A" }],
-                "usage": {
-                    "input_tokens": 7,
-                    "output_tokens": 13,
-                    "cache_read_input_tokens": 100
-                }
-            }
-        });
-        let assistant_b = json!({
-            "type": "assistant",
-            "message": {
-                "id": "request-b",
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "B" }],
-                "usage": { "input_tokens": 2, "output_tokens": 3 }
-            }
-        });
-        let contents = [
-            json!({
-                "type": "user",
-                "uuid": "user-a",
-                "isSidechain": false,
-                "promptId": "prompt-a",
-                "message": { "role": "user", "content": [{ "type": "text", "text": "A" }] }
-            }),
-            assistant_a.clone(),
-            assistant_a,
-            json!({
-                "type": "user",
-                "uuid": "user-b",
-                "isSidechain": false,
-                "promptId": "prompt-b",
-                "message": { "role": "user", "content": [{ "type": "text", "text": "B" }] }
-            }),
-            assistant_b.clone(),
-            assistant_b,
-            json!({
-                "type": "result",
-                "usage": { "input_tokens": 4, "output_tokens": 6 }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let replay = parse_claude_session_replay(&contents);
-        assert!(replay.cumulative_usage_complete);
-        let usage = replay.cumulative_usage.expect("boundary usage");
-        assert_eq!(usage_value_u64(&usage, "input_tokens"), 11);
-        assert_eq!(usage_value_u64(&usage, "output_tokens"), 19);
-        assert_eq!(usage_value_u64(&usage, "total_tokens"), 30);
-        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 100);
-    }
-
-    #[tokio::test]
-    async fn replay_user_prompt_boundary_preserves_prior_missing_id_ambiguity() {
-        let missing_a = json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "cancelled A" }],
-                "usage": { "input_tokens": 7, "output_tokens": 13 }
-            }
-        });
-        let assistant_b = json!({
-            "type": "assistant",
-            "message": {
-                "id": "request-b",
-                "role": "assistant",
-                "content": [{ "type": "text", "text": "B" }],
-                "usage": { "input_tokens": 2, "output_tokens": 3 }
-            }
-        });
-        let contents = [
-            json!({
-                "type": "user",
-                "uuid": "user-a",
-                "isSidechain": false,
-                "promptId": "prompt-a",
-                "message": { "role": "user", "content": [{ "type": "text", "text": "A" }] }
-            }),
-            missing_a.clone(),
-            missing_a,
-            json!({
-                "type": "user",
-                "uuid": "user-b",
-                "isSidechain": false,
-                "promptId": "prompt-b",
-                "message": { "role": "user", "content": [{ "type": "text", "text": "B" }] }
-            }),
-            assistant_b.clone(),
-            assistant_b,
-            json!({
-                "type": "result",
-                "usage": { "input_tokens": 4, "output_tokens": 6 }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let replay = parse_claude_session_replay(&contents);
-        assert!(!replay.cumulative_usage_complete);
-        assert_eq!(
-            replay
-                .cumulative_usage
-                .as_ref()
-                .map(|usage| usage_value_u64(usage, "total_tokens")),
-            Some(10)
-        );
-
-        let (inner, mut rx) = make_test_inner();
-        let message_id = "claude-msg-replay-boundary";
-        inner.emit_stream_start(message_id, None);
-        let stream_start = rx.recv().await.expect("replay boundary StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        assert_eq!(
-            stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some(message_id)
-        );
-        {
-            let mut state = inner.state.lock().await;
-            state.cumulative_usage = replay.cumulative_usage;
-            state.cumulative_usage_complete = replay.cumulative_usage_complete;
-        }
-        let usage = inner
-            .normalize_usage_for_turn(Some(json!({
-                "input_tokens": 3,
-                "output_tokens": 2,
-                "total_tokens": 5
-            })))
-            .await
-            .expect("known current turn");
-        inner.emit_placeholder_stream_end(None, Some(usage), None);
-        let raw = rx
-            .recv()
-            .await
-            .expect("identified replay boundary StreamEnd");
-        assert_eq!(event_kind(&raw), Some("StreamEnd"));
-        let event: ChatEvent = serde_json::from_value(raw).expect("typed ambiguous usage");
-        let ChatEvent::StreamEnd(end) = event else {
-            panic!("expected StreamEnd");
-        };
-        assert_eq!(
-            end.message.message_id.as_ref().map(|id| id.0.as_str()),
-            Some(message_id)
-        );
-        assert!(matches!(
-            end.message.token_usage.expect("usage").cumulative,
-            protocol::TokenUsageScope::Unavailable {
-                reason: protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous
-            }
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "replay boundary should not emit an identity error or cancellation"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_claude_session_replay_marks_missing_usage_identity_unreportable() {
-        let covered = [
-            json!({
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "covered" }],
-                    "usage": { "input_tokens": 2, "output_tokens": 3 }
-                }
-            }),
-            json!({
-                "type": "result",
-                "usage": { "input_tokens": 4, "output_tokens": 6 }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-        let covered = parse_claude_session_replay(&covered);
-        assert!(covered.cumulative_usage_complete);
-        assert_eq!(
-            covered
-                .cumulative_usage
-                .as_ref()
-                .map(|usage| usage_value_u64(usage, "total_tokens")),
-            Some(10)
-        );
-
-        let contents = [
-            json!({
-                "type": "result",
-                "usage": { "input_tokens": 4, "output_tokens": 6 }
-            }),
-            json!({
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "partial" }],
-                    "usage": { "input_tokens": 7, "output_tokens": 13 }
-                }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        let replay = parse_claude_session_replay(&contents);
-        assert!(!replay.cumulative_usage_complete);
-        assert_eq!(
-            replay
-                .cumulative_usage
-                .as_ref()
-                .map(|usage| usage_value_u64(usage, "total_tokens")),
-            Some(10)
-        );
-
-        let (inner, mut rx) = make_test_inner();
-        let message_id = "claude-msg-replay-missing-usage-id";
-        inner.emit_stream_start(message_id, None);
-        let stream_start = rx.recv().await.expect("replay usage StreamStart");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
-        assert_eq!(
-            stream_start
-                .get("data")
-                .and_then(|data| data.get("message_id"))
-                .and_then(Value::as_str),
-            Some(message_id)
-        );
-        {
-            let mut state = inner.state.lock().await;
-            state.cumulative_usage = replay.cumulative_usage;
-            state.cumulative_usage_complete = replay.cumulative_usage_complete;
-        }
-        let usage = inner
-            .normalize_usage_for_turn(Some(json!({
-                "input_tokens": 3,
-                "output_tokens": 2,
-                "total_tokens": 5
-            })))
-            .await
-            .expect("known current turn");
-        assert_eq!(usage_value_u64(&usage.turn, "total_tokens"), 5);
-        assert_eq!(usage.cumulative, None);
-        inner.emit_placeholder_stream_end(None, Some(usage), None);
-        let raw = rx.recv().await.expect("identified replay usage StreamEnd");
-        assert_eq!(event_kind(&raw), Some("StreamEnd"));
-        let event: ChatEvent = serde_json::from_value(raw).expect("typed replay usage terminal");
-        let ChatEvent::StreamEnd(end) = event else {
-            panic!("expected StreamEnd");
-        };
-        assert_eq!(
-            end.message.message_id.as_ref().map(|id| id.0.as_str()),
-            Some(message_id)
-        );
-        let token_usage = end.message.token_usage.expect("typed token usage");
-        assert_eq!(
-            token_usage
-                .turn
-                .known_usage()
-                .map(|usage| usage.total_tokens),
-            Some(5)
-        );
-        assert!(matches!(
-            token_usage.cumulative,
-            protocol::TokenUsageScope::Unavailable {
-                reason: protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous
-            }
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "replay usage terminal should not emit an identity error or cancellation"
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_from_message_accepts_reasoning_summary_blocks() {
-        let message = json!({
-            "content": [
-                { "type": "text", "text": "visible answer" },
-                { "type": "reasoning_summary", "summary": "Checking constraints first." }
-            ]
-        });
-
-        assert_eq!(
-            extract_reasoning_from_message(&message),
-            Some("Checking constraints first.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_text_accepts_camel_case_summary_fields() {
-        let block = json!({
-            "type": "reasoning_summary",
-            "summaryText": "Tracing Claude summary output."
-        });
-
-        assert_eq!(
-            extract_reasoning_text(&block),
-            Some("Tracing Claude summary output.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_text_preserves_boundary_whitespace() {
-        assert_eq!(
-            extract_reasoning_text(&json!(" user")),
-            Some(" user".to_string())
-        );
-    }
-
-    #[test]
-    fn append_reasoning_text_preserves_leading_spaces_between_deltas() {
-        let mut summary = ClaudeStdoutSummary::default();
-
-        append_reasoning_text(&mut summary, "The", false);
-        append_reasoning_text(&mut summary, " user", false);
-
-        assert_eq!(summary.streamed_reasoning, "The user");
-    }
-
-    #[test]
-    fn extract_tool_result_events_maps_success_and_error_results() {
-        let message = json!({
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_ok",
-                    "content": "command output"
-                },
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_fail",
-                    "is_error": true,
-                    "content": "stderr:\npermission denied\nexit code: 126"
-                }
-            ]
-        });
-        let mut tool_names = HashMap::new();
-        tool_names.insert("toolu_ok".to_string(), "ReadFiles".to_string());
-        tool_names.insert("toolu_fail".to_string(), "Bash".to_string());
-        let tool_calls = HashMap::new();
-
-        let events = extract_tool_result_events_from_message(&message, &tool_names, &tool_calls);
-        assert_eq!(events.len(), 2);
-
-        let success = &events[0];
-        assert!(success.success);
-        assert_eq!(success.tool_call_id, "toolu_ok");
-        assert_eq!(success.tool_name, "ReadFiles");
-        assert!(success.error.is_none());
-        assert_eq!(
-            success.tool_result.get("kind").and_then(Value::as_str),
-            Some("Other")
-        );
-
-        let failure = &events[1];
-        assert!(!failure.success);
-        assert_eq!(failure.tool_call_id, "toolu_fail");
-        assert_eq!(failure.tool_name, "Bash");
-        assert_eq!(
-            failure.tool_result.get("kind").and_then(Value::as_str),
-            Some("RunCommand")
-        );
-        assert_eq!(
-            failure.tool_result.get("exit_code").and_then(Value::as_i64),
-            Some(126)
-        );
-        assert_eq!(
-            failure.tool_result.get("stderr").and_then(Value::as_str),
-            Some("permission denied\nexit code: 126")
-        );
-        assert!(failure.error.is_some());
-    }
-
-    #[test]
-    fn extract_tool_result_events_maps_bash_success_to_run_command() {
-        let message = json!({
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_bash",
-                    "content": "command output line"
-                }
-            ]
-        });
-        let mut tool_names = HashMap::new();
-        tool_names.insert("toolu_bash".to_string(), "Bash".to_string());
-        let tool_calls = HashMap::new();
-
-        let events = extract_tool_result_events_from_message(&message, &tool_names, &tool_calls);
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert!(event.success);
-        assert_eq!(
-            event.tool_result.get("kind").and_then(Value::as_str),
-            Some("RunCommand")
-        );
-        assert_eq!(
-            event.tool_result.get("stdout").and_then(Value::as_str),
-            Some("command output line")
-        );
-        assert_eq!(
-            event.tool_result.get("stderr").and_then(Value::as_str),
-            Some("")
-        );
-        assert_eq!(
-            event.tool_result.get("exit_code").and_then(Value::as_i64),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn claude_tool_request_type_maps_edit_to_modify_file() {
-        let request = claude_tool_request_type(
-            "Edit",
-            &json!({
-                "file_path": "/tmp/example.txt",
-                "old_string": "old line",
-                "new_string": "new line"
-            }),
-        );
-
-        assert_eq!(
-            request.get("kind").and_then(Value::as_str),
-            Some("ModifyFile")
-        );
-        assert_eq!(
-            request.get("file_path").and_then(Value::as_str),
-            Some("/tmp/example.txt")
-        );
-        assert_eq!(
-            request.get("before").and_then(Value::as_str),
-            Some("old line")
-        );
-        assert_eq!(
-            request.get("after").and_then(Value::as_str),
-            Some("new line")
-        );
-    }
-
-    #[test]
-    fn claude_agent_tool_projection_excludes_provider_metadata() {
-        let request = claude_tool_request_type(
-            "Task",
-            &json!({
-                "prompt": "Inspect the relay",
-                "description": "Relay investigator",
-                "subagent_type": "Explore",
-                "resume": "provider-session-id",
-                "output_file": "/private/tmp/claude/task-output.txt"
-            }),
-        );
-        let parsed: protocol::ToolRequestType =
-            serde_json::from_value(request.clone()).expect("typed Claude agent request");
-        assert!(matches!(
-            parsed,
-            protocol::ToolRequestType::AgentSpawn { prompt, name }
-                if prompt.as_deref() == Some("Inspect the relay")
-                    && name.as_deref() == Some("Relay investigator")
-        ));
-
-        let result = claude_public_tool_result(
-            "Task",
-            true,
-            json!({
-                "agentId": "provider-agent-id",
-                "output_file": "/private/tmp/claude/task-output.txt",
-                "content": "provider control prose"
-            }),
-        );
-        let encoded = serde_json::to_string(&(request, result)).expect("serialize projection");
-        assert!(!encoded.contains("provider-session-id"));
-        assert!(!encoded.contains("provider-agent-id"));
-        assert!(!encoded.contains("/private/tmp"));
-        assert!(!encoded.contains("provider control prose"));
-    }
-
-    #[test]
-    fn claude_agent_adapter_emits_only_projected_failure() {
-        let (inner, mut rx) = make_test_inner();
-        let tool_call = ClaudeToolCall {
-            id: "task-call".to_owned(),
-            name: "Agent".to_owned(),
-            arguments: json!({
-                "prompt": "Inspect the relay",
-                "description": "Relay investigator",
-                "resume": "provider-session-id"
-            }),
-        };
-        inner.emit_tool_request(&tool_call);
-        inner.emit_tool_execution_completed(
-            &tool_call.id,
-            &tool_call.name,
-            false,
-            json!({
-                "kind": "Other",
-                "result": {
-                    "agentId": "provider-agent-id",
-                    "outputPath": "/private/tmp/claude/output.txt"
-                }
-            }),
-            Some("provider control prose /private/tmp/claude/output.txt".to_owned()),
-        );
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(serde_json::to_string(&event).expect("serialize emitted event"));
-        }
-        let encoded = events.join("\n");
-        assert!(encoded.contains("AgentSpawn"));
-        assert!(encoded.contains("Agent task failed"));
-        assert!(!encoded.contains("provider-session-id"));
-        assert!(!encoded.contains("provider-agent-id"));
-        assert!(!encoded.contains("/private/tmp"));
-        assert!(!encoded.contains("provider control prose"));
-    }
-
-    #[test]
-    fn claude_tool_request_type_maps_read_to_read_files() {
-        let request = claude_tool_request_type(
-            "Read",
-            &json!({
-                "file_path": "/tmp/example.txt"
-            }),
-        );
-
-        assert_eq!(
-            request.get("kind").and_then(Value::as_str),
-            Some("ReadFiles")
-        );
-        let paths = request
-            .get("file_paths")
-            .and_then(Value::as_array)
-            .expect("file_paths");
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].as_str(), Some("/tmp/example.txt"));
-    }
-
-    fn claude_read_replay(arguments: Value, content: Value) -> ClaudeReplayToolExecution {
-        let message = json!({
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "toolu_read",
-                "content": content
-            }]
-        });
-        let tool_call = ClaudeToolCall {
-            id: "toolu_read".to_string(),
-            name: "Read".to_string(),
-            arguments,
-        };
-        let tool_names = HashMap::from([("toolu_read".to_string(), "Read".to_string())]);
-        let tool_calls = HashMap::from([("toolu_read".to_string(), tool_call)]);
-
-        extract_tool_result_events_from_message(&message, &tool_names, &tool_calls)
-            .into_iter()
-            .next()
-            .expect("Claude read replay result")
-    }
-
-    #[test]
-    fn claude_single_read_replay_reports_exact_utf8_bytes() {
-        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
-        let text = "ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π";
-        assert_eq!(text.len(), 70);
-        assert_eq!(text.chars().count(), 69);
-
-        let event = claude_read_replay(json!({ "file_path": path }), json!(text));
-
-        assert!(event.success);
-        assert_eq!(
-            event.tool_result,
-            json!({
-                "kind": "ReadFiles",
-                "files": [{ "path": path, "bytes": 70 }]
-            })
-        );
-    }
-
-    #[test]
-    fn claude_multi_path_request_retains_paths_without_replicating_bytes() {
-        let arguments = json!({
-            "file_path": "first.txt",
-            "file_paths": ["second.txt", "third.txt"],
-            "paths": ["fourth.txt", "second.txt"]
-        });
-        let request = claude_tool_request_type("Read", &arguments);
-        assert_eq!(
-            request,
-            json!({
-                "kind": "ReadFiles",
-                "file_paths": [
-                    "first.txt",
-                    "second.txt",
-                    "third.txt",
-                    "fourth.txt"
-                ]
-            })
-        );
-
-        let event = claude_read_replay(arguments, json!("one undifferentiated result"));
-
-        assert_eq!(
-            event.tool_result,
-            json!({
-                "kind": "Other",
-                "result": "one undifferentiated result"
-            })
-        );
-        assert!(event.tool_result.get("files").is_none());
-        assert!(!event.tool_result.to_string().contains("\"bytes\""));
-    }
-
-    #[test]
-    fn claude_read_replay_without_paths_preserves_result_as_other() {
-        let event =
-            claude_read_replay(json!({ "unrecognized": "value" }), json!("raw read result"));
-
-        assert_eq!(
-            event.tool_result,
-            json!({
-                "kind": "Other",
-                "result": "raw read result"
-            })
-        );
-
-        let empty = claude_read_replay(json!({ "unrecognized": true }), json!([]));
-        assert_eq!(
-            empty.tool_result,
-            json!({
-                "kind": "Other",
-                "result": {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_read",
-                    "content": []
-                }
-            })
-        );
-
-        let structured =
-            claude_read_replay(json!({ "unrecognized": true }), json!([{ "count": 1 }]));
-        assert_eq!(
-            structured.tool_result,
-            json!({
-                "kind": "Other",
-                "result": {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_read",
-                    "content": [{ "count": 1 }]
-                }
-            })
-        );
-
-        let text_parts = claude_read_replay(
-            json!({ "unrecognized": true }),
-            json!([{ "type": "text", "text": "first" }, "second"]),
-        );
-        assert_eq!(
-            text_parts.tool_result,
-            json!({
-                "kind": "Other",
-                "result": "first\nsecond"
-            })
-        );
-    }
-
-    #[test]
-    fn claude_single_empty_read_replay_is_legitimate_zero_bytes() {
-        let event = claude_read_replay(json!({ "path": "empty.txt" }), json!(""));
-
-        assert_eq!(
-            event.tool_result,
-            json!({
-                "kind": "ReadFiles",
-                "files": [{ "path": "empty.txt", "bytes": 0 }]
-            })
-        );
-    }
-
-    #[test]
-    fn claude_read_request_without_recognizable_path_is_raw_other() {
-        let arguments = json!({
-            "file_paths": ["", "  ", 7],
-            "unknown": "retained"
-        });
-
-        let request = claude_tool_request_type("Read", &arguments);
-
-        assert_eq!(
-            request,
-            json!({
-                "kind": "Other",
-                "args": {
-                    "tool": "Read",
-                    "arguments": arguments
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn claude_tool_request_type_maps_ask_user_question() {
-        let request = claude_tool_request_type(
-            "AskUserQuestion",
-            &json!({
-                "questions": [{
-                    "id": "language",
-                    "question": "Which language?",
-                    "header": "Language",
-                    "options": [
-                        { "label": "Rust", "description": "Systems lang" },
-                        { "label": "Python", "description": "Scripting lang" }
-                    ],
-                    "multiSelect": false
-                }]
-            }),
-        );
-
-        let parsed: protocol::ToolRequestType =
-            serde_json::from_value(request).expect("typed AskUserQuestion request");
-        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed else {
-            panic!("expected AskUserQuestion request");
-        };
-        assert_eq!(questions.len(), 1);
-        let question = &questions[0];
-        assert_eq!(question.id.as_deref(), Some("language"));
-        assert_eq!(question.question, "Which language?");
-        assert_eq!(question.header.as_deref(), Some("Language"));
-        assert!(!question.multi_select);
-        assert_eq!(question.options.len(), 2);
-        assert_eq!(question.options[0].label, "Rust");
-        assert_eq!(
-            question.options[0].description.as_deref(),
-            Some("Systems lang")
-        );
-    }
-
-    #[test]
-    fn claude_tool_request_type_maps_top_level_prompt_ask_user_question() {
-        let request = claude_tool_request_type(
-            "AskUserQuestion",
-            &json!({
-                "prompt": "Continue?"
-            }),
-        );
-
-        let parsed: protocol::ToolRequestType =
-            serde_json::from_value(request).expect("typed AskUserQuestion request");
-        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed else {
-            panic!("expected AskUserQuestion request");
-        };
-        assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].question, "Continue?");
-        assert_eq!(questions[0].header, None);
-        assert!(questions[0].options.is_empty());
-        assert!(!questions[0].multi_select);
-    }
-
-    #[test]
-    fn claude_tool_request_type_maps_exit_plan_mode() {
-        let request = claude_tool_request_type(
-            "ExitPlanMode",
-            &json!({
-                "plan": "# Plan\n\nDo the work.",
-                "planFilePath": "/repo/.claude/plans/test.md",
-            }),
-        );
-
-        let parsed: protocol::ToolRequestType =
-            serde_json::from_value(request).expect("typed ExitPlanMode request");
-        let protocol::ToolRequestType::ExitPlanMode { plan, plan_path } = parsed else {
-            panic!("expected ExitPlanMode tool type");
-        };
-        assert_eq!(plan.as_deref(), Some("# Plan\n\nDo the work."));
-        assert_eq!(plan_path.as_deref(), Some("/repo/.claude/plans/test.md"));
-    }
-
-    #[test]
-    fn extract_tool_result_events_maps_modify_file_result() {
-        let message = json!({
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_edit",
-                    "content": "ok"
-                }
-            ]
-        });
-
-        let mut tool_names = HashMap::new();
-        tool_names.insert("toolu_edit".to_string(), "Edit".to_string());
-
-        let mut tool_calls = HashMap::new();
-        tool_calls.insert(
-            "toolu_edit".to_string(),
-            ClaudeToolCall {
-                id: "toolu_edit".to_string(),
-                name: "Edit".to_string(),
-                arguments: json!({
-                    "file_path": "/tmp/example.txt",
-                    "old_string": "old line",
-                    "new_string": "new line"
-                }),
-            },
-        );
-
-        let events = extract_tool_result_events_from_message(&message, &tool_names, &tool_calls);
-        assert_eq!(events.len(), 1);
-
-        let event = &events[0];
-        assert!(event.success);
-        assert_eq!(event.tool_name, "Edit");
-        assert_eq!(
-            event.tool_result.get("kind").and_then(Value::as_str),
-            Some("ModifyFile")
-        );
-        assert_eq!(
-            event.tool_result.get("lines_added").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            event
-                .tool_result
-                .get("lines_removed")
-                .and_then(Value::as_u64),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn derive_turn_token_usage_subtracts_prior_cumulative_usage() {
-        let previous = json!({
-            "input_tokens": 1_000,
-            "output_tokens": 200,
-            "total_tokens": 1_200,
-            "cached_prompt_tokens": 800,
-            "cache_creation_input_tokens": 50,
-            "reasoning_tokens": 40,
-            "context_window": 200_000
-        });
-        let current = json!({
-            "input_tokens": 1_300,
-            "output_tokens": 260,
-            "total_tokens": 1_560,
-            "cached_prompt_tokens": 1_020,
-            "cache_creation_input_tokens": 70,
-            "reasoning_tokens": 55,
-            "context_window": 200_000
-        });
-
-        let turn = derive_turn_token_usage(&current, Some(&previous)).expect("turn usage");
-        assert_eq!(
-            turn,
-            json!({
-                "input_tokens": 300,
-                "output_tokens": 60,
-                "total_tokens": 360,
-                "cached_prompt_tokens": 220,
-                "cache_creation_input_tokens": 20,
-                "reasoning_tokens": 15,
-                "context_window": 200_000
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn result_usage_accumulates_per_turn_without_overwriting_session_totals() {
-        let (inner, _rx) = make_test_inner();
-        let first = json!({
-            "input_tokens": 5,
-            "output_tokens": 10,
-            "total_tokens": 15,
-            "cached_prompt_tokens": 20_000,
-            "cache_creation_input_tokens": 500,
-            "reasoning_tokens": 2,
-            "context_window": 200_000
-        });
-        let second = json!({
-            "input_tokens": 3,
-            "output_tokens": 7,
-            "total_tokens": 10,
-            "cached_prompt_tokens": 4_000,
-            "cache_creation_input_tokens": 100,
-            "reasoning_tokens": 5,
-            "context_window": 200_000
-        });
-
-        let first_usage = inner
-            .normalize_usage_for_turn(Some(first.clone()))
-            .await
-            .expect("first turn usage");
-        assert_eq!(first_usage.turn, first);
-        assert_eq!(first_usage.cumulative, Some(first));
-
-        let second_usage = inner
-            .normalize_usage_for_turn(Some(second.clone()))
-            .await
-            .expect("second turn usage");
-        assert_eq!(second_usage.turn, second);
-        assert_eq!(
-            second_usage.cumulative,
-            Some(json!({
-                "input_tokens": 8,
-                "output_tokens": 17,
-                "total_tokens": 25,
-                "cached_prompt_tokens": 24_000,
-                "cache_creation_input_tokens": 600,
-                "reasoning_tokens": 7,
-                "context_window": 200_000
-            }))
-        );
-        let first_cumulative = first_usage.cumulative.as_ref().expect("first cumulative");
-        let second_cumulative = second_usage.cumulative.as_ref().expect("second cumulative");
-        assert!(
-            usage_value_u64(second_cumulative, "total_tokens")
-                >= usage_value_u64(first_cumulative, "total_tokens")
-        );
-        assert_eq!(
-            inner.state.lock().await.cumulative_usage,
-            Some(second_cumulative.clone())
-        );
-    }
-
-    #[test]
-    fn derive_turn_token_usage_deltas_cumulative_snapshots_and_reset() {
-        let first = json!({
-            "input_tokens": 400,
-            "output_tokens": 100,
-            "total_tokens": 500,
-            "cached_prompt_tokens": 250,
-            "cache_creation_input_tokens": 20,
-            "reasoning_tokens": 15,
-            "context_window": 200_000
-        });
-        let second = json!({
-            "input_tokens": 900,
-            "output_tokens": 180,
-            "total_tokens": 1_080,
-            "cached_prompt_tokens": 650,
-            "cache_creation_input_tokens": 35,
-            "reasoning_tokens": 45,
-            "context_window": 200_000
-        });
-        let reset = json!({
-            "input_tokens": 120,
-            "output_tokens": 25,
-            "total_tokens": 145,
-            "cached_prompt_tokens": 80,
-            "cache_creation_input_tokens": 5,
-            "reasoning_tokens": 7,
-            "context_window": 200_000
-        });
-
-        let first_turn = derive_turn_token_usage(&first, None).expect("first turn usage");
-        assert_eq!(first_turn, first);
-
-        let second_turn =
-            derive_turn_token_usage(&second, Some(&first)).expect("second turn usage");
-        assert_eq!(
-            second_turn,
-            json!({
-                "input_tokens": 500,
-                "output_tokens": 80,
-                "total_tokens": 580,
-                "cached_prompt_tokens": 400,
-                "cache_creation_input_tokens": 15,
-                "reasoning_tokens": 30,
-                "context_window": 200_000
-            })
-        );
-
-        for key in [
-            "input_tokens",
-            "output_tokens",
-            "total_tokens",
-            "cached_prompt_tokens",
-            "cache_creation_input_tokens",
-            "reasoning_tokens",
-        ] {
-            assert!(
-                second_turn.get(key).and_then(Value::as_u64).is_some(),
-                "{key} should be a non-negative token count"
-            );
-        }
-
-        let reset_turn = derive_turn_token_usage(&reset, Some(&second)).expect("reset turn usage");
-        assert_eq!(reset_turn, reset);
-    }
-
-    #[test]
-    fn derive_turn_token_usage_handles_counter_reset() {
-        let previous = json!({
-            "input_tokens": 10_000,
-            "output_tokens": 1_000,
-            "total_tokens": 11_000,
-            "cached_prompt_tokens": 9_000,
-            "cache_creation_input_tokens": 200,
-            "reasoning_tokens": 400,
-            "context_window": 200_000
-        });
-        let current = json!({
-            "input_tokens": 220,
-            "output_tokens": 30,
-            "total_tokens": 250,
-            "cached_prompt_tokens": 150,
-            "cache_creation_input_tokens": 10,
-            "reasoning_tokens": 8,
-            "context_window": 200_000
-        });
-
-        let turn = derive_turn_token_usage(&current, Some(&previous)).expect("turn usage");
-        assert_eq!(turn, current);
-    }
-
-    #[test]
-    fn normalize_claude_permission_mode_maps_default_to_bypass_permissions() {
-        let value = Value::String("default".to_string());
-        assert_eq!(
-            normalize_claude_permission_mode(&value),
-            Some("bypassPermissions".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_claude_effort_preserves_native_levels_and_unset() {
-        for (input, expected) in [
-            ("low", ClaudeEffort::Low),
-            (" Medium ", ClaudeEffort::Medium),
-            ("HIGH", ClaudeEffort::High),
-            ("xhigh", ClaudeEffort::XHigh),
-            ("max", ClaudeEffort::Max),
-        ] {
-            assert_eq!(
-                parse_claude_effort_setting(&Value::String(input.to_string())),
-                Ok(Some(expected))
-            );
-        }
-        assert_eq!(parse_claude_effort_setting(&Value::Null), Ok(None));
-        assert_eq!(
-            parse_claude_effort_setting(&Value::String("  ".to_string())),
-            Ok(None)
-        );
-    }
-
-    #[test]
-    fn parse_claude_effort_rejects_aliases_and_unknown_values() {
-        for value in ["extra_high", "extra-high", "minimal", "none", "ultra"] {
-            let error = parse_claude_effort_setting(&Value::String(value.to_string()))
-                .expect_err("non-native Claude effort should fail");
-            assert!(error.contains("Claude effort"));
-            assert!(error.contains(value));
-            for valid in ["low", "medium", "high", "xhigh", "max"] {
-                assert!(
-                    error.contains(valid),
-                    "Claude effort error should list valid value {valid}: {error}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn parse_token_usage_accepts_camel_case_fields() {
-        let usage = json!({
-            "inputTokens": 1200,
-            "outputTokens": 90,
-            "totalTokens": 1290,
-            "cacheReadInputTokens": 300,
-            "cacheCreationInputTokens": 20,
-            "reasoningTokens": 7,
-            "contextWindow": 200_000
-        });
-
-        let parsed = parse_token_usage(Some(&usage)).expect("usage should parse");
-        assert_eq!(
-            parsed,
-            json!({
-                "input_tokens": 1200,
-                "output_tokens": 90,
-                "total_tokens": 1290,
-                "cached_prompt_tokens": 300,
-                "cache_creation_input_tokens": 20,
-                "reasoning_tokens": 7,
-                "context_window": 200_000
-            })
-        );
-    }
-
-    #[test]
-    fn result_event_reasoning_summary_is_captured() {
-        let (inner, _rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        consume_claude_stream_value(
-            &json!({
-                "type": "result",
-                "result": "Done",
-                "reasoningSummaryText": "I validated the constraints first."
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(
-            summary.best_reasoning(),
-            Some("I validated the constraints first.".to_string())
-        );
-        assert!(summary.reasoning_bytes > 0);
-    }
-
-    #[test]
-    fn estimate_context_breakdown_uses_known_context_window() {
-        let usage = json!({
-            "input_tokens": 10,
-            "output_tokens": 50,
-            "total_tokens": 60,
-            "cached_prompt_tokens": 18_000,
-            "cache_creation_input_tokens": 2_000,
-            "reasoning_tokens": 0
-        });
-        // With known_context_window = 200_000, context_window should be 200_000
-        // even though input_tokens (10+18000+2000 = 20_010) < 200_000.
-        let bd = estimate_context_breakdown(Some(&usage), 100, 50, 0, Some(200_000), None);
-        assert_eq!(
-            bd.get("context_window").and_then(Value::as_u64),
-            Some(200_000)
-        );
-        assert_eq!(bd.get("input_tokens").and_then(Value::as_u64), Some(20_010));
-    }
-
-    #[test]
-    fn estimate_context_breakdown_known_window_not_inflated_by_large_input() {
-        // Regression: previously, if input_tokens exceeded the estimated context
-        // window (200K), the fallback used max(200K, input_tokens) which inflated
-        // context_window to match, always showing 100% utilization.
-        let usage = json!({
-            "input_tokens": 50_000,
-            "output_tokens": 100,
-            "total_tokens": 50_100,
-            "cached_prompt_tokens": 400_000,
-            "cache_creation_input_tokens": 150_000,
-            "reasoning_tokens": 0
-        });
-        // Total prompt = 50K + 400K + 150K = 600K (bogus — would only happen
-        // with the old cumulative-vs-per-call bug, but test the fallback anyway).
-        // With known_context_window = 200_000, context_window stays at 200_000.
-        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, Some(200_000), None);
-        assert_eq!(
-            bd.get("context_window").and_then(Value::as_u64),
-            Some(200_000)
-        );
-    }
-
-    #[test]
-    fn estimate_context_breakdown_falls_back_to_estimated_without_known_window() {
-        let usage = json!({
-            "input_tokens": 5,
-            "output_tokens": 10,
-            "total_tokens": 15,
-            "cached_prompt_tokens": 20_000,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0
-        });
-        // No known_context_window → should fall back to the conservative default.
-        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, None);
-        assert_eq!(
-            bd.get("context_window").and_then(Value::as_u64),
-            Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT)
-        );
-    }
-
-    #[test]
-    fn result_event_does_not_overwrite_per_api_call_usage() {
-        // Simulate the event sequence from a multi-tool-call Claude process:
-        // 1. assistant message with per-API-call usage
-        // 2. result event with aggregate turn usage
-        // summary.usage should remain the per-API-call value.
-        let mut summary = ClaudeStdoutSummary {
-            usage: Some(json!({
-                "input_tokens": 1,
-                "output_tokens": 5,
-                "total_tokens": 6,
-                "cached_prompt_tokens": 20_000,
-                "cache_creation_input_tokens": 500,
-                "reasoning_tokens": 0
-            })),
-            ..Default::default()
-        };
-
-        // Simulate consuming a result event — it should set
-        // result_turn_usage, NOT overwrite usage.
-        let result_event = json!({
-            "type": "result",
-            "result": "Done",
-            "usage": {
-                "input_tokens": 5,
-                "output_tokens": 20,
-                "total_tokens": 25,
-                "cache_read_input_tokens": 40_000,
-                "cache_creation_input_tokens": 1_000,
-            },
-            "modelUsage": {
-                "claude-opus-4-6": {
-                    "inputTokens": 5,
-                    "outputTokens": 20,
-                    "cacheReadInputTokens": 40_000,
-                    "cacheCreationInputTokens": 1_000,
-                    "contextWindow": 200_000
-                }
-            }
-        });
-        let (inner, _rx) = make_test_inner();
-        let mut segment = SegmentState::default();
-        let base_id = "test-msg".to_string();
-        let mut current_id = base_id.clone();
-        consume_claude_stream_value(
-            &result_event,
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // usage should still be the per-API-call value (not the turn aggregate)
-        let usage = summary.usage.as_ref().expect("usage should be set");
-        assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(1));
-        assert_eq!(
-            usage.get("cached_prompt_tokens").and_then(Value::as_u64),
-            Some(20_000)
-        );
-
-        // result_turn_usage should hold the turn aggregate from result
-        let cum = summary
-            .result_turn_usage
-            .as_ref()
-            .expect("result_turn_usage should be set");
-        assert_eq!(cum.get("input_tokens").and_then(Value::as_u64), Some(5));
-        assert_eq!(
-            cum.get("cached_prompt_tokens").and_then(Value::as_u64),
-            Some(40_000)
-        );
-
-        // result_context_window should be extracted from modelUsage
-        assert_eq!(summary.result_context_window, Some(200_000));
-    }
-
-    #[test]
-    fn result_event_prefers_model_usage_entry_for_current_model() {
-        let mut summary = ClaudeStdoutSummary {
-            model: Some("claude-haiku-4-5-20251001".to_string()),
-            ..Default::default()
-        };
-
-        let result_event = json!({
-            "type": "result",
-            "result": "Done",
-            "model": "claude-haiku-4-5-20251001",
-            "modelUsage": {
-                "claude-sonnet-4-6": { "contextWindow": 1_000_000 },
-                "claude-haiku-4-5-20251001": { "contextWindow": 200_000 }
-            }
-        });
-        let (inner, _rx) = make_test_inner();
-        let mut segment = SegmentState::default();
-        let base_id = "test-msg".to_string();
-        let mut current_id = base_id.clone();
-        consume_claude_stream_value(
-            &result_event,
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        assert_eq!(summary.result_context_window, Some(200_000));
-    }
-
-    #[test]
-    fn estimate_context_breakdown_supports_explicit_1m_model_suffix_fallback() {
-        let usage = json!({
-            "input_tokens": 20,
-            "output_tokens": 10,
-            "total_tokens": 30,
-            "cached_prompt_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0
-        });
-        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, Some("sonnet[1m]"));
-        assert_eq!(
-            bd.get("context_window").and_then(Value::as_u64),
-            Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M)
-        );
-    }
-
-    #[test]
-    fn estimate_context_breakdown_treats_fable_as_1m_window() {
-        // Fable defaults to a 1M context window even without an explicit [1m]
-        // suffix, so the estimated fallback must not collapse it to 200k.
-        let usage = json!({
-            "input_tokens": 20,
-            "output_tokens": 10,
-            "total_tokens": 30,
-            "cached_prompt_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0
-        });
-        for model in ["fable", "claude-fable-5", "Claude Fable 5"] {
-            let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, Some(model));
-            assert_eq!(
-                bd.get("context_window").and_then(Value::as_u64),
-                Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M),
-                "{model} should estimate a 1M context window"
-            );
-        }
-    }
-
-    #[test]
-    fn phase_usage_emits_per_api_call_request_usage() {
-        let mut summary = ClaudeStdoutSummary::default();
-
-        // No usage set → None.
-        assert!(phase_usage_for_emission(&mut summary).is_none());
-
-        summary.usage = Some(json!({
-            "input_tokens": 150_000,
-            "output_tokens": 500,
-            "total_tokens": 150_500,
-            "cached_prompt_tokens": 120_000,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0
-        }));
-
-        let usage = phase_usage_for_emission(&mut summary).expect("request usage");
-        assert_eq!(
-            usage.get("total_tokens").and_then(Value::as_u64),
-            Some(150_500)
-        );
-        assert!(summary.usage.is_none());
-    }
-
-    #[test]
-    fn todo_write_emits_task_update() {
-        use protocol::TaskStatus;
-        let arguments = json!({
-            "todos": [
-                {"content": "Fix the bug", "status": "completed", "activeForm": "Fixing the bug"},
-                {"content": "Run tests", "status": "in_progress", "activeForm": "Running tests"},
-                {"content": "Deploy", "status": "pending", "activeForm": "Deploying"},
-            ]
-        });
-        let tasks = claude_task_update_from_todo_write(&arguments)
-            .expect("should produce a TaskList payload");
-        assert_eq!(tasks.title, "");
-        assert_eq!(tasks.tasks.len(), 3);
-        assert_eq!(tasks.tasks[0].description, "Fix the bug");
-        assert!(matches!(tasks.tasks[0].status, TaskStatus::Completed));
-        assert_eq!(tasks.tasks[1].description, "Running tests");
-        assert!(matches!(tasks.tasks[1].status, TaskStatus::InProgress));
-        assert_eq!(tasks.tasks[2].description, "Deploy");
-        assert!(matches!(tasks.tasks[2].status, TaskStatus::Pending));
-    }
-
-    #[test]
-    fn todo_write_returns_none_for_missing_todos() {
-        assert!(claude_task_update_from_todo_write(&json!({})).is_none());
-        assert!(claude_task_update_from_todo_write(&json!({"todos": "not an array"})).is_none());
-    }
-
-    #[test]
-    fn current_task_tools_build_a_typed_task_list() {
-        use protocol::TaskStatus;
-
-        let mut tracker = ClaudeTaskTracker::default();
-        let create = ClaudeToolCall {
-            id: "create-1".to_string(),
-            name: "TaskCreate".to_string(),
-            arguments: json!({"subject": "Alpha check", "description": "Calculate 1+1"}),
-        };
-        let created = tracker.observe_request(&create).expect("create snapshot");
-        assert_eq!(created.tasks[0].description, "Alpha check");
-        assert!(matches!(created.tasks[0].status, TaskStatus::Pending));
-        tracker
-            .observe_completion(
-                "create-1",
-                "TaskCreate",
-                &json!("Task #7 created successfully: Alpha check"),
-            )
-            .expect("create completion snapshot");
-
-        let update = ClaudeToolCall {
-            id: "update-1".to_string(),
-            name: "TaskUpdate".to_string(),
-            arguments: json!({"taskId": "7", "status": "in_progress"}),
-        };
-        assert!(tracker.observe_request(&update).is_none());
-        let active = tracker
-            .observe_completion("update-1", "TaskUpdate", &json!("Updated task #7 status"))
-            .expect("update snapshot");
-        assert!(matches!(active.tasks[0].status, TaskStatus::InProgress));
-
-        let missing_arguments = ClaudeToolCall {
-            id: "create-2".to_string(),
-            name: "TaskCreate".to_string(),
-            arguments: json!({}),
-        };
-        assert!(tracker.observe_request(&missing_arguments).is_none());
-        let recovered = tracker
-            .observe_completion(
-                "create-2",
-                "TaskCreate",
-                &json!("Task #8 created successfully: Beta check"),
-            )
-            .expect("completion reconstructs missing request arguments");
-        assert_eq!(recovered.tasks[1].description, "Beta check");
-    }
-
-    #[tokio::test]
-    async fn repeated_tools_in_one_claude_response_remain_visible() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-response".to_owned();
-        let mut current_id = base_id.clone();
-        inner.emit_stream_start(&base_id, Some("claude-test".to_owned()));
-
-        for (index, subject) in ["Alpha check", "Beta check", "Gamma check"]
-            .into_iter()
-            .enumerate()
-        {
-            let tool_call_id = format!("tool-{index}");
-            let assistant = json!({
-                "type": "assistant",
-                "message": {
-                    "id": "same-provider-message",
-                    "model": "claude-test",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": tool_call_id.clone(),
-                        "name": "TaskCreate",
-                        "input": {"subject": subject, "description": subject}
-                    }]
-                }
-            });
-            consume_claude_stream_value(
-                &assistant,
-                &mut summary,
-                &mut segment,
-                &inner,
-                &base_id,
-                &mut current_id,
-            );
-            close_current_phase(&mut summary, &mut segment, &inner);
-            consume_claude_stream_value(
-                &assistant,
-                &mut summary,
-                &mut segment,
-                &inner,
-                &base_id,
-                &mut current_id,
-            );
-            consume_claude_stream_value(
-                &json!({
-                    "type": "user",
-                    "message": {
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": format!("Task #{} created successfully: {subject}", index + 1)
-                        }]
-                    }
-                }),
-                &mut summary,
-                &mut segment,
-                &inner,
-                &base_id,
-                &mut current_id,
-            );
-        }
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event_kind(event) == Some("ToolRequest"))
-                .count(),
-            3
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event_kind(event) == Some("ToolExecutionCompleted")
-                        && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)
-                })
-                .count(),
-            3
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| event_kind(event) != Some("Error")),
-            "repeated tool lifecycle emitted an Error: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| event_kind(event) != Some("OperationCancelled")),
-            "repeated tool lifecycle was cancelled: {events:?}"
-        );
-        assert!(events.iter().all(|event| {
-            event
-                .pointer("/data/tool_result/short_message")
-                .and_then(Value::as_str)
-                != Some("Tool result missing")
-        }));
-        let final_tasks = events
-            .iter()
-            .rev()
-            .find(|event| event_kind(event) == Some("TaskUpdate"))
-            .expect("typed task update");
-        assert_eq!(
-            final_tasks
-                .pointer("/data/tasks")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn extract_spawn_description_prefers_prompt_over_description() {
-        let input = json!({
-            "description": "Spawn test sub-agent",
-            "prompt": "Say \"hello world\" and nothing else."
-        });
-        assert_eq!(
-            extract_spawn_description(Some(&input)),
-            "Say \"hello world\" and nothing else."
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_subagent_prompt_is_emitted_on_content_block_stop() {
-        let (relay_event_tx, mut relay_event_rx) = mpsc::unbounded_channel();
-        let (model_usage_tx, _model_usage_rx) = mpsc::unbounded_channel();
-        let (total_usage_tx, _total_usage_rx) = mpsc::unbounded_channel();
-        let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_claude_subagent_event_bridge(
-            raw_event_rx,
-            relay_event_tx.clone(),
-            model_usage_tx,
-            total_usage_tx,
-        );
-        let mut streams = HashMap::new();
-        streams.insert(
-            "toolu_spawn".to_string(),
-            SubAgentStream {
-                summary: ClaudeStdoutSummary::default(),
-                segment: SegmentState::default(),
-                message_id: "subagent-toolu_spawn".to_string(),
-                has_explicit_task_prompt: false,
-                inner: Arc::new(ClaudeInner {
-                    emitter: Arc::new(TurnEmitter::new_for_agent(
-                        raw_event_tx,
-                        AgentName(CLAUDE_AGENT_NAME),
-                    )),
-                    state: Mutex::new(ClaudeState::default()),
-                    runtime: Mutex::new(None),
-                    turn_event_gate: Mutex::new(()),
-                    task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-                    background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
-                    skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
-                    skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
-                    pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-                    background_work_active: std::sync::atomic::AtomicBool::new(false),
-                    typing_active: std::sync::atomic::AtomicBool::new(false),
-                }),
-                parent_tool_use_id: "toolu_spawn".to_string(),
-                parent_tool_name: "Task".to_string(),
-                agent_id: protocol::AgentId("test-subagent".to_string()),
-                agent_name: "Agent".to_string(),
-                name_update_tx: None,
-                parent_emitter: test_parent_emitter().0,
-                last_progress_emit: std::time::Instant::now(),
-                execution: SubAgentExecution::Foreground,
-                seen_tool_call_ids: HashSet::new(),
-                last_tool_name: None,
-                reported_total_tokens: None,
-            },
-        );
-
-        let mut pending_prompts = HashMap::new();
-        pending_prompts.insert(
-            0,
-            PendingSubAgentPrompt {
-                tool_use_id: "toolu_spawn".to_string(),
-                partial_json: "{\"prompt\":\"Say \\\"hello world\\\" and nothing else.\"}"
-                    .to_string(),
-            },
-        );
-
-        let stop_event = json!({
-            "type": "stream_event",
-            "event": {
-                "type": "content_block_stop",
-                "index": 0
-            }
-        });
-
-        track_pending_subagent_prompt_event(&stop_event, &mut streams, &mut pending_prompts);
-
-        let emitted = relay_event_rx
-            .recv()
-            .await
-            .expect("prompt message should be emitted");
-        let protocol::ChatEvent::MessageAdded(message) = emitted else {
-            panic!("expected MessageAdded chat event");
-        };
-        assert_eq!(message.content, "Say \"hello world\" and nothing else.");
-        assert!(pending_prompts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn claude_child_bridge_routes_total_only_usage_outside_chat() {
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
-        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
-        let (model_tx, _model_rx) = mpsc::unbounded_channel();
-        let (total_tx, mut total_rx) = mpsc::unbounded_channel();
-        spawn_claude_subagent_event_bridge(raw_rx, chat_tx, model_tx, total_tx);
-
-        raw_tx
-            .send(json!({
-                "kind": "TotalOnlyTokenUsage",
-                "data": { "total_tokens": 47 }
-            }))
-            .expect("raw bridge should be open");
-
-        assert_eq!(
-            timeout(Duration::from_secs(1), total_rx.recv())
-                .await
-                .expect("total-only usage should cross child bridge"),
-            Some(47)
-        );
-        assert!(chat_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn ask_user_question_tool_emits_request_and_success_completion() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        // Outer code emits initial StreamStart before read_claude_stdout runs.
-        inner.emit_stream_start(&base_id, None);
-        let ev = rx.recv().await.unwrap();
-        assert_eq!(event_kind(&ev), Some("StreamStart"));
-
-        // 1) assistant message with AskUserQuestion tool_use
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "model": "claude-opus-4-6",
-                    "id": "msg_ask",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "toolu_ask",
-                        "name": "AskUserQuestion",
-                        "input": {
-                            "questions": [{
-                                "question": "Which language?",
-                                "header": "Language",
-                                "options": [
-                                    { "label": "Rust", "description": "Systems lang" },
-                                    { "label": "Python", "description": "Scripting lang" }
-                                ],
-                                "multiSelect": false
-                            }]
-                        }
-                    }],
-                    "usage": { "input_tokens": 100, "output_tokens": 50 }
-                },
-                "session_id": "test-session"
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // At this point the tool_call is registered but no StreamEnd/ToolRequest emitted yet
-        // (close_current_phase hasn't been called yet).
-        assert!(
-            summary.tool_name_by_id.contains_key("toolu_ask"),
-            "tool call should be registered: {:?}",
-            summary.tool_name_by_id
-        );
-
-        // 2) user message with tool_result (is_error: true) — this triggers
-        //    close_current_phase (StreamEnd + ToolRequest) then ToolExecutionCompleted.
-        consume_claude_stream_value(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "content": "Answer questions?",
-                        "is_error": true,
-                        "tool_use_id": "toolu_ask"
-                    }]
-                },
-                "session_id": "test-session"
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // Drain all emitted events
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
-        let kinds: Vec<_> = events
-            .iter()
-            .filter_map(|ev| ev.get("kind").and_then(Value::as_str))
-            .collect();
-
-        // Expect: StreamEnd, ToolRequest, ToolExecutionCompleted
-        assert!(
-            kinds.contains(&"StreamEnd"),
-            "expected StreamEnd in events, got: {kinds:?}"
-        );
-        assert!(
-            kinds.contains(&"ToolRequest"),
-            "expected ToolRequest in events, got: {kinds:?}"
-        );
-        assert!(
-            kinds.contains(&"ToolExecutionCompleted"),
-            "expected ToolExecutionCompleted in events, got: {kinds:?}"
-        );
-
-        let request = events
-            .iter()
-            .find(|ev| event_kind(ev) == Some("ToolRequest"))
-            .expect("ToolRequest should be present");
-        assert_eq!(
-            request
-                .pointer("/data/tool_type/kind")
-                .and_then(Value::as_str),
-            Some("AskUserQuestion")
-        );
-        let parsed_request: protocol::ToolRequest =
-            serde_json::from_value(request["data"].clone()).expect("typed ToolRequest");
-        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed_request.tool_type
-        else {
-            panic!("expected AskUserQuestion tool type");
-        };
-        assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].question, "Which language?");
-        assert_eq!(questions[0].header.as_deref(), Some("Language"));
-        assert_eq!(questions[0].options.len(), 2);
-        assert_eq!(questions[0].options[0].label, "Rust");
-        assert_eq!(
-            questions[0].options[0].description.as_deref(),
-            Some("Systems lang")
-        );
-        assert!(!questions[0].multi_select);
-
-        // ToolExecutionCompleted should be success (overridden from is_error)
-        let completion = events
-            .iter()
-            .find(|ev| event_kind(ev) == Some("ToolExecutionCompleted"))
-            .expect("ToolExecutionCompleted should be present");
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(true),
-            "user-input tool should be overridden to success"
-        );
-        assert_eq!(
-            completion
-                .pointer("/data/tool_name")
-                .and_then(Value::as_str),
-            Some("AskUserQuestion")
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_includes_plan_content_from_preceding_write() {
-        let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        let mut segment = SegmentState::default();
-        let base_id = "claude-msg-1".to_string();
-        let mut current_id = base_id.clone();
-
-        inner.emit_stream_start(&base_id, None);
-        let ev = rx.recv().await.unwrap();
-        assert_eq!(event_kind(&ev), Some("StreamStart"));
-
-        let plan_content = "# Plan\n\n## Step 1\nDo the first thing.";
-
-        // 1) assistant message with Write tool_use (plan file) + ExitPlanMode tool_use
-        consume_claude_stream_value(
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "model": "claude-opus-4-6",
-                    "id": "msg_plan",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_write",
-                            "name": "Write",
-                            "input": {
-                                "file_path": "/Users/test/.claude/plans/test-plan.md",
-                                "content": plan_content
-                            }
-                        },
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_exit",
-                            "name": "ExitPlanMode",
-                            "input": {}
-                        }
-                    ],
-                    "usage": { "input_tokens": 100, "output_tokens": 50 }
-                },
-                "session_id": "test-session"
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // 2) user message with tool_results for both tools
-        consume_claude_stream_value(
-            &json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "content": "",
-                            "is_error": false,
-                            "tool_use_id": "toolu_write"
-                        },
-                        {
-                            "type": "tool_result",
-                            "content": "Exit plan mode?",
-                            "is_error": true,
-                            "tool_use_id": "toolu_exit"
-                        }
-                    ]
-                },
-                "session_id": "test-session"
-            }),
-            &mut summary,
-            &mut segment,
-            &inner,
-            &base_id,
-            &mut current_id,
-        );
-
-        // Drain all emitted events
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
-        // Find the ExitPlanMode ToolExecutionCompleted
-        let completion = events
-            .iter()
-            .find(|ev| {
-                event_kind(ev) == Some("ToolExecutionCompleted")
-                    && ev.pointer("/data/tool_name").and_then(Value::as_str) == Some("ExitPlanMode")
-            })
-            .expect("ExitPlanMode ToolExecutionCompleted should be present");
-
-        assert_eq!(
-            completion.pointer("/data/success").and_then(Value::as_bool),
-            Some(true),
-        );
-
-        // The result should contain the plan content from the Write tool
-        assert_eq!(
-            completion
-                .pointer("/data/tool_result/result/plan_content")
-                .and_then(Value::as_str),
-            Some(plan_content),
-            "ExitPlanMode result should include plan_content from preceding Write"
-        );
-    }
-
-    #[tokio::test]
-    async fn forward_claude_backend_event_fails_ready_on_pre_session_error() {
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-        let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let session_id = Arc::new(std::sync::Mutex::new(None));
-
-        let forwarded = forward_claude_backend_event(
-            json!({
-                "kind": "Error",
-                "data": "Failed to start Claude CLI: No such file or directory"
-            }),
-            &events_tx,
-            &session_id,
-            Some(&ready_tx),
-        )
-        .await;
-
-        assert!(forwarded, "expected backend error event to be forwarded");
-        assert_eq!(
-            ready_rx.await.expect("ready result"),
-            Err("Failed to start Claude CLI: No such file or directory".to_string())
-        );
-
-        let BackendEvent::Chat(event) = events_rx.recv().await.expect("forwarded chat event")
-        else {
-            panic!("expected forwarded chat event");
-        };
-        match event {
-            ChatEvent::MessageAdded(message) => {
-                assert!(matches!(message.sender, protocol::MessageSender::Error));
-                assert_eq!(
-                    message.content,
-                    "Failed to start Claude CLI: No such file or directory"
-                );
-            }
-            other => panic!("expected error chat event, got {other:?}"),
-        }
     }
 }

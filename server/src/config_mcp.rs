@@ -574,6 +574,7 @@ impl TydeConfigMcpServer {
         let mcp_server = McpServerConfig {
             id: McpServerId(id),
             name: input.name,
+            supports_parallel_tool_calls: false,
             transport: input.transport.into(),
         };
         match self

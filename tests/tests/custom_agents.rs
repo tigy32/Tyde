@@ -365,6 +365,7 @@ fn sample_mcp_server(id: &str, name: &str) -> McpServerConfig {
     McpServerConfig {
         id: McpServerId(id.to_string()),
         name: name.to_string(),
+        supports_parallel_tool_calls: false,
         transport: McpTransportConfig::Stdio {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
@@ -377,6 +378,7 @@ fn sample_http_mcp_server(id: &str, name: &str, url: &str) -> McpServerConfig {
     McpServerConfig {
         id: McpServerId(id.to_string()),
         name: name.to_string(),
+        supports_parallel_tool_calls: false,
         transport: McpTransportConfig::Http {
             url: url.to_string(),
             headers: HashMap::new(),

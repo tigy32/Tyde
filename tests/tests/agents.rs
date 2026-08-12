@@ -1095,17 +1095,20 @@ async fn expect_task_token_usage_matching(
     mut matches_payload: impl FnMut(&TaskTokenUsagePayload) -> bool,
 ) -> TaskTokenUsagePayload {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
             !remaining.is_zero(),
-            "timed out waiting for task token usage {context}"
+            "timed out waiting for task token usage {context}; observed={observed:#?}"
         );
         let env = match tokio::time::timeout(remaining, client.next_event()).await {
             Ok(Ok(Some(env))) => env,
             Ok(Ok(None)) => panic!("connection closed before task token usage {context}"),
             Ok(Err(err)) => panic!("next_event failed before task token usage {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for task token usage {context}"),
+            Err(_) => {
+                panic!("timed out waiting for task token usage {context}; observed={observed:#?}")
+            }
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
@@ -1119,6 +1122,9 @@ async fn expect_task_token_usage_matching(
             continue;
         }
         let payload: TaskTokenUsagePayload = env.parse_payload().expect("TaskTokenUsage");
+        if &payload.root_agent_id == root_agent_id {
+            observed.push(payload.clone());
+        }
         if &payload.root_agent_id == root_agent_id && matches_payload(&payload) {
             return payload;
         }

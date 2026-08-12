@@ -928,8 +928,17 @@ impl ProtocolValidator {
                     )
                 })?;
                 state.saw_bootstrap = true;
-                for event in payload.events {
-                    validate_agent_bootstrap_event(&recent_frames, envelope, state, event)?;
+                let bootstrap_events = payload.events;
+                for event in bootstrap_events.iter().cloned() {
+                    if let Err(violation) =
+                        validate_agent_bootstrap_event(&recent_frames, envelope, state, event)
+                    {
+                        eprintln!(
+                            "TYDE BOOTSTRAP VALIDATION FAILURE stream={} events={bootstrap_events:#?}",
+                            envelope.stream
+                        );
+                        return Err(violation);
+                    }
                 }
             }
             _ if !state.saw_bootstrap => {

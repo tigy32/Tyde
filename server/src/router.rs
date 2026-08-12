@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
 use anyhow::anyhow;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendSettingsRefreshPayload,
@@ -488,6 +490,7 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "send_message")?;
+                validate_message_images("send_message", payload.images.as_deref())?;
 
                 deliver_agent_input(
                     host,
@@ -1065,6 +1068,7 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
                     "new prompt must not be empty unless images are attached",
                 ));
             }
+            validate_message_images("spawn_agent", images.as_deref())?;
         }
         SpawnAgentParams::Resume { session_id, .. } => {
             ensure_non_empty("spawn_agent", "session_id", session_id.0.as_str())?;
@@ -1088,10 +1092,92 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
                     "fork prompt must not be empty unless images are attached",
                 ));
             }
+            validate_message_images("spawn_agent", images.as_deref())?;
         }
     }
 
     Ok(())
+}
+
+fn validate_message_images(
+    operation: &'static str,
+    images: Option<&[protocol::ImageData]>,
+) -> AppResult<()> {
+    for image in images.unwrap_or_default() {
+        let expected = match image.media_type.as_str() {
+            "image/png" => ImageFormat::Png,
+            "image/jpeg" => ImageFormat::Jpeg,
+            "image/gif" => ImageFormat::Gif,
+            "image/webp" => ImageFormat::Webp,
+            _ => {
+                return Err(AppError::invalid(
+                    operation,
+                    format!("unsupported image media type {:?}", image.media_type),
+                ));
+            }
+        };
+        if image.data.trim().is_empty() || image.data.trim() != image.data {
+            return Err(AppError::invalid(
+                operation,
+                "image data must be non-empty base64",
+            ));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(&image.data)
+            .map_err(|_| AppError::invalid(operation, "image data is not valid base64"))?;
+        let actual = detect_image_format(&bytes).ok_or_else(|| {
+            AppError::invalid(operation, "image data is not a complete supported image")
+        })?;
+        if actual != expected {
+            return Err(AppError::invalid(
+                operation,
+                "image media type does not match its encoded content",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+fn detect_image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.len() >= 24
+        && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        && bytes[12..16] == *b"IHDR"
+        && u32::from_be_bytes(bytes[16..20].try_into().ok()?) > 0
+        && u32::from_be_bytes(bytes[20..24].try_into().ok()?) > 0
+    {
+        return Some(ImageFormat::Png);
+    }
+    if bytes.len() >= 4 && bytes.starts_with(&[0xff, 0xd8]) && bytes.ends_with(&[0xff, 0xd9]) {
+        return Some(ImageFormat::Jpeg);
+    }
+    if bytes.len() >= 13
+        && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+        && u16::from_le_bytes(bytes[6..8].try_into().ok()?) > 0
+        && u16::from_le_bytes(bytes[8..10].try_into().ok()?) > 0
+        && bytes.iter().rev().find(|byte| !byte.is_ascii_whitespace()) == Some(&0x3b)
+    {
+        return Some(ImageFormat::Gif);
+    }
+    if bytes.len() >= 20
+        && bytes.starts_with(b"RIFF")
+        && bytes[8..12] == *b"WEBP"
+        && matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X")
+        && usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?))
+            .ok()?
+            .checked_add(8)?
+            <= bytes.len()
+    {
+        return Some(ImageFormat::Webp);
+    }
+    None
 }
 
 fn validate_team_member_create_spec(

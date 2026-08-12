@@ -7658,6 +7658,7 @@ impl McpForm {
             id: self.id.clone(),
             name,
             transport,
+            supports_parallel_tool_calls: false,
         })
     }
 }

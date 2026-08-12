@@ -9,9 +9,9 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
-    CompactionMethod, CompactionMetrics, CompactionStage, ContextBreakdown, MessageSender,
-    MessageTokenUsage, ModelInfo, OperationCancelledData, RetryAttemptData, SelectOption,
-    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    CompactionMethod, CompactionMetrics, CompactionStage, CompactionTrigger, ContextBreakdown,
+    MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, RetryAttemptData,
+    SelectOption, SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
     StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::agent::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, await_progress_data_for_tool, normalize_tyde_chat_event,
-    spawn_progress_data_for_tool_result,
+    spawn_progress_data_for_tool_result, terminal_await_progress_data_for_tool,
 };
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
@@ -34,13 +34,15 @@ use crate::backend::{
     BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
-    BackendCompactionNotDispatchedReason, BackendCompactionProgress, BackendCompactionRequest,
-    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason, BackendEvent,
-    BackendSession, BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
+    BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
+    BackendCompactionProgress, BackendCompactionRequest, BackendCompactionResult,
+    BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnavailableReason, BackendCompactionUserFocus,
+    BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
     StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
-    tyde_owned_no_root_cwd,
+    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
+    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
 };
 use crate::hermes_mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
@@ -61,10 +63,7 @@ const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HERMES_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HERMES_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
 const HERMES_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(test))]
 const HERMES_SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
-#[cfg(test)]
-const HERMES_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
@@ -78,12 +77,36 @@ const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 const HERMES_TOOL_SEARCH_BRIDGE_TOOL: &str = "tool_search";
 const HERMES_MCP_GATEWAY_ENTRY: &str = r#"
 import os
+import re
 import sys
 import threading
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv()
+from agent.process_bootstrap import _get_proxy_for_base_url
+import run_agent as _tyde_run_agent
+_tyde_original_parallel_gate = _tyde_run_agent._should_parallelize_tool_batch
+def _tyde_parallel_gate(tool_calls):
+    result = _tyde_original_parallel_gate(tool_calls)
+    names = [getattr(getattr(call, "function", None), "name", "") for call in tool_calls]
+    from tools.mcp_tool import is_mcp_tool_parallel_safe
+    safety = [is_mcp_tool_parallel_safe(name) for name in names]
+    print(
+        f"TYDE HERMES PARALLEL GATE names={names!r} safety={safety!r} result={result}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return result
+_tyde_run_agent._should_parallelize_tool_batch = _tyde_parallel_gate
+print(
+    "TYDE HERMES TRANSPORT "
+    f"https_proxy={bool(os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy'))} "
+    f"http_proxy={bool(os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'))} "
+    f"all_proxy={bool(os.environ.get('ALL_PROXY') or os.environ.get('all_proxy'))} "
+    f"openrouter_proxy={bool(_get_proxy_for_base_url('https://openrouter.ai/api/v1'))}",
+    file=sys.stderr,
+)
 from tui_gateway import server as _tyde_gateway_server
 
 _tyde_original_emit = _tyde_gateway_server._emit
@@ -91,7 +114,24 @@ _tyde_original_get_usage = _tyde_gateway_server._get_usage
 _tyde_original_make_agent = _tyde_gateway_server._make_agent
 _tyde_tool_start_args = {}
 _tyde_message_condition = threading.Condition()
-_tyde_open_messages = set()
+_tyde_open_messages = {}
+_tyde_message_generations = {}
+from tools import process_registry as _tyde_process_registry_module
+_tyde_original_format_process_notification = _tyde_process_registry_module.format_process_notification
+_tyde_background_completion_lock = threading.Lock()
+_tyde_background_completions = {}
+_tyde_background_completions_delivered = set()
+
+def _tyde_format_process_notification(event):
+    text = _tyde_original_format_process_notification(event)
+    if isinstance(event, dict) and event.get("type", "completion") == "completion" and text:
+        process_id = str(event.get("session_id") or "")
+        with _tyde_background_completion_lock:
+            if process_id and process_id not in _tyde_background_completions_delivered:
+                _tyde_background_completions[text] = dict(event)
+    return text
+
+_tyde_process_registry_module.format_process_notification = _tyde_format_process_notification
 
 def _tyde_get_usage(agent):
     usage = dict(_tyde_original_get_usage(agent))
@@ -123,26 +163,104 @@ def _tyde_make_agent(*args, **kwargs):
                     {"iteration": int(iteration), "usage": _tyde_get_usage(agent)},
                 )
     agent.step_callback = _tyde_step_callback
+    original_buffer_status = getattr(agent, "_buffer_status", None)
+    original_buffer_vprint = getattr(agent, "_buffer_vprint", None)
+    retry_failures = {}
+    emitted_retries = set()
+    def _tyde_retry_observe(message):
+        text = str(message or "")
+        attempt_match = re.search(r"attempt\s+(\d+)\s*/\s*(\d+)", text, re.I)
+        if attempt_match:
+            attempt = int(attempt_match.group(1))
+            maximum = int(attempt_match.group(2))
+            if "failed" in text.lower() or "error" in text.lower():
+                retry_failures[attempt] = text
+        else:
+            attempt = maximum = None
+        backoff_match = re.search(r"(?:retrying in|waiting)\s+([0-9]+(?:\.[0-9]+)?)s", text, re.I)
+        if backoff_match:
+            if attempt is None and retry_failures:
+                attempt = max(retry_failures)
+                failure_match = re.search(
+                    r"attempt\s+(\d+)\s*/\s*(\d+)",
+                    retry_failures[attempt],
+                    re.I,
+                )
+                maximum = int(failure_match.group(2)) if failure_match else None
+            if attempt and maximum and attempt <= maximum and attempt not in emitted_retries:
+                emitted_retries.add(attempt)
+                _tyde_original_emit(
+                    "status.update",
+                    session_id,
+                    {
+                        "kind": "retry",
+                        "text": retry_failures.get(attempt, text),
+                        "attempt": attempt,
+                        "max_retries": maximum,
+                        "backoff_ms": max(1, int(float(backoff_match.group(1)) * 1000)),
+                    },
+                )
+    def _tyde_buffer_status(message):
+        _tyde_retry_observe(message)
+        if callable(original_buffer_status):
+            return original_buffer_status(message)
+    def _tyde_buffer_vprint(message):
+        _tyde_retry_observe(message)
+        if callable(original_buffer_vprint):
+            return original_buffer_vprint(message)
+    agent._buffer_status = _tyde_buffer_status
+    agent._buffer_vprint = _tyde_buffer_vprint
     return agent
 
 def _tyde_emit(event_type, session_id, payload=None):
+    if event_type == "subagent.complete" and isinstance(payload, dict):
+        summary = str(payload.get("summary") or payload.get("text") or "")
+        if payload.get("status") == "completed" and summary.startswith(
+            ("API call failed after ", "Billing or credits exhausted:")
+        ):
+            payload = dict(payload)
+            payload["status"] = "failed"
+            payload["error"] = summary
     if event_type == "message.start":
+        owner = threading.get_ident()
         with _tyde_message_condition:
-            while session_id in _tyde_open_messages:
+            while session_id in _tyde_open_messages and _tyde_open_messages[session_id][0] != owner:
                 _tyde_message_condition.wait()
-            _tyde_open_messages.add(session_id)
+            if session_id in _tyde_open_messages and _tyde_open_messages[session_id][0] == owner:
+                return
+            generation = int(_tyde_message_generations.get(session_id, 0)) + 1
+            _tyde_message_generations[session_id] = generation
+            _tyde_open_messages[session_id] = (owner, generation)
+            payload = dict(payload) if isinstance(payload, dict) else {}
+            payload["_tyde_turn_generation"] = generation
+    if event_type == "message.complete":
+        with _tyde_message_condition:
+            active = _tyde_open_messages.get(session_id)
+            if active is not None:
+                payload = dict(payload) if isinstance(payload, dict) else {}
+                payload["_tyde_turn_generation"] = active[1]
     if event_type == "tool.start" and isinstance(payload, dict):
         tool_id = str(payload.get("tool_id") or payload.get("tool_call_id") or "")
         args = _tyde_tool_start_args.pop((session_id, tool_id), None)
         if isinstance(args, dict):
             payload = dict(payload)
             payload["args"] = args
+    if event_type == "status.update" and isinstance(payload, dict) and payload.get("kind") == "process":
+        text = str(payload.get("text") or "")
+        with _tyde_background_completion_lock:
+            completion = _tyde_background_completions.pop(text, None)
+            if isinstance(completion, dict):
+                process_id = str(completion.get("session_id") or "")
+                if process_id:
+                    _tyde_background_completions_delivered.add(process_id)
+        if isinstance(completion, dict):
+            _tyde_original_emit("background.complete", session_id, completion)
     try:
         _tyde_original_emit(event_type, session_id, payload)
     finally:
         if event_type in ("message.complete", "error"):
             with _tyde_message_condition:
-                _tyde_open_messages.discard(session_id)
+                _tyde_open_messages.pop(session_id, None)
                 _tyde_message_condition.notify_all()
 
 _tyde_original_tool_start = _tyde_gateway_server._on_tool_start
@@ -187,7 +305,12 @@ from hermes_cli.config import read_raw_config, save_config
 
 name = sys.argv[1]
 command = sys.argv[2]
-managed = {"command": command, "args": ["hermes-mcp-bridge"]}
+supports_parallel_tool_calls = sys.argv[3].lower() == "true"
+managed = {
+    "command": command,
+    "args": ["hermes-mcp-bridge"],
+    "supports_parallel_tool_calls": supports_parallel_tool_calls,
+}
 config = read_raw_config()
 if not isinstance(config, dict):
     config = {}
@@ -253,17 +376,6 @@ if str(Path(wanted).expanduser()) not in existing:
     save_config(config)
 print(json.dumps(skills.get("external_dirs", [])))
 "#;
-
-#[cfg(test)]
-static TEST_HERMES_PYTHON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-#[cfg(test)]
-static TEST_HERMES_EXECUTABLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-#[cfg(test)]
-static TEST_HERMES_BRIDGE_EXECUTABLE: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
-#[cfg(test)]
-pub(crate) static TEST_HERMES_OVERRIDE_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 pub struct HermesBackend {
@@ -648,6 +760,7 @@ struct HermesEventMapper {
     current_message_id: Option<String>,
     current_text: String,
     current_reasoning_seen: bool,
+    typing_active: bool,
     model: Option<String>,
     provider: Option<String>,
     pending_tools: HashMap<String, String>,
@@ -655,11 +768,15 @@ struct HermesEventMapper {
     turn_tools: HashMap<String, HermesTurnTool>,
     next_turn_tool_order: u64,
     cancelled_tools: HashSet<String>,
+    opaque_progress_tools: HashSet<String>,
     background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
     last_session_usage: Option<TokenUsage>,
     cumulative_usage_incomplete: bool,
-    awaiting_interrupted_complete: bool,
+    current_turn_generation: Option<u64>,
+    last_turn_generation: Option<u64>,
+    interrupted_turn_generations: VecDeque<u64>,
+    next_local_turn_generation: u64,
     session_info_emitted: bool,
     approval_counter: u64,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
@@ -774,12 +891,23 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+            tyde_agent_adapter::BackendCapability::TaskUpdates,
+            tyde_agent_adapter::BackendCapability::TaskListReplacement,
+            tyde_agent_adapter::BackendCapability::TaskListClear,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
+            tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            tyde_agent_adapter::BackendCapability::OpaqueToolProgress,
+            tyde_agent_adapter::BackendCapability::RetryTelemetry,
+            tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
         ]
         .into()
     }
@@ -1854,7 +1982,6 @@ impl HermesSessionActor {
             || self.mapper.current_reasoning_seen
             || !self.mapper.pending_tools.is_empty()
             || self.mapper.pending_approval_tool_id.is_some()
-            || self.mapper.awaiting_interrupted_complete
         {
             return BackendCompactionStart::Deferred {
                 reason: BackendCompactionDeferredReason::ActiveTurn,
@@ -1878,7 +2005,7 @@ impl HermesSessionActor {
         let focus = request.focus.clone();
         self.emit_compaction_progress(&operation_id, CompactionStage::Dispatching);
         let mut params = json!({ "session_id": live_session_id.clone() });
-        if let Some(focus) = focus.filter(|focus| !focus.trim().is_empty()) {
+        if let Some(focus) = focus.clone().filter(|focus| !focus.trim().is_empty()) {
             params["focus_topic"] = Value::String(focus);
         }
         let response = match gateway.dispatch_request("session.compress", params).await {
@@ -1924,13 +2051,39 @@ impl HermesSessionActor {
                 },
             )));
             let result = classify_hermes_compaction_response(
-                terminal_operation_id,
+                terminal_operation_id.clone(),
                 live_session_id,
                 stored_before,
                 response,
                 &stored_session_id,
                 &compaction_capability,
             );
+            if result.mutation == BackendCompactionMutationState::Completed
+                && result.outcome.is_ok()
+                && let Some(provider_session_id) = result.provider_session_id.clone()
+            {
+                let observation = BackendObservedCompaction {
+                    observation_id: super::compaction::stable_observation_id(
+                        "hermes",
+                        &provider_session_id.0,
+                        &format!("session.compress:{}", terminal_operation_id.0),
+                    ),
+                    trigger: CompactionTrigger::BackendObservedManual,
+                    method: CompactionMethod::NativeRpc,
+                    provider_session_id: Some(provider_session_id),
+                    metrics: result.metrics.clone(),
+                    source: BackendCompactionObservationSource::HermesRpc {
+                        operation_id: terminal_operation_id.clone(),
+                    },
+                    user_focus: focus.map(|text| BackendCompactionUserFocus {
+                        text,
+                        provenance: BackendCompactionUserFocusProvenance::TydeRequest,
+                    }),
+                };
+                let _ = events_tx.send(BackendEvent::Compaction(BackendCompactionEvent::Observed(
+                    Box::new(observation),
+                )));
+            }
             *active_compaction
                 .lock()
                 .expect("Hermes active compaction mutex poisoned") = None;
@@ -1977,7 +2130,7 @@ impl HermesSessionActor {
 
         for event in startup_gateway_events {
             if !self.handle_gateway_event(event).await {
-                self.drain_background_tasks();
+                self.stop_owned_background_work().await;
                 self.gateway.shutdown().await;
                 return;
             }
@@ -1987,8 +2140,13 @@ impl HermesSessionActor {
             self.handle_send_message(input).await;
         }
 
+        let mut background_poll = tokio::time::interval(Duration::from_millis(500));
+        background_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = background_poll.tick(), if !self.mapper.background_tasks.is_empty() => {
+                    self.poll_background_tasks().await;
+                }
                 maybe_event = self.gateway_events_rx.recv() => {
                     let Some(event) = maybe_event else {
                         self.emit_error("Hermes gateway event channel closed");
@@ -2019,9 +2177,19 @@ impl HermesSessionActor {
                             let _ = reply.send(start);
                         }
                         HermesBackendCommand::Shutdown(reply) => {
-                            self.drain_background_tasks();
-                            self.gateway.shutdown().await;
+                            let active_turn = self.mapper.current_message_id.is_some()
+                                || self.mapper.current_reasoning_seen
+                                || !self.mapper.pending_tools.is_empty()
+                                || self.mapper.pending_approval_tool_id.is_some();
+                            if active_turn {
+                                eprintln!(
+                                    "TYDE HERMES SHUTDOWN settling active provider turn before session close"
+                                );
+                                let _ = self.handle_interrupt().await;
+                            }
+                            self.stop_owned_background_work().await;
                             let _ = reply.send(());
+                            self.gateway.shutdown().await;
                             return;
                         }
                     }
@@ -2029,13 +2197,149 @@ impl HermesSessionActor {
             }
         }
 
-        self.drain_background_tasks();
+        self.stop_owned_background_work().await;
         self.gateway.shutdown().await;
+    }
+
+    async fn stop_owned_background_work(&mut self) {
+        let task_ids = self
+            .mapper
+            .background_tasks
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for task_id in task_ids {
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                self.gateway.request(
+                    "process.kill",
+                    json!({
+                        "session_id": self.live_session_id,
+                        "process_id": task_id,
+                    }),
+                ),
+            )
+            .await;
+            tracing::debug!(task_id, ?result, "stopped Hermes-owned background process");
+        }
+        let subagent_ids = self.native_subagents.keys().cloned().collect::<Vec<_>>();
+        for subagent_id in subagent_ids {
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                self.gateway.request(
+                    "subagent.interrupt",
+                    json!({
+                        "session_id": self.live_session_id,
+                        "subagent_id": subagent_id,
+                    }),
+                ),
+            )
+            .await;
+            tracing::debug!(subagent_id, ?result, "stopped Hermes-owned native subagent");
+        }
+        self.drain_background_tasks();
     }
 
     fn drain_background_tasks(&mut self) {
         for event in self.mapper.drain_background_tasks() {
             self.emit(event);
+        }
+        let mut children = self.native_subagents.drain().collect::<Vec<_>>();
+        children.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, child) in children {
+            let _ = child
+                .handle
+                .event_tx
+                .send(ChatEvent::TypingStatusChanged(false));
+            if let Some(anchor) = child.parent_anchor.as_ref() {
+                self.emit(ChatEvent::ToolProgress(hermes_subagent_progress(
+                    &child.handle,
+                    &child.agent_name,
+                    anchor,
+                    child.tool_calls,
+                    true,
+                    protocol::SubAgentProgressStatus::Stopped,
+                )));
+                self.emit(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: anchor.tool_call_id.clone(),
+                        tool_name: anchor.tool_name.clone(),
+                        tool_result: ToolExecutionResult::Cancelled {
+                            message: "Hermes gateway owner exited before the native subagent reported completion"
+                                .to_owned(),
+                        },
+                        success: false,
+                        error: Some(
+                            "Hermes gateway owner exited before the native subagent reported completion"
+                                .to_owned(),
+                        ),
+                        normalization_failure: None,
+                    },
+                ));
+            }
+        }
+    }
+
+    async fn poll_background_tasks(&mut self) {
+        let response = match self
+            .gateway
+            .request(
+                "process.list",
+                json!({ "session_id": self.live_session_id }),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%error, "Hermes background process poll failed");
+                return;
+            }
+        };
+        let Some(processes) = response.get("processes").and_then(Value::as_array) else {
+            tracing::debug!(response = %response, "Hermes process.list omitted processes");
+            return;
+        };
+        let terminals = processes
+            .iter()
+            .filter_map(|process| {
+                let task_id = process.get("session_id")?.as_str()?;
+                (process.get("status").and_then(Value::as_str) == Some("exited")
+                    && self.mapper.background_tasks.contains_key(task_id))
+                .then(|| {
+                    (
+                        task_id.to_owned(),
+                        process.get("exit_code").and_then(Value::as_i64),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (task_id, exit_code) in terminals {
+            let Some(background) = self.mapper.background_tasks.remove(&task_id) else {
+                continue;
+            };
+            let status = if exit_code == Some(0) {
+                BackgroundTaskStatus::Completed
+            } else {
+                BackgroundTaskStatus::Failed
+            };
+            tracing::debug!(
+                task_id,
+                ?exit_code,
+                ?status,
+                "Hermes observed background process terminal from process.list"
+            );
+            for event in self.mapper.background_terminal_events(
+                &background,
+                &task_id,
+                status,
+                exit_code
+                    .and_then(|code| i32::try_from(code).ok())
+                    .unwrap_or(-1),
+                String::new(),
+                exit_code.map(|code| format!("Exited with code {code}")),
+            ) {
+                self.emit(event);
+            }
         }
     }
 
@@ -2081,6 +2385,7 @@ impl HermesSessionActor {
         // stale output from an earlier one.
         self.recent_stderr.clear();
         self.emit(ChatEvent::MessageAdded(user_message(&payload.message)));
+        self.mapper.typing_active = true;
         self.emit(ChatEvent::TypingStatusChanged(true));
         match self
             .gateway
@@ -2108,6 +2413,9 @@ impl HermesSessionActor {
 
     async fn handle_tool_response(&mut self, response: SendMessageToolResponse, message: String) {
         match response {
+            SendMessageToolResponse::AskUserQuestion { .. } => {
+                self.emit_error("Hermes received an unsupported user-question response");
+            }
             SendMessageToolResponse::ExitPlanMode {
                 tool_call_id,
                 decision,
@@ -2153,6 +2461,7 @@ impl HermesSessionActor {
                                 normalization_failure: None,
                             },
                         ));
+                        self.mapper.typing_active = true;
                         self.emit(ChatEvent::TypingStatusChanged(true));
                     }
                     Err(err) => self.emit_error(format!("Hermes approval.respond failed: {err}")),
@@ -2319,16 +2628,25 @@ impl HermesSessionActor {
                     "mapping Hermes gateway event"
                 );
                 if event_type.starts_with("subagent.") {
+                    eprintln!(
+                        "TYDE HERMES SUBAGENT RAW type={event_type} session={} payload={payload:?}",
+                        self.live_session_id
+                    );
                     self.handle_native_subagent_event(&event_type, payload)
                         .await;
                     return true;
                 }
                 if event_type == "message.complete" {
+                    eprintln!(
+                        "TYDE HERMES MESSAGE COMPLETE RAW session={} payload={payload:?}",
+                        self.live_session_id
+                    );
                     let status = payload
                         .as_ref()
                         .and_then(|value| optional_string(value, &["status"]));
-                    let cancelled_settlement = (self.mapper.awaiting_interrupted_complete
-                        && self.mapper.current_message_id.is_none())
+                    let cancelled_settlement = self
+                        .mapper
+                        .completion_belongs_to_interrupted_turn(payload.as_ref())
                         || status.as_deref() == Some("interrupted");
                     if !cancelled_settlement {
                         payload = self.enrich_message_complete_payload(payload).await;
@@ -2352,6 +2670,7 @@ impl HermesSessionActor {
                 true
             }
             HermesGatewayEvent::Stderr(line) => {
+                eprintln!("TYDE HERMES STDERR {line}");
                 // Hermes stderr is diagnostic decoration — retry panels ("API
                 // call failed (attempt 1/3)", provider/endpoint/elapsed banners),
                 // capability notes, and the like — not a user-facing error
@@ -2422,13 +2741,17 @@ impl HermesSessionActor {
             let parent_anchor = self
                 .mapper
                 .resolve_delegation_anchor(&payload, &description);
-            if parent_anchor.is_none() {
-                tracing::debug!(
+            let Some(parent_anchor) = parent_anchor else {
+                self.emit_error(format!(
+                    "Hermes native child {subagent_id} could not be attributed to a unique delegate_task request"
+                ));
+                tracing::error!(
                     subagent_id = %subagent_id,
                     event_type,
-                    "Hermes native child has no unambiguous delegation card; its progress stays unanchored"
+                    "Hermes native child has no unambiguous delegation card"
                 );
-            }
+                return;
+            };
             let task_index = payload
                 .get("task_index")
                 .and_then(Value::as_u64)
@@ -2438,7 +2761,7 @@ impl HermesSessionActor {
             let session_id_hint = optional_string(&payload, &["child_session_id"]).map(SessionId);
             let handle = match emitter
                 .on_subagent_spawned(
-                    subagent_id.clone(),
+                    parent_anchor.tool_call_id.clone(),
                     agent_name.clone(),
                     description.clone(),
                     "hermes_native".to_string(),
@@ -2459,7 +2782,7 @@ impl HermesSessionActor {
                 HermesNativeSubagent {
                     handle,
                     agent_name,
-                    parent_anchor,
+                    parent_anchor: Some(parent_anchor),
                     tool_calls: 0,
                 },
             );
@@ -2467,11 +2790,33 @@ impl HermesSessionActor {
 
         let mut child_event = None;
         let mut parent_progress = None;
+        let mut parent_completion = None;
         if let Some(child) = self.native_subagents.get_mut(&subagent_id) {
             if event_type == "subagent.tool" {
                 child.tool_calls = child.tool_calls.saturating_add(1);
             }
             let completed = event_type == "subagent.complete";
+            let reported_status = optional_string_any(&payload, &["status", "state"])
+                .map(|status| status.to_ascii_lowercase());
+            let status = if !completed {
+                protocol::SubAgentProgressStatus::Running
+            } else if payload.get("success").and_then(Value::as_bool) == Some(false)
+                || reported_status.as_deref().is_some_and(|status| {
+                    matches!(
+                        status,
+                        "failed" | "failure" | "error" | "timeout" | "rejected"
+                    )
+                })
+                || payload.get("error").is_some_and(|error| !error.is_null())
+            {
+                protocol::SubAgentProgressStatus::Failed
+            } else if reported_status.as_deref().is_some_and(|status| {
+                matches!(status, "interrupted" | "cancelled" | "canceled" | "stopped")
+            }) {
+                protocol::SubAgentProgressStatus::Stopped
+            } else {
+                protocol::SubAgentProgressStatus::Completed
+            };
             parent_progress = child.parent_anchor.as_ref().map(|anchor| {
                 hermes_subagent_progress(
                     &child.handle,
@@ -2479,11 +2824,16 @@ impl HermesSessionActor {
                     anchor,
                     child.tool_calls,
                     completed,
+                    status,
                 )
             });
             if completed {
                 let content = optional_string_any(&payload, &["summary", "text"])
                     .unwrap_or_else(|| "Hermes child completed.".to_string());
+                let token_usage = token_usage_from_value(&payload);
+                if let Some(usage) = token_usage.as_ref() {
+                    let _ = child.handle.total_usage_tx.send(usage.total_tokens);
+                }
                 child_event = Some(ChatEvent::MessageAdded(ChatMessage {
                     message_id: None,
                     timestamp: unix_now_ms(),
@@ -2495,10 +2845,60 @@ impl HermesSessionActor {
                     tool_calls: Vec::new(),
                     model_info: optional_string(&payload, &["model"])
                         .map(|model| ModelInfo { model }),
-                    token_usage: None,
+                    token_usage: token_usage.map(|usage| MessageTokenUsage {
+                        request: TokenUsageScope::Unavailable {
+                            reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                        },
+                        turn: TokenUsageScope::Known {
+                            usage: Box::new(usage.clone()),
+                        },
+                        cumulative: TokenUsageScope::Known {
+                            usage: Box::new(usage),
+                        },
+                    }),
                     context_breakdown: None,
                     images: None,
                 }));
+                let (success, tool_result, error) = match status {
+                    protocol::SubAgentProgressStatus::Completed => (
+                        true,
+                        ToolExecutionResult::Other {
+                            result: payload.clone(),
+                        },
+                        None,
+                    ),
+                    protocol::SubAgentProgressStatus::Stopped => (
+                        false,
+                        ToolExecutionResult::Cancelled {
+                            message: "Hermes native subagent was stopped".to_owned(),
+                        },
+                        Some("Hermes native subagent was stopped".to_owned()),
+                    ),
+                    _ => {
+                        let message = optional_string_any(&payload, &["error", "summary", "text"])
+                            .unwrap_or_else(|| "Hermes native subagent failed".to_owned());
+                        (
+                            false,
+                            ToolExecutionResult::Error {
+                                short_message: message.clone(),
+                                detailed_message: payload.to_string(),
+                            },
+                            Some(message),
+                        )
+                    }
+                };
+                if let Some(anchor) = child.parent_anchor.as_ref() {
+                    parent_completion = Some(ChatEvent::ToolExecutionCompleted(
+                        ToolExecutionCompletedData {
+                            tool_call_id: anchor.tool_call_id.clone(),
+                            tool_name: anchor.tool_name.clone(),
+                            tool_result,
+                            success,
+                            error,
+                            normalization_failure: None,
+                        },
+                    ));
+                }
             }
         }
         if let Some(progress) = parent_progress {
@@ -2508,6 +2908,9 @@ impl HermesSessionActor {
             && let Some(child) = self.native_subagents.get(&subagent_id)
         {
             let _ = child.handle.event_tx.send(event);
+        }
+        if let Some(completion) = parent_completion {
+            self.emit(completion);
         }
         if event_type == "subagent.complete" {
             self.native_subagents.remove(&subagent_id);
@@ -3394,7 +3797,12 @@ async fn prepare_hermes_mcp_runtime(
     }
 
     let bridge_program = resolve_hermes_bridge_executable()?;
-    let selected = register_hermes_mcp_bridge(target, &bridge_program).await?;
+    let selected = register_hermes_mcp_bridge(
+        target,
+        &bridge_program,
+        descriptor.supports_parallel_tool_calls,
+    )
+    .await?;
     let selected_toolsets = if let Some(selected) = selected {
         let selected =
             hermes_selected_toolsets(selected, isolate_without_tools, skills_discoverable);
@@ -3464,6 +3872,14 @@ async fn prepare_hermes_mcp_runtime(
             .collect::<Vec<_>>(),
         "Starting Hermes gateway with the managed Tyde MCP bridge"
     );
+    eprintln!(
+        "TYDE HERMES MCP PARALLEL CONFIG servers={:?} bridge={}",
+        startup_mcp_servers
+            .iter()
+            .map(|server| (&server.name, server.supports_parallel_tool_calls))
+            .collect::<Vec<_>>(),
+        descriptor.supports_parallel_tool_calls
+    );
     Ok(Some(HermesMcpRuntime {
         _descriptor_dir: descriptor_dir,
         ready_path,
@@ -3481,15 +3897,20 @@ fn hermes_selected_toolsets(
     if skills_discoverable && !selected.iter().any(|name| name == "skills") {
         selected.push("skills".to_string());
     }
+    if !selected.iter().any(|name| name == "delegation") {
+        selected.push("delegation".to_string());
+    }
     if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
         selected.push(MANAGED_SERVER_NAME.to_string());
     }
+    eprintln!("TYDE HERMES SELECTED TOOLSETS {selected:?}");
     selected
 }
 
 async fn register_hermes_mcp_bridge(
     target: &HermesSpawnTarget,
     bridge_program: &str,
+    supports_parallel_tool_calls: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let mut command = Command::new(&target.program);
     command.args([
@@ -3497,6 +3918,11 @@ async fn register_hermes_mcp_bridge(
         HERMES_BRIDGE_REGISTRATION,
         MANAGED_SERVER_NAME,
         bridge_program,
+        if supports_parallel_tool_calls {
+            "true"
+        } else {
+            "false"
+        },
     ]);
     // Registration must run against the same Hermes home the gateway will be
     // spawned with. `target.env` carries the selected profile's HERMES_HOME,
@@ -3742,15 +4168,6 @@ fn prepare_hermes_managed_toolsets(
 }
 
 fn resolve_hermes_bridge_executable() -> Result<String, String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_HERMES_BRIDGE_EXECUTABLE
-        .lock()
-        .expect("test Hermes bridge executable mutex poisoned")
-        .clone()
-    {
-        return Ok(value);
-    }
-
     if let Some(value) = std::env::var(HERMES_BRIDGE_EXECUTABLE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
@@ -3800,6 +4217,10 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         .await;
     }
 
+    eprintln!(
+        "TYDE HERMES SPAWN ENV https_proxy={:?}",
+        std::env::var("HTTPS_PROXY")
+    );
     let mut command = Command::new(&target.program);
     command.args(&target.args);
     command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
@@ -3830,11 +4251,13 @@ impl HermesEventMapper {
         tasks.sort_by(|(left, _), (right, _)| left.cmp(right));
         tasks
             .into_iter()
-            .filter_map(|(task_id, background)| {
-                self.background_progress_event(
+            .flat_map(|(task_id, background)| {
+                self.background_terminal_events(
                     &background,
                     &task_id,
                     BackgroundTaskStatus::Stopped,
+                    -1,
+                    String::new(),
                     Some(
                         "Hermes gateway owner exited before the background command reported completion"
                             .to_string(),
@@ -3851,16 +4274,20 @@ impl HermesEventMapper {
             "session.title" => Ok(Vec::new()),
             "status.update" => self.map_status_update(payload),
             "provider.request.start" => self.map_provider_request_start(payload),
-            "message.start" => self.map_message_start(),
+            "message.start" => self.map_message_start(payload),
             "message.delta" => self.map_message_delta(payload),
             "message.complete" => self.map_message_complete(payload),
             "thinking.delta" | "reasoning.delta" => self.map_reasoning_delta(event_type, payload),
             "reasoning.available" => self.map_reasoning_available(payload),
-            "tool.generating" => Ok(Vec::new()),
+            "tool.generating" => {
+                eprintln!("TYDE HERMES TOOL GENERATING payload={payload:?}");
+                Ok(Vec::new())
+            }
             "tool.start" => self.map_tool_start(payload),
             "tool.progress" => self.map_tool_progress(payload),
             "tool.complete" => self.map_tool_complete(payload),
             "agent.terminal.output" => self.map_agent_terminal_output(payload),
+            "background.complete" => self.map_background_complete(payload),
             "terminal.close" => Ok(Vec::new()),
             "approval.request" => self.map_approval_request(payload),
             "error" => self.map_error(payload),
@@ -3889,6 +4316,7 @@ impl HermesEventMapper {
         ));
         events.push(ChatEvent::MessageAdded(error_message(message.into())));
         events.push(ChatEvent::TypingStatusChanged(false));
+        self.typing_active = false;
         self.clear_turn_state();
         events
     }
@@ -3962,7 +4390,7 @@ impl HermesEventMapper {
         Ok(Vec::new())
     }
 
-    fn map_message_start(&mut self) -> Result<Vec<ChatEvent>, String> {
+    fn map_message_start(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
             events.extend(self.finish_stream_events(None, None, None, None));
@@ -3979,10 +4407,24 @@ impl HermesEventMapper {
             )));
         }
         self.clear_turn_state();
+        let generation = payload
+            .as_ref()
+            .and_then(|payload| payload.get("_tyde_turn_generation"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                self.next_local_turn_generation = self.next_local_turn_generation.saturating_add(1);
+                self.next_local_turn_generation
+            });
+        self.next_local_turn_generation = self.next_local_turn_generation.max(generation);
+        self.current_turn_generation = Some(generation);
         let message_id = Uuid::new_v4().to_string();
         self.current_message_id = Some(message_id.clone());
         self.current_text.clear();
         self.current_reasoning_seen = false;
+        if !self.typing_active {
+            events.push(ChatEvent::TypingStatusChanged(true));
+            self.typing_active = true;
+        }
         events.push(ChatEvent::StreamStart(StreamStartData {
             message_id: Some(message_id),
             agent: HERMES_AGENT_NAME.to_string(),
@@ -4101,8 +4543,32 @@ impl HermesEventMapper {
             Some(raw) => raw.trim().to_string(),
             None => "complete".to_string(),
         };
-        if self.awaiting_interrupted_complete && self.current_message_id.is_none() {
-            self.awaiting_interrupted_complete = false;
+        let stamped_generation = payload.get("_tyde_turn_generation").and_then(Value::as_u64);
+        if stamped_generation.is_none() && !self.interrupted_turn_generations.is_empty() {
+            tracing::warn!(
+                active_generation = ?self.current_turn_generation,
+                "ignored uncorrelated Hermes completion while an interrupted generation remained unsettled"
+            );
+            return Ok(Vec::new());
+        }
+        let reported_generation = stamped_generation.or(self.current_turn_generation);
+        if let Some(generation) = reported_generation
+            && let Some(index) = self
+                .interrupted_turn_generations
+                .iter()
+                .position(|candidate| *candidate == generation)
+        {
+            self.interrupted_turn_generations.remove(index);
+            return Ok(Vec::new());
+        }
+        if let (Some(reported), Some(active)) = (reported_generation, self.current_turn_generation)
+            && reported != active
+        {
+            tracing::warn!(
+                reported_generation = reported,
+                active_generation = active,
+                "ignored Hermes completion for a non-current turn generation"
+            );
             return Ok(Vec::new());
         }
         if self.current_message_id.is_none() {
@@ -4204,6 +4670,7 @@ impl HermesEventMapper {
             }
         }
         if status != "interrupted" {
+            self.typing_active = false;
             self.clear_turn_state();
         }
         Ok(events)
@@ -4288,15 +4755,20 @@ impl HermesEventMapper {
             .ok_or_else(|| {
                 format!("Hermes tool.progress missing name for unknown tool_id {tool_call_id}")
             })?;
+        self.opaque_progress_tools.insert(tool_call_id.clone());
         Ok(vec![ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id,
             tool_name,
-            update: ToolProgressUpdate::Other { payload },
+            update: ToolProgressUpdate::Other {
+                status: protocol::OpaqueToolProgressStatus::Running,
+                payload,
+            },
         })])
     }
 
     fn map_tool_complete(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "tool.complete")?;
+        eprintln!("TYDE HERMES TOOL COMPLETE RAW payload={payload}");
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.complete")?;
         let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.complete")?;
@@ -4323,29 +4795,105 @@ impl HermesEventMapper {
             .cloned()
             .or_else(|| payload.get("summary").cloned())
             .unwrap_or(Value::Null);
-        let error = hermes_tool_error(&payload, &result);
-        let success = error.is_none();
+        let provider_error = hermes_tool_error(&payload, &result);
+        let normalized_mcp = tool_name
+            .starts_with("mcp_tyde_")
+            .then(|| normalize_mcp_call_tool_result(&payload));
+        let success = normalized_mcp
+            .as_ref()
+            .map(|normalized| normalized.success && provider_error.is_none())
+            .unwrap_or_else(|| provider_error.is_none());
+        let error = normalized_mcp
+            .as_ref()
+            .and_then(|normalized| normalized.error.clone())
+            .or(provider_error);
         let completion_tool_call_id = tool_call_id.clone();
-        let mut events = vec![ChatEvent::ToolExecutionCompleted(
-            ToolExecutionCompletedData {
-                tool_call_id,
+        let mut events = Vec::new();
+        if let Some(progress) = terminal_await_progress_data_for_tool(
+            &completion_tool_call_id,
+            &tool_name,
+            &arguments,
+            if success {
+                protocol::AgentControlProgressStatus::Completed
+            } else if error.as_ref().is_some_and(|error| {
+                error.to_ascii_lowercase().contains("cancel")
+                    || error.to_ascii_lowercase().contains("interrupt")
+            }) {
+                protocol::AgentControlProgressStatus::Stopped
+            } else {
+                protocol::AgentControlProgressStatus::Failed
+            },
+        ) {
+            events.push(ChatEvent::ToolProgress(progress));
+        }
+        if self.opaque_progress_tools.remove(&completion_tool_call_id) {
+            events.push(ChatEvent::ToolProgress(ToolProgressData {
+                tool_call_id: completion_tool_call_id.clone(),
                 tool_name: tool_name.clone(),
-                tool_result: ToolExecutionResult::Other {
+                update: ToolProgressUpdate::Other {
+                    status: if success {
+                        protocol::OpaqueToolProgressStatus::Completed
+                    } else {
+                        protocol::OpaqueToolProgressStatus::Failed
+                    },
+                    payload: payload.clone(),
+                },
+            }));
+        }
+        let tool_result = match normalized_mcp {
+            Some(normalized) if success => serde_json::from_value(normalized.tool_result)
+                .expect("canonical MCP tool result must deserialize"),
+            Some(normalized)
+                if normalized.tool_result.get("kind").and_then(Value::as_str) == Some("Error") =>
+            {
+                serde_json::from_value(normalized.tool_result)
+                    .expect("canonical MCP error result must deserialize")
+            }
+            Some(normalized) => ToolExecutionResult::Error {
+                short_message: error
+                    .clone()
+                    .unwrap_or_else(|| "Hermes MCP tool failed".to_owned()),
+                detailed_message: normalized
+                    .tool_result
+                    .get("result")
+                    .and_then(|result| serde_json::to_string_pretty(result).ok())
+                    .unwrap_or_else(|| normalized.tool_result.to_string()),
+            },
+            None => match &error {
+                None => ToolExecutionResult::Other {
                     result: result.clone(),
                 },
-                success,
-                error,
-                normalization_failure: None,
+                Some(message) => ToolExecutionResult::Error {
+                    short_message: message.clone(),
+                    detailed_message: serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| result.to_string()),
+                },
             },
-        )];
-        if success
+        };
+        let background_task_id = (success
             && normalized_hermes_tool_name(&tool_name) == "terminal"
             && arguments
                 .get("background")
                 .and_then(Value::as_bool)
-                .unwrap_or(false)
-            && let Some(task_id) = non_empty_value_string(&result, &["session_id", "process_id"])
-        {
+                .unwrap_or(false))
+        .then(|| non_empty_value_string(&result, &["session_id", "process_id"]))
+        .flatten();
+        let native_subagent_dispatch = success
+            && is_hermes_delegate_tool(&tool_name)
+            && optional_string(&result, &["status"]).as_deref() == Some("dispatched");
+        if background_task_id.is_none() && !native_subagent_dispatch {
+            events.push(ChatEvent::ToolExecutionCompleted(
+                ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    tool_result: tool_result.clone(),
+                    success,
+                    error: error.clone(),
+                    normalization_failure: None,
+                },
+            ));
+        }
+        if let Some(task_id) = background_task_id {
             let command = arguments
                 .get("command")
                 .and_then(Value::as_str)
@@ -4375,7 +4923,22 @@ impl HermesEventMapper {
                 BackgroundTaskStatus::Failed
             };
             let summary = exit_code.map(|code| format!("Exited with code {code}"));
-            events.extend(self.background_progress_event(&background, &task_id, status, summary));
+            events.extend(
+                self.background_terminal_events(
+                    &background,
+                    &task_id,
+                    status,
+                    exit_code
+                        .and_then(|code| i32::try_from(code).ok())
+                        .unwrap_or(-1),
+                    result
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    summary,
+                ),
+            );
         }
         if success
             && is_hermes_todo_tool(&tool_name)
@@ -4396,6 +4959,49 @@ impl HermesEventMapper {
             events.push(ChatEvent::ToolProgress(progress));
         }
         Ok(events)
+    }
+
+    fn map_background_complete(
+        &mut self,
+        payload: Option<Value>,
+    ) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "background.complete")?;
+        let task_id = required_string_any(
+            &payload,
+            &["session_id", "process_id"],
+            "background.complete",
+        )?;
+        let Some(background) = self.background_tasks.remove(&task_id) else {
+            return Ok(Vec::new());
+        };
+        let exit_code = payload
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .unwrap_or(-1);
+        let completion_reason = optional_string(&payload, &["completion_reason"])
+            .unwrap_or_else(|| "exited".to_owned());
+        let success = exit_code == 0 && completion_reason != "killed";
+        let status = if completion_reason == "killed" {
+            BackgroundTaskStatus::Stopped
+        } else if success {
+            BackgroundTaskStatus::Completed
+        } else {
+            BackgroundTaskStatus::Failed
+        };
+        let output = payload
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Ok(self.background_terminal_events(
+            &background,
+            &task_id,
+            status,
+            exit_code,
+            output,
+            Some(format!("Exited with code {exit_code}")),
+        ))
     }
 
     fn map_agent_terminal_output(
@@ -4461,6 +5067,57 @@ impl HermesEventMapper {
                 output_unavailable: None,
             }),
         }))
+    }
+
+    fn background_terminal_events(
+        &self,
+        background: &HermesBackgroundTask,
+        task_id: &str,
+        status: BackgroundTaskStatus,
+        exit_code: i32,
+        output: String,
+        summary: Option<String>,
+    ) -> Vec<ChatEvent> {
+        let Some(progress) =
+            self.background_progress_event(background, task_id, status, summary.clone())
+        else {
+            return Vec::new();
+        };
+        let stopped = status == BackgroundTaskStatus::Stopped;
+        let success = status == BackgroundTaskStatus::Completed && exit_code == 0;
+        let message = summary.unwrap_or_else(|| match status {
+            BackgroundTaskStatus::Completed => "Hermes background command completed".to_owned(),
+            BackgroundTaskStatus::Failed => {
+                format!("Hermes background command exited with code {exit_code}")
+            }
+            BackgroundTaskStatus::Stopped => "Hermes background command stopped".to_owned(),
+            BackgroundTaskStatus::Running => "Hermes background command is running".to_owned(),
+            BackgroundTaskStatus::Unknown => {
+                "Hermes background command ended with unknown status".to_owned()
+            }
+        });
+        let tool_result = if stopped {
+            ToolExecutionResult::Cancelled {
+                message: message.clone(),
+            }
+        } else {
+            ToolExecutionResult::RunCommand {
+                exit_code,
+                stdout: output,
+                stderr: String::new(),
+            }
+        };
+        vec![
+            progress,
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                tool_call_id: background.tool_call_id.clone(),
+                tool_name: background.tool_name.clone(),
+                tool_result,
+                success,
+                error: (!success).then_some(message),
+                normalization_failure: None,
+            }),
+        ]
     }
 
     /// Resolves the delegation card a native child anchors to: an explicit
@@ -4610,6 +5267,14 @@ impl HermesEventMapper {
 
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
+        if let Some(generation) = self.current_turn_generation.or(self.last_turn_generation)
+            && !self.interrupted_turn_generations.contains(&generation)
+        {
+            if self.interrupted_turn_generations.len() >= 256 {
+                self.interrupted_turn_generations.pop_front();
+            }
+            self.interrupted_turn_generations.push_back(generation);
+        }
         if self.current_message_id.is_some() {
             events.extend(self.finish_stream_events(None, None, None, None));
         }
@@ -4620,11 +5285,11 @@ impl HermesEventMapper {
             message: message.to_string(),
         }));
         events.push(ChatEvent::TypingStatusChanged(false));
+        self.typing_active = false;
         self.current_message_id = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
         self.clear_turn_tool_state();
-        self.awaiting_interrupted_complete = true;
         events
     }
 
@@ -4642,6 +5307,16 @@ impl HermesEventMapper {
                 self.cancelled_tools.clear();
             }
             self.cancelled_tools.insert(tool_call_id.clone());
+            if self.opaque_progress_tools.remove(&tool_call_id) {
+                events.push(ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    update: ToolProgressUpdate::Other {
+                        status: protocol::OpaqueToolProgressStatus::Stopped,
+                        payload: Value::Null,
+                    },
+                }));
+            }
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
                     tool_call_id,
@@ -4685,11 +5360,20 @@ impl HermesEventMapper {
     }
 
     fn clear_turn_state(&mut self) {
+        if let Some(generation) = self.current_turn_generation.take() {
+            self.last_turn_generation = Some(generation);
+        }
         self.current_message_id = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
-        self.awaiting_interrupted_complete = false;
         self.clear_turn_tool_state();
+    }
+
+    fn completion_belongs_to_interrupted_turn(&self, payload: Option<&Value>) -> bool {
+        payload
+            .and_then(|payload| payload.get("_tyde_turn_generation"))
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| self.interrupted_turn_generations.contains(&generation))
     }
 
     fn clear_turn_tool_state(&mut self) {
@@ -4697,10 +5381,10 @@ impl HermesEventMapper {
             self.pending_tool_arguments.remove(tool_call_id);
         }
         self.pending_tools.clear();
+        self.opaque_progress_tools.clear();
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
         self.pending_approval_tool_id = None;
-        self.delegation_tools.clear();
     }
 }
 
@@ -4808,6 +5492,7 @@ fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option
         return Some(ToolRequestType::AgentSpawn {
             prompt: (!goals.is_empty()).then(|| goals.join("\n\n")),
             name: None,
+            execution_mode: protocol::AgentExecutionMode::Background,
         });
     }
     None
@@ -4934,6 +5619,7 @@ fn hermes_subagent_progress(
     anchor: &HermesDelegationAnchor,
     tool_calls: u64,
     completed: bool,
+    status: protocol::SubAgentProgressStatus,
 ) -> ToolProgressData {
     ToolProgressData {
         tool_call_id: anchor.tool_call_id.clone(),
@@ -4944,6 +5630,7 @@ fn hermes_subagent_progress(
             last_tool_name: None,
             tool_calls,
             completed,
+            status,
         }),
     }
 }
@@ -5047,7 +5734,13 @@ fn hermes_mcp_bridge_descriptor(
         });
     }
 
-    Ok(Some(BridgeDescriptor { servers }))
+    Ok(Some(BridgeDescriptor {
+        supports_parallel_tool_calls: !startup_mcp_servers.is_empty()
+            && startup_mcp_servers
+                .iter()
+                .all(|server| server.supports_parallel_tool_calls),
+        servers,
+    }))
 }
 
 fn build_session_create_params(
@@ -5554,15 +6247,31 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                     .unwrap_or_else(|| "tool".to_string());
                 let result =
                     serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+                let normalized_mcp = tool_name
+                    .starts_with("mcp_tyde_")
+                    .then(|| normalize_mcp_call_tool_result(&result));
+                let (tool_result, success, error) = match normalized_mcp {
+                    Some(normalized) => (
+                        serde_json::from_value(normalized.tool_result)
+                            .expect("canonical replayed MCP tool result must deserialize"),
+                        normalized.success,
+                        normalized.error,
+                    ),
+                    None => (
+                        ToolExecutionResult::Other {
+                            result: result.clone(),
+                        },
+                        true,
+                        None,
+                    ),
+                };
                 events.push(ChatEvent::ToolExecutionCompleted(
                     ToolExecutionCompletedData {
                         tool_call_id,
                         tool_name: tool_name.clone(),
-                        tool_result: ToolExecutionResult::Other {
-                            result: result.clone(),
-                        },
-                        success: true,
-                        error: None,
+                        tool_result,
+                        success,
+                        error,
                         normalization_failure: None,
                     },
                 ));
@@ -5677,10 +6386,6 @@ async fn resolve_gateway_spawn_target(
         });
     }
 
-    if test_hermes_python_override_is_set() {
-        return hermes_python_spawn_target(resolve_hermes_python_test_override()?, workspace_roots);
-    }
-
     if let Some(program) = explicit_hermes_python() {
         probe_hermes_python_gateway_import(&program)
             .await
@@ -5760,21 +6465,6 @@ async fn resolve_hermes_cli_gateway_spawn_target(
     Err(hermes_cli_required_failure(first_failure).message)
 }
 
-fn test_hermes_python_override_is_set() -> bool {
-    #[cfg(test)]
-    {
-        TEST_HERMES_PYTHON
-            .lock()
-            .expect("test Hermes Python mutex poisoned")
-            .is_some()
-    }
-
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
 pub(crate) fn hermes_executable_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
 
@@ -5798,15 +6488,6 @@ pub(crate) fn hermes_executable_candidates() -> Vec<String> {
 }
 
 pub(crate) fn explicit_hermes_executable() -> Option<String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_HERMES_EXECUTABLE
-        .lock()
-        .expect("test Hermes executable mutex poisoned")
-        .clone()
-    {
-        return Some(value);
-    }
-
     std::env::var(HERMES_EXECUTABLE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
@@ -6344,19 +7025,6 @@ pub(crate) fn hermes_cli_required_failure(
     }
 }
 
-fn resolve_hermes_python_test_override() -> Result<String, String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_HERMES_PYTHON
-        .lock()
-        .expect("test Hermes Python mutex poisoned")
-        .clone()
-    {
-        return Ok(value);
-    }
-
-    Err("test Hermes Python override is not set".to_string())
-}
-
 pub(crate) async fn probe_hermes_python_gateway_import(
     command: &str,
 ) -> Result<(), HermesProbeFailure> {
@@ -6849,4713 +7517,4 @@ fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)
         .unwrap_or(default)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use protocol::{BackendAccessMode, SendMessagePayload};
-    use std::fs;
-    use tempfile::TempDir;
-    use tokio::time::timeout;
-
-    struct TestHermesPythonGuard {
-        old: Option<String>,
-    }
-
-    struct TestHermesExecutableGuard {
-        old: Option<String>,
-    }
-
-    struct TestHermesBridgeExecutableGuard {
-        old: Option<String>,
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        old_value: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let old_value = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, old_value }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let old_value = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, old_value }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.old_value.take() {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
-            }
-        }
-    }
-
-    impl TestHermesPythonGuard {
-        fn set(value: &str) -> Self {
-            let mut guard = TEST_HERMES_PYTHON
-                .lock()
-                .expect("test Hermes Python mutex poisoned");
-            let old = guard.replace(value.to_string());
-            Self { old }
-        }
-    }
-
-    /// Points profile discovery at a test-owned Hermes home so tests never
-    /// read the machine's real `~/.hermes`. Serialize with
-    /// `TEST_HERMES_OVERRIDE_LOCK` like the other overrides.
-    struct TestHermesHomeGuard {
-        old: Option<PathBuf>,
-    }
-
-    impl TestHermesHomeGuard {
-        fn set(path: &Path) -> Self {
-            let mut guard = hermes_config::TEST_HERMES_HOME
-                .lock()
-                .expect("test Hermes home mutex poisoned");
-            let old = guard.replace(path.to_path_buf());
-            Self { old }
-        }
-    }
-
-    impl Drop for TestHermesHomeGuard {
-        fn drop(&mut self) {
-            *hermes_config::TEST_HERMES_HOME
-                .lock()
-                .expect("test Hermes home mutex poisoned") = self.old.take();
-        }
-    }
-
-    impl Drop for TestHermesPythonGuard {
-        fn drop(&mut self) {
-            *TEST_HERMES_PYTHON
-                .lock()
-                .expect("test Hermes Python mutex poisoned") = self.old.take();
-        }
-    }
-
-    impl TestHermesExecutableGuard {
-        fn set(value: &str) -> Self {
-            let mut guard = TEST_HERMES_EXECUTABLE
-                .lock()
-                .expect("test Hermes executable mutex poisoned");
-            let old = guard.replace(value.to_string());
-            Self { old }
-        }
-    }
-
-    impl Drop for TestHermesExecutableGuard {
-        fn drop(&mut self) {
-            *TEST_HERMES_EXECUTABLE
-                .lock()
-                .expect("test Hermes executable mutex poisoned") = self.old.take();
-        }
-    }
-
-    impl TestHermesBridgeExecutableGuard {
-        fn set(value: &str) -> Self {
-            let mut guard = TEST_HERMES_BRIDGE_EXECUTABLE
-                .lock()
-                .expect("test Hermes bridge executable mutex poisoned");
-            let old = guard.replace(value.to_string());
-            Self { old }
-        }
-    }
-
-    impl Drop for TestHermesBridgeExecutableGuard {
-        fn drop(&mut self) {
-            *TEST_HERMES_BRIDGE_EXECUTABLE
-                .lock()
-                .expect("test Hermes bridge executable mutex poisoned") = self.old.take();
-        }
-    }
-
-    fn payload(message: &str) -> SendMessagePayload {
-        SendMessagePayload {
-            message: message.to_string(),
-            images: None,
-            origin: None,
-            tool_response: None,
-        }
-    }
-
-    /// Tyde invokes the Hermes program two ways: as the gateway, and as
-    /// `hermes -c <script> <arg>` to edit the profile's config. A fake that only
-    /// models the first would answer a registration with gateway chatter, so
-    /// every fake gateway answers the skills-directory registration the way a
-    /// real install does — by running the script, which reports the configured
-    /// directories.
-    const FAKE_SKILL_REGISTRATION_PRELUDE: &str = r#"
-import json as _json, sys as _sys
-if len(_sys.argv) > 3 and _sys.argv[1] == "-c" and "external_dirs" in _sys.argv[2]:
-    print(_json.dumps([_sys.argv[3]]), flush=True)
-    raise SystemExit(0)
-"#;
-
-    fn write_fake_gateway(dir: &TempDir, body: &str) -> String {
-        let script = dir.path().join("fake_gateway.py");
-        fs::write(&script, format!("{FAKE_SKILL_REGISTRATION_PRELUDE}{body}"))
-            .expect("write fake gateway");
-        let launcher = dir.path().join("fake_python.sh");
-        fs::write(
-            &launcher,
-            format!("#!/bin/sh\nexec python3 {} \"$@\"\n", script.display()),
-        )
-        .expect("write fake python");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&launcher)
-                .expect("launcher metadata")
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&launcher, perms).expect("chmod launcher");
-        }
-        launcher.to_string_lossy().to_string()
-    }
-
-    fn write_fake_managed_mcp_gateway(
-        dir: &TempDir,
-    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
-        write_fake_managed_mcp_gateway_with_deferral(dir, false)
-    }
-
-    /// Like `write_fake_managed_mcp_gateway`, but simulates a Hermes with
-    /// Tool Search deferral active: tools.show never names the managed
-    /// toolset (the model-visible list carries only the tool_search bridge),
-    /// and the managed toolset is visible solely through the tools.list
-    /// registry view.
-    fn write_fake_deferred_mcp_gateway(
-        dir: &TempDir,
-    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
-        write_fake_managed_mcp_gateway_with_deferral(dir, true)
-    }
-
-    fn write_fake_managed_mcp_gateway_with_deferral(
-        dir: &TempDir,
-        deferred: bool,
-    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
-        let observed = dir.path().join("observed.json");
-        let config = dir.path().join("config.json");
-        fs::write(
-            &config,
-            serde_json::to_vec(&json!({
-                "model": { "default": "native-model" },
-                "mcp_servers": {
-                    "native": { "command": "native-command", "args": [] },
-                    "tyde": {
-                        "command": "/obsolete/tyde-server",
-                        "args": ["hermes-mcp-bridge"]
-                    }
-                }
-            }))
-            .expect("serialize fake config"),
-        )
-        .expect("write fake config");
-        let observed_json =
-            serde_json::to_string(&observed.to_string_lossy()).expect("serialize observed path");
-        let config_json =
-            serde_json::to_string(&config.to_string_lossy()).expect("serialize config path");
-        let deferred_py = if deferred { "True" } else { "False" };
-        let script = format!(
-            r#"
-import json, os, sys
-
-observed_path = {observed_json}
-config_path = {config_json}
-DEFERRED = {deferred_py}
-if len(sys.argv) == 5 and sys.argv[1:2] == ["-c"]:
-    name = sys.argv[-2]
-    command = sys.argv[-1]
-    with open(config_path, encoding="utf-8") as source:
-        config = json.load(source)
-    existing = config.setdefault("mcp_servers", {{}}).get(name)
-    managed = {{"command": command, "args": ["hermes-mcp-bridge"]}}
-    if existing != managed:
-        if existing is not None and existing.get("args") != ["hermes-mcp-bridge"]:
-            raise RuntimeError("user-managed collision")
-        config["mcp_servers"][name] = managed
-        with open(config_path, "w", encoding="utf-8") as output:
-            json.dump(config, output, sort_keys=True)
-    print(json.dumps(["file"]))
-    raise SystemExit(0)
-
-with open(config_path, encoding="utf-8") as source:
-    config = json.load(source)
-with open(os.environ["TYDE_HERMES_MCP_DESCRIPTOR"], encoding="utf-8") as source:
-    descriptor = json.load(source)
-with open(observed_path, "w", encoding="utf-8") as output:
-    json.dump({{
-        "config": config,
-        "descriptor": descriptor,
-        "toolsets": os.environ.get("HERMES_TUI_TOOLSETS")
-    }}, output, sort_keys=True)
-with open(os.path.join(os.environ["TMPDIR"], "tyde-mcp-ready.json"), "w", encoding="utf-8") as output:
-    json.dump({{"ok": True}}, output)
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{"skin":"default"}}}}}}), flush=True)
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request["id"]
-    method = request["method"]
-    params = request.get("params") or {{}}
-    if method == "session.create":
-        result = {{"session_id":"live-mcp","stored_session_id":"stored-mcp","messages":[],"info":{{}}}}
-    elif method == "prompt.submit":
-        result = {{"status":"streaming"}}
-    elif method == "session.usage":
-        result = {{"input":0,"output":0,"total":0}}
-    elif method == "tools.show":
-        if DEFERRED:
-            result = {{"sections":[{{"name":"unknown","tools":[{{"name":"tool_search"}},{{"name":"tool_describe"}},{{"name":"tool_call"}}]}}],"total":3}}
-        else:
-            result = {{"sections":[{{"name":"mcp-tyde","tools":[{{"name":"mcp_tyde_probe"}}]}}],"total":1}}
-    elif method == "tools.list":
-        if DEFERRED:
-            result = {{"toolsets":[
-                {{"name":"file","tool_count":1,"enabled":True,"tools":["read_file"]}},
-                {{"name":"tyde","tool_count":1,"enabled":True,"tools":["mcp_tyde_probe"]}},
-            ]}}
-        else:
-            result = {{"toolsets":[]}}
-    else:
-        result = {{}}
-    print(json.dumps({{"jsonrpc":"2.0","id":request_id,"result":result}}), flush=True)
-    if method == "session.create":
-        if DEFERRED:
-            tools_payload = {{"other":["tool_search","tool_describe","tool_call"]}}
-        else:
-            tools_payload = {{"mcp-tyde":["mcp_tyde_probe"]}}
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"session.info","session_id":"live-mcp","payload":{{"tools":tools_payload}}}}}}), flush=True)
-    if method == "prompt.submit":
-        session_id = params["session_id"]
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":session_id}}}}), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":session_id,"payload":{{"text":"mcp ready","status":"complete"}}}}}}), flush=True)
-"#
-        );
-        (write_fake_gateway(dir, &script), observed, config)
-    }
-
-    fn write_fake_hermes_cli_install(dir: &TempDir) -> (String, String) {
-        let project = dir.path().join("hermes-agent");
-        fs::create_dir_all(&project).expect("create fake Hermes project");
-        let python = dir.path().join("fake_python");
-        let console = dir.path().join("hermes_console");
-        fs::write(
-            &python,
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
-        )
-        .expect("write fake Hermes Python");
-        fs::write(
-            &console,
-            format!("#!{}\nimport sys\nsys.exit(1)\n", python.to_string_lossy()),
-        )
-        .expect("write fake Hermes console script");
-        let hermes = dir.path().join("hermes");
-        let console_quoted = console.to_string_lossy().replace('\'', "'\\''");
-        fs::write(
-            &hermes,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexec '{console_quoted}' \"$@\"\n",
-                project.to_string_lossy(),
-            ),
-        )
-        .expect("write fake Hermes executable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&python, &console, &hermes] {
-                let mut perms = fs::metadata(path)
-                    .expect("fake Hermes metadata")
-                    .permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(path, perms).expect("chmod fake Hermes executable");
-            }
-        }
-        (
-            hermes.to_string_lossy().to_string(),
-            python.to_string_lossy().to_string(),
-        )
-    }
-
-    #[tokio::test]
-    async fn hermes_spawn_target_prefers_verified_cli_install() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let (hermes, python) = write_fake_hermes_cli_install(&dir);
-        let _hermes_guard = TestHermesExecutableGuard::set(&hermes);
-        let _python_env = EnvGuard::unset("HERMES_PYTHON");
-
-        let target = resolve_gateway_spawn_target(&[dir.path().to_string_lossy().to_string()])
-            .await
-            .expect("resolve Hermes spawn target");
-
-        assert_eq!(target.program, python);
-        assert_eq!(target.args[0], "-c");
-        assert_eq!(target.args[1], HERMES_MCP_GATEWAY_ENTRY);
-        assert!(
-            target.display_program.contains(&hermes),
-            "display should mention resolved Hermes executable: {}",
-            target.display_program
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_spawn_target_discovers_home_local_bin_cli() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let home = TempDir::new().expect("tempdir");
-        let local_bin = home.path().join(".local").join("bin");
-        fs::create_dir_all(&local_bin).expect("create fake local bin");
-        let cli_dir = TempDir::new().expect("cli tempdir");
-        let (hermes, python) = write_fake_hermes_cli_install(&cli_dir);
-        let local_hermes = local_bin.join("hermes");
-        fs::rename(&hermes, &local_hermes).expect("move fake Hermes into ~/.local/bin");
-        let _home = EnvGuard::set("HOME", &home.path().to_string_lossy());
-        let _python_env = EnvGuard::unset("HERMES_PYTHON");
-        let _executable_env = EnvGuard::unset("HERMES_EXECUTABLE");
-
-        let target = resolve_gateway_spawn_target(&[home.path().to_string_lossy().to_string()])
-            .await
-            .expect("resolve Hermes spawn target");
-
-        assert_eq!(target.program, python);
-        let local_hermes = local_hermes.to_string_lossy();
-        assert!(
-            target.display_program.contains(local_hermes.as_ref()),
-            "display should mention Hermes discovered in ~/.local/bin: {}",
-            target.display_program
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_gateway_import_failure_is_concise() {
-        let dir = TempDir::new().expect("tempdir");
-        let python = dir.path().join("python");
-        fs::write(
-            &python,
-            "#!/bin/sh\nprintf 'Traceback (most recent call last):\\nModuleNotFoundError: tui_gateway\\n' >&2\nexit 1\n",
-        )
-        .expect("write fake python");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python)
-                .expect("fake python metadata")
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).expect("chmod fake python");
-        }
-
-        let failure = probe_hermes_python_gateway_import(&python.to_string_lossy())
-            .await
-            .expect_err("import probe should fail");
-
-        assert_eq!(
-            failure.code,
-            BackendSetupDiagnosticCode::GatewayImportFailed
-        );
-        assert!(
-            !failure.message.contains("Traceback")
-                && !failure.message.contains("ModuleNotFoundError"),
-            "diagnostic should not include raw Python traceback output: {}",
-            failure.message
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_backend_maps_basic_turn() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(
-            &dir,
-            r#"
-import json, sys, threading, time
-sessions = {}
-print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"skin":"default"}}}), flush=True)
-
-def emit(t, sid, payload=None):
-    params = {"type": t, "session_id": sid}
-    if payload is not None:
-        params["payload"] = payload
-    print(json.dumps({"jsonrpc":"2.0","method":"event","params":params}), flush=True)
-
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    params = req.get("params") or {}
-    if method == "session.create":
-        sid = "live1"
-        sessions[sid] = 0
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"session_id":sid,"stored_session_id":"stored1","messages":[],"info":{}}}), flush=True)
-        emit("session.info", sid, {"model":"fake-model","provider":"fake","cwd":"/tmp"})
-    elif method == "prompt.submit":
-        sid = params["session_id"]
-        sessions[sid] = sessions.get(sid, 0) + 1
-        turn = sessions[sid]
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"streaming"}}), flush=True)
-        emit("message.start", sid)
-        emit("reasoning.delta", sid, {"text":"think"})
-        emit("message.delta", sid, {"text":"hel"})
-        emit("message.delta", sid, {"text":"lo"})
-        emit("message.complete", sid, {"text":"hello","status":"complete","usage":{"input":turn,"output":2*turn,"total":3*turn,"cached_prompt_tokens":10*turn,"cache_creation_input_tokens":4*turn,"reasoning_tokens":turn}})
-    elif method == "session.interrupt":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"interrupted"}}), flush=True)
-    elif method == "session.usage":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"input":1,"output":2,"total":3}}), flush=True)
-    elif method == "session.context_breakdown":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"estimated_total":12000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":9000}]}}), flush=True)
-    elif method == "session.history":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"count":0,"messages":[]}}), flush=True)
-    elif method == "session.list":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"sessions":[]}}), flush=True)
-    else:
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
-"#,
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) = HermesBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            payload("hello"),
-        )
-        .await
-        .expect("spawn fake hermes");
-        assert_eq!(backend.session_id(), SessionId("stored1".to_string()));
-
-        let mut saw_start = false;
-        let mut text = String::new();
-        let mut saw_end = false;
-        let mut observed = Vec::new();
-        let deadline = Duration::from_secs(2);
-        while !saw_end {
-            let event = timeout(deadline, events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event stream open");
-            observed.push(format!("{event:?}"));
-            match event {
-                ChatEvent::StreamStart(_) => saw_start = true,
-                ChatEvent::StreamReasoningDelta(delta) => {
-                    panic!("Hermes raw reasoning must not be emitted: {delta:?}");
-                }
-                ChatEvent::StreamDelta(delta) => text.push_str(&delta.text),
-                ChatEvent::StreamEnd(end) => {
-                    assert_eq!(end.message.content, "hello");
-                    assert!(end.message.reasoning.is_none());
-                    let context = end
-                        .message
-                        .context_breakdown
-                        .as_ref()
-                        .expect("context breakdown");
-                    assert_eq!(context.input_tokens, 12_000);
-                    assert_eq!(context.context_window, 200_000);
-                    let usage = end.message.token_usage.as_ref().expect("usage");
-                    assert_eq!(
-                        usage.turn.known_usage().expect("turn usage").total_tokens,
-                        3
-                    );
-                    assert_eq!(
-                        usage
-                            .turn
-                            .known_usage()
-                            .and_then(|usage| usage.cached_prompt_tokens),
-                        Some(10)
-                    );
-                    saw_end = true;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_start);
-        assert_eq!(text, "hello");
-        assert!(
-            observed.iter().all(|event| !event.contains("think")),
-            "raw Hermes reasoning leaked into events: {observed:#?}"
-        );
-
-        assert!(
-            backend
-                .send(AgentInput::SendMessage(payload("again")))
-                .await
-        );
-        let second_end = timeout(deadline, async {
-            loop {
-                if let Some(ChatEvent::StreamEnd(end)) = events.recv().await {
-                    break end;
-                }
-            }
-        })
-        .await
-        .expect("second turn timeout");
-        let second_usage = second_end.message.token_usage.expect("second usage");
-        assert_eq!(
-            second_usage
-                .turn
-                .known_usage()
-                .expect("second turn usage")
-                .total_tokens,
-            3
-        );
-        assert_eq!(
-            second_usage
-                .cumulative
-                .known_usage()
-                .expect("second cumulative usage")
-                .total_tokens,
-            6
-        );
-        assert_eq!(
-            second_usage
-                .cumulative
-                .known_usage()
-                .and_then(|usage| usage.cached_prompt_tokens),
-            Some(20)
-        );
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn hermes_rejects_images_until_verified() {
-        let mut with_image = payload("hello");
-        with_image.images = Some(vec![protocol::ImageData {
-            media_type: "image/png".to_string(),
-            data: "abc".to_string(),
-        }]);
-        let err = match HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), with_image)
-            .await
-        {
-            Ok(_) => panic!("image support should be disabled"),
-            Err(err) => err,
-        };
-        assert!(err.contains("image input is disabled"));
-    }
-
-    #[tokio::test]
-    async fn hermes_gateway_uses_managed_mcp_bridge() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let (fake, observed_path, config_path) = write_fake_managed_mcp_gateway(&dir);
-        let _python_guard = TestHermesPythonGuard::set(&fake);
-        let _token_guard = EnvGuard::set("TYDE_MCP_TOKEN", "private-token");
-        let bridge = dir.path().join("tyde-server");
-        fs::write(&bridge, "bridge placeholder").expect("write bridge placeholder");
-        let _bridge_guard = TestHermesBridgeExecutableGuard::set(&bridge.to_string_lossy());
-
-        let startup_mcp_servers = vec![
-            StartupMcpServer {
-                name: "local".to_string(),
-                transport: StartupMcpTransport::Stdio {
-                    command: "node".to_string(),
-                    args: vec!["server.js".to_string()],
-                    env: HashMap::from([("LOCAL_KEY".to_string(), "value".to_string())]),
-                },
-            },
-            StartupMcpServer {
-                name: "shared".to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: "https://tyde.invalid/mcp".to_string(),
-                    headers: HashMap::from([("X-Tyde".to_string(), "yes".to_string())]),
-                    bearer_token_env_var: Some("TYDE_MCP_TOKEN".to_string()),
-                },
-            },
-        ];
-
-        let config = BackendSpawnConfig {
-            startup_mcp_servers,
-            ..BackendSpawnConfig::default()
-        };
-        let (backend, mut events) = HermesBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            config,
-            payload("verify MCP startup"),
-        )
-        .await
-        .expect("spawn bridged fake Hermes backend");
-
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    return;
-                }
-            }
-            panic!("Hermes event stream closed before the MCP test turn completed");
-        })
-        .await
-        .expect("MCP test turn should finish");
-
-        let observed: Value = serde_json::from_slice(
-            &fs::read(&observed_path).expect("read observed process config"),
-        )
-        .expect("parse observed process config");
-        assert_eq!(observed["toolsets"], "file,tyde");
-        assert_eq!(
-            observed["config"]["mcp_servers"]["native"]["command"],
-            "native-command"
-        );
-        assert_eq!(
-            observed["config"]["mcp_servers"]["tyde"]["command"],
-            bridge.to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            observed["config"]["mcp_servers"]["tyde"]["args"],
-            json!(["hermes-mcp-bridge"])
-        );
-        let servers = observed["descriptor"]["servers"]
-            .as_array()
-            .expect("descriptor servers");
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0]["name"], "local");
-        assert_eq!(servers[0]["transport"]["kind"], "stdio");
-        assert_eq!(servers[0]["transport"]["command"], "node");
-        assert_eq!(servers[0]["transport"]["env"]["LOCAL_KEY"], "value");
-        assert_eq!(servers[1]["name"], "shared");
-        assert_eq!(servers[1]["transport"]["kind"], "http");
-        assert_eq!(servers[1]["transport"]["url"], "https://tyde.invalid/mcp");
-        assert_eq!(
-            servers[1]["transport"]["headers"]["Authorization"],
-            "Bearer private-token"
-        );
-
-        let persisted: Value = serde_json::from_slice(
-            &fs::read(config_path).expect("read persisted fake Hermes config"),
-        )
-        .expect("parse persisted fake Hermes config");
-        assert_eq!(persisted["model"]["default"], "native-model");
-        assert_eq!(
-            persisted["mcp_servers"]["native"]["command"],
-            "native-command"
-        );
-        assert_eq!(
-            persisted["mcp_servers"]["tyde"]["command"],
-            bridge.to_string_lossy().as_ref()
-        );
-
-        backend.shutdown().await;
-    }
-
-    /// A modern Hermes with Tool Search deferral active hides MCP tools from
-    /// the model-visible tools.show sections (they sit behind the tool_search
-    /// bridge) and reports the managed toolset only via the tools.list
-    /// registry view. Both startup gates must still pass — this pinned the
-    /// live "Hermes did not register the managed Tyde MCP toolset" failure.
-    #[tokio::test]
-    async fn hermes_mcp_gates_accept_tool_search_deferred_toolset() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let (fake, _observed_path, _config_path) = write_fake_deferred_mcp_gateway(&dir);
-        let _python_guard = TestHermesPythonGuard::set(&fake);
-        let bridge = dir.path().join("tyde-server");
-        fs::write(&bridge, "bridge placeholder").expect("write bridge placeholder");
-        let _bridge_guard = TestHermesBridgeExecutableGuard::set(&bridge.to_string_lossy());
-
-        let startup_mcp_servers = vec![StartupMcpServer {
-            name: "local".to_string(),
-            transport: StartupMcpTransport::Stdio {
-                command: "node".to_string(),
-                args: vec!["server.js".to_string()],
-                env: HashMap::new(),
-            },
-        }];
-        let config = BackendSpawnConfig {
-            startup_mcp_servers,
-            ..BackendSpawnConfig::default()
-        };
-        let (backend, mut events) = HermesBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            config,
-            payload("verify deferred MCP startup"),
-        )
-        .await
-        .expect("spawn must succeed when the managed toolset is deferred behind tool_search");
-
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    return;
-                }
-            }
-            panic!("Hermes event stream closed before the deferred MCP test turn completed");
-        })
-        .await
-        .expect("deferred MCP test turn should finish");
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn register_runs_in_the_selected_profile_hermes_home() {
-        // The registration script writes `mcp_servers.<managed>` into whatever
-        // config.yaml its own HERMES_HOME resolves to. The gateway is later
-        // spawned with the profile's HERMES_HOME, so if registration does not
-        // inherit the same env it registers the bridge in the default profile,
-        // the named profile's Hermes never launches the bridge, and startup
-        // fails on the MCP-bridge readiness timeout.
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let observed = dir.path().join("observed-home");
-        let launcher = dir.path().join("fake_python_record_home.sh");
-        fs::write(
-            &launcher,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"${{HERMES_HOME:-<unset>}}\" > {}\necho '[\"terminal\"]'\n",
-                observed.display()
-            ),
-        )
-        .expect("write fake python");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&launcher)
-                .expect("launcher metadata")
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&launcher, perms).expect("chmod launcher");
-        }
-
-        let profile_home = dir.path().join("profiles").join("work");
-        let target = HermesSpawnTarget {
-            program: launcher.to_string_lossy().to_string(),
-            args: Vec::new(),
-            env: HashMap::from([(
-                crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
-                profile_home.to_string_lossy().to_string(),
-            )]),
-            cwd: None,
-            remote_host: None,
-            display_program: "hermes".to_string(),
-            provider_version: None,
-        };
-
-        let selected = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
-            .await
-            .expect("registration must succeed");
-        assert_eq!(selected, Some(vec!["terminal".to_string()]));
-        assert_eq!(
-            fs::read_to_string(&observed).expect("registration must have run"),
-            profile_home.to_string_lossy(),
-            "registration must run against the selected profile's HERMES_HOME"
-        );
-    }
-
-    #[tokio::test]
-    async fn register_reports_missing_hermes_mcp_extra() {
-        // When Hermes is installed without the optional `mcp` package, the
-        // registration script prints the marker and exits 0 instead of spawning
-        // the bridge. Tyde must turn that into an actionable error at launch
-        // rather than waiting out the startup timeout with an opaque message.
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let launcher = dir.path().join("fake_python_mcp_missing.sh");
-        fs::write(
-            &launcher,
-            format!("#!/bin/sh\necho {HERMES_MCP_MISSING_MARKER}\nexit 0\n"),
-        )
-        .expect("write fake python");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&launcher)
-                .expect("launcher metadata")
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&launcher, perms).expect("chmod launcher");
-        }
-
-        let target = HermesSpawnTarget {
-            program: launcher.to_string_lossy().to_string(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            cwd: None,
-            remote_host: None,
-            display_program: "hermes".to_string(),
-            provider_version: None,
-        };
-
-        let error = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
-            .await
-            .expect_err("registration must fail when the Hermes mcp extra is absent");
-        assert!(
-            error.contains("mcp"),
-            "error should name the missing package: {error}"
-        );
-        assert!(
-            error.contains("pip install") && error.contains(".[mcp]"),
-            "error should give the install command: {error}"
-        );
-        assert!(
-            error.contains("hermes"),
-            "error should reference the Hermes interpreter: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_empty_allow_list_uses_only_empty_bridge() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let (fake, observed_path, _) = write_fake_managed_mcp_gateway(&dir);
-        let _python_guard = TestHermesPythonGuard::set(&fake);
-        let bridge = dir.path().join("tyde-server");
-        fs::write(&bridge, "bridge placeholder").expect("write bridge placeholder");
-        let _bridge_guard = TestHermesBridgeExecutableGuard::set(&bridge.to_string_lossy());
-        let mut config = BackendSpawnConfig::default();
-        config.resolved_spawn_config.tool_policy =
-            protocol::ToolPolicy::AllowList { tools: Vec::new() };
-
-        let (backend, mut events) = HermesBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            config,
-            payload("name this task"),
-        )
-        .await
-        .expect("spawn tool-free fake Hermes backend");
-
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    return;
-                }
-            }
-            panic!("Hermes event stream closed before the tool-free turn completed");
-        })
-        .await
-        .expect("tool-free Hermes turn should finish");
-
-        let observed: Value = serde_json::from_slice(
-            &fs::read(&observed_path).expect("read observed process config"),
-        )
-        .expect("parse observed process config");
-        assert_eq!(observed["toolsets"], MANAGED_SERVER_NAME);
-        assert_eq!(observed["descriptor"]["servers"], json!([]));
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn hermes_probe_session_settings_schema_uses_model_options() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(
-            &dir,
-            r#"
-import json, sys
-print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"skin":"default"}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    if method == "model.options":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{
-            "provider":"openrouter",
-            "model":"anthropic/claude-haiku-4.5",
-            "providers":[{
-                "slug":"openrouter",
-                "name":"OpenRouter",
-                "authenticated":True,
-                "models":["anthropic/claude-haiku-4.5"]
-            }]
-        }}), flush=True)
-    else:
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
-"#,
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let home = TempDir::new().expect("hermes home");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let probe = probe_session_settings_schema(
-            &[dir.path().to_string_lossy().to_string()],
-            &HashMap::new(),
-        )
-        .await
-        .expect("schema");
-
-        assert!(
-            probe.schema.fields.iter().any(|field| field.key == "model"),
-            "dynamic Hermes schema must include model options: {probe:?}"
-        );
-        // A lone default profile needs no profile picker.
-        assert!(
-            probe
-                .schema
-                .fields
-                .iter()
-                .all(|field| field.key != "profile"),
-            "single-profile schema must not expose a profile field: {probe:?}"
-        );
-        assert_eq!(probe.profiles.len(), 1);
-        assert_eq!(probe.profiles[0].name, "default");
-        assert_eq!(
-            probe.profiles[0].summary.as_deref(),
-            Some("openrouter/anthropic/claude-haiku-4.5")
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_native_settings_snapshot_reports_profiles_and_providers() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(
-            &dir,
-            r#"
-import json, sys
-print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"skin":"default"}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    if method == "model.options":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{
-            "provider":"openrouter",
-            "model":"anthropic/claude-haiku-4.5",
-            "providers":[
-                {"slug":"openrouter","name":"OpenRouter","authenticated":True,
-                 "auth_type":"api_key","key_env":"OPENROUTER_API_KEY",
-                 "models":["anthropic/claude-haiku-4.5"]},
-                {"slug":"anthropic","name":"Anthropic","authenticated":False,
-                 "auth_type":"api_key","key_env":"ANTHROPIC_API_KEY",
-                 "warning":"set ANTHROPIC_API_KEY","models":["claude-sonnet-5"]}
-            ]
-        }}), flush=True)
-    else:
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
-"#,
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let home = TempDir::new().expect("hermes home");
-        fs::write(
-            home.path().join("config.yaml"),
-            "model:\n  provider: openrouter\n  default: anthropic/claude-haiku-4.5\n",
-        )
-        .expect("write config");
-        fs::create_dir_all(home.path().join("profiles/grok")).expect("named profile");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let snapshot = native_settings_snapshot(&[dir.path().to_string_lossy().to_string()]).await;
-
-        assert_eq!(snapshot.backend_kind, BackendKind::Hermes);
-        assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Ready);
-        let doc: protocol::hermes_config::HermesNativeSettingsDoc =
-            serde_json::from_value(snapshot.settings.expect("settings doc")).expect("typed doc");
-        assert_eq!(doc.profiles.len(), 2);
-        let default = &doc.profiles[0];
-        assert_eq!(default.name, "default");
-        assert_eq!(default.config.model.provider.as_deref(), Some("openrouter"));
-        assert_eq!(
-            default.config.model.model.as_deref(),
-            Some("anthropic/claude-haiku-4.5")
-        );
-        assert_eq!(default.active_provider.as_deref(), Some("openrouter"));
-        let providers = default.providers.as_ref().expect("provider states");
-        assert_eq!(providers.len(), 2);
-        assert!(providers[0].authenticated);
-        assert!(!providers[1].authenticated);
-        assert_eq!(providers[1].key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(doc.profiles[1].name, "grok");
-        assert!(doc.actions.is_empty());
-    }
-
-    #[test]
-    fn hermes_multi_profile_schema_exposes_profile_select_and_per_profile_models() {
-        let profiles = vec![
-            HermesProfileRef {
-                name: "default".to_string(),
-                home_dir: PathBuf::from("/hermes-home"),
-            },
-            HermesProfileRef {
-                name: "claude".to_string(),
-                home_dir: PathBuf::from("/hermes-home/profiles/claude"),
-            },
-            HermesProfileRef {
-                name: "gpt".to_string(),
-                home_dir: PathBuf::from("/hermes-home/profiles/gpt"),
-            },
-        ];
-        let default_payload = json!({
-            "provider": "openrouter",
-            "model": "minimax/minimax-m3",
-            "providers": [{
-                "slug": "openrouter", "name": "OpenRouter", "authenticated": true,
-                "models": ["minimax/minimax-m3"]
-            }]
-        });
-        let claude_payload = json!({
-            "provider": "anthropic",
-            "model": "claude-sonnet-5",
-            "providers": [{
-                "slug": "anthropic", "name": "Anthropic", "authenticated": true,
-                "models": ["claude-sonnet-5"]
-            }]
-        });
-        let probe = session_schema_probe_from_model_options(
-            &profiles,
-            vec![
-                Ok(default_payload),
-                Ok(claude_payload),
-                Err("gateway exploded".to_string()),
-            ],
-            &HashMap::new(),
-        )
-        .expect("probe");
-
-        let profile_field = probe.schema.fields.first().expect("profile field first");
-        assert_eq!(profile_field.key, "profile");
-        match &profile_field.field_type {
-            SessionSettingFieldType::Select {
-                options,
-                default,
-                nullable,
-            } => {
-                let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
-                assert_eq!(values, vec!["default", "claude", "gpt"]);
-                assert_eq!(options[0].label, "Default");
-                assert!(
-                    options[2].label.contains("Unavailable")
-                        && options[2].label.contains("gateway exploded"),
-                    "failed profiles must remain visible with their error: {:?}",
-                    options[2]
-                );
-                assert_eq!(default.as_deref(), Some("default"));
-                assert!(!nullable);
-            }
-            other => panic!("profile must be Select, got {other:?}"),
-        }
-
-        let model_field = probe
-            .schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("model field");
-        let by_profile = model_field
-            .select_options_by_setting
-            .as_ref()
-            .expect("per-profile model options");
-        assert_eq!(by_profile.setting_key, "profile");
-        assert_eq!(by_profile.values.len(), 2);
-        assert_eq!(by_profile.values[1].setting_value, "claude");
-        assert_eq!(
-            by_profile.values[1].options[0].value,
-            encode_model_option_value("claude-sonnet-5", Some("anthropic"))
-        );
-
-        assert_eq!(probe.profiles.len(), 3);
-        assert_eq!(
-            probe.profiles[1].summary.as_deref(),
-            Some("anthropic/claude-sonnet-5")
-        );
-        let broken = &probe.profiles[2];
-        assert_eq!(broken.name, "gpt");
-        assert!(
-            broken
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("gateway exploded")),
-            "broken profile must carry its probe error: {broken:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_disabled_providers_are_dropped_from_model_options() {
-        let payload = json!({
-            "provider": "bedrock",
-            "model": "claude-fable-5",
-            "providers": [
-                {
-                    "slug": "copilot", "name": "GitHub Copilot", "authenticated": true,
-                    "models": ["gpt-5.5", "claude-opus-4.8"]
-                },
-                {
-                    "slug": "bedrock", "name": "AWS Bedrock", "authenticated": true,
-                    "models": ["claude-fable-5"]
-                }
-            ]
-        });
-        let profiles = vec![HermesProfileRef {
-            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
-            home_dir: PathBuf::from("/hermes-home"),
-        }];
-        let disabled = HashMap::from([("default".to_string(), vec!["copilot".to_string()])]);
-
-        let probe =
-            session_schema_probe_from_model_options(&profiles, vec![Ok(payload)], &disabled)
-                .expect("probe");
-        let model_field = probe
-            .schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("model field");
-        let SessionSettingFieldType::Select { options, .. } = &model_field.field_type else {
-            panic!("model field must be a select: {model_field:?}");
-        };
-        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
-        assert!(
-            values.iter().all(|value| !value.contains("copilot")),
-            "a disabled provider's models must not be offered: {values:?}"
-        );
-        assert!(
-            values.iter().any(|value| value.contains("bedrock")),
-            "an enabled provider must still be offered: {values:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_disabling_every_provider_says_so_instead_of_blaming_hermes() {
-        let payload = json!({
-            "provider": "bedrock",
-            "model": "claude-fable-5",
-            "providers": [{
-                "slug": "bedrock", "name": "AWS Bedrock", "authenticated": true,
-                "models": ["claude-fable-5"]
-            }]
-        });
-        let profiles = vec![HermesProfileRef {
-            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
-            home_dir: PathBuf::from("/hermes-home"),
-        }];
-        let disabled = HashMap::from([("default".to_string(), vec!["bedrock".to_string()])]);
-
-        let error =
-            session_schema_probe_from_model_options(&profiles, vec![Ok(payload)], &disabled)
-                .expect_err("no selectable models must fail the schema");
-        assert!(
-            error.contains("disabled in Tyde"),
-            "the user disabled these, so the message must point at Tyde's own list: {error}"
-        );
-        assert!(error.contains("bedrock"), "{error}");
-    }
-
-    #[test]
-    fn hermes_schema_fails_when_default_profile_probe_fails() {
-        let profiles = vec![HermesProfileRef {
-            name: "default".to_string(),
-            home_dir: PathBuf::from("/hermes-home"),
-        }];
-        let error = session_schema_probe_from_model_options(
-            &profiles,
-            vec![Err("no authenticated providers".to_string())],
-            &HashMap::new(),
-        )
-        .expect_err("default profile failure must fail the schema");
-        assert!(error.contains("no authenticated providers"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn hermes_persist_native_settings_runs_actions_and_writes_config() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let rpc_log = dir.path().join("rpc.jsonl");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, sys
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{"skin":"default"}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    with open({rpc_log:?}, "a") as f:
-        f.write(json.dumps({{"method": method, "params": req.get("params")}}) + "\n")
-    if method == "model.save_key":
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"slug":req["params"]["slug"],"authenticated":True}}}}), flush=True)
-    elif method == "model.disconnect":
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"disconnected":True}}}}), flush=True)
-    else:
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{}}}}), flush=True)
-"#
-            ),
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let home = TempDir::new().expect("hermes home");
-        fs::write(
-            home.path().join("config.yaml"),
-            "model:\n  provider: openrouter\n  default: minimax/minimax-m3\ntoolsets:\n  - hermes-cli\n",
-        )
-        .expect("write config");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let mut doc = native_settings_doc(&[dir.path().to_string_lossy().to_string()])
-            .await
-            .expect("snapshot doc");
-        doc.profiles[0].base_config = Some(doc.profiles[0].config.clone());
-        doc.profiles[0].config.model.provider = Some("anthropic".to_string());
-        doc.profiles[0].config.model.model = Some("claude-sonnet-5".to_string());
-        doc.actions = vec![
-            protocol::hermes_config::HermesCredentialAction::SaveApiKey {
-                profile: "default".to_string(),
-                provider: "anthropic".to_string(),
-                api_key: "sk-test-value".to_string(),
-            },
-            protocol::hermes_config::HermesCredentialAction::Disconnect {
-                profile: "default".to_string(),
-                provider: "copilot".to_string(),
-            },
-        ];
-
-        persist_native_settings(
-            serde_json::to_value(&doc).expect("doc to value"),
-            &[dir.path().to_string_lossy().to_string()],
-        )
-        .await
-        .expect("persist");
-
-        let rpc = fs::read_to_string(&rpc_log).expect("rpc log");
-        assert!(
-            rpc.contains("model.save_key") && rpc.contains("\"slug\": \"anthropic\""),
-            "save_key must reach the gateway: {rpc}"
-        );
-        assert!(rpc.contains("model.disconnect"), "{rpc}");
-
-        let config = fs::read_to_string(home.path().join("config.yaml")).expect("config");
-        assert!(config.contains("provider: anthropic"), "{config}");
-        assert!(config.contains("default: claude-sonnet-5"), "{config}");
-        assert!(
-            config.contains("hermes-cli"),
-            "unmodeled keys preserved: {config}"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_named_profile_disconnect_is_blocked_without_blocking_config_save() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let rpc_log = dir.path().join("rpc.jsonl");
-        let spawn_log = dir.path().join("spawned");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, sys
-with open({spawn_log:?}, "w") as output:
-    output.write("spawned")
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    with open({rpc_log:?}, "a") as output:
-        output.write(json.dumps({{"method": req["method"], "params": req.get("params")}}) + "\n")
-    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":{{}}}}), flush=True)
-"#
-            ),
-        );
-        let _python_guard = TestHermesPythonGuard::set(&fake);
-        let home = TempDir::new().expect("Hermes home");
-        let profile_home = home.path().join("profiles").join("work");
-        fs::create_dir_all(&profile_home).expect("profile home");
-        fs::write(
-            profile_home.join("config.yaml"),
-            "model:\n  provider: openrouter\n  default: old/model\n",
-        )
-        .expect("profile config");
-        let root_auth = home.path().join("auth.json");
-        let root_auth_bytes = br#"{"providers":{"copilot":{"token":"synthetic"}}}"#;
-        fs::write(&root_auth, root_auth_bytes).expect("synthetic root auth");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let base = hermes_config::load_profile_config(&profile_home).expect("base config");
-        let mut changed = base.clone();
-        changed.model.model = Some("new/model".to_string());
-        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
-            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
-            profile_actions: Vec::new(),
-            profiles: vec![protocol::hermes_config::HermesProfileSettings {
-                name: "work".to_string(),
-                home_dir: profile_home.to_string_lossy().to_string(),
-                config: changed,
-                base_config: Some(base),
-                providers: None,
-                providers_error: None,
-                active_model: None,
-                active_provider: None,
-                toolsets: None,
-            }],
-            actions: vec![
-                protocol::hermes_config::HermesCredentialAction::Disconnect {
-                    profile: "work".to_string(),
-                    provider: "copilot".to_string(),
-                },
-            ],
-        };
-
-        let outcome = persist_native_settings(
-            serde_json::to_value(doc).expect("settings"),
-            &[dir.path().to_string_lossy().to_string()],
-        )
-        .await
-        .expect("unrelated configuration writes must complete");
-        let error = outcome
-            .partial_error_message()
-            .expect("blocked credential action must be reported");
-
-        assert!(
-            error.contains("saved the unrelated configuration"),
-            "{error}"
-        );
-        assert!(error.contains("cannot prove"), "{error}");
-        assert_eq!(
-            fs::read(&root_auth).expect("root auth"),
-            root_auth_bytes,
-            "named-profile action must never mutate the default credential store"
-        );
-        assert!(
-            fs::read_to_string(profile_home.join("config.yaml"))
-                .expect("saved profile config")
-                .contains("new/model"),
-            "unrelated config edit must still land"
-        );
-        let rpc = fs::read_to_string(&rpc_log).unwrap_or_default();
-        assert!(
-            !rpc.contains("model.disconnect"),
-            "unsafe disconnect RPC must not be sent: {rpc}"
-        );
-        assert!(
-            !spawn_log.exists(),
-            "a named-profile disconnect rejected locally must not spawn Hermes"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_persist_skips_rewrite_for_unchanged_profiles() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let home = TempDir::new().expect("hermes home");
-        let original = "# hand-written comment\nmodel:\n  provider: openrouter\n  default: minimax/minimax-m3\n";
-        fs::write(home.path().join("config.yaml"), original).expect("write config");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        // An unchanged config section must not rewrite the file (which would
-        // drop comments); build the doc directly from disk without a gateway.
-        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
-            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
-            profile_actions: Vec::new(),
-            profiles: vec![protocol::hermes_config::HermesProfileSettings {
-                name: "default".to_string(),
-                home_dir: home.path().to_string_lossy().to_string(),
-                config: hermes_config::load_profile_config(home.path()).expect("load"),
-                base_config: None,
-                providers: None,
-                providers_error: None,
-                active_model: None,
-                active_provider: None,
-                toolsets: None,
-            }],
-            actions: Vec::new(),
-        };
-        persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
-            .await
-            .expect("persist");
-
-        let after = fs::read_to_string(home.path().join("config.yaml")).expect("config");
-        assert_eq!(after, original, "unchanged profile must not be rewritten");
-    }
-
-    /// A save carrying profile actions applies them before anything else, so
-    /// the rest of that same save sees the resulting set of profiles.
-    #[tokio::test]
-    async fn hermes_persist_applies_profile_actions_before_config_writes() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let home = TempDir::new().expect("hermes home");
-        fs::write(
-            home.path().join("config.yaml"),
-            "model:\n  provider: bedrock\n",
-        )
-        .expect("write config");
-        // A profile with history, to prove a delete takes the whole home.
-        let doomed = home.path().join("profiles/doomed");
-        fs::create_dir_all(doomed.join("sessions")).expect("profile dir");
-        fs::write(doomed.join("state.db"), "sqlite").expect("state");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let mut doc = protocol::hermes_config::HermesNativeSettingsDoc {
-            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
-            profile_actions: vec![
-                protocol::hermes_config::HermesProfileAction::CreateProfile {
-                    name: "fresh".to_string(),
-                    copy_config_from: None,
-                },
-                protocol::hermes_config::HermesProfileAction::DeleteProfile {
-                    name: "doomed".to_string(),
-                },
-            ],
-            profiles: Vec::new(),
-            actions: Vec::new(),
-        };
-        // The doomed profile is still in the client's document, exactly as a
-        // real save would carry it — it was on screen when the user hit
-        // delete. Its config section must be skipped, not resolved.
-        doc.profiles
-            .push(protocol::hermes_config::HermesProfileSettings {
-                name: "doomed".to_string(),
-                home_dir: doomed.to_string_lossy().to_string(),
-                config: protocol::hermes_config::HermesProfileConfig::default(),
-                base_config: Some(protocol::hermes_config::HermesProfileConfig::default()),
-                providers: None,
-                providers_error: None,
-                active_model: None,
-                active_provider: None,
-                toolsets: None,
-            });
-
-        persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
-            .await
-            .expect("persist");
-
-        assert!(!doomed.exists(), "a deleted profile's whole home must go");
-        let fresh = home.path().join("profiles/fresh");
-        assert!(fresh.is_dir(), "the created profile must exist");
-        assert_eq!(
-            fs::read_to_string(fresh.join("config.yaml")).expect("copied config"),
-            "model:\n  provider: bedrock\n",
-            "a new profile starts from the source profile's config"
-        );
-
-        let names: Vec<String> = hermes_config::discover_profiles_in(home.path())
-            .expect("discover")
-            .into_iter()
-            .map(|profile| profile.name)
-            .collect();
-        assert_eq!(names, vec!["default".to_string(), "fresh".to_string()]);
-    }
-
-    /// Credentials are applied against a profile by name. Letting a save both
-    /// delete a profile and key it would run one of those against a directory
-    /// the other just removed, so the pair is refused outright.
-    #[tokio::test]
-    async fn hermes_persist_refuses_crediting_a_profile_the_same_save_deletes() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let home = TempDir::new().expect("hermes home");
-        let profile = home.path().join("profiles/work");
-        fs::create_dir_all(&profile).expect("profile dir");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
-            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
-            profile_actions: vec![
-                protocol::hermes_config::HermesProfileAction::DeleteProfile {
-                    name: "work".to_string(),
-                },
-            ],
-            profiles: Vec::new(),
-            actions: vec![
-                protocol::hermes_config::HermesCredentialAction::SaveApiKey {
-                    profile: "work".to_string(),
-                    provider: "openrouter".to_string(),
-                    api_key: "sk-test".to_string(),
-                },
-            ],
-        };
-
-        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
-            .await
-            .expect_err("a delete + credential save must be refused");
-        assert!(error.contains("same save that deletes it"), "{error}");
-        assert!(
-            profile.is_dir(),
-            "a refused save must not have deleted anything"
-        );
-    }
-
-    fn default_profile_doc(
-        home: &Path,
-        config: protocol::hermes_config::HermesProfileConfig,
-        base_config: Option<protocol::hermes_config::HermesProfileConfig>,
-    ) -> protocol::hermes_config::HermesNativeSettingsDoc {
-        protocol::hermes_config::HermesNativeSettingsDoc {
-            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
-            profile_actions: Vec::new(),
-            profiles: vec![protocol::hermes_config::HermesProfileSettings {
-                name: "default".to_string(),
-                home_dir: home.to_string_lossy().to_string(),
-                config,
-                base_config,
-                providers: None,
-                providers_error: None,
-                active_model: None,
-                active_provider: None,
-                toolsets: None,
-            }],
-            actions: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn hermes_persist_refuses_stale_base_and_half_filled_fallbacks() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let home = TempDir::new().expect("hermes home");
-        fs::write(
-            home.path().join("config.yaml"),
-            "model:\n  provider: openrouter\n  default: minimax/minimax-m3\n",
-        )
-        .expect("write config");
-        let _home_guard = TestHermesHomeGuard::set(home.path());
-
-        // Stale base: the disk changed after this snapshot was taken.
-        let stale_base = protocol::hermes_config::HermesProfileConfig::default();
-        let mut edited = stale_base.clone();
-        edited.agent.max_turns = Some(50);
-        let doc = default_profile_doc(home.path(), edited, Some(stale_base));
-        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
-            .await
-            .expect_err("stale base must be refused");
-        assert!(error.contains("changed since it was loaded"), "{error}");
-        let raw = fs::read_to_string(home.path().join("config.yaml")).expect("config");
-        assert!(
-            !raw.contains("max_turns"),
-            "refused save must not touch the file: {raw}"
-        );
-
-        // Half-filled fallback: rejected before anything is written.
-        let mut invalid = hermes_config::load_profile_config(home.path()).expect("load");
-        invalid
-            .fallback_providers
-            .push(protocol::hermes_config::HermesFallbackProvider {
-                provider: "anthropic".to_string(),
-                model: String::new(),
-                extra: Default::default(),
-            });
-        let doc = default_profile_doc(home.path(), invalid, None);
-        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
-            .await
-            .expect_err("half-filled fallback must be refused");
-        assert!(error.contains("provider and a model"), "{error}");
-        let raw = fs::read_to_string(home.path().join("config.yaml")).expect("config");
-        assert!(!raw.contains("fallback_providers"), "{raw}");
-    }
-
-    #[tokio::test]
-    async fn hermes_empty_root_gateway_runs_from_tyde_no_root_cwd() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let cwd_log = dir.path().join("cwd.txt");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, os, sys
-with open({cwd_log:?}, "w") as f:
-    f.write(os.getcwd())
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{"skin":"default"}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    params = req.get("params") or {{}}
-    if method == "session.create":
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"session_id":"live1","stored_session_id":"stored1","messages":[],"info":{{}}}}}}), flush=True)
-    elif method == "prompt.submit":
-        sid = params["session_id"]
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"status":"streaming"}}}}), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":sid}}}}), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":sid,"payload":{{"text":"ok","status":"complete"}}}}}}), flush=True)
-    elif method == "session.usage":
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"input":0,"output":0,"total":0}}}}), flush=True)
-    else:
-        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{}}}}), flush=True)
-"#,
-                cwd_log = cwd_log.to_string_lossy()
-            ),
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) =
-            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
-                .await
-                .expect("spawn fake hermes");
-        let mut warnings = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                match event {
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Warning,
-                        content,
-                        ..
-                    }) => warnings.push(content),
-                    ChatEvent::StreamEnd(_) => break,
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("turn should finish");
-        backend.shutdown().await;
-        assert!(
-            warnings.is_empty(),
-            "optional usage diagnostics must stay out of chat: {warnings:?}"
-        );
-
-        let cwd = fs::read_to_string(&cwd_log).expect("read cwd log");
-        assert!(
-            cwd.ends_with(".tyde/hermes/no-root"),
-            "empty-root gateway cwd must be Tyde-owned no-root dir, got {cwd}"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_shutdown_waits_for_child_eof_and_exit() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let exited = dir.path().join("child-exited");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, sys
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    method = req["method"]
-    if method == "session.create":
-        result = {{"session_id":"live","stored_session_id":"stored"}}
-    elif method == "prompt.submit":
-        result = {{"status":"streaming"}}
-    else:
-        result = {{}}
-    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
-    if method == "prompt.submit":
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":"live"}}}}), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":"live","payload":{{"text":"done","status":"complete","usage":{{"input":1,"output":1,"total":2}}}}}}}}), flush=True)
-# Reaching here proves stdin EOF without racing the test-only force-kill grace.
-print("final shutdown diagnostic", file=sys.stderr, flush=True)
-with open({exited:?}, "w") as output:
-    output.write("exited")
-"#
-            ),
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) =
-            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
-                .await
-                .expect("spawn fake Hermes");
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    return;
-                }
-            }
-            panic!("event stream closed before completion");
-        })
-        .await
-        .expect("turn");
-
-        backend.shutdown().await;
-
-        assert_eq!(
-            fs::read_to_string(&exited).expect("child exit marker"),
-            "exited",
-            "shutdown must await child EOF/exit before returning"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_owner_loss_retires_background_command_once() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(
-            &dir,
-            r#"
-import json, sys
-print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    method = req["method"]
-    if method == "session.create":
-        result = {"session_id":"live","stored_session_id":"stored"}
-    elif method == "prompt.submit":
-        result = {"status":"streaming"}
-    elif method == "session.usage":
-        result = {"input":1,"output":1,"total":2}
-    elif method == "session.context_breakdown":
-        result = {"context_used":2,"context_max":200000}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}), flush=True)
-    if method == "prompt.submit":
-        def emit(event_type, payload=None):
-            params = {"type":event_type,"session_id":"live"}
-            if payload is not None:
-                params["payload"] = payload
-            print(json.dumps({"jsonrpc":"2.0","method":"event","params":params}), flush=True)
-        emit("message.start")
-        emit("tool.start", {
-            "tool_id":"terminal-1",
-            "name":"terminal",
-            "args":{"command":"sleep 30","background":True}
-        })
-        emit("tool.complete", {
-            "tool_id":"terminal-1",
-            "name":"terminal",
-            "result":{"session_id":"proc-1","exit_code":0}
-        })
-        emit("message.complete", {
-            "text":"launched",
-            "status":"complete",
-            "usage":{"input":1,"output":1,"total":2}
-        })
-"#,
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) =
-            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("launch"))
-                .await
-                .expect("spawn fake Hermes");
-        let mut observed = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                let turn_done = matches!(event, ChatEvent::StreamEnd(_));
-                observed.push(event);
-                if turn_done {
-                    return;
-                }
-            }
-            panic!("event stream closed before launch completed");
-        })
-        .await
-        .expect("background launch");
-
-        backend.shutdown().await;
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                observed.push(event);
-            }
-        })
-        .await
-        .expect("Hermes teardown");
-
-        assert_eq!(
-            observed
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ChatEvent::ToolProgress(ToolProgressData {
-                        tool_call_id,
-                        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                            task_id,
-                            status: BackgroundTaskStatus::Stopped,
-                            ..
-                        }),
-                        ..
-                    }) if tool_call_id == "terminal-1" && task_id == "proc-1"
-                ))
-                .count(),
-            1,
-            "irreversible Hermes owner loss must retire Running exactly once"
-        );
-        assert_eq!(
-            observed
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                        tool_call_id,
-                        ..
-                    }) if tool_call_id == "terminal-1"
-                ))
-                .count(),
-            1,
-            "the launch completion remains authoritative; teardown must not duplicate it"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_shutdown_forces_a_child_that_ignores_eof() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let survived = dir.path().join("child-survived");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, sys, time
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    method = req["method"]
-    if method == "session.create":
-        result = {{"session_id":"live","stored_session_id":"stored"}}
-    elif method == "prompt.submit":
-        result = {{"status":"streaming"}}
-    else:
-        result = {{}}
-    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
-    if method == "prompt.submit":
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":"live"}}}}), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":"live","payload":{{"text":"done","status":"complete","usage":{{"input":1,"output":1,"total":2}}}}}}}}), flush=True)
-time.sleep(0.5)
-with open({survived:?}, "w") as output:
-    output.write("survived")
-"#
-            ),
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) =
-            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
-                .await
-                .expect("spawn fake Hermes");
-        timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    return;
-                }
-            }
-            panic!("event stream closed before completion");
-        })
-        .await
-        .expect("turn");
-
-        backend.shutdown().await;
-        tokio::time::sleep(Duration::from_millis(600)).await;
-
-        assert!(
-            !survived.exists(),
-            "shutdown must force a child that remains alive after stdin EOF"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_child_waiter_awaits_and_reports_the_real_exit_code() {
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(&dir, "raise SystemExit(23)\n");
-        let mut command = Command::new(fake);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command.group_spawn().expect("spawn child");
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-        let (_force_tx, force_rx) = mpsc::unbounded_channel();
-
-        spawn_child_waiter(child, inbound_tx, force_rx);
-
-        let event = timeout(Duration::from_secs(2), inbound_rx.recv())
-            .await
-            .expect("child wait")
-            .expect("closed event");
-        assert!(matches!(event, HermesGatewayInbound::Closed(Some(23))));
-    }
-
-    #[test]
-    fn hermes_read_only_instructions_use_the_gateway_system_overlay() {
-        let resolved = ResolvedSpawnConfig {
-            access_mode: BackendAccessMode::ReadOnly,
-            ..ResolvedSpawnConfig::default()
-        };
-        let params = build_session_create_params(&[], &SessionSettingsValues::default(), None)
-            .expect("params");
-        let cwd = params["cwd"].as_str().expect("cwd");
-        assert!(
-            cwd.ends_with(".tyde/hermes/no-root"),
-            "empty-root Hermes sessions must use Tyde-owned no-root cwd, got {cwd}"
-        );
-        let ambient_cwd = std::env::current_dir()
-            .ok()
-            .map(|path| path.to_string_lossy().to_string());
-        assert_ne!(
-            Some(cwd),
-            ambient_cwd.as_deref(),
-            "empty-root Hermes sessions must not fall back to ambient cwd"
-        );
-        assert!(
-            params.get("messages").is_none(),
-            "Tyde instructions must not be persisted as ordinary history"
-        );
-        let instructions = render_hermes_spawn_instructions(&resolved, true).expect("instructions");
-        assert!(instructions.contains("Backend access mode is read-only"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("ephemeral_system_prompt"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains(TYDE_HERMES_SYSTEM_PROMPT_ENV));
-        let fallback = build_session_create_params(
-            &[],
-            &SessionSettingsValues::default(),
-            Some(&instructions),
-        )
-        .expect("remote fallback params");
-        assert_eq!(
-            fallback["messages"][0]["content"].as_str(),
-            Some(instructions.as_str())
-        );
-    }
-
-    #[test]
-    fn hermes_skill_seed_is_a_compact_progressive_catalog() {
-        let body_sentinel = "BODY_SENTINEL_SHOULD_NOT_BE_EAGERLY_INJECTED";
-        let resolved = ResolvedSpawnConfig {
-            skills: vec![
-                crate::agent::customization::ResolvedSkill::test_fixture(
-                    "Review changes",
-                    &format!("{body_sentinel}\n{}", "x".repeat(20_000)),
-                ),
-                crate::agent::customization::ResolvedSkill::test_fixture(
-                    "Trace failures",
-                    "another private body",
-                ),
-            ],
-            ..ResolvedSpawnConfig::default()
-        };
-
-        let seed = render_hermes_spawn_instructions(&resolved, true).expect("system overlay");
-
-        assert!(seed.contains("Review changes"));
-        assert!(seed.contains("Trace failures"));
-        assert!(seed.contains("skill discovery"));
-        assert!(!seed.contains(body_sentinel));
-        assert!(!seed.contains("another private body"));
-        assert!(
-            seed.len() < 1_000,
-            "skill catalogue must stay bounded independently of body size"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_resume_reseeds_tyde_instructions_outside_history() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let prompt_log = dir.path().join("prompt.txt");
-        let fake = write_fake_gateway(
-            &dir,
-            &format!(
-                r#"
-import json, os, sys
-with open({prompt_log:?}, "w") as output:
-    output.write(os.environ.get("TYDE_HERMES_SYSTEM_PROMPT", ""))
-print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    method = req["method"]
-    if method == "session.resume":
-        result = {{"session_id":"live","resumed":"stored"}}
-    elif method == "session.history":
-        result = {{"messages":[]}}
-    else:
-        result = {{}}
-    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
-"#
-            ),
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let mut config = BackendSpawnConfig::default();
-        config.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
-        config.resolved_spawn_config.skills =
-            vec![crate::agent::customization::ResolvedSkill::test_fixture(
-                "Review changes",
-                "PRIVATE_SKILL_BODY",
-            )];
-
-        let (backend, _events) =
-            HermesBackend::resume(Vec::new(), config, SessionId("stored".to_string()))
-                .await
-                .expect("resume with a Tyde system overlay");
-        backend.shutdown().await;
-
-        let prompt = fs::read_to_string(prompt_log).expect("resume prompt");
-        assert!(
-            prompt.contains("Backend access mode is read-only"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("Review changes"), "{prompt}");
-        assert!(!prompt.contains("PRIVATE_SKILL_BODY"), "{prompt}");
-    }
-
-    #[test]
-    fn hermes_runtime_profile_validation_allows_only_same_effective_profile() {
-        let mut current = SessionSettingsValues::default();
-        current.0.insert(
-            HERMES_PROFILE_SETTING.to_string(),
-            SessionSettingValue::String("work".to_string()),
-        );
-        let mut same = SessionSettingsValues::default();
-        same.0.insert(
-            HERMES_PROFILE_SETTING.to_string(),
-            SessionSettingValue::String("work".to_string()),
-        );
-        assert!(validate_runtime_session_settings_update(&current, &same).is_ok());
-
-        let mut changed = same;
-        changed.0.insert(
-            HERMES_PROFILE_SETTING.to_string(),
-            SessionSettingValue::String("other".to_string()),
-        );
-        assert!(validate_runtime_session_settings_update(&current, &changed).is_err());
-        let mut removed = SessionSettingsValues::default();
-        removed.0.insert(
-            HERMES_PROFILE_SETTING.to_string(),
-            SessionSettingValue::Null,
-        );
-        assert!(validate_runtime_session_settings_update(&current, &removed).is_err());
-
-        let default = SessionSettingsValues::default();
-        let mut explicit_default = SessionSettingsValues::default();
-        explicit_default.0.insert(
-            HERMES_PROFILE_SETTING.to_string(),
-            SessionSettingValue::String(hermes_config_default_profile().to_string()),
-        );
-        assert!(
-            validate_runtime_session_settings_update(&default, &explicit_default).is_ok(),
-            "absent and explicit default are the same effective profile"
-        );
-    }
-
-    #[test]
-    fn hermes_session_catalog_reflects_system_overlay_support() {
-        let value = json!({
-            "sessions": [{
-                "id": "stored",
-                "title": "Resumable Hermes session",
-                "started_at": 1_700_000_000.0
-            }]
-        });
-        let sessions = parse_session_list(&value, true).expect("local session catalog");
-
-        assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].resumable);
-        let sessions = parse_session_list(&value, false).expect("remote session catalog");
-        assert!(!sessions[0].resumable);
-    }
-
-    #[test]
-    fn hermes_remote_resume_catalog_matches_the_instruction_overlay_gate() {
-        let remote_roots = vec!["ssh://builder.example/work/repo".to_string()];
-        let local_roots = vec!["/work/repo".to_string()];
-        let plain = ResolvedSpawnConfig::default();
-        let protected = ResolvedSpawnConfig {
-            access_mode: BackendAccessMode::ReadOnly,
-            ..ResolvedSpawnConfig::default()
-        };
-
-        assert!(session_is_resumable_for_workspace_roots(
-            &remote_roots,
-            &plain
-        ));
-        assert!(!session_is_resumable_for_workspace_roots(
-            &remote_roots,
-            &protected
-        ));
-        assert!(session_is_resumable_for_workspace_roots(
-            &local_roots,
-            &protected
-        ));
-    }
-
-    #[test]
-    fn hermes_session_create_params_include_model_provider_reasoning_and_fast() {
-        let mut settings = SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String(encode_model_option_value(
-                "minimax/minimax-m2.7",
-                Some("openrouter"),
-            )),
-        );
-        settings.0.insert(
-            "reasoning_effort".to_string(),
-            SessionSettingValue::String("none".to_string()),
-        );
-        settings
-            .0
-            .insert("fast".to_string(), SessionSettingValue::Bool(true));
-
-        let params = build_session_create_params(&[], &settings, None).expect("params");
-
-        assert_eq!(params["model"], "minimax/minimax-m2.7");
-        assert_eq!(params["provider"], "openrouter");
-        assert_eq!(params["reasoning_effort"], "none");
-        assert_eq!(params["fast"], true);
-    }
-
-    #[test]
-    fn hermes_model_option_value_round_trips_including_delimiter_like_ids() {
-        // A model id containing the legacy delimiter must survive the round-trip.
-        let model = "weird --provider embedded/model";
-        let provider = "openrouter";
-        let encoded = encode_model_option_value(model, Some(provider));
-        let parsed = parse_hermes_model_setting(&encoded).expect("round-trips");
-        assert_eq!(parsed.model, model);
-        assert_eq!(parsed.provider.as_deref(), Some(provider));
-
-        // No provider.
-        let encoded = encode_model_option_value("bare/model", None);
-        let parsed = parse_hermes_model_setting(&encoded).expect("round-trips");
-        assert_eq!(parsed.model, "bare/model");
-        assert_eq!(parsed.provider, None);
-
-        // Legacy packed string still parses for previously persisted values.
-        let legacy =
-            parse_hermes_model_setting("legacy/model --provider anthropic").expect("legacy parses");
-        assert_eq!(legacy.model, "legacy/model");
-        assert_eq!(legacy.provider.as_deref(), Some("anthropic"));
-    }
-
-    /// Build a schema from one `model.options` payload as if it were the only
-    /// (default) profile — the pre-profile schema shape these tests pin.
-    fn schema_from_single_profile_payload(
-        payload: &Value,
-    ) -> Result<SessionSettingsSchema, String> {
-        let profiles = vec![HermesProfileRef {
-            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
-            home_dir: PathBuf::from("/nonexistent-hermes-home"),
-        }];
-        session_schema_probe_from_model_options(
-            &profiles,
-            vec![Ok(payload.clone())],
-            &HashMap::new(),
-        )
-        .map(|probe| probe.schema)
-    }
-
-    #[test]
-    fn hermes_model_options_schema_uses_authenticated_provider_models() {
-        let schema = schema_from_single_profile_payload(&json!({
-            "provider": "openrouter",
-            "model": "minimax/minimax-m2.7",
-            "providers": [
-                {
-                    "slug": "openrouter",
-                    "name": "OpenRouter",
-                    "authenticated": true,
-                    "models": ["minimax/minimax-m2.7", "anthropic/claude-sonnet-5"]
-                },
-                {
-                    "slug": "anthropic",
-                    "name": "Anthropic",
-                    "authenticated": false,
-                    "models": ["claude-opus"]
-                }
-            ]
-        }))
-        .expect("schema");
-
-        assert_eq!(schema.backend_kind, BackendKind::Hermes);
-        assert!(
-            schema.fields.iter().all(|field| field.key != "provider"),
-            "Hermes schema must not expose an independent provider dropdown"
-        );
-
-        let model_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("model field");
-        match &model_field.field_type {
-            SessionSettingFieldType::Select {
-                options, default, ..
-            } => {
-                assert_eq!(options.len(), 2);
-                assert_eq!(
-                    options[0].value,
-                    encode_model_option_value("minimax/minimax-m2.7", Some("openrouter"))
-                );
-                assert_eq!(
-                    default.as_deref(),
-                    Some(
-                        encode_model_option_value("minimax/minimax-m2.7", Some("openrouter"))
-                            .as_str()
-                    )
-                );
-                assert!(
-                    options[0].label.contains("OpenRouter"),
-                    "flattened labels must include provider context"
-                );
-            }
-            other => panic!("model must be Select, got {other:?}"),
-        }
-        assert!(
-            schema
-                .fields
-                .iter()
-                .any(|field| field.key == "reasoning_effort")
-        );
-        assert!(schema.fields.iter().any(|field| field.key == "fast"));
-    }
-
-    #[test]
-    fn hermes_model_options_schema_does_not_infer_default_provider() {
-        let schema = schema_from_single_profile_payload(&json!({
-            "model": "shared/model",
-            "providers": [
-                {
-                    "slug": "openrouter",
-                    "name": "OpenRouter",
-                    "authenticated": true,
-                    "models": ["shared/model"]
-                },
-                {
-                    "slug": "fallback",
-                    "name": "Fallback",
-                    "authenticated": true,
-                    "models": ["shared/model"]
-                }
-            ]
-        }))
-        .expect("schema");
-
-        let model_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("model field");
-        match &model_field.field_type {
-            SessionSettingFieldType::Select {
-                options, default, ..
-            } => {
-                assert_eq!(options.len(), 2);
-                assert!(
-                    default.is_none(),
-                    "missing top-level provider must not infer a provider-specific default"
-                );
-            }
-            other => panic!("model must be Select, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hermes_model_options_schema_rejects_malformed_top_level_selection() {
-        for (name, payload, expected) in [
-            (
-                "non-string provider",
-                json!({
-                    "provider": 7,
-                    "providers": [{
-                        "slug": "openrouter",
-                        "authenticated": true,
-                        "models": ["anthropic/claude-haiku-4.5"]
-                    }]
-                }),
-                "field provider must be a string",
-            ),
-            (
-                "empty provider",
-                json!({
-                    "provider": " ",
-                    "providers": [{
-                        "slug": "openrouter",
-                        "authenticated": true,
-                        "models": ["anthropic/claude-haiku-4.5"]
-                    }]
-                }),
-                "field provider must be non-empty",
-            ),
-            (
-                "non-string model",
-                json!({
-                    "model": {},
-                    "providers": [{
-                        "slug": "openrouter",
-                        "authenticated": true,
-                        "models": ["anthropic/claude-haiku-4.5"]
-                    }]
-                }),
-                "field model must be a string",
-            ),
-            (
-                "empty model",
-                json!({
-                    "model": " ",
-                    "providers": [{
-                        "slug": "openrouter",
-                        "authenticated": true,
-                        "models": ["anthropic/claude-haiku-4.5"]
-                    }]
-                }),
-                "field model must be non-empty",
-            ),
-        ] {
-            let err = match schema_from_single_profile_payload(&payload) {
-                Ok(_) => panic!("{name} should fail"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(expected),
-                "{name} error should contain {expected:?}, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn hermes_model_options_schema_rejects_malformed_provider_rows() {
-        for (name, payload, expected) in [
-            (
-                "missing authenticated",
-                json!({ "providers": [{ "slug": "openrouter", "models": [] }] }),
-                "providers[0].authenticated must be a bool",
-            ),
-            (
-                "non-bool authenticated",
-                json!({ "providers": [{ "slug": "openrouter", "authenticated": "yes", "models": [] }] }),
-                "providers[0].authenticated must be a bool",
-            ),
-            (
-                "missing slug",
-                json!({ "providers": [{ "authenticated": true, "models": [] }] }),
-                "providers[0] missing required string field slug",
-            ),
-            (
-                "empty slug",
-                json!({ "providers": [{ "slug": " ", "authenticated": true, "models": [] }] }),
-                "providers[0] field slug must be non-empty",
-            ),
-            (
-                "non-array models",
-                json!({ "providers": [{ "slug": "openrouter", "authenticated": true, "models": {} }] }),
-                "providers[0] 'openrouter' missing models array",
-            ),
-            (
-                "non-string model",
-                json!({ "providers": [{ "slug": "openrouter", "authenticated": true, "models": [42] }] }),
-                "providers[0] 'openrouter' models[0] must be a string",
-            ),
-            (
-                "empty model",
-                json!({ "providers": [{ "slug": "openrouter", "authenticated": true, "models": [" "] }] }),
-                "providers[0] 'openrouter' models[0] must be non-empty",
-            ),
-        ] {
-            let err = match schema_from_single_profile_payload(&payload) {
-                Ok(_) => panic!("{name} should fail"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(expected),
-                "{name} error should contain {expected:?}, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn hermes_tool_state_is_scoped_to_one_turn() {
-        let mut mapper = HermesEventMapper::default();
-
-        assert!(matches!(
-            mapper.map_event("message.start", None).as_slice(),
-            [ChatEvent::StreamStart(_)]
-        ));
-        assert!(
-            mapper
-                .map_event(
-                    "tool.start",
-                    Some(json!({ "tool_id": "tool-1", "name": "shell" })),
-                )
-                .iter()
-                .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
-        );
-        assert!(
-            mapper
-                .map_event(
-                    "tool.complete",
-                    Some(json!({
-                        "tool_id": "tool-1",
-                        "name": "shell",
-                        "result": { "ok": true }
-                    })),
-                )
-                .iter()
-                .any(
-                    |event| matches!(event, ChatEvent::ToolExecutionCompleted(data) if data.success)
-                )
-        );
-        let first_complete = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "first", "status": "complete" })),
-        );
-        let first_end = first_complete
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("first turn StreamEnd");
-        assert_eq!(first_end.message.tool_calls.len(), 1);
-        assert_eq!(first_end.message.tool_calls[0].id, "tool-1");
-
-        assert!(matches!(
-            mapper.map_event("message.start", None).as_slice(),
-            [ChatEvent::StreamStart(_)]
-        ));
-        let second_complete = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "second", "status": "complete" })),
-        );
-        let second_end = second_complete
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("second turn StreamEnd");
-        assert!(
-            second_end.message.tool_calls.is_empty(),
-            "second turn must not inherit first-turn tool calls"
-        );
-        assert!(
-            second_complete.iter().all(|event| {
-                !matches!(
-                    event,
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error,
-                        ..
-                    }) | ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                        success: false,
-                        ..
-                    })
-                )
-            }),
-            "second turn must not report stale unresolved/cancelled tool state: {second_complete:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_nested_tool_errors_are_failed_completions() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "args": { "command": "exit 7" }
-            })),
-        );
-        let terminal = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "result": {
-                    "error": "command denied",
-                    "exit_code": -1,
-                    "status": "blocked"
-                }
-            })),
-        );
-        assert!(terminal.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                success: false,
-                error: Some(error),
-                ..
-            }) if error == "command denied"
-        )));
-
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "mcp-1",
-                "name": "mcp_tyde_tyde_spawn_agent",
-                "args": {
-                    "name": "Hermes Child",
-                    "prompt": "Inspect the failure path"
-                }
-            })),
-        );
-        let mcp = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "mcp-1",
-                "name": "mcp_tyde_tyde_spawn_agent",
-                "result": {
-                    "isError": true,
-                    "content": [{ "type": "text", "text": "missing prompt" }]
-                }
-            })),
-        );
-        assert!(
-            mcp.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                    success: false,
-                    error: Some(error),
-                    ..
-                }) if error == "missing prompt"
-            )),
-            "MCP tool failure must use its text content: {mcp:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_late_completion_after_cancel_is_ignored() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "args": { "command": "sleep 20" }
-            })),
-        );
-        let cancelled = mapper.cancel_events("Operation cancelled");
-        assert!(cancelled.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                success: false,
-                tool_result: ToolExecutionResult::Cancelled { .. },
-                ..
-            })
-        )));
-        assert!(
-            mapper
-                .map_event(
-                    "tool.complete",
-                    Some(json!({
-                        "tool_id": "terminal-1",
-                        "name": "terminal",
-                        "result": { "exit_code": -15 }
-                    })),
-                )
-                .is_empty()
-        );
-        assert!(
-            mapper
-                .map_event(
-                    "message.complete",
-                    Some(json!({ "text": "already finished", "status": "complete" })),
-                )
-                .is_empty(),
-            "the post-cancel settlement may race with a normal completion"
-        );
-        assert!(!mapper.awaiting_interrupted_complete);
-    }
-
-    #[test]
-    fn hermes_background_terminal_emits_typed_lifecycle() {
-        let mut mapper = HermesEventMapper::default();
-        let request = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "args": {
-                    "command": "sleep 8",
-                    "background": true
-                }
-            })),
-        );
-        assert!(request.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolRequest(ToolRequest {
-                tool_type: ToolRequestType::RunCommand { command, .. },
-                ..
-            }) if command == "sleep 8"
-        )));
-
-        let launched = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "result": {
-                    "session_id": "proc-1",
-                    "exit_code": 0
-                }
-            })),
-        );
-        assert!(launched.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolProgress(ToolProgressData {
-                tool_call_id,
-                update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                    task_id,
-                    status: BackgroundTaskStatus::Running,
-                    ..
-                }),
-                ..
-            }) if tool_call_id == "terminal-1" && task_id == "proc-1"
-        )));
-
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "process-1",
-                "name": "process",
-                "args": {
-                    "action": "wait",
-                    "session_id": "proc-1"
-                }
-            })),
-        );
-        let completed = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "process-1",
-                "name": "process",
-                "result": { "exit_code": 0 }
-            })),
-        );
-        assert!(completed.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolProgress(ToolProgressData {
-                tool_call_id,
-                update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                    task_id,
-                    status: BackgroundTaskStatus::Completed,
-                    ..
-                }),
-                ..
-            }) if tool_call_id == "terminal-1" && task_id == "proc-1"
-        )));
-    }
-
-    #[test]
-    fn hermes_turn_interrupt_preserves_background_command() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "args": {
-                    "command": "sleep 8",
-                    "background": true
-                }
-            })),
-        );
-        let _ = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "result": {
-                    "session_id": "proc-1",
-                    "exit_code": 0
-                }
-            })),
-        );
-
-        let cancelled = mapper.cancel_events("Operation cancelled");
-
-        assert!(
-            mapper.background_tasks.contains_key("proc-1"),
-            "ordinary turn interruption must preserve detached Hermes work"
-        );
-        assert!(cancelled.iter().all(|event| {
-            !matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                        status: BackgroundTaskStatus::Stopped,
-                        ..
-                    }),
-                    ..
-                })
-            )
-        }));
-    }
-
-    #[test]
-    fn hermes_tool_generation_notice_is_not_a_warning() {
-        let mut mapper = HermesEventMapper::default();
-        assert!(
-            mapper
-                .map_event("tool.generating", Some(json!({ "name": "probe" })))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn hermes_gateway_preserves_authoritative_tool_arguments() {
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("payload[\"args\"] = args"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("_tyde_gateway_server._on_tool_start"));
-    }
-
-    #[test]
-    fn hermes_gateway_preserves_native_cache_usage() {
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_cache_read_tokens"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_cache_write_tokens"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_reasoning_tokens"));
-        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("_tyde_gateway_server._get_usage"));
-    }
-
-    #[test]
-    fn hermes_tyde_agent_tools_use_shared_typed_contracts() {
-        let mut mapper = HermesEventMapper::default();
-        let request = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "spawn-1",
-                "name": "mcp_tyde_tyde_spawn_agent",
-                "args": {
-                    "name": "Hermes Child",
-                    "prompt": "Review this change"
-                }
-            })),
-        );
-        assert!(request.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolRequest(ToolRequest {
-                tool_type: ToolRequestType::AgentSpawn {
-                    prompt: Some(prompt),
-                    name: Some(name),
-                },
-                ..
-            }) if prompt == "Review this change" && name == "Hermes Child"
-        )));
-
-        let completion = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "spawn-1",
-                "name": "mcp_tyde_tyde_spawn_agent",
-                "args": {
-                    "name": "Hermes Child",
-                    "prompt": "Review this change"
-                },
-                "result": {
-                    "result": "{\"agent_id\":\"agent-1\",\"name\":\"Hermes Child\",\"status\":\"thinking\"}"
-                }
-            })),
-        );
-        assert!(completion.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolProgress(ToolProgressData {
-                update: ToolProgressUpdate::AgentControl(progress),
-                ..
-            }) if progress.agents.iter().any(|agent| agent.agent_id.0 == "agent-1")
-        )));
-    }
-
-    #[test]
-    fn hermes_native_delegation_is_a_typed_agent_spawn() {
-        let mut mapper = HermesEventMapper::default();
-        let events = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "delegate-1",
-                "name": "delegate_task",
-                "args": { "goals": ["Inspect the protocol"] }
-            })),
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolRequest(ToolRequest {
-                tool_type: ToolRequestType::AgentSpawn {
-                    prompt: Some(prompt),
-                    ..
-                },
-                ..
-            }) if prompt == "Inspect the protocol"
-        )));
-        assert_eq!(mapper.delegation_tools.len(), 1);
-        assert_eq!(mapper.delegation_tools[0].tool_call_id, "delegate-1");
-    }
-
-    #[test]
-    fn hermes_background_progress_carries_the_raw_request_name() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "Terminal",
-                "args": {
-                    "command": "sleep 8",
-                    "background": true
-                }
-            })),
-        );
-        let launched = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "Terminal",
-                "result": {
-                    "session_id": "proc-1",
-                    "exit_code": 0
-                }
-            })),
-        );
-        assert!(
-            launched.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                        status: BackgroundTaskStatus::Running,
-                        ..
-                    }),
-                }) if tool_call_id == "terminal-1" && tool_name == "Terminal"
-            )),
-            "background progress must carry the emitted request's raw name: {launched:?}"
-        );
-
-        let output = mapper.map_event(
-            "agent.terminal.output",
-            Some(json!({ "process_id": "proc-1", "text": "tick" })),
-        );
-        assert!(
-            output.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "terminal-1" && tool_name == "Terminal"
-            )),
-            "terminal output frames must carry the emitted request's raw name: {output:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_background_progress_never_attaches_to_a_reused_tool_id() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "Terminal",
-                "args": {
-                    "command": "sleep 8",
-                    "background": true
-                }
-            })),
-        );
-        let _ = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "Terminal",
-                "result": {
-                    "session_id": "proc-1",
-                    "exit_code": 0
-                }
-            })),
-        );
-        let _ = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "launched", "status": "complete" })),
-        );
-
-        let cross_turn = mapper.map_event(
-            "agent.terminal.output",
-            Some(json!({ "process_id": "proc-1", "text": "tick" })),
-        );
-        assert!(
-            cross_turn.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "tool-1" && tool_name == "Terminal"
-            )),
-            "the anchor survives a turn reset while the id is unclaimed: {cross_turn:?}"
-        );
-
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "read_file",
-                "args": { "path": "/tmp/x" }
-            })),
-        );
-        assert!(
-            mapper
-                .map_event(
-                    "agent.terminal.output",
-                    Some(json!({ "process_id": "proc-1", "text": "tick" })),
-                )
-                .is_empty(),
-            "a reused tool_call_id must not receive the stale task's frames"
-        );
-
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "process-1",
-                "name": "process",
-                "args": {
-                    "action": "wait",
-                    "session_id": "proc-1"
-                }
-            })),
-        );
-        let waited = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "process-1",
-                "name": "process",
-                "result": { "exit_code": 0 }
-            })),
-        );
-        assert!(
-            waited.iter().all(|event| !matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    update: ToolProgressUpdate::BackgroundTask(_),
-                    ..
-                })
-            )),
-            "wait completion must not attach the stale task to the reused id: {waited:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_tool_progress_uses_the_registered_request_name_first() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "Terminal",
-                "args": { "command": "pwd" }
-            })),
-        );
-        let progress = mapper.map_event(
-            "tool.progress",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "terminal",
-                "output": "tick"
-            })),
-        );
-        assert!(
-            progress.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "tool-1" && tool_name == "Terminal"
-            )),
-            "the registered request name wins over the payload name: {progress:?}"
-        );
-
-        let unknown = mapper.map_event(
-            "tool.progress",
-            Some(json!({
-                "tool_id": "ghost-1",
-                "name": "custom_probe",
-                "output": "tick"
-            })),
-        );
-        assert!(
-            unknown.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "ghost-1" && tool_name == "custom_probe"
-            )),
-            "ids the registry never saw still use the payload name: {unknown:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_delegation_anchors_are_never_guessed_across_candidates() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "delegate-1",
-                "name": "mcp_tyde_tyde_delegate_task",
-                "args": { "goals": ["Goal A"] }
-            })),
-        );
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "delegate-2",
-                "name": "delegate_task",
-                "args": { "goals": ["Goal B"] }
-            })),
-        );
-
-        let by_goal = mapper
-            .resolve_delegation_anchor(&json!({}), "Goal A")
-            .expect("goal match");
-        assert_eq!(by_goal.tool_call_id, "delegate-1");
-        assert_eq!(by_goal.tool_name, "mcp_tyde_tyde_delegate_task");
-
-        let by_id = mapper
-            .resolve_delegation_anchor(&json!({ "parent_tool_call_id": "delegate-2" }), "")
-            .expect("explicit id match");
-        assert_eq!(by_id.tool_call_id, "delegate-2");
-        assert_eq!(by_id.tool_name, "delegate_task");
-
-        assert!(
-            mapper
-                .resolve_delegation_anchor(&json!({ "parent_tool_call_id": "delegate-9" }), "")
-                .is_none(),
-            "an unknown explicit parent id must not fall back to another card"
-        );
-        assert!(
-            mapper.resolve_delegation_anchor(&json!({}), "").is_none(),
-            "two outstanding delegations with no goal match are ambiguous"
-        );
-
-        let _ = mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "delegate-1",
-                "name": "mcp_tyde_tyde_delegate_task",
-                "result": { "summary": "done" }
-            })),
-        );
-        let only_outstanding = mapper
-            .resolve_delegation_anchor(&json!({}), "")
-            .expect("single outstanding candidate is unambiguous");
-        assert_eq!(only_outstanding.tool_call_id, "delegate-2");
-
-        mapper.clear_turn_tool_state();
-        assert!(mapper.delegation_tools.is_empty());
-        assert!(
-            mapper
-                .resolve_delegation_anchor(&json!({}), "Goal B")
-                .is_none(),
-            "a prior turn's delegation card must not adopt a new turn's children"
-        );
-    }
-
-    #[test]
-    fn hermes_idless_children_never_share_a_synthetic_identity() {
-        let mut issued = HashMap::new();
-        let mut live: HashSet<String> = HashSet::new();
-
-        let first =
-            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
-        assert_eq!(first, "hermes-subagent-0");
-        live.insert(first.clone());
-
-        let same =
-            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
-        assert_eq!(same, first, "events for the live child keep its id");
-
-        live.remove(&first);
-        let second =
-            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
-        assert_ne!(
-            second, first,
-            "a new id-less child must not inherit a finished child's identity"
-        );
-        live.insert(second.clone());
-        let same_second =
-            resolve_synthetic_subagent_id("hermes-subagent-0", |id| live.contains(id), &mut issued);
-        assert_eq!(same_second, second);
-    }
-
-    #[test]
-    fn hermes_subagent_progress_carries_the_delegation_request_name() {
-        let handle = SubAgentHandle {
-            event_tx: mpsc::unbounded_channel().0,
-            model_usage_tx: mpsc::unbounded_channel().0,
-            total_usage_tx: mpsc::unbounded_channel().0,
-            agent_id: protocol::AgentId("agent-1".to_string()),
-            name_update_tx: None,
-        };
-        let anchor = HermesDelegationAnchor {
-            tool_call_id: "delegate-1".to_string(),
-            tool_name: "mcp_tyde_tyde_delegate_task".to_string(),
-        };
-        let progress = hermes_subagent_progress(&handle, "Hermes Agent 1", &anchor, 3, false);
-        assert_eq!(progress.tool_call_id, "delegate-1");
-        assert_eq!(progress.tool_name, "mcp_tyde_tyde_delegate_task");
-    }
-
-    #[test]
-    fn hermes_native_title_does_not_override_tyde_naming() {
-        let mut mapper = HermesEventMapper::default();
-        assert!(
-            mapper
-                .map_event(
-                    "session.title",
-                    Some(json!({ "session_id": "stored", "title": "Hermes title" })),
-                )
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn unsupported_gateway_method_is_recognized() {
-        assert!(is_unsupported_gateway_method(
-            "Hermes JSON-RPC error -32601: unknown method: session.context_breakdown"
-        ));
-        assert!(is_unsupported_gateway_method(
-            "unknown method: session.title"
-        ));
-        assert!(!is_unsupported_gateway_method(
-            "Hermes session.context_breakdown timed out"
-        ));
-        assert!(!is_unsupported_gateway_method(
-            "Hermes JSON-RPC error -32000: internal error"
-        ));
-    }
-
-    #[test]
-    fn managed_toolset_entry_matches_alias_and_respects_enabled() {
-        assert!(
-            managed_mcp_toolset_entry(&json!({
-                "name": "tyde", "enabled": true, "tools": ["mcp_tyde_probe"]
-            })),
-            "the gateway displays the managed toolset under its server alias"
-        );
-        assert!(
-            managed_mcp_toolset_entry(&json!({
-                "name": "mcp-tyde", "tools": ["mcp_tyde_probe"]
-            })),
-            "canonical name with a missing enabled field counts as enabled"
-        );
-        assert!(!managed_mcp_toolset_entry(&json!({
-            "name": "tyde", "enabled": false, "tools": ["mcp_tyde_probe"]
-        })));
-        assert!(!managed_mcp_toolset_entry(&json!({
-            "name": "tyde", "enabled": true, "tools": []
-        })));
-        assert!(!managed_mcp_toolset_entry(&json!({
-            "name": "file", "enabled": true, "tools": ["read_file"]
-        })));
-    }
-
-    #[test]
-    fn failure_message_absorbs_buffered_stderr_tail() {
-        let empty = VecDeque::new();
-        assert_eq!(
-            format_failure_with_stderr_tail("Hermes gateway exited".to_string(), &empty),
-            "Hermes gateway exited",
-            "no buffered stderr should leave the message untouched"
-        );
-
-        let mut tail = VecDeque::new();
-        tail.push_back("API call failed (attempt 3/3): AssertionError".to_string());
-        tail.push_back("Error: model rejected the request".to_string());
-        let message = format_failure_with_stderr_tail("Hermes gateway exited".to_string(), &tail);
-        assert!(message.starts_with("Hermes gateway exited"));
-        assert!(
-            message.contains("AssertionError") && message.contains("model rejected the request"),
-            "the failure must carry the buffered stderr so the cause is not silenced: {message}"
-        );
-    }
-
-    #[test]
-    fn hermes_reasoning_only_completion_suppresses_raw_reasoning_and_warns() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event("reasoning.delta", Some(json!({ "text": "thinking" })));
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "", "status": "complete" })),
-        );
-
-        let end = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        assert_eq!(end.message.content, "");
-        assert!(end.message.reasoning.is_none());
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Warning,
-                    content,
-                    ..
-                }) if content.contains("reasoning only")
-            )),
-            "reasoning-only completions must be visible: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
-            "reasoning-only completions must clear typing: {events:?}"
-        );
-        assert!(
-            events.iter().all(|event| !matches!(
-                event,
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Error,
-                    content,
-                    ..
-                }) if content.contains("missing required string field text")
-            )),
-            "empty final text must not be a missing-text protocol error: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| !format!("{event:?}").contains("thinking")),
-            "raw Hermes reasoning leaked into events: {events:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_empty_message_delta_is_noop() {
-        let mut mapper = HermesEventMapper::default();
-        let start = mapper.map_event("message.start", None);
-        assert!(matches!(start.as_slice(), [ChatEvent::StreamStart(_)]));
-
-        let events = mapper.map_event("message.delta", Some(json!({ "text": "" })));
-
-        assert!(events.is_empty(), "empty deltas must be no-ops: {events:?}");
-        assert!(
-            mapper.current_message_id.is_some(),
-            "empty deltas must not close the stream"
-        );
-    }
-
-    #[test]
-    fn hermes_completion_preserves_streamed_text_and_new_final_suffix() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": "Checked the repository before the tool." })),
-        );
-        let _ = mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": " The tool completed." })),
-        );
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({
-                "text": "Final recommendation not present in the deltas.",
-                "status": "complete"
-            })),
-        );
-        let content = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data.message.content.as_str()),
-                _ => None,
-            })
-            .expect("StreamEnd");
-
-        assert!(
-            content.starts_with("Checked the repository before the tool."),
-            "{content}"
-        );
-        assert!(
-            content.ends_with("Final recommendation not present in the deltas."),
-            "{content}"
-        );
-    }
-
-    #[test]
-    fn hermes_tool_offsets_count_unicode_scalars() {
-        let mut mapper = HermesEventMapper::default();
-        let mut events = mapper.map_event("message.start", None);
-        events.extend(mapper.map_event("message.delta", Some(json!({ "text": "Pré🙂 " }))));
-        events.extend(mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "args": { "command": "printf LIVE_TOOL_OK" }
-            })),
-        ));
-        events.extend(mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "terminal-1",
-                "name": "terminal",
-                "result": { "exit_code": 0, "stdout": "LIVE_TOOL_OK" }
-            })),
-        ));
-        events.extend(mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "Pré🙂 ", "status": "complete" })),
-        ));
-
-        let end = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        assert_eq!(end.message.content, "Pré🙂 ");
-        assert_eq!(end.message.tool_calls.len(), 1);
-        assert_eq!(end.message.tool_calls[0].id, "terminal-1");
-        assert_eq!(
-            end.message.tool_calls[0].content_offset,
-            Some(5),
-            "offsets count Unicode scalar values, not UTF-8 bytes"
-        );
-        assert_ne!("Pré🙂 ".len(), 5);
-    }
-
-    #[test]
-    fn hermes_provider_requests_are_distinct_chat_messages() {
-        let mut mapper = HermesEventMapper::default();
-        let mut events = mapper.map_event("message.start", None);
-        events.extend(mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": "I will inspect the file." })),
-        ));
-        events.extend(mapper.map_event(
-            "tool.start",
-            Some(json!({
-                "tool_id": "read-1",
-                "name": "read_file",
-                "args": { "path": "src/main.rs" }
-            })),
-        ));
-        events.extend(mapper.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "read-1",
-                "name": "read_file",
-                "result": { "content": "fn main() {}" }
-            })),
-        ));
-
-        // The tool cannot execute until the first provider response has ended,
-        // so output arriving after its completion belongs to a new request.
-        events.extend(mapper.map_event(
-            "provider.request.start",
-            Some(json!({
-                "iteration": 2,
-                "usage": { "input": 10, "output": 4, "total": 14 }
-            })),
-        ));
-        events.extend(mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": "The file contains an empty main function." })),
-        ));
-        events.extend(mapper.map_event(
-            "message.complete",
-            Some(json!({
-                "text": "The file contains an empty main function.",
-                "status": "complete"
-            })),
-        ));
-
-        let messages = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(&data.message),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            messages.len(),
-            2,
-            "each Hermes provider request must produce its own Tyde chat message"
-        );
-        assert_eq!(messages[0].content, "I will inspect the file.");
-        assert_eq!(messages[0].tool_calls.len(), 1);
-        assert_eq!(
-            messages[1].content,
-            "The file contains an empty main function."
-        );
-        assert!(messages[1].tool_calls.is_empty());
-    }
-
-    #[test]
-    fn hermes_same_offset_tools_keep_observed_order() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event("message.delta", Some(json!({ "text": "PRE" })));
-        for tool_id in ["tool-b", "tool-a"] {
-            let _ = mapper.map_event(
-                "tool.start",
-                Some(json!({ "tool_id": tool_id, "name": "terminal" })),
-            );
-            let _ = mapper.map_event(
-                "tool.complete",
-                Some(json!({
-                    "tool_id": tool_id,
-                    "name": "terminal",
-                    "result": { "exit_code": 0 }
-                })),
-            );
-        }
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "POST", "status": "complete" })),
-        );
-        let tools = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(&data.message.tool_calls),
-                _ => None,
-            })
-            .expect("StreamEnd tools");
-        assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["tool-b", "tool-a"]
-        );
-        assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.content_offset)
-                .collect::<Vec<_>>(),
-            vec![Some(3), Some(3)]
-        );
-    }
-
-    #[test]
-    fn hermes_reconciliation_reanchors_or_invalidates_tool_offsets() {
-        let mut reanchored = HermesEventMapper::default();
-        let _ = reanchored.map_event("message.start", None);
-        let _ = reanchored.map_event("message.delta", Some(json!({ "text": "PRE" })));
-        let _ = reanchored.map_event(
-            "tool.start",
-            Some(json!({ "tool_id": "tool-1", "name": "terminal" })),
-        );
-        let _ = reanchored.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "tool-1",
-                "name": "terminal",
-                "result": { "exit_code": 0 }
-            })),
-        );
-        let events = reanchored.map_event(
-            "message.complete",
-            Some(json!({ "text": "  PRE extended", "status": "complete" })),
-        );
-        let message = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(&data.message),
-                _ => None,
-            })
-            .expect("reanchored StreamEnd");
-        assert_eq!(message.content, "  PRE extended");
-        assert_eq!(message.tool_calls[0].content_offset, Some(5));
-
-        let mut invalidated = HermesEventMapper::default();
-        let _ = invalidated.map_event("message.start", None);
-        let _ = invalidated.map_event("message.delta", Some(json!({ "text": "PRE   " })));
-        let _ = invalidated.map_event(
-            "tool.start",
-            Some(json!({ "tool_id": "tool-2", "name": "terminal" })),
-        );
-        let _ = invalidated.map_event(
-            "tool.complete",
-            Some(json!({
-                "tool_id": "tool-2",
-                "name": "terminal",
-                "result": { "exit_code": 0 }
-            })),
-        );
-        let events = invalidated.map_event(
-            "message.complete",
-            Some(json!({ "text": "unequal final text", "status": "complete" })),
-        );
-        let message = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(&data.message),
-                _ => None,
-            })
-            .expect("invalidated StreamEnd");
-        assert_eq!(message.content, "PRE\n\nunequal final text");
-        assert_eq!(
-            message.tool_calls[0].content_offset, None,
-            "removed streamed prefix text must invalidate the observed position"
-        );
-    }
-
-    #[test]
-    fn hermes_completion_does_not_duplicate_repeated_final_text() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event("message.delta", Some(json!({ "text": "hello" })));
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "hello", "status": "complete" })),
-        );
-        let content = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data.message.content.as_str()),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        assert_eq!(content, "hello");
-    }
-
-    #[test]
-    fn hermes_transient_status_uses_retry_channel_not_history() {
-        let mut mapper = HermesEventMapper::default();
-        let events = mapper.map_event(
-            "status.update",
-            Some(json!({
-                "kind": "lifecycle",
-                "text": "Retrying provider",
-                "attempt": 2,
-                "max_retries": 3,
-                "backoff_ms": 500
-            })),
-        );
-
-        assert!(matches!(
-            events.as_slice(),
-            [ChatEvent::RetryAttempt(RetryAttemptData {
-                attempt: 2,
-                max_retries: 3,
-                backoff_ms: 500,
-                ..
-            })]
-        ));
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, ChatEvent::MessageAdded(_)))
-        );
-    }
-
-    #[test]
-    fn hermes_trailing_lifecycle_status_cannot_rearm_a_cancelled_turn() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let cancel_events = mapper.cancel_events("cancelled");
-        assert!(
-            cancel_events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-        );
-
-        let events = mapper.map_event(
-            "status.update",
-            Some(json!({
-                "kind": "lifecycle",
-                "text": "Retrying provider after an internal backoff"
-            })),
-        );
-
-        assert!(events.is_empty());
-        assert!(mapper.current_message_id.is_none());
-    }
-
-    #[test]
-    fn hermes_compacting_status_stays_off_turn_lifecycle() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let events = mapper.map_event(
-            "status.update",
-            Some(json!({
-                "kind": "compacting",
-                "text": "Compacting context — summarizing earlier conversation"
-            })),
-        );
-
-        assert!(events.is_empty());
-        assert!(mapper.current_message_id.is_some());
-    }
-
-    #[test]
-    fn hermes_approval_request_keeps_turn_busy() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-
-        let events = mapper.map_event(
-            "approval.request",
-            Some(json!({
-                "description": "Run the command?",
-                "command": "printf ok"
-            })),
-        );
-
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, ChatEvent::TypingStatusChanged(false)))
-        );
-    }
-
-    #[test]
-    fn hermes_error_completion_emits_one_error_without_assistant_masquerade() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let failure = "No allowed providers are available";
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": failure, "status": "error" })),
-        );
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error,
-                        content,
-                        ..
-                    }) if content == failure
-                ))
-                .count(),
-            1
-        );
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::StreamEnd(StreamEndData { message })
-                if message.content == failure
-        )));
-    }
-
-    #[test]
-    fn hermes_error_event_terminalizes_the_crashed_turn_once() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({ "tool_id": "tool-1", "name": "terminal" })),
-        );
-        let failure = "No allowed providers are available";
-        let events = mapper.map_event("error", Some(json!({ "message": failure })));
-
-        assert!(mapper.current_message_id.is_none());
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                tool_result: ToolExecutionResult::Cancelled { .. },
-                success: false,
-                ..
-            })
-        )));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error,
-                        content,
-                        ..
-                    }) if content == failure
-                ))
-                .count(),
-            1
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, ChatEvent::RetryAttempt(_)))
-        );
-    }
-
-    #[test]
-    fn hermes_message_complete_missing_status_defaults_to_complete() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-
-        let events = mapper.map_event("message.complete", Some(json!({ "text": "ok" })));
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::StreamEnd(StreamEndData { message }) if message.content == "ok"
-        )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-        );
-    }
-
-    #[test]
-    fn hermes_message_complete_maps_turn_and_cumulative_usage() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({
-                "text": "ok",
-                "status": "complete",
-                "usage": { "input": 3, "output": 4, "total": 7 },
-                "cumulative_usage": { "input": 10, "output": 15, "total": 25 }
-            })),
-        );
-
-        let end = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        let usage = end.message.token_usage.as_ref().expect("token usage");
-        assert_eq!(
-            usage
-                .turn
-                .known_usage()
-                .expect("known turn usage")
-                .total_tokens,
-            7
-        );
-        assert_eq!(
-            usage
-                .cumulative
-                .known_usage()
-                .expect("known cumulative usage")
-                .total_tokens,
-            25
-        );
-        assert!(matches!(
-            usage.request,
-            TokenUsageScope::Unavailable {
-                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
-            }
-        ));
-    }
-
-    #[test]
-    fn hermes_message_complete_without_usage_emits_unavailable() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "ok", "status": "complete" })),
-        );
-
-        let end = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        let usage = end.message.token_usage.as_ref().expect("token usage");
-        assert!(matches!(
-            usage.turn,
-            protocol::TokenUsageScope::Unavailable {
-                reason: TokenUsageUnavailableReason::BackendDidNotReport
-            }
-        ));
-    }
-
-    #[test]
-    fn hermes_session_cumulative_usage_is_differenced_per_turn() {
-        let previous = token_usage_from_value(&json!({
-            "input": 10,
-            "output": 5,
-            "total": 15,
-            "cached_prompt_tokens": 2,
-            "cache_creation_input_tokens": 3,
-            "reasoning_tokens": 4
-        }))
-        .expect("previous usage");
-        let current = token_usage_from_value(&json!({
-            "input": 18,
-            "output": 13,
-            "total": 31,
-            "cached_prompt_tokens": 7,
-            "cache_creation_input_tokens": 8,
-            "reasoning_tokens": 9
-        }))
-        .expect("current usage");
-
-        let (turn, reset) = token_usage_delta(Some(&previous), &current);
-
-        assert!(!reset);
-        assert_eq!(turn.input_tokens, 8);
-        assert_eq!(turn.output_tokens, 8);
-        assert_eq!(turn.total_tokens, 16);
-        assert_eq!(turn.cached_prompt_tokens, Some(5));
-        assert_eq!(turn.cache_creation_input_tokens, Some(5));
-        assert_eq!(turn.reasoning_tokens, Some(5));
-    }
-
-    #[test]
-    fn hermes_usage_counter_decrease_starts_a_new_epoch() {
-        let previous = token_usage_from_value(&json!({
-            "input": 100,
-            "output": 40,
-            "total": 140,
-            "reasoning_tokens": 20
-        }))
-        .expect("previous usage");
-        let current = token_usage_from_value(&json!({
-            "input": 9,
-            "output": 3,
-            "total": 12,
-            "reasoning_tokens": 2
-        }))
-        .expect("current usage");
-
-        let (turn, reset) = token_usage_delta(Some(&previous), &current);
-
-        assert!(reset);
-        assert_eq!(turn, current);
-    }
-
-    #[test]
-    fn hermes_resumed_usage_epoch_keeps_first_turn_and_hides_partial_total() {
-        let mut mapper = HermesEventMapper {
-            cumulative_usage_incomplete: true,
-            ..HermesEventMapper::default()
-        };
-        let first = TokenUsage {
-            input_tokens: 12,
-            output_tokens: 3,
-            total_tokens: 15,
-            ..TokenUsage::default()
-        };
-
-        let (first_turn, first_cumulative) = mapper.record_session_usage(first.clone());
-
-        assert_eq!(first_turn, first);
-        assert!(
-            first_cumulative.is_none(),
-            "a resumed runtime has no authoritative prior-session total"
-        );
-
-        let second = TokenUsage {
-            input_tokens: 20,
-            output_tokens: 7,
-            total_tokens: 27,
-            ..TokenUsage::default()
-        };
-        let (second_turn, second_cumulative) = mapper.record_session_usage(second);
-        assert_eq!(second_turn.input_tokens, 8);
-        assert_eq!(second_turn.output_tokens, 4);
-        assert_eq!(second_turn.total_tokens, 12);
-        assert!(second_cumulative.is_none());
-    }
-
-    #[test]
-    fn hermes_usage_accepts_upstream_reasoning_alias() {
-        let usage = token_usage_from_value(&json!({
-            "input": 10,
-            "output": 4,
-            "total": 14,
-            "reasoning": 3
-        }))
-        .expect("usage");
-
-        assert_eq!(usage.reasoning_tokens, Some(3));
-    }
-
-    #[test]
-    fn hermes_explicit_zero_usage_is_distinct_from_missing_usage() {
-        assert!(token_usage_from_value(&json!({})).is_none());
-        assert_eq!(
-            token_usage_from_value(&json!({
-                "input": 0,
-                "output": 0,
-                "total": 0
-            }))
-            .expect("explicit zero usage"),
-            TokenUsage::default()
-        );
-    }
-
-    #[test]
-    fn hermes_context_breakdown_maps_native_categories() {
-        let breakdown = context_breakdown_from_hermes(&json!({
-            "context_used": 12_000,
-            "context_max": 200_000,
-            "estimated_total": 12_000,
-            "categories": [
-                { "id": "system_prompt", "tokens": 1_000 },
-                { "id": "tool_definitions", "tokens": 2_000 },
-                { "id": "mcp", "tokens": 300 },
-                { "id": "subagent_definitions", "tokens": 200 },
-                { "id": "conversation", "tokens": 7_000 },
-                { "id": "rules", "tokens": 400 },
-                { "id": "skills", "tokens": 500 },
-                { "id": "memory", "tokens": 600 }
-            ]
-        }))
-        .expect("native context breakdown");
-
-        assert_eq!(breakdown.input_tokens, 12_000);
-        assert_eq!(breakdown.context_window, 200_000);
-        assert_eq!(breakdown.system_prompt_bytes, 4_000);
-        assert_eq!(breakdown.tool_io_bytes, 10_000);
-        assert_eq!(breakdown.conversation_history_bytes, 28_000);
-        assert_eq!(breakdown.context_injection_bytes, 6_000);
-    }
-
-    #[test]
-    fn hermes_context_breakdown_preserves_measured_total_with_estimated_categories() {
-        let breakdown = context_breakdown_from_hermes(&json!({
-            "context_used": 8_100,
-            "context_max": 1_048_000,
-            "estimated_total": 8_037,
-            "categories": [
-                { "id": "system_prompt", "tokens": 3_000 },
-                { "id": "tool_definitions", "tokens": 2_000 },
-                { "id": "conversation", "tokens": 3_037 }
-            ]
-        }))
-        .expect("measured utilization with estimated categories");
-
-        assert_eq!(breakdown.input_tokens, 8_100);
-        assert_eq!(breakdown.system_prompt_bytes, 12_000);
-        assert_eq!(breakdown.tool_io_bytes, 8_000);
-        assert_eq!(breakdown.conversation_history_bytes, 12_148);
-    }
-
-    #[test]
-    fn hermes_context_breakdown_keeps_large_unattributed_measured_remainder() {
-        let breakdown = context_breakdown_from_hermes(&json!({
-            "context_used": 61_000,
-            "context_max": 1_048_000,
-            "estimated_total": 8_100,
-            "categories": [
-                { "id": "tool_definitions", "tokens": 8_100 }
-            ]
-        }))
-        .expect("measured utilization must survive incomplete attribution");
-
-        assert_eq!(breakdown.input_tokens, 61_000);
-        assert_eq!(breakdown.tool_io_bytes, 32_400);
-        assert_eq!(breakdown.reasoning_bytes, 0);
-    }
-
-    #[test]
-    fn hermes_message_complete_rejects_malformed_status() {
-        for (payload, expected) in [
-            (
-                json!({ "text": "ok", "status": "" }),
-                "status must be non-empty",
-            ),
-            (
-                json!({ "text": "ok", "status": 7 }),
-                "status must be a string",
-            ),
-        ] {
-            let mut mapper = HermesEventMapper::default();
-            let _ = mapper.map_event("message.start", None);
-
-            let events = mapper.map_event("message.complete", Some(payload));
-
-            assert!(
-                events.iter().any(|event| matches!(
-                    event,
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error,
-                        content,
-                        ..
-                    }) if content.contains(expected)
-                )),
-                "malformed status should surface {expected:?}: {events:?}"
-            );
-            assert!(
-                events
-                    .iter()
-                    .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-            );
-        }
-    }
-
-    #[test]
-    fn hermes_empty_completion_without_reasoning_is_visible() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-
-        let events = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "", "status": "complete" })),
-        );
-
-        let end = events
-            .iter()
-            .find_map(|event| match event {
-                ChatEvent::StreamEnd(data) => Some(data),
-                _ => None,
-            })
-            .expect("StreamEnd");
-        assert_eq!(end.message.content, "");
-        assert!(end.message.reasoning.is_none());
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Error,
-                    content,
-                    ..
-                }) if content.contains("without visible assistant text")
-            )),
-            "empty completions must be visible: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
-            "empty completions must clear typing: {events:?}"
-        );
-    }
-
-    #[test]
-    fn hermes_mapper_error_closes_active_stream_tools_and_typing() {
-        let mut mapper = HermesEventMapper::default();
-        let _ = mapper.map_event("message.start", None);
-        let _ = mapper.map_event(
-            "tool.start",
-            Some(json!({ "tool_id": "tool-1", "name": "shell" })),
-        );
-
-        let events = mapper.map_event("message.delta", Some(json!({})));
-
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::StreamEnd(_))),
-            "protocol errors must close open streams: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                    tool_call_id,
-                    success: false,
-                    ..
-                }) if tool_call_id == "tool-1"
-            )),
-            "protocol errors must complete open tools: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Error,
-                    content,
-                    ..
-                }) if content.contains("missing required string field text")
-            )),
-            "protocol errors must be visible: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
-            "protocol errors must clear typing: {events:?}"
-        );
-        assert!(mapper.current_message_id.is_none());
-        assert!(mapper.pending_tools.is_empty());
-        assert!(mapper.turn_tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn hermes_bad_prompt_status_clears_typing() {
-        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
-        let dir = TempDir::new().expect("tempdir");
-        let fake = write_fake_gateway(
-            &dir,
-            r#"
-import json, sys
-print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"skin":"default"}}}), flush=True)
-for line in sys.stdin:
-    req = json.loads(line)
-    rid = req["id"]
-    method = req["method"]
-    if method == "session.create":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"session_id":"live1","stored_session_id":"stored1","messages":[],"info":{}}}), flush=True)
-    elif method == "prompt.submit":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"bogus"}}), flush=True)
-    else:
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
-"#,
-        );
-        let _guard = TestHermesPythonGuard::set(&fake);
-        let (backend, mut events) = HermesBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            payload("hello"),
-        )
-        .await
-        .expect("spawn fake hermes");
-
-        let mut saw_error = false;
-        let mut saw_typing_false = false;
-        let mut observed = Vec::new();
-        for _ in 0..8 {
-            let event = timeout(Duration::from_secs(2), events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event stream open");
-            observed.push(format!("{event:?}"));
-            match event {
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Error,
-                    content,
-                    ..
-                }) if content.contains("unexpected status 'bogus'") => {
-                    saw_error = true;
-                }
-                ChatEvent::TypingStatusChanged(false) if saw_error => {
-                    saw_typing_false = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(
-            saw_error,
-            "bad prompt status should emit a visible error; observed: {observed:#?}"
-        );
-        assert!(
-            saw_typing_false,
-            "bad prompt status should clear typing after the error; observed: {observed:#?}"
-        );
-        backend.shutdown().await;
-    }
-
-    #[test]
-    fn todo_results_build_stable_typed_task_lists() {
-        use protocol::TaskStatus;
-
-        let mut ids = HashMap::new();
-        let mut next_id = 0;
-        let first = hermes_task_list_from_value(
-            &json!({"todos": [
-                {"id": "alpha", "content": "Alpha check", "status": "in_progress"},
-                {"id": "beta", "content": "Beta check", "status": "pending"}
-            ]}),
-            &mut ids,
-            &mut next_id,
-        )
-        .expect("first task list");
-        let second = hermes_task_list_from_value(
-            &json!({"todos": [
-                {"id": "alpha", "content": "Alpha check", "status": "completed"},
-                {"id": "beta", "content": "Beta check", "status": "in_progress"}
-            ]}),
-            &mut ids,
-            &mut next_id,
-        )
-        .expect("second task list");
-
-        assert_eq!(first.tasks[0].id, second.tasks[0].id);
-        assert_eq!(first.tasks[1].id, second.tasks[1].id);
-        assert!(matches!(second.tasks[0].status, TaskStatus::Completed));
-        assert!(matches!(second.tasks[1].status, TaskStatus::InProgress));
-    }
-
-    #[test]
-    fn history_replays_tool_only_messages_and_todo_state() {
-        let events = hermes_history_to_chat_events(&json!({"messages": [
-            {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "call-1",
-                    "function": {
-                        "name": "todo",
-                        "arguments": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"in_progress\"}]}"
-                    }
-                }]
-            },
-            {
-                "role": "tool",
-                "content": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"completed\"}]}",
-                "tool_call_id": "call-1",
-                "tool_name": "todo"
-            },
-            {
-                "role": "tool",
-                "name": "todo",
-                "context": "Update task list"
-            }
-        ]}))
-        .expect("history mapping");
-
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::ToolExecutionCompleted(_)))
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::TaskUpdate(tasks)
-                if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
-        )));
-    }
-
-    #[test]
-    fn history_tool_completions_take_names_from_the_assistant_request() {
-        let events = hermes_history_to_chat_events(&json!({"messages": [
-            {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                    {
-                        "id": "call-1",
-                        "function": {
-                            "name": "todo",
-                            "arguments": "{}"
-                        }
-                    },
-                    {
-                        "id": "call-2",
-                        "function": {
-                            "name": "Terminal",
-                            "arguments": "{\"command\":\"pwd\"}"
-                        }
-                    }
-                ]
-            },
-            {
-                "role": "tool",
-                "content": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"completed\"}]}",
-                "tool_call_id": "call-1"
-            },
-            {
-                "role": "tool",
-                "content": "/tmp",
-                "tool_call_id": "call-2",
-                "tool_name": "terminal"
-            }
-        ]}))
-        .expect("history mapping");
-
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "call-1" && tool_name == "todo"
-            )),
-            "a nameless tool record must resolve its request's name: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::TaskUpdate(tasks)
-                    if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
-            )),
-            "todo reconstruction must survive a nameless tool record: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                    tool_call_id,
-                    tool_name,
-                    ..
-                }) if tool_call_id == "call-2" && tool_name == "Terminal"
-            )),
-            "the replayed request name is the authority over the record's own name: {events:?}"
-        );
-    }
-
-    fn skill_resolved_config(selection: SkillSelection) -> ResolvedSpawnConfig {
-        ResolvedSpawnConfig {
-            skills: vec![
-                crate::agent::customization::ResolvedSkill::test_fixture("axdb-ops", ""),
-                crate::agent::customization::ResolvedSkill::test_fixture("eazy-ecs", ""),
-            ],
-            skill_selection: selection,
-            ..ResolvedSpawnConfig::default()
-        }
-    }
-
-    #[test]
-    fn hermes_registers_the_resolved_skill_store_not_the_global_default() {
-        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
-
-        assert_eq!(
-            hermes_skill_roots(&resolved.skills).expect("resolved skill roots"),
-            vec![PathBuf::from("/nonexistent/tyde-test-skills")]
-        );
-    }
-
-    #[test]
-    fn hermes_keeps_skills_available_when_mcp_selects_toolsets() {
-        assert_eq!(
-            hermes_selected_toolsets(vec!["terminal".to_string()], false, true),
-            vec![
-                "terminal".to_string(),
-                "skills".to_string(),
-                MANAGED_SERVER_NAME.to_string()
-            ]
-        );
-        assert_eq!(
-            hermes_selected_toolsets(vec!["terminal".to_string()], true, true),
-            vec![MANAGED_SERVER_NAME.to_string()],
-            "an empty allowlist remains authoritative"
-        );
-    }
-
-    /// The failure this closes: a remote gateway reads another machine's config
-    /// and another machine's disk, so naming Tyde's skills there promises
-    /// instructions that do not exist. The model then reports every one of them
-    /// as missing.
-    #[test]
-    fn remote_instructions_never_name_a_skill_hermes_cannot_load() {
-        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
-
-        let local = render_hermes_spawn_instructions(&resolved, true).expect("local overlay");
-        assert!(local.contains("axdb-ops"), "{local}");
-        assert!(local.contains("skill discovery"), "{local}");
-
-        assert_eq!(
-            render_hermes_spawn_instructions(&resolved, false),
-            None,
-            "a remote session must not be handed skill names with nothing behind them"
-        );
-    }
-
-    /// A registration Hermes did not take is the exact case that used to stop
-    /// the spawn. It now costs the session its skills — and, critically, the
-    /// instructions stop naming them, so the model is never told about a skill
-    /// `skills_list` cannot see.
-    #[test]
-    fn a_failed_registration_drops_the_skills_from_the_prompt_not_the_session() {
-        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
-
-        let (instructions, notice) = hermes_skill_exposure(&resolved, Some(Ok(())));
-        assert!(
-            instructions
-                .as_deref()
-                .is_some_and(|text| text.contains("axdb-ops")),
-            "a registered store may be named: {instructions:?}"
-        );
-        assert_eq!(notice, None);
-
-        let (instructions, notice) = hermes_skill_exposure(
-            &resolved,
-            Some(Err(
-                "Hermes did not register the Tyde skills directory".to_string()
-            )),
-        );
-        assert!(
-            !instructions
-                .as_deref()
-                .unwrap_or_default()
-                .contains("axdb-ops"),
-            "a store Hermes did not register must not be named: {instructions:?}"
-        );
-        let notice = notice.expect("a failed registration must be reported");
-        assert!(notice.contains("2 selected skill(s)"), "{notice}");
-        assert!(notice.contains("did not register"), "{notice}");
-        assert!(
-            notice.contains("works normally otherwise"),
-            "the session survives, and the notice says so: {notice}"
-        );
-
-        // Never attempted (remote, or nothing selected): no notice from here,
-        // and nothing named.
-        let (instructions, notice) = hermes_skill_exposure(&resolved, None);
-        assert!(
-            !instructions
-                .as_deref()
-                .unwrap_or_default()
-                .contains("axdb-ops")
-        );
-        assert_eq!(notice, None);
-    }
-
-    /// A remote session keeps its workspace and loses its skills, whichever way
-    /// they were selected. The selection type only changes how the loss is
-    /// described — an explicitly named skill going missing is worth saying so.
-    #[test]
-    fn remote_hermes_drops_skills_with_a_notice_for_every_selection() {
-        let explicit = skill_resolved_config(SkillSelection::Explicit);
-        let explicit_notice = hermes_remote_skill_notice(&explicit, Some("builder.example"))
-            .expect("an explicit selection is dropped with a notice, not refused");
-        assert!(
-            explicit_notice.contains("2 explicitly selected skill(s)"),
-            "{explicit_notice}"
-        );
-        assert!(
-            explicit_notice.contains("builder.example"),
-            "{explicit_notice}"
-        );
-
-        let notice = hermes_remote_skill_notice(
-            &skill_resolved_config(SkillSelection::AllInstalled),
-            Some("builder.example"),
-        )
-        .expect("a Default agent starts remotely, but never silently");
-        assert!(notice.contains("2 installed skill(s)"), "{notice}");
-        assert!(notice.contains("builder.example"), "{notice}");
-
-        // Local sessions are unaffected, and a skill-less remote session has
-        // nothing to report either way.
-        assert_eq!(hermes_remote_skill_notice(&explicit, None), None);
-        assert_eq!(
-            hermes_remote_skill_notice(&ResolvedSpawnConfig::default(), Some("builder.example")),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    fn write_fake_hermes_python(path: &Path, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(path, script).expect("write fake python");
-        let mut perms = fs::metadata(path).expect("launcher metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("chmod launcher");
-    }
-
-    /// Registration is verified, not assumed. Hermes silently ignores an
-    /// external skills directory it did not record, and a session that believed
-    /// otherwise would name skills `skills_list` cannot see — the exact failure
-    /// this work fixes.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn hermes_skill_dir_registration_is_verified_not_assumed() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = dir.path().join("skills");
-        let target = |program: &Path| HermesSpawnTarget {
-            program: program.to_string_lossy().to_string(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            cwd: None,
-            remote_host: None,
-            display_program: "hermes".to_string(),
-            provider_version: None,
-        };
-
-        let confirming = dir.path().join("fake_python_confirms.sh");
-        write_fake_hermes_python(
-            &confirming,
-            &format!(
-                "#!/bin/sh\nprintf '[\"%s\"]\\n' \"{}\"\n",
-                store.to_string_lossy()
-            ),
-        );
-        register_hermes_skill_dir(&target(&confirming), &store)
-            .await
-            .expect("a registration Hermes confirms must be accepted");
-
-        // Hermes reports a list without the store: registration silently did not
-        // take, so the session must not start.
-        let ignoring = dir.path().join("fake_python_ignores.sh");
-        write_fake_hermes_python(&ignoring, "#!/bin/sh\necho '[\"/somewhere/else\"]'\n");
-        let err = register_hermes_skill_dir(&target(&ignoring), &store)
-            .await
-            .expect_err("an unregistered store must fail the spawn");
-        assert!(err.contains("did not register"), "{err}");
-        assert!(err.contains("/somewhere/else"), "{err}");
-
-        let failing = dir.path().join("fake_python_fails.sh");
-        write_fake_hermes_python(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
-        let err = register_hermes_skill_dir(&target(&failing), &store)
-            .await
-            .expect_err("a rejected registration must fail the spawn");
-        assert!(err.contains("boom"), "{err}");
-    }
-
-    /// A `~`-spelled entry the user already configured is the same directory, so
-    /// registration must not append a duplicate or claim it is missing.
-    #[test]
-    fn hermes_external_dir_comparison_expands_the_home_shorthand() {
-        let home = crate::paths::home_dir().expect("home dir");
-        assert_eq!(
-            expand_hermes_path("~/.tyde/skills"),
-            home.join(".tyde/skills")
-        );
-        assert_eq!(expand_hermes_path("~"), home);
-        assert_eq!(
-            expand_hermes_path("/absolute/skills"),
-            PathBuf::from("/absolute/skills")
-        );
-        // Another user's home is not this one's.
-        assert_eq!(
-            expand_hermes_path("~someone/skills"),
-            PathBuf::from("~someone/skills")
-        );
-    }
-
-    #[test]
-    fn compaction_capability_never_gates_on_provider_version() {
-        for version in [
-            None,
-            Some("Hermes Agent v999.0.0"),
-            Some("Hermes Agent v999.0.0-nightly.1"),
-            Some("Hermes Agent development"),
-            Some("malformed version output"),
-        ] {
-            let capability = hermes_compaction_capability(version);
-            assert!(matches!(
-                capability.availability,
-                crate::backend::BackendCompactionAvailability::Native {
-                    mechanism: BackendCompactionMechanism::JsonRpcRequest
-                }
-            ));
-            assert_eq!(
-                capability.provider_version.as_deref(),
-                version.map(str::trim)
-            );
-            assert!(
-                crate::backend::compaction::not_dispatched_for_capability(&capability).is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_guard_precedes_method_probe() {
-        let capability = hermes_compaction_capability(None);
-        assert!(matches!(
-            hermes_compaction_pre_dispatch(&capability, false),
-            Some(BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
-                    BackendCompactionUnavailableReason::TranscriptNotAuthoritative
-                ),
-                fallback_safe: true,
-            })
-        ));
-        assert!(
-            hermes_compaction_pre_dispatch(
-                &hermes_compaction_capability(Some("malformed version output")),
-                true,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn typed_rpc_error_preserves_provider_code() {
-        let mut pending = HashMap::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        pending.insert(7, reply_tx);
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let mut ready = None;
-        handle_gateway_stdout_line(
-            r#"{"jsonrpc":"2.0","id":7,"error":{"code":4009,"message":"busy"}}"#,
-            &mut pending,
-            &event_tx,
-            &mut ready,
-        );
-        let error = reply_rx
-            .blocking_recv()
-            .expect("gateway reply")
-            .expect_err("provider error");
-        assert_eq!(error.code, Some(4009));
-        assert_eq!(error.message, "busy");
-    }
-
-    #[test]
-    fn method_absence_is_cached_while_accepted_or_ambiguous_failures_stay_unsafe() {
-        let stored = Arc::new(std::sync::Mutex::new(SessionId("stored".to_string())));
-        let capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(Some(
-            "Hermes Agent v999.0.0-nightly.1",
-        ))));
-        let busy = classify_hermes_compaction_response(
-            protocol::CompactionOperationId("busy".to_string()),
-            "live".to_string(),
-            SessionId("stored".to_string()),
-            Err(HermesRpcError {
-                code: Some(4009),
-                message: "busy".to_string(),
-            }),
-            &stored,
-            &capability,
-        );
-        assert_eq!(busy.dispatch, BackendCompactionDispatchState::Accepted);
-        assert_eq!(busy.mutation, BackendCompactionMutationState::NotObserved);
-        assert!(busy.outcome.is_err());
-
-        let method_missing = classify_hermes_compaction_response(
-            protocol::CompactionOperationId("method-missing".to_string()),
-            "live".to_string(),
-            SessionId("stored".to_string()),
-            Err(HermesRpcError {
-                code: Some(-32601),
-                message: "Method not found".to_string(),
-            }),
-            &stored,
-            &capability,
-        );
-        assert_eq!(
-            method_missing.dispatch,
-            BackendCompactionDispatchState::Rejected
-        );
-        assert_eq!(
-            method_missing.mutation,
-            BackendCompactionMutationState::NotObserved
-        );
-        let cached = capability
-            .lock()
-            .expect("Hermes compaction capability")
-            .clone();
-        assert!(matches!(
-            &cached.availability,
-            crate::backend::BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
-            }
-        ));
-        assert_eq!(
-            cached.provider_version.as_deref(),
-            Some("Hermes Agent v999.0.0-nightly.1")
-        );
-        assert!(matches!(
-            crate::backend::compaction::not_dispatched_for_capability(&cached),
-            Some(BackendCompactionStart::NotDispatched {
-                fallback_safe: true,
-                ..
-            })
-        ));
-
-        let unknown = classify_hermes_compaction_response(
-            protocol::CompactionOperationId("unknown".to_string()),
-            "live".to_string(),
-            SessionId("stored".to_string()),
-            Err(HermesRpcError {
-                code: Some(5005),
-                message: "compress failed".to_string(),
-            }),
-            &stored,
-            &capability,
-        );
-        assert_eq!(
-            unknown.mutation,
-            BackendCompactionMutationState::MayHaveMutated
-        );
-
-        let malformed = classify_hermes_compaction_response(
-            protocol::CompactionOperationId("malformed".to_string()),
-            "live".to_string(),
-            SessionId("stored".to_string()),
-            Ok(json!({"status":"compressed"})),
-            &stored,
-            &capability,
-        );
-        assert_eq!(
-            malformed.mutation,
-            BackendCompactionMutationState::MayHaveMutated
-        );
-        assert!(matches!(
-            malformed.outcome,
-            Err(BackendCompactionFailure {
-                kind: BackendCompactionFailureKind::ProtocolViolation,
-                ..
-            })
-        ));
-    }
 }

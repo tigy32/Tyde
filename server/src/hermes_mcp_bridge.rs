@@ -14,6 +14,9 @@ use rmcp::transport::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::backend::TYDE_MCP_RESULT_ENVELOPE_KEY;
 
 const DOWNSTREAM_STARTUP_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(250)
@@ -29,6 +32,8 @@ pub const READY_FILE_NAME: &str = "tyde-mcp-ready.json";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BridgeDescriptor {
     pub servers: Vec<BridgeServerConfig>,
+    #[serde(default)]
+    pub supports_parallel_tool_calls: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,7 +125,7 @@ impl ServerHandler for HermesMcpBridge {
                 None,
             ));
         };
-        self.downstreams[index]
+        let mut result = self.downstreams[index]
             .peer
             .call_tool(request)
             .await
@@ -132,7 +137,30 @@ impl ServerHandler for HermesMcpBridge {
                     ),
                     None,
                 )
-            })
+            })?;
+        let canonical = serde_json::to_value(&result).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to preserve downstream MCP result: {error}"),
+                None,
+            )
+        })?;
+        let mut structured = match result.structured_content.take() {
+            Some(Value::Object(object)) => object,
+            Some(original) => {
+                let mut object = serde_json::Map::new();
+                object.insert("value".to_owned(), original);
+                object
+            }
+            None => serde_json::Map::new(),
+        };
+        structured.insert(TYDE_MCP_RESULT_ENVELOPE_KEY.to_owned(), canonical);
+        result.structured_content = Some(Value::Object(structured));
+        result.is_error = Some(false);
+        eprintln!(
+            "TYDE HERMES MCP BRIDGE RESULT outbound={}",
+            serde_json::to_value(&result).unwrap_or(Value::Null)
+        );
+        Ok(result)
     }
 }
 
@@ -427,6 +455,7 @@ mod tests {
         })
         .await;
         let descriptor = BridgeDescriptor {
+            supports_parallel_tool_calls: false,
             servers: vec![
                 http_server("first", first_url),
                 http_server("second", second_url),
@@ -500,6 +529,7 @@ mod tests {
         })
         .await;
         let (bridge, mut downstreams) = build_bridge(Some(BridgeDescriptor {
+            supports_parallel_tool_calls: false,
             servers: vec![
                 http_server("first", first_url),
                 http_server("second", second_url),
@@ -525,6 +555,7 @@ mod tests {
         })
         .await;
         let (bridge, mut downstreams) = build_bridge(Some(BridgeDescriptor {
+            supports_parallel_tool_calls: false,
             servers: vec![
                 http_server("working", working_url),
                 http_server("unavailable", "http://127.0.0.1:1/mcp".to_string()),
@@ -564,6 +595,7 @@ mod tests {
         });
 
         let (bridge, mut downstreams) = build_bridge(Some(BridgeDescriptor {
+            supports_parallel_tool_calls: false,
             servers: vec![
                 http_server("working", working_url),
                 http_server("stalled", stalled_url),

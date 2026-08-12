@@ -670,7 +670,7 @@ fn render_body(
             failed_result_body(result).into_any()
         }
         ToolRequestType::AskUserQuestion { .. } => {
-            ask_user_question::render(agent_ref, req, result, mode).into_any()
+            ask_user_question::render(agent_ref, tool_call_id, req, result, mode).into_any()
         }
         ToolRequestType::ExitPlanMode { .. } => {
             exit_plan_mode::render(agent_ref, tool_call_id, req, result, mode).into_any()
@@ -2052,6 +2052,11 @@ mod live_card_wasm_tests {
                 last_tool_name: Some("Read".to_owned()),
                 tool_calls,
                 completed,
+                status: if completed {
+                    protocol::SubAgentProgressStatus::Completed
+                } else {
+                    protocol::SubAgentProgressStatus::Running
+                },
             }),
         }
     }
@@ -2070,6 +2075,7 @@ mod live_card_wasm_tests {
                     agent_id: AgentId("agent-sub".to_owned()),
                     name: Some("Worker".to_owned()),
                 }],
+                status: protocol::AgentControlProgressStatus::Running,
             }),
         }
     }
@@ -2453,6 +2459,7 @@ mod live_card_wasm_tests {
                         name: Some("Claude design".to_owned()),
                     },
                 ],
+                status: protocol::AgentControlProgressStatus::Completed,
             }),
         };
         let (container, _state) = mount_card(entry, Some(progress));
@@ -2493,6 +2500,7 @@ mod live_card_wasm_tests {
                     agent_id: AgentId("native-child".to_owned()),
                     name: Some("/root/sleeper".to_owned()),
                 }],
+                status: protocol::AgentControlProgressStatus::Completed,
             }),
         };
         let (container, state) = mount_card(entry, Some(progress));

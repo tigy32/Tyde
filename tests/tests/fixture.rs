@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use protocol::{
     AgentId, BackendKind, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostSettingValue, SessionSchemaEntry, SessionSchemasPayload,
+    HostSettingValue,
 };
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
@@ -103,65 +103,6 @@ impl Fixture {
             false,
         )
         .await
-    }
-
-    #[allow(dead_code)]
-    pub async fn new_with_real_codex_backend_and_probe_program(
-        codex_probe_program: String,
-    ) -> Self {
-        let mut fixture = Self::new_with_runtime_config_inner(
-            server::HostRuntimeConfig {
-                codex_probe_program: Some(codex_probe_program),
-                ..Default::default()
-            },
-            true,
-            Some(vec![BackendKind::Codex]),
-            false,
-        )
-        .await;
-
-        if let Some(entry) = fixture
-            .bootstrap
-            .session_schemas
-            .iter()
-            .find(|entry| entry.backend_kind() == BackendKind::Codex)
-        {
-            match entry {
-                SessionSchemaEntry::Ready { .. } => return fixture,
-                SessionSchemaEntry::Unavailable { message, .. } => {
-                    panic!("fake Codex schema probe failed: {message}")
-                }
-                SessionSchemaEntry::Pending { .. } => {}
-            }
-        }
-
-        loop {
-            let env = fixture
-                .client
-                .next_event()
-                .await
-                .expect("Codex schema event read failed")
-                .expect("connection closed before Codex schema became ready");
-            if env.kind != FrameKind::SessionSchemas {
-                continue;
-            }
-            let schemas: SessionSchemasPayload =
-                env.parse_payload().expect("parse Codex SessionSchemas");
-            let Some(entry) = schemas
-                .schemas
-                .iter()
-                .find(|entry| entry.backend_kind() == BackendKind::Codex)
-            else {
-                continue;
-            };
-            match entry {
-                SessionSchemaEntry::Ready { .. } => return fixture,
-                SessionSchemaEntry::Unavailable { message, .. } => {
-                    panic!("fake Codex schema probe failed: {message}")
-                }
-                SessionSchemaEntry::Pending { .. } => {}
-            }
-        }
     }
 
     #[allow(dead_code)]

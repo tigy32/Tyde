@@ -359,9 +359,9 @@ pub struct HostRuntimeConfig {
     /// supplied. Defaults to `false` so production startup is unaffected.
     pub skip_real_backend_probe: bool,
     pub agents_view_preferences_primary: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub start_agent_supervisor_worker: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub enable_actor_transcript_io: bool,
 }
 
@@ -380,9 +380,9 @@ impl Default for HostRuntimeConfig {
             mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
             agents_view_preferences_primary: true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             start_agent_supervisor_worker: true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             enable_actor_transcript_io: false,
         }
     }
@@ -1925,6 +1925,72 @@ impl HostHandle {
         barrier_rx.await.is_ok()
     }
 
+    pub async fn shutdown_agents_for_conformance(&self) {
+        let (agent_control_mcp, handles, session_store) = {
+            let state = self.state.lock().await;
+            (
+                state.agent_control_mcp.clone(),
+                state
+                    .registry
+                    .agent_ids()
+                    .into_iter()
+                    .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
+                    .collect::<Vec<_>>(),
+                Arc::clone(&state.session_store),
+            )
+        };
+        let durable_queues = session_store
+            .lock()
+            .await
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| !record.queued_messages.is_empty())
+            .map(|record| (record.id, record.queued_messages))
+            .collect::<Vec<_>>();
+        agent_control_mcp.expire_await_requests();
+        for handle in handles {
+            handle.close().await;
+        }
+        for (session_id, queued_messages) in durable_queues {
+            if let Err(error) = session_store.lock().await.update(&session_id, |record| {
+                record.queued_messages = queued_messages
+            }) {
+                eprintln!(
+                    "TYDE CONFORMANCE RESTART QUEUE RESTORE session={} error={}",
+                    session_id.0, error
+                );
+            }
+        }
+        self.shutdown_spawn_operations().await;
+    }
+
+    pub async fn force_agent_backend_shutdown_for_conformance(&self, agent_id: &AgentId) -> bool {
+        let handle = self.state.lock().await.registry.agent_handle(agent_id);
+        match handle {
+            Some(handle) => handle.force_backend_shutdown_for_conformance().await,
+            None => false,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn hold_agent_message_delivery_for_conformance(&self, hold: bool) {
+        self.state
+            .lock()
+            .await
+            .agent_control_mcp
+            .hold_send_requests(hold);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn active_agent_message_delivery_count_for_conformance(&self) -> usize {
+        self.state
+            .lock()
+            .await
+            .agent_control_mcp
+            .active_send_request_count()
+    }
+
     #[cfg(feature = "test-support")]
     pub async fn mark_backend_capacity_stale_for_test(&self, backend_kind: BackendKind) {
         let retrieved_at_ms = self
@@ -2053,11 +2119,39 @@ impl HostHandle {
         gate
     }
 
+    pub fn install_resume_queue_dispatch_test_gate(
+        &self,
+        agent_name: &str,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        crate::agent::install_resume_queue_dispatch_test_gate(
+            agent_name.to_owned(),
+            Arc::clone(&gate.inner),
+        );
+        gate
+    }
+
+    pub fn install_agent_startup_backend_ready_test_gate(
+        &self,
+        agent_name: &str,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        crate::agent::install_startup_backend_ready_test_gate(
+            agent_name.to_owned(),
+            Arc::clone(&gate.inner),
+        );
+        gate
+    }
+
     pub fn spawn_operation_limits_for_test(&self) -> (usize, usize) {
         (
             MAX_CONCURRENT_SPAWN_OPERATIONS,
             SPAWN_OPERATION_QUEUE_CAPACITY,
         )
+    }
+
+    pub async fn connection_count_for_test(&self) -> usize {
+        self.state.lock().await.host_streams.len()
     }
 }
 
@@ -3479,6 +3573,11 @@ impl HostHandle {
             agent_handle,
             stream,
         } = attachment;
+        tracing::debug!(
+            host_stream = %host_stream,
+            agent_stream = %agent_stream,
+            "attaching deferred agent stream"
+        );
         let reply = match reply {
             Some(reply) => Some(reply),
             None => match (agent_handle, stream) {
@@ -3491,6 +3590,12 @@ impl HostHandle {
             Some(reply) => reply.await.unwrap_or(false),
             None => false,
         };
+        tracing::debug!(
+            host_stream = %host_stream,
+            agent_stream = %agent_stream,
+            attached,
+            "finished deferred agent stream attachment"
+        );
         let mut state = self.state.lock().await;
         let Some(subscriber) = state.host_streams.get_mut(&host_stream) else {
             return;
@@ -5575,7 +5680,7 @@ impl HostHandle {
                         ),
                     }
                 };
-                resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
+                resolved_spawn_config.access_mode = access_mode.unwrap_or(record.access_mode);
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let (session_settings_schema, schema_failure) =
@@ -7614,7 +7719,7 @@ impl HostHandle {
         let queued = self
             .agent_status_snapshot(&agent_id)
             .await
-            .map(|status| status.is_active() || status.is_plan_approval_pending())
+            .map(|status| status.is_active() || status.is_user_response_pending())
             .unwrap_or(false);
         let events = registry
             .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
@@ -7693,7 +7798,7 @@ impl HostHandle {
                 if let Some(status) = self.agent_status_snapshot(&agent_id).await {
                     let events = if status.terminated {
                         registry.clear_binding_by_agent(agent_id.clone()).await?
-                    } else if status.is_plan_approval_pending() {
+                    } else if status.is_user_response_pending() {
                         registry
                             .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
                             .await?
@@ -9378,10 +9483,15 @@ impl HostHandle {
     }
 
     pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
-        let agent_handle = {
+        let (agent_handle, agent_control_mcp) = {
             let state = self.state.lock().await;
-            state.registry.agent_handle(agent_id)
+            (
+                state.registry.agent_handle(agent_id),
+                state.agent_control_mcp.clone(),
+            )
         };
+
+        agent_control_mcp.cancel_await_requests_for(agent_id);
 
         match agent_handle {
             Some(handle) => handle.interrupt().await,
@@ -9862,6 +9972,15 @@ impl HostHandle {
 
     pub async fn agent_control_mcp_url(&self) -> String {
         self.state.lock().await.agent_control_mcp.url.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn active_agent_control_await_request_count(&self) -> usize {
+        self.state
+            .lock()
+            .await
+            .agent_control_mcp
+            .active_await_request_count()
     }
 
     pub async fn agent_control_mcp_caller(
@@ -10474,6 +10593,7 @@ impl HostHandle {
         if !workflow_mcp.url.is_empty() {
             startup_mcp_servers.push(StartupMcpServer {
                 name: WORKFLOW_PROGRESS_MCP_SERVER_NAME.to_owned(),
+                supports_parallel_tool_calls: false,
                 transport: StartupMcpTransport::Http {
                     url: workflow_mcp.url.clone(),
                     headers: HashMap::new(),
@@ -11116,6 +11236,35 @@ impl HostHandle {
         }
     }
 
+    async fn wait_for_parent_tool_request(
+        &self,
+        parent_handle: &AgentHandle,
+        parent_agent_id: &AgentId,
+        tool_use_id: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let request_marker = format!("[{tool_use_id}]");
+        loop {
+            let observed = parent_handle
+                .read_activity_history(None, 1024, 1024 * 1024)
+                .await
+                .is_some_and(|history| {
+                    history.rendered.lines().any(|line| {
+                        line.contains("Tool requested:") && line.contains(&request_marker)
+                    })
+                });
+            if observed {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "parent agent {parent_agent_id} did not publish tool request {tool_use_id} before backend-native child spawn"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn spawn_backend_native_subagent(
         &self,
         request: &HostSubAgentSpawnRequest,
@@ -11145,7 +11294,6 @@ impl HostHandle {
         let parent_session_id = self
             .wait_for_parent_session_id(&request.parent_agent_id)
             .await?;
-
         let parent_start = parent_handle.snapshot();
         if parent_start.workspace_roots != request.workspace_roots {
             return Err(format!(
@@ -11290,6 +11438,34 @@ impl HostHandle {
             return Err(message);
         }
 
+        let child_agent_id = start.agent_id.clone();
+        let result = SubAgentHandle {
+            event_tx,
+            model_usage_tx,
+            total_usage_tx,
+            agent_id: child_agent_id.clone(),
+            name_update_tx: Some(name_update_tx),
+        };
+        let parent_agent_id = request.parent_agent_id.clone();
+        let tool_use_id = request.tool_use_id.clone();
+        let parent_is_visible = {
+            let state = self.state.lock().await;
+            !state
+                .agent_visibility
+                .visible_host_streams(&parent_agent_id)
+                .is_empty()
+        };
+        if parent_is_visible
+            && let Err(error) = self
+                .wait_for_parent_tool_request(&parent_handle, &parent_agent_id, &tool_use_id)
+                .await
+        {
+            tracing::error!(child_agent_id = %child_agent_id, "{error}");
+            let _ = self
+                .close_agent_for_recorded_visibility(&child_agent_id)
+                .await;
+            return Err(error);
+        }
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
@@ -11325,9 +11501,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             fan_out_current_agents_view_preferences(&mut state).await;
         }
-
         self.fan_out_session_lists().await;
-
         let naming_handle = agent_handle.clone();
         tokio::spawn(async move {
             while let Some(name) = name_update_rx.recv().await {
@@ -11336,14 +11510,7 @@ impl HostHandle {
                 }
             }
         });
-
-        Ok(SubAgentHandle {
-            event_tx,
-            model_usage_tx,
-            total_usage_tx,
-            agent_id: start.agent_id,
-            name_update_tx: Some(name_update_tx),
-        })
+        Ok(result)
     }
 
     pub(crate) async fn open_browse_stream(
@@ -12766,6 +12933,7 @@ impl HostHandle {
             mcp_servers: vec![McpServerConfig {
                 id: McpServerId("tyde-review-feedback".to_owned()),
                 name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
+                supports_parallel_tool_calls: false,
                 transport: McpTransportConfig::Http {
                     url: review_mcp_url,
                     headers: HashMap::new(),
@@ -14179,7 +14347,7 @@ fn spawn_host_team_status_task(host: HostHandle) {
                 let registry = { host.state.lock().await.team_registry.clone() };
                 let result = if status.terminated {
                     registry.clear_binding_by_agent(agent_id.clone()).await
-                } else if status.is_plan_approval_pending() {
+                } else if status.is_user_response_pending() {
                     registry
                         .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
                         .await
@@ -14610,7 +14778,7 @@ fn supervisor_active_phase_after_progress(
     SupervisorPhase::Active {
         // Waiting on a person is not stalling, so the clock stays paused until
         // that turn resumes.
-        progress_at: (!status.is_plan_approval_pending()).then_some(now),
+        progress_at: (!status.is_user_response_pending()).then_some(now),
         recheck_after: None,
     }
 }
@@ -14623,7 +14791,7 @@ fn supervisor_active_phase_unchanged(
     previous: &SupervisorPhase,
     now: Instant,
 ) -> SupervisorPhase {
-    if status.is_plan_approval_pending() {
+    if status.is_user_response_pending() {
         return SupervisorPhase::Active {
             progress_at: None,
             recheck_after: None,
@@ -14686,7 +14854,7 @@ fn supervisor_phase_for_fresh_observation(
 ) -> SupervisorPhase {
     if status.is_active() {
         supervisor_active_phase_after_progress(status, now)
-    } else if status.is_plan_approval_pending() {
+    } else if status.is_user_response_pending() {
         SupervisorPhase::Dormant { idle_since: now }
     } else {
         supervisor_idle_phase(status, settings, now)
@@ -14991,7 +15159,7 @@ async fn observe_supervised_agents(
                 let phase = supervisor_active_phase_unchanged(status, &entry.phase, now);
                 entry.phase = phase;
             }
-        } else if status.is_plan_approval_pending() {
+        } else if status.is_user_response_pending() {
             if !matches!(&entry.phase, SupervisorPhase::Compacting) {
                 let idle_since = supervisor_phase_idle_since(&entry.phase).unwrap_or(now);
                 entry.phase = SupervisorPhase::Dormant { idle_since };
@@ -15168,7 +15336,7 @@ async fn interrupt_stalled_supervised_agent(
     if observation.status.activity_counter != activity_counter
         || observation.status.terminated
         || !observation.status.is_active()
-        || observation.status.is_plan_approval_pending()
+        || observation.status.is_user_response_pending()
     {
         observe_supervised_agents(host, entries, settings.settings).await;
         return;
@@ -15289,7 +15457,7 @@ async fn launch_supervision_verdict(
     if observation.status.activity_counter != activity_counter
         || observation.status.terminated
         || observation.status.is_active()
-        || observation.status.is_plan_approval_pending()
+        || observation.status.is_user_response_pending()
     {
         observe_supervised_agents(host, entries, settings.settings).await;
         return;
@@ -15695,7 +15863,7 @@ async fn accept_supervision_verdict_result(
     if observation.status.activity_counter != result.activity_counter
         || observation.status.terminated
         || observation.status.is_active()
-        || observation.status.is_plan_approval_pending()
+        || observation.status.is_user_response_pending()
     {
         observe_supervised_agents(host, entries, live_settings.settings).await;
         return;
@@ -15975,7 +16143,7 @@ async fn launch_supervisor_auto_compaction(
     if observation.status.activity_counter != activity_counter
         || observation.status.terminated
         || observation.status.is_active()
-        || observation.status.is_plan_approval_pending()
+        || observation.status.is_user_response_pending()
     {
         observe_supervised_agents(host, entries, settings.settings).await;
         return;
@@ -16975,6 +17143,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
     {
         servers.push(StartupMcpServer {
             name: "tyde-config".to_string(),
+            supports_parallel_tool_calls: false,
             transport: StartupMcpTransport::Http {
                 url: config_mcp.url.clone(),
                 headers: HashMap::new(),
@@ -17003,6 +17172,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
             .unwrap_or_else(|| debug_mcp.url.clone());
         servers.push(StartupMcpServer {
             name: "tyde-debug".to_string(),
+            supports_parallel_tool_calls: false,
             transport: StartupMcpTransport::Http {
                 url,
                 headers,
@@ -17017,6 +17187,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
     {
         servers.push(StartupMcpServer {
             name: crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME.to_string(),
+            supports_parallel_tool_calls: true,
             transport: StartupMcpTransport::Http {
                 url: agent_control_mcp.url.clone(),
                 headers: HashMap::new(),
@@ -17025,6 +17196,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
         });
         servers.push(StartupMcpServer {
             name: crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME.to_string(),
+            supports_parallel_tool_calls: true,
             transport: StartupMcpTransport::Http {
                 url: agent_control_mcp.await_url.clone(),
                 headers: HashMap::new(),

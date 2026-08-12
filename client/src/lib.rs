@@ -11,20 +11,20 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
     AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendSetupPayload, BrowseBootstrapPayload,
-    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
-    FetchSessionHistoryPayload, FrameError, FrameKind, FrameReader, HelloPayload,
-    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
-    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    BackendConfigSnapshotsPayload, BackendSettingsRefreshPayload, BackendSetupPayload,
+    BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
+    FrameError, FrameKind, FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
+    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -35,7 +35,7 @@ use protocol::{
     SessionSchemasPayload, SessionSettingsPayload, SessionSummaryCountUpdatedPayload,
     SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload,
+    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload, TeamCompactPayload,
     TeamContextCompactionNotifyPayload, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
@@ -453,6 +453,14 @@ impl Connection {
             .await
     }
 
+    pub async fn backend_settings_refresh(
+        &mut self,
+        payload: BackendSettingsRefreshPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::BackendSettingsRefresh, &payload)
+            .await
+    }
+
     pub async fn mcp_server_upsert(
         &mut self,
         payload: McpServerUpsertPayload,
@@ -559,6 +567,11 @@ impl Connection {
 
     pub async fn team_create(&mut self, payload: TeamCreatePayload) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::TeamCreate, &payload)
+            .await
+    }
+
+    pub async fn team_compact(&mut self, payload: TeamCompactPayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamCompact, &payload)
             .await
     }
 
@@ -921,6 +934,23 @@ impl Connection {
             .await
     }
 
+    pub async fn compact_agent(
+        &mut self,
+        stream: &StreamPath,
+        payload: protocol::AgentCompactPayload,
+    ) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("compact_agent on unknown stream — AgentStart must be received first");
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::AgentCompact, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn set_agent_name_stream(
         &mut self,
         stream: &Stream,
@@ -1018,6 +1048,22 @@ impl Connection {
             &payload,
         )
         .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn edit_queued_message(
+        &mut self,
+        stream: &StreamPath,
+        payload: EditQueuedMessagePayload,
+    ) -> Result<(), FrameError> {
+        let seq =
+            self.outgoing_seq.get(stream).copied().expect(
+                "edit_queued_message on unknown stream — AgentStart must be received first",
+            );
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::EditQueuedMessage, seq, &payload)
+                .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(stream.clone(), seq + 1);
         write_envelope(&mut self.writer, &envelope).await
     }

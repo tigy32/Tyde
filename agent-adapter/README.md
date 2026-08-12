@@ -60,7 +60,7 @@ run.
 
 ## Paid qualification suite
 
-`CertificationCase` defines 66 narrow live contracts. Every case is an
+`CertificationCase` defines the catalog of narrow live contracts. Every case is an
 independent ignored test, so a model can iterate on one invariant with one cheap
 provider call. The aggregate `real_universal_backend_qualification_suite` runs
 the same catalog across every selected backend and reports all failures it can
@@ -74,7 +74,7 @@ real calls and select backends with:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 \
-TYDE_REAL_BACKENDS=claude,codex,kiro,hermes \
+TYDE_REAL_BACKENDS=claude,codex,kiro,hermes,tycode \
 cargo test -p tests --test backend \
   real_universal_backend_qualification_suite -- --ignored --nocapture
 ```
@@ -87,7 +87,7 @@ cargo test -p tests --test backend \
   real_cert_request_sequence_starts_at_one -- --ignored --nocapture
 ```
 
-`TYDE_REAL_BACKENDS` also accepts `tycode`, `antigravity`, and `agy`. A selected
+`TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `kiro`, `hermes`, and `tycode`. A selected
 backend that is missing or unrunnable is a qualification failure, not a silent
 skip. Claude qualification calls are pinned to Haiku with `low` effort, and
 Codex calls are pinned to `gpt-5.6-luna` with `low` reasoning rather than

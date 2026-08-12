@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
@@ -39,7 +42,10 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::{
+    sync::Notify,
+    time::{Instant, MissedTickBehavior},
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -57,6 +63,12 @@ pub struct AgentControlMcpHandle {
     pub url: String,
     pub await_url: String,
     credentials: AgentControlCredentialAuthority,
+    active_await_requests: Arc<AtomicUsize>,
+    await_request_cancellations: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
+    active_send_requests: Arc<AtomicUsize>,
+    hold_send_requests: Arc<AtomicBool>,
+    send_release: Arc<Notify>,
+    await_expiration: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -138,6 +150,12 @@ impl AgentControlMcpHandle {
             url: String::new(),
             await_url: String::new(),
             credentials: AgentControlCredentialAuthority::new(),
+            active_await_requests: Arc::new(AtomicUsize::new(0)),
+            await_request_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            active_send_requests: Arc::new(AtomicUsize::new(0)),
+            hold_send_requests: Arc::new(AtomicBool::new(false)),
+            send_release: Arc::new(Notify::new()),
+            await_expiration: CancellationToken::new(),
         }
     }
 
@@ -147,6 +165,115 @@ impl AgentControlMcpHandle {
             await_url: self.await_url.clone(),
             authorization: format!("Bearer {}", self.credentials.issue(agent_id)),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn active_await_request_count(&self) -> usize {
+        self.active_await_requests.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn active_send_request_count(&self) -> usize {
+        self.active_send_requests.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_send_requests(&self, hold: bool) {
+        self.hold_send_requests.store(hold, Ordering::Release);
+        if !hold {
+            self.send_release.notify_waiters();
+        }
+    }
+
+    pub(crate) fn expire_await_requests(&self) {
+        self.await_expiration.cancel();
+    }
+
+    pub(crate) fn cancel_await_requests_for(&self, agent_id: &AgentId) {
+        let requests = self
+            .await_request_cancellations
+            .lock()
+            .expect("agent await cancellation registry poisoned")
+            .remove(agent_id);
+        for cancellation in requests.into_iter().flat_map(HashMap::into_values) {
+            cancellation.cancel();
+        }
+    }
+}
+
+struct ActiveAwaitRequestGuard(Arc<AtomicUsize>);
+
+struct AgentAwaitCancellationGuard {
+    registry: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
+    agent_id: AgentId,
+    request_id: Uuid,
+}
+
+impl AgentAwaitCancellationGuard {
+    fn register(
+        registry: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
+        agent_id: AgentId,
+    ) -> (Self, CancellationToken) {
+        let request_id = Uuid::new_v4();
+        let cancellation = CancellationToken::new();
+        registry
+            .lock()
+            .expect("agent await cancellation registry poisoned")
+            .entry(agent_id.clone())
+            .or_default()
+            .insert(request_id, cancellation.clone());
+        (
+            Self {
+                registry,
+                agent_id,
+                request_id,
+            },
+            cancellation,
+        )
+    }
+}
+
+impl Drop for AgentAwaitCancellationGuard {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("agent await cancellation registry poisoned");
+        let remove_agent = registry.get_mut(&self.agent_id).is_some_and(|requests| {
+            requests.remove(&self.request_id);
+            requests.is_empty()
+        });
+        if remove_agent {
+            registry.remove(&self.agent_id);
+        }
+    }
+}
+
+impl ActiveAwaitRequestGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+struct ActiveSendRequestGuard(Arc<AtomicUsize>);
+
+impl ActiveSendRequestGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveSendRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for ActiveAwaitRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -161,22 +288,13 @@ struct TydeAgentControlMcpServer {
     host: HostHandle,
     credentials: AgentControlCredentialAuthority,
     surface: AgentControlMcpSurface,
+    active_await_requests: Arc<AtomicUsize>,
+    await_request_cancellations: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
+    active_send_requests: Arc<AtomicUsize>,
+    hold_send_requests: Arc<AtomicBool>,
+    send_release: Arc<Notify>,
+    await_expiration: CancellationToken,
     tool_router: ToolRouter<Self>,
-}
-
-impl TydeAgentControlMcpServer {
-    fn new(
-        host: HostHandle,
-        credentials: AgentControlCredentialAuthority,
-        surface: AgentControlMcpSurface,
-    ) -> Self {
-        Self {
-            host,
-            credentials,
-            surface,
-            tool_router: Self::tool_router(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
@@ -691,6 +809,7 @@ impl TydeAgentControlMcpServer {
         Extension(parts): Extension<axum::http::request::Parts>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let _active_request = ActiveAwaitRequestGuard::new(Arc::clone(&self.active_await_requests));
         let caller = match require_authenticated_caller(self, &parts, "tyde_await_agents").await {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
@@ -702,7 +821,19 @@ impl TydeAgentControlMcpServer {
         if let Err(error) = authorize_direct_children(&self.host, &caller, &agent_ids).await {
             return Ok(err_text(error));
         }
-        match do_await_agents(&self.host, agent_ids, context).await {
+        let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
+            Arc::clone(&self.await_request_cancellations),
+            caller,
+        );
+        match do_await_agents(
+            &self.host,
+            agent_ids,
+            context,
+            host_cancellation,
+            self.await_expiration.clone(),
+        )
+        .await
+        {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -797,6 +928,14 @@ impl TydeAgentControlMcpServer {
         .await
         {
             return Ok(err_text(error));
+        }
+        let _active = ActiveSendRequestGuard::new(Arc::clone(&self.active_send_requests));
+        loop {
+            let released = self.send_release.notified();
+            if !self.hold_send_requests.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
         }
         match do_send_message(&self.host, &agent_id, input.message).await {
             Ok(()) => ok_json(json!({ "ok": true })),
@@ -1006,6 +1145,18 @@ pub fn start_server(
         .map_err(|err| format!("failed to read agent-control MCP listener addr: {err}"))?;
     let credentials = AgentControlCredentialAuthority::new();
     let server_credentials = credentials.clone();
+    let active_await_requests = Arc::new(AtomicUsize::new(0));
+    let server_active_await_requests = Arc::clone(&active_await_requests);
+    let await_request_cancellations = Arc::new(Mutex::new(HashMap::new()));
+    let server_await_request_cancellations = Arc::clone(&await_request_cancellations);
+    let active_send_requests = Arc::new(AtomicUsize::new(0));
+    let server_active_send_requests = Arc::clone(&active_send_requests);
+    let hold_send_requests = Arc::new(AtomicBool::new(false));
+    let server_hold_send_requests = Arc::clone(&hold_send_requests);
+    let send_release = Arc::new(Notify::new());
+    let server_send_release = Arc::clone(&send_release);
+    let await_expiration = CancellationToken::new();
+    let server_await_expiration = await_expiration.clone();
 
     std::thread::Builder::new()
         .name("tyde-agent-control-mcp".to_string())
@@ -1019,16 +1170,32 @@ pub fn start_server(
                     .expect("failed to create tokio agent-control MCP listener");
                 let control_host = host_handle.clone();
                 let control_credentials = server_credentials.clone();
+                let control_active_await_requests = Arc::clone(&server_active_await_requests);
+                let control_await_request_cancellations =
+                    Arc::clone(&server_await_request_cancellations);
+                let control_active_send_requests = Arc::clone(&server_active_send_requests);
+                let control_hold_send_requests = Arc::clone(&server_hold_send_requests);
+                let control_send_release = Arc::clone(&server_send_release);
+                let control_await_expiration = server_await_expiration.clone();
                 let control_service: StreamableHttpService<
                     TydeAgentControlMcpServer,
                     LocalSessionManager,
                 > = StreamableHttpService::new(
                     move || {
-                        Ok(TydeAgentControlMcpServer::new(
-                            control_host.clone(),
-                            control_credentials.clone(),
-                            AgentControlMcpSurface::Control,
-                        ))
+                        Ok(TydeAgentControlMcpServer {
+                            host: control_host.clone(),
+                            credentials: control_credentials.clone(),
+                            surface: AgentControlMcpSurface::Control,
+                            active_await_requests: Arc::clone(&control_active_await_requests),
+                            await_request_cancellations: Arc::clone(
+                                &control_await_request_cancellations,
+                            ),
+                            active_send_requests: Arc::clone(&control_active_send_requests),
+                            hold_send_requests: Arc::clone(&control_hold_send_requests),
+                            send_release: Arc::clone(&control_send_release),
+                            await_expiration: control_await_expiration.clone(),
+                            tool_router: TydeAgentControlMcpServer::tool_router(),
+                        })
                     },
                     Default::default(),
                     StreamableHttpServerConfig {
@@ -1036,28 +1203,84 @@ pub fn start_server(
                         ..Default::default()
                     },
                 );
+                let await_host = host_handle.clone();
                 let await_credentials = server_credentials.clone();
+                let await_active_requests = Arc::clone(&server_active_await_requests);
+                let await_request_cancellations = Arc::clone(&server_await_request_cancellations);
+                let await_active_send_requests = Arc::clone(&server_active_send_requests);
+                let await_hold_send_requests = Arc::clone(&server_hold_send_requests);
+                let await_send_release = Arc::clone(&server_send_release);
+                let await_expiration_for_service = server_await_expiration.clone();
                 let await_service: StreamableHttpService<
                     TydeAgentControlMcpServer,
                     LocalSessionManager,
                 > = StreamableHttpService::new(
                     move || {
-                        Ok(TydeAgentControlMcpServer::new(
-                            host_handle.clone(),
-                            await_credentials.clone(),
-                            AgentControlMcpSurface::Await,
-                        ))
+                        Ok(TydeAgentControlMcpServer {
+                            host: await_host.clone(),
+                            credentials: await_credentials.clone(),
+                            surface: AgentControlMcpSurface::Await,
+                            active_await_requests: Arc::clone(&await_active_requests),
+                            await_request_cancellations: Arc::clone(&await_request_cancellations),
+                            active_send_requests: Arc::clone(&await_active_send_requests),
+                            hold_send_requests: Arc::clone(&await_hold_send_requests),
+                            send_release: Arc::clone(&await_send_release),
+                            await_expiration: await_expiration_for_service.clone(),
+                            tool_router: TydeAgentControlMcpServer::tool_router(),
+                        })
                     },
                     Default::default(),
                     StreamableHttpServerConfig {
                         stateful_mode: false,
+                        ..Default::default()
+                    },
+                );
+                let cancellable_await_host = host_handle.clone();
+                let cancellable_await_credentials = server_credentials.clone();
+                let cancellable_await_active_requests = Arc::clone(&server_active_await_requests);
+                let cancellable_await_request_cancellations =
+                    Arc::clone(&server_await_request_cancellations);
+                let cancellable_await_active_send_requests =
+                    Arc::clone(&server_active_send_requests);
+                let cancellable_await_hold_send_requests = Arc::clone(&server_hold_send_requests);
+                let cancellable_await_send_release = Arc::clone(&server_send_release);
+                let cancellable_await_expiration = server_await_expiration.clone();
+                let cancellable_await_service: StreamableHttpService<
+                    TydeAgentControlMcpServer,
+                    LocalSessionManager,
+                > = StreamableHttpService::new(
+                    move || {
+                        Ok(TydeAgentControlMcpServer {
+                            host: cancellable_await_host.clone(),
+                            credentials: cancellable_await_credentials.clone(),
+                            surface: AgentControlMcpSurface::Await,
+                            active_await_requests: Arc::clone(&cancellable_await_active_requests),
+                            await_request_cancellations: Arc::clone(
+                                &cancellable_await_request_cancellations,
+                            ),
+                            active_send_requests: Arc::clone(
+                                &cancellable_await_active_send_requests,
+                            ),
+                            hold_send_requests: Arc::clone(&cancellable_await_hold_send_requests),
+                            send_release: Arc::clone(&cancellable_await_send_release),
+                            await_expiration: cancellable_await_expiration.clone(),
+                            tool_router: TydeAgentControlMcpServer::tool_router(),
+                        })
+                    },
+                    Default::default(),
+                    StreamableHttpServerConfig {
+                        // Await requests must share a live MCP session with
+                        // their cancellation notification so the server-side
+                        // RequestContext is actually cancelled.
+                        stateful_mode: true,
                         ..Default::default()
                     },
                 );
                 let router = Router::new()
                     .route("/healthz", get(healthz_handler))
                     .nest_service("/mcp", control_service)
-                    .nest_service("/await", await_service);
+                    .nest_service("/await", await_service)
+                    .nest_service("/await-cancellable", cancellable_await_service);
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::warn!("agent-control MCP HTTP server stopped: {err}");
                 }
@@ -1069,6 +1292,12 @@ pub fn start_server(
         url: format!("http://{local_addr}/mcp"),
         await_url: format!("http://{local_addr}/await"),
         credentials,
+        active_await_requests,
+        await_request_cancellations,
+        active_send_requests,
+        hold_send_requests,
+        send_release,
+        await_expiration,
     })
 }
 
@@ -1584,17 +1813,28 @@ async fn do_await_agents(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
     context: RequestContext<RoleServer>,
+    host_cancellation: CancellationToken,
+    host_expiration: CancellationToken,
 ) -> Result<AwaitAgentsResult, String> {
     let cancellation_token = context.ct.clone();
     let progress_reporter = AwaitProgressReporter::from_context(&context);
-    do_await_agents_with_progress(host, agent_ids, Some(cancellation_token), progress_reporter)
-        .await
+    do_await_agents_with_progress(
+        host,
+        agent_ids,
+        Some(cancellation_token),
+        Some(host_cancellation),
+        Some(host_expiration),
+        progress_reporter,
+    )
+    .await
 }
 
 async fn do_await_agents_with_progress(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
     cancellation_token: Option<CancellationToken>,
+    host_cancellation: Option<CancellationToken>,
+    host_expiration: Option<CancellationToken>,
     progress_reporter: Option<AwaitProgressReporter>,
 ) -> Result<AwaitAgentsResult, String> {
     if agent_ids.is_empty() {
@@ -1619,6 +1859,12 @@ async fn do_await_agents_with_progress(
     let mut emitted_initial_progress = false;
 
     loop {
+        if host_expiration
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err("agent await expired because the host stopped".to_owned());
+        }
         let result = await_result_from_snapshot(host, &agent_ids).await?;
         if !result.ready.is_empty() || result.still_thinking.is_empty() {
             return Ok(result);
@@ -1634,6 +1880,16 @@ async fn do_await_agents_with_progress(
         }
 
         tokio::select! {
+            biased;
+            _ = async {
+                if let Some(host_expiration) = host_expiration.as_ref() {
+                    host_expiration.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err("agent await expired because the host stopped".to_owned());
+            }
             changed = status_rx.changed() => {
                 if changed.is_err() {
                     return Err("agent status notification channel closed".to_string());
@@ -1652,13 +1908,22 @@ async fn do_await_agents_with_progress(
                 }
             }
             _ = async {
+                if let Some(host_cancellation) = host_cancellation.as_ref() {
+                    host_cancellation.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err("agent await request cancelled".to_owned());
+            }
+            _ = async {
                 if let Some(cancellation_token) = cancellation_token.as_ref() {
                     cancellation_token.cancelled().await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             } => {
-                return await_result_from_snapshot(host, &agent_ids).await;
+                return Err("agent await request cancelled".to_owned());
             }
         }
     }
@@ -1683,7 +1948,7 @@ async fn await_result_from_snapshot(
             agent_id: agent_id.0.clone(),
             status: status.status(),
         };
-        if status.is_plan_approval_pending() || !status.is_active() {
+        if status.is_user_response_pending() || !status.is_active() {
             ready.push(entry);
         } else {
             still_thinking.push(entry);
@@ -1803,7 +2068,11 @@ fn parse_agent_id(input: &str) -> Result<AgentId, String> {
 fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
     let mut agent_ids = Vec::with_capacity(inputs.len());
     for input in inputs {
-        agent_ids.push(parse_agent_id(&input)?);
+        let agent_id = parse_agent_id(&input)?;
+        if agent_ids.contains(&agent_id) {
+            return Err(format!("duplicate agent_id {}", agent_id.0));
+        }
+        agent_ids.push(agent_id);
     }
     Ok(agent_ids)
 }
@@ -2376,10 +2645,16 @@ mod tests {
         )
         .await
         .expect("spawn Hermes profile agent");
-        let result =
-            do_await_agents_with_progress(&host, vec![AgentId(spawned.agent_id)], None, None)
-                .await
-                .expect("await Hermes profile agent");
+        let result = do_await_agents_with_progress(
+            &host,
+            vec![AgentId(spawned.agent_id)],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("await Hermes profile agent");
         assert!(result.still_thinking.is_empty());
         assert_eq!(result.ready.len(), 1);
         assert_eq!(result.ready[0].status, AgentControlStatus::Idle);
@@ -2419,6 +2694,8 @@ mod tests {
             vec![AgentId(spawned.agent_id)],
             Some(cancellation_token.clone()),
             None,
+            None,
+            None,
         );
         tokio::pin!(await_future);
 
@@ -2430,16 +2707,11 @@ mod tests {
         );
 
         cancellation_token.cancel();
-        let result = timeout(Duration::from_secs(1), &mut await_future)
+        let error = timeout(Duration::from_secs(1), &mut await_future)
             .await
             .expect("await should finish after cancellation")
-            .expect("await should return a cancellation snapshot");
-        assert!(result.ready.is_empty());
-        assert_eq!(result.still_thinking.len(), 1);
-        assert_eq!(
-            result.still_thinking[0].status,
-            AgentControlStatus::Thinking
-        );
+            .expect_err("request cancellation must fail the pending await");
+        assert_eq!(error, "agent await request cancelled");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2476,6 +2748,8 @@ mod tests {
             vec![AgentId(spawned.agent_id)],
             Some(cancellation_token.clone()),
             None,
+            None,
+            None,
         );
         tokio::pin!(await_future);
 
@@ -2487,14 +2761,14 @@ mod tests {
         );
 
         cancellation_token.cancel();
-        let result = await_future
+        let error = await_future
             .await
-            .expect("cancellation should return a status snapshot");
-        assert_eq!(result.still_thinking.len(), 1);
+            .expect_err("request cancellation must fail the pending await");
+        assert_eq!(error, "agent await request cancelled");
     }
 
     #[tokio::test]
-    async fn await_agents_returns_snapshot_on_request_cancellation() {
+    async fn await_agents_fails_on_request_cancellation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = crate::host::spawn_host_with_mock_backend(
             dir.path().join("sessions.json"),
@@ -2528,21 +2802,17 @@ mod tests {
             cancel_task_token.cancel();
         });
 
-        let result = do_await_agents_with_progress(
+        let error = do_await_agents_with_progress(
             &host,
             vec![AgentId(spawned.agent_id)],
             Some(cancellation_token),
             None,
+            None,
+            None,
         )
         .await
-        .expect("await should return a status snapshot on cancellation");
-
-        assert!(result.ready.is_empty());
-        assert_eq!(result.still_thinking.len(), 1);
-        assert_eq!(
-            result.still_thinking[0].status,
-            AgentControlStatus::Thinking
-        );
+        .expect_err("request cancellation must fail the pending await");
+        assert_eq!(error, "agent await request cancelled");
     }
 
     #[tokio::test]
@@ -2559,7 +2829,7 @@ mod tests {
             .expect("spawn fatal-await agent");
         let agent_id = AgentId(spawned.agent_id);
         let initially_ready =
-            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None)
                 .await
                 .expect("initial mock turn becomes idle");
         assert_eq!(initially_ready.ready[0].status, AgentControlStatus::Idle);
@@ -2578,7 +2848,8 @@ mod tests {
         assert!(active.is_active());
         assert_eq!(active.status(), AgentControlStatus::Thinking);
 
-        let await_future = do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None);
+        let await_future =
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None);
         tokio::pin!(await_future);
         assert!(
             timeout(Duration::from_millis(50), &mut await_future)
@@ -2610,7 +2881,7 @@ mod tests {
             .await
             .expect("spawn ordered-send agent");
         let agent_id = AgentId(spawned.agent_id);
-        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None)
             .await
             .expect("initial mock turn becomes idle");
 
@@ -2631,7 +2902,7 @@ mod tests {
 
         let completed = timeout(
             Duration::from_secs(6),
-            do_await_agents_with_progress(&host, vec![agent_id], None, None),
+            do_await_agents_with_progress(&host, vec![agent_id], None, None, None, None),
         )
         .await
         .expect("slow mock follow-up completes")
@@ -2653,7 +2924,7 @@ mod tests {
             .await
             .expect("spawn terminal-send agent");
         let agent_id = AgentId(spawned.agent_id);
-        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None)
             .await
             .expect("initial mock turn becomes idle");
         do_send_message(
@@ -2665,7 +2936,7 @@ mod tests {
         .expect("actor accepts fatal follow-up");
         let failed = timeout(
             Duration::from_secs(2),
-            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None),
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None),
         )
         .await
         .expect("backend closure becomes terminal")
@@ -2718,7 +2989,7 @@ mod tests {
             .await
             .expect("spawn compacting-send agent");
         let agent_id = AgentId(spawned.agent_id);
-        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None)
             .await
             .expect("initial mock turn becomes idle");
         let handle = host
@@ -2756,9 +3027,10 @@ mod tests {
             .expect("compaction-blocked status");
         assert!(!status.is_active());
         assert_eq!(status.status(), AgentControlStatus::Idle);
-        let ready = do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
-            .await
-            .expect("compaction-blocked actor remains awaitable");
+        let ready =
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None, None, None)
+                .await
+                .expect("compaction-blocked actor remains awaitable");
         assert!(ready.still_thinking.is_empty());
         assert_eq!(ready.ready[0].status, AgentControlStatus::Idle);
         assert_eq!(
@@ -2784,7 +3056,7 @@ mod tests {
             .await
             .expect("spawn removed-watched agent");
         let removed_id = AgentId(removed.agent_id);
-        do_await_agents_with_progress(&host, vec![removed_id.clone()], None, None)
+        do_await_agents_with_progress(&host, vec![removed_id.clone()], None, None, None, None)
             .await
             .expect("removed candidate becomes idle");
 
@@ -2832,6 +3104,8 @@ mod tests {
             &host,
             vec![removed_id.clone()],
             Some(CancellationToken::new()),
+            None,
+            None,
             None,
         )
         .await

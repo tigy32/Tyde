@@ -468,13 +468,24 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
         .clone()
         .expect("child AgentStart should include forked session_id");
     assert_ne!(child_start_session_id, parent_session_id);
-    let child_initial =
+    let mut child_initial =
         collect_turn_delta_text(&mut fixture.client, &child.instance_stream, "child turn").await;
+    if !child_initial.contains("mock backend response to: child prompt") {
+        child_initial = collect_turn_delta_text(
+            &mut fixture.client,
+            &child.instance_stream,
+            "child live turn after fork history",
+        )
+        .await;
+    }
     assert!(
         !child_initial.contains("[access_mode: ReadOnly]"),
         "child fork unexpectedly used read-only access mode: {child_initial}"
     );
-    assert!(child_initial.contains("mock backend response to: child prompt"));
+    assert!(
+        child_initial.contains("mock backend response to: child prompt"),
+        "unexpected child turn: {child_initial:?}"
+    );
 
     let sessions = wait_for_session_count(fixture.store_dir(), 2).await;
     let child_session = sessions

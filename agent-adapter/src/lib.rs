@@ -7,21 +7,84 @@ use std::collections::BTreeSet;
 
 mod certification;
 mod conformance;
+mod coverage;
 
 pub use certification::{CertificationCase, CertificationTier};
 pub use conformance::{BackendConformanceError, BackendConformanceValidator, ConformanceSnapshot};
+pub use coverage::{
+    ActivityCondition, AgentControlAuthorizationSet, AgentControlBoundaryRace,
+    AgentControlCoverageCell, AgentControlCoverageLedger, AgentControlRequestMultiplicity,
+    AgentControlTargetRelation, AmbientActivityOutcome, AmbientWorkKind,
+    AssistantToolRepresentationCell, BackendNativeConfigDiscoveryCell, BackendSetupDiscoveryCell,
+    CapacityLifecycleCell, ConformanceCoverageCell, ConformanceCoverageError,
+    ConformanceCoverageLedger, ContractOutcome, ContractState, ContractStimulus,
+    DynamicSessionDiscoveryCell, EnumeratedCoverageLedger, GenericToolBoundaryTiming,
+    GenericToolCallRelation, GenericToolClientTopology, GenericToolContract,
+    GenericToolLifecycleApplicability, GenericToolLifecycleBoundary, GenericToolLifecycleCell,
+    GenericToolLifecyclePhase, GenericToolMultiplicity, ImageAttachmentActivityCell,
+    ImageAttachmentCell, ImageCoverageApplicability, ImageLifecycleActivityCell,
+    ImageLifecycleCell, InputAdmissionAction, InputAdmissionCoverageCell,
+    InputAdmissionCoverageLedger, InputAdmissionKind, InputAdmissionState,
+    InteractionConcurrencyApplicability, InteractionConcurrencyCell,
+    InteractionConcurrencyContract, InteractionConcurrencyScenario, InteractionImageActivityCell,
+    InteractionImagePayloadCell, LiveCustomizationCell, McpActivityCoverageCell,
+    McpConfigurationRaceCell, McpConnectionOwnershipCell, McpFailureConsistencyCell,
+    McpHttpTransportCell, MessageMetadataApplicabilityCell, MessageMetadataCoverageApplicability,
+    MessageMetadataCoverageCell, NormalizedTurnCoverageCell, NormalizedTurnCoverageLedger,
+    NormalizedTurnShape, OrchestrationCorrelationCell, OrchestrationLifecycleCell,
+    OrchestrationMetadataCell, OrchestrationOutcomeCell, OrchestrationPayloadCell,
+    OrchestrationPhaseCell, PlainTerminationMechanism, PlainTerminationPhase, ProgressCoverageCell,
+    ProgressFamily, ProgressSubagentMode, ProgressTransition, ReasoningCoverageCell,
+    RequestUsageLifecycleCell, RetryBoundary, RetryFailureSource, RetryLifecycleApplicability,
+    RetryLifecycleCell, SessionListLifecycleCell, SkillLifecycleCell, SpecialToolContract,
+    TaskUpdateLifecycleApplicability, TaskUpdateLifecycleCell, ToolContractClass, ToolInputVariant,
+    ToolResultVariant, TraceInvariant, UsageLifecycleCell,
+};
 
 /// A normalized adapter observation consumed by live conformance tests.
 #[derive(Debug, Clone)]
 pub enum BackendObservation {
     Chat(protocol::ChatEvent),
     ModelRequestTokenUsage(protocol::ModelRequestTokenUsage),
+    Compaction(BackendCompactionObservation),
     Other,
 }
 
+/// A provider compaction lifecycle event exposed to adapter conformance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendCompactionObservation {
+    Progress {
+        operation_id: protocol::CompactionOperationId,
+        stage: protocol::CompactionStage,
+        elapsed_ms: Option<u64>,
+    },
+    Observed {
+        observation_id: protocol::CompactionObservationId,
+        trigger: protocol::CompactionTrigger,
+        method: protocol::CompactionMethod,
+        provider_session_id: Option<protocol::SessionId>,
+        metrics: protocol::CompactionMetrics,
+    },
+}
+
 /// A behavior that a live backend session promises to support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BackendCapability {
+macro_rules! exhaustive_capabilities {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum BackendCapability {
+            $($variant),+
+        }
+
+        impl BackendCapability {
+            pub const ALL: [Self; 0usize $(+ exhaustive_capabilities!(@one $variant))+] = [
+                $(Self::$variant),+
+            ];
+        }
+    };
+    (@one $variant:ident) => { 1usize };
+}
+
+exhaustive_capabilities! {
     ListSessions,
     ResumeSession,
     ForkSession,
@@ -29,38 +92,40 @@ pub enum BackendCapability {
     Interrupt,
     SessionSettings,
     StartupMcpServers,
+    AgentControlTools,
     TurnUsageReported,
     ModelRequestUsageReported,
     ContextUsageReported,
     ContextBreakdownReported,
+    CompactionReported,
     Subagents,
+    ForegroundSubagents,
+    BackgroundSubagents,
     BackgroundTasks,
     AgentInitiatedTurns,
     MidTurnSteering,
+    ReasoningDeltas,
+    TaskUpdates,
+    TaskListReplacement,
+    TaskListClear,
+    WorkflowProgress,
+    OpaqueToolProgress,
+    RetryTelemetry,
+    OrchestrationEvents,
+    UserQuestionRequests,
+    PlanApprovalRequests,
     WorkspaceInstructions,
     Customization,
-}
-
-impl BackendCapability {
-    pub const ALL: [Self; 17] = [
-        Self::ListSessions,
-        Self::ResumeSession,
-        Self::ForkSession,
-        Self::ImageInput,
-        Self::Interrupt,
-        Self::SessionSettings,
-        Self::StartupMcpServers,
-        Self::TurnUsageReported,
-        Self::ModelRequestUsageReported,
-        Self::ContextUsageReported,
-        Self::ContextBreakdownReported,
-        Self::Subagents,
-        Self::BackgroundTasks,
-        Self::AgentInitiatedTurns,
-        Self::MidTurnSteering,
-        Self::WorkspaceInstructions,
-        Self::Customization,
-    ];
+    GenericModifyFile,
+    GenericReadFiles,
+    GenericSearchTypes,
+    GenericGetTypeDocs,
+    GenericGenerateImage,
+    GenericWebSearch,
+    GenericViewImage,
+    GenericSleep,
+    GenericOtherTool,
+    CapacityTelemetry,
 }
 
 /// The capabilities declared by a live backend session.
@@ -100,6 +165,26 @@ impl BackendCapabilities {
         self.require(
             BackendCapability::ModelRequestUsageReported,
             BackendCapability::TurnUsageReported,
+        )?;
+        self.require(
+            BackendCapability::AgentControlTools,
+            BackendCapability::StartupMcpServers,
+        )?;
+        self.require(
+            BackendCapability::StartupMcpServers,
+            BackendCapability::GenericOtherTool,
+        )?;
+        self.require(
+            BackendCapability::ForegroundSubagents,
+            BackendCapability::Subagents,
+        )?;
+        self.require(
+            BackendCapability::BackgroundSubagents,
+            BackendCapability::Subagents,
+        )?;
+        self.require(
+            BackendCapability::BackgroundSubagents,
+            BackendCapability::BackgroundTasks,
         )?;
         Ok(())
     }
@@ -173,6 +258,15 @@ mod tests {
             BackendCapability::ContextBreakdownReported
         );
         assert_eq!(error.required, BackendCapability::ContextUsageReported);
+    }
+
+    #[test]
+    fn startup_mcp_requires_generic_other_normalization() {
+        let capabilities = BackendCapabilities::from([BackendCapability::StartupMcpServers]);
+
+        let error = capabilities.validate().expect_err("invalid declaration");
+        assert_eq!(error.capability, BackendCapability::StartupMcpServers);
+        assert_eq!(error.required, BackendCapability::GenericOtherTool);
     }
 
     #[test]

@@ -102,6 +102,8 @@ pub struct SessionRecord {
     pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
     #[serde(default)]
+    pub access_mode: protocol::BackendAccessMode,
+    #[serde(default)]
     pub project_id: Option<ProjectId>,
     #[serde(default)]
     pub custom_agent_id: Option<CustomAgentId>,
@@ -122,6 +124,8 @@ pub struct SessionRecord {
     pub token_count: Option<u64>,
     #[serde(default)]
     pub session_settings: Option<SessionSettingsValues>,
+    #[serde(default)]
+    pub queued_messages: Vec<protocol::QueuedMessageEntry>,
     #[serde(default = "default_resumable")]
     pub resumable: bool,
     #[serde(default)]
@@ -246,6 +250,7 @@ impl SessionStore {
                     backend_kind: session.backend_kind,
                     launch_profile_id: launch_profile_id.clone(),
                     workspace_roots: session.workspace_roots.clone(),
+                    access_mode: protocol::BackendAccessMode::Unrestricted,
                     project_id: project_id.clone(),
                     custom_agent_id: custom_agent_id.clone(),
                     alias: session.title.clone(),
@@ -256,6 +261,7 @@ impl SessionStore {
                     message_count: 0,
                     token_count: session.token_count,
                     session_settings: None,
+                    queued_messages: Vec::new(),
                     resumable: session.resumable,
                     compacted_from_session_id: None,
                     compacted_to_session_id: None,
@@ -305,6 +311,20 @@ impl SessionStore {
 
             entry.clone()
         })
+    }
+
+    pub fn set_access_mode(
+        &self,
+        session_id: &SessionId,
+        access_mode: protocol::BackendAccessMode,
+    ) -> Result<(), String> {
+        self.read_modify_write(|records| {
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+            record.access_mode = access_mode;
+            Ok(())
+        })?
     }
 
     pub fn update<F>(&self, session_id: &SessionId, update: F) -> Result<(), String>
@@ -1382,6 +1402,7 @@ mod tests {
             backend_kind,
             launch_profile_id: None,
             workspace_roots: Vec::new(),
+            access_mode: protocol::BackendAccessMode::Unrestricted,
             project_id: None,
             custom_agent_id: None,
             alias: None,
@@ -1392,6 +1413,7 @@ mod tests {
             message_count: 0,
             token_count: None,
             session_settings: None,
+            queued_messages: Vec::new(),
             resumable,
             compacted_from_session_id: None,
             compacted_to_session_id: None,

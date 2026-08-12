@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{BufRead as _, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use rmcp::ServiceExt;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, ServerResult,
+};
+use rmcp::service::PeerRequestOptions;
+use rmcp::transport::{
+    StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29,17 +37,20 @@ use protocol::{
 };
 
 use crate::agent::customization::{ResolvedSkill, SkillSelection};
-use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
+use crate::agent_control_mcp::{
+    AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME,
+};
 use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, is_tyde_agent_control_await_tool_name,
     is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event,
 };
 use crate::backend::turn_emitter::{
-    AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+    AgentName, MessageMetadataUpdatePayload, RetryAttemptPayload, StreamEndPayload,
+    ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
     BackendExecutionMode, BackendStartupError, SessionCommand, StartupMcpServer,
-    StartupMcpTransport, render_combined_spawn_instructions,
+    StartupMcpTransport, normalize_mcp_call_tool_result, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -86,246 +97,11 @@ The partial output above was kept and the turn continued.";
 const CODEX_SKILLS_ROOT_PREFIX: &str = "tyde-codex-skills-";
 const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-
-#[cfg(any(test, feature = "test-support"))]
-static CODEX_TEST_APP_SERVER_BINARY: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::path::PathBuf>>,
-> = std::sync::OnceLock::new();
-#[cfg(test)]
-static CODEX_TEST_NATIVE_HOME: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
-    std::sync::OnceLock::new();
-#[cfg(test)]
-static CODEX_TEST_SKILL_TEMP_PARENT: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::path::PathBuf>>,
-> = std::sync::OnceLock::new();
-#[cfg(test)]
-static CODEX_TEST_RESOURCE_LINK_FAILURE: std::sync::OnceLock<std::sync::Mutex<Option<OsString>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(any(test, feature = "test-support"))]
-fn codex_test_app_server_binary_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>>
-{
-    CODEX_TEST_APP_SERVER_BINARY.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn codex_test_native_home_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
-    CODEX_TEST_NATIVE_HOME.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn codex_test_skill_temp_parent_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>>
-{
-    CODEX_TEST_SKILL_TEMP_PARENT.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn codex_test_resource_link_failure_override() -> &'static std::sync::Mutex<Option<OsString>> {
-    CODEX_TEST_RESOURCE_LINK_FAILURE.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(feature = "test-support")]
-pub struct CodexTestAppServerGuard {
-    previous: Option<std::path::PathBuf>,
-}
-
-#[cfg(feature = "test-support")]
-impl Drop for CodexTestAppServerGuard {
-    fn drop(&mut self) {
-        *codex_test_app_server_binary_override()
-            .lock()
-            .expect("codex test app-server binary mutex poisoned") = self.previous.take();
-    }
-}
-
-#[cfg(feature = "test-support")]
-pub fn install_test_app_server_binary(binary: std::path::PathBuf) -> CodexTestAppServerGuard {
-    let previous = codex_test_app_server_binary_override()
-        .lock()
-        .expect("codex test app-server binary mutex poisoned")
-        .replace(binary);
-    CodexTestAppServerGuard { previous }
-}
-
-#[cfg(test)]
-mod capacity_mapping_tests {
-    use super::*;
-
-    #[test]
-    fn passive_notification_maps_complete_vendor_buckets_without_unit_conversion() {
-        let report = map_passive_rate_limits_updated(&json!({
-            "rateLimits": {
-                "limitId": "subscription", "limitName": "subscription",
-                "primary": {"usedPercent": 82, "windowDurationMins": 300, "resetsAt": 1_700_000_000},
-                "secondary": {"usedPercent": 17, "windowDurationMins": 10_080, "resetsAt": 1_700_100_000},
-                "credits": {"hasCredits": true, "unlimited": false, "balance": "12"},
-                "individualLimit": true, "planType": "pro", "rateLimitReachedType": null
-            }
-        })).expect("complete passive notification");
-        assert_eq!(
-            report.coverage,
-            protocol::CapacityCoverage::AllVendorBuckets
-        );
-        assert_eq!(
-            report.plan.as_ref().map(|plan| plan.label.as_str()),
-            Some("pro")
-        );
-        assert_eq!(report.buckets[0].label, "subscription primary limit");
-        let protocol::CapacityMeasure::UsedPercent {
-            used_percent,
-            remaining_percent,
-            provenance,
-        } = &report.buckets[0].measure
-        else {
-            panic!("primary percent");
-        };
-        assert_eq!((*used_percent, *remaining_percent), (82, 18));
-        assert!(provenance.vendor_reported);
-        assert_eq!(
-            report.buckets[0].measure.used_percent_provenance(),
-            Some(protocol::PercentValueProvenance::VendorReported)
-        );
-        assert_eq!(
-            report.buckets[0].measure.remaining_percent_provenance(),
-            Some(protocol::PercentValueProvenance::DerivedComplement)
-        );
-        assert!(matches!(
-            &report.buckets[2].measure,
-            protocol::CapacityMeasure::Credits { .. }
-        ));
-    }
-
-    #[test]
-    fn sparse_subscription_notification_maps_only_reported_buckets() {
-        let report = map_passive_rate_limits_updated(&json!({
-            "rateLimits": {
-                "credits": {"balance": "0", "hasCredits": false, "unlimited": false},
-                "individualLimit": null,
-                "limitId": "codex",
-                "limitName": null,
-                "planType": "pro",
-                "primary": {
-                    "resetsAt": 1_784_780_142,
-                    "usedPercent": 20,
-                    "windowDurationMins": 10_080
-                },
-                "rateLimitReachedType": null,
-                "secondary": null
-            }
-        }))
-        .expect("current sparse Codex subscription notification");
-
-        assert_eq!(
-            report.coverage,
-            protocol::CapacityCoverage::RepresentativeBucketOnly
-        );
-        assert_eq!(report.buckets.len(), 2);
-        assert_eq!(report.buckets[0].label, "primary limit");
-        assert_eq!(
-            report.buckets[0].scope,
-            protocol::CapacityScope::NotReported
-        );
-        assert!(matches!(
-            report.buckets[0].measure,
-            protocol::CapacityMeasure::UsedPercent {
-                used_percent: 20,
-                remaining_percent: 80,
-                ..
-            }
-        ));
-        assert!(matches!(
-            report.buckets[1].measure,
-            protocol::CapacityMeasure::Credits {
-                has_credits: false,
-                unlimited: false,
-                balance: Some(ref balance),
-            } if balance == "0"
-        ));
-    }
-
-    #[test]
-    fn account_mode_distinguishes_chatgpt_from_api_usage() {
-        assert_eq!(
-            codex_capacity_account_mode(&json!({
-                "account": {"type": "chatgpt", "planType": "pro"},
-                "requiresOpenaiAuth": true
-            })),
-            CodexCapacityAccountMode::ChatGpt
-        );
-        assert_eq!(
-            codex_capacity_account_mode(&json!({
-                "account": {"type": "apiKey"},
-                "requiresOpenaiAuth": true
-            })),
-            CodexCapacityAccountMode::Unsupported
-        );
-        assert_eq!(
-            codex_capacity_account_mode(&json!({
-                "account": {"type": "amazonBedrock", "usesCodexManagedCredentials": false},
-                "requiresOpenaiAuth": false
-            })),
-            CodexCapacityAccountMode::Unsupported
-        );
-    }
-
-    #[test]
-    fn incomplete_or_out_of_range_passive_notification_never_claims_full_coverage() {
-        assert_eq!(
-            map_passive_rate_limits_updated(&json!({"rateLimits": {}})),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-        let malformed = json!({"rateLimits": {
-            "limitId":"x", "limitName":"x",
-            "primary":{"usedPercent":101,"windowDurationMins":300,"resetsAt":1},
-            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
-            "credits":{"hasCredits":false,"unlimited":false,"balance":null},
-            "individualLimit":false,"planType":null,"rateLimitReachedType":null
-        }});
-        assert_eq!(
-            map_passive_rate_limits_updated(&malformed),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-    }
-
-    #[test]
-    fn malformed_credit_or_timestamp_fields_are_unavailable_without_raw_values() {
-        let malformed = json!({"rateLimits": {
-            "limitId":"x", "limitName":"x",
-            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
-            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
-            "credits":{"hasCredits":true,"unlimited":false,"balance":{"raw":"secret"}},
-            "individualLimit":false,"planType":null,"rateLimitReachedType":null
-        }});
-        assert_eq!(
-            map_passive_rate_limits_updated(&malformed),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-        let overflow = json!({"rateLimits": {
-            "limitId":"x", "limitName":"x",
-            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":18446744073709551615_u64},
-            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
-            "credits":{"hasCredits":true,"unlimited":false,"balance":null},
-            "individualLimit":false,"planType":null,"rateLimitReachedType":null
-        }});
-        assert_eq!(
-            map_passive_rate_limits_updated(&overflow),
-            Err(protocol::CapacityUnavailableReason::MalformedReport)
-        );
-    }
-}
+const CODEX_SESSION_META_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CODEX_LEGACY_AWAIT_WARNING: &str = "This saved Codex session predates Tyde's reliable sub-agent await tool. The installed Codex app-server cannot add dynamic tools while resuming or forking an existing session, so awaiting sub-agents may be unavailable here. Start a new Codex session to enable it.";
+const CODEX_UNVERIFIED_AWAIT_WARNING: &str = "Tyde could not verify that this resumed or forked Codex session contains the reliable sub-agent await tool, and Codex did not report the native await tool as available. Start a new Codex session before relying on sub-agent awaits.";
 
 fn codex_command() -> Command {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        let override_path = codex_test_app_server_binary_override()
-            .lock()
-            .expect("codex test app-server binary mutex poisoned")
-            .clone();
-        if let Some(path) = override_path {
-            return Command::new(path);
-        }
-    }
-
     Command::new("codex")
 }
 
@@ -396,26 +172,6 @@ impl CodexSkillProjection {
 }
 
 fn create_codex_skill_tempdir() -> Result<tempfile::TempDir, String> {
-    #[cfg(test)]
-    if let Some(parent) = codex_test_skill_temp_parent_override()
-        .lock()
-        .expect("Codex test skill temp parent mutex poisoned")
-        .clone()
-    {
-        std::fs::create_dir_all(&parent).map_err(|err| {
-            format!(
-                "Failed to create Codex test skill temp parent {}: {err}",
-                parent.display()
-            )
-        })?;
-        let root = tempfile::Builder::new()
-            .prefix(CODEX_SKILLS_ROOT_PREFIX)
-            .tempdir_in(&parent)
-            .map_err(|err| format!("Failed to create Codex session skill root: {err}"))?;
-        restrict_codex_directory(root.path())?;
-        return Ok(root);
-    }
-
     let root = tempfile::Builder::new()
         .prefix(CODEX_SKILLS_ROOT_PREFIX)
         .tempdir()
@@ -717,20 +473,6 @@ fn restrict_codex_file(_path: &Path) -> Result<(), String> {
 }
 
 fn create_codex_resource_link(source: &Path, link: &Path) -> Result<(), String> {
-    #[cfg(test)]
-    if codex_test_resource_link_failure_override()
-        .lock()
-        .expect("Codex test resource-link failure mutex poisoned")
-        .as_ref()
-        .is_some_and(|name| Some(name.as_os_str()) == link.file_name())
-    {
-        return Err(format!(
-            "{} -> {}: injected resource-link failure",
-            link.display(),
-            source.display()
-        ));
-    }
-
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(source, link)
@@ -1119,11 +861,6 @@ fn codex_version_from_user_agent(user_agent: &str) -> Result<Option<&str>, ()> {
         return Err(());
     }
     Ok(Some(version))
-}
-
-#[cfg(test)]
-fn codex_compaction_capability(user_agent: Option<&str>) -> BackendCompactionCapability {
-    codex_compaction_capability_with_installed_version(user_agent, None)
 }
 
 fn codex_compaction_capability_with_installed_version(
@@ -1725,6 +1462,7 @@ struct CodexThreadResponseConfig<'a> {
     startup_mcp_servers: &'a [StartupMcpServer],
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
+    rollout_path_local: bool,
 }
 
 struct CodexSelectedSkillContext<'a> {
@@ -1972,6 +1710,13 @@ impl CodexSession {
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
+        if let Some(await_tool) = codex_agent_await_dynamic_tool(startup_mcp_servers) {
+            // Codex 0.146 can advertise MCP tools as deferred while omitting
+            // the tool-search bridge that would make them callable. Project
+            // the load-bearing await through its direct dynamic-tool surface;
+            // execution still goes through the same real Tyde MCP endpoint.
+            thread_start_params["dynamicTools"] = json!([await_tool]);
+        }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             match codex_inference_thread_config(&rpc, &cwd).await {
                 Ok(config) => thread_start_params["config"] = config,
@@ -2011,6 +1756,7 @@ impl CodexSession {
                 startup_mcp_servers,
                 access_mode,
                 execution_mode,
+                rollout_path_local: ssh_host.is_none(),
             },
             thread_started,
             "thread/start",
@@ -2199,6 +1945,7 @@ impl CodexSession {
                 startup_mcp_servers,
                 access_mode,
                 execution_mode: BackendExecutionMode::Agent,
+                rollout_path_local: ssh_host.is_none(),
             },
             thread_forked,
             "thread/fork",
@@ -2221,6 +1968,16 @@ impl CodexSession {
             skill_projection,
             skill_setup,
         } = resources;
+        let await_endpoint_configured =
+            codex_agent_await_endpoint(config.startup_mcp_servers).is_some();
+        let saved_await_warning = codex_saved_await_warning(
+            &rpc,
+            &thread_response,
+            await_endpoint_configured,
+            method,
+            config.rollout_path_local,
+        )
+        .await;
         let thread_id = thread_response
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -2295,6 +2052,7 @@ impl CodexSession {
                 model_token_usage_by_turn: HashMap::new(),
                 turn_context_by_turn: HashMap::new(),
                 file_change_call_ids: HashMap::new(),
+                pending_raw_modify_calls: HashMap::new(),
                 pending_request: None,
                 pending_user_input_bytes: 0,
                 conversation_bytes_total: 0,
@@ -2309,6 +2067,8 @@ impl CodexSession {
             }),
             steering_tempfile,
             skill_projection: std::sync::Mutex::new(skill_projection),
+            dynamic_awaits: Mutex::new(CodexDynamicAwaitState::default()),
+            dynamic_await_endpoint: codex_agent_await_endpoint(config.startup_mcp_servers),
         });
 
         if !skill_setup.exposed_names.is_empty() {
@@ -2322,12 +2082,76 @@ impl CodexSession {
                 .emitter
                 .subprocess_stderr(&format!("Codex warning: {diagnostic}"));
         }
+        if let Some(warning) = saved_await_warning {
+            inner.emitter.warning_message(&warning);
+        }
 
         let forward_inner = Arc::clone(&inner);
         tokio::spawn(async move {
             let mut rx = inbound_rx;
-            while let Some(msg) = rx.recv().await {
-                forward_inner.handle_inbound(msg).await;
+            let mut nested_batches = HashMap::<String, CodexNestedGenericBatch>::new();
+            while let Some(inbound) = rx.recv().await {
+                if let Some((turn_id, call_count)) = codex_raw_nested_batch_declaration(&inbound) {
+                    eprintln!(
+                        "TYDE CODEX GENERIC BATCH DECLARED turn={turn_id} calls={call_count}"
+                    );
+                    assert!(
+                        nested_batches
+                            .insert(turn_id, CodexNestedGenericBatch::new(call_count))
+                            .is_none(),
+                        "Codex declared overlapping nested generic batches for one turn"
+                    );
+                    forward_inner.handle_inbound(inbound).await;
+                    continue;
+                }
+                let Some((method, params, _, item_id)) =
+                    codex_nested_generic_tool_notification(&inbound)
+                else {
+                    forward_inner.handle_inbound(inbound).await;
+                    continue;
+                };
+                let Some(turn_id) = extract_turn_id(params) else {
+                    forward_inner.handle_inbound(inbound).await;
+                    continue;
+                };
+                let Some(batch) = nested_batches.get_mut(&turn_id) else {
+                    forward_inner.handle_inbound(inbound).await;
+                    continue;
+                };
+                match method {
+                    "item/started" => {
+                        eprintln!(
+                            "TYDE CODEX GENERIC BATCH START turn={turn_id} item={item_id} params={params}"
+                        );
+                        batch.observe_start(item_id);
+                        forward_inner.handle_inbound(inbound).await;
+                        if batch.starts_remaining == 0 {
+                            for completion in batch.pending_completions.drain(..) {
+                                forward_inner.handle_inbound(completion).await;
+                            }
+                        }
+                    }
+                    "item/completed" => {
+                        batch.observe_completion(item_id);
+                        if batch.starts_remaining == 0 {
+                            forward_inner.handle_inbound(inbound).await;
+                        } else {
+                            eprintln!(
+                                "TYDE CODEX GENERIC BATCH BUFFER turn={turn_id} completion={item_id} starts_remaining={}",
+                                batch.starts_remaining
+                            );
+                            batch.pending_completions.push(inbound);
+                        }
+                    }
+                    _ => forward_inner.handle_inbound(inbound).await,
+                }
+                if batch.completions_remaining == 0 {
+                    assert!(
+                        batch.pending_completions.is_empty(),
+                        "Codex nested batch ended before every request was admitted"
+                    );
+                    nested_batches.remove(&turn_id);
+                }
             }
         });
 
@@ -2400,7 +2224,10 @@ impl CodexSession {
     }
 
     pub async fn shutdown(self) {
+        self.inner.terminalize_dynamic_awaits(None).await;
+        self.inner.terminate_background_terminals().await;
         self.inner.drain_background_commands().await;
+        self.inner.complete_all_codex_subagents().await;
         self.inner.rpc.shutdown().await;
         remove_codex_skill_projection_guard(&self.inner.skill_projection);
         remove_codex_steering_tempfile(&self.inner.steering_tempfile);
@@ -3236,11 +3063,14 @@ struct CodexSubAgentStream {
     provider_item_tombstones: VecDeque<CodexProviderItemTombstone>,
     terminated_turns: VecDeque<TerminatedCodexTurn>,
     terminated_turn_awaiting_replacement: Option<String>,
+    pending_spawn_terminal_status: Option<String>,
+    background_work_failed: bool,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
+    provider_usage_baseline: Option<TokenUsage>,
 }
 
 impl CodexSubAgentStream {
@@ -3284,7 +3114,9 @@ struct CompletedCodexSubAgentStream {
     sender_thread_id: String,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
+    provider_usage_baseline: Option<TokenUsage>,
     provider_item_tombstones: VecDeque<CodexProviderItemTombstone>,
+    owner_terminated: bool,
 }
 
 struct FinalizedCodexSubAgentProviderItem {
@@ -3303,7 +3135,10 @@ struct FinalizedCodexSubAgentProviderItem {
     images: Vec<ImageData>,
 }
 
-fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
+fn completed_codex_subagent_stream(
+    stream: CodexSubAgentStream,
+    owner_terminated: bool,
+) -> CompletedCodexSubAgentStream {
     CompletedCodexSubAgentStream {
         emitter: stream.emitter,
         agent_id: stream.agent_id,
@@ -3315,7 +3150,9 @@ fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCode
         sender_thread_id: stream.sender_thread_id,
         pending_message_metadata: stream.pending_message_metadata,
         model_token_usage_by_turn: stream.model_token_usage_by_turn,
+        provider_usage_baseline: stream.provider_usage_baseline,
         provider_item_tombstones: stream.provider_item_tombstones,
+        owner_terminated,
     }
 }
 
@@ -3481,6 +3318,7 @@ struct CodexState {
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
     turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
+    pending_raw_modify_calls: HashMap<(String, String), PendingRawCodexModify>,
     pending_request: Option<PendingRequest>,
     pending_user_input_bytes: u64,
     conversation_bytes_total: u64,
@@ -3504,6 +3342,17 @@ struct PendingCodexCompaction {
     item_completed: bool,
     turn_status: Option<String>,
     deprecated_notification_seen: bool,
+    started_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingRawCodexModify {
+    turn_id: String,
+    tool_call_id: String,
+    file_path: String,
+    before: String,
+    after: String,
+    failed_output: Option<String>,
 }
 
 #[derive(Default)]
@@ -3635,9 +3484,80 @@ struct CodexInner {
     state: Mutex<CodexState>,
     steering_tempfile: Option<std::path::PathBuf>,
     skill_projection: std::sync::Mutex<Option<CodexSkillProjection>>,
+    dynamic_awaits: Mutex<CodexDynamicAwaitState>,
+    dynamic_await_endpoint: Option<CodexAgentAwaitEndpoint>,
+}
+
+struct CodexDynamicAwaitState {
+    pending: HashMap<String, CodexPendingDynamicAwait>,
+    terminal_turns: VecDeque<String>,
+    accepting: bool,
+}
+
+impl Default for CodexDynamicAwaitState {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            terminal_turns: VecDeque::new(),
+            accepting: true,
+        }
+    }
+}
+
+struct CodexPendingDynamicAwait {
+    turn_id: String,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl CodexInner {
+    async fn terminalize_dynamic_awaits(&self, turn_id: Option<&str>) {
+        let pending = {
+            let mut awaits = self.dynamic_awaits.lock().await;
+            if let Some(turn_id) = turn_id {
+                if !awaits.terminal_turns.iter().any(|known| known == turn_id) {
+                    awaits.terminal_turns.push_back(turn_id.to_owned());
+                    while awaits.terminal_turns.len() > MAX_CODEX_TERMINATED_TURNS {
+                        awaits.terminal_turns.pop_front();
+                    }
+                }
+            } else {
+                awaits.accepting = false;
+            }
+            let call_ids = awaits
+                .pending
+                .iter()
+                .filter_map(|(call_id, pending)| {
+                    turn_id
+                        .is_none_or(|turn_id| pending.turn_id == turn_id)
+                        .then_some(call_id.clone())
+                })
+                .collect::<Vec<_>>();
+            call_ids
+                .into_iter()
+                .filter_map(|call_id| {
+                    awaits
+                        .pending
+                        .remove(&call_id)
+                        .map(|pending| (call_id, pending))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (tool_call_id, pending) in pending {
+            tracing::info!(
+                tool_call_id,
+                turn_id = pending.turn_id,
+                "Cancelling direct Codex await MCP call"
+            );
+            self.emitter
+                .cancel_pending_tool(&tool_call_id, "Tyde await was interrupted");
+            let mut state = self.state.lock().await;
+            state.pending_tool_call_ids.remove(&tool_call_id);
+            state.cancelled_tool_call_ids.insert(tool_call_id);
+            drop(state);
+            pending.cancellation.cancel();
+        }
+    }
+
     async fn begin_compaction(
         self: &Arc<Self>,
         request: BackendCompactionRequest,
@@ -3693,6 +3613,7 @@ impl CodexInner {
                 item_completed: false,
                 turn_status: None,
                 deprecated_notification_seen: false,
+                started_at: std::time::Instant::now(),
             });
             thread_id
         };
@@ -3817,7 +3738,7 @@ impl CodexInner {
             );
             return;
         };
-        let progress = {
+        let promoted = {
             let mut state = self.state.lock().await;
             if thread_id != state.thread_id
                 || !state.background_command_owner_active
@@ -3850,6 +3771,7 @@ impl CodexInner {
                     match state.background_commands.entry(key) {
                         Entry::Occupied(_) => None,
                         Entry::Vacant(entry) => {
+                            let tool_call_id = outstanding.tool_call_id.clone();
                             let command = CodexBackgroundCommand {
                                 tool_call_id: outstanding.tool_call_id,
                                 task_id: session_id.clone(),
@@ -3858,13 +3780,20 @@ impl CodexInner {
                             };
                             let progress = command.progress(BackgroundTaskStatus::Running, None);
                             entry.insert(command);
-                            Some(progress)
+                            Some((progress, tool_call_id))
                         }
                     }
                 }
             }
         };
-        if let Some(progress) = progress {
+        if let Some((progress, tool_call_id)) = promoted {
+            if self.emitter.detach_tool(&tool_call_id) {
+                self.state
+                    .lock()
+                    .await
+                    .pending_tool_call_ids
+                    .remove(&tool_call_id);
+            }
             self.emitter.tool_progress(&progress);
         } else {
             tracing::debug!(
@@ -3873,6 +3802,163 @@ impl CodexInner {
                 yielded_session_id = session_id,
                 "Codex yielded session result did not match one live root command"
             );
+        }
+    }
+
+    async fn handle_raw_modify_completion(&self, params: &Value) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            return;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("custom_tool_call") => {
+                let Some(input) = item.get("input").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some((file_path, before, after)) = parse_raw_codex_apply_patch(input) else {
+                    return;
+                };
+                let Some(turn_id) = extract_turn_id(params) else {
+                    return;
+                };
+                let tool_call_id = format!("codex:{thread_id}:{turn_id}:raw:{call_id}");
+                self.state.lock().await.pending_raw_modify_calls.insert(
+                    (thread_id, call_id.to_owned()),
+                    PendingRawCodexModify {
+                        turn_id,
+                        tool_call_id,
+                        file_path,
+                        before,
+                        after,
+                        failed_output: None,
+                    },
+                );
+            }
+            Some("custom_tool_call_output") => {
+                let output = raw_custom_tool_output_text(item);
+                if !output.starts_with("Script failed") {
+                    self.state
+                        .lock()
+                        .await
+                        .pending_raw_modify_calls
+                        .remove(&(thread_id, call_id.to_owned()));
+                    return;
+                }
+                if let Some(pending) = self
+                    .state
+                    .lock()
+                    .await
+                    .pending_raw_modify_calls
+                    .get_mut(&(thread_id, call_id.to_owned()))
+                {
+                    pending.failed_output = Some(output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn flush_raw_modify_failures(&self, turn_id: Option<&str>) {
+        let pending = {
+            let mut state = self.state.lock().await;
+            let keys = state
+                .pending_raw_modify_calls
+                .iter()
+                .filter(|(_, pending)| {
+                    pending.failed_output.is_some()
+                        && turn_id.is_none_or(|turn_id| pending.turn_id == turn_id)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| state.pending_raw_modify_calls.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for pending in pending {
+            let output = pending
+                .failed_output
+                .expect("flushed raw modify failure must have output");
+            self.emit_modify_file_request(
+                &pending.tool_call_id,
+                &pending.file_path,
+                &pending.before,
+                &pending.after,
+            )
+            .await;
+            self.emit_tool_execution_completed(
+                &pending.tool_call_id,
+                "modify_file",
+                false,
+                json!({
+                    "kind": "Error",
+                    "short_message": "File modification failed",
+                    "detailed_message": output,
+                }),
+                Some(output),
+            )
+            .await;
+        }
+    }
+
+    async fn promote_root_commands_before_agent_response(&self, params: &Value) {
+        let thread_id = extract_notification_thread_id(params);
+        let turn_id = extract_turn_id(params);
+        let promoted = {
+            let mut state = self.state.lock().await;
+            let thread_id = thread_id.unwrap_or_else(|| state.thread_id.clone());
+            let turn_id = turn_id.or_else(|| state.active_turn_id.clone());
+            if thread_id != state.thread_id || !state.background_command_owner_active {
+                Vec::new()
+            } else {
+                let keys = state
+                    .outstanding_command_executions
+                    .iter()
+                    .filter(|(key, command)| {
+                        key.0 == thread_id
+                            && turn_id
+                                .as_ref()
+                                .is_none_or(|turn_id| command.turn_id == *turn_id)
+                            && !state.background_commands.contains_key(*key)
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| {
+                        let outstanding = state.outstanding_command_executions.get(&key)?.clone();
+                        let command = CodexBackgroundCommand {
+                            tool_call_id: outstanding.tool_call_id.clone(),
+                            task_id: outstanding
+                                .process_id
+                                .clone()
+                                .unwrap_or_else(|| key.1.clone()),
+                            description: outstanding.command,
+                            missing_polls: 0,
+                        };
+                        let progress = command.progress(BackgroundTaskStatus::Running, None);
+                        state.background_commands.insert(key, command);
+                        Some((progress, outstanding.tool_call_id))
+                    })
+                    .collect()
+            }
+        };
+        for (progress, tool_call_id) in promoted {
+            tracing::info!(
+                tool_call_id,
+                "Promoting Codex command because agent response began before command completion"
+            );
+            if self.emitter.detach_tool(&tool_call_id) {
+                self.state
+                    .lock()
+                    .await
+                    .pending_tool_call_ids
+                    .remove(&tool_call_id);
+            }
+            self.emitter.tool_progress(&progress);
         }
     }
 
@@ -3920,13 +4006,17 @@ impl CodexInner {
         } else {
             BackendCompactionDispatchState::MayHaveReachedProvider
         });
+        let metrics = CompactionMetrics {
+            duration_ms: Some(pending.started_at.elapsed().as_millis() as u64),
+            ..CompactionMetrics::default()
+        };
         let result = BackendCompactionResult {
             operation_id: pending.request.operation_id.clone(),
             dispatch,
             mutation,
             outcome: Err(BackendCompactionFailure { kind, message }),
             provider_session_id: Some(SessionId(thread_id.clone())),
-            metrics: CompactionMetrics::default(),
+            metrics,
             post_context_tokens: PostCompactionTokenCount::Unknown,
             evidence: BackendCompactionTerminalEvidence::Codex {
                 thread_id,
@@ -3949,6 +4039,10 @@ impl CodexInner {
             && pending.item_started
             && pending.item_completed
             && pending.turn_status.as_deref() == Some("completed");
+        let metrics = CompactionMetrics {
+            duration_ms: Some(pending.started_at.elapsed().as_millis() as u64),
+            ..CompactionMetrics::default()
+        };
         let result = BackendCompactionResult {
             operation_id: pending.request.operation_id.clone(),
             dispatch: BackendCompactionDispatchState::Accepted,
@@ -3973,7 +4067,7 @@ impl CodexInner {
                 })
             },
             provider_session_id: Some(SessionId(thread_id.clone())),
-            metrics: CompactionMetrics::default(),
+            metrics,
             post_context_tokens: PostCompactionTokenCount::Unknown,
             evidence: BackendCompactionTerminalEvidence::Codex {
                 thread_id,
@@ -4202,6 +4296,42 @@ impl CodexInner {
         });
     }
 
+    async fn terminate_background_terminals(&self) {
+        let terminals = {
+            let state = self.state.lock().await;
+            state
+                .background_commands
+                .iter()
+                .map(|((thread_id, _), command)| (thread_id.clone(), command.task_id.clone()))
+                .chain(state.outstanding_command_executions.iter().filter_map(
+                    |((thread_id, _), command)| {
+                        command
+                            .process_id
+                            .as_ref()
+                            .map(|process_id| (thread_id.clone(), process_id.clone()))
+                    },
+                ))
+                .collect::<HashSet<_>>()
+        };
+        for (thread_id, process_id) in terminals {
+            if let Err(error) = self
+                .rpc
+                .request(
+                    "thread/backgroundTerminals/terminate",
+                    json!({ "threadId": thread_id, "processId": process_id }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    thread_id,
+                    process_id,
+                    error = %error,
+                    "Failed to terminate Codex background terminal during shutdown"
+                );
+            }
+        }
+    }
+
     /// One reconcile pass. Returns whether the loop should keep polling.
     async fn poll_background_terminals_once(&self) -> bool {
         // Native children are separate threads on the same app-server, and
@@ -4252,15 +4382,41 @@ impl CodexInner {
                 }
                 reconcile_codex_background_terminals(&mut state, &thread_id, &listed)
             };
-            if progress.is_empty() {
-                continue;
+            if !progress.is_empty() {
+                let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
+                    // The child's stream is gone; its rows went with it.
+                    continue;
+                };
+                for update in &progress {
+                    if matches!(
+                        &update.update,
+                        ToolProgressUpdate::BackgroundTask(task)
+                            if task.status == BackgroundTaskStatus::Running
+                    ) {
+                        emitter.detach_tool(&update.tool_call_id);
+                    }
+                    emitter.tool_progress(update);
+                }
             }
-            let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
-                // The child's stream is gone; its rows went with it.
-                continue;
+            let deferred_terminal = {
+                let mut state = self.state.lock().await;
+                let still_running = state
+                    .background_commands
+                    .keys()
+                    .chain(state.outstanding_command_executions.keys())
+                    .any(|(owner_thread_id, _)| owner_thread_id == &thread_id);
+                (!still_running)
+                    .then(|| {
+                        state
+                            .subagent_streams
+                            .get_mut(&thread_id)
+                            .and_then(|stream| stream.pending_spawn_terminal_status.take())
+                    })
+                    .flatten()
             };
-            for update in &progress {
-                emitter.tool_progress(update);
+            if let Some(status) = deferred_terminal {
+                self.terminalize_codex_subagent_spawn(&thread_id, &status)
+                    .await;
             }
         }
         true
@@ -5779,6 +5935,8 @@ impl CodexInner {
                 terminated_background_commands,
             )
         };
+        self.terminalize_dynamic_awaits(provider_turn_id.as_deref())
+            .await;
         if let Some(stream) = active_stream {
             let finalized = self
                 .finalize_root_provider_stream(stream, CodexProviderStreamFinalization::TurnAborted)
@@ -6145,11 +6303,14 @@ impl CodexInner {
                     (
                         state.thread_id.clone(),
                         state.active_turn_id.clone(),
-                        !state.background_commands.is_empty()
+                        (!state.background_commands.is_empty()
+                            || !state.subagent_streams.is_empty())
                             && (state.active_turn_id.is_none()
                                 || state.foreground_response_completed),
                     )
                 };
+                self.terminalize_dynamic_awaits(turn_id_opt.as_deref())
+                    .await;
                 if foreground_ended_with_background_work {
                     self.emitter.interrupt_acknowledged(
                         "Codex foreground turn already ended; background work continues.",
@@ -6252,6 +6413,10 @@ impl CodexInner {
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
+        let active_turn_id = self.state.lock().await.active_turn_id.clone();
+        self.terminalize_dynamic_awaits(active_turn_id.as_deref())
+            .await;
+        self.terminalize_dynamic_awaits(None).await;
         self.state.lock().await.pending_resume_thread_id = Some(session_id.clone());
         let resumed = async {
             let response = self
@@ -6282,10 +6447,18 @@ impl CodexInner {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
-            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
+            let saved_await_warning = codex_saved_await_warning(
+                &self.rpc,
+                &response,
+                self.dynamic_await_endpoint.is_some(),
+                "thread/resume",
+                true,
+            )
+            .await;
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns, saved_await_warning))
         }
         .await;
-        let (resumed_thread_id, resumed_model, turns) = match resumed {
+        let (resumed_thread_id, resumed_model, turns, saved_await_warning) = match resumed {
             Ok(resumed) => resumed,
             Err(error) => {
                 self.state.lock().await.pending_resume_thread_id = None;
@@ -6330,6 +6503,10 @@ impl CodexInner {
         let restored_bytes = self.emit_resumed_thread_history(&turns, &model).await;
         let mut state = self.state.lock().await;
         state.conversation_bytes_total = restored_bytes;
+        drop(state);
+        if let Some(warning) = saved_await_warning {
+            self.emitter.warning_message(&warning);
+        }
 
         Ok(())
     }
@@ -6441,7 +6618,7 @@ impl CodexInner {
                             continue;
                         }
                         total_bytes = total_bytes.saturating_add(text.len() as u64);
-                        self.emitter.user_message(&text, Vec::new());
+                        self.emitter.user_message(&text, None);
                     }
                     "agentMessage" => {
                         let text = extract_codex_item_text(item);
@@ -6652,9 +6829,21 @@ impl CodexInner {
     async fn handle_inbound(self: &Arc<Self>, inbound: CodexInbound) {
         match inbound {
             CodexInbound::Stderr(line) => {
-                self.emitter.subprocess_stderr(&line);
+                if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&line) {
+                    self.emitter.retry_attempt(RetryAttemptPayload {
+                        attempt,
+                        max_retries,
+                        error: &line,
+                        backoff_ms: 250u64
+                            .saturating_mul(1u64 << attempt.saturating_sub(1))
+                            .min(4_000),
+                    });
+                } else {
+                    self.emitter.subprocess_stderr(&line);
+                }
             }
             CodexInbound::Closed { exit_code } => {
+                self.terminalize_dynamic_awaits(None).await;
                 self.finish_compaction_failure(
                     BackendCompactionFailureKind::TransportClosed,
                     "Codex app-server exited during compaction".to_string(),
@@ -6687,9 +6876,52 @@ impl CodexInner {
             return;
         }
         self.trace_notification_structure(method, params).await;
+        if method == "mcpServer/startupStatus/updated"
+            && params.get("name").and_then(Value::as_str)
+                == Some(AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
+            && params.get("status").and_then(Value::as_str) == Some("ready")
+        {
+            let inner = Arc::clone(self);
+            tokio::spawn(async move {
+                match inner
+                    .rpc
+                    .request(
+                        "mcpServerStatus/list",
+                        json!({"detail": "toolsAndAuthOnly", "limit": 100}),
+                    )
+                    .await
+                {
+                    Ok(statuses) => {
+                        let await_status =
+                            statuses
+                                .get("data")
+                                .and_then(Value::as_array)
+                                .and_then(|servers| {
+                                    servers.iter().find(|server| {
+                                        server.get("name").and_then(Value::as_str)
+                                            == Some(AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
+                                    })
+                                });
+                        tracing::info!(?await_status, "Codex await MCP inventory after ready");
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to inspect Codex MCP inventory"),
+                }
+            });
+        }
         self.trace_agent_message_identity_event(method, params)
             .await;
         if method == "rawResponseItem/completed" {
+            if matches!(
+                params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("custom_tool_call" | "custom_tool_call_output")
+            ) {
+                tracing::debug!(?params, "Codex raw custom tool completion");
+                eprintln!("TYDE CODEX RAW CUSTOM TOOL {params}");
+            }
+            self.handle_raw_modify_completion(params).await;
             self.promote_yielded_root_command(params).await;
             return;
         }
@@ -6791,8 +7023,25 @@ impl CodexInner {
                         .or_else(|| item.get("exit_code"))
                         .and_then(Value::as_i64)
                         .unwrap_or(-1);
+                    let success = exit_code == 0;
+                    self.emit_tool_execution_completed(
+                        &command.tool_call_id,
+                        "run_command",
+                        success,
+                        json!({
+                            "kind": "RunCommand",
+                            "exit_code": exit_code,
+                            "stdout": item
+                                .get("aggregatedOutput")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            "stderr": "",
+                        }),
+                        (!success).then(|| format!("Command failed with exit code {exit_code}")),
+                    )
+                    .await;
                     self.emitter.tool_progress(&command.progress(
-                        if exit_code == 0 {
+                        if success {
                             BackgroundTaskStatus::Completed
                         } else {
                             BackgroundTaskStatus::Failed
@@ -6905,6 +7154,7 @@ impl CodexInner {
                 if provider_initiated {
                     self.emitter.typing_status_changed(true);
                 }
+                self.dynamic_awaits.lock().await.accepting = true;
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -7141,13 +7391,8 @@ impl CodexInner {
     }
 
     async fn trace_notification_structure(&self, method: &str, params: &Value) {
-        #[cfg(test)]
-        if std::env::var("TYDE_LIVE_CODEX_TEST_VERBOSE")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            eprintln!("[live-codex-notification] method={method} params={params}");
+        if method == "mcpServer/startupStatus/updated" {
+            tracing::info!(?params, "Codex MCP startup status");
         }
         let item = params.get("item");
         let item_id = item
@@ -7336,7 +7581,7 @@ impl CodexInner {
                     .effective_model
                     .clone()
                     .unwrap_or_else(|| "codex".to_string());
-                tracing::debug!(
+                tracing::info!(
                     method,
                     thread_id,
                     "Codex notification ownership: live child"
@@ -8076,6 +8321,21 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        if self
+            .state
+            .lock()
+            .await
+            .completed_subagent_streams
+            .get(stream_key)
+            .is_some_and(|stream| stream.owner_terminated)
+        {
+            tracing::debug!(
+                child_thread_id = stream_key,
+                codex_method = method,
+                "Dropping late Codex child event after owner termination"
+            );
+            return;
+        }
         if method == "item/completed"
             && let Some(item) = params.get("item")
             && item.get("type").and_then(Value::as_str) == Some("commandExecution")
@@ -8629,7 +8889,7 @@ impl CodexInner {
                     &tool_name,
                     json!({
                         "kind": "Other",
-                        "args": item
+                        "args": codex_generic_tool_arguments(item)
                     }),
                 );
                 (container, vec![item_id])
@@ -8832,6 +9092,32 @@ impl CodexInner {
                         Some(exit_code as i64),
                     ));
                 }
+                let pending_spawn_terminal = {
+                    let mut state = self.state.lock().await;
+                    if !success && let Some(stream) = state.subagent_streams.get_mut(stream_key) {
+                        stream.background_work_failed = true;
+                        if stream.pending_spawn_terminal_status.is_some() {
+                            stream.pending_spawn_terminal_status = Some("failed".to_owned());
+                        }
+                    }
+                    let still_running = state
+                        .background_commands
+                        .keys()
+                        .chain(state.outstanding_command_executions.keys())
+                        .any(|(thread_id, _)| thread_id == stream_key);
+                    if still_running {
+                        None
+                    } else {
+                        state
+                            .subagent_streams
+                            .get_mut(stream_key)
+                            .and_then(|stream| stream.pending_spawn_terminal_status.take())
+                    }
+                };
+                if let Some(status) = pending_spawn_terminal {
+                    self.terminalize_codex_subagent_spawn(stream_key, &status)
+                        .await;
+                }
             }
             "fileChange" => {
                 let item_id = self
@@ -8886,14 +9172,23 @@ impl CodexInner {
                 let mut completed_call_ids = Vec::with_capacity(total);
                 for (idx, change) in file_changes.iter().enumerate() {
                     let call_id = codex_file_change_call_id(&item_id, idx, total);
-                    let container = emitter.tool_completed(ToolCompletedPayload {
-                        tool_call_id: &call_id,
-                        tool_name: "modify_file",
-                        tool_result: json!({
+                    let tool_result = if success {
+                        json!({
                             "kind": "ModifyFile",
                             "lines_added": change.lines_added,
                             "lines_removed": change.lines_removed
-                        }),
+                        })
+                    } else {
+                        json!({
+                            "kind": "Error",
+                            "short_message": "File changes were not applied",
+                            "detailed_message": item.to_string()
+                        })
+                    };
+                    let container = emitter.tool_completed(ToolCompletedPayload {
+                        tool_call_id: &call_id,
+                        tool_name: "modify_file",
+                        tool_result,
                         success,
                         error: err_str,
                     });
@@ -8915,20 +9210,28 @@ impl CodexInner {
                 let item_id = self
                     .tool_call_completed_id(params, provider_item_id, tool_name)
                     .await;
-                let success = item.get("status").and_then(Value::as_str) == Some("completed")
+                let provider_success = item.get("status").and_then(Value::as_str)
+                    == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
-                let error_message = if success {
-                    None
+                let (tool_result, success, error_message) = if item_type == "mcpToolCall" {
+                    let normalized = normalize_mcp_call_tool_result(item);
+                    let success = normalized.success && provider_success;
+                    let error = normalized
+                        .error
+                        .or_else(|| (!success).then(|| format!("{tool_name} failed")));
+                    (normalized.tool_result, success, error)
                 } else {
-                    Some(format!("{tool_name} failed"))
+                    let error = (!provider_success).then(|| format!("{tool_name} failed"));
+                    (
+                        codex_public_generic_tool_result(tool_name, item, provider_success),
+                        provider_success,
+                        error,
+                    )
                 };
                 let container = emitter.tool_completed(ToolCompletedPayload {
                     tool_call_id: &item_id,
                     tool_name,
-                    tool_result: json!({
-                        "kind": "Other",
-                        "result": item
-                    }),
+                    tool_result,
                     success,
                     error: error_message.as_deref(),
                 });
@@ -9627,6 +9930,115 @@ impl CodexInner {
             status = turn_status,
             "Codex child turn completed; retaining ownership for possible follow-up"
         );
+        let deferred_for_background_work = {
+            let mut state = self.state.lock().await;
+            let has_background_work = state
+                .background_commands
+                .keys()
+                .chain(state.outstanding_command_executions.keys())
+                .any(|(thread_id, _)| thread_id == stream_key);
+            let terminal_status = if state
+                .subagent_streams
+                .get(stream_key)
+                .is_some_and(|stream| stream.background_work_failed)
+            {
+                "failed"
+            } else {
+                turn_status.as_str()
+            }
+            .to_owned();
+            if has_background_work && turn_status == "completed" {
+                if let Some(stream) = state.subagent_streams.get_mut(stream_key) {
+                    stream.pending_spawn_terminal_status = Some(terminal_status);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if deferred_for_background_work {
+            tracing::info!(
+                child_thread_id = stream_key,
+                "Deferring native spawn terminal until child background work completes"
+            );
+            return;
+        }
+        let terminal_status = {
+            let state = self.state.lock().await;
+            if state
+                .subagent_streams
+                .get(stream_key)
+                .is_some_and(|stream| stream.background_work_failed)
+            {
+                "failed"
+            } else {
+                turn_status.as_str()
+            }
+            .to_owned()
+        };
+        self.terminalize_codex_subagent_spawn(stream_key, &terminal_status)
+            .await;
+    }
+
+    async fn terminalize_codex_subagent_spawn(&self, stream_key: &str, turn_status: &str) {
+        let terminal = {
+            let state = self.state.lock().await;
+            state.subagent_streams.get(stream_key).map(|stream| {
+                (
+                    stream.spawn_item_id.clone(),
+                    stream.agent_id.clone(),
+                    stream.agent_name.clone(),
+                )
+            })
+        };
+        if let Some((recorded_tool_call_id, agent_id, agent_name)) = terminal {
+            let tool_call_id = if self
+                .emitter
+                .has_pending_tool_request(&recorded_tool_call_id)
+            {
+                recorded_tool_call_id
+            } else {
+                format!("codex-native-spawn:{recorded_tool_call_id}")
+            };
+            if !self.emitter.has_pending_tool_request(&tool_call_id) {
+                return;
+            }
+            tracing::info!(
+                child_thread_id = stream_key,
+                tool_call_id,
+                status = turn_status,
+                "Terminalizing Codex native background spawn"
+            );
+            let tool_name = self
+                .emitter
+                .tool_request_name(&tool_call_id)
+                .unwrap_or_else(|| "spawnAgent".to_owned());
+            self.emitter.tool_progress(&ToolProgressData {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                    agent_id,
+                    agent_name,
+                    last_tool_name: None,
+                    tool_calls: 0,
+                    completed: true,
+                    status: match turn_status {
+                        "completed" => protocol::SubAgentProgressStatus::Completed,
+                        "interrupted" => protocol::SubAgentProgressStatus::Stopped,
+                        _ => protocol::SubAgentProgressStatus::Failed,
+                    },
+                }),
+            });
+            let success = turn_status == "completed";
+            self.emit_tool_execution_completed(
+                &tool_call_id,
+                &tool_name,
+                success,
+                json!({ "kind": "Other", "result": { "status": turn_status } }),
+                (!success).then(|| format!("Codex child turn ended with status '{turn_status}'")),
+            )
+            .await;
+        }
     }
 
     async fn emit_subagent_model_request_usage(
@@ -9648,6 +10060,11 @@ impl CodexInner {
                     .completed_subagent_streams
                     .get_mut(stream_key)
                     .and_then(|stream| {
+                        let cumulative = normalize_subagent_cumulative_usage(
+                            &mut stream.provider_usage_baseline,
+                            &request,
+                            cumulative,
+                        );
                         let turn_context = stream
                             .pending_message_metadata
                             .as_ref()
@@ -9669,6 +10086,11 @@ impl CodexInner {
                     .subagent_streams
                     .get_mut(stream_key)
                     .and_then(|stream| {
+                        let cumulative = normalize_subagent_cumulative_usage(
+                            &mut stream.provider_usage_baseline,
+                            &request,
+                            cumulative,
+                        );
                         let turn_context = stream
                             .pending_message_metadata
                             .as_ref()
@@ -9693,6 +10115,10 @@ impl CodexInner {
     }
 
     async fn handle_legacy_codex_event(&self, method: &str, params: &Value) {
+        if let Some(retry) = extract_legacy_codex_retry_attempt(method, params) {
+            self.emitter.retry_attempt(retry);
+            return;
+        }
         let Some(delta) = extract_reasoning_delta_from_legacy_codex_event(method, params) else {
             return;
         };
@@ -9758,6 +10184,9 @@ impl CodexInner {
         };
 
         if terminal {
+            let active_turn_id = self.state.lock().await.active_turn_id.clone();
+            self.terminalize_dynamic_awaits(active_turn_id.as_deref())
+                .await;
             self.complete_all_codex_subagents().await;
             self.emitter.backend_error(&message);
             self.emitter.typing_status_changed(false);
@@ -9768,7 +10197,7 @@ impl CodexInner {
             .subprocess_stderr(&format!("Codex warning: {message}"));
     }
 
-    async fn handle_server_request(&self, id: Value, method: &str, params: &Value) {
+    async fn handle_server_request(self: &Arc<Self>, id: Value, method: &str, params: &Value) {
         let inference_only =
             self.state.lock().await.execution_mode == BackendExecutionMode::InferenceOnly;
         if inference_only && is_codex_tool_server_request(method) {
@@ -10046,16 +10475,137 @@ impl CodexInner {
                 }
             }
             "item/tool/call" => {
+                let tool_name = params
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("dynamic_tool");
+                if is_tyde_agent_control_await_tool_name(tool_name) {
+                    let requested_thread_id = params
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let thread_id = self.state.lock().await.thread_id.clone();
+                    if requested_thread_id != thread_id {
+                        let _ = self
+                            .rpc
+                            .respond(
+                                id,
+                                json!({
+                                    "success": false,
+                                    "contentItems": [{
+                                        "type": "inputText",
+                                        "text": "Codex dynamic await request did not belong to the active thread"
+                                    }]
+                                }),
+                            )
+                            .await;
+                        return;
+                    }
+                    let arguments = params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let call_id = params
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .map(|call_id| codex_scoped_tool_call_id(params, call_id))
+                        .unwrap_or_else(|| codex_scoped_tool_call_id(params, "dynamic-await"));
+                    let turn_id = match extract_turn_id(params) {
+                        Some(turn_id) => turn_id,
+                        None => self
+                            .state
+                            .lock()
+                            .await
+                            .active_turn_id
+                            .clone()
+                            .unwrap_or_default(),
+                    };
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    let rejected = {
+                        let mut awaits = self.dynamic_awaits.lock().await;
+                        if !awaits.accepting
+                            || turn_id.is_empty()
+                            || awaits.terminal_turns.iter().any(|known| known == &turn_id)
+                        {
+                            true
+                        } else {
+                            awaits.pending.insert(
+                                call_id.clone(),
+                                CodexPendingDynamicAwait {
+                                    turn_id,
+                                    cancellation: cancellation.clone(),
+                                },
+                            );
+                            false
+                        }
+                    };
+                    if rejected {
+                        let _ = self
+                            .rpc
+                            .respond(
+                                id,
+                                json!({
+                                    "success": false,
+                                    "contentItems": [{
+                                        "type": "inputText",
+                                        "text": "Tyde await arrived after its Codex turn ended"
+                                    }]
+                                }),
+                            )
+                            .await;
+                        return;
+                    }
+                    let inner = Arc::clone(self);
+                    tokio::spawn(async move {
+                        tracing::info!(
+                            tool_call_id = call_id,
+                            "Starting direct Codex await MCP call"
+                        );
+                        let result = match inner.dynamic_await_endpoint.as_ref() {
+                            Some(endpoint) => {
+                                call_codex_agent_await(endpoint, arguments, cancellation.clone())
+                                    .await
+                            }
+                            None => Err(
+                                "Tyde await MCP endpoint is unavailable for this Codex session"
+                                    .to_owned(),
+                            ),
+                        };
+                        inner.dynamic_awaits.lock().await.pending.remove(&call_id);
+                        tracing::info!(
+                            tool_call_id = call_id,
+                            success = result.is_ok(),
+                            "Finished direct Codex await MCP call"
+                        );
+                        let (success, text) = match result {
+                            Ok(result) => (
+                                !result
+                                    .get("isError")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                                serde_json::to_string(&result)
+                                    .unwrap_or_else(|_| "Tyde await completed".to_owned()),
+                            ),
+                            Err(error) => (false, error),
+                        };
+                        let _ = inner
+                            .rpc
+                            .respond(
+                                id,
+                                json!({
+                                    "success": success,
+                                    "contentItems": [{ "type": "inputText", "text": text }]
+                                }),
+                            )
+                            .await;
+                    });
+                    return;
+                }
                 let call_id = params
                     .get("callId")
                     .and_then(Value::as_str)
                     .map(|call_id| codex_scoped_tool_call_id(params, call_id))
                     .unwrap_or_else(|| codex_scoped_tool_call_id(params, "dynamic-tool-call"));
-                let tool_name = params
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .unwrap_or("dynamic_tool");
-
                 self.track_tool_requests(std::iter::once(call_id.clone()))
                     .await;
                 self.emit_tool_request(
@@ -10063,10 +10613,7 @@ impl CodexInner {
                     tool_name,
                     json!({
                         "kind": "Other",
-                        "args": {
-                            "type": "dynamic_tool_call",
-                            "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)
-                        }
+                        "args": params.get("arguments").cloned().unwrap_or(Value::Null)
                     }),
                 )
                 .await;
@@ -10130,6 +10677,8 @@ impl CodexInner {
 
         match item_type {
             "agentMessage" => {
+                self.promote_root_commands_before_agent_response(params)
+                    .await;
                 let Some(item_id) = item_id.filter(|item_id| !item_id.trim().is_empty()) else {
                     self.reject_agent_message_identity(
                         StreamIdentityViolation::MissingMessageId,
@@ -10271,6 +10820,7 @@ impl CodexInner {
                 .await;
             }
             "webSearch" => {
+                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=webSearch item={item}");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "web_search")
                     .await;
@@ -10290,6 +10840,7 @@ impl CodexInner {
                 .await;
             }
             "imageView" => {
+                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=imageView item={item}");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "view_image")
                     .await;
@@ -10309,6 +10860,7 @@ impl CodexInner {
                 .await;
             }
             "sleep" => {
+                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=sleep item={item}");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "sleep")
                     .await;
@@ -10809,6 +11361,28 @@ impl CodexInner {
                         .unwrap_or_default()
                 };
                 let file_changes = parse_codex_file_changes(item);
+                if let (Some(thread_id), Some(turn_id)) = (
+                    extract_notification_thread_id(params),
+                    extract_turn_id(params),
+                ) {
+                    let mut state = self.state.lock().await;
+                    for change in &file_changes {
+                        let key = state
+                            .pending_raw_modify_calls
+                            .iter()
+                            .find(|((owner_thread_id, _), pending)| {
+                                owner_thread_id == &thread_id
+                                    && pending.turn_id == turn_id
+                                    && pending.before == change.before
+                                    && pending.after == change.after
+                                    && codex_modify_paths_match(&pending.file_path, &change.path)
+                            })
+                            .map(|(key, _)| key.clone());
+                        if let Some(key) = key {
+                            state.pending_raw_modify_calls.remove(&key);
+                        }
+                    }
+                }
                 let completions =
                     codex_file_change_completion_plan(&item_id, &known_call_ids, &file_changes);
 
@@ -10824,15 +11398,24 @@ impl CodexInner {
                             .await;
                         }
 
-                        self.emit_tool_execution_completed(
-                            &completion.call_id,
-                            "modify_file",
-                            success,
+                        let tool_result = if success {
                             json!({
                                 "kind": "ModifyFile",
                                 "lines_added": completion.lines_added,
                                 "lines_removed": completion.lines_removed
-                            }),
+                            })
+                        } else {
+                            json!({
+                                "kind": "Error",
+                                "short_message": "File changes were not applied",
+                                "detailed_message": item.to_string()
+                            })
+                        };
+                        self.emit_tool_execution_completed(
+                            &completion.call_id,
+                            "modify_file",
+                            success,
+                            tool_result,
                             if success {
                                 None
                             } else {
@@ -10884,23 +11467,32 @@ impl CodexInner {
                 let item_id = self
                     .tool_call_completed_id(params, item_id.unwrap_or("item"), tool_name)
                     .await;
-                let success = item.get("status").and_then(Value::as_str) == Some("completed")
+                let provider_success = item.get("status").and_then(Value::as_str)
+                    == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
-                self.emit_tool_execution_completed(
-                    &item_id,
-                    tool_name,
-                    success,
+                let normalized_mcp =
+                    (item_type == "mcpToolCall").then(|| normalize_mcp_call_tool_result(item));
+                let result = if let Some(normalized) = normalized_mcp.as_ref() {
+                    normalized.tool_result.clone()
+                } else if item_type == "dynamicToolCall"
+                    && is_tyde_agent_control_await_tool_name(tool_name)
+                {
+                    codex_dynamic_await_result(item).unwrap_or_else(|| item.clone())
+                } else {
                     json!({
                         "kind": "Other",
                         "result": item
-                    }),
-                    if success {
-                        None
-                    } else {
-                        Some(format!("{tool_name} failed"))
-                    },
-                )
-                .await;
+                    })
+                };
+                let success = normalized_mcp
+                    .as_ref()
+                    .map(|normalized| normalized.success && provider_success)
+                    .unwrap_or(provider_success);
+                let error = normalized_mcp
+                    .and_then(|normalized| normalized.error)
+                    .or_else(|| (!success).then(|| format!("{tool_name} failed")));
+                self.emit_tool_execution_completed(&item_id, tool_name, success, result, error)
+                    .await;
             }
             "collabToolCall" | "collabAgentToolCall" => {
                 tracing::debug!(
@@ -10910,6 +11502,7 @@ impl CodexInner {
                     receiver_count = codex_native_wait_thread_ids(item).len(),
                     "Codex native collaboration completion"
                 );
+                tracing::info!(item = %item, "Codex native collaboration completion payload");
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
@@ -10920,21 +11513,24 @@ impl CodexInner {
                     .tool_call_completed_id(params, item_id.unwrap_or("item"), tool_name)
                     .await;
                 let success = codex_item_success(item);
-                self.emit_tool_execution_completed(
-                    &item_id,
-                    tool_name,
-                    success,
-                    json!({
-                        "kind": "Other",
-                        "result": item
-                    }),
-                    if success {
-                        None
-                    } else {
-                        Some(format!("{tool_name} failed"))
-                    },
-                )
-                .await;
+                let native_spawn = !parse_codex_subagent_collabs(item).is_empty();
+                if !native_spawn {
+                    self.emit_tool_execution_completed(
+                        &item_id,
+                        tool_name,
+                        success,
+                        json!({
+                            "kind": "Other",
+                            "result": item
+                        }),
+                        if success {
+                            None
+                        } else {
+                            Some(format!("{tool_name} failed"))
+                        },
+                    )
+                    .await;
+                }
                 self.record_codex_subagent_spawn_metadata_if_needed(
                     Some(&item_id),
                     Some(params),
@@ -11194,7 +11790,6 @@ impl CodexInner {
         };
 
         let spawn_item_id = spawn.item_id.clone();
-        let progress_tool_call_id = spawn_item_id.clone();
         let spawn_tool_name = spawn.tool_name.clone();
         let spawn_prompt = spawn.prompt.clone();
         let spawn_name = spawn.name.clone();
@@ -11237,6 +11832,28 @@ impl CodexInner {
             AgentName(CODEX_AGENT_NAME),
         ));
 
+        let progress_tool_call_id = if needs_synthetic_request {
+            let synthetic_tool_call_id = format!("codex-native-spawn:{spawn_item_id}");
+            self.emit_tool_request(
+                &synthetic_tool_call_id,
+                &spawn_tool_name,
+                serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+                    prompt: spawn_prompt,
+                    name: Some(activity.agent_path.clone()),
+                    execution_mode: protocol::AgentExecutionMode::Background,
+                })
+                .expect("serialize native Codex agent spawn"),
+            )
+            .await;
+            synthetic_tool_call_id
+        } else {
+            spawn_item_id.clone()
+        };
+        let progress_tool_name = self
+            .emitter
+            .tool_request_name(&progress_tool_call_id)
+            .unwrap_or_else(|| spawn_tool_name.clone());
+
         let duplicate_after_spawn = {
             let mut state = self.state.lock().await;
             state.registering_subagent_threads.remove(&thread_id);
@@ -11260,7 +11877,7 @@ impl CodexInner {
                         spawn_item_id: spawn_item_id.clone(),
                         activity_item_id: activity.item_id.clone(),
                         agent_path: activity.agent_path.clone(),
-                        agent_name: spawn_name,
+                        agent_name: spawn_name.clone(),
                         name_update_tx: handle.name_update_tx,
                         sender_thread_id,
                         active_turn_id: None,
@@ -11281,14 +11898,30 @@ impl CodexInner {
                         provider_item_tombstones: VecDeque::new(),
                         terminated_turns: VecDeque::new(),
                         terminated_turn_awaiting_replacement: None,
+                        pending_spawn_terminal_status: None,
+                        background_work_failed: false,
                         generated_identity_epoch: codex_generated_identity_epoch(&thread_id),
                         next_generated_identity_ordinal: 1,
                         pending_message_metadata: None,
                         token_usage_by_turn: HashMap::new(),
                         model_token_usage_by_turn: HashMap::new(),
+                        provider_usage_baseline: None,
                         current_images: Vec::new(),
                     },
                 );
+                self.emitter.tool_progress(&ToolProgressData {
+                    tool_call_id: progress_tool_call_id.clone(),
+                    tool_name: progress_tool_name,
+                    update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                        agent_id: spawned_agent,
+                        agent_name: spawn_name,
+                        last_tool_name: None,
+                        tool_calls: 0,
+                        completed: false,
+                        status: protocol::SubAgentProgressStatus::Running,
+                    }),
+                });
+                self.emitter.detach_tool(&progress_tool_call_id);
                 false
             }
         };
@@ -11299,106 +11932,13 @@ impl CodexInner {
             );
             tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
             self.emitter.backend_error(&message);
-        } else if needs_synthetic_request {
-            let synthetic_tool_call_id = format!("codex-native-spawn:{}", spawn_item_id);
-            self.emit_tool_request(
-                &synthetic_tool_call_id,
-                &spawn_tool_name,
-                serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
-                    prompt: spawn_prompt,
-                    name: Some(activity.agent_path.clone()),
-                })
-                .expect("serialize native Codex agent spawn"),
-            )
-            .await;
-            self.emitter.tool_progress(&ToolProgressData {
-                tool_call_id: synthetic_tool_call_id.clone(),
-                tool_name: spawn_tool_name.clone(),
-                update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                    progress_kind: AgentControlProgressKind::Spawn,
-                    agents: vec![AgentControlAgentRef {
-                        agent_id: spawned_agent.clone(),
-                        name: Some(activity.agent_path.clone()),
-                    }],
-                }),
-            });
-            self.emit_tool_execution_completed(
-                &synthetic_tool_call_id,
-                &spawn_tool_name,
-                true,
-                json!({
-                    "kind": "Other",
-                    "result": {
-                        "agent_id": spawned_agent.0,
-                        "name": activity.agent_path,
-                    }
-                }),
-                None,
-            )
-            .await;
-        } else {
-            // The emitted request owns the spawn item's identity; the parsed
-            // spawn metadata defaults its own alias (`spawnAgent`) while the
-            // request card for a tool-less collab item was emitted as
-            // `collab_tool`, so an unresolved name desyncs this frame.
-            let progress_tool_name = self
-                .emitter
-                .tool_request_name(&progress_tool_call_id)
-                .unwrap_or(spawn_tool_name);
-            self.emitter.tool_progress(&ToolProgressData {
-                tool_call_id: progress_tool_call_id,
-                tool_name: progress_tool_name,
-                update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                    progress_kind: AgentControlProgressKind::Spawn,
-                    agents: vec![AgentControlAgentRef {
-                        agent_id: spawned_agent,
-                        name: Some(activity.agent_path),
-                    }],
-                }),
-            });
-        }
-    }
-
-    #[cfg(test)]
-    async fn complete_codex_subagent_if_needed(&self, thread_id: &str) {
-        let completed = {
-            let mut state = self.state.lock().await;
-            let Some(stream) = state.subagent_streams.remove(thread_id) else {
-                return;
-            };
-            let emitter = Arc::clone(&stream.emitter);
-            let commands = take_codex_commands_for_thread(&mut state, thread_id);
-            state.completed_subagent_streams.insert(
-                thread_id.to_string(),
-                completed_codex_subagent_stream(stream),
-            );
-            (emitter, commands)
-        };
-        for command in completed.1 {
-            if let Some(background_command) = command.background_command {
-                completed.0.tool_progress(
-                    &background_command.progress(BackgroundTaskStatus::Stopped, None),
-                );
-            }
-            if completed.0.has_pending_tool_request(&command.tool_call_id) {
-                completed.0.tool_completed(ToolCompletedPayload {
-                    tool_call_id: &command.tool_call_id,
-                    tool_name: "run_command",
-                    tool_result: json!({
-                        "kind": "Cancelled",
-                        "message": "Codex child completed before command completion",
-                    }),
-                    success: false,
-                    error: None,
-                });
-            }
         }
     }
 
     async fn complete_all_codex_subagents(&self) {
         let mut state = self.state.lock().await;
         let streams = state.subagent_streams.drain().collect::<Vec<_>>();
-        for (item_id, stream) in streams {
+        for (item_id, mut stream) in streams {
             let commands = take_codex_commands_for_thread(&mut state, &item_id);
             for command in commands {
                 if let Some(background_command) = command.background_command {
@@ -11422,6 +11962,13 @@ impl CodexInner {
                     });
                 }
             }
+            for tool_call_id in stream.pending_tool_call_ids.drain() {
+                stream
+                    .emitter
+                    .cancel_pending_tool(&tool_call_id, "Codex child owner exited");
+            }
+            stream.tool_container = None;
+            stream.tool_container_images.clear();
             if stream.current_message_id.is_some() {
                 stream.emitter.discard_open_stream_with_identity_violation(
                     StreamIdentityViolation::MismatchedEndMessageId,
@@ -11438,7 +11985,32 @@ impl CodexInner {
             }
             state
                 .completed_subagent_streams
-                .insert(item_id, completed_codex_subagent_stream(stream));
+                .insert(item_id, completed_codex_subagent_stream(stream, true));
+        }
+    }
+
+    async fn retire_idle_codex_subagents(&self) {
+        let mut state = self.state.lock().await;
+        let idle = state
+            .subagent_streams
+            .iter()
+            .filter(|(thread_id, stream)| {
+                stream.active_turn_id.is_none()
+                    && stream.current_message_id.is_none()
+                    && !state
+                        .background_commands
+                        .keys()
+                        .chain(state.outstanding_command_executions.keys())
+                        .any(|(owner_thread_id, _)| owner_thread_id == *thread_id)
+            })
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        for thread_id in idle {
+            if let Some(stream) = state.subagent_streams.remove(&thread_id) {
+                state
+                    .completed_subagent_streams
+                    .insert(thread_id, completed_codex_subagent_stream(stream, false));
+            }
         }
     }
 
@@ -11474,6 +12046,10 @@ impl CodexInner {
 
     async fn handle_turn_completed(self: &Arc<Self>, params: &Value) {
         let completed_turn_id = extract_turn_id(params);
+        self.terminalize_dynamic_awaits(completed_turn_id.as_deref())
+            .await;
+        self.flush_raw_modify_failures(completed_turn_id.as_deref())
+            .await;
         let consumed_terminated_turn = {
             let mut state = self.state.lock().await;
             match completed_turn_id.as_ref() {
@@ -11715,7 +12291,6 @@ impl CodexInner {
             self.emitter.model_request_token_usage(&usage);
         }
         if let Some(stream) = interrupted_published_stream {
-            self.complete_all_codex_subagents().await;
             self.trace_terminal_emission("stream_end", Some(&stream.message_id.0))
                 .await;
             self.emitter.stream_end_with_id(
@@ -11738,7 +12313,7 @@ impl CodexInner {
             return;
         }
         if let Some((message_id, reasoning)) = partial_idless_reasoning {
-            if matches!(turn_status.as_str(), "interrupted" | "failed") {
+            if turn_status == "failed" {
                 self.complete_all_codex_subagents().await;
             }
             self.trace_terminal_emission("stream_end", Some(&message_id.0))
@@ -11764,7 +12339,7 @@ impl CodexInner {
             return;
         }
         if open_item_without_completion {
-            if matches!(turn_status.as_str(), "interrupted" | "failed") {
+            if turn_status == "failed" {
                 self.complete_all_codex_subagents().await;
             }
             if open_item_published {
@@ -11790,7 +12365,7 @@ impl CodexInner {
         }
 
         if turn_status == "interrupted" {
-            self.complete_all_codex_subagents().await;
+            self.retire_idle_codex_subagents().await;
             // emitter.operation_cancelled runs the full cancel tail:
             // flush pending tools → OperationCancelled → TypingStatusChanged(false).
             self.emitter.operation_cancelled("Operation cancelled");
@@ -11953,6 +12528,7 @@ impl CodexInner {
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents,
+                status: protocol::AgentControlProgressStatus::Running,
             }),
         });
     }
@@ -11985,16 +12561,17 @@ impl CodexInner {
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
-        let image_payload = images
-            .unwrap_or(&[])
-            .iter()
-            .map(|image| {
-                json!({
-                    "media_type": image.media_type,
-                    "data": image.data
+        let image_payload = images.map(|images| {
+            images
+                .iter()
+                .map(|image| {
+                    json!({
+                        "media_type": image.media_type,
+                        "data": image.data
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        });
         self.emitter.user_message(content, image_payload);
     }
 }
@@ -12354,11 +12931,6 @@ fn parse_codex_subagent_collabs(item: &Value) -> Vec<CodexSubAgentSpawnInfo> {
         .collect()
 }
 
-#[cfg(test)]
-fn parse_codex_subagent_collab(item: &Value) -> Option<CodexSubAgentSpawnInfo> {
-    parse_codex_subagent_collabs(item).into_iter().next()
-}
-
 fn parse_codex_subagent_activity(item: &Value) -> Option<CodexSubAgentActivity> {
     if !matches!(
         item.get("type").and_then(Value::as_str),
@@ -12521,6 +13093,42 @@ fn extract_reasoning_delta_from_legacy_codex_event(method: &str, params: &Value)
         return None;
     }
     extract_codex_reasoning_delta_text(params)
+}
+
+fn extract_legacy_codex_retry_attempt<'a>(
+    method: &str,
+    params: &'a Value,
+) -> Option<RetryAttemptPayload<'a>> {
+    if !method.ends_with("/stream_error") {
+        return None;
+    }
+    let message = params
+        .get("msg")
+        .and_then(|msg| msg.get("message"))
+        .and_then(Value::as_str)?;
+    let (attempt, max_retries) = parse_codex_reconnecting_attempt(message)?;
+    let error = params
+        .get("msg")
+        .and_then(|msg| msg.get("additional_details"))
+        .and_then(Value::as_str)
+        .unwrap_or(message);
+    Some(RetryAttemptPayload {
+        attempt,
+        max_retries,
+        error,
+        backoff_ms: 250u64
+            .saturating_mul(1u64 << attempt.saturating_sub(1))
+            .min(4_000),
+    })
+}
+
+fn parse_codex_reconnecting_attempt(message: &str) -> Option<(u64, u64)> {
+    let reconnect = message.split("Reconnecting... ").nth(1)?;
+    let reconnect = reconnect.split_whitespace().next()?;
+    let (connection, total) = reconnect.split_once('/')?;
+    let attempt = connection.parse::<u64>().ok()?.checked_sub(1)?;
+    let max_retries = total.parse::<u64>().ok()?.checked_sub(1)?;
+    (attempt > 0 && attempt <= max_retries).then_some((attempt, max_retries))
 }
 
 fn metadata_target_for_visible_message(
@@ -13182,6 +13790,42 @@ fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
         add_optional_token_usage(total.reasoning_tokens, usage.reasoning_tokens);
 }
 
+fn normalize_subagent_cumulative_usage(
+    baseline: &mut Option<TokenUsage>,
+    request: &TokenUsage,
+    provider_cumulative: TokenUsage,
+) -> TokenUsage {
+    let Some(baseline) = baseline.as_ref() else {
+        *baseline = Some(subtract_token_usage(&provider_cumulative, request));
+        return request.clone();
+    };
+    subtract_token_usage(&provider_cumulative, baseline)
+}
+
+fn subtract_token_usage(total: &TokenUsage, baseline: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: total.input_tokens.saturating_sub(baseline.input_tokens),
+        output_tokens: total.output_tokens.saturating_sub(baseline.output_tokens),
+        total_tokens: total.total_tokens.saturating_sub(baseline.total_tokens),
+        cached_prompt_tokens: subtract_optional_token_usage(
+            total.cached_prompt_tokens,
+            baseline.cached_prompt_tokens,
+        ),
+        cache_creation_input_tokens: subtract_optional_token_usage(
+            total.cache_creation_input_tokens,
+            baseline.cache_creation_input_tokens,
+        ),
+        reasoning_tokens: subtract_optional_token_usage(
+            total.reasoning_tokens,
+            baseline.reasoning_tokens,
+        ),
+    }
+}
+
+fn subtract_optional_token_usage(total: Option<u64>, baseline: Option<u64>) -> Option<u64> {
+    total.map(|total| total.saturating_sub(baseline.unwrap_or(0)))
+}
+
 fn add_optional_token_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
     match (total, usage) {
         (None, None) => None,
@@ -13460,6 +14104,47 @@ fn codex_yielded_session_id(params: &Value) -> Option<String> {
         .next()
 }
 
+fn raw_custom_tool_output_text(item: &Value) -> String {
+    item.get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn parse_raw_codex_apply_patch(input: &str) -> Option<(String, String, String)> {
+    let decoded = input.replace("\\n", "\n");
+    let patch = decoded
+        .split_once("*** Begin Patch")?
+        .1
+        .split_once("*** End Patch")?
+        .0;
+    let file_path = patch
+        .lines()
+        .find_map(|line| line.strip_prefix("*** Update File: "))?
+        .trim()
+        .to_owned();
+    let before = patch
+        .lines()
+        .filter_map(|line| line.strip_prefix('-').filter(|_| !line.starts_with("---")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after = patch
+        .lines()
+        .filter_map(|line| line.strip_prefix('+').filter(|_| !line.starts_with("+++")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((file_path, before, after))
+}
+
+fn codex_modify_paths_match(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    left == right || left.ends_with(right) || right.ends_with(left)
+}
+
 fn take_codex_raw_contract_drift_warning(
     state: &mut CodexState,
 ) -> Option<CodexRawContractDriftWarning> {
@@ -13499,6 +14184,9 @@ fn take_codex_commands_for_turn(
         .collect::<Vec<_>>();
     let mut commands = Vec::new();
     for key in keys {
+        if thread_id == state.thread_id && state.background_commands.contains_key(&key) {
+            continue;
+        }
         state.outstanding_command_executions.remove(&key);
         if let Some(command) = state.background_commands.remove(&key) {
             commands.push(command);
@@ -13620,6 +14308,12 @@ fn reconcile_codex_background_terminals(
             continue;
         };
         state.outstanding_command_executions.remove(&key);
+        if let Some(stream) = state.subagent_streams.get_mut(thread_id) {
+            stream.background_work_failed = true;
+            if stream.pending_spawn_terminal_status.is_some() {
+                stream.pending_spawn_terminal_status = Some("failed".to_owned());
+            }
+        }
         progress.push(command.progress(BackgroundTaskStatus::Stopped, None));
     }
     progress
@@ -13741,14 +14435,6 @@ fn codex_mcp_elicitation_result(params: &Value) -> Value {
     json!({
         "action": "cancel"
     })
-}
-
-#[cfg(test)]
-fn codex_server_request_result(method: &str, params: &Value) -> Value {
-    match method {
-        "mcpServer/elicitation/request" => codex_mcp_elicitation_result(params),
-        _ => json!({"ignored": true, "reason": "unsupported_server_request"}),
-    }
 }
 
 fn parse_approval_decision(message: &str) -> &'static str {
@@ -14082,13 +14768,226 @@ enum CodexInbound {
     },
 }
 
+fn codex_nested_generic_tool_notification(
+    inbound: &CodexInbound,
+) -> Option<(&str, &Value, &str, &str)> {
+    let CodexInbound::Notification { method, params } = inbound else {
+        return None;
+    };
+    let item = params.get("item")?;
+    let item_type = item.get("type")?.as_str()?;
+    if !matches!(item_type, "mcpToolCall" | "dynamicToolCall") {
+        return None;
+    }
+    let item_id = item.get("id")?.as_str()?;
+    Some((method, params, item_type, item_id))
+}
+
+struct CodexNestedGenericBatch {
+    starts_remaining: usize,
+    completions_remaining: usize,
+    started_ids: HashSet<String>,
+    completed_ids: HashSet<String>,
+    pending_completions: Vec<CodexInbound>,
+}
+
+impl CodexNestedGenericBatch {
+    fn new(call_count: usize) -> Self {
+        Self {
+            starts_remaining: call_count,
+            completions_remaining: call_count,
+            started_ids: HashSet::new(),
+            completed_ids: HashSet::new(),
+            pending_completions: Vec::new(),
+        }
+    }
+
+    fn observe_start(&mut self, item_id: &str) {
+        assert!(
+            self.started_ids.insert(item_id.to_owned()),
+            "Codex duplicated nested batch request admission {item_id}"
+        );
+        self.starts_remaining = self
+            .starts_remaining
+            .checked_sub(1)
+            .expect("Codex admitted more nested requests than the raw batch declared");
+    }
+
+    fn observe_completion(&mut self, item_id: &str) {
+        assert!(
+            self.completed_ids.insert(item_id.to_owned()),
+            "Codex duplicated nested batch completion {item_id}"
+        );
+        self.completions_remaining = self
+            .completions_remaining
+            .checked_sub(1)
+            .expect("Codex completed more nested requests than the raw batch declared");
+    }
+}
+
+fn codex_raw_nested_batch_declaration(inbound: &CodexInbound) -> Option<(String, usize)> {
+    let CodexInbound::Notification { method, params } = inbound else {
+        return None;
+    };
+    if method != "rawResponseItem/completed" {
+        return None;
+    }
+    let item = params.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+        return None;
+    }
+    let input = item.get("input").and_then(Value::as_str)?;
+    if !input.contains("Promise.all") {
+        return None;
+    }
+    let call_count = input.match_indices("tools.mcp__").count();
+    if call_count < 2 {
+        return None;
+    }
+    Some((extract_turn_id(params)?, call_count))
+}
+
 fn toml_quoted(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
 const CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
 
-fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<String> {
+#[derive(Clone)]
+struct CodexAgentAwaitEndpoint {
+    url: String,
+    headers: HashMap<String, String>,
+}
+
+fn codex_agent_await_endpoint(
+    startup_mcp_servers: &[StartupMcpServer],
+) -> Option<CodexAgentAwaitEndpoint> {
+    startup_mcp_servers.iter().find_map(|server| {
+        if server.name.trim() != AGENT_CONTROL_AWAIT_MCP_SERVER_NAME {
+            return None;
+        }
+        let StartupMcpTransport::Http {
+            url,
+            headers,
+            bearer_token_env_var,
+        } = &server.transport
+        else {
+            return None;
+        };
+        if url.trim().is_empty() {
+            return None;
+        }
+        let mut headers = headers.clone();
+        if let Some(variable) = bearer_token_env_var
+            .as_deref()
+            .map(str::trim)
+            .filter(|variable| !variable.is_empty())
+            && let Ok(token) = std::env::var(variable)
+        {
+            headers
+                .entry(reqwest::header::AUTHORIZATION.as_str().to_owned())
+                .or_insert_with(|| format!("Bearer {token}"));
+        }
+        Some(CodexAgentAwaitEndpoint {
+            url: url
+                .strip_suffix("/await")
+                .map(|base| format!("{base}/await-cancellable"))
+                .unwrap_or_else(|| url.clone()),
+            headers,
+        })
+    })
+}
+
+async fn call_codex_agent_await(
+    endpoint: &CodexAgentAwaitEndpoint,
+    arguments: Value,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<Value, String> {
+    let mut header_map = reqwest::header::HeaderMap::new();
+    for (name, value) in &endpoint.headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("invalid await MCP HTTP header name '{name}': {error}"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|error| format!("invalid await MCP HTTP header value: {error}"))?;
+        header_map.insert(name, value);
+    }
+    let client = reqwest::Client::builder()
+        .default_headers(header_map)
+        .build()
+        .map_err(|error| format!("failed to build await MCP HTTP client: {error}"))?;
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri(endpoint.url.clone()),
+    );
+    let connect = ().serve(transport);
+    let mut service = tokio::select! {
+        result = connect => result.map_err(|error| {
+            format!("failed to connect to the Tyde await MCP endpoint: {error}")
+        })?,
+        _ = cancellation.cancelled() => return Err("Tyde await was interrupted".to_owned()),
+    };
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Tyde await arguments must be a JSON object".to_owned())?;
+    let peer = service.peer().clone();
+    let dispatch = peer.send_cancellable_request(
+        ClientRequest::CallToolRequest(CallToolRequest {
+            method: Default::default(),
+            params: CallToolRequestParams {
+                meta: None,
+                name: "tyde_await_agents".into(),
+                arguments: Some(arguments),
+                task: None,
+            },
+            extensions: Default::default(),
+        }),
+        PeerRequestOptions::no_options(),
+    );
+    let mut request = tokio::select! {
+        result = dispatch => result
+            .map_err(|error| format!("failed to start Tyde await MCP call: {error}"))?,
+        _ = cancellation.cancelled() => {
+            let _ = service.close_with_timeout(Duration::from_secs(1)).await;
+            return Err("Tyde await was interrupted".to_owned());
+        },
+    };
+    let result = tokio::select! {
+        result = &mut request.rx => match result {
+            Ok(Ok(ServerResult::CallToolResult(result))) => Ok(result),
+            Ok(Ok(_)) => Err("Tyde await MCP returned an unexpected response".to_owned()),
+            Ok(Err(error)) => Err(format!("Tyde await MCP call failed: {error}")),
+            Err(_) => Err("Tyde await MCP response channel closed".to_owned()),
+        },
+        _ = cancellation.cancelled() => {
+            let cancellation_result = peer
+                .notify_cancelled(CancelledNotificationParam {
+                    request_id: request.id.clone(),
+                    reason: Some("Codex await was interrupted".to_owned()),
+                })
+                .await
+                .map_err(|error| format!("failed to cancel Tyde await MCP call: {error}"));
+            match cancellation_result {
+                Err(error) => Err(error),
+                Ok(()) => match tokio::time::timeout(Duration::from_secs(1), &mut request.rx).await {
+                    Err(_) => Err("Tyde await MCP did not acknowledge cancellation".to_owned()),
+                    Ok(Err(_)) => Err("Tyde await MCP cancellation response channel closed".to_owned()),
+                    Ok(Ok(Err(error))) => Err(format!("Tyde await MCP cancellation failed: {error}")),
+                    Ok(Ok(Ok(_))) => Err("Tyde await was interrupted".to_owned()),
+                },
+            }
+        },
+    };
+    let _ = service.close_with_timeout(Duration::from_secs(1)).await;
+    let result = result?;
+    serde_json::to_value(result)
+        .map_err(|error| format!("failed to encode Tyde await MCP result: {error}"))
+}
+
+fn codex_mcp_config_overrides(
+    startup_mcp_servers: &[StartupMcpServer],
+    tyde_loopback_reachable: bool,
+) -> Vec<String> {
     let mut overrides = Vec::new();
 
     for server in startup_mcp_servers {
@@ -14097,6 +14996,17 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
             continue;
         }
         let base = format!("mcp_servers.{name}");
+        if tyde_loopback_reachable
+            && matches!(
+                name,
+                AGENT_CONTROL_MCP_SERVER_NAME | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+            )
+        {
+            // These are load-bearing Tyde conversation-control tools. Codex
+            // gives optional uncached MCP servers only a short startup grace
+            // before capturing the immutable tool binding for a turn.
+            overrides.push(format!("{base}.required=true"));
+        }
         if name == AGENT_CONTROL_AWAIT_MCP_SERVER_NAME {
             // Codex otherwise applies its 300-second default to a tool whose
             // contract is to wait until an agent changes state.
@@ -14157,6 +15067,146 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
     }
 
     overrides
+}
+
+fn codex_agent_await_dynamic_tool(startup_mcp_servers: &[StartupMcpServer]) -> Option<Value> {
+    codex_agent_await_endpoint(startup_mcp_servers).map(|_| {
+            json!({
+                "type": "function",
+                "name": "tyde_await_agents",
+                "description": "Wait until any supplied direct child Tyde agent becomes idle or failed.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "agent_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        }
+                    },
+                    "required": ["agent_ids"]
+                }
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexSavedAwaitTool {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn codex_saved_await_tool(thread_response: &Value) -> CodexSavedAwaitTool {
+    // Codex exposes dynamicTools only on thread/start. Resume and fork restore
+    // them from the immutable session metadata, so inspect that record without
+    // rewriting provider-owned rollout history.
+    let Some(path) = thread_response
+        .get("thread")
+        .and_then(|thread| thread.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return CodexSavedAwaitTool::Unknown;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return CodexSavedAwaitTool::Unknown;
+    };
+    let mut first_line = String::new();
+    if std::io::BufReader::new(file)
+        .take(CODEX_SESSION_META_MAX_BYTES)
+        .read_line(&mut first_line)
+        .is_err()
+    {
+        return CodexSavedAwaitTool::Unknown;
+    }
+    let Ok(session_meta) = serde_json::from_str::<Value>(&first_line) else {
+        return CodexSavedAwaitTool::Unknown;
+    };
+    if session_meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return CodexSavedAwaitTool::Unknown;
+    }
+    let Some(dynamic_tools) = session_meta
+        .get("payload")
+        .and_then(|payload| payload.get("dynamic_tools"))
+        .and_then(Value::as_array)
+    else {
+        return CodexSavedAwaitTool::Absent;
+    };
+    if dynamic_tools.iter().any(|tool| {
+        tool.get("name").and_then(Value::as_str) == Some("tyde_await_agents")
+            || tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        tool.get("name").and_then(Value::as_str) == Some("tyde_await_agents")
+                    })
+                })
+    }) {
+        CodexSavedAwaitTool::Present
+    } else {
+        CodexSavedAwaitTool::Absent
+    }
+}
+
+async fn codex_saved_await_warning(
+    rpc: &CodexRpc,
+    thread_response: &Value,
+    await_endpoint_configured: bool,
+    lifecycle_method: &str,
+    rollout_path_local: bool,
+) -> Option<String> {
+    let saved_await_tool = if rollout_path_local {
+        codex_saved_await_tool(thread_response)
+    } else {
+        CodexSavedAwaitTool::Unknown
+    };
+    if !await_endpoint_configured
+        || lifecycle_method == "thread/start"
+        || saved_await_tool == CodexSavedAwaitTool::Present
+    {
+        return None;
+    }
+
+    let native_await_visible = tokio::time::timeout(
+        Duration::from_secs(2),
+        rpc.request(
+            "mcpServerStatus/list",
+            json!({"detail": "toolsAndAuthOnly", "limit": 100}),
+        ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|response| response.get("data").and_then(Value::as_array).cloned())
+    .is_some_and(|servers| {
+        servers.iter().any(|server| {
+            server.get("name").and_then(Value::as_str) == Some(AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
+                && server
+                    .get("tools")
+                    .and_then(Value::as_object)
+                    .is_some_and(|tools| tools.contains_key("tyde_await_agents"))
+        })
+    });
+    if native_await_visible {
+        None
+    } else {
+        tracing::warn!(
+            ?saved_await_tool,
+            lifecycle_method,
+            "Codex session has no verified sub-agent await tool"
+        );
+        Some(
+            match saved_await_tool {
+                CodexSavedAwaitTool::Absent => CODEX_LEGACY_AWAIT_WARNING,
+                CodexSavedAwaitTool::Unknown => CODEX_UNVERIFIED_AWAIT_WARNING,
+                CodexSavedAwaitTool::Present => return None,
+            }
+            .to_owned(),
+        )
+    }
 }
 
 type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
@@ -14284,7 +15334,8 @@ impl CodexRpc {
         if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
             return Err("Codex transient inference requires a local Codex process".to_owned());
         }
-        let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
+        let mut config_overrides =
+            codex_mcp_config_overrides(startup_mcp_servers, ssh_host.is_none());
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
         }
@@ -14307,14 +15358,6 @@ impl CodexRpc {
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
-            }
-            #[cfg(test)]
-            if let Some(home) = codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned")
-                .clone()
-            {
-                cmd.env("CODEX_HOME", home);
             }
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -14517,7 +15560,7 @@ impl CodexRpc {
                     )))
                 }
             };
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 tracing::warn!(
                     codex_method = method,
                     error = %error,
@@ -15245,6 +16288,20 @@ fn emit_codex_tool_request(
 }
 
 fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
+    if tool_name.eq_ignore_ascii_case("spawnAgent") {
+        return serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+            prompt: arguments
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            name: arguments
+                .get("receiverAgentName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            execution_mode: protocol::AgentExecutionMode::Background,
+        })
+        .expect("serialize native Codex agent spawn");
+    }
     parse_codex_subagent_collabs(arguments)
         .into_iter()
         .next()
@@ -15252,6 +16309,7 @@ fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
             serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
                 prompt: spawn.prompt,
                 name: Some(spawn.name),
+                execution_mode: protocol::AgentExecutionMode::Background,
             })
             .expect("serialize native Codex agent spawn")
         })
@@ -15265,9 +16323,52 @@ fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
                     }
                 })
             } else {
-                json!({ "kind": "Other", "args": arguments })
+                json!({
+                    "kind": "Other",
+                    "args": codex_generic_tool_arguments(arguments),
+                })
             }
         })
+}
+
+fn codex_generic_tool_arguments(item: &Value) -> Value {
+    item.get("arguments")
+        .cloned()
+        .unwrap_or_else(|| item.clone())
+}
+
+fn codex_public_generic_tool_result(tool_name: &str, item: &Value, success: bool) -> Value {
+    if success {
+        json!({
+            "kind": "Other",
+            "result": item.get("result").cloned().unwrap_or_else(|| item.clone()),
+        })
+    } else {
+        json!({
+            "kind": "Error",
+            "short_message": format!("{tool_name} failed"),
+            "detailed_message": serde_json::to_string_pretty(item)
+                .unwrap_or_else(|_| item.to_string()),
+        })
+    }
+}
+
+fn codex_dynamic_await_result(item: &Value) -> Option<Value> {
+    let envelope = item
+        .get("contentItems")?
+        .as_array()?
+        .iter()
+        .find_map(|content| content.get("text").and_then(Value::as_str))?;
+    let response: Value = serde_json::from_str(envelope).ok()?;
+    if let Some(structured) = response.get("structuredContent") {
+        return Some(structured.clone());
+    }
+    response
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|content| content.get("text").and_then(Value::as_str))
+        .and_then(|text| serde_json::from_str(text).ok())
 }
 
 fn normalize_codex_tool_result(
@@ -15283,6 +16384,22 @@ fn normalize_codex_tool_result(
     {
         return (
             codex_public_collaboration_result_with_name(tool_name, item, success),
+            None,
+        );
+    }
+    if !success
+        && !matches!(
+            tool_result.get("kind").and_then(Value::as_str),
+            Some("Error" | "Cancelled")
+        )
+    {
+        return (
+            json!({
+                "kind": "Error",
+                "short_message": format!("{tool_name} failed"),
+                "detailed_message": serde_json::to_string_pretty(&tool_result)
+                    .unwrap_or_else(|_| tool_result.to_string()),
+            }),
             None,
         );
     }
@@ -15520,7 +16637,21 @@ fn codex_backend_event_from_raw(
                 "SubprocessStderr" => {
                     let message = codex_raw_event_message(value, "Codex subprocess stderr");
                     tracing::warn!(message = %message, "Codex subprocess stderr");
-                    if codex_stderr_is_visible_warning(&message) {
+                    if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&message)
+                    {
+                        Some(CodexForwardedBackendEvent {
+                            chat_event: ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                                attempt,
+                                max_retries,
+                                error: message,
+                                backoff_ms: 250u64
+                                    .saturating_mul(1u64 << attempt.saturating_sub(1))
+                                    .min(4_000),
+                            }),
+                            terminal: false,
+                            normalization_error: None,
+                        })
+                    } else if codex_stderr_is_visible_warning(&message) {
                         Some(CodexForwardedBackendEvent {
                             chat_event: backend_warning_message(message),
                             terminal: false,
@@ -15605,157 +16736,16 @@ fn codex_subprocess_exit_message(value: &Value) -> String {
 
 struct CodexStartupCancelGuard(Option<oneshot::Sender<()>>);
 
-#[cfg(test)]
-struct CodexRequestObserver {
-    method: String,
-    sender: oneshot::Sender<()>,
-}
-
-#[cfg(test)]
-static CODEX_REQUEST_SENT_OBSERVER: std::sync::Mutex<Option<CodexRequestObserver>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static CODEX_SPAWN_READY_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static CODEX_SPAWN_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static CODEX_FORK_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-struct CodexSteeringTempfileObserver {
-    content: String,
-    sender: oneshot::Sender<PathBuf>,
-}
-
-#[cfg(test)]
-static CODEX_STEERING_TEMPFILE_CREATED_OBSERVER: std::sync::Mutex<
-    Option<CodexSteeringTempfileObserver>,
-> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn install_codex_request_observer(method: &str) -> oneshot::Receiver<()> {
-    let (sender, receiver) = oneshot::channel();
-    let mut observer = CODEX_REQUEST_SENT_OBSERVER
-        .lock()
-        .expect("Codex request observer mutex poisoned");
-    assert!(
-        observer.is_none(),
-        "a Codex request observer is already installed"
-    );
-    *observer = Some(CodexRequestObserver {
-        method: method.to_string(),
-        sender,
-    });
-    receiver
-}
-
-#[cfg(test)]
-fn install_codex_steering_tempfile_observer(content: &str) -> oneshot::Receiver<PathBuf> {
-    let (sender, receiver) = oneshot::channel();
-    let mut observer = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
-        .lock()
-        .expect("Codex steering tempfile observer mutex poisoned");
-    assert!(
-        observer.is_none(),
-        "a Codex steering tempfile observer is already installed"
-    );
-    *observer = Some(CodexSteeringTempfileObserver {
-        content: content.to_owned(),
-        sender,
-    });
-    receiver
-}
-
-#[cfg(not(test))]
 fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     crate::steering::write_codex_steering_tempfile(content)
 }
 
-#[cfg(test)]
-fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
-    let path = crate::steering::write_codex_steering_tempfile(content)?;
-    let observer = {
-        let mut observer = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
-            .lock()
-            .expect("Codex steering tempfile observer mutex poisoned");
-        if observer
-            .as_ref()
-            .is_some_and(|observer| observer.content == content)
-        {
-            observer.take()
-        } else {
-            None
-        }
-    };
-    if let Some(observer) = observer {
-        let _ = observer.sender.send(path.clone());
-    }
-    Ok(path)
-}
-
-#[cfg(test)]
-fn observe_codex_request_sent(method: &str) {
-    let mut observer = CODEX_REQUEST_SENT_OBSERVER
-        .lock()
-        .expect("Codex request observer mutex poisoned");
-    if observer
-        .as_ref()
-        .is_some_and(|expected| expected.method == method)
-        && let Some(expected) = observer.take()
-    {
-        let _ = expected.sender.send(());
-    }
-}
-
-#[cfg(not(test))]
 fn observe_codex_request_sent(_method: &str) {}
 
-#[cfg(test)]
-fn observe_codex_fork_startup_cancelled() {
-    if let Some(observer) = CODEX_FORK_STARTUP_CANCEL_OBSERVER
-        .lock()
-        .expect("Codex fork startup cancel observer mutex poisoned")
-        .take()
-    {
-        let _ = observer.send(());
-    }
-}
-
-#[cfg(not(test))]
 fn observe_codex_fork_startup_cancelled() {}
 
-#[cfg(test)]
-fn observe_codex_spawn_ready() {
-    if let Some(observer) = CODEX_SPAWN_READY_OBSERVER
-        .lock()
-        .expect("Codex spawn ready observer mutex poisoned")
-        .take()
-    {
-        let _ = observer.send(());
-    }
-}
-
-#[cfg(not(test))]
 fn observe_codex_spawn_ready() {}
 
-#[cfg(test)]
-fn observe_codex_spawn_startup_cancelled() {
-    if let Some(observer) = CODEX_SPAWN_STARTUP_CANCEL_OBSERVER
-        .lock()
-        .expect("Codex spawn startup cancel observer mutex poisoned")
-        .take()
-    {
-        let _ = observer.send(());
-    }
-}
-
-#[cfg(not(test))]
 fn observe_codex_spawn_startup_cancelled() {}
 
 impl CodexStartupCancelGuard {
@@ -15809,14 +16799,24 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
+            tyde_agent_adapter::BackendCapability::GenericModifyFile,
+            tyde_agent_adapter::BackendCapability::GenericGenerateImage,
+            tyde_agent_adapter::BackendCapability::GenericWebSearch,
+            tyde_agent_adapter::BackendCapability::GenericViewImage,
+            tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            tyde_agent_adapter::BackendCapability::CapacityTelemetry,
+            tyde_agent_adapter::BackendCapability::RetryTelemetry,
         ]
         .into()
     }
@@ -16370,18532 +17370,5 @@ impl Backend for CodexBackend {
 
     async fn shutdown(self) {
         drop(self);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::BackendCompactionAvailability;
-    use crate::sub_agent::SubAgentHandle;
-    use protocol::{
-        AgentBootstrapEvent, AgentBootstrapPayload, AgentControlProgressKind, AgentErrorCode,
-        AgentId, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload, ChatEvent,
-        Envelope, FrameKind, HostBootstrapPayload, HostSettings, MobileAccessStatePayload,
-        MobileBrokerStatus, MobilePairingState, NewAgentPayload, PROTOCOL_VERSION,
-        ProtocolValidator, StreamPath, TeamPresetCatalog, TokenUsageScope, ToolProgressUpdate,
-        Version, WelcomePayload,
-    };
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, MutexGuard, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::time::timeout;
-
-    static CODEX_FAKE_APP_SERVER_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-
-    #[test]
-    fn session_metadata_counts_only_assistant_responses() {
-        let metadata = codex_thread_to_session_metadata(&json!({
-            "id": "thread-1",
-            "turns": [
-                {
-                    "items": [
-                        { "type": "userMessage", "text": "first" },
-                        { "type": "reasoning", "text": "thinking" },
-                        { "type": "agentMessage", "text": "answer one" }
-                    ]
-                },
-                {
-                    "items": [
-                        { "type": "userMessage", "text": "second" },
-                        { "type": "agentMessage", "text": "answer two" }
-                    ]
-                }
-            ]
-        }))
-        .expect("session metadata");
-
-        assert_eq!(
-            metadata.get("message_count").and_then(Value::as_u64),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn transcript_metadata_attests_provider_identity_without_guessing_generated_ids() {
-        let provider_session_id = Arc::new(std::sync::Mutex::new(Some(SessionId(
-            "provider-thread".to_owned(),
-        ))));
-        let provider_event = ChatEvent::StreamStart(protocol::StreamStartData {
-            message_id: Some("provider-item".to_owned()),
-            agent: "codex".to_owned(),
-            model: Some("codex-model".to_owned()),
-        });
-        assert_eq!(
-            codex_transcript_event_metadata(&provider_session_id, &provider_event),
-            BackendTranscriptEventMetadata::visible_provider_event(
-                SessionId("provider-thread".to_owned()),
-                "stream-start:provider-item".to_owned(),
-            )
-        );
-
-        let generated_event = ChatEvent::StreamStart(protocol::StreamStartData {
-            message_id: Some(
-                protocol::ServerGeneratedChatMessageIdentity {
-                    origin:
-                        protocol::ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
-                    stream_epoch: 7,
-                    item_ordinal: 3,
-                }
-                .message_id()
-                .0,
-            ),
-            agent: "codex".to_owned(),
-            model: Some("codex-model".to_owned()),
-        });
-        assert_eq!(
-            codex_transcript_event_metadata(&provider_session_id, &generated_event),
-            BackendTranscriptEventMetadata {
-                provider_session_id: None,
-                provider_event_id: None,
-            }
-        );
-    }
-
-    struct CodexFakeAppServer {
-        _dir: tempfile::TempDir,
-        binary: std::path::PathBuf,
-        capture: std::path::PathBuf,
-        argv_capture: std::path::PathBuf,
-        initial_turn_gate: std::path::PathBuf,
-        fork_response_marker: std::path::PathBuf,
-        startup_settings_gate: std::path::PathBuf,
-        command_execution_marker: std::path::PathBuf,
-        native_mcp_contacts: std::path::PathBuf,
-        skill_temp_parent: std::path::PathBuf,
-    }
-
-    #[derive(Clone)]
-    struct CapturedCodexRequest {
-        pid: u64,
-        request: Value,
-    }
-
-    struct CapturedCodexArgv {
-        pid: u64,
-        argv: Vec<String>,
-        codex_home: Option<std::path::PathBuf>,
-        auth_present: bool,
-        native_mcp_configured: bool,
-    }
-
-    struct CodexTestAppServerBinaryGuard {
-        _serial: MutexGuard<'static, ()>,
-        previous: Option<std::path::PathBuf>,
-        previous_native_home: Option<std::path::PathBuf>,
-        previous_skill_temp_parent: Option<std::path::PathBuf>,
-        previous_resource_link_failure: Option<OsString>,
-    }
-
-    struct CodexLiveHomeGuard {
-        _serial: MutexGuard<'static, ()>,
-        previous_native_home: Option<std::path::PathBuf>,
-        home: tempfile::TempDir,
-    }
-
-    impl CodexLiveHomeGuard {
-        fn from_real_auth() -> Result<Self, String> {
-            let codex_home = inherited_codex_home()?;
-            Self::from_auth_path(&codex_home.join("auth.json"))
-        }
-
-        fn from_auth_path(auth_path: &Path) -> Result<Self, String> {
-            let serial = CODEX_FAKE_APP_SERVER_SERIAL
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir()
-                .map_err(|err| format!("failed to create isolated Codex home: {err}"))?;
-            restrict_codex_directory(home.path())?;
-
-            let auth = std::fs::read(auth_path).map_err(|err| {
-                format!(
-                    "failed to stage Codex auth from {}: {err}",
-                    auth_path.display()
-                )
-            })?;
-            let auth_path_in_home = home.path().join("auth.json");
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                options.mode(0o600);
-            }
-            let mut auth_file = options.open(&auth_path_in_home).map_err(|err| {
-                format!(
-                    "failed to create isolated Codex auth {}: {err}",
-                    auth_path_in_home.display()
-                )
-            })?;
-            use std::io::Write;
-
-            auth_file.write_all(&auth).map_err(|err| {
-                format!(
-                    "failed to write isolated Codex auth {}: {err}",
-                    auth_path_in_home.display()
-                )
-            })?;
-            auth_file
-                .sync_all()
-                .map_err(|err| format!("failed to sync isolated Codex auth: {err}"))?;
-            drop(auth_file);
-            restrict_codex_file(&auth_path_in_home)?;
-            drop(auth);
-
-            let previous_native_home = codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned")
-                .replace(home.path().to_path_buf());
-            Ok(Self {
-                _serial: serial,
-                previous_native_home,
-                home,
-            })
-        }
-
-        fn path(&self) -> &Path {
-            self.home.path()
-        }
-    }
-
-    fn inherited_codex_home() -> Result<PathBuf, String> {
-        Ok(std::env::var_os("CODEX_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(crate::paths::home_dir()?.join(".codex")))
-    }
-
-    impl Drop for CodexLiveHomeGuard {
-        fn drop(&mut self) {
-            *codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned") = self.previous_native_home.take();
-        }
-    }
-
-    fn codex_file_snapshot(path: &Path) -> Result<Option<[u8; 32]>, String> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(format!(
-                    "failed to snapshot Codex file {}: {err}",
-                    path.display()
-                ));
-            }
-        };
-        Ok(Some(Sha256::digest(bytes).into()))
-    }
-
-    fn assert_codex_file_snapshot_unchanged(
-        path: &Path,
-        before: Option<[u8; 32]>,
-    ) -> Result<(), String> {
-        let after = codex_file_snapshot(path)?;
-        if before == after {
-            Ok(())
-        } else {
-            Err(format!(
-                "Codex file changed during live test: {}",
-                path.display()
-            ))
-        }
-    }
-
-    impl CodexTestAppServerBinaryGuard {
-        fn set(binary: std::path::PathBuf) -> Self {
-            Self::set_with_native_home(binary, None)
-        }
-
-        fn set_with_native_home(
-            binary: std::path::PathBuf,
-            native_home: Option<std::path::PathBuf>,
-        ) -> Self {
-            let serial = CODEX_FAKE_APP_SERVER_SERIAL
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let skill_temp_parent = binary
-                .parent()
-                .expect("fake app-server binary parent")
-                .join("skill-projections");
-            let previous = codex_test_app_server_binary_override()
-                .lock()
-                .expect("codex test app-server binary mutex poisoned")
-                .replace(binary);
-            let previous_native_home = std::mem::replace(
-                &mut *codex_test_native_home_override()
-                    .lock()
-                    .expect("codex test native home mutex poisoned"),
-                native_home,
-            );
-            let previous_skill_temp_parent = codex_test_skill_temp_parent_override()
-                .lock()
-                .expect("Codex test skill temp parent mutex poisoned")
-                .replace(skill_temp_parent);
-            let previous_resource_link_failure = codex_test_resource_link_failure_override()
-                .lock()
-                .expect("Codex test resource-link failure mutex poisoned")
-                .take();
-            Self {
-                _serial: serial,
-                previous,
-                previous_native_home,
-                previous_skill_temp_parent,
-                previous_resource_link_failure,
-            }
-        }
-    }
-
-    impl Drop for CodexTestAppServerBinaryGuard {
-        fn drop(&mut self) {
-            *codex_test_app_server_binary_override()
-                .lock()
-                .expect("codex test app-server binary mutex poisoned") = self.previous.take();
-            *codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned") = self.previous_native_home.take();
-            *codex_test_skill_temp_parent_override()
-                .lock()
-                .expect("Codex test skill temp parent mutex poisoned") =
-                self.previous_skill_temp_parent.take();
-            *codex_test_resource_link_failure_override()
-                .lock()
-                .expect("Codex test resource-link failure mutex poisoned") =
-                self.previous_resource_link_failure.take();
-        }
-    }
-
-    #[test]
-    fn codex_live_home_stages_auth_privately_and_cleans_up() {
-        let source_home = tempfile::tempdir().expect("Codex auth source home");
-        let source_auth = source_home.path().join("auth.json");
-        std::fs::write(&source_auth, br#"{"tokens":{"access":"fixture"}}"#)
-            .expect("write fixture auth");
-        let source_config = source_home.path().join("config.toml");
-        std::fs::write(&source_config, "[projects]\n").expect("write fixture config");
-        let source_config_before =
-            codex_file_snapshot(&source_config).expect("snapshot fixture config");
-        let isolated_home_path;
-        {
-            let guard = CodexLiveHomeGuard::from_auth_path(&source_auth)
-                .expect("stage fixture auth in isolated Codex home");
-            isolated_home_path = guard.path().to_path_buf();
-            let isolated_auth = guard.path().join("auth.json");
-            assert!(
-                std::fs::read(&isolated_auth).expect("read isolated auth")
-                    == br#"{"tokens":{"access":"fixture"}}"#
-            );
-            assert!(!guard.path().join("config.toml").exists());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                assert_eq!(
-                    std::fs::metadata(guard.path())
-                        .expect("isolated home metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o700
-                );
-                assert_eq!(
-                    std::fs::metadata(&isolated_auth)
-                        .expect("isolated auth metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
-            }
-        }
-        assert!(!isolated_home_path.exists());
-        assert_codex_file_snapshot_unchanged(&source_config, source_config_before)
-            .expect("auth staging must not change source config");
-    }
-
-    #[test]
-    fn codex_live_home_rejects_missing_auth_without_fallback() {
-        let source_home = tempfile::tempdir().expect("Codex auth source home");
-        let result = CodexLiveHomeGuard::from_auth_path(&source_home.path().join("auth.json"));
-
-        assert!(result.is_err());
-        assert!(
-            codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn codex_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
-        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
-
-        assert!(std::path::Path::new(&root).is_dir());
-        assert!(
-            std::path::Path::new(&root)
-                .ends_with(std::path::Path::new(".tyde").join("codex").join("no-root"))
-        );
-        assert!(codex_runtime_workspace_roots(&[], &root).is_empty());
-    }
-
-    #[test]
-    fn codex_pick_workspace_root_keeps_ssh_only_roots_invalid() {
-        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
-            .expect_err("ssh-only local roots should remain invalid");
-
-        assert!(err.contains("requires at least one local workspace root"));
-    }
-
-    #[test]
-    fn codex_cost_hints_do_not_guess_model_metadata_values() {
-        let values = codex_cost_hint_defaults(protocol::SpawnCostHint::Low);
-
-        assert!(!values.0.contains_key("model"));
-        assert!(!values.0.contains_key("reasoning_effort"));
-    }
-
-    impl CodexFakeAppServer {
-        fn new(mode: &str, child_thread_id: &str) -> Self {
-            let dir = tempfile::tempdir().expect("fake codex app-server tempdir");
-            let binary = dir.path().join("codex-fake-app-server.py");
-            let capture = dir.path().join("requests.jsonl");
-            let argv_capture = dir.path().join("argv.json");
-            let initial_turn_gate = dir.path().join("initial-turn-gate");
-            let fork_response_marker = dir.path().join("fork-response-sent");
-            let startup_settings_gate = dir.path().join("startup-settings-gate");
-            let command_execution_marker = dir.path().join("command-executed");
-            let native_mcp_contacts = dir.path().join("native-mcp-contacts.jsonl");
-            let skill_temp_parent = dir.path().join("skill-projections");
-            let mut script = String::new();
-            script.push_str("#!/usr/bin/env python3\n");
-            script.push_str("import json, os, sys, threading, time\n");
-            script.push_str(&format!(
-                "CAPTURE = {}\n",
-                serde_json::to_string(&capture.to_string_lossy()).expect("capture path JSON")
-            ));
-            script.push_str(&format!(
-                "ARGV_CAPTURE = {}\n",
-                serde_json::to_string(&argv_capture.to_string_lossy())
-                    .expect("argv capture path JSON")
-            ));
-            script.push_str(&format!(
-                "MODE = {}\n",
-                serde_json::to_string(mode).expect("mode JSON")
-            ));
-            script.push_str(&format!(
-                "CHILD_THREAD_ID = {}\n",
-                serde_json::to_string(child_thread_id).expect("child thread id JSON")
-            ));
-            script.push_str(&format!(
-                "INITIAL_TURN_GATE = {}\n",
-                serde_json::to_string(&initial_turn_gate.to_string_lossy())
-                    .expect("initial turn gate path JSON")
-            ));
-            script.push_str(&format!(
-                "FORK_RESPONSE_MARKER = {}\n",
-                serde_json::to_string(&fork_response_marker.to_string_lossy())
-                    .expect("fork response marker path JSON")
-            ));
-            script.push_str(&format!(
-                "STARTUP_SETTINGS_GATE = {}\n",
-                serde_json::to_string(&startup_settings_gate.to_string_lossy())
-                    .expect("startup settings gate path JSON")
-            ));
-            script.push_str(&format!(
-                "COMMAND_EXECUTION_MARKER = {}\n",
-                serde_json::to_string(&command_execution_marker.to_string_lossy())
-                    .expect("command execution marker path JSON")
-            ));
-            script.push_str(&format!(
-                "NATIVE_MCP_CONTACTS = {}\n",
-                serde_json::to_string(&native_mcp_contacts.to_string_lossy())
-                    .expect("native MCP contacts path JSON")
-            ));
-            script.push_str(
-                r#"
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-def yaml_scalar(value):
-    value = value.strip()
-    if value.startswith('"'):
-        try:
-            return json.loads(value)
-        except Exception:
-            return None
-    if value.startswith("'") and value.endswith("'"):
-        return value[1:-1].replace("''", "'")
-    if value in ("", "~", "null", "Null", "NULL"):
-        return None
-    return value
-
-def skill_metadata(skill_dir, enabled=True):
-    skill_md = os.path.join(skill_dir, "SKILL.md")
-    if not os.path.isfile(skill_md):
-        return None
-    try:
-        with open(skill_md, "r", encoding="utf-8") as body:
-            lines = body.read().splitlines()
-    except OSError:
-        return None
-    if not lines or lines[0].strip() != "---":
-        return None
-    name = None
-    description = None
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if not line or line[0].isspace() or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        if key == "name" and name is None:
-            name = yaml_scalar(value)
-        elif key == "description" and description is None:
-            description = yaml_scalar(value)
-    if not name or not description:
-        return None
-    for manifest in (".codex-plugin/plugin.json", ".claude-plugin/plugin.json"):
-        manifest_path = os.path.join(skill_dir, manifest)
-        if not os.path.isfile(manifest_path):
-            continue
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as body:
-                namespace = (json.load(body).get("name") or "").strip()
-        except Exception:
-            continue
-        if not namespace:
-            namespace = os.path.basename(skill_dir)
-        name = namespace + ":" + name
-        break
-    return {
-        "name": name,
-        "description": description,
-        "path": os.path.realpath(skill_md),
-        "scope": "user",
-        "enabled": enabled
-    }
-
-def scan_skill_roots(roots, enabled=True):
-    skills = []
-    for root in roots:
-        if not root or not os.path.isdir(root):
-            continue
-        for entry in sorted(os.listdir(root)):
-            metadata = skill_metadata(os.path.join(root, entry), enabled)
-            if metadata:
-                skills.append(metadata)
-    return skills
-
-codex_home = os.environ.get("CODEX_HOME")
-auth_present = bool(codex_home) and os.path.isfile(os.path.join(codex_home, "auth.json"))
-native_mcp_configured = False
-if codex_home:
-    try:
-        with open(os.path.join(codex_home, "config.toml"), "r", encoding="utf-8") as native_config:
-            native_mcp_configured = "[mcp_servers.native-fixture]" in native_config.read()
-    except FileNotFoundError:
-        pass
-with open(ARGV_CAPTURE, "a", encoding="utf-8") as argv_capture:
-    argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:], "codex_home": codex_home, "auth_present": auth_present, "native_mcp_configured": native_mcp_configured}, separators=(",", ":")) + "\n")
-
-turn_count = 0
-skills_list_count = 0
-background_poll_count = 0
-extra_skill_roots = []
-extra_roots_set = False
-inference_only = "features.shell_tool=false" in sys.argv
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-    except Exception:
-        continue
-    with open(CAPTURE, "a", encoding="utf-8") as capture:
-        capture.write(json.dumps({"pid": os.getpid(), "request": request}, separators=(",", ":")) + "\n")
-    request_id = request.get("id")
-    method = request.get("method")
-    params = request.get("params") or {}
-    if method == "initialize":
-        if MODE == "skills_initialize_error":
-            send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":"initialize rejected"}})
-        else:
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "userAgent": "fake-codex/0",
-                    "codexHome": "/tmp/fake-codex-home",
-                    "platformFamily": "unix",
-                    "platformOs": "test"
-                }
-            })
-    elif method == "skills/list":
-        skills_list_count += 1
-        if MODE == "skills_final_delayed" and skills_list_count > 1:
-            while not os.path.exists(INITIAL_TURN_GATE):
-                time.sleep(0.005)
-        native_roots = [os.path.join(codex_home, "skills")] if codex_home else []
-        skills = scan_skill_roots(native_roots)
-        if MODE == "skills_native_tree_changes" and skills_list_count == 1:
-            for skill in skills:
-                skill_md = skill.get("path")
-                if skill_md and os.path.isfile(skill_md):
-                    os.remove(skill_md)
-                    os.mkdir(skill_md)
-        if extra_roots_set and MODE != "skills_final_missing":
-            skills += scan_skill_roots(
-                extra_skill_roots,
-                enabled=(MODE != "skills_final_disabled")
-            )
-        if MODE == "skills_final_missing_default" and skills_list_count > 1:
-            skills = [skill for skill in skills if skill.get("name") != "broken"]
-        if MODE == "skills_final_disabled_default" and skills_list_count > 1:
-            for skill in skills:
-                if skill.get("name") == "broken":
-                    skill["enabled"] = False
-        if MODE == "skills_final_name_shape_default" and skills_list_count > 1:
-            for skill in skills:
-                if skill.get("name") == "broken":
-                    skill["name"] = {"malformed": True}
-        if MODE == "skills_native_enabled_shape":
-            for skill in skills:
-                if skill.get("name") == "broken":
-                    skill["enabled"] = "unknown"
-        if MODE == "skills_nonfilesystem_locator":
-            skills.append({
-                "name": "opaque-native",
-                "description": "opaque fixture",
-                "path": "skill://environment/opaque-native",
-                "scope": "user",
-                "enabled": True
-            })
-            skills.append({
-                "name": "pathless-native",
-                "description": "pathless fixture",
-                "scope": "user",
-                "enabled": True
-            })
-        catalog_errors = []
-        if MODE == "skills_catalog_errors":
-            catalog_errors.append({
-                "path": "/catalog/" + ("baseline" if skills_list_count == 1 else "final"),
-                "message": ("baseline" if skills_list_count == 1 else "final") + " catalog fixture"
-            })
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "data": [{
-                    "cwd": (params.get("cwds") or [""])[0],
-                    "skills": skills,
-                    "errors": catalog_errors
-                }]
-            }
-        })
-    elif method == "skills/extraRoots/set":
-        if MODE == "skills_unsupported":
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": "Method not found: skills/extraRoots/set"
-                }
-            })
-        elif MODE == "skills_set_error":
-            send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":"extra roots rejected"}})
-        else:
-            extra_skill_roots = params.get("extraRoots") or []
-            extra_roots_set = True
-            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method == "config/read":
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "config": {
-                    "mcp_servers": ({
-                        "native-fixture": {
-                            "url": "https://native.invalid/mcp",
-                            "enabled": True
-                        }
-                    } if native_mcp_configured else {})
-                },
-                "origins": {}
-            }
-        })
-    elif method == "thread/start":
-        if MODE == "skills_thread_start_error":
-            send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":"thread start rejected"}})
-            continue
-        thread_config = params.get("config") or {}
-        mcp_overrides = thread_config.get("mcp_servers") or {}
-        native_mcp_override = mcp_overrides.get("native-fixture") or {}
-        if native_mcp_configured and native_mcp_override.get("enabled") is not False:
-            with open(NATIVE_MCP_CONTACTS, "a", encoding="utf-8") as contacts:
-                contacts.write(json.dumps({"pid": os.getpid()}, separators=(",", ":")) + "\n")
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "thread": {
-                    "id": "fresh-thread-id",
-                    "sessionId": "fresh-thread-id",
-                    "turns": []
-                },
-                "model": "fake-codex-model"
-            }
-        })
-    elif method == "thread/fork":
-        if MODE == "unsupported":
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": "Method not found: thread/fork"
-                }
-            })
-        else:
-            if MODE == "fork_startup_delayed":
-                while not os.path.exists(INITIAL_TURN_GATE):
-                    time.sleep(0.005)
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "thread": {
-                        "id": CHILD_THREAD_ID,
-                        "sessionId": CHILD_THREAD_ID,
-                        "forkedFromId": params.get("threadId"),
-                        "turns": []
-                    },
-                    "model": "fake-codex-model"
-                }
-            })
-            if MODE == "fork_startup_delayed":
-                with open(FORK_RESPONSE_MARKER, "w", encoding="utf-8") as marker:
-                    marker.write("sent")
-    elif method == "thread/resume":
-        resume_turns = []
-        if MODE == "resume_background_history":
-            yielded = json.dumps({"chunk_id":"historic-chunk","wall_time_seconds":1.001,"session_id":4242,"original_token_count":0,"output":""}, separators=(",", ":"))
-            resume_turns = [{
-                "id": "historic-turn",
-                "status": "completed",
-                "items": [
-                    {
-                        "type": "userMessage",
-                        "id": "historic-user",
-                        "text": "run the historical command"
-                    },
-                    {
-                        "type": "commandExecution",
-                        "id": "historic-command",
-                        "command": "sleep 1",
-                        "cwd": "/tmp",
-                        "processId": "4242",
-                        "status": "completed",
-                        "exitCode": 0,
-                        "aggregatedOutput": "done"
-                    },
-                    {
-                        "type": "custom_tool_call_output",
-                        "call_id": "historic-exec-call",
-                        "output": [
-                            {
-                                "type": "input_text",
-                                "text": "Script completed\nWall time 1.2 seconds\nOutput:\n"
-                            },
-                            {
-                                "type": "input_text",
-                                "text": yielded
-                            }
-                        ]
-                    },
-                    {
-                        "type": "agentMessage",
-                        "id": "historic-agent",
-                        "text": "historical command complete"
-                    }
-                ]
-            }]
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "thread": {
-                    "id": params.get("threadId"),
-                    "sessionId": params.get("threadId"),
-                    "turns": resume_turns
-                },
-                "model": "fake-codex-model"
-            }
-        })
-    elif method == "turn/start":
-        turn_count += 1
-        if MODE in ("foreground_background_poll", "yielded_background_poll"):
-            turn_id = "turn-background-poll"
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":turn_id}}})
-            send({"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"fresh-thread-id","turnId":turn_id,"item":{"type":"custom_tool_call","name":"exec","arguments":"{\"cmd\":\"sleep 30\",\"yield_time_ms\":1000}"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","turnId":turn_id,"item":{"id":"poll-command","type":"commandExecution","command":"sleep 30","cwd":"/tmp","processId":"71411","source":"unifiedExecStartup","status":"inProgress"}}})
-            if MODE == "yielded_background_poll":
-                yielded = json.dumps({"chunk_id":"chunk-fixture","wall_time_seconds":1.001,"session_id":71411,"original_token_count":0,"output":""}, separators=(",", ":"))
-                send({"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"fresh-thread-id","turnId":turn_id,"item":{"type":"custom_tool_call_output","call_id":"exec-call","output":[{"type":"input_text","text":"Script completed\nWall time 1.2 seconds\nOutput:\n"},{"type":"input_text","text":yielded}]}}})
-        elif MODE == "strict_termination_interrupt_held":
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-strict-termination"}}})
-            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"fresh-thread-id","itemId":"strict-open-item","delta":"accepted before violation"}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"strict-wrong-item","type":"agentMessage","text":"wrong identity"}}})
-        elif MODE == "inference_reject_command" and inference_only:
-            send({
-                "jsonrpc": "2.0",
-                "id": 900,
-                "method": "item/commandExecution/requestApproval",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turnId": "turn-inference",
-                    "itemId": "naming-command",
-                    "command": "touch " + COMMAND_EXECUTION_MARKER
-                }
-            })
-        elif MODE == "inference_reject_command":
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-agent"}}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"message-agent","type":"agentMessage","text":"real agent complete"}}})
-            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-agent","status":"completed"}}})
-        elif MODE == "fresh_agent_control_progress":
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/started",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turn": {
-                        "id": "turn-fresh"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/started",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": "await-call-1",
-                        "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-await__tyde_await_agents",
-                        "arguments": {
-                            "agent_ids": ["agent-a", "agent-b"]
-                        }
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": "await-call-1",
-                        "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-await__tyde_await_agents",
-                        "status": "completed"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/started",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": "spawn-call-1",
-                        "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
-                        "arguments": {
-                            "name": "Builder"
-                        }
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": "spawn-call-1",
-                        "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
-                        "status": "completed",
-                        "output": "{\"agent_id\":\"agent-spawned\",\"name\":\"Builder\"}"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turn": {
-                        "id": "turn-fresh",
-                        "status": "completed"
-                    }
-                }
-            })
-        elif MODE == "fresh_late_token_usage":
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/started",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turn": {
-                        "id": "turn-fresh-late-usage"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/agentMessage/delta",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "itemId": "msg-fresh-late-usage",
-                    "delta": "fresh late done"
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": "msg-fresh-late-usage",
-                        "type": "agentMessage",
-                        "text": "fresh late done"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turn": {
-                        "id": "turn-fresh-late-usage",
-                        "status": "completed"
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "thread/tokenUsage/updated",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "turnId": "turn-fresh-late-usage",
-                    "tokenUsage": {
-                        "input_tokens": 31,
-                        "output_tokens": 10,
-                        "total_tokens": 41
-                    }
-                }
-            })
-        elif MODE == "fresh_native_child_before_initial_response":
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-live-order"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"019f60f0-7a69-73f0-9ab3-7ddc24062e30","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"reply exactly QUICK_DONE","receiverAgentType":"sub-agent","receiverAgentName":"/root/quick_child"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-quick-child","type":"sub_agent_activity","kind":"started","agent_thread_id":CHILD_THREAD_ID,"agent_path":"/root/quick_child"}}})
-            def delayed_initial_turn_response(response_id):
-                while not os.path.exists(INITIAL_TURN_GATE):
-                    time.sleep(0.005)
-                send({"jsonrpc":"2.0","id":response_id,"result":{"turn":{"id":"turn-fake"}}})
-            threading.Thread(target=delayed_initial_turn_response, args=(request_id,), daemon=True).start()
-            continue
-        elif MODE == "fresh_native_child_routing":
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker","status":"completed"}}})
-            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"wait-call","type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID}}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker","status":"completed"}}})
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":CHILD_THREAD_ID,"turn":{"id":"turn-child"}}})
-            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":CHILD_THREAD_ID,"itemId":"message-child","delta":"child-only"}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":CHILD_THREAD_ID,"item":{"id":"message-child","type":"agentMessage","text":"child-only"}}})
-            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":CHILD_THREAD_ID,"turn":{"id":"turn-child","status":"interrupted"}}})
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"wait-call","type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"agentsStates":{CHILD_THREAD_ID:{"status":"cancelled"}}}}})
-            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent","status":"completed"}}})
-        elif MODE == "fresh_native_multi_child_routing":
-            child_a, child_b = "child-a", "child-b"
-            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-multi"}}})
-            for child, label in ((child_a, "alpha"), (child_b, "beta")):
-                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-"+label,"type":"collabAgentToolCall","senderThreadId":"fresh-thread-id","receiverThreadId":child,"prompt":"inspect "+label,"receiverAgentType":"worker","receiverAgentName":label}}})
-                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-"+label,"type":"sub_agent_activity","kind":"started","agent_thread_id":child,"agent_path":"/root/"+label}}})
-                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"wait-"+label,"type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":child}}})
-            for child, label, status in ((child_b, "beta", "interrupted"), (child_a, "alpha", "completed")):
-                send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":child,"turn":{"id":"turn-"+label}}})
-                send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":child,"itemId":"message-"+label,"delta":label+"-only"}})
-                send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":child,"item":{"id":"message-"+label,"type":"agentMessage","text":label+"-only"}}})
-                send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":child,"turn":{"id":"turn-"+label,"status":status}}})
-                send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"wait-"+label,"type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":child,"agentsStates":{child:{"status":status}}}}})
-            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-multi","status":"completed"}}})
-        elif MODE in ("runtime_settings", "reject_runtime_settings"):
-            turn_id = "turn-settings-" + str(turn_count)
-            message_id = "message-settings-" + str(turn_count)
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/started",
-                "params": {"threadId": "fresh-thread-id", "turn": {"id": turn_id}}
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/completed",
-                "params": {
-                    "threadId": "fresh-thread-id",
-                    "item": {
-                        "id": message_id,
-                        "type": "agentMessage",
-                        "text": "settings turn " + str(turn_count)
-                    }
-                }
-            })
-            send({
-                "jsonrpc": "2.0",
-                "method": "turn/completed",
-                "params": {"threadId": "fresh-thread-id", "turn": {"id": turn_id, "status": "completed"}}
-            })
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {"turn": {"id": "turn-fake"}}
-        })
-    elif method == "thread/backgroundTerminals/list":
-        background_poll_count += 1
-        if MODE in ("foreground_background_poll", "yielded_background_poll"):
-            if background_poll_count == 1:
-                send({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"itemId":"poll-command","processId":"71411","command":"sleep 30","cwd":"/tmp","osPid":None,"cpuPercent":None,"rssKb":None}],"nextCursor":None}})
-            else:
-                send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","turnId":"turn-background-poll","item":{"id":"poll-command","type":"commandExecution","command":"sleep 30","cwd":"/tmp","processId":"71411","source":"unifiedExecStartup","status":"completed","exitCode":0,"durationMs":3000,"aggregatedOutput":"done"}}})
-                if MODE == "foreground_background_poll":
-                    send({"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"fresh-thread-id","turnId":"turn-background-poll","item":{"type":"custom_tool_call_output","call_id":"exec-call","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"done"}]}}})
-                send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-background-poll","status":"completed"}}})
-                send({"jsonrpc":"2.0","id":request_id,"result":{"data":[],"nextCursor":None}})
-        else:
-            send({"jsonrpc":"2.0","id":request_id,"result":{"data":[],"nextCursor":None}})
-    elif method == "turn/interrupt":
-        if MODE == "strict_termination_interrupt_held":
-            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"strict-wrong-item","type":"agentMessage","text":"repeat wrong identity"}}})
-            def delayed_interrupt_failure(response_id):
-                while not os.path.exists(INITIAL_TURN_GATE):
-                    time.sleep(0.005)
-                send({"jsonrpc":"2.0","id":response_id,"error":{"code":-32000,"message":"held interrupt rejected"}})
-                send({"jsonrpc":"2.0","id":991,"method":"mcpServer/elicitation/request","params":{}})
-            threading.Thread(target=delayed_interrupt_failure, args=(request_id,), daemon=True).start()
-            continue
-        elif MODE == "fresh_native_child_before_initial_response":
-            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-live-order","status":"interrupted"}}})
-        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method == "thread/settings/update":
-        if MODE == "startup_settings_delayed":
-            def delayed_startup_settings_response(response_id):
-                while not os.path.exists(STARTUP_SETTINGS_GATE):
-                    time.sleep(0.005)
-                send({"jsonrpc":"2.0","id":response_id,"result":{}})
-            threading.Thread(target=delayed_startup_settings_response, args=(request_id,), daemon=True).start()
-            continue
-        elif MODE == "startup_settings_rejected" or (
-            MODE == "reject_runtime_settings"
-            and "approvalPolicy" not in params
-        ):
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32000, "message": "settings rejected"}
-            })
-        else:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method is None and request_id == 991 and MODE == "strict_termination_interrupt_held":
-        continue
-    elif method is None and request_id == 900 and MODE == "inference_reject_command":
-        if (request.get("result") or {}).get("decision") != "decline":
-            with open(COMMAND_EXECUTION_MARKER, "w", encoding="utf-8") as marker:
-                marker.write("executed")
-    else:
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32601,
-                "message": "Method not found: " + str(method)
-            }
-        })
-"#,
-            );
-            std::fs::write(&binary, script).expect("write fake codex app-server");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&binary)
-                    .expect("fake codex app-server metadata")
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&binary, permissions)
-                    .expect("chmod fake codex app-server");
-            }
-            Self {
-                _dir: dir,
-                binary,
-                capture,
-                argv_capture,
-                initial_turn_gate,
-                fork_response_marker,
-                startup_settings_gate,
-                command_execution_marker,
-                native_mcp_contacts,
-                skill_temp_parent,
-            }
-        }
-
-        fn release_initial_turn(&self) {
-            std::fs::write(&self.initial_turn_gate, "release").expect("release fake initial turn");
-        }
-
-        fn release_startup_settings(&self) {
-            std::fs::write(&self.startup_settings_gate, "release")
-                .expect("release fake startup settings");
-        }
-
-        fn requests(&self) -> Vec<Value> {
-            self.captured_requests()
-                .into_iter()
-                .map(|captured| captured.request)
-                .collect()
-        }
-
-        fn captured_requests(&self) -> Vec<CapturedCodexRequest> {
-            let contents = std::fs::read_to_string(&self.capture).unwrap_or_default();
-            contents
-                .lines()
-                .map(|line| {
-                    let value: Value = serde_json::from_str(line).expect("captured request JSON");
-                    match value.get("request") {
-                        Some(request) => CapturedCodexRequest {
-                            pid: value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
-                            request: request.clone(),
-                        },
-                        None => CapturedCodexRequest {
-                            pid: 0,
-                            request: value,
-                        },
-                    }
-                })
-                .collect()
-        }
-
-        fn captured_fork_process(&self, parent_thread_id: &str) -> (u64, Vec<Value>) {
-            let captured = self.captured_requests();
-            let fork_pid = captured
-                .iter()
-                .find(|captured| {
-                    captured.request.get("method").and_then(Value::as_str) == Some("thread/fork")
-                        && captured
-                            .request
-                            .pointer("/params/threadId")
-                            .and_then(Value::as_str)
-                            == Some(parent_thread_id)
-                })
-                .map(|captured| captured.pid)
-                .expect("captured thread/fork request");
-            let requests = captured
-                .into_iter()
-                .filter(|captured| captured.pid == fork_pid)
-                .map(|captured| captured.request)
-                .collect::<Vec<_>>();
-            (fork_pid, requests)
-        }
-
-        fn captured_argv(&self) -> Vec<CapturedCodexArgv> {
-            let contents = std::fs::read_to_string(&self.argv_capture).unwrap_or_default();
-            contents
-                .lines()
-                .map(|line| {
-                    let value: Value =
-                        serde_json::from_str(line).expect("fake app-server argv JSON");
-                    match value.get("argv") {
-                        Some(argv) => CapturedCodexArgv {
-                            pid: value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
-                            argv: serde_json::from_value(argv.clone())
-                                .expect("fake app-server argv array"),
-                            codex_home: value
-                                .get("codex_home")
-                                .and_then(Value::as_str)
-                                .map(std::path::PathBuf::from),
-                            auth_present: value
-                                .get("auth_present")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            native_mcp_configured: value
-                                .get("native_mcp_configured")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        },
-                        None => CapturedCodexArgv {
-                            pid: 0,
-                            argv: serde_json::from_value(value)
-                                .expect("fake app-server argv array"),
-                            codex_home: None,
-                            auth_present: false,
-                            native_mcp_configured: false,
-                        },
-                    }
-                })
-                .collect()
-        }
-
-        fn argv_for_pid(&self, pid: u64) -> Vec<String> {
-            self.captured_argv()
-                .into_iter()
-                .find(|captured| captured.pid == pid)
-                .map(|captured| captured.argv)
-                .expect("fake app-server argv for pid")
-        }
-
-        fn environment_for_pid(&self, pid: u64) -> CapturedCodexArgv {
-            self.captured_argv()
-                .into_iter()
-                .find(|captured| captured.pid == pid)
-                .expect("fake app-server environment for pid")
-        }
-
-        fn native_mcp_contact_pids(&self) -> Vec<u64> {
-            std::fs::read_to_string(&self.native_mcp_contacts)
-                .unwrap_or_default()
-                .lines()
-                .map(|line| {
-                    serde_json::from_str::<Value>(line)
-                        .expect("native MCP contact JSON")
-                        .get("pid")
-                        .and_then(Value::as_u64)
-                        .expect("native MCP contact pid")
-                })
-                .collect()
-        }
-
-        fn skill_projection_dirs(&self) -> HashSet<PathBuf> {
-            skill_projection_dirs_under(&self.skill_temp_parent)
-        }
-    }
-
-    async fn yield_until_codex_request_count(
-        fake: &CodexFakeAppServer,
-        method: &str,
-        expected: usize,
-    ) {
-        for _ in 0..1_000 {
-            let count = codex_request_count(fake, method);
-            if count >= expected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("fake Codex app-server did not receive {expected} {method} requests");
-    }
-
-    fn codex_request_count(fake: &CodexFakeAppServer, method: &str) -> usize {
-        fake.requests()
-            .iter()
-            .filter(|request| request.get("method").and_then(Value::as_str) == Some(method))
-            .count()
-    }
-
-    async fn advance_codex_background_poll_interval() {
-        tokio::time::advance(CODEX_BACKGROUND_TERMINAL_POLL_INTERVAL + Duration::from_millis(1))
-            .await;
-    }
-
-    async fn yield_until_command_state(
-        inner: &Arc<CodexInner>,
-        outstanding: usize,
-        promoted: usize,
-    ) {
-        for _ in 0..1_000 {
-            let ready = {
-                let state = inner.state.lock().await;
-                state.outstanding_command_executions.len() == outstanding
-                    && state.background_commands.len() == promoted
-                    && (outstanding == 0 || state.background_terminal_poll_active)
-            };
-            if ready {
-                tokio::task::yield_now().await;
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        let state = inner.state.lock().await;
-        panic!(
-            "Codex command state did not reach outstanding={outstanding}, promoted={promoted}; \
-             observed outstanding={}, promoted={}",
-            state.outstanding_command_executions.len(),
-            state.background_commands.len()
-        );
-    }
-
-    async fn yield_until_first_background_snapshot(inner: &Arc<CodexInner>) {
-        for _ in 0..1_000 {
-            if inner
-                .state
-                .lock()
-                .await
-                .first_background_list_thread_id
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("Codex poller did not reconcile its first background snapshot");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn current_root_foreground_poll_lifecycle_has_no_progress() {
-        let fake = CodexFakeAppServer::new("foreground_background_poll", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace");
-        let roots = [workspace.path().to_string_lossy().to_string()];
-        let (session, mut events) = CodexSession::spawn_with_mode(
-            &roots,
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&[]),
-        )
-        .await
-        .expect("spawn foreground poll fixture");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "run foreground fixture".to_owned(),
-                images: None,
-            })
-            .await
-            .expect("start foreground fixture");
-        yield_until_command_state(&session.inner, 1, 0).await;
-        let started = drain_events(&mut events);
-        assert!(
-            started
-                .iter()
-                .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
-            "foreground start emitted background progress: {started:?}"
-        );
-
-        tokio::time::pause();
-        advance_codex_background_poll_interval().await;
-        yield_until_codex_request_count(&fake, "thread/backgroundTerminals/list", 1).await;
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            1
-        );
-        yield_until_first_background_snapshot(&session.inner).await;
-        assert!(
-            drain_events(&mut events)
-                .iter()
-                .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
-            "foreground list row emitted background progress"
-        );
-
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            1
-        );
-        advance_codex_background_poll_interval().await;
-        yield_until_codex_request_count(&fake, "thread/backgroundTerminals/list", 2).await;
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            2
-        );
-        yield_until_command_state(&session.inner, 0, 0).await;
-        let terminal = drain_events(&mut events);
-        assert_eq!(
-            terminal
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .count(),
-            1
-        );
-        assert!(
-            terminal
-                .iter()
-                .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
-            "foreground completion emitted background progress: {terminal:?}"
-        );
-        session.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn current_root_yielded_poll_lifecycle_has_one_progress() {
-        let fake = CodexFakeAppServer::new("yielded_background_poll", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace");
-        let roots = [workspace.path().to_string_lossy().to_string()];
-        let (session, mut events) = CodexSession::spawn_with_mode(
-            &roots,
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&[]),
-        )
-        .await
-        .expect("spawn yielded poll fixture");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "run yielded fixture".to_owned(),
-                images: None,
-            })
-            .await
-            .expect("start yielded fixture");
-        yield_until_command_state(&session.inner, 1, 1).await;
-        let started = drain_events(&mut events);
-        assert_eq!(
-            started
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                        && event.pointer("/data/update/status").and_then(Value::as_str)
-                            == Some("running")
-                })
-                .count(),
-            1
-        );
-
-        tokio::time::pause();
-        advance_codex_background_poll_interval().await;
-        yield_until_codex_request_count(&fake, "thread/backgroundTerminals/list", 1).await;
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            1
-        );
-        yield_until_first_background_snapshot(&session.inner).await;
-        assert!(
-            drain_events(&mut events)
-                .iter()
-                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("ToolProgress") }),
-            "list liveness duplicated the yielded Running row"
-        );
-
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            1
-        );
-        advance_codex_background_poll_interval().await;
-        yield_until_codex_request_count(&fake, "thread/backgroundTerminals/list", 2).await;
-        assert_eq!(
-            codex_request_count(&fake, "thread/backgroundTerminals/list"),
-            2
-        );
-        yield_until_command_state(&session.inner, 0, 0).await;
-        let terminal = drain_events(&mut events);
-        assert_eq!(
-            terminal
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                        && event.pointer("/data/update/status").and_then(Value::as_str)
-                            == Some("completed")
-                })
-                .count(),
-            1
-        );
-        assert_eq!(
-            terminal
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .count(),
-            1
-        );
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn resume_drains_unconfirmed_and_confirmed_root_commands() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace");
-        let roots = [workspace.path().to_string_lossy().to_string()];
-        let (session, mut events) = CodexSession::spawn_with_mode(
-            &roots,
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&[]),
-        )
-        .await
-        .expect("spawn resume fixture");
-        session
-            .inner
-            .handle_notification(
-                "turn/started",
-                &json!({
-                    "threadId": "fresh-thread-id",
-                    "turn": { "id": "old-turn" }
-                }),
-            )
-            .await;
-        for (item_id, process_id) in [("foreground", "101"), ("yielded", "202")] {
-            session
-                .inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "fresh-thread-id",
-                        "turnId": "old-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": item_id,
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": process_id,
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-        }
-        session
-            .inner
-            .handle_notification(
-                "rawResponseItem/completed",
-                &yielded_raw_result("fresh-thread-id", "old-turn", json!(202)),
-            )
-            .await;
-        drain_events(&mut events);
-        {
-            let state = session.inner.state.lock().await;
-            assert_eq!(state.outstanding_command_executions.len(), 2);
-            assert_eq!(state.background_commands.len(), 1);
-        }
-
-        session
-            .command_handle()
-            .execute(SessionCommand::ResumeSession {
-                session_id: "resumed-thread".to_owned(),
-            })
-            .await
-            .expect("resume fixture");
-        {
-            let state = session.inner.state.lock().await;
-            assert_eq!(state.thread_id, "resumed-thread");
-            assert!(state.background_command_owner_active);
-            assert!(
-                state.background_commands.is_empty()
-                    && state.outstanding_command_executions.is_empty()
-            );
-        }
-        let resumed = drain_events(&mut events);
-        assert_eq!(
-            resumed
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                        && event.pointer("/data/update/status").and_then(Value::as_str)
-                            == Some("stopped")
-                })
-                .count(),
-            1
-        );
-
-        session
-            .inner
-            .handle_notification(
-                "rawResponseItem/completed",
-                &yielded_raw_result("fresh-thread-id", "old-turn", json!(202)),
-            )
-            .await;
-        assert!(
-            drain_events(&mut events).is_empty(),
-            "old-thread raw result promoted after resume"
-        );
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn resumed_history_cannot_promote_background_commands() {
-        let fake = CodexFakeAppServer::new("resume_background_history", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace");
-        let roots = [workspace.path().to_string_lossy().to_string()];
-        let (session, mut events) = CodexSession::spawn_with_mode(
-            &roots,
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&[]),
-        )
-        .await
-        .expect("spawn resume-history fixture");
-        drain_events(&mut events);
-
-        // Exercise the command/RPC boundary used by a real resume. Historical
-        // items must stay on `emit_resumed_thread_history`; routing them through
-        // `handle_notification` here would reimplement an unreachable path.
-        session
-            .command_handle()
-            .execute(SessionCommand::ResumeSession {
-                session_id: "resumed-history-thread".to_owned(),
-            })
-            .await
-            .expect("resume historical thread");
-
-        let resumed = drain_events(&mut events);
-        let messages = resumed
-            .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("MessageAdded"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            messages.len(),
-            2,
-            "the replayable user and terminal assistant messages appear once each"
-        );
-        for content in ["run the historical command", "historical command complete"] {
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|event| {
-                        event.pointer("/data/content").and_then(Value::as_str) == Some(content)
-                    })
-                    .count(),
-                1,
-                "historical message must appear exactly once: {content}"
-            );
-        }
-        assert!(
-            resumed.iter().all(|event| {
-                !matches!(
-                    event.get("kind").and_then(Value::as_str),
-                    Some("ToolProgress" | "ToolRequest" | "ToolExecutionCompleted")
-                )
-            }),
-            "completed command and raw-like history must not enter the live tool lifecycle"
-        );
-        {
-            let state = session.inner.state.lock().await;
-            assert_eq!(state.thread_id, "resumed-history-thread");
-            assert!(state.active_turn_id.is_none());
-            assert!(
-                state.background_commands.is_empty()
-                    && state.outstanding_command_executions.is_empty()
-                    && !state.background_terminal_poll_active,
-                "history replay must not create live command or polling state"
-            );
-        }
-
-        let requests = fake.requests();
-        let resume_requests = requests
-            .iter()
-            .filter(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/resume")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            resume_requests.len(),
-            1,
-            "the fixture must cross the real thread/resume RPC once"
-        );
-        assert_eq!(
-            resume_requests[0]
-                .pointer("/params/threadId")
-                .and_then(Value::as_str),
-            Some("resumed-history-thread")
-        );
-        assert_eq!(
-            resume_requests[0]
-                .pointer("/params/experimentalRawEvents")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(
-            requests.iter().all(|request| {
-                request.get("method").and_then(Value::as_str)
-                    != Some("thread/backgroundTerminals/list")
-            }),
-            "historical command shapes must not start live terminal polling"
-        );
-        session.shutdown().await;
-    }
-
-    fn skill_projection_dirs_under(parent: &Path) -> HashSet<PathBuf> {
-        std::fs::read_dir(parent)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(CODEX_SKILLS_ROOT_PREFIX))
-            })
-            .collect()
-    }
-
-    fn write_codex_skill(root: &Path, name: &str, body: &str) -> ResolvedSkill {
-        let source_dir = root.join(name);
-        std::fs::create_dir_all(&source_dir).expect("create Codex skill fixture");
-        let skill_md_path = source_dir.join("SKILL.md");
-        std::fs::write(
-            &skill_md_path,
-            format!("---\nname: {name}\ndescription: {name} fixture\n---\n{body}\n"),
-        )
-        .expect("write Codex skill body");
-        std::fs::create_dir_all(source_dir.join("scripts")).expect("create skill scripts");
-        std::fs::write(
-            source_dir.join("scripts").join("run.sh"),
-            "#!/bin/sh\nexit 0\n",
-        )
-        .expect("write skill script");
-        std::fs::write(source_dir.join("reference.md"), "fixture reference\n")
-            .expect("write skill reference");
-        let source_dir = std::fs::canonicalize(source_dir).expect("canonical skill dir");
-        let skill_md_path = std::fs::canonicalize(skill_md_path).expect("canonical skill body");
-        ResolvedSkill::path_only(
-            protocol::Skill {
-                id: protocol::SkillId(name.to_owned()),
-                name: name.to_owned(),
-                title: None,
-                description: Some(format!("{name} fixture")),
-            },
-            source_dir,
-            skill_md_path,
-        )
-    }
-
-    fn write_codex_raw_skill(
-        root: &Path,
-        name: &str,
-        description: Option<&str>,
-        body: &str,
-    ) -> ResolvedSkill {
-        let source_dir = root.join(name);
-        std::fs::create_dir_all(&source_dir).expect("create raw Codex skill fixture");
-        let skill_md_path = source_dir.join("SKILL.md");
-        std::fs::write(&skill_md_path, body).expect("write raw Codex skill body");
-        std::fs::write(source_dir.join("reference.md"), "raw fixture reference\n")
-            .expect("write raw skill reference");
-        let source_dir = std::fs::canonicalize(source_dir).expect("canonical raw skill dir");
-        let skill_md_path = std::fs::canonicalize(skill_md_path).expect("canonical raw skill body");
-        ResolvedSkill::path_only(
-            protocol::Skill {
-                id: protocol::SkillId(name.to_owned()),
-                name: name.to_owned(),
-                title: None,
-                description: description.map(str::to_owned),
-            },
-            source_dir,
-            skill_md_path,
-        )
-    }
-
-    fn codex_native_skill_spawn_options<'a>(
-        selected_skills: &'a [ResolvedSkill],
-    ) -> CodexSessionSpawnOptions<'a> {
-        codex_native_skill_spawn_options_with_selection(selected_skills, SkillSelection::Explicit)
-    }
-
-    fn codex_native_skill_spawn_options_with_selection<'a>(
-        selected_skills: &'a [ResolvedSkill],
-        skill_selection: SkillSelection,
-    ) -> CodexSessionSpawnOptions<'a> {
-        CodexSessionSpawnOptions {
-            ephemeral: false,
-            access_mode: BackendAccessMode::Unrestricted,
-            subagent_emitter: None,
-            execution_mode: BackendExecutionMode::Agent,
-            installed_provider_version: None,
-            selected_skills,
-            skill_selection,
-        }
-    }
-
-    fn codex_extra_root(requests: &[Value]) -> Option<PathBuf> {
-        requests
-            .iter()
-            .find(|request| {
-                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
-            })
-            .and_then(|request| request.pointer("/params/extraRoots/0"))
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-    }
-
-    fn codex_wrapper_parts(body: &str) -> (&str, &str) {
-        let rest = body
-            .strip_prefix("---\n")
-            .expect("wrapper frontmatter opener");
-        rest.split_once("\n---\n")
-            .expect("wrapper frontmatter closer")
-    }
-
-    fn codex_wrapper_mapping(body: &str) -> serde_yaml::Mapping {
-        let (frontmatter, _) = codex_wrapper_parts(body);
-        serde_yaml::from_str::<serde_yaml::Value>(frontmatter)
-            .expect("wrapper frontmatter YAML")
-            .as_mapping()
-            .expect("wrapper frontmatter mapping")
-            .clone()
-    }
-
-    fn yaml_string(mapping: &serde_yaml::Mapping, key: &str) -> String {
-        mapping
-            .get(key)
-            .and_then(serde_yaml::Value::as_str)
-            .unwrap_or_else(|| panic!("string frontmatter field {key}"))
-            .to_owned()
-    }
-
-    #[tokio::test]
-    async fn codex_projection_preserves_full_frontmatter_semantics() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_raw_skill(
-            store.path(),
-            "rich-helper",
-            Some("Store description must not replace source"),
-            concat!(
-                "---\n",
-                "name: source-name-must-not-survive\n",
-                "Name: preserved-case-sensitive-unknown\n",
-                "description: Source description controls implicit matching\n",
-                "metadata:\n",
-                "  short-description: Source short description\n",
-                "allowed-tools: [Read, Bash]\n",
-                "future-field:\n",
-                "  enabled: true\n",
-                "  options: [one, two]\n",
-                "1: scalar-key-retained\n",
-                "delimiter-value: \"alpha\\n  ---  \\nomega\"\n",
-                "z-nested:\n",
-                "  name: nested-name-must-not-override-identity\n",
-                "  description: nested-description-must-not-override-source\n",
-                "---\n",
-                "RICH_BODY_SENTINEL\n",
-                "Read reference.md.\n",
-            ),
-        )];
-
-        let (session, mut raw_events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("valid rich frontmatter must remain discoverable");
-        assert!(
-            raw_events.try_recv().is_err(),
-            "valid rich frontmatter must not degrade"
-        );
-
-        let requests = fake.requests();
-        let methods = requests
-            .iter()
-            .filter_map(|request| request.get("method").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec![
-                "initialize",
-                "skills/list",
-                "skills/extraRoots/set",
-                "skills/list",
-                "thread/start",
-            ]
-        );
-        let projection = codex_extra_root(&requests).expect("projection root");
-        let wrapper = std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
-            .expect("rich wrapper");
-        let (rendered_frontmatter, rendered_body) = codex_wrapper_parts(&wrapper);
-        assert_eq!(rendered_body, "RICH_BODY_SENTINEL\nRead reference.md.\n");
-        assert!(
-            !rendered_frontmatter
-                .lines()
-                .any(|line| line.trim() == "---"),
-            "serialized frontmatter must not contain a Codex closing delimiter"
-        );
-
-        let mapping = codex_wrapper_mapping(&wrapper);
-        assert_eq!(yaml_string(&mapping, "name"), "rich-helper");
-        assert_eq!(
-            yaml_string(&mapping, "Name"),
-            "preserved-case-sensitive-unknown"
-        );
-        assert_eq!(
-            yaml_string(&mapping, "description"),
-            "Source description controls implicit matching"
-        );
-        assert_eq!(
-            mapping
-                .get("metadata")
-                .and_then(serde_yaml::Value::as_mapping)
-                .and_then(|metadata| metadata.get("short-description"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("Source short description")
-        );
-        assert_eq!(
-            mapping.get("allowed-tools"),
-            Some(&serde_yaml::from_str("[Read, Bash]").expect("allowed-tools YAML"))
-        );
-        assert_eq!(
-            mapping
-                .get("future-field")
-                .and_then(serde_yaml::Value::as_mapping)
-                .and_then(|future| future.get("options")),
-            Some(&serde_yaml::from_str("[one, two]").expect("future options YAML"))
-        );
-        assert_eq!(
-            mapping
-                .get("z-nested")
-                .and_then(serde_yaml::Value::as_mapping)
-                .and_then(|nested| nested.get("name"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("nested-name-must-not-override-identity")
-        );
-        assert_eq!(
-            mapping
-                .get("delimiter-value")
-                .and_then(serde_yaml::Value::as_str),
-            Some("alpha\n  ---  \nomega")
-        );
-        assert_eq!(
-            mapping
-                .get(serde_yaml::Value::Number(1.into()))
-                .and_then(serde_yaml::Value::as_str),
-            Some("scalar-key-retained")
-        );
-
-        session.shutdown().await;
-        assert!(!projection.exists());
-    }
-
-    #[test]
-    fn codex_projection_accepts_empty_comment_and_null_frontmatter() {
-        let projection = tempfile::tempdir().expect("projection");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let fixtures = [
-            (
-                "empty",
-                Some("Empty fallback"),
-                "---\n---\nEMPTY_BODY\n",
-                "Empty fallback",
-                "EMPTY_BODY\n",
-            ),
-            (
-                "comment",
-                Some("Comment fallback"),
-                "---\n# comment only\n---\nCOMMENT_BODY\n",
-                "Comment fallback",
-                "COMMENT_BODY\n",
-            ),
-            (
-                "null",
-                None,
-                "---\n~\n---\nNULL_BODY\n",
-                "null",
-                "NULL_BODY\n",
-            ),
-            (
-                "bom-body",
-                Some("BOM fallback"),
-                "\u{feff}BOM_BODY\n",
-                "BOM fallback",
-                "\u{feff}BOM_BODY\n",
-            ),
-        ];
-
-        for (ordinal, (name, store_description, source, expected_description, expected_body)) in
-            fixtures.into_iter().enumerate()
-        {
-            let skill = write_codex_raw_skill(store.path(), name, store_description, source);
-            let wrapper = materialize_codex_skill(projection.path(), &skill, ordinal)
-                .unwrap_or_else(|err| panic!("{name} frontmatter must be accepted: {err}"));
-            let wrapper = std::fs::read_to_string(wrapper).expect("normalized wrapper");
-            let mapping = codex_wrapper_mapping(&wrapper);
-            assert_eq!(yaml_string(&mapping, "name"), name);
-            assert_eq!(yaml_string(&mapping, "description"), expected_description);
-            assert_eq!(codex_wrapper_parts(&wrapper).1, expected_body);
-        }
-    }
-
-    #[test]
-    fn codex_projection_uses_source_then_store_then_name_description() {
-        let projection = tempfile::tempdir().expect("projection");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let fixtures = [
-            (
-                "source-wins",
-                Some("Store description"),
-                "---\nname: source\ndescription: Source description\n---\nSOURCE_BODY\n",
-                "Source description",
-            ),
-            (
-                "store-fallback",
-                Some("Store description"),
-                "---\nname: source\nfuture: true\n---\nSTORE_BODY\n",
-                "Store description",
-            ),
-            (
-                "name-fallback",
-                None,
-                "---\nname: source\nfuture: true\n---\nNAME_BODY\n",
-                "name-fallback",
-            ),
-        ];
-
-        for (ordinal, (name, store_description, source, expected_description)) in
-            fixtures.into_iter().enumerate()
-        {
-            let skill = write_codex_raw_skill(store.path(), name, store_description, source);
-            let wrapper = materialize_codex_skill(projection.path(), &skill, ordinal)
-                .unwrap_or_else(|err| panic!("{name} wrapper: {err}"));
-            let wrapper = std::fs::read_to_string(wrapper).expect("description wrapper");
-            let mapping = codex_wrapper_mapping(&wrapper);
-            assert_eq!(yaml_string(&mapping, "name"), name);
-            assert_eq!(yaml_string(&mapping, "description"), expected_description);
-            if name != "source-wins" {
-                assert_eq!(
-                    mapping.get("future").and_then(serde_yaml::Value::as_bool),
-                    Some(true)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn codex_projection_rejects_only_frontmatter_codex_cannot_load() {
-        let fixtures = [
-            (
-                "---\n[one, two]\n---\nBODY\n",
-                "frontmatter is not a YAML mapping",
-            ),
-            (
-                "---\ndescription: true\n---\nBODY\n",
-                "field 'description' must be a YAML string",
-            ),
-            (
-                "---\ndescription: \"  \\t \"\n---\nBODY\n",
-                "field 'description' must not be empty",
-            ),
-            (
-                "---\nmetadata: text\n---\nBODY\n",
-                "field 'metadata' must be a YAML mapping",
-            ),
-            (
-                "---\nmetadata:\n  short-description: [one]\n---\nBODY\n",
-                "field 'metadata.short-description' must be a YAML string",
-            ),
-            (
-                "---\n? [one, two]\n: value\n---\nBODY\n",
-                "collection-valued key that Codex cannot load",
-            ),
-            (
-                "---\ndescription: [\n---\nBODY\n",
-                "frontmatter is not valid YAML",
-            ),
-            (
-                "---\ndescription: never closed\nBODY\n",
-                "frontmatter block that is never closed",
-            ),
-        ];
-
-        for (source, expected) in fixtures {
-            let err = parse_codex_skill_md(source).expect_err("invalid frontmatter must fail");
-            assert!(
-                err.contains(expected),
-                "expected {expected:?} in error for {source:?}, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_projection_matches_trimmed_delimiters_and_preserves_body() {
-        let projection = tempfile::tempdir().expect("projection");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let skill = write_codex_raw_skill(
-            store.path(),
-            "trimmed-delimiters",
-            Some("Store fallback"),
-            "  ---  \r\ndescription: Source delimiter description\nfuture: retained\r\n  ---  \r\nTRIMMED_BODY\r\n",
-        );
-
-        let wrapper = materialize_codex_skill(projection.path(), &skill, 0)
-            .expect("Codex-compatible trimmed delimiters");
-        let wrapper = std::fs::read_to_string(wrapper).expect("trimmed-delimiter wrapper");
-        let mapping = codex_wrapper_mapping(&wrapper);
-        assert_eq!(
-            yaml_string(&mapping, "description"),
-            "Source delimiter description"
-        );
-        assert_eq!(
-            mapping.get("future").and_then(serde_yaml::Value::as_str),
-            Some("retained")
-        );
-        assert_eq!(codex_wrapper_parts(&wrapper).1, "TRIMMED_BODY\r\n");
-    }
-
-    #[test]
-    fn codex_projection_rendering_is_deterministic() {
-        let first_projection = tempfile::tempdir().expect("first projection");
-        let second_projection = tempfile::tempdir().expect("second projection");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let skill = write_codex_raw_skill(
-            store.path(),
-            "deterministic",
-            Some("Unused store fallback"),
-            "---\nz-last: true\ndescription: Source description\na-first:\n  z: 2\n  a: 1\nname: source\n---\nDETERMINISTIC_BODY\n",
-        );
-
-        let first = materialize_codex_skill(first_projection.path(), &skill, 0)
-            .expect("first deterministic wrapper");
-        let second = materialize_codex_skill(second_projection.path(), &skill, 0)
-            .expect("second deterministic wrapper");
-        assert_eq!(
-            std::fs::read(first).expect("first wrapper"),
-            std::fs::read(second).expect("second wrapper")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_projection_exposes_claude_plugin_namespace_collision() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = write_codex_skill(store.path(), "plugin-bearing", "PLUGIN_BODY");
-        std::fs::create_dir(selected.source_dir.join(".claude-plugin"))
-            .expect("create Claude plugin manifest directory");
-        std::fs::write(
-            selected
-                .source_dir
-                .join(".claude-plugin")
-                .join("plugin.json"),
-            r#"{"name":"source-plugin"}"#,
-        )
-        .expect("write Claude plugin manifest");
-        let selected = vec![selected];
-
-        let result = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await;
-        let (session, mut raw_events) = result.expect(
-                "fail-open: plugin namespace collision must not remain visible, it degrades with a notice",
-            );
-        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join("\n");
-        session.shutdown().await;
-        assert!(
-            diagnostics.contains(
-                "Selected Codex skill 'plugin-bearing' must resolve to exactly one enabled entry"
-            ),
-            "unexpected collision error: {diagnostics}"
-        );
-        let methods = fake
-            .requests()
-            .into_iter()
-            .filter_map(|request| {
-                request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect::<Vec<_>>();
-        // The collision is reported and the skill dropped, then the remaining
-        // (empty) selection is re-registered and re-verified before the session
-        // starts its thread. What must never appear is a session that kept the
-        // ambiguous skill.
-        assert_eq!(
-            methods,
-            vec![
-                "initialize",
-                "skills/list",
-                "skills/extraRoots/set",
-                "skills/list",
-                "skills/extraRoots/set",
-                "skills/list",
-                "thread/start",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_native_skills_are_selected_before_the_first_turn_and_cleaned() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        std::fs::write(
-            native_home.path().join("config.toml"),
-            "[skills]\ninclude_instructions = true\n",
-        )
-        .expect("native config fixture");
-        let original_config =
-            std::fs::read(native_home.path().join("config.toml")).expect("read config fixture");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![
-            write_codex_skill(store.path(), "chosen-a", "BODY_SENTINEL_A"),
-            write_codex_skill(store.path(), "chosen-b", "BODY_SENTINEL_B"),
-        ];
-        let _unselected = write_codex_skill(store.path(), "not-chosen", "BODY_SENTINEL_C");
-
-        let (session, _events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            Some("Custom instructions without skill bodies."),
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("spawn with selected native skills");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "use a selected skill".to_owned(),
-                images: None,
-            })
-            .await
-            .expect("send first turn");
-
-        let captured = fake.captured_requests();
-        let pid = captured
-            .iter()
-            .find(|captured| {
-                captured.request.get("method").and_then(Value::as_str) == Some("initialize")
-            })
-            .map(|captured| captured.pid)
-            .expect("fake app-server pid");
-        let requests = captured
-            .iter()
-            .filter(|captured| captured.pid == pid)
-            .map(|captured| captured.request.clone())
-            .collect::<Vec<_>>();
-        let methods = requests
-            .iter()
-            .filter_map(|request| request.get("method").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec![
-                "initialize",
-                "skills/list",
-                "skills/extraRoots/set",
-                "skills/list",
-                "thread/start",
-                "turn/start",
-            ]
-        );
-        assert!(
-            !methods.contains(&"skills/config/write"),
-            "native discovery must never persist Codex skill configuration"
-        );
-
-        let projection = codex_extra_root(&requests).expect("selected skill parent root");
-        assert!(projection.is_absolute());
-        assert!(
-            projection
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(CODEX_SKILLS_ROOT_PREFIX))
-        );
-        let wrappers = std::fs::read_dir(&projection)
-            .expect("read projection")
-            .map(|entry| entry.expect("projection entry").path())
-            .collect::<Vec<_>>();
-        assert_eq!(wrappers.len(), 2);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&projection)
-                    .expect("projection metadata")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
-        for (ordinal, skill) in selected.iter().enumerate() {
-            let wrapper = projection.join(format!("skill-{ordinal:05}"));
-            let wrapper_body =
-                std::fs::read_to_string(wrapper.join("SKILL.md")).expect("wrapper SKILL.md");
-            let wrapper_mapping = codex_wrapper_mapping(&wrapper_body);
-            assert_eq!(yaml_string(&wrapper_mapping, "name"), skill.name);
-            assert!(wrapper_body.contains(&format!("BODY_SENTINEL_{}", ['A', 'B'][ordinal])));
-            assert_eq!(
-                std::fs::canonicalize(wrapper.join("reference.md"))
-                    .expect("resolve wrapper resource"),
-                skill.source_dir.join("reference.md")
-            );
-            assert_eq!(
-                std::fs::canonicalize(wrapper.join("scripts"))
-                    .expect("resolve wrapper resource directory"),
-                skill.source_dir.join("scripts")
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                assert_eq!(
-                    std::fs::metadata(&wrapper)
-                        .expect("wrapper metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o700
-                );
-                assert_eq!(
-                    std::fs::metadata(wrapper.join("SKILL.md"))
-                        .expect("wrapper SKILL.md metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
-            }
-        }
-        assert!(!wrappers.iter().any(|wrapper| {
-            std::fs::read_to_string(wrapper.join("SKILL.md"))
-                .is_ok_and(|body| body.contains("BODY_SENTINEL_C"))
-        }));
-
-        let argv = fake.argv_for_pid(pid);
-        let steering_path = argv
-            .windows(2)
-            .find_map(|args| {
-                (args[0] == "-c")
-                    .then(|| args[1].strip_prefix("model_instructions_file="))
-                    .flatten()
-            })
-            .map(|quoted| {
-                serde_json::from_str::<String>(quoted).expect("quoted model instructions path")
-            })
-            .expect("model instructions path");
-        let steering = std::fs::read_to_string(&steering_path).expect("read model instructions");
-        assert!(steering.contains("Custom instructions without skill bodies."));
-        assert!(!steering.contains("BODY_SENTINEL"));
-        assert!(!steering.contains("Skills:"));
-        assert_eq!(
-            std::fs::read(native_home.path().join("config.toml")).expect("reread native config"),
-            original_config
-        );
-
-        session.shutdown().await;
-        assert!(!projection.exists());
-        assert!(!Path::new(&steering_path).exists());
-        for skill in &selected {
-            assert!(skill.skill_md_path.exists());
-            assert!(skill.source_dir.join("reference.md").exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_projection_preserves_source_description_and_normalizes_identity() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![
-            write_codex_raw_skill(
-                store.path(),
-                ".hidden-helper",
-                Some("Hidden helper description"),
-                "FRONTMATTERLESS_INSTRUCTIONS\nRead reference.md.\n",
-            ),
-            write_codex_raw_skill(
-                store.path(),
-                "store-helper",
-                Some("Store helper description"),
-                "---\nname: other-helper\ndescription: Wrong metadata\n---\nMISMATCHED_INSTRUCTIONS\nRead reference.md.\n",
-            ),
-        ];
-
-        let (session, _events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("normalized wrappers must load through Codex");
-        let projection = codex_extra_root(&fake.requests()).expect("projection root");
-        let hidden_wrapper =
-            std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
-                .expect("frontmatter-less wrapper");
-        let hidden_mapping = codex_wrapper_mapping(&hidden_wrapper);
-        assert_eq!(yaml_string(&hidden_mapping, "name"), ".hidden-helper");
-        assert_eq!(
-            yaml_string(&hidden_mapping, "description"),
-            "Hidden helper description"
-        );
-        assert_eq!(
-            codex_wrapper_parts(&hidden_wrapper).1,
-            "FRONTMATTERLESS_INSTRUCTIONS\nRead reference.md.\n"
-        );
-        let mismatch_wrapper =
-            std::fs::read_to_string(projection.join("skill-00001").join("SKILL.md"))
-                .expect("mismatched wrapper");
-        let mismatch_mapping = codex_wrapper_mapping(&mismatch_wrapper);
-        assert_eq!(yaml_string(&mismatch_mapping, "name"), "store-helper");
-        // The rendered source value is "Wrong metadata". The old store-value
-        // assertion rejected correct behavior because Codex uses this field for
-        // implicit matching; only the wrapper's top-level name is authoritative.
-        assert_eq!(
-            yaml_string(&mismatch_mapping, "description"),
-            "Wrong metadata"
-        );
-        assert_eq!(
-            mismatch_mapping
-                .keys()
-                .filter(|key| key.as_str() == Some("name"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            codex_wrapper_parts(&mismatch_wrapper).1,
-            "MISMATCHED_INSTRUCTIONS\nRead reference.md.\n"
-        );
-        for (ordinal, skill) in selected.iter().enumerate() {
-            assert_eq!(
-                std::fs::canonicalize(
-                    projection
-                        .join(format!("skill-{ordinal:05}"))
-                        .join("reference.md")
-                )
-                .expect("wrapper resource link"),
-                skill.source_dir.join("reference.md")
-            );
-        }
-        session.shutdown().await;
-        assert!(!projection.exists());
-        assert!(selected.iter().all(|skill| skill.skill_md_path.exists()));
-    }
-
-    #[tokio::test]
-    async fn codex_malformed_frontmatter_is_policy_aware_and_empty_default_skips_capability() {
-        {
-            let fake = CodexFakeAppServer::new("ok", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![write_codex_raw_skill(
-                store.path(),
-                "broken",
-                Some("Broken fixture"),
-                "---\nname: broken\ndescription: never closed\ninstructions\n",
-            )];
-
-            let (session, mut raw_events) = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(
-                    &selected,
-                    SkillSelection::AllInstalled,
-                ),
-            )
-            .await
-            .expect("Default must omit malformed source frontmatter");
-            let diagnostic = raw_events
-                .try_recv()
-                .expect("malformed frontmatter degradation diagnostic");
-            assert!(
-                diagnostic
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text.contains("frontmatter block that is never closed"))
-            );
-            let methods = fake
-                .requests()
-                .into_iter()
-                .filter_map(|request| {
-                    request
-                        .get("method")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(methods, vec!["initialize", "skills/list", "thread/start"]);
-            session.shutdown().await;
-        }
-
-        {
-            let fake = CodexFakeAppServer::new("ok", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![write_codex_raw_skill(
-                store.path(),
-                "broken",
-                Some("Broken fixture"),
-                "---\nname: broken\ndescription: never closed\ninstructions\n",
-            )];
-
-            let result = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options(&selected),
-            )
-            .await;
-            let (session, mut raw_events) = result.expect(
-                "fail-open: Explicit must not refuse malformed source frontmatter, it degrades with a notice",
-            );
-            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n");
-            session.shutdown().await;
-            assert!(diagnostics.contains("frontmatter block that is never closed"));
-            assert!(!fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
-            }));
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_final_catalog_failures_degrade_default_and_fail_explicit() {
-        for (mode, expected) in [
-            (
-                "skills_final_missing_default",
-                "must resolve to exactly one enabled entry",
-            ),
-            (
-                "skills_final_disabled_default",
-                "must resolve to exactly one enabled entry",
-            ),
-            (
-                "skills_final_name_shape_default",
-                "final discovery reported related errors",
-            ),
-        ] {
-            {
-                let fake = CodexFakeAppServer::new(mode, "unused");
-                let native_home = tempfile::tempdir().expect("native Codex home");
-                let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                    fake.binary.clone(),
-                    Some(native_home.path().to_path_buf()),
-                );
-                let workspace = tempfile::tempdir().expect("workspace");
-                let store = tempfile::tempdir().expect("Tyde skill store");
-                let selected = vec![
-                    write_codex_skill(store.path(), "broken", "broken body"),
-                    write_codex_skill(store.path(), "available", "available body"),
-                ];
-
-                let (session, mut raw_events) = CodexSession::spawn_with_mode(
-                    &[workspace.path().to_string_lossy().to_string()],
-                    None,
-                    &[],
-                    None,
-                    codex_native_skill_spawn_options_with_selection(
-                        &selected,
-                        SkillSelection::AllInstalled,
-                    ),
-                )
-                .await
-                .expect("Default must omit a final-invalid skill and reverify the remainder");
-                let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                    .filter_map(|event| {
-                        event.get("data").and_then(Value::as_str).map(str::to_owned)
-                    })
-                    .collect::<Vec<_>>();
-                assert!(diagnostics.iter().any(|diagnostic| {
-                    diagnostic.contains("omitted Tyde skill 'broken'")
-                        && diagnostic.contains(expected)
-                }));
-                assert!(
-                    !diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.contains("omitted Tyde skill 'available'"))
-                );
-
-                let requests = fake.requests();
-                assert_eq!(
-                    requests
-                        .iter()
-                        .filter(|request| {
-                            request.get("method").and_then(Value::as_str)
-                                == Some("skills/extraRoots/set")
-                        })
-                        .count(),
-                    2
-                );
-                assert_eq!(
-                    requests
-                        .iter()
-                        .filter(|request| {
-                            request.get("method").and_then(Value::as_str) == Some("skills/list")
-                        })
-                        .count(),
-                    3
-                );
-                let projection = codex_extra_root(&requests).expect("projection root");
-                assert!(!projection.join("skill-00000").exists());
-                assert!(projection.join("skill-00001").join("SKILL.md").exists());
-                assert!(requests.iter().any(|request| {
-                    request.get("method").and_then(Value::as_str) == Some("thread/start")
-                }));
-                session.shutdown().await;
-            }
-
-            {
-                let fake = CodexFakeAppServer::new(mode, "unused");
-                let native_home = tempfile::tempdir().expect("native Codex home");
-                let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                    fake.binary.clone(),
-                    Some(native_home.path().to_path_buf()),
-                );
-                let workspace = tempfile::tempdir().expect("workspace");
-                let store = tempfile::tempdir().expect("Tyde skill store");
-                let selected = vec![write_codex_skill(store.path(), "broken", "broken body")];
-
-                let result = CodexSession::spawn_with_mode(
-                    &[workspace.path().to_string_lossy().to_string()],
-                    None,
-                    &[],
-                    None,
-                    codex_native_skill_spawn_options(&selected),
-                )
-                .await;
-                let (session, mut raw_events) = result.expect(
-                "fail-open: Explicit must not fail final verification in mode {mode}, it degrades with a notice",
-            );
-                let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                    .filter_map(|event| {
-                        event.get("data").and_then(Value::as_str).map(str::to_owned)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                session.shutdown().await;
-                assert!(diagnostics.contains(expected), "{mode}: {diagnostics}");
-                assert!(
-                    diagnostics.contains("explicitly selected"),
-                    "{mode}: an explicitly selected skill must be named as such: {diagnostics}"
-                );
-                assert!(
-                    fake.requests().iter().any(|request| {
-                        request.get("method").and_then(Value::as_str) == Some("thread/start")
-                    }),
-                    "{mode}: the session must still start"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_unknown_enabled_state_is_selected_skill_ambiguity() {
-        for selection in [SkillSelection::AllInstalled, SkillSelection::Explicit] {
-            let fake = CodexFakeAppServer::new("skills_native_enabled_shape", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let native_root = native_home.path().join("skills");
-            std::fs::create_dir_all(&native_root).expect("native skill root");
-            let _native = write_codex_skill(&native_root, "broken", "native body");
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let mut selected = vec![write_codex_skill(store.path(), "broken", "selected body")];
-            if selection == SkillSelection::AllInstalled {
-                selected.push(write_codex_skill(
-                    store.path(),
-                    "available",
-                    "available body",
-                ));
-            }
-
-            let result = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(&selected, selection),
-            )
-            .await;
-            match selection {
-                SkillSelection::AllInstalled => {
-                    let (session, mut raw_events) =
-                        result.expect("Default must omit unknown-enabled collision");
-                    let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                        .filter_map(|event| {
-                            event.get("data").and_then(Value::as_str).map(str::to_owned)
-                        })
-                        .collect::<Vec<_>>();
-                    assert!(diagnostics.iter().any(|diagnostic| {
-                        diagnostic.contains("omitted Tyde skill 'broken'")
-                            && diagnostic.contains("enabled")
-                    }));
-                    session.shutdown().await;
-                }
-                SkillSelection::Explicit => {
-                    let (session, mut raw_events) = result.expect(
-                "fail-open: Explicit must not fail unknown-enabled collision, it degrades with a notice",
-            );
-                    let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                        .filter_map(|event| {
-                            event.get("data").and_then(Value::as_str).map(str::to_owned)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    session.shutdown().await;
-                    assert!(
-                        diagnostics.contains("discovery errors")
-                            || diagnostics.contains("enabled state")
-                    );
-                    assert!(!fake.requests().iter().any(|request| {
-                        request.get("method").and_then(Value::as_str)
-                            == Some("skills/extraRoots/set")
-                    }));
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_catalog_tolerates_unrelated_nonfilesystem_skill_locators() {
-        let fake = CodexFakeAppServer::new("skills_nonfilesystem_locator", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-
-        let (session, _events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("unrelated opaque catalog entries must not fail selected filesystem skills");
-        assert!(fake.requests().iter().any(|request| {
-            request.get("method").and_then(Value::as_str) == Some("thread/start")
-        }));
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_catalog_errors_are_forwarded_as_visible_diagnostics() {
-        let fake = CodexFakeAppServer::new("skills_catalog_errors", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-
-        let (session, mut raw_events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("catalog diagnostics must not block a valid selection");
-
-        let diagnostics = [raw_events.try_recv(), raw_events.try_recv()]
-            .into_iter()
-            .map(|event| event.expect("queued catalog diagnostic"))
-            .collect::<Vec<_>>();
-        assert!(diagnostics.iter().any(|event| {
-            event
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("baseline skills/list diagnostic")
-                        && text.contains("baseline catalog fixture")
-                })
-        }));
-        assert!(diagnostics.iter().any(|event| {
-            event
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("final skills/list diagnostic")
-                        && text.contains("final catalog fixture")
-                })
-        }));
-        for diagnostic in diagnostics {
-            let mut normalization_failures = HashMap::new();
-            let forwarded = codex_backend_event_from_raw(&diagnostic, &mut normalization_failures)
-                .expect("diagnostic must be user-visible");
-            let ChatEvent::MessageAdded(message) = forwarded.chat_event else {
-                panic!("catalog diagnostic must become a visible message");
-            };
-            assert!(matches!(message.sender, MessageSender::Warning));
-        }
-        session.shutdown().await;
-    }
-
-    #[test]
-    fn codex_skill_manifest_is_complete_and_bounded() {
-        let left = tempfile::tempdir().expect("left tree");
-        let right = tempfile::tempdir().expect("right tree");
-        let left_skill = write_codex_skill(left.path(), "same", "body");
-        let right_skill = write_codex_skill(right.path(), "same", "body");
-        let (_, left_manifest) =
-            CodexSkillTreeManifestBuilder::build(&left_skill.source_dir).expect("left manifest");
-        let (_, right_manifest) =
-            CodexSkillTreeManifestBuilder::build(&right_skill.source_dir).expect("right manifest");
-        assert_eq!(left_manifest, right_manifest);
-
-        std::fs::write(
-            right_skill.source_dir.join("reference.md"),
-            "different complete-tree resource\n",
-        )
-        .expect("change resource");
-        let (_, changed_manifest) = CodexSkillTreeManifestBuilder::build(&right_skill.source_dir)
-            .expect("changed manifest");
-        assert_ne!(left_manifest, changed_manifest);
-        assert!(left_manifest.entries <= CODEX_SKILL_MANIFEST_MAX_ENTRIES);
-        assert!(left_manifest.bytes <= CODEX_SKILL_MANIFEST_MAX_BYTES);
-        let entry_err = codex_sorted_entry_names(&right_skill.source_dir, 0)
-            .expect_err("entry cap must fail before collecting an unbounded directory");
-        assert!(entry_err.contains("collision-check limit"));
-
-        let oversized = right_skill.source_dir.join("oversized-resource.bin");
-        let oversized_file = std::fs::File::create(&oversized).expect("oversized sparse fixture");
-        oversized_file
-            .set_len(CODEX_SKILL_MANIFEST_MAX_BYTES + 1)
-            .expect("size sparse fixture");
-        let err = CodexSkillTreeManifestBuilder::build(&right_skill.source_dir)
-            .expect_err("oversized collision tree must fail visibly");
-        assert!(err.contains("collision-check limit"));
-    }
-
-    #[tokio::test]
-    async fn codex_native_skills_collapse_complete_equivalent_native_trees() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let native_root = native_home.path().join("skills");
-        std::fs::create_dir_all(&native_root).expect("native skill root");
-        let native = write_codex_skill(&native_root, "same-skill", "identical body");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(
-            store.path(),
-            "same-skill",
-            "identical body",
-        )];
-        assert_ne!(native.source_dir, selected[0].source_dir);
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-
-        let (session, _events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("equivalent native tree should satisfy selection");
-
-        let requests = fake.requests();
-        let set = requests
-            .iter()
-            .find(|request| {
-                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
-            })
-            .expect("extra roots set request");
-        assert_eq!(
-            set.pointer("/params/extraRoots")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(0),
-            "an already-visible complete equivalent must not be projected"
-        );
-        session.shutdown().await;
-        assert!(native.skill_md_path.exists());
-        assert!(selected[0].skill_md_path.exists());
-    }
-
-    #[tokio::test]
-    async fn codex_explicit_skills_reject_divergent_same_name_before_setting_roots() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let native_root = native_home.path().join("skills");
-        std::fs::create_dir_all(&native_root).expect("native skill root");
-        let native = write_codex_skill(&native_root, "collision", "native body");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(
-            store.path(),
-            "collision",
-            "selected body",
-        )];
-        let before = fake.skill_projection_dirs();
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-
-        let result = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await;
-        let (session, mut raw_events) = result.expect(
-            "fail-open: divergent same-name skills must not fail, it degrades with a notice",
-        );
-        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join("\n");
-        session.shutdown().await;
-        assert!(diagnostics.contains("conflicts with a different enabled Codex skill"));
-        assert!(diagnostics.contains(&native.source_dir.display().to_string()));
-        assert!(diagnostics.contains(&selected[0].source_dir.display().to_string()));
-        assert_eq!(
-            fake.requests()
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            // No `skills/extraRoots/set`: the collision is caught before any root
-            // is registered, so nothing of Tyde's is ever exposed under a name
-            // that resolves elsewhere. The session starts regardless.
-            vec!["initialize", "skills/list", "thread/start"]
-        );
-        assert_eq!(fake.skill_projection_dirs(), before);
-        assert!(native.skill_md_path.exists());
-        assert!(selected[0].skill_md_path.exists());
-    }
-
-    #[tokio::test]
-    async fn codex_default_skills_omit_divergent_collision_and_keep_remaining_selection() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let native_root = native_home.path().join("skills");
-        std::fs::create_dir_all(&native_root).expect("native skill root");
-        let native = write_codex_skill(&native_root, "collision", "native body");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![
-            write_codex_skill(store.path(), "collision", "selected body"),
-            write_codex_skill(store.path(), "available", "available body"),
-        ];
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-
-        let (session, mut raw_events) = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options_with_selection(
-                &selected,
-                SkillSelection::AllInstalled,
-            ),
-        )
-        .await
-        .expect("Default must omit one collision without blocking the session");
-
-        let diagnostic = raw_events
-            .try_recv()
-            .expect("Default collision degradation diagnostic");
-        let diagnostic = diagnostic
-            .get("data")
-            .and_then(Value::as_str)
-            .expect("diagnostic text");
-        assert!(diagnostic.contains("Codex session omitted Tyde skill 'collision'"));
-        assert!(diagnostic.contains(&native.source_dir.display().to_string()));
-        assert!(!diagnostic.contains("omitted Tyde skill 'available'"));
-
-        let projection = codex_extra_root(&fake.requests()).expect("remaining projection root");
-        let wrappers = std::fs::read_dir(&projection)
-            .expect("read remaining wrappers")
-            .map(|entry| entry.expect("remaining wrapper").path())
-            .collect::<Vec<_>>();
-        assert_eq!(wrappers.len(), 1);
-        let wrapper = std::fs::read_to_string(wrappers[0].join("SKILL.md"))
-            .expect("remaining wrapper SKILL.md");
-        assert_eq!(
-            yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
-            "available"
-        );
-        assert!(fake.requests().iter().any(|request| {
-            request.get("method").and_then(Value::as_str) == Some("thread/start")
-        }));
-
-        session.shutdown().await;
-        assert!(!projection.exists());
-        assert!(selected.iter().all(|skill| skill.skill_md_path.exists()));
-    }
-
-    #[tokio::test]
-    async fn codex_native_tree_preparation_errors_degrade_default_and_fail_explicit() {
-        {
-            let fake = CodexFakeAppServer::new("skills_native_tree_changes", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let native_root = native_home.path().join("skills");
-            std::fs::create_dir_all(&native_root).expect("native skill root");
-            let _native = write_codex_skill(&native_root, "changing", "native body");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![
-                write_codex_skill(store.path(), "changing", "selected body"),
-                write_codex_skill(store.path(), "available", "available body"),
-            ];
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-
-            let (session, mut raw_events) = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(
-                    &selected,
-                    SkillSelection::AllInstalled,
-                ),
-            )
-            .await
-            .expect("Default must omit a skill whose native collision tree changed");
-
-            let diagnostic = raw_events
-                .try_recv()
-                .expect("changed native-tree degradation diagnostic");
-            let diagnostic = diagnostic
-                .get("data")
-                .and_then(Value::as_str)
-                .expect("diagnostic text");
-            assert!(diagnostic.contains("omitted Tyde skill 'changing'"));
-            assert!(diagnostic.contains("not a regular file"));
-
-            let projection = codex_extra_root(&fake.requests()).expect("remaining projection");
-            let wrappers = std::fs::read_dir(&projection)
-                .expect("read remaining projection")
-                .map(|entry| entry.expect("remaining wrapper").path())
-                .collect::<Vec<_>>();
-            assert_eq!(wrappers.len(), 1);
-            let wrapper =
-                std::fs::read_to_string(wrappers[0].join("SKILL.md")).expect("remaining SKILL.md");
-            assert_eq!(
-                yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
-                "available"
-            );
-            session.shutdown().await;
-        }
-
-        {
-            let fake = CodexFakeAppServer::new("skills_native_tree_changes", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let native_root = native_home.path().join("skills");
-            std::fs::create_dir_all(&native_root).expect("native skill root");
-            let _native = write_codex_skill(&native_root, "changing", "native body");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![write_codex_skill(store.path(), "changing", "selected body")];
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-
-            let result = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(
-                    &selected,
-                    SkillSelection::Explicit,
-                ),
-            )
-            .await;
-            let (session, mut raw_events) = result.expect(
-                "fail-open: Explicit must not fail when a native collision tree changes, it degrades with a notice",
-            );
-            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n");
-            session.shutdown().await;
-            assert!(diagnostics.contains("not a regular file"));
-            assert!(!fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
-            }));
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_materialization_errors_degrade_default_and_fail_explicit() {
-        {
-            let fake = CodexFakeAppServer::new("ok", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![
-                write_codex_skill(store.path(), "broken", "broken body"),
-                write_codex_skill(store.path(), "available", "available body"),
-            ];
-            std::fs::write(
-                selected[0].source_dir.join("fail-link.txt"),
-                "resource-link fixture\n",
-            )
-            .expect("write failing resource fixture");
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            *codex_test_resource_link_failure_override()
-                .lock()
-                .expect("Codex test resource-link failure mutex poisoned") =
-                Some(std::ffi::OsString::from("fail-link.txt"));
-            let workspace = tempfile::tempdir().expect("workspace");
-
-            let (session, mut raw_events) = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(
-                    &selected,
-                    SkillSelection::AllInstalled,
-                ),
-            )
-            .await
-            .expect("Default must omit a skill whose wrapper cannot materialize");
-
-            let diagnostic = raw_events
-                .try_recv()
-                .expect("materialization degradation diagnostic");
-            let diagnostic = diagnostic
-                .get("data")
-                .and_then(Value::as_str)
-                .expect("diagnostic text");
-            assert!(diagnostic.contains("omitted Tyde skill 'broken'"));
-            assert!(diagnostic.contains("injected resource-link failure"));
-
-            let projection = codex_extra_root(&fake.requests()).expect("remaining projection");
-            let wrappers = std::fs::read_dir(&projection)
-                .expect("read remaining projection")
-                .map(|entry| entry.expect("remaining wrapper").path())
-                .collect::<Vec<_>>();
-            assert_eq!(wrappers.len(), 1);
-            let wrapper =
-                std::fs::read_to_string(wrappers[0].join("SKILL.md")).expect("remaining SKILL.md");
-            assert_eq!(
-                yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
-                "available"
-            );
-            assert!(
-                !projection.join("skill-00000").exists(),
-                "failed partial wrapper must be removed before final discovery"
-            );
-            session.shutdown().await;
-        }
-
-        {
-            let fake = CodexFakeAppServer::new("ok", "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![write_codex_skill(store.path(), "broken", "broken body")];
-            std::fs::write(
-                selected[0].source_dir.join("fail-link.txt"),
-                "resource-link fixture\n",
-            )
-            .expect("write failing resource fixture");
-            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            *codex_test_resource_link_failure_override()
-                .lock()
-                .expect("Codex test resource-link failure mutex poisoned") =
-                Some(std::ffi::OsString::from("fail-link.txt"));
-            let workspace = tempfile::tempdir().expect("workspace");
-
-            let result = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options_with_selection(
-                    &selected,
-                    SkillSelection::Explicit,
-                ),
-            )
-            .await;
-            let (session, mut raw_events) = result.expect(
-                "fail-open: Explicit must not fail when a selected wrapper cannot materialize, it degrades with a notice",
-            );
-            let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-                .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n");
-            session.shutdown().await;
-            assert!(diagnostics.contains("injected resource-link failure"));
-            assert!(!fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
-            }));
-            assert!(fake.skill_projection_dirs().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_native_skills_report_unsupported_method_without_fallback() {
-        let fake = CodexFakeAppServer::new("skills_unsupported", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(
-            store.path(),
-            "selected",
-            "NO_FALLBACK_BODY",
-        )];
-
-        let result = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            Some("non-skill steering"),
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await;
-        let (session, mut raw_events) = result.expect(
-            "fail-open: unsupported skills method must not fail, it degrades with a notice",
-        );
-        let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
-            .filter_map(|event| event.get("data").and_then(Value::as_str).map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join("\n");
-        session.shutdown().await;
-        assert!(diagnostics.contains("skills/extraRoots/set"));
-        assert!(diagnostics.contains("Update Codex CLI"));
-        let requests = fake.requests();
-        assert_eq!(
-            requests
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![
-                "initialize",
-                "skills/list",
-                "skills/extraRoots/set",
-                "thread/start",
-            ]
-        );
-        // The point of "without fallback": Tyde never writes the skill into the
-        // user's Codex config to work around the missing method. The session
-        // starts without the skill instead.
-        assert!(!requests.iter().any(|request| {
-            matches!(
-                request.get("method").and_then(Value::as_str),
-                Some("skills/config/write")
-            )
-        }));
-        let projection = codex_extra_root(&requests).expect("attempted projection root");
-        assert!(!projection.exists());
-        let argv = fake.captured_argv();
-        assert_eq!(argv.len(), 1);
-        let steering_arg = argv[0]
-            .argv
-            .windows(2)
-            .find_map(|args| {
-                (args[0] == "-c")
-                    .then(|| args[1].strip_prefix("model_instructions_file="))
-                    .flatten()
-            })
-            .expect("steering override");
-        let steering_path =
-            serde_json::from_str::<String>(steering_arg).expect("quoted steering path");
-        assert!(!Path::new(&steering_path).exists());
-        assert!(selected[0].skill_md_path.exists());
-    }
-
-    #[tokio::test]
-    async fn codex_resume_surfaces_native_skill_setup_errors_without_a_turn() {
-        let fake = CodexFakeAppServer::new("skills_unsupported", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = write_codex_skill(store.path(), "selected", "body");
-        let config = BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                skills: vec![selected],
-                skill_delivery: crate::agent::customization::SkillDelivery::NativeDiscovery,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let (backend, mut events) = <CodexBackend as Backend>::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            config,
-            SessionId("resume-target".to_owned()),
-        )
-        .await
-        .expect("resume returns an event stream for asynchronous startup");
-        let replay_complete = events
-            .take_resume_replay_complete()
-            .expect("resume replay barrier");
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .expect("resume setup error timeout")
-            .expect("resume setup error event");
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("resume setup failure must be a visible message");
-        };
-        // A warning, not an error: the resume succeeds, it just has no Tyde
-        // skills. An error card here would say the session did not come back.
-        assert!(matches!(message.sender, MessageSender::Warning));
-        assert!(message.content.contains("skills/extraRoots/set"));
-        assert!(message.content.contains("Update Codex CLI"));
-        tokio::time::timeout(Duration::from_secs(5), replay_complete)
-            .await
-            .expect("resume warning completes replay barrier")
-            .expect("resume worker retains replay barrier");
-        assert!(
-            fake.requests().iter().any(|request| {
-                matches!(
-                    request.get("method").and_then(Value::as_str),
-                    Some("thread/start" | "thread/resume")
-                )
-            }),
-            "the session must still resume without its skills"
-        );
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_resume_surfaces_native_skill_collisions_without_a_turn() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let native_root = native_home.path().join("skills");
-        std::fs::create_dir_all(&native_root).expect("native skill root");
-        let _native = write_codex_skill(&native_root, "collision", "native body");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = write_codex_skill(store.path(), "collision", "selected body");
-        let config = BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                skills: vec![selected],
-                skill_delivery: crate::agent::customization::SkillDelivery::NativeDiscovery,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let (backend, mut events) = <CodexBackend as Backend>::resume(
-            vec![workspace.path().to_string_lossy().to_string()],
-            config,
-            SessionId("resume-target".to_owned()),
-        )
-        .await
-        .expect("resume returns an event stream for asynchronous startup");
-        let replay_complete = events
-            .take_resume_replay_complete()
-            .expect("resume replay barrier");
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .expect("resume collision timeout")
-            .expect("resume collision event");
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("resume collision must be a visible message");
-        };
-        assert!(matches!(message.sender, MessageSender::Warning));
-        assert!(
-            message
-                .content
-                .contains("conflicts with a different enabled Codex skill")
-        );
-        tokio::time::timeout(Duration::from_secs(5), replay_complete)
-            .await
-            .expect("resume collision completes replay barrier")
-            .expect("resume worker retains replay barrier");
-        // The colliding skill was dropped before any root was registered, so
-        // nothing of Tyde's is exposed — but the session itself comes back.
-        assert!(!fake.requests().iter().any(|request| {
-            matches!(
-                request.get("method").and_then(Value::as_str),
-                Some("skills/extraRoots/set")
-            )
-        }));
-        assert!(fake.requests().iter().any(|request| {
-            matches!(
-                request.get("method").and_then(Value::as_str),
-                Some("thread/start" | "thread/resume")
-            )
-        }));
-        backend.shutdown().await;
-    }
-
-    /// Whether a startup mode is fatal, or merely costs the session its skills.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum CodexStartupOutcome {
-        /// Nothing to do with skills: without this step there is no session.
-        Fails,
-        /// A skill could not be exposed. The session starts without it.
-        DegradesWithoutSkills,
-    }
-
-    /// Whatever the outcome, the session's own skill root is cleaned up and the
-    /// user's skill store is untouched.
-    #[tokio::test]
-    async fn codex_native_skill_startup_failures_clean_owned_roots() {
-        for (mode, outcome) in [
-            ("skills_initialize_error", CodexStartupOutcome::Fails),
-            (
-                "skills_set_error",
-                CodexStartupOutcome::DegradesWithoutSkills,
-            ),
-            (
-                "skills_final_missing",
-                CodexStartupOutcome::DegradesWithoutSkills,
-            ),
-            (
-                "skills_final_disabled",
-                CodexStartupOutcome::DegradesWithoutSkills,
-            ),
-            ("skills_thread_start_error", CodexStartupOutcome::Fails),
-        ] {
-            let fake = CodexFakeAppServer::new(mode, "unused");
-            let native_home = tempfile::tempdir().expect("native Codex home");
-            let before = fake.skill_projection_dirs();
-            let guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-                fake.binary.clone(),
-                Some(native_home.path().to_path_buf()),
-            );
-            let workspace = tempfile::tempdir().expect("workspace");
-            let store = tempfile::tempdir().expect("Tyde skill store");
-            let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-
-            let result = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                Some("temporary steering"),
-                codex_native_skill_spawn_options(&selected),
-            )
-            .await;
-            match (outcome, result) {
-                (CodexStartupOutcome::Fails, Ok((session, _))) => {
-                    session.shutdown().await;
-                    panic!("{mode} must fail startup")
-                }
-                (CodexStartupOutcome::Fails, Err(err)) => {
-                    assert!(!err.is_empty(), "{mode} must report a visible error")
-                }
-                (CodexStartupOutcome::DegradesWithoutSkills, Ok((session, _))) => {
-                    session.shutdown().await
-                }
-                (CodexStartupOutcome::DegradesWithoutSkills, Err(err)) => {
-                    panic!("{mode} costs the session its skills, not the session: {err}")
-                }
-            }
-            assert_eq!(
-                fake.skill_projection_dirs(),
-                before,
-                "{mode} leaked a session skill root"
-            );
-            assert!(selected[0].skill_md_path.exists(), "{mode} removed source");
-            drop(guard);
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_native_skill_root_is_cleaned_when_app_server_cannot_spawn() {
-        let missing = tempfile::tempdir().expect("missing app-server parent");
-        let _guard = CodexTestAppServerBinaryGuard::set(missing.path().join("not-present"));
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-        let projection_parent = missing.path().join("skill-projections");
-        let before = skill_projection_dirs_under(&projection_parent);
-
-        let result = CodexSession::spawn_with_mode(
-            &[workspace.path().to_string_lossy().to_string()],
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await;
-        match result {
-            Ok((session, _)) => {
-                session.shutdown().await;
-                panic!("missing app-server must fail startup")
-            }
-            Err(err) => assert!(err.contains("Failed to spawn Codex app-server")),
-        }
-        assert_eq!(skill_projection_dirs_under(&projection_parent), before);
-        assert!(selected[0].skill_md_path.exists());
-    }
-
-    #[tokio::test]
-    async fn cancelling_codex_native_skill_startup_drops_the_projection() {
-        let fake = CodexFakeAppServer::new("skills_final_delayed", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let workspace_roots = vec![workspace.path().to_string_lossy().to_string()];
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-
-        let startup = tokio::spawn(async move {
-            CodexSession::spawn_with_mode(
-                &workspace_roots,
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options(&selected),
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if fake
-                    .requests()
-                    .iter()
-                    .filter(|request| {
-                        request.get("method").and_then(Value::as_str) == Some("skills/list")
-                    })
-                    .count()
-                    >= 2
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("startup reached delayed final skills/list");
-        let projection = codex_extra_root(&fake.requests()).expect("projection root");
-        assert!(projection.exists());
-
-        startup.abort();
-        let _ = startup.await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while projection.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("cancelled startup cleaned projection");
-        assert!(store.path().join("selected").join("SKILL.md").exists());
-        assert!(!fake.requests().iter().any(|request| {
-            request.get("method").and_then(Value::as_str) == Some("thread/start")
-        }));
-    }
-
-    #[tokio::test]
-    async fn codex_native_skill_roots_are_isolated_between_concurrent_sessions() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let first_skills = vec![write_codex_skill(store.path(), "first", "first body")];
-        let second_skills = vec![write_codex_skill(store.path(), "second", "second body")];
-        let roots = [workspace.path().to_string_lossy().to_string()];
-
-        let (first, second) = tokio::join!(
-            CodexSession::spawn_with_mode(
-                &roots,
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options(&first_skills),
-            ),
-            CodexSession::spawn_with_mode(
-                &roots,
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options(&second_skills),
-            )
-        );
-        let (first, _) = first.expect("first concurrent session");
-        let (second, _) = second.expect("second concurrent session");
-        let projections = fake
-            .captured_requests()
-            .into_iter()
-            .filter(|captured| {
-                captured.request.get("method").and_then(Value::as_str)
-                    == Some("skills/extraRoots/set")
-            })
-            .filter_map(|captured| {
-                captured
-                    .request
-                    .pointer("/params/extraRoots/0")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-            })
-            .collect::<HashSet<_>>();
-        assert_eq!(projections.len(), 2);
-        assert!(projections.iter().all(|projection| projection.exists()));
-
-        let first_projection = projections
-            .iter()
-            .find(|projection| {
-                std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
-                    .is_ok_and(|body| yaml_string(&codex_wrapper_mapping(&body), "name") == "first")
-            })
-            .expect("first projection")
-            .clone();
-        let second_projection = projections
-            .iter()
-            .find(|projection| {
-                std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md")).is_ok_and(
-                    |body| yaml_string(&codex_wrapper_mapping(&body), "name") == "second",
-                )
-            })
-            .expect("second projection")
-            .clone();
-        first.shutdown().await;
-        assert!(!first_projection.exists());
-        assert!(second_projection.exists());
-        second.shutdown().await;
-        assert!(!second_projection.exists());
-        assert!(first_skills[0].skill_md_path.exists());
-        assert!(second_skills[0].skill_md_path.exists());
-    }
-
-    #[tokio::test]
-    async fn codex_native_skills_precede_fork_and_resume_thread_operations() {
-        let fake = CodexFakeAppServer::new("ok", "forked-thread");
-        let native_home = tempfile::tempdir().expect("native Codex home");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let workspace = tempfile::tempdir().expect("workspace");
-        let workspace_roots = [workspace.path().to_string_lossy().to_string()];
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-
-        let (forked, _) = CodexSession::fork_with_selected_skills(
-            &workspace_roots,
-            None,
-            &[],
-            None,
-            BackendAccessMode::Unrestricted,
-            "parent-thread",
-            CodexSelectedSkillContext {
-                skills: &selected,
-                selection: SkillSelection::Explicit,
-                installed_provider_version: None,
-            },
-        )
-        .await
-        .expect("fork with selected skills");
-        forked.shutdown().await;
-
-        let (resumed, _) = CodexSession::spawn_with_mode(
-            &workspace_roots,
-            None,
-            &[],
-            None,
-            codex_native_skill_spawn_options(&selected),
-        )
-        .await
-        .expect("resume bootstrap with selected skills");
-        resumed
-            .command_handle()
-            .execute(SessionCommand::ResumeSession {
-                session_id: "resumed-thread".to_owned(),
-            })
-            .await
-            .expect("resume existing thread");
-        resumed.shutdown().await;
-
-        let captured = fake.captured_requests();
-        let pids = captured
-            .iter()
-            .map(|captured| captured.pid)
-            .collect::<HashSet<_>>();
-        assert_eq!(pids.len(), 2);
-        for pid in pids {
-            let methods = captured
-                .iter()
-                .filter(|captured| captured.pid == pid)
-                .filter_map(|captured| captured.request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                &methods[..4],
-                [
-                    "initialize",
-                    "skills/list",
-                    "skills/extraRoots/set",
-                    "skills/list",
-                ]
-            );
-            let thread_index = methods
-                .iter()
-                .position(|method| {
-                    matches!(*method, "thread/start" | "thread/fork" | "thread/resume")
-                })
-                .expect("thread operation");
-            assert!(thread_index >= 4);
-        }
-    }
-
-    #[test]
-    fn codex_ssh_drops_only_nonempty_native_skill_selections() {
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-        assert!(codex_selected_skills_ssh_notice(Some("example.com"), &[]).is_none());
-        let notice = codex_selected_skills_ssh_notice(Some("example.com"), &selected)
-            .expect("selected SSH skills must be dropped with a notice");
-        assert!(notice.contains("example.com"));
-        assert!(notice.contains("will not send local skill paths"));
-        assert!(codex_selected_skills_ssh_notice(None, &selected).is_none());
-    }
-
-    #[test]
-    fn codex_selected_skill_and_fork_gates_share_malformed_ssh_detection() {
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-        let malformed = ["ssh://missing-remote-path".to_owned()];
-
-        let selected_notice = codex_selected_skills_remote_workspace_notice(&malformed, &selected)
-            .expect("selected skills must be dropped for malformed SSH roots");
-        let fork_error = codex_ssh_fork_unsupported_error(&malformed)
-            .expect("fork must still reject the same malformed SSH roots");
-
-        assert!(selected_notice.contains("malformed SSH workspace roots"));
-        assert!(fork_error.message.contains("malformed SSH workspace roots"));
-        assert!(
-            codex_selected_skills_remote_workspace_notice(&malformed, &[]).is_none(),
-            "no-skill SSH behavior remains unchanged"
-        );
-    }
-
-    /// The contract this used to enforce by refusing the spawn: **no local skill
-    /// path is ever handed to a remote app-server**, and nothing is materialized
-    /// for a selection that cannot travel. That still holds — the session now
-    /// starts without the skills instead of not starting at all, so the
-    /// assertion moved from "the spawn fails" to "the selection is dropped and
-    /// nothing local is written".
-    #[test]
-    fn codex_remote_roots_drop_selected_skills_before_local_startup() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let store = tempfile::tempdir().expect("Tyde skill store");
-        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
-        let remote_roots = vec!["ssh://devbox.example.com/workspace".to_owned()];
-
-        let notice = codex_remote_skill_notice(None, &remote_roots, &selected)
-            .expect("remote roots must drop a non-empty selection");
-        assert!(notice.contains("devbox.example.com"), "{notice}");
-        assert!(
-            notice.contains("will not send local skill paths"),
-            "{notice}"
-        );
-        assert!(
-            codex_remote_skill_notice(None, &remote_roots, &[]).is_none(),
-            "no-skill SSH sessions retain their existing routing"
-        );
-
-        // The dropped selection is what reaches projection, so nothing local is
-        // materialized and no path exists to send anywhere.
-        assert!(
-            CodexSkillProjection::new(&[])
-                .expect("an empty selection needs no projection")
-                .is_none()
-        );
-        assert!(fake.skill_projection_dirs().is_empty());
-        assert!(fake.requests().is_empty());
-    }
-
-    #[test]
-    fn codex_projection_scans_are_isolated_by_instance_parent() {
-        let first = CodexFakeAppServer::new("ok", "unused");
-        let second = CodexFakeAppServer::new("ok", "unused");
-        let first_projection = first
-            .skill_temp_parent
-            .join(format!("{CODEX_SKILLS_ROOT_PREFIX}first"));
-        let second_projection = second
-            .skill_temp_parent
-            .join(format!("{CODEX_SKILLS_ROOT_PREFIX}second"));
-        std::fs::create_dir_all(&first_projection).expect("first instance projection");
-        std::fs::create_dir_all(&second_projection).expect("second instance projection");
-
-        assert_eq!(
-            first.skill_projection_dirs(),
-            HashSet::from([first_projection])
-        );
-        assert_eq!(
-            second.skill_projection_dirs(),
-            HashSet::from([second_projection])
-        );
-    }
-
-    const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
-    const LIVE_CODEX_TEST_ENV: &str = "TYDE_LIVE_CODEX_TEST";
-
-    fn live_codex_tests_enabled() -> bool {
-        std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
-            || std::env::var(LIVE_CODEX_TEST_ENV).ok().as_deref() == Some("1")
-    }
-
-    fn live_test_verbose() -> bool {
-        std::env::var("TYDE_LIVE_CODEX_TEST_VERBOSE")
-            .ok()
-            .as_deref()
-            == Some("1")
-    }
-
-    fn live_test_log(msg: &str) {
-        eprintln!("[live-codex-test] {msg}");
-    }
-
-    fn skip_live_codex_test() {
-        eprintln!(
-            "Skipping live Codex test (set {RUN_REAL_AI_TESTS_ENV}=1 or {LIVE_CODEX_TEST_ENV}=1 to run)."
-        );
-    }
-
-    fn test_file_change(path: &str, lines_added: u64, lines_removed: u64) -> CodexFileChange {
-        CodexFileChange {
-            path: path.to_string(),
-            before: "before".to_string(),
-            after: "after".to_string(),
-            lines_added,
-            lines_removed,
-        }
-    }
-
-    #[test]
-    fn file_change_completion_plan_completes_missing_started_paths() {
-        let known_call_ids = vec![
-            "change-1#1".to_string(),
-            "change-1#2".to_string(),
-            "change-1#3".to_string(),
-            "change-1#4".to_string(),
-        ];
-        let file_changes = vec![
-            test_file_change("src/a.rs", 4, 1),
-            test_file_change("src/b.rs", 2, 0),
-        ];
-
-        let completions =
-            codex_file_change_completion_plan("change-1", &known_call_ids, &file_changes);
-
-        assert_eq!(completions.len(), 4);
-        assert_eq!(
-            completions
-                .iter()
-                .map(|completion| completion.call_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["change-1#1", "change-1#2", "change-1#3", "change-1#4"]
-        );
-        assert_eq!(
-            completions
-                .iter()
-                .map(|completion| (completion.lines_added, completion.lines_removed))
-                .collect::<Vec<_>>(),
-            vec![(4, 1), (2, 0), (0, 0), (0, 0)]
-        );
-        assert!(
-            completions
-                .iter()
-                .all(|completion| completion.request.is_none()),
-            "known request ids should not emit duplicate requests"
-        );
-    }
-
-    #[test]
-    fn file_change_completion_plan_completes_known_ids_without_changes() {
-        let known_call_ids = vec!["change-2#1".to_string(), "change-2#2".to_string()];
-
-        let completions = codex_file_change_completion_plan("change-2", &known_call_ids, &[]);
-
-        assert_eq!(
-            completions
-                .iter()
-                .map(|completion| (completion.call_id.as_str(), completion.lines_added))
-                .collect::<Vec<_>>(),
-            vec![("change-2#1", 0), ("change-2#2", 0)]
-        );
-    }
-
-    #[test]
-    fn file_change_completion_plan_requests_new_completed_changes() {
-        let file_changes = vec![
-            test_file_change("src/a.rs", 1, 0),
-            test_file_change("src/b.rs", 0, 3),
-        ];
-
-        let completions = codex_file_change_completion_plan("change-3", &[], &file_changes);
-
-        assert_eq!(
-            completions
-                .iter()
-                .map(|completion| completion.call_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["change-3#1", "change-3#2"]
-        );
-        assert_eq!(
-            completions
-                .iter()
-                .filter_map(|completion| completion.request.as_ref())
-                .map(|change| change.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/b.rs"]
-        );
-    }
-
-    #[test]
-    fn codex_model_options_use_canonical_labels_and_version_sort() {
-        let raw_models = vec![
-            json!({
-                "id": "gpt-5.4",
-                "model": "gpt-5.4",
-                "displayName": "gpt-5.4",
-            }),
-            json!({
-                "id": "gpt-5.5",
-                "model": "gpt-5.5",
-                "displayName": "GPT-5.5",
-            }),
-            json!({
-                "id": "gpt-5.4-mini",
-                "model": "gpt-5.4-mini",
-                "displayName": "GPT-5.4-Mini",
-            }),
-            json!({
-                "id": "gpt-5.3-codex",
-                "model": "gpt-5.3-codex",
-                "displayName": "gpt-5.3-codex",
-            }),
-            json!({
-                "id": "gpt-5.3-codex-spark",
-                "model": "gpt-5.3-codex-spark",
-                "displayName": "GPT-5.3-Codex-Spark",
-            }),
-            json!({
-                "id": "gpt-5.2",
-                "model": "gpt-5.2",
-                "displayName": "gpt-5.2",
-            }),
-        ];
-
-        let options = codex_model_metadata_from_raw(&raw_models)
-            .into_iter()
-            .map(|model| model.option)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            options,
-            vec![
-                protocol::SelectOption {
-                    value: "gpt-5.5".to_string(),
-                    label: "gpt-5.5".to_string(),
-                },
-                protocol::SelectOption {
-                    value: "gpt-5.4".to_string(),
-                    label: "gpt-5.4".to_string(),
-                },
-                protocol::SelectOption {
-                    value: "gpt-5.4-mini".to_string(),
-                    label: "gpt-5.4-mini".to_string(),
-                },
-                protocol::SelectOption {
-                    value: "gpt-5.3-codex".to_string(),
-                    label: "gpt-5.3-codex".to_string(),
-                },
-                protocol::SelectOption {
-                    value: "gpt-5.3-codex-spark".to_string(),
-                    label: "gpt-5.3-codex-spark".to_string(),
-                },
-                protocol::SelectOption {
-                    value: "gpt-5.2".to_string(),
-                    label: "gpt-5.2".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn codex_model_version_sort_handles_multi_digit_components() {
-        let raw_models = vec![
-            json!({ "model": "gpt-5.9" }),
-            json!({ "model": "gpt-5.10" }),
-            json!({ "model": "gpt-5.10-mini" }),
-            json!({ "model": "gpt-5" }),
-        ];
-
-        let values = codex_model_metadata_from_raw(&raw_models)
-            .into_iter()
-            .map(|model| model.option.value)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            values,
-            vec!["gpt-5.10", "gpt-5.10-mini", "gpt-5.9", "gpt-5"]
-        );
-    }
-
-    #[test]
-    fn codex_auto_model_remains_unset_in_dynamic_schema_and_spawn_settings() {
-        let schema = codex_session_settings_schema(codex_model_metadata_from_raw(&[json!({
-            "model": "gpt-5.6",
-            "isDefault": true,
-            "supportedReasoningEfforts": [
-                { "reasoningEffort": "low" },
-                { "reasoningEffort": "max" }
-            ]
-        })]));
-        let model_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model")
-            .expect("Codex model field");
-        let SessionSettingFieldType::Select {
-            default, nullable, ..
-        } = &model_field.field_type
-        else {
-            panic!("Codex model field should be a select");
-        };
-        assert_eq!(default, &None);
-        assert!(*nullable);
-
-        let resolved = resolve_session_settings(&BackendSpawnConfig::default());
-        assert!(
-            !resolved.0.contains_key("model"),
-            "Auto must omit the model override so Codex selects its effective model"
-        );
-        assert!(
-            !resolved.0.contains_key("reasoning_effort"),
-            "Auto must not force a reasoning level over Codex's model default"
-        );
-    }
-
-    #[test]
-    fn codex_thread_settings_update_preserves_null_and_omission() {
-        assert_eq!(
-            codex_thread_settings_update_params(
-                "thread-1",
-                &json!({
-                    "model": null,
-                    "reasoning_effort": "high",
-                }),
-            )
-            .expect("settings params"),
-            json!({
-                "threadId": "thread-1",
-                "model": null,
-                "effort": "high",
-            })
-        );
-        assert_eq!(
-            codex_thread_settings_update_params(
-                "thread-2",
-                &json!({
-                    "approval_policy": null,
-                }),
-            )
-            .expect("settings params"),
-            json!({
-                "threadId": "thread-2",
-                "approvalPolicy": null,
-            })
-        );
-    }
-
-    #[test]
-    fn codex_reasoning_options_follow_each_models_metadata() {
-        let schema = codex_session_settings_schema(codex_model_metadata_from_raw(&[
-            json!({
-                "model": "gpt-5.6",
-                "isDefault": true,
-                "supportedReasoningEfforts": [
-                    { "reasoningEffort": "low" },
-                    { "reasoningEffort": "xhigh" },
-                    { "reasoningEffort": "max" },
-                    { "reasoningEffort": "ultra" }
-                ]
-            }),
-            json!({
-                "model": "gpt-5.5",
-                "supportedReasoningEfforts": [
-                    { "reasoningEffort": "low" },
-                    { "reasoningEffort": "high" }
-                ]
-            }),
-        ]));
-        let reasoning_field = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "reasoning_effort")
-            .expect("Codex reasoning field");
-
-        let mut values = protocol::SessionSettingsValues::default();
-        assert_eq!(
-            reasoning_field
-                .select_options(&values)
-                .expect("default model reasoning options")
-                .iter()
-                .map(|option| option.value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["low", "xhigh", "max", "ultra"]
-        );
-
-        values.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("gpt-5.5".to_string()),
-        );
-        assert_eq!(
-            reasoning_field
-                .select_options(&values)
-                .expect("selected model reasoning options")
-                .iter()
-                .map(|option| option.value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["low", "high"]
-        );
-
-        let tiers =
-            codex_tier_config_from_schema(&schema, &protocol::SessionSettingsValues::default())
-                .expect("Codex tiers should resolve from default model metadata");
-        assert_eq!(
-            tiers.low.0.get("reasoning_effort"),
-            Some(&SessionSettingValue::String("low".to_owned()))
-        );
-        assert_eq!(
-            tiers.high.0.get("reasoning_effort"),
-            Some(&SessionSettingValue::String("ultra".to_owned()))
-        );
-        assert!(!tiers.low.0.contains_key("model"));
-        assert!(!tiers.high.0.contains_key("model"));
-
-        let selected_model_tiers = codex_tier_config_from_schema(&schema, &values)
-            .expect("Codex tiers should follow the selected model metadata");
-        assert_eq!(
-            selected_model_tiers.high.0.get("reasoning_effort"),
-            Some(&SessionSettingValue::String("high".to_owned()))
-        );
-
-        values.0.insert(
-            "reasoning_effort".to_string(),
-            SessionSettingValue::String("max".to_string()),
-        );
-        let error = crate::backend::validate_session_settings_values(&schema, &values)
-            .expect_err("unsupported model/effort pair must be rejected");
-        assert!(error.contains("reasoning_effort"));
-        assert!(error.contains("max"));
-    }
-
-    #[test]
-    fn codex_reasoning_normalization_preserves_max() {
-        assert_eq!(normalize_reasoning_effort("max").as_deref(), Some("max"));
-        assert_eq!(
-            normalize_reasoning_effort("xhigh").as_deref(),
-            Some("xhigh")
-        );
-    }
-
-    #[test]
-    fn codex_model_probe_surfaces_cleanup_failure_after_success() {
-        let error = codex_probe_result_with_cleanup(
-            Ok::<_, String>(()),
-            Err("timed out reaping test app-server".to_string()),
-        )
-        .expect_err("cleanup failure must fail model discovery");
-
-        assert!(error.contains("Codex model discovery app-server cleanup failed"));
-        assert!(error.contains("timed out reaping test app-server"));
-    }
-
-    #[test]
-    fn codex_terminate_ignores_kill_failure_when_child_was_reaped() {
-        codex_terminate_outcome(
-            Some(
-                "failed to kill Codex app-server process group: No such process (os error 3)"
-                    .to_string(),
-            ),
-            None,
-        )
-        .expect("killing an already-exited child must not report a cleanup failure");
-    }
-
-    #[test]
-    fn codex_terminate_surfaces_kill_failure_when_child_never_exits() {
-        let error = codex_terminate_outcome(
-            Some("failed to kill Codex app-server process group: permission denied".to_string()),
-            Some("timed out after 3s reaping Codex app-server process group".to_string()),
-        )
-        .expect_err("an unkillable, unreaped child must fail cleanup");
-        assert!(error.contains("permission denied"));
-        assert!(error.contains("timed out"));
-    }
-
-    #[test]
-    fn codex_model_probe_preserves_operation_and_cleanup_failures() {
-        let error = codex_probe_result_with_cleanup::<()>(
-            Err("model/list failed".to_string()),
-            Err("kill failed".to_string()),
-        )
-        .expect_err("both failures must remain visible");
-
-        assert!(error.contains("model/list failed"));
-        assert!(error.contains("Codex app-server cleanup also failed: kill failed"));
-    }
-
-    #[tokio::test]
-    async fn codex_child_wait_timeout_is_bounded_and_explicit() {
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_codex_child_exit(
-                std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
-                Duration::from_millis(10),
-            ),
-        )
-        .await
-        .expect("bounded child wait must return")
-        .expect_err("pending child wait must time out");
-
-        assert!(result.contains("timed out after 0.01s"));
-        assert!(result.contains("reaping Codex app-server process group"));
-    }
-
-    async fn wait_for_codex_test_stream_end(events: &mut EventStream) -> protocol::StreamEndData {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if let ChatEvent::StreamEnd(data) = event {
-                    return data;
-                }
-            }
-            panic!("fake Codex event stream ended before StreamEnd");
-        })
-        .await
-        .expect("fake Codex StreamEnd timeout")
-    }
-
-    async fn wait_for_codex_test_error(events: &mut EventStream) -> String {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if let ChatEvent::MessageAdded(message) = event
-                    && matches!(message.sender, MessageSender::Error)
-                {
-                    return message.content;
-                }
-            }
-            panic!("fake Codex event stream ended before typed error");
-        })
-        .await
-        .expect("fake Codex typed error timeout")
-    }
-
-    #[tokio::test]
-    async fn submitted_turn_emits_one_active_event() {
-        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "initial".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-
-        let active_events = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut active_events = 0;
-            let mut stream_ended = false;
-            while let Some(event) = events.recv().await {
-                match event {
-                    ChatEvent::TypingStatusChanged(true) => {
-                        active_events += 1;
-                    }
-                    ChatEvent::StreamEnd(_) => {
-                        stream_ended = true;
-                    }
-                    ChatEvent::TypingStatusChanged(false) if stream_ended => {
-                        return active_events;
-                    }
-                    _ => {}
-                }
-            }
-            panic!("fake Codex event stream ended before idle");
-        })
-        .await
-        .expect("fake Codex idle timeout");
-
-        assert_eq!(active_events, 1);
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn strict_termination_interrupts_once_without_waiting() {
-        let fake = CodexFakeAppServer::new("strict_termination_interrupt_held", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "trigger strict termination".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-
-        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut terminal = Vec::new();
-            while let Some(event) = events.recv().await {
-                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
-                terminal.push(event);
-                if idle {
-                    return terminal;
-                }
-            }
-            panic!("strict termination ended before its idle tail");
-        })
-        .await
-        .expect("strict termination tail must not await turn/interrupt");
-
-        let stream_end = terminal
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    ChatEvent::StreamEnd(data)
-                        if data.message.message_id.as_ref().is_some_and(
-                            |message_id| message_id.0 == "strict-open-item"
-                        )
-                            && data.message.content == "accepted before violation"
-                )
-            })
-            .expect("accepted provider content must finalize before termination");
-        let error = terminal
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    ChatEvent::MessageAdded(message)
-                        if matches!(&message.sender, MessageSender::Error)
-                            && message.content
-                                == "Stream identity violation: foreign active message id"
-                )
-            })
-            .expect("strict termination must emit its identity error");
-        let cancelled = terminal
-            .iter()
-            .position(|event| matches!(event, ChatEvent::OperationCancelled(_)))
-            .expect("strict termination must emit cancellation");
-        let idle = terminal
-            .iter()
-            .position(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-            .expect("strict termination must emit idle");
-        assert!(stream_end < error && error < cancelled && cancelled < idle);
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if fake.requests().iter().any(|request| {
-                    request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
-                }) {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("strict termination must spawn turn/interrupt");
-        let interrupts = fake
-            .requests()
-            .into_iter()
-            .filter(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(interrupts.len(), 1);
-        assert_eq!(
-            interrupts[0]
-                .pointer("/params/threadId")
-                .and_then(Value::as_str),
-            Some("fresh-thread-id")
-        );
-        assert_eq!(
-            interrupts[0]
-                .pointer("/params/turnId")
-                .and_then(Value::as_str),
-            Some("turn-strict-termination")
-        );
-        assert!(
-            fake.requests().iter().all(|request| {
-                request.get("id").and_then(Value::as_u64) != Some(991)
-                    || request.get("result").is_none()
-            }),
-            "the terminal tail must arrive while the fake still holds the interrupt response"
-        );
-
-        fake.release_initial_turn();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if fake.requests().iter().any(|request| {
-                    request.get("id").and_then(Value::as_u64) == Some(991)
-                        && request.get("result").is_some()
-                }) {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fake interrupt failure and repeated violation must be observed");
-        assert_eq!(
-            fake.requests()
-                .iter()
-                .filter(|request| {
-                    request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
-                })
-                .count(),
-            1,
-            "a repeated violation and a definitive interrupt failure must not retry"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_inference_mode_inherits_auth_and_rejects_tools() {
-        let fake = CodexFakeAppServer::new("inference_reject_command", "unused");
-        let native_home = tempfile::tempdir().expect("native Codex home fixture");
-        std::fs::write(
-            native_home.path().join("config.toml"),
-            "notify = [\"/tmp/native-notify\"]\n\n[mcp_servers.native-fixture]\nurl = \"https://native.invalid/mcp\"\n",
-        )
-        .expect("write native Codex MCP fixture");
-        std::fs::write(
-            native_home.path().join("auth.json"),
-            r#"{"OPENAI_API_KEY":"fixture-only","tokens":null}"#,
-        )
-        .expect("write native Codex auth fixture");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            fake.binary.clone(),
-            Some(native_home.path().to_path_buf()),
-        );
-        let isolated_workspace = tempfile::tempdir().expect("isolated naming workspace");
-        let isolated_root = isolated_workspace.path().to_string_lossy().to_string();
-        let configured_mcp = StartupMcpServer {
-            name: "method-not-allowed".to_owned(),
-            transport: StartupMcpTransport::Http {
-                url: "https://example.com/mcp".to_owned(),
-                headers: HashMap::new(),
-                bearer_token_env_var: None,
-            },
-        };
-        let mut configured_settings = protocol::SessionSettingsValues::default();
-        configured_settings.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("configured-model".to_owned()),
-        );
-        configured_settings.0.insert(
-            "reasoning_effort".to_owned(),
-            SessionSettingValue::String("high".to_owned()),
-        );
-        let task = "Investigate the configured MCP endpoint";
-        let naming_prompt = crate::agent::build_name_generation_prompt(task);
-        let mut naming_config = crate::agent::agent_name_generation_spawn_config(None);
-        assert_eq!(
-            naming_config.resolved_spawn_config.tool_policy,
-            protocol::ToolPolicy::AllowList { tools: Vec::new() }
-        );
-        naming_config.startup_mcp_servers = vec![configured_mcp.clone()];
-        naming_config.session_settings = Some(configured_settings.clone());
-        naming_config.resolved_spawn_config.instructions =
-            Some("This configured agent instruction must not enter naming.".to_owned());
-
-        let (naming_backend, mut naming_events) = <CodexBackend as Backend>::spawn(
-            vec![isolated_root.clone()],
-            naming_config,
-            protocol::SendMessagePayload {
-                message: naming_prompt.clone(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn production Codex naming backend against fake app-server");
-        let naming_error = wait_for_codex_test_error(&mut naming_events).await;
-        assert_eq!(
-            naming_error,
-            "Codex transient inference rejected tool request 'item/commandExecution/requestApproval'"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        naming_backend.shutdown().await;
-
-        let naming_capture = fake.captured_requests();
-        let naming_pid = naming_capture
-            .iter()
-            .find(|captured| {
-                captured
-                    .request
-                    .pointer("/params/input/0/text")
-                    .and_then(Value::as_str)
-                    == Some(naming_prompt.as_str())
-            })
-            .map(|captured| captured.pid)
-            .expect("captured naming turn");
-        let naming_requests = naming_capture
-            .iter()
-            .filter(|captured| captured.pid == naming_pid)
-            .map(|captured| &captured.request)
-            .collect::<Vec<_>>();
-        let naming_thread = naming_requests
-            .iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
-            .expect("naming thread/start");
-        let config_read_index = naming_requests
-            .iter()
-            .position(|request| {
-                request.get("method").and_then(Value::as_str) == Some("config/read")
-            })
-            .expect("naming config/read");
-        let thread_start_index = naming_requests
-            .iter()
-            .position(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/start")
-            })
-            .expect("naming thread/start index");
-        assert!(config_read_index < thread_start_index);
-        assert_eq!(
-            naming_requests[config_read_index]
-                .pointer("/params/cwd")
-                .and_then(Value::as_str),
-            Some(isolated_root.as_str())
-        );
-        assert_eq!(
-            naming_thread
-                .pointer("/params/config/mcp_servers/native-fixture/enabled")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(
-            naming_thread
-                .pointer("/params/config/notify")
-                .and_then(Value::as_array)
-                .is_some_and(Vec::is_empty)
-        );
-        assert_eq!(
-            naming_thread.pointer("/params/cwd").and_then(Value::as_str),
-            Some(isolated_root.as_str())
-        );
-        assert_eq!(
-            naming_thread
-                .pointer("/params/sandbox")
-                .and_then(Value::as_str),
-            Some(CODEX_INFERENCE_SANDBOX)
-        );
-        assert_eq!(
-            naming_thread
-                .pointer("/params/approvalPolicy")
-                .and_then(Value::as_str),
-            Some(CODEX_INFERENCE_APPROVAL_POLICY)
-        );
-        assert_eq!(
-            naming_thread
-                .pointer("/params/ephemeral")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        let naming_turn = naming_requests
-            .iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .expect("naming turn/start");
-        assert_eq!(
-            naming_turn
-                .pointer("/params/input/0/text")
-                .and_then(Value::as_str),
-            Some(naming_prompt.as_str())
-        );
-        assert_eq!(naming_turn.pointer("/params/model"), None);
-        assert_eq!(naming_turn.pointer("/params/effort"), None);
-        assert_eq!(
-            naming_turn
-                .pointer("/params/sandboxPolicy/type")
-                .and_then(Value::as_str),
-            Some("readOnly")
-        );
-        assert_eq!(
-            naming_turn
-                .pointer("/params/sandboxPolicy/networkAccess")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            naming_turn
-                .pointer("/params/approvalPolicy")
-                .and_then(Value::as_str),
-            Some(CODEX_INFERENCE_APPROVAL_POLICY)
-        );
-        let rejection = naming_requests
-            .iter()
-            .find(|request| request.get("id").and_then(Value::as_u64) == Some(900))
-            .expect("captured naming command rejection");
-        assert_eq!(
-            rejection
-                .pointer("/result/decision")
-                .and_then(Value::as_str),
-            Some("decline")
-        );
-        let naming_argv = fake.argv_for_pid(naming_pid);
-        assert!(
-            naming_argv.windows(2).any(|args| {
-                args == ["--sandbox".to_owned(), CODEX_INFERENCE_SANDBOX.to_owned()]
-            })
-        );
-        for disabled in codex_inference_config_overrides() {
-            assert!(naming_argv.contains(&disabled), "missing {disabled}");
-        }
-        assert!(
-            !naming_argv
-                .iter()
-                .any(|arg| arg.starts_with("mcp_servers."))
-        );
-        assert!(
-            !naming_argv
-                .iter()
-                .any(|arg| arg.starts_with("model_instructions_file="))
-        );
-        let naming_environment = fake.environment_for_pid(naming_pid);
-        assert_eq!(
-            naming_environment.codex_home.as_deref(),
-            Some(native_home.path())
-        );
-        assert!(naming_environment.auth_present);
-        assert!(naming_environment.native_mcp_configured);
-        assert!(!fake.native_mcp_contact_pids().contains(&naming_pid));
-        assert!(!fake.command_execution_marker.exists());
-
-        let real_workspace = tempfile::tempdir().expect("real agent workspace");
-        let real_root = real_workspace.path().to_string_lossy().to_string();
-        let real_task = "Perform the full configured agent task";
-        let real_config = BackendSpawnConfig {
-            execution_mode: BackendExecutionMode::Agent,
-            startup_mcp_servers: vec![configured_mcp],
-            session_settings: Some(configured_settings),
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                instructions: Some("Retain the real agent instruction.".to_owned()),
-                access_mode: BackendAccessMode::Unrestricted,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (real_backend, mut real_events) = <CodexBackend as Backend>::spawn(
-            vec![real_root.clone()],
-            real_config,
-            protocol::SendMessagePayload {
-                message: real_task.to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn production real-agent Codex backend against fake app-server");
-        let _ = wait_for_codex_test_stream_end(&mut real_events).await;
-        real_backend.shutdown().await;
-
-        let real_capture = fake.captured_requests();
-        let real_pid = real_capture
-            .iter()
-            .find(|captured| {
-                captured
-                    .request
-                    .pointer("/params/input/0/text")
-                    .and_then(Value::as_str)
-                    == Some(real_task)
-            })
-            .map(|captured| captured.pid)
-            .expect("captured real agent turn");
-        let real_requests = real_capture
-            .iter()
-            .filter(|captured| captured.pid == real_pid)
-            .map(|captured| &captured.request)
-            .collect::<Vec<_>>();
-        let real_thread = real_requests
-            .iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
-            .expect("real agent thread/start");
-        assert!(real_thread.pointer("/params/config").is_none());
-        assert_eq!(
-            real_thread.pointer("/params/cwd").and_then(Value::as_str),
-            Some(real_root.as_str())
-        );
-        assert_eq!(
-            real_thread
-                .pointer("/params/ephemeral")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        let real_turn = real_requests
-            .iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .expect("real agent turn/start");
-        assert_eq!(
-            real_turn
-                .pointer("/params/input/0/text")
-                .and_then(Value::as_str),
-            Some(real_task)
-        );
-        assert_eq!(
-            real_turn.pointer("/params/model").and_then(Value::as_str),
-            Some("configured-model")
-        );
-        assert_eq!(
-            real_turn.pointer("/params/effort").and_then(Value::as_str),
-            Some("high")
-        );
-        let real_argv = fake.argv_for_pid(real_pid);
-        assert!(real_argv.iter().any(|arg| {
-            arg == "mcp_servers.method-not-allowed.url=\"https://example.com/mcp\""
-        }));
-        assert!(
-            real_argv
-                .iter()
-                .any(|arg| arg.starts_with("model_instructions_file="))
-        );
-        assert!(!real_argv.contains(&"features.shell_tool=false".to_owned()));
-        let real_environment = fake.environment_for_pid(real_pid);
-        assert_eq!(
-            real_environment.codex_home.as_deref(),
-            Some(native_home.path())
-        );
-        assert!(real_environment.auth_present);
-        assert!(real_environment.native_mcp_configured);
-        assert!(fake.native_mcp_contact_pids().contains(&real_pid));
-    }
-
-    #[tokio::test]
-    async fn codex_session_runtime_settings_acknowledge_provider_before_followup() {
-        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let workspace_roots = vec![workspace.path().to_string_lossy().to_string()];
-        let (session, _events) = CodexSession::spawn(
-            &workspace_roots,
-            None,
-            &[],
-            None,
-            BackendAccessMode::ReadOnly,
-        )
-        .await
-        .expect("spawn fake Codex session");
-        let handle = session.command_handle();
-
-        handle
-            .update_runtime_settings(json!({
-                "model": "gpt-updated",
-                "reasoning_effort": "max",
-            }))
-            .await
-            .expect("provider should accept settings update");
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "followup".to_owned(),
-                images: None,
-            })
-            .await
-            .expect("send followup after settings acknowledgement");
-        session.shutdown().await;
-
-        let requests = fake.requests();
-        let update_index = requests
-            .iter()
-            .position(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
-            })
-            .expect("thread/settings/update request");
-        let turn_index = requests
-            .iter()
-            .position(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .expect("turn/start request");
-        assert!(update_index < turn_index);
-        assert_eq!(
-            requests[update_index]
-                .pointer("/params/effort")
-                .and_then(Value::as_str),
-            Some("max")
-        );
-        assert!(requests[update_index].pointer("/params/settings").is_none());
-        assert_eq!(
-            requests[turn_index]
-                .pointer("/params/model")
-                .and_then(Value::as_str),
-            Some("gpt-updated")
-        );
-        assert_eq!(
-            requests[turn_index]
-                .pointer("/params/effort")
-                .and_then(Value::as_str),
-            Some("max")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_session_rejected_runtime_settings_preserve_live_state() {
-        let fake = CodexFakeAppServer::new("reject_runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let workspace_roots = vec![workspace.path().to_string_lossy().to_string()];
-        let (session, _events) = CodexSession::spawn(
-            &workspace_roots,
-            None,
-            &[],
-            None,
-            BackendAccessMode::ReadOnly,
-        )
-        .await
-        .expect("spawn fake Codex session");
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::UpdateSettings {
-                settings: json!({
-                    "model": "gpt-initial",
-                    "reasoning_effort": "low",
-                }),
-                persist: false,
-            })
-            .await
-            .expect("configure initial live settings");
-
-        let error = handle
-            .update_runtime_settings(json!({
-                "model": "gpt-rejected",
-                "reasoning_effort": "max",
-            }))
-            .await
-            .expect_err("provider rejection must reach the caller");
-        assert!(error.contains("settings rejected"));
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "followup".to_owned(),
-                images: None,
-            })
-            .await
-            .expect("send followup after rejected settings");
-        session.shutdown().await;
-
-        let turn = fake
-            .requests()
-            .into_iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .expect("turn/start request");
-        assert_eq!(
-            turn.pointer("/params/model").and_then(Value::as_str),
-            Some("gpt-initial")
-        );
-        assert_eq!(
-            turn.pointer("/params/effort").and_then(Value::as_str),
-            Some("low")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_auto_model_preserves_effective_model_without_turn_override() {
-        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "initial".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-
-        let completion = wait_for_codex_test_stream_end(&mut events).await;
-        assert_eq!(
-            completion
-                .message
-                .model_info
-                .as_ref()
-                .map(|model| model.model.as_str()),
-            Some("fake-codex-model")
-        );
-
-        let requests = fake.requests();
-        assert!(
-            !requests.iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
-            }),
-            "Auto settings must not dispatch an empty provider update"
-        );
-        let turn = requests
-            .iter()
-            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .expect("initial turn/start request");
-        assert!(turn.pointer("/params/model").is_none());
-        assert!(turn.pointer("/params/effort").is_none());
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_runtime_settings_update_changes_followup_turn_overrides() {
-        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "initial".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-        let _ = wait_for_codex_test_stream_end(&mut events).await;
-
-        let mut values = protocol::SessionSettingsValues::default();
-        values.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("gpt-updated".to_owned()),
-        );
-        values.0.insert(
-            "reasoning_effort".to_owned(),
-            SessionSettingValue::String("max".to_owned()),
-        );
-        Backend::update_session_settings(
-            &mut backend,
-            protocol::SetSessionSettingsPayload { values },
-        )
-        .await
-        .expect("provider should accept settings update");
-        assert!(
-            Backend::send(
-                &backend,
-                AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: "followup".to_owned(),
-                    images: None,
-                    origin: None,
-                    tool_response: None,
-                }),
-            )
-            .await
-        );
-        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
-        assert_eq!(
-            followup_end
-                .message
-                .model_info
-                .as_ref()
-                .map(|model| model.model.as_str()),
-            Some("gpt-updated")
-        );
-
-        let turn_requests = fake
-            .requests()
-            .into_iter()
-            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .collect::<Vec<_>>();
-        let followup = turn_requests.last().expect("followup turn/start request");
-        assert_eq!(
-            followup.pointer("/params/model").and_then(Value::as_str),
-            Some("gpt-updated")
-        );
-        assert_eq!(
-            followup.pointer("/params/effort").and_then(Value::as_str),
-            Some("max")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_auto_update_clears_overrides_without_forgetting_effective_model() {
-        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut initial_values = protocol::SessionSettingsValues::default();
-        initial_values.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("gpt-initial".to_owned()),
-        );
-        initial_values.0.insert(
-            "reasoning_effort".to_owned(),
-            SessionSettingValue::String("low".to_owned()),
-        );
-        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                session_settings: Some(initial_values),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "initial".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-        let _ = wait_for_codex_test_stream_end(&mut events).await;
-
-        let mut auto_values = protocol::SessionSettingsValues::default();
-        auto_values
-            .0
-            .insert("model".to_owned(), SessionSettingValue::Null);
-        auto_values
-            .0
-            .insert("reasoning_effort".to_owned(), SessionSettingValue::Null);
-        Backend::update_session_settings(
-            &mut backend,
-            protocol::SetSessionSettingsPayload {
-                values: auto_values,
-            },
-        )
-        .await
-        .expect("provider should acknowledge Auto settings");
-        assert!(
-            Backend::send(
-                &backend,
-                AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: "followup".to_owned(),
-                    images: None,
-                    origin: None,
-                    tool_response: None,
-                }),
-            )
-            .await
-        );
-        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
-        assert_eq!(
-            followup_end
-                .message
-                .model_info
-                .as_ref()
-                .map(|model| model.model.as_str()),
-            Some("gpt-initial")
-        );
-
-        let turn_requests = fake
-            .requests()
-            .into_iter()
-            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .collect::<Vec<_>>();
-        let followup = turn_requests.last().expect("followup turn/start request");
-        assert!(followup.pointer("/params/model").is_none());
-        assert!(followup.pointer("/params/effort").is_none());
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_rejected_runtime_settings_do_not_change_followup_turn() {
-        let fake = CodexFakeAppServer::new("reject_runtime_settings", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut initial_values = protocol::SessionSettingsValues::default();
-        initial_values.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("gpt-initial".to_owned()),
-        );
-        initial_values.0.insert(
-            "reasoning_effort".to_owned(),
-            SessionSettingValue::String("low".to_owned()),
-        );
-        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                session_settings: Some(initial_values),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "initial".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn fake Codex backend");
-        let _ = wait_for_codex_test_stream_end(&mut events).await;
-
-        let mut values = protocol::SessionSettingsValues::default();
-        values.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("gpt-rejected".to_owned()),
-        );
-        values.0.insert(
-            "reasoning_effort".to_owned(),
-            SessionSettingValue::String("max".to_owned()),
-        );
-        let error = Backend::update_session_settings(
-            &mut backend,
-            protocol::SetSessionSettingsPayload { values },
-        )
-        .await
-        .expect_err("provider rejection must reach the caller");
-        assert!(error.contains("settings rejected"));
-
-        assert!(
-            Backend::send(
-                &backend,
-                AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: "followup".to_owned(),
-                    images: None,
-                    origin: None,
-                    tool_response: None,
-                }),
-            )
-            .await
-        );
-        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
-        assert_eq!(
-            followup_end
-                .message
-                .model_info
-                .as_ref()
-                .map(|model| model.model.as_str()),
-            Some("gpt-initial")
-        );
-        let turn_requests = fake
-            .requests()
-            .into_iter()
-            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            .collect::<Vec<_>>();
-        let followup = turn_requests.last().expect("followup turn/start request");
-        assert_eq!(
-            followup.pointer("/params/model").and_then(Value::as_str),
-            Some("gpt-initial")
-        );
-        assert_eq!(
-            followup.pointer("/params/effort").and_then(Value::as_str),
-            Some("low")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fork_uses_thread_fork_child_id_and_child_turn() {
-        let fake = CodexFakeAppServer::new("ok", "child-thread-id");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let workspace_root = workspace.path().to_string_lossy().to_string();
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("gpt-test".to_string()),
-        );
-        settings.0.insert(
-            "reasoning_effort".to_string(),
-            SessionSettingValue::String("medium".to_string()),
-        );
-        let config = BackendSpawnConfig {
-            session_settings: Some(settings),
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                instructions: Some("Use the fork-specific instructions.".to_string()),
-                access_mode: BackendAccessMode::ReadOnly,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let (backend, _events) = <CodexBackend as Backend>::fork(
-            vec![workspace_root.clone(), "/tmp".to_string()],
-            config,
-            SessionId("parent-thread-id".to_string()),
-            protocol::SendMessagePayload {
-                message: "child prompt".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("Codex fork should start against fake app-server");
-
-        assert_eq!(
-            Backend::session_id(&backend),
-            SessionId("child-thread-id".to_string())
-        );
-        backend.shutdown().await;
-
-        let (_fork_pid, requests) = fake.captured_fork_process("parent-thread-id");
-        let methods = requests
-            .iter()
-            .filter_map(|request| request.get("method").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["initialize", "thread/fork", "turn/start"]);
-
-        let fork_params = requests[1].get("params").expect("thread/fork params");
-        assert_eq!(
-            fork_params.get("threadId").and_then(Value::as_str),
-            Some("parent-thread-id")
-        );
-        assert_eq!(
-            fork_params.get("cwd").and_then(Value::as_str),
-            Some(workspace_root.as_str())
-        );
-        assert_eq!(
-            fork_params.get("sandbox").and_then(Value::as_str),
-            Some(CODEX_UNRESTRICTED_SANDBOX)
-        );
-        assert_eq!(
-            fork_params.get("approvalPolicy").and_then(Value::as_str),
-            Some(CODEX_FORCED_APPROVAL_POLICY)
-        );
-        assert_eq!(
-            fork_params
-                .get("experimentalRawEvents")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            fork_params
-                .get("persistExtendedHistory")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            fork_params
-                .get("runtimeWorkspaceRoots")
-                .and_then(Value::as_array)
-                .expect("runtimeWorkspaceRoots")
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>(),
-            vec![workspace_root.as_str(), "/tmp"]
-        );
-
-        // Other tests may trigger short-lived model discovery while this fake
-        // app-server override is installed; this exact sequence is for the
-        // process that handled thread/fork. CodexSession::execute(UpdateSettings)
-        // only updates local state used by subsequent turn/start calls, so
-        // configuring model/effort above should not add a thread/settings/update RPC.
-        let turn_params = requests[2].get("params").expect("turn/start params");
-        assert_eq!(
-            turn_params.get("threadId").and_then(Value::as_str),
-            Some("child-thread-id"),
-            "the initial turn must be sent to the returned child thread, not the parent"
-        );
-        assert_eq!(
-            turn_params.pointer("/input/0/text").and_then(Value::as_str),
-            Some("child prompt")
-        );
-        assert_eq!(
-            turn_params.get("model").and_then(Value::as_str),
-            Some("gpt-test")
-        );
-        assert_eq!(
-            turn_params.get("effort").and_then(Value::as_str),
-            Some("medium")
-        );
-        assert_eq!(
-            turn_params
-                .pointer("/sandboxPolicy/type")
-                .and_then(Value::as_str),
-            Some("dangerFullAccess")
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_codex_spawn_after_readiness_cancels_before_initial_prompt() {
-        let fake = CodexFakeAppServer::new("ok", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let (ready_tx, mut ready_rx) = oneshot::channel();
-        *CODEX_SPAWN_READY_OBSERVER
-            .lock()
-            .expect("Codex spawn ready observer mutex poisoned") = Some(ready_tx);
-        let mut thread_start_request_rx = install_codex_request_observer("thread/start");
-        let (cancelled_tx, cancelled_rx) = oneshot::channel();
-        *CODEX_SPAWN_STARTUP_CANCEL_OBSERVER
-            .lock()
-            .expect("Codex spawn startup cancel observer mutex poisoned") = Some(cancelled_tx);
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut startup = Box::pin(CodexBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "must not submit after readiness cancellation".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        ));
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
-            tokio::select! {
-                biased;
-                observed = &mut thread_start_request_rx => {
-                    observed.expect("Codex worker must retain the thread/start request observer");
-                }
-                result = startup.as_mut() => {
-                    match result {
-                        Ok(_) => panic!("Codex spawn completed before issuing thread/start"),
-                        Err(error) => {
-                            panic!("Codex spawn failed before issuing thread/start: {error}")
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("fixture must observe the real thread/start write before readiness");
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
-            tokio::select! {
-                biased;
-                observed = &mut ready_rx => {
-                    observed.expect("Codex worker must retain readiness observer");
-                }
-                _ = startup.as_mut() => {
-                    panic!("Codex spawn must not complete before the readiness handoff is observed");
-                }
-            }
-        })
-        .await
-        .expect("production Codex spawn must reach its readiness handoff");
-
-        drop(startup);
-
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, cancelled_rx)
-            .await
-            .expect("detached Codex spawn worker must acknowledge startup cancellation")
-            .expect("detached Codex spawn worker must retain its cancellation observer");
-        let methods = fake
-            .requests()
-            .into_iter()
-            .filter_map(|request| {
-                request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<Vec<_>>();
-        assert!(methods.iter().any(|method| method == "thread/start"));
-        assert!(
-            !methods.iter().any(|method| method == "turn/start"),
-            "dropping ordinary Codex startup at the readiness handoff must prevent the paid initial prompt: {methods:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_codex_fork_startup_cancels_before_initial_prompt() {
-        let fake = CodexFakeAppServer::new("fork_startup_delayed", "cancelled-child-thread");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let (cancelled_tx, cancelled_rx) = oneshot::channel();
-        *CODEX_FORK_STARTUP_CANCEL_OBSERVER
-            .lock()
-            .expect("Codex fork startup cancel observer mutex poisoned") = Some(cancelled_tx);
-        let mut fork_request_rx = install_codex_request_observer("thread/fork");
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut startup = Box::pin(<CodexBackend as Backend>::fork(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            SessionId("cancelled-parent-thread".to_owned()),
-            protocol::SendMessagePayload {
-                message: "must not submit after actor cancellation".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        ));
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
-            tokio::select! {
-                observed = &mut fork_request_rx => {
-                    observed.expect("Codex worker must retain the fork request observer");
-                }
-                _ = startup.as_mut() => {
-                    panic!("fork startup completed before the fixture held its real fork request");
-                }
-            }
-        })
-        .await
-        .expect("fixture must observe the detached Codex fork request before readiness");
-        drop(startup);
-        fake.release_initial_turn();
-
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, cancelled_rx)
-            .await
-            .expect("detached Codex fork worker must acknowledge startup cancellation")
-            .expect("detached Codex fork worker must retain its cancellation observer");
-        assert!(
-            fake.fork_response_marker.exists(),
-            "fixture must release the detached worker's real fork response before cancellation"
-        );
-        assert!(
-            !fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/start")
-            }),
-            "dropping startup must explicitly cancel the detached worker before the paid initial prompt"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fork_cleans_steering_tempfile_when_app_server_spawn_fails() {
-        const STEERING_CONTENT: &str = "Fork cleanup tempfile observer fixture.";
-        let missing_binary_dir = tempfile::tempdir().expect("missing binary tempdir");
-        let _guard = CodexTestAppServerBinaryGuard::set(
-            missing_binary_dir.path().join("missing-codex-app-server"),
-        );
-        let steering_tempfile_rx = install_codex_steering_tempfile_observer(STEERING_CONTENT);
-
-        let result = CodexSession::fork(
-            &["/tmp".to_string()],
-            None,
-            &[],
-            Some(STEERING_CONTENT),
-            BackendAccessMode::ReadOnly,
-            "parent-thread-id",
-        )
-        .await;
-
-        // Not a skill failure: without an app-server there is no session at all,
-        // so this one still fails.
-        let err = match result {
-            Ok((session, _)) => {
-                session.shutdown().await;
-                panic!("missing app-server binary should fail fork")
-            }
-            Err(err) => err,
-        };
-        assert!(
-            err.contains("Failed to spawn Codex app-server"),
-            "unexpected fork spawn error: {err}"
-        );
-        let steering_tempfile =
-            tokio::time::timeout(CODEX_REQUEST_TIMEOUT, steering_tempfile_rx)
-            .await
-            .expect("CodexSession::fork never created its keyed steering tempfile before the request timeout")
-            .expect("fork should report the exact steering tempfile it created");
-        assert!(
-            !steering_tempfile.exists(),
-            "CodexSession::fork should remove its own steering tempfile when app-server spawn fails: {}",
-            steering_tempfile.display()
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fork_method_not_found_is_unsupported() {
-        let fake = CodexFakeAppServer::new("unsupported", "unused-child-thread-id");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let config = BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                instructions: Some("Temporary fork instructions.".to_string()),
-                access_mode: BackendAccessMode::ReadOnly,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = <CodexBackend as Backend>::fork(
-            vec!["/tmp".to_string()],
-            config,
-            SessionId("parent-thread-id".to_string()),
-            protocol::SendMessagePayload {
-                message: "child prompt".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await;
-        let err = match result {
-            Ok((backend, _)) => {
-                backend.shutdown().await;
-                panic!("Codex fork should fail when app-server lacks thread/fork")
-            }
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code, AgentErrorCode::Unsupported);
-        assert!(err.message.contains("thread/fork"));
-        assert!(err.message.contains("Update Codex CLI"));
-
-        let (fork_pid, requests) = fake.captured_fork_process("parent-thread-id");
-        let methods = requests
-            .iter()
-            .filter_map(|request| request.get("method").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec!["initialize", "thread/fork"],
-            "unsupported fork must not fall back to thread/start, resume, or session-file copying"
-        );
-
-        let steering_path = fake
-            .argv_for_pid(fork_pid)
-            .windows(2)
-            .find_map(|args| {
-                if args[0] == "-c" {
-                    args[1].strip_prefix("model_instructions_file=")
-                } else {
-                    None
-                }
-            })
-            .map(|quoted| {
-                serde_json::from_str::<String>(quoted)
-                    .expect("model_instructions_file should be TOML/JSON quoted")
-            })
-            .expect("fake Codex app-server should receive a steering tempfile override");
-        assert!(
-            !std::path::Path::new(&steering_path).exists(),
-            "Codex fork startup failure should remove steering tempfile {steering_path}"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fork_rejects_ssh_roots_without_local_app_server() {
-        let fake = CodexFakeAppServer::new("ok", "unused-child-thread-id");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-
-        let result = <CodexBackend as Backend>::fork(
-            vec!["ssh://devbox.example.com/workspace".to_string()],
-            BackendSpawnConfig::default(),
-            SessionId("parent-thread-id".to_string()),
-            protocol::SendMessagePayload {
-                message: "child prompt".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await;
-
-        let err = match result {
-            Ok((backend, _)) => {
-                backend.shutdown().await;
-                panic!("SSH-backed Codex fork should fail before app-server startup")
-            }
-            Err(err) => err,
-        };
-        assert_eq!(err.code, AgentErrorCode::Unsupported);
-        assert!(err.message.contains("SSH host 'devbox.example.com'"));
-        assert!(
-            fake.requests().iter().all(|request| {
-                request.get("method").and_then(Value::as_str) != Some("thread/fork")
-                    || request.pointer("/params/threadId").and_then(Value::as_str)
-                        != Some("parent-thread-id")
-            }),
-            "SSH fork must not silently try a local Codex thread/fork"
-        );
-    }
-
-    fn summarize_live_event(event: &Value) -> String {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        match kind {
-            "ToolRequest" => {
-                let tool_name = event
-                    .get("data")
-                    .and_then(|d| d.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                let call_id = event
-                    .get("data")
-                    .and_then(|d| d.get("tool_call_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                format!("kind=ToolRequest tool={tool_name} call_id={call_id}")
-            }
-            "ToolExecutionCompleted" => {
-                let tool_name = event
-                    .get("data")
-                    .and_then(|d| d.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                let success = event
-                    .get("data")
-                    .and_then(|d| d.get("success"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let call_id = event
-                    .get("data")
-                    .and_then(|d| d.get("tool_call_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                format!(
-                    "kind=ToolExecutionCompleted tool={tool_name} success={success} call_id={call_id}"
-                )
-            }
-            "Error" => {
-                let data = event.get("data").cloned().unwrap_or(Value::Null);
-                format!("kind=Error data={data}")
-            }
-            "StreamStart" => {
-                let model = event
-                    .get("data")
-                    .and_then(|d| d.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                format!("kind=StreamStart model={model}")
-            }
-            "StreamEnd" => {
-                let content = event
-                    .get("data")
-                    .and_then(|d| d.get("message"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let preview = if content.len() > 80 {
-                    format!("{}...", &content[..80])
-                } else {
-                    content.to_string()
-                };
-                format!("kind=StreamEnd preview={preview:?}")
-            }
-            "MessageAdded" => {
-                let sender = event
-                    .get("data")
-                    .and_then(|d| d.get("sender"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                format!("kind=MessageAdded sender={sender}")
-            }
-            "TypingStatusChanged" => {
-                let typing = event.get("data").and_then(Value::as_bool).unwrap_or(false);
-                format!("kind=TypingStatusChanged typing={typing}")
-            }
-            other => format!("kind={other}"),
-        }
-    }
-
-    fn test_codex_state() -> CodexState {
-        CodexState {
-            thread_id: "thread-test".to_string(),
-            pending_resume_thread_id: None,
-            effective_model: Some("codex".to_string()),
-            model_override: None,
-            reasoning_effort_override: Some("xhigh".to_string()),
-            approval_policy: None,
-            access_mode: BackendAccessMode::Unrestricted,
-            execution_mode: BackendExecutionMode::Agent,
-            turn_network_access: false,
-            active_turn_id: Some("turn-test".to_string()),
-            foreground_response_completed: false,
-            awaiting_root_turn_start: false,
-            interrupt_next_root_turn: false,
-            pending_compaction: None,
-            active_stream: Some(ActiveStreamState {
-                turn_id: "turn-test".to_string(),
-                message_id: ChatMessageId("msg-seed".to_string()),
-                generated_identity: None,
-                text: String::new(),
-                reasoning: String::new(),
-                reasoning_only: false,
-                stream_published: true,
-                images: Vec::new(),
-            }),
-            tool_container: None,
-            notification_sequence: 0,
-            completed_agent_messages: HashMap::new(),
-            retired_unpublished_message_ids: HashSet::new(),
-            provider_supersessions_this_turn: 0,
-            supersession_warning_emitted: false,
-            provider_item_tombstones: VecDeque::new(),
-            terminated_turns: VecDeque::new(),
-            terminated_turn_awaiting_replacement: None,
-            generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
-            next_generated_identity_ordinal: 1,
-            pending_tool_call_ids: HashSet::new(),
-            tool_call_identities: CodexToolCallIdentities::default(),
-            background_commands: HashMap::new(),
-            background_command_owner_active: true,
-            outstanding_command_executions: HashMap::new(),
-            background_terminal_poll_active: false,
-            pending_background_wakes: VecDeque::new(),
-            background_wake_request_in_flight: false,
-            experimental_raw_events_requested: CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
-            raw_response_item_completed_seen: false,
-            first_background_list_thread_id: None,
-            observed_notification_methods: HashSet::new(),
-            raw_notification_methods_truncated: false,
-            raw_contract_drift_warned: false,
-            tool_container_images: Vec::new(),
-            cancelled_tool_call_ids: HashSet::new(),
-            close_active_stream_when_tools_idle: false,
-            pending_message_metadata: None,
-            completed_message_metadata_by_turn: HashMap::new(),
-            token_usage_by_turn: HashMap::new(),
-            model_token_usage_by_turn: HashMap::new(),
-            turn_context_by_turn: HashMap::new(),
-            file_change_call_ids: HashMap::new(),
-            pending_request: None,
-            pending_user_input_bytes: 0,
-            conversation_bytes_total: 0,
-            subagent_emitter: None,
-            capacity_refresh_in_flight: false,
-            pending_subagent_spawns: HashMap::new(),
-            conflicting_subagent_threads: HashMap::new(),
-            registering_subagent_threads: HashSet::new(),
-            unknown_owner_notifications: HashSet::new(),
-            subagent_streams: HashMap::new(),
-            completed_subagent_streams: HashMap::new(),
-        }
-    }
-
-    fn test_codex_inner() -> (Arc<CodexInner>, mpsc::UnboundedReceiver<Value>) {
-        let mut child = Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .group_spawn()
-            .expect("spawn test child");
-        let stdin = child
-            .inner()
-            .stdin
-            .take()
-            .expect("capture test child stdin");
-        let stdout = child.inner().stdout.take();
-        let stderr = child.inner().stderr.take();
-        let stdout_task = tokio::spawn(async move {
-            drop(stdout);
-        });
-        let stderr_task = tokio::spawn(async move {
-            drop(stderr);
-        });
-        let rpc = CodexRpc {
-            stdin: Arc::new(Mutex::new(stdin)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
-            child: Arc::new(Mutex::new(Some(child))),
-            stdout_task,
-            stderr_task,
-            compaction_capability: Arc::new(std::sync::Mutex::new(
-                BackendCompactionCapability::native(
-                    BackendCompactionMechanism::JsonRpcRequest,
-                    Some("0.144.3".to_string()),
-                    BackendCompactionCapabilityEvidence::CodexMethodProbe,
-                ),
-            )),
-        };
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let inner = Arc::new(CodexInner {
-            rpc,
-            emitter: Arc::new(TurnEmitter::new_for_agent(
-                event_tx,
-                AgentName(CODEX_AGENT_NAME),
-            )),
-            state: Mutex::new(test_codex_state()),
-            steering_tempfile: None,
-            skill_projection: std::sync::Mutex::new(None),
-        });
-        (inner, event_rx)
-    }
-
-    fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
-        let mut out = Vec::new();
-        let mut normalization_failures = HashMap::new();
-        while let Ok(event) = rx.try_recv() {
-            match event.get("kind").and_then(Value::as_str) {
-                Some("ModelRequestTokenUsage") => {}
-                Some("Error") => {
-                    let forwarded =
-                        codex_backend_event_from_raw(&event, &mut normalization_failures)
-                            .expect("raw Codex error must forward to a visible chat event");
-                    out.push(
-                        serde_json::to_value(forwarded.chat_event)
-                            .expect("serialize forwarded Codex error"),
-                    );
-                }
-                _ => out.push(event),
-            }
-        }
-        out
-    }
-
-    async fn start_test_codex_provider_item(
-        inner: &Arc<CodexInner>,
-        thread_id: &str,
-        item_id: Option<&str>,
-        kind: CodexProviderItemKind,
-    ) {
-        let item_type = match kind {
-            CodexProviderItemKind::AgentMessage => "agentMessage",
-            CodexProviderItemKind::Reasoning => "reasoning",
-        };
-        let mut item = json!({ "type": item_type });
-        if let Some(item_id) = item_id {
-            item["id"] = Value::String(item_id.to_string());
-        }
-        inner
-            .handle_notification(
-                "item/started",
-                &json!({ "threadId": thread_id, "item": item }),
-            )
-            .await;
-    }
-
-    async fn delta_test_codex_provider_item(
-        inner: &Arc<CodexInner>,
-        thread_id: &str,
-        item_id: Option<&str>,
-        kind: CodexProviderItemKind,
-        delta: &str,
-    ) {
-        let method = match kind {
-            CodexProviderItemKind::AgentMessage => "item/agentMessage/delta",
-            CodexProviderItemKind::Reasoning => "item/reasoning/delta",
-        };
-        let mut params = json!({ "threadId": thread_id, "delta": delta });
-        if let Some(item_id) = item_id {
-            params["itemId"] = Value::String(item_id.to_string());
-        }
-        inner.handle_notification(method, &params).await;
-    }
-
-    async fn complete_test_codex_provider_item(
-        inner: &Arc<CodexInner>,
-        thread_id: &str,
-        item_id: &str,
-        kind: CodexProviderItemKind,
-        content: &str,
-    ) {
-        let item = match kind {
-            CodexProviderItemKind::AgentMessage => {
-                json!({ "type": "agentMessage", "id": item_id, "text": content })
-            }
-            CodexProviderItemKind::Reasoning => {
-                json!({ "type": "reasoning", "id": item_id, "summary": content })
-            }
-        };
-        inner
-            .handle_notification(
-                "item/completed",
-                &json!({ "threadId": thread_id, "item": item }),
-            )
-            .await;
-    }
-
-    fn codex_event_message_id(event: &Value) -> Option<&str> {
-        event
-            .pointer("/data/message_id")
-            .or_else(|| event.pointer("/data/message/message_id"))
-            .and_then(Value::as_str)
-    }
-
-    async fn attach_test_codex_subagent(
-        inner: &Arc<CodexInner>,
-        subagent_tx: mpsc::UnboundedSender<Value>,
-        receiver_thread_id: &str,
-    ) {
-        let mut state = inner.state.lock().await;
-        state.thread_id = "thread-parent".to_string();
-        state.subagent_streams.insert(
-            receiver_thread_id.to_string(),
-            CodexSubAgentStream {
-                emitter: Arc::new(TurnEmitter::new_for_agent(
-                    subagent_tx,
-                    AgentName(CODEX_AGENT_NAME),
-                )),
-                agent_id: protocol::AgentId(format!("agent-{receiver_thread_id}")),
-                spawn_item_id: receiver_thread_id.to_string(),
-                activity_item_id: None,
-                agent_path: receiver_thread_id.to_string(),
-                agent_name: "Sub-agent".to_string(),
-                name_update_tx: None,
-                sender_thread_id: "thread-parent".to_string(),
-                active_turn_id: None,
-                current_message_id: None,
-                current_generated_identity: None,
-                current_reasoning_only: false,
-                current_stream_published: false,
-                current_text: String::new(),
-                current_reasoning: String::new(),
-                current_tool_call_ids: Vec::new(),
-                tool_container: None,
-                pending_tool_call_ids: HashSet::new(),
-                tool_container_images: Vec::new(),
-                completed_agent_messages: HashMap::new(),
-                retired_unpublished_message_ids: HashSet::new(),
-                provider_supersessions_this_turn: 0,
-                supersession_warning_emitted: false,
-                provider_item_tombstones: VecDeque::new(),
-                terminated_turns: VecDeque::new(),
-                terminated_turn_awaiting_replacement: None,
-                generated_identity_epoch: codex_generated_identity_epoch(receiver_thread_id),
-                next_generated_identity_ordinal: 1,
-                pending_message_metadata: None,
-                token_usage_by_turn: HashMap::new(),
-                model_token_usage_by_turn: HashMap::new(),
-                current_images: Vec::new(),
-            },
-        );
-    }
-
-    fn event_kinds(events: &[Value]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| event.get("kind").and_then(Value::as_str))
-            .collect()
-    }
-
-    fn forwarded_codex_event(raw: Value) -> (bool, Option<ChatEvent>) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut normalization_failures = HashMap::new();
-        let keep_open = forward_codex_backend_event(raw, &tx, &mut normalization_failures);
-        (keep_open, rx.try_recv().ok())
-    }
-
-    fn forwarded_visible_codex_event(raw: Value) -> (bool, ChatEvent) {
-        let (keep_open, event) = forwarded_codex_event(raw);
-        (
-            keep_open,
-            event.expect("raw Codex event should become a ChatEvent"),
-        )
-    }
-
-    #[test]
-    fn forward_codex_backend_event_passes_valid_chat_event_unchanged() {
-        let raw = json!({
-            "kind": "TypingStatusChanged",
-            "data": true,
-        });
-
-        let (keep_open, event) = forwarded_visible_codex_event(raw.clone());
-
-        assert!(keep_open);
-        assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
-        assert_eq!(
-            serde_json::to_value(event).expect("serialize forwarded event"),
-            raw
-        );
-    }
-
-    #[test]
-    fn forwarded_collaboration_event_is_projected_before_chat_event_boundary() {
-        let raw = json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": "wait-call",
-                "tool_name": "wait",
-                "tool_result": {
-                    "kind": "Other",
-                    "result": {
-                        "type": "collabAgentToolCall",
-                        "tool": "wait",
-                        "senderThreadId": "parent-thread-secret",
-                        "agentsStates": {
-                            "child-thread-secret": {
-                                "status": "completed",
-                                "outputPath": "/private/tmp/codex/output.txt"
-                            }
-                        }
-                    }
-                },
-                "success": true,
-                "error": null
-            }
-        });
-
-        let (_, event) = forwarded_visible_codex_event(raw);
-        let encoded = serde_json::to_string(&event).expect("serialize forwarded event");
-        assert!(encoded.contains("agent_count"));
-        assert!(!encoded.contains("parent-thread-secret"));
-        assert!(!encoded.contains("child-thread-secret"));
-        assert!(!encoded.contains("agentsStates"));
-        assert!(!encoded.contains("/private/tmp"));
-    }
-
-    #[test]
-    fn malformed_canonical_codex_tool_request_stays_in_tool_lifecycle() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut normalization_failures = HashMap::new();
-        assert!(forward_codex_backend_event(
-            json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": "call-malformed",
-                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
-                    "tool_type": {
-                        "kind": "Other",
-                        "args": { "agent_id": "agent-a" }
-                    }
-                }
-            }),
-            &tx,
-            &mut normalization_failures,
-        ));
-
-        let ChatEvent::ToolRequest(request) = rx.try_recv().expect("inspectable raw request")
-        else {
-            panic!("malformed canonical request must remain inspectable");
-        };
-        assert!(matches!(
-            request.tool_type,
-            protocol::ToolRequestType::Other { .. }
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn malformed_codex_request_marks_its_completion_without_exposing_arguments() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut normalization_failures = HashMap::new();
-        assert!(forward_codex_backend_event(
-            json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": "call-normalization",
-                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
-                    "tool_type": {
-                        "kind": "Other",
-                        "args": { "agent_id": "agent-a", "api_key": "request-secret" }
-                    }
-                }
-            }),
-            &tx,
-            &mut normalization_failures,
-        ));
-        let _ = rx.try_recv().expect("inspectable fallback request");
-
-        assert!(forward_codex_backend_event(
-            json!({
-                "kind": "ToolExecutionCompleted",
-                "data": {
-                    "tool_call_id": "call-normalization",
-                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
-                    "tool_result": { "kind": "Other", "result": { "ok": true } },
-                    "success": true,
-                    "error": null,
-                }
-            }),
-            &tx,
-            &mut normalization_failures,
-        ));
-        let ChatEvent::ToolExecutionCompleted(completion) =
-            rx.try_recv().expect("marked completion")
-        else {
-            panic!("expected marked tool completion");
-        };
-        assert_eq!(
-            completion.normalization_failure,
-            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
-        );
-        assert!(!completion.success);
-        assert!(completion.error.as_deref().is_some_and(|error| {
-            error.contains("expected non-empty agent_id/agentId and message")
-        }));
-        let encoded = serde_json::to_string(&completion).expect("serialize marked completion");
-        assert!(!encoded.contains("request-secret"));
-    }
-
-    #[test]
-    fn malformed_codex_result_marks_only_its_completion() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut normalization_failures = HashMap::new();
-        assert!(forward_codex_backend_event(
-            json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": "call-result-normalization",
-                    "tool_name": "mcp__tyde-agent-await__tyde_await_agents",
-                    "tool_type": {
-                        "kind": "Other",
-                        "args": { "arguments": { "agent_ids": ["agent-a"] } }
-                    }
-                }
-            }),
-            &tx,
-            &mut normalization_failures,
-        ));
-        let ChatEvent::ToolRequest(request) = rx.try_recv().expect("typed request") else {
-            panic!("expected typed tool request");
-        };
-        assert!(matches!(
-            request.tool_type,
-            protocol::ToolRequestType::TydeAwaitAgents { .. }
-        ));
-
-        assert!(forward_codex_backend_event(
-            json!({
-                "kind": "ToolExecutionCompleted",
-                "data": {
-                    "tool_call_id": "call-result-normalization",
-                    "tool_name": "mcp__tyde-agent-await__tyde_await_agents",
-                    "tool_result": {
-                        "kind": "Other",
-                        "result": { "ready": [], "api_key": "result-secret" }
-                    },
-                    "success": true,
-                    "error": null,
-                }
-            }),
-            &tx,
-            &mut normalization_failures,
-        ));
-        let ChatEvent::ToolExecutionCompleted(completion) =
-            rx.try_recv().expect("marked completion")
-        else {
-            panic!("expected marked tool completion");
-        };
-        assert_eq!(
-            completion.normalization_failure,
-            Some(ToolExecutionNormalizationFailure::CanonicalResult)
-        );
-        assert!(!completion.success);
-        assert!(completion.error.is_some());
-    }
-
-    #[test]
-    fn model_request_usage_uses_backend_only_event_path() {
-        let usage = ModelRequestTokenUsage {
-            request_id: ModelRequestId {
-                turn_id: ModelTurnId("turn-1".to_owned()),
-                sequence: 3,
-            },
-            request: TokenUsage {
-                total_tokens: 12,
-                ..TokenUsage::default()
-            },
-            turn: TokenUsage {
-                total_tokens: 42,
-                ..TokenUsage::default()
-            },
-            cumulative: TokenUsage {
-                total_tokens: 142,
-                ..TokenUsage::default()
-            },
-            model_context_window: Some(400_000),
-            current_context_usage: None,
-            estimated_context_breakdown: None,
-        };
-        let raw = json!({
-            "kind": "ModelRequestTokenUsage",
-            "data": serde_json::to_value(&usage).expect("serialize usage"),
-        });
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut normalization_failures = HashMap::new();
-
-        assert!(forward_codex_backend_stream_event(
-            raw.clone(),
-            &tx,
-            &mut normalization_failures,
-        ));
-        let BackendEvent::ModelRequestTokenUsage(forwarded) =
-            rx.try_recv().expect("backend usage event")
-        else {
-            panic!("usage should not be forwarded as chat");
-        };
-        assert_eq!(forwarded, usage);
-
-        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
-        assert!(forward_codex_backend_event(
-            raw,
-            &chat_tx,
-            &mut normalization_failures,
-        ));
-        assert!(chat_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn native_child_bridge_preserves_model_request_usage() {
-        let usage = ModelRequestTokenUsage {
-            request_id: ModelRequestId {
-                turn_id: ModelTurnId("child-turn".to_owned()),
-                sequence: 1,
-            },
-            request: TokenUsage {
-                total_tokens: 9,
-                ..TokenUsage::default()
-            },
-            turn: TokenUsage {
-                total_tokens: 9,
-                ..TokenUsage::default()
-            },
-            cumulative: TokenUsage {
-                total_tokens: 9,
-                ..TokenUsage::default()
-            },
-            model_context_window: Some(200_000),
-            current_context_usage: None,
-            estimated_context_breakdown: None,
-        };
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
-        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
-        let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
-        spawn_codex_subagent_event_bridge(raw_rx, chat_tx, usage_tx);
-
-        raw_tx
-            .send(json!({
-                "kind": "ModelRequestTokenUsage",
-                "data": serde_json::to_value(&usage).expect("serialize usage")
-            }))
-            .expect("raw bridge should be open");
-
-        assert_eq!(
-            timeout(Duration::from_secs(1), usage_rx.recv())
-                .await
-                .expect("usage should cross child bridge"),
-            Some(usage)
-        );
-        assert!(chat_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn forward_codex_backend_event_converts_raw_error_to_visible_message() {
-        let (keep_open, event) = forwarded_visible_codex_event(json!({
-            "kind": "Error",
-            "data": "backend exploded",
-        }));
-
-        assert!(keep_open);
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("raw Error should become MessageAdded, got {event:?}");
-        };
-        assert!(matches!(message.sender, MessageSender::Error));
-        assert_eq!(message.content, "backend exploded");
-    }
-
-    #[test]
-    fn forward_codex_backend_event_converts_warning_stderr_to_visible_message() {
-        let (keep_open, event) = forwarded_visible_codex_event(json!({
-            "kind": "SubprocessStderr",
-            "data": "Codex warning: Tool warning",
-        }));
-
-        assert!(keep_open);
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("stderr should become MessageAdded, got {event:?}");
-        };
-        assert!(matches!(message.sender, MessageSender::Warning));
-        assert_eq!(message.content, "Codex warning: Tool warning");
-    }
-
-    #[test]
-    fn forward_codex_backend_event_logs_generic_stderr_without_chat_event() {
-        let (keep_open, event) = forwarded_codex_event(json!({
-            "kind": "SubprocessStderr",
-            "data": "debug noise",
-        }));
-
-        assert!(keep_open);
-        assert!(
-            event.is_none(),
-            "generic stderr should be logged but not forwarded to chat"
-        );
-    }
-
-    #[test]
-    fn forward_codex_backend_event_converts_subprocess_exit_to_terminal_error() {
-        let (keep_open, event) = forwarded_visible_codex_event(json!({
-            "kind": "SubprocessExit",
-            "data": { "exit_code": 7 },
-        }));
-
-        assert!(!keep_open);
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("subprocess exit should become MessageAdded, got {event:?}");
-        };
-        assert!(matches!(message.sender, MessageSender::Error));
-        assert_eq!(message.content, "Codex subprocess exited with code 7");
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fresh_spawn_emits_agent_control_progress() {
-        let fake = CodexFakeAppServer::new("fresh_agent_control_progress", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let workspace_root = workspace.path().to_string_lossy().to_string();
-
-        let (backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace_root],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "start".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("Codex fresh spawn should start against fake app-server");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut saw_await = false;
-        let mut saw_spawn = false;
-        while tokio::time::Instant::now() < deadline && !(saw_await && saw_spawn) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(ChatEvent::ToolProgress(progress))) => {
-                    let ToolProgressUpdate::AgentControl(progress_update) = progress.update else {
-                        continue;
-                    };
-                    match progress_update.progress_kind {
-                        AgentControlProgressKind::Await => {
-                            saw_await |= progress.tool_call_id == "await-call-1"
-                                && progress_update
-                                    .agents
-                                    .iter()
-                                    .map(|agent| agent.agent_id.0.as_str())
-                                    .collect::<Vec<_>>()
-                                    == vec!["agent-a", "agent-b"];
-                        }
-                        AgentControlProgressKind::Spawn => {
-                            saw_spawn |= progress.tool_call_id == "spawn-call-1"
-                                && progress_update.agents.len() == 1
-                                && progress_update.agents[0].agent_id
-                                    == AgentId("agent-spawned".to_string())
-                                && progress_update.agents[0].name.as_deref() == Some("Builder");
-                        }
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        backend.shutdown().await;
-        assert!(
-            saw_await,
-            "fresh Codex session loop did not emit Await progress"
-        );
-        assert!(
-            saw_spawn,
-            "fresh Codex session loop did not emit Spawn progress"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fresh_spawn_routes_native_child_by_thread() {
-        let fake = CodexFakeAppServer::new("fresh_native_child_routing", "child-thread-id");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let emitter = Arc::new(RecordingSubAgentEmitter::new());
-        let (backend, mut events) = CodexBackend::spawn_with_subagent_emitter(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "start".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-            emitter.clone() as Arc<dyn SubAgentEmitter>,
-        )
-        .await
-        .expect("production Codex spawn should start against fake app-server");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut parent_events = Vec::new();
-        let mut saw_wait_request = false;
-        let mut saw_wait_progress = false;
-        let mut saw_wait_completion = false;
-        let mut spawn_completion_count = 0;
-        let mut saw_parent_terminal = false;
-        while tokio::time::Instant::now() < deadline && !saw_parent_terminal {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(event)) => {
-                    saw_wait_request |= matches!(
-                        &event,
-                        ChatEvent::ToolRequest(request) if request.tool_call_id == "wait-call"
-                    );
-                    saw_wait_progress |= matches!(
-                        &event,
-                        ChatEvent::ToolProgress(ToolProgressData {
-                            tool_call_id,
-                            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                                progress_kind: AgentControlProgressKind::Await,
-                                agents,
-                            }),
-                            ..
-                        }) if tool_call_id == "wait-call"
-                            && agents.len() == 1
-                            && agents[0].agent_id == AgentId("subagent-1".to_owned())
-                    );
-                    saw_wait_completion |= matches!(
-                        &event,
-                        ChatEvent::ToolExecutionCompleted(completion)
-                            if completion.tool_call_id == "wait-call"
-                                && completion.success
-                                && completion.error.is_none()
-                    );
-                    if matches!(
-                        &event,
-                        ChatEvent::ToolExecutionCompleted(completion)
-                            if completion.tool_call_id == "spawn-call"
-                    ) {
-                        spawn_completion_count += 1;
-                    }
-                    saw_parent_terminal |= matches!(&event, ChatEvent::TypingStatusChanged(false));
-                    parent_events.push(event);
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert_eq!(
-            emitter.spawn_count().await,
-            1,
-            "repeated child activity must not create another relay"
-        );
-        assert!(
-            !parent_events.iter().any(|event| matches!(
-                event,
-                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
-            )),
-            "identical activity started/completed must not surface a parent error"
-        );
-        assert!(
-            saw_wait_request,
-            "fixture must exercise the parent's pending wait card"
-        );
-        assert!(
-            saw_wait_progress,
-            "native wait must identify the Tyde child behind Codex's thread id"
-        );
-        assert!(
-            saw_wait_completion,
-            "wait must complete with Codex's result, not cancellation"
-        );
-        assert_eq!(
-            spawn_completion_count, 1,
-            "replayed terminal spawn completion must remain idempotent"
-        );
-        assert!(
-            saw_parent_terminal,
-            "fixture must drain through the parent terminal marker"
-        );
-        let child_events = emitter.events_by_agent().await;
-        assert!(child_events.values().flatten().any(|event| matches!(
-            event,
-            ChatEvent::StreamEnd(payload) if payload.message.content == "child-only"
-        )));
-        assert!(
-            child_events
-                .values()
-                .flatten()
-                .any(|event| matches!(event, ChatEvent::OperationCancelled(_)))
-        );
-        assert!(!parent_events.iter().any(|event| matches!(
-            event,
-            ChatEvent::StreamEnd(payload) if payload.message.content == "child-only"
-        )));
-        assert!(
-            !parent_events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
-            "the child interruption must not cancel the parent wait/turn"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_publishes_parent_session_before_live_order_child_activity() {
-        let fake = CodexFakeAppServer::new(
-            "fresh_native_child_before_initial_response",
-            "native-quick-child-thread",
-        );
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let (ready_tx, mut ready_rx) = oneshot::channel();
-        *CODEX_SPAWN_READY_OBSERVER
-            .lock()
-            .expect("Codex spawn ready observer mutex poisoned") = Some(ready_tx);
-        let mut initial_turn_request_rx = install_codex_request_observer("turn/start");
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let emitter = Arc::new(RecordingSubAgentEmitter::new());
-        let startup = CodexBackend::spawn_with_subagent_emitter(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "start release child routing".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-            emitter.clone() as Arc<dyn SubAgentEmitter>,
-        );
-        tokio::pin!(startup);
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
-            tokio::select! {
-                biased;
-                observed = &mut ready_rx => {
-                    observed
-                        .expect("Codex worker must retain its parent-session readiness observer");
-                }
-                result = &mut startup => {
-                    match result {
-                        Ok(_) => panic!(
-                            "Codex startup completed before its parent-session readiness handoff was observed"
-                        ),
-                        Err(error) => {
-                            panic!(
-                                "production Codex startup failed before parent-session readiness: {error}"
-                            )
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect(
-            "fixture must observe authoritative parent-session publication before the delayed initial turn response",
-        );
-        let (backend, mut events) = match tokio::time::timeout(
-            Duration::from_millis(500),
-            &mut startup,
-        )
-        .await
-        {
-            Ok(Ok(started)) => started,
-            Ok(Err(error)) => {
-                panic!("production Codex startup failed before child ordering check: {error}")
-            }
-            Err(_) => {
-                fake.release_initial_turn();
-                let _ = tokio::time::timeout(Duration::from_secs(1), &mut startup).await;
-                panic!(
-                    "Codex startup waited for the initial turn response instead of publishing the parent session before native child activity"
-                );
-            }
-        };
-        assert_eq!(
-            backend.session_id().0,
-            "fresh-thread-id",
-            "startup must publish the authoritative thread/start session before the delayed turn response"
-        );
-
-        // Ordinary spawn now deliberately waits for the caller to accept the
-        // authoritative session before it submits the paid initial turn. Claim
-        // that handoff first, then require the fixture to observe that turn.
-        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, &mut initial_turn_request_rx)
-            .await
-            .expect(
-                "fixture must launch its delayed initial turn after the ordinary-spawn readiness handoff",
-            )
-            .expect("Codex worker must retain the delayed initial-turn request observer");
-
-        let registration_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while emitter.spawn_count().await == 0
-            && tokio::time::Instant::now() < registration_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            emitter.spawn_count().await,
-            1,
-            "the live-order child activity must register before the parent interrupt"
-        );
-
-        assert!(
-            backend.interrupt().await,
-            "the parent interrupt must reach Codex while the initial turn response is delayed"
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut parent_events = Vec::new();
-        while tokio::time::Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(event)) => {
-                    let terminal = matches!(&event, ChatEvent::TypingStatusChanged(false));
-                    parent_events.push(event);
-                    if terminal {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        fake.release_initial_turn();
-
-        let spawns = emitter.spawns().await;
-        assert_eq!(
-            spawns.len(),
-            1,
-            "the live-order child must allocate exactly once"
-        );
-        assert_eq!(
-            spawns[0].tool_use_id,
-            "019f60f0-7a69-73f0-9ab3-7ddc24062e30"
-        );
-        assert_eq!(spawns[0].name, "/root/quick_child");
-        assert_eq!(spawns[0].native_thread_id, "native-quick-child-thread");
-        assert!(
-            !parent_events.iter().any(|event| matches!(
-                event,
-                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
-            )),
-            "authoritative child activity before the initial turn response must not surface a parent error: {parent_events:?}"
-        );
-        assert!(
-            parent_events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
-            "the parent must reach its terminal idle marker after its interrupt"
-        );
-        assert!(
-            parent_events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
-            "the delayed initial turn must receive the full interruption tail"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_cancels_pending_initial_input_during_startup_settings() {
-        let fake = CodexFakeAppServer::new("startup_settings_delayed", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("fake-startup-model".to_string()),
-        );
-        let config = BackendSpawnConfig {
-            session_settings: Some(settings),
-            ..BackendSpawnConfig::default()
-        };
-        assert_eq!(
-            resolve_session_settings(&config).0.get("model"),
-            Some(&SessionSettingValue::String(
-                "fake-startup-model".to_string()
-            )),
-            "fixture must pass an authoritative model override into Codex startup"
-        );
-        let startup = CodexBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            config,
-            protocol::SendMessagePayload {
-                message: "wait for startup settings".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        );
-        tokio::pin!(startup);
-        let mut startup_result = None;
-
-        let thread_start_deadline = tokio::time::Instant::now() + CODEX_REQUEST_TIMEOUT;
-        while !fake
-            .requests()
-            .iter()
-            .any(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
-            && tokio::time::Instant::now() < thread_start_deadline
-        {
-            if let Some(Err(error)) = startup_result.as_ref() {
-                panic!("production Codex startup failed before thread/start: {error}");
-            }
-            tokio::select! {
-                result = &mut startup, if startup_result.is_none() => {
-                    startup_result = Some(result);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-        }
-        assert!(
-            fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/start")
-            }),
-            "fixture must observe the authoritative thread/start request before startup-settings dispatch"
-        );
-        let settings_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !fake.requests().iter().any(|request| {
-            request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
-        }) && tokio::time::Instant::now() < settings_deadline
-        {
-            if let Some(Err(error)) = startup_result.as_ref() {
-                panic!(
-                    "production Codex startup failed before delayed thread/settings/update: {error}"
-                );
-            }
-            tokio::select! {
-                result = &mut startup, if startup_result.is_none() => {
-                    startup_result = Some(result);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-        }
-        assert!(
-            fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
-            }),
-            "the fake must hold the startup thread/settings/update request; captured methods: {:?}",
-            fake.requests()
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-        );
-        let (backend, mut events) = match startup_result {
-            Some(Ok(started)) => started,
-            Some(Err(error)) => {
-                panic!(
-                    "production Codex startup failed before delayed thread/settings/update: {error}"
-                )
-            }
-            None => tokio::time::timeout(Duration::from_millis(500), &mut startup)
-                .await
-                .expect("parent session must publish before delayed thread/settings/update")
-                .expect("production Codex spawn should publish its parent session"),
-        };
-
-        assert!(
-            backend.interrupt().await,
-            "the published backend must accept an interrupt while thread/settings/update is delayed"
-        );
-        fake.release_startup_settings();
-        let mut cancellation_events = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut cancellation_events = Vec::new();
-            loop {
-                let Some(event) = events.recv().await else {
-                    panic!("pending initial-input cancellation ended before its idle tail");
-                };
-                let terminal = matches!(&event, ChatEvent::TypingStatusChanged(false));
-                cancellation_events.push(event);
-                if terminal {
-                    return cancellation_events;
-                }
-            }
-        })
-        .await
-        .expect("the pending initial-input cancellation must emit its terminal idle tail");
-        assert_eq!(
-            cancellation_events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
-                .count(),
-            1,
-            "pending initial-input cancellation must emit one cancellation event"
-        );
-        assert_eq!(
-            cancellation_events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-                .count(),
-            1,
-            "pending initial-input cancellation must emit one idle event"
-        );
-        assert!(
-            !fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
-            }),
-            "pre-turn cancellation must not issue a no-op turn/interrupt request"
-        );
-
-        assert!(
-            backend
-                .send(AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: "follow up after cancelled initial".to_string(),
-                    images: None,
-                    origin: None,
-                    tool_response: None,
-                }))
-                .await,
-            "the backend must remain idle and accept a follow-up after cancelling its initial input"
-        );
-        let follow_up_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !fake.requests().iter().any(|request| {
-            request
-                .pointer("/params/input/0/text")
-                .and_then(Value::as_str)
-                == Some("follow up after cancelled initial")
-        }) && tokio::time::Instant::now() < follow_up_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            fake.requests().iter().any(|request| {
-                request
-                    .pointer("/params/input/0/text")
-                    .and_then(Value::as_str)
-                    == Some("follow up after cancelled initial")
-            }),
-            "a follow-up after the cancelled initial input must start a real Codex turn"
-        );
-        assert_eq!(
-            fake.requests()
-                .iter()
-                .filter(|request| {
-                    request.get("method").and_then(Value::as_str) == Some("turn/start")
-                })
-                .count(),
-            1,
-            "settings completion must not resurrect the cancelled initial prompt"
-        );
-        while let Ok(event) = events.try_recv() {
-            cancellation_events.push(event);
-        }
-        assert_eq!(
-            cancellation_events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
-                .count(),
-            1,
-            "the follow-up must not duplicate the initial cancellation tail"
-        );
-        assert_eq!(
-            cancellation_events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
-                .count(),
-            1,
-            "the follow-up must not duplicate the initial idle tail"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_dispatches_initial_prompt_after_startup_settings_success() {
-        let fake = CodexFakeAppServer::new("startup_settings_delayed", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("fake-startup-model".to_string()),
-        );
-        let (backend, _) = CodexBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                session_settings: Some(settings),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "dispatch after settings".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("production Codex spawn should publish before delayed startup settings");
-
-        let settings_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !fake.requests().iter().any(|request| {
-            request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
-        }) && tokio::time::Instant::now() < settings_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            !fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/start")
-            }),
-            "the initial prompt must not start before thread/settings/update succeeds"
-        );
-
-        fake.release_startup_settings();
-        let prompt_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !fake
-            .requests()
-            .iter()
-            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
-            && tokio::time::Instant::now() < prompt_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/start")
-            }),
-            "the initial prompt must dispatch after successful startup settings"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_startup_settings_rejection_emits_error_then_idle() {
-        let fake = CodexFakeAppServer::new("startup_settings_rejected", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("fake-startup-model".to_string()),
-        );
-        let (backend, mut events) = CodexBackend::spawn(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                session_settings: Some(settings),
-                ..BackendSpawnConfig::default()
-            },
-            protocol::SendMessagePayload {
-                message: "settings must reject".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("parent session must publish before startup-settings rejection");
-
-        let (error_index, idle_index) = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut events_seen = Vec::new();
-            loop {
-                let Some(event) = events.recv().await else {
-                    panic!("startup settings rejection ended before typed terminal events");
-                };
-                events_seen.push(event);
-                let error_index = events_seen.iter().position(|event| {
-                    matches!(
-                        event,
-                        ChatEvent::MessageAdded(message)
-                            if matches!(message.sender, MessageSender::Error)
-                                && message.content.contains("Failed to configure Codex session")
-                    )
-                });
-                let idle_index = events_seen
-                    .iter()
-                    .position(|event| matches!(event, ChatEvent::TypingStatusChanged(false)));
-                if let (Some(error_index), Some(idle_index)) = (error_index, idle_index) {
-                    return (error_index, idle_index);
-                }
-            }
-        })
-        .await
-        .expect("startup settings rejection must surface typed error and idle terminal event");
-        assert!(
-            error_index < idle_index,
-            "startup settings failure must emit the typed error before terminal idle"
-        );
-        assert!(
-            !fake.requests().iter().any(|request| {
-                request.get("method").and_then(Value::as_str) == Some("turn/start")
-            }),
-            "a rejected startup settings update must never dispatch the initial prompt"
-        );
-        assert!(
-            matches!(
-                tokio::time::timeout(Duration::from_secs(1), events.recv()).await,
-                Ok(None)
-            ),
-            "startup settings failure must close the parent event stream after its idle terminal"
-        );
-
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fresh_spawn_routes_multiple_native_children_independently() {
-        let fake = CodexFakeAppServer::new("fresh_native_multi_child_routing", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let emitter = Arc::new(RecordingSubAgentEmitter::new());
-        let (backend, mut events) = CodexBackend::spawn_with_subagent_emitter(
-            vec![workspace.path().to_string_lossy().to_string()],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "start".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-            emitter.clone() as Arc<dyn SubAgentEmitter>,
-        )
-        .await
-        .expect("production Codex spawn should start against multi-child fake app-server");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut parent_events = Vec::new();
-        let mut completed_waits = HashSet::new();
-        let mut saw_parent_terminal = false;
-        while tokio::time::Instant::now() < deadline && !saw_parent_terminal {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(event)) => {
-                    if let ChatEvent::ToolExecutionCompleted(completion) = &event
-                        && completion.success
-                        && (completion.tool_call_id == "wait-alpha"
-                            || completion.tool_call_id == "wait-beta")
-                    {
-                        completed_waits.insert(completion.tool_call_id.clone());
-                    }
-                    saw_parent_terminal |= matches!(&event, ChatEvent::TypingStatusChanged(false));
-                    parent_events.push(event);
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(saw_parent_terminal);
-        assert_eq!(emitter.spawn_count().await, 2);
-        assert_eq!(
-            completed_waits,
-            HashSet::from(["wait-alpha".to_string(), "wait-beta".to_string()])
-        );
-        let events_by_thread = emitter.events_by_native_thread().await;
-        let alpha_events = events_by_thread
-            .get("child-a")
-            .expect("recorded child A association");
-        let beta_events = events_by_thread
-            .get("child-b")
-            .expect("recorded child B association");
-        let has_content = |events: &[ChatEvent], content: &str| {
-            events.iter().any(|event| {
-                matches!(
-                    event,
-                    ChatEvent::StreamEnd(payload) if payload.message.content == content
-                )
-            })
-        };
-        assert!(has_content(alpha_events, "alpha-only"));
-        assert!(!has_content(alpha_events, "beta-only"));
-        assert!(has_content(beta_events, "beta-only"));
-        assert!(!has_content(beta_events, "alpha-only"));
-        assert!(
-            !parent_events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::OperationCancelled(_)))
-        );
-        assert!(!parent_events.iter().any(|event| matches!(
-            event,
-            ChatEvent::StreamEnd(payload) if payload.message.content == "alpha-only" || payload.message.content == "beta-only"
-        )));
-        backend.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn codex_backend_fresh_spawn_patches_late_token_usage_after_turn_completed() {
-        let fake = CodexFakeAppServer::new("fresh_late_token_usage", "unused");
-        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let workspace_root = workspace.path().to_string_lossy().to_string();
-
-        let (backend, mut events) = <CodexBackend as Backend>::spawn(
-            vec![workspace_root],
-            BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "start".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("Codex fresh spawn should start against fake app-server");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut saw_stream_end = false;
-        let mut saw_pre_usage_metadata = false;
-        let mut saw_late_usage_metadata = false;
-        while tokio::time::Instant::now() < deadline && !saw_late_usage_metadata {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(ChatEvent::StreamEnd(data))) => {
-                    if data.message.content == "fresh late done" {
-                        saw_stream_end = true;
-                        assert!(
-                            data.message.token_usage.is_none(),
-                            "fresh Codex StreamEnd should not fabricate usage before late update"
-                        );
-                    }
-                }
-                Ok(Some(ChatEvent::MessageMetadataUpdated(update))) => {
-                    if update.message_id.0 != "msg-fresh-late-usage" {
-                        continue;
-                    }
-                    let Some(token_usage) = update.token_usage.as_ref() else {
-                        saw_pre_usage_metadata = true;
-                        continue;
-                    };
-                    match &token_usage.request {
-                        TokenUsageScope::Known { usage } => {
-                            assert_eq!(usage.total_tokens, 41);
-                        }
-                        other => panic!("expected known request usage patch, got {other:?}"),
-                    }
-                    match &token_usage.turn {
-                        TokenUsageScope::Known { usage } => {
-                            assert_eq!(usage.total_tokens, 41);
-                        }
-                        other => panic!("expected known turn usage patch, got {other:?}"),
-                    }
-                    assert!(
-                        !matches!(
-                            &token_usage.turn,
-                            TokenUsageScope::Known { usage } if usage.total_tokens == 0
-                        ),
-                        "late Codex usage must not be fabricated as Known(0)"
-                    );
-                    saw_late_usage_metadata = true;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        backend.shutdown().await;
-        assert!(
-            saw_stream_end,
-            "fresh Codex session loop did not emit StreamEnd"
-        );
-        assert!(
-            saw_pre_usage_metadata,
-            "fresh Codex session loop did not emit completed-turn metadata before late usage"
-        );
-        assert!(
-            saw_late_usage_metadata,
-            "fresh Codex inline loop did not patch late token usage metadata"
-        );
-    }
-
-    fn assert_codex_protocol_valid(events: &[Value]) {
-        let mut validator = ProtocolValidator::new();
-        let host_stream = StreamPath("/host/local".to_string());
-        let agent_stream = StreamPath("/agent/agent-1/instance-1".to_string());
-        let agent_id = AgentId("agent-1".to_string());
-        let new_agent = NewAgentPayload {
-            agent_id: agent_id.clone(),
-            name: "Test Agent".to_string(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Codex,
-            launch_profile_id: None,
-            workspace_roots: vec!["/tmp".to_string()],
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            workflow: None,
-            created_at_ms: 0,
-            instance_stream: agent_stream.clone(),
-            activity_summary: Default::default(),
-        };
-        let welcome = Envelope::from_payload(
-            host_stream.clone(),
-            FrameKind::Welcome,
-            0,
-            &WelcomePayload {
-                protocol_version: PROTOCOL_VERSION,
-                tyde_version: Version {
-                    major: 0,
-                    minor: 0,
-                    patch: 0,
-                },
-                release_version: None,
-            },
-        )
-        .expect("serialize Welcome");
-        validator
-            .validate_envelope(&welcome)
-            .expect("Welcome validates");
-        let bootstrap = Envelope::from_payload(
-            host_stream,
-            FrameKind::HostBootstrap,
-            1,
-            &HostBootstrapPayload {
-                settings: HostSettings {
-                    enabled_backends: vec![BackendKind::Codex],
-                    default_backend: Some(BackendKind::Codex),
-                    enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    tyde_debug_mcp_enabled: false,
-                    tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
-                    complexity_tiers_enabled: false,
-                    backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: Default::default(),
-                    supervisor: Default::default(),
-                    code_intel: Default::default(),
-                    backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
-                    hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
-                },
-                mobile_access: MobileAccessStatePayload {
-                    broker_status: MobileBrokerStatus::Disabled,
-                    pairing: MobilePairingState::Idle,
-                    paired_devices: vec![],
-                },
-                backend_setup: BackendSetupPayload { backends: vec![] },
-                session_schemas: vec![],
-                backend_config_schemas: vec![],
-                backend_config_snapshots: vec![],
-                launch_profile_catalog: Default::default(),
-                sessions: vec![],
-                session_list: Default::default(),
-                projects: vec![],
-                mcp_servers: vec![],
-                skills: vec![],
-                steering: vec![],
-                custom_agents: vec![],
-                team_preset_catalog: TeamPresetCatalog {
-                    role_presets: vec![],
-                    personality_traits: vec![],
-                    personality_presets: vec![],
-                    team_templates: vec![],
-                },
-                team_drafts: vec![],
-                teams: vec![],
-                team_members: vec![],
-                team_member_bindings: vec![],
-                agents: vec![new_agent.clone()],
-                task_token_usages: Vec::new(),
-                workflow_summaries: vec![],
-                workflow_diagnostics: vec![],
-                workflow_runs: vec![],
-                workflow_locations: vec![],
-                agents_view_preferences: None,
-            },
-        )
-        .expect("serialize HostBootstrap");
-        validator
-            .validate_envelope(&bootstrap)
-            .expect("HostBootstrap validates");
-        let agent_bootstrap = Envelope::from_payload(
-            agent_stream.clone(),
-            FrameKind::AgentBootstrap,
-            0,
-            &AgentBootstrapPayload {
-                events: vec![AgentBootstrapEvent::AgentStart(AgentStartPayload {
-                    agent_id,
-                    name: new_agent.name,
-                    origin: new_agent.origin,
-                    backend_kind: new_agent.backend_kind,
-                    launch_profile_id: None,
-                    workspace_roots: new_agent.workspace_roots,
-                    custom_agent_id: new_agent.custom_agent_id,
-                    team_id: new_agent.team_id,
-                    team_member_id: new_agent.team_member_id,
-                    project_id: new_agent.project_id,
-                    parent_agent_id: new_agent.parent_agent_id,
-                    session_id: None,
-                    workflow: None,
-                    created_at_ms: new_agent.created_at_ms,
-                })],
-                latest_output: Default::default(),
-                turn_active: false,
-            },
-        )
-        .expect("serialize AgentBootstrap");
-        validator
-            .validate_envelope(&agent_bootstrap)
-            .expect("AgentBootstrap validates");
-
-        for (index, event) in events.iter().enumerate() {
-            let chat_event: ChatEvent =
-                serde_json::from_value(event.clone()).expect("emitter produced ChatEvent JSON");
-            let envelope = Envelope::from_payload(
-                agent_stream.clone(),
-                FrameKind::ChatEvent,
-                index as u64 + 1,
-                &chat_event,
-            )
-            .expect("serialize ChatEvent");
-            validator
-                .validate_envelope(&envelope)
-                .unwrap_or_else(|err| panic!("event {index} violates protocol: {err}"));
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct RecordedSpawn {
-        tool_use_id: String,
-        name: String,
-        description: String,
-        agent_type: String,
-        agent_id: AgentId,
-        native_thread_id: String,
-    }
-
-    struct RecordingSubAgentEmitter {
-        next_agent_id: AtomicU64,
-        spawns: tokio::sync::Mutex<Vec<RecordedSpawn>>,
-        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<AgentId, Vec<ChatEvent>>>>,
-    }
-
-    impl RecordingSubAgentEmitter {
-        fn new() -> Self {
-            Self {
-                next_agent_id: AtomicU64::new(1),
-                spawns: tokio::sync::Mutex::new(Vec::new()),
-                events_by_agent_id: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            }
-        }
-
-        async fn spawn_count(&self) -> usize {
-            self.spawns.lock().await.len()
-        }
-
-        async fn spawns(&self) -> Vec<RecordedSpawn> {
-            self.spawns.lock().await.clone()
-        }
-
-        async fn events_by_agent(&self) -> HashMap<AgentId, Vec<ChatEvent>> {
-            self.events_by_agent_id.lock().await.clone()
-        }
-
-        async fn events_by_native_thread(&self) -> HashMap<String, Vec<ChatEvent>> {
-            let spawns = self.spawns.lock().await;
-            let events = self.events_by_agent_id.lock().await;
-            spawns
-                .iter()
-                .map(|spawn| {
-                    (
-                        spawn.native_thread_id.clone(),
-                        events.get(&spawn.agent_id).cloned().unwrap_or_default(),
-                    )
-                })
-                .collect()
-        }
-    }
-
-    impl SubAgentEmitter for RecordingSubAgentEmitter {
-        fn on_subagent_spawned(
-            &self,
-            tool_use_id: String,
-            name: String,
-            description: String,
-            agent_type: String,
-            session_id_hint: Option<SessionId>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                let agent_id = AgentId(format!(
-                    "subagent-{}",
-                    self.next_agent_id.fetch_add(1, Ordering::Relaxed)
-                ));
-                let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
-                let (model_usage_tx, mut model_usage_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (total_usage_tx, mut total_usage_rx) = tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(async move { while model_usage_rx.recv().await.is_some() {} });
-                tokio::spawn(async move { while total_usage_rx.recv().await.is_some() {} });
-                let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
-                let agent_id_for_events = agent_id.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = event_rx.recv().await {
-                        let mut guard = events_by_agent_id.lock().await;
-                        guard
-                            .entry(agent_id_for_events.clone())
-                            .or_default()
-                            .push(event);
-                    }
-                });
-                live_test_log(&format!(
-                    "spawn callback: tool_use_id={tool_use_id} agent_id={} name={name:?} agent_type={agent_type:?} description={description:?}",
-                    agent_id.0
-                ));
-                let native_thread_id = session_id_hint
-                    .expect("Codex child registration must carry the native thread ID")
-                    .0;
-                self.spawns.lock().await.push(RecordedSpawn {
-                    tool_use_id,
-                    name,
-                    description,
-                    agent_type,
-                    agent_id: agent_id.clone(),
-                    native_thread_id,
-                });
-                Ok(SubAgentHandle {
-                    event_tx,
-                    model_usage_tx,
-                    total_usage_tx,
-                    agent_id,
-                    name_update_tx: None,
-                })
-            })
-        }
-    }
-
-    struct FailingSubAgentEmitter;
-
-    impl SubAgentEmitter for FailingSubAgentEmitter {
-        fn on_subagent_spawned(
-            &self,
-            _tool_use_id: String,
-            _name: String,
-            _description: String,
-            _agent_type: String,
-            _session_id_hint: Option<SessionId>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
-        > {
-            Box::pin(async { Err("parent session is unavailable".to_string()) })
-        }
-    }
-
-    async fn live_test_select_model(session: &CodexSession) -> Result<String, String> {
-        const REQUIRED_MODEL: &str = "gpt-5.6-luna";
-        let response = session
-            .inner
-            .rpc
-            .request("model/list", json!({ "includeHidden": true }))
-            .await
-            .map_err(|error| format!("failed to list models before Luna live test: {error}"))?;
-        let models = response
-            .get("data")
-            .or_else(|| response.get("models"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("model/list response missing models: {response}"))?;
-        models
-            .iter()
-            .any(|model| {
-                model
-                    .get("model")
-                    .or_else(|| model.get("id"))
-                    .and_then(Value::as_str)
-                    == Some(REQUIRED_MODEL)
-            })
-            .then(|| REQUIRED_MODEL.to_owned())
-            .ok_or_else(|| {
-                format!(
-                    "required low-cost live Codex model {REQUIRED_MODEL} is unavailable; refusing to run a fallback model"
-                )
-            })
-    }
-
-    async fn live_test_wait_for_mcp_tool(
-        session: &CodexSession,
-        server_name: &str,
-        tool_name: &str,
-        timeout: Duration,
-    ) -> Value {
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let response = session
-                .list_mcp_server_statuses()
-                .await
-                .expect("list mcp server statuses");
-
-            let found = response
-                .get("data")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|server| {
-                    server.get("name").and_then(Value::as_str) == Some(server_name)
-                        && server
-                            .get("tools")
-                            .and_then(Value::as_object)
-                            .is_some_and(|tools| tools.contains_key(tool_name))
-                })
-                .cloned();
-
-            if let Some(server) = found {
-                return server;
-            }
-
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for MCP tool {server_name}/{tool_name}; last response={}",
-                response
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    }
-
-    #[test]
-    #[ignore = "Required live Codex native-skill wrapper identity/resource smoke. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_native_skill_wrapper_identity_and_resource_smoke() {
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-        assert!(
-            std::process::Command::new("codex")
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| output.status.success()),
-            "required live Codex native-skill smoke needs an installed Codex CLI"
-        );
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let real_codex_home = inherited_codex_home().expect("resolve inherited Codex home");
-            let real_config = real_codex_home.join("config.toml");
-            let real_auth = real_codex_home.join("auth.json");
-            let real_config_before =
-                codex_file_snapshot(&real_config).expect("snapshot real Codex config");
-            let real_auth_before = codex_file_snapshot(&real_auth).expect("snapshot real auth");
-            let live_home = CodexLiveHomeGuard::from_real_auth()
-                .expect("stage real Codex auth in isolated home");
-            let isolated_home_path = live_home.path().to_path_buf();
-            let workspace = tempfile::tempdir().expect("live skill workspace");
-            let store = tempfile::tempdir().expect("live skill store");
-            let selected = write_codex_raw_skill(
-                store.path(),
-                "live-wrapper-smoke",
-                Some("Fallback description for the wrapper smoke"),
-                "---\nname: deliberately-wrong-source-name\ndescription: Live wrapper identity and linked-resource smoke\n---\nWhen invoked, read reference.md and reply with exactly one line in this format: IDENTITY=live-wrapper-smoke RESOURCE=<the complete contents of reference.md>\n",
-            );
-            std::fs::write(
-                selected.source_dir.join("reference.md"),
-                "LIVE_WRAPPER_RESOURCE_7F31",
-            )
-            .expect("write live linked-resource sentinel");
-            let selected_skills = vec![selected];
-            let (session, mut event_rx) = CodexSession::spawn_with_mode(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                codex_native_skill_spawn_options(&selected_skills),
-            )
-            .await
-            .expect("spawn live Codex session with native selected skill");
-            let live_result: Result<String, String> = async {
-                let model = live_test_select_model(&session).await?;
-                session
-                    .command_handle()
-                    .update_runtime_settings(json!({
-                        "model": model,
-                        "reasoning_effort": "low"
-                    }))
-                    .await?;
-                session
-                    .command_handle()
-                    .execute(SessionCommand::SendMessage {
-                        message:
-                            "Invoke $live-wrapper-smoke now and follow its instructions exactly."
-                                .to_owned(),
-                        images: None,
-                    })
-                    .await?;
-
-                let expected =
-                    "IDENTITY=live-wrapper-smoke RESOURCE=LIVE_WRAPPER_RESOURCE_7F31";
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-                let mut observed = String::new();
-                while tokio::time::Instant::now() < deadline && !observed.contains(expected) {
-                    match tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await {
-                        Ok(Some(event)) => observed.push_str(&event.to_string()),
-                        Ok(None) => break,
-                        Err(_) => {}
-                    }
-                }
-                Ok(observed)
-            }
-            .await;
-            session.shutdown().await;
-            assert!(
-                isolated_home_path.join("config.toml").exists(),
-                "Codex trust/config writes must stay in the isolated home"
-            );
-            let real_config_result =
-                assert_codex_file_snapshot_unchanged(&real_config, real_config_before);
-            let real_auth_result =
-                assert_codex_file_snapshot_unchanged(&real_auth, real_auth_before);
-            drop(live_home);
-            assert!(!isolated_home_path.exists());
-            real_config_result.expect("real Codex config changed during live test");
-            real_auth_result.expect("real Codex auth changed during live test");
-            let observed = live_result.expect("live Codex smoke failed");
-            let expected =
-                "IDENTITY=live-wrapper-smoke RESOURCE=LIVE_WRAPPER_RESOURCE_7F31";
-            assert!(
-                observed.contains(expected),
-                "live Codex did not expose the normalized wrapper identity and linked resource; events={observed}"
-            );
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_spawn_agent_round_trip_emits_subagent_callbacks() {
-        live_test_log("starting live codex sub-agent test");
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-        live_test_log("preflight: live Codex test env set");
-
-        let codex_available = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        live_test_log(&format!(
-            "preflight: codex --version available={codex_available}"
-        ));
-        if !codex_available {
-            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
-            return;
-        }
-
-        if let Ok(out) = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let logged_in = out.status.success() && combined.contains("logged in");
-            let explicitly_not_logged_in = combined.contains("not logged in");
-            if live_test_verbose() {
-                live_test_log(&format!(
-                    "preflight: codex login status exit={} stdout={:?} stderr={:?}",
-                    out.status, stdout, stderr
-                ));
-            } else {
-                live_test_log(&format!(
-                    "preflight: codex login status exit={} logged_in={} explicitly_not_logged_in={}",
-                    out.status, logged_in, explicitly_not_logged_in
-                ));
-            }
-            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
-                eprintln!(
-                    "Skipping live Codex test (`codex login status` indicates no active login)."
-                );
-                return;
-            }
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let workspace = std::env::temp_dir().join(format!("tyde-codex-live-subagent-{suffix}"));
-            std::fs::create_dir_all(&workspace).expect("create temp workspace");
-            std::fs::write(workspace.join("hello.txt"), "hello from live test\n")
-                .expect("seed workspace file");
-            live_test_log(&format!("workspace prepared: {}", workspace.display()));
-
-            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
-            live_test_log("spawning CodexSession");
-            let (session, mut event_rx) = CodexSession::spawn(
-                &workspace_roots,
-                None,
-                &[],
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-                .expect("spawn codex session");
-            live_test_log("CodexSession spawned");
-            let model = live_test_select_model(&session)
-                .await
-                .expect("Luna is required for the live Codex sub-agent test");
-            live_test_log(&format!("using live Codex sub-agent test model: {model}"));
-            session
-                .command_handle()
-                .update_runtime_settings(json!({
-                    "model": model,
-                    "reasoning_effort": "low"
-                }))
-                .await
-                .expect("provider must acknowledge low-cost Luna sub-agent test settings");
-            let emitter = Arc::new(RecordingSubAgentEmitter::new());
-            session
-                .set_subagent_emitter(emitter.clone() as Arc<dyn SubAgentEmitter>)
-                .await
-                .expect("attach Codex sub-agent emitter");
-            live_test_log("sub-agent emitter attached");
-
-            let prompt = r#"Test harness: you MUST call spawn_agent exactly once and then wait_agent.
-1) spawn_agent: use agent_type "worker", message "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK".
-2) wait_agent: wait for that spawned agent id.
-3) Return a one-line summary.
-If you skip spawn_agent or wait_agent, this test fails."#;
-            live_test_log(&format!("sending prompt: {prompt}"));
-
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message: prompt.to_string(),
-                    images: None,
-                })
-                .await
-                .expect("send message");
-            live_test_log("prompt sent; waiting for completion callback");
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
-            let idle_grace = Duration::from_secs(8);
-            let mut poll_ticks: u64 = 0;
-            let mut tool_request_count: u64 = 0;
-            let mut tool_execution_completed_count: u64 = 0;
-            let mut stream_end_count: u64 = 0;
-            let mut last_stream_end_preview: Option<String> = None;
-            let mut seen_typing_true = false;
-            let mut last_typing_status: Option<bool> = None;
-            let mut idle_edge_at: Option<tokio::time::Instant> = None;
-            let mut event_stream_closed = false;
-            while tokio::time::Instant::now() < deadline {
-                poll_ticks = poll_ticks.saturating_add(1);
-                if let Some(idle_at) = idle_edge_at
-                    && tokio::time::Instant::now().duration_since(idle_at) >= idle_grace {
-                        live_test_log(&format!(
-                            "idle edge grace elapsed ({:?}); exiting wait loop",
-                            idle_grace
-                        ));
-                        break;
-                    }
-
-                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
-                    Ok(Some(event)) => {
-                        if live_test_verbose() {
-                            live_test_log(&format!("event(raw): {event}"));
-                        } else {
-                            live_test_log(&format!("event: {}", summarize_live_event(&event)));
-                        }
-                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
-                            let spawn_count_now = emitter.spawn_count().await;
-                            let state = session.inner.state.lock().await;
-                            live_test_log(&format!(
-                                "error event encountered; spawn_count={spawn_count_now} pending_subagent_threads={:?} registering_subagent_threads={:?} live_subagent_threads={:?}",
-                                state.pending_subagent_spawns.keys().collect::<Vec<_>>(),
-                                state.registering_subagent_threads,
-                                state.subagent_streams.keys().collect::<Vec<_>>()
-                            ));
-                            drop(state);
-                            panic!("Codex emitted error during live subagent test: {event}");
-                        }
-                        match event.get("kind").and_then(Value::as_str) {
-                            Some("ToolRequest") => {
-                                tool_request_count = tool_request_count.saturating_add(1);
-                            }
-                            Some("ToolExecutionCompleted") => {
-                                tool_execution_completed_count =
-                                    tool_execution_completed_count.saturating_add(1);
-                            }
-                            Some("StreamEnd") => {
-                                stream_end_count = stream_end_count.saturating_add(1);
-                                let content = event
-                                    .get("data")
-                                    .and_then(|d| d.get("message"))
-                                    .and_then(|m| m.get("content"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                if !content.is_empty() {
-                                    let preview = if content.len() > 120 {
-                                        format!("{}...", &content[..120])
-                                    } else {
-                                        content.to_string()
-                                    };
-                                    last_stream_end_preview = Some(preview);
-                                }
-                            }
-                            Some("TypingStatusChanged") => {
-                                let typing =
-                                    event.get("data").and_then(Value::as_bool).unwrap_or(false);
-                                if typing {
-                                    seen_typing_true = true;
-                                    idle_edge_at = None;
-                                }
-                                if matches!(last_typing_status, Some(true)) && !typing {
-                                    idle_edge_at = Some(tokio::time::Instant::now());
-                                    live_test_log(
-                                        "detected TypingStatusChanged true->false (model idle edge)",
-                                    );
-                                }
-                                last_typing_status = Some(typing);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(None) => {
-                        event_stream_closed = true;
-                        live_test_log("event stream closed before completion");
-                        break;
-                    }
-                    Err(_) => {
-                        if poll_ticks.is_multiple_of(10) {
-                            live_test_log(&format!(
-                                "still waiting... elapsed={}s",
-                                poll_ticks.saturating_mul(2)
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let spawn_count = emitter.spawn_count().await;
-            let wait_diagnostics = format!(
-                "seen_typing_true={} last_typing_status={:?} idle_edge_observed={} tool_requests={} tool_execution_completed_events={} stream_ends={} last_stream_end_preview={:?} event_stream_closed={} poll_ticks={}",
-                seen_typing_true,
-                last_typing_status,
-                idle_edge_at.is_some(),
-                tool_request_count,
-                tool_execution_completed_count,
-                stream_end_count,
-                last_stream_end_preview,
-                event_stream_closed,
-                poll_ticks
-            );
-            live_test_log(&format!("post-run counts: spawn_count={spawn_count}"));
-            live_test_log(&format!("wait diagnostics: {wait_diagnostics}"));
-            assert!(
-                spawn_count > 0,
-                "Expected at least one sub-agent spawn callback from live Codex run. diagnostics={wait_diagnostics}"
-            );
-            let spawns = emitter.spawns.lock().await;
-            for spawn in spawns.iter() {
-                live_test_log(&format!(
-                    "recorded spawn: tool_use_id={} agent_id={} name={:?} agent_type={:?} description={:?}",
-                    spawn.tool_use_id,
-                    spawn.agent_id,
-                    spawn.name,
-                    spawn.agent_type,
-                    spawn.description
-                ));
-            }
-            assert!(
-                spawns.iter().any(|s| !s.tool_use_id.is_empty()),
-                "spawn callback should include a tool_use_id. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                spawns.iter().any(|s| !s.agent_id.0.is_empty()),
-                "spawn callback should include a non-empty agent_id. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                spawns.iter().any(|s| !s.name.trim().is_empty()),
-                "spawn callback should include a display name. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                spawns
-                    .iter()
-                    .any(|s| !s.description.is_empty() || !s.agent_type.is_empty()),
-                "spawn callback should include description or agent type metadata. diagnostics={wait_diagnostics}"
-            );
-            let events_by_agent = emitter.events_by_agent().await;
-            for (agent_id, events) in &events_by_agent {
-                live_test_log(&format!(
-                    "sub-agent event stream: agent_id={} events={}",
-                    agent_id,
-                    events.len()
-                ));
-            }
-            assert!(
-                events_by_agent.values().any(|events| {
-                    events
-                        .iter()
-                        .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
-                }),
-                "sub-agent event stream should include a StreamEnd. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                events_by_agent.values().any(|events| {
-                    events
-                        .iter()
-                        .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
-                }),
-                "sub-agent event stream should include at least one ToolRequest. diagnostics={wait_diagnostics}"
-            );
-            drop(spawns);
-            live_test_log("shutting down session");
-            session.shutdown().await;
-
-            let _ = std::fs::remove_dir_all(&workspace);
-            live_test_log("workspace removed; final assertions");
-
-            live_test_log("live codex sub-agent test completed successfully");
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_session_can_call_tyde_debug_mcp_tool_via_rpc() {
-        live_test_log("starting live codex MCP RPC test");
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-
-        let codex_available = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !codex_available {
-            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
-            return;
-        }
-
-        if let Ok(out) = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let logged_in = out.status.success() && combined.contains("logged in");
-            let explicitly_not_logged_in = combined.contains("not logged in");
-            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
-                eprintln!(
-                    "Skipping live Codex test (`codex login status` indicates no active login)."
-                );
-                return;
-            }
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let workspace = std::env::temp_dir().join(format!("tyde-codex-live-mcp-rpc-{suffix}"));
-            std::fs::create_dir_all(&workspace).expect("create temp workspace");
-
-            let debug_mcp =
-                crate::debug_mcp::start_server(None).expect("start Tyde debug MCP server");
-            live_test_log(&format!("debug MCP URL: {}", debug_mcp.url));
-
-            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
-            let startup_mcp_servers = vec![StartupMcpServer {
-                name: "tyde-debug".to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: debug_mcp.url.clone(),
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
-                },
-            }];
-
-            let (session, _event_rx) = CodexSession::spawn(
-                &workspace_roots,
-                None,
-                &startup_mcp_servers,
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-            .expect("spawn codex session");
-
-            let server = live_test_wait_for_mcp_tool(
-                &session,
-                "tyde-debug",
-                "tyde_dev_instance_list",
-                Duration::from_secs(30),
-            )
-            .await;
-            live_test_log(&format!("mcp server inventory: {server}"));
-
-            let tools = server
-                .get("tools")
-                .and_then(Value::as_object)
-                .expect("server tools map");
-            assert!(
-                tools.contains_key("tyde_dev_instance_list"),
-                "expected tyde_dev_instance_list in MCP inventory: {server}"
-            );
-
-            let response = session
-                .call_mcp_tool("tyde-debug", "tyde_dev_instance_list", None, None)
-                .await
-                .expect("call tyde_dev_instance_list");
-            live_test_log(&format!("mcp tool response: {response}"));
-
-            assert_ne!(
-                response.get("isError").and_then(Value::as_bool),
-                Some(true),
-                "expected successful MCP tool call: {response}"
-            );
-
-            let content = response
-                .get("content")
-                .and_then(Value::as_array)
-                .expect("mcp tool content array");
-            assert!(
-                content.iter().any(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("text")
-                        && item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| text.trim_start().starts_with('['))
-                }),
-                "expected JSON text content from tyde_dev_instance_list: {response}"
-            );
-
-            session.shutdown().await;
-            let _ = std::fs::remove_dir_all(&workspace);
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_session_can_call_tyde_agent_control_mcp_tool_via_rpc() {
-        live_test_log("starting live codex agent-control MCP RPC test");
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-
-        let codex_available = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !codex_available {
-            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
-            return;
-        }
-
-        if let Ok(out) = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let logged_in = out.status.success() && combined.contains("logged in");
-            let explicitly_not_logged_in = combined.contains("not logged in");
-            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
-                eprintln!(
-                    "Skipping live Codex test (`codex login status` indicates no active login)."
-                );
-                return;
-            }
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let workspace =
-                std::env::temp_dir().join(format!("tyde-codex-live-agent-control-{suffix}"));
-            std::fs::create_dir_all(&workspace).expect("create temp workspace");
-
-            let host = crate::host::spawn_host_with_mock_backend(
-                workspace.join("sessions.json"),
-                workspace.join("projects.json"),
-                workspace.join("settings.json"),
-            )
-            .expect("spawn mock host");
-            let agent_control = crate::agent_control_mcp::start_server(None, host.clone())
-                .expect("start Tyde agent-control MCP server");
-            live_test_log(&format!("agent-control MCP URL: {}", agent_control.url));
-
-            let caller_id = host
-                .spawn_agent(protocol::SpawnAgentPayload {
-                    name: Some("agent-control-live-caller".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: protocol::SpawnAgentParams::New {
-                        workspace_roots: vec![workspace.to_string_lossy().to_string()],
-                        prompt: "keep the live MCP caller active".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-                .expect("spawn active agent-control caller");
-            let caller = agent_control.caller(&caller_id);
-            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
-            let mut headers = HashMap::new();
-            headers.insert("Authorization".to_owned(), caller.authorization);
-            let startup_mcp_servers = vec![StartupMcpServer {
-                name: "tyde-agent-control".to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: agent_control.url.clone(),
-                    headers,
-                    bearer_token_env_var: None,
-                },
-            }];
-
-            let (session, _event_rx) = CodexSession::spawn(
-                &workspace_roots,
-                None,
-                &startup_mcp_servers,
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-            .expect("spawn codex session");
-
-            let server = live_test_wait_for_mcp_tool(
-                &session,
-                "tyde-agent-control",
-                "tyde_list_agents",
-                Duration::from_secs(30),
-            )
-            .await;
-            live_test_log(&format!("agent-control inventory: {server}"));
-
-            let tools = server
-                .get("tools")
-                .and_then(Value::as_object)
-                .expect("server tools map");
-            assert!(
-                tools.contains_key("tyde_list_agents"),
-                "expected tyde_list_agents in MCP inventory: {server}"
-            );
-            assert!(
-                tools.contains_key("tyde_spawn_agent"),
-                "expected tyde_spawn_agent in MCP inventory: {server}"
-            );
-
-            let response = session
-                .call_mcp_tool("tyde-agent-control", "tyde_list_agents", None, None)
-                .await
-                .expect("call tyde_list_agents");
-            live_test_log(&format!("agent-control tool response: {response}"));
-
-            assert_ne!(
-                response.get("isError").and_then(Value::as_bool),
-                Some(true),
-                "expected successful MCP tool call: {response}"
-            );
-
-            let content = response
-                .get("content")
-                .and_then(Value::as_array)
-                .expect("mcp tool content array");
-            assert!(
-                content.iter().any(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("text")
-                        && item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| text.trim_start().starts_with('['))
-                }),
-                "expected JSON text content from tyde_list_agents: {response}"
-            );
-
-            session.shutdown().await;
-            let _ = std::fs::remove_dir_all(&workspace);
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_model_emits_mcp_tool_call_for_tyde_debug_tool() {
-        live_test_log("starting live codex model-driven MCP test");
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-
-        let codex_available = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !codex_available {
-            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
-            return;
-        }
-
-        if let Ok(out) = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let logged_in = out.status.success() && combined.contains("logged in");
-            let explicitly_not_logged_in = combined.contains("not logged in");
-            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
-                eprintln!(
-                    "Skipping live Codex test (`codex login status` indicates no active login)."
-                );
-                return;
-            }
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let workspace =
-                std::env::temp_dir().join(format!("tyde-codex-live-mcp-model-{suffix}"));
-            std::fs::create_dir_all(&workspace).expect("create temp workspace");
-
-            let debug_mcp =
-                crate::debug_mcp::start_server(None).expect("start Tyde debug MCP server");
-            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
-            let startup_mcp_servers = vec![StartupMcpServer {
-                name: "tyde-debug".to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: debug_mcp.url.clone(),
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
-                },
-            }];
-
-            let (session, mut event_rx) = CodexSession::spawn(
-                &workspace_roots,
-                None,
-                &startup_mcp_servers,
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-            .expect("spawn codex session");
-
-            let _ = live_test_wait_for_mcp_tool(
-                &session,
-                "tyde-debug",
-                "tyde_dev_instance_list",
-                Duration::from_secs(30),
-            )
-            .await;
-
-            let model = live_test_select_model(&session)
-                .await
-                .expect("Luna is required for the model-driven live Codex test");
-            live_test_log(&format!("using live Codex test model: {model}"));
-            session
-                .command_handle()
-                .update_runtime_settings(json!({
-                    "model": model,
-                    "reasoning_effort": "low"
-                }))
-                .await
-                .expect("provider must acknowledge low-cost Luna live codex test settings");
-
-            let prompt = r#"Test harness: call the MCP tool `tyde_dev_instance_list` exactly once, then reply with the number of instances it returned as a single line like `instances=0`.
-Do not describe the tool, and do not skip the tool call."#;
-
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message: prompt.to_string(),
-                    images: None,
-                })
-                .await
-                .expect("send message");
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-            let mut saw_mcp_tool_request = false;
-            let mut saw_mcp_tool_completion = false;
-            let mut final_message: Option<String> = None;
-
-            while tokio::time::Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
-                    Ok(Some(event)) => {
-                        if live_test_verbose() {
-                            live_test_log(&format!("event(raw): {event}"));
-                        } else {
-                            live_test_log(&format!("event: {}", summarize_live_event(&event)));
-                        }
-
-                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
-                            panic!("Codex emitted error during live MCP test: {event}");
-                        }
-
-                        match event.get("kind").and_then(Value::as_str) {
-                            Some("ToolRequest") => {
-                                if event
-                                    .get("data")
-                                    .and_then(|d| d.get("tool_name"))
-                                    .and_then(Value::as_str)
-                                    == Some("tyde_dev_instance_list")
-                                {
-                                    saw_mcp_tool_request = true;
-                                }
-                            }
-                            Some("ToolExecutionCompleted") => {
-                                if event
-                                    .get("data")
-                                    .and_then(|d| d.get("tool_name"))
-                                    .and_then(Value::as_str)
-                                    == Some("tyde_dev_instance_list")
-                                {
-                                    saw_mcp_tool_completion = true;
-                                }
-                            }
-                            Some("StreamEnd") => {
-                                let visible_message = event
-                                    .get("data")
-                                    .and_then(|d| d.get("message"))
-                                    .and_then(|m| m.get("content"))
-                                    .and_then(Value::as_str)
-                                    .filter(|message| !message.trim().is_empty())
-                                    .map(ToString::to_string);
-                                if visible_message.is_some() {
-                                    final_message = visible_message;
-                                }
-                                if saw_mcp_tool_request
-                                    && saw_mcp_tool_completion
-                                    && final_message.is_some()
-                                {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {}
-                }
-            }
-
-            assert!(
-                saw_mcp_tool_request,
-                "expected Codex to emit ToolRequest for tyde_dev_instance_list; final_message={final_message:?}"
-            );
-            assert!(
-                saw_mcp_tool_completion,
-                "expected Codex to emit ToolExecutionCompleted for tyde_dev_instance_list; final_message={final_message:?}"
-            );
-            assert!(
-                final_message
-                    .as_deref()
-                    .is_some_and(|message| message.trim().starts_with("instances=")),
-                "expected final message summarizing instance count, got {final_message:?}"
-            );
-
-            session.shutdown().await;
-            let _ = std::fs::remove_dir_all(&workspace);
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_generates_inline_image() {
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-        if !std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
-            eprintln!("Skipping live Codex image test (`codex` CLI is not available).");
-            return;
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let workspace = tempfile::tempdir().expect("live image workspace");
-            let (session, mut event_rx) = CodexSession::spawn(
-                &[workspace.path().to_string_lossy().to_string()],
-                None,
-                &[],
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-            .expect("spawn live Codex image session");
-            let model = live_test_select_model(&session)
-                .await
-                .expect("Luna is required for the live Codex image test");
-            session
-                .command_handle()
-                .update_runtime_settings(json!({
-                    "model": model,
-                    "reasoning_effort": "low"
-                }))
-                .await
-                .expect("provider must acknowledge Luna image test settings");
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message: "Use image generation exactly once to create a simple 256px blue square prototype on a white background. Then reply exactly IMAGE_DONE."
-                        .to_owned(),
-                    images: None,
-                })
-                .await
-                .expect("send live image prompt");
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-            let mut saw_request = false;
-            let mut saw_completion = false;
-            let mut image: Option<ImageData> = None;
-            while tokio::time::Instant::now() < deadline {
-                let Ok(Some(event)) =
-                    tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await
-                else {
-                    continue;
-                };
-                live_test_log(&format!("image event: {}", summarize_live_event(&event)));
-                assert_ne!(
-                    event.get("kind").and_then(Value::as_str),
-                    Some("Error"),
-                    "Codex emitted an error during live image generation: {event}"
-                );
-                match event.get("kind").and_then(Value::as_str) {
-                    Some("ToolRequest") => {
-                        saw_request |= event
-                            .pointer("/data/tool_type/kind")
-                            .and_then(Value::as_str)
-                            == Some("GenerateImage");
-                    }
-                    Some("ToolExecutionCompleted") => {
-                        saw_completion |= event
-                            .pointer("/data/tool_result/kind")
-                            .and_then(Value::as_str)
-                            == Some("GenerateImage");
-                    }
-                    Some("StreamEnd") => {
-                        if let Some(value) = event.pointer("/data/message/images/0") {
-                            image = serde_json::from_value(value.clone()).ok();
-                        }
-                    }
-                    _ => {}
-                }
-                if saw_request && saw_completion && image.is_some() {
-                    break;
-                }
-            }
-            assert!(saw_request, "live Codex did not emit typed image request");
-            assert!(
-                saw_completion,
-                "live Codex did not emit typed image completion"
-            );
-            let image = image.expect("live Codex image was not attached to StreamEnd");
-            assert!(image.media_type.starts_with("image/"));
-            assert!(image.data.len() > 100);
-            session.shutdown().await;
-        });
-    }
-
-    #[test]
-    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
-    fn live_codex_completes_background_command_and_follow_up() {
-        live_test_log("starting live codex background command test");
-        if !live_codex_tests_enabled() {
-            skip_live_codex_test();
-            return;
-        }
-
-        let codex_available = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !codex_available {
-            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
-            return;
-        }
-
-        if let Ok(out) = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let logged_in = out.status.success() && combined.contains("logged in");
-            let explicitly_not_logged_in = combined.contains("not logged in");
-            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
-                eprintln!(
-                    "Skipping live Codex test (`codex login status` indicates no active login)."
-                );
-                return;
-            }
-        }
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let workspace =
-                std::env::temp_dir().join(format!("tyde-codex-live-background-{suffix}"));
-            std::fs::create_dir_all(&workspace).expect("create temp workspace");
-            let script_path = workspace.join("background_test.sh");
-            let output_path = workspace.join("BACKGROUND_DONE.txt");
-            std::fs::write(
-                &script_path,
-                "#!/bin/sh\nsleep 12\nprintf LIVE_BACKGROUND_OK > BACKGROUND_DONE.txt\nprintf LIVE_BACKGROUND_OK\n",
-            )
-            .expect("write background test script");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                let mut permissions = std::fs::metadata(&script_path)
-                    .expect("stat background test script")
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&script_path, permissions)
-                    .expect("chmod background test script");
-            }
-
-            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
-            let (session, mut event_rx) = CodexSession::spawn(
-                &workspace_roots,
-                None,
-                &[],
-                None,
-                BackendAccessMode::Unrestricted,
-            )
-            .await
-            .expect("spawn codex session");
-
-            let model = live_test_select_model(&session)
-                .await
-                .expect("Luna is required for the background live Codex test");
-            live_test_log(&format!("using live Codex test model: {model}"));
-            session
-                .command_handle()
-                .update_runtime_settings(json!({
-                    "model": model,
-                    "reasoning_effort": "low"
-                }))
-                .await
-                .expect("provider must acknowledge low-cost Luna live codex test settings");
-
-            let prompt = r#"Execute `./background_test.sh` exactly once using command execution. Wait for the command to finish, including polling any running process if necessary. Do not reply before it finishes. Then reply exactly `LIVE_BACKGROUND_OK`."#;
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message: prompt.to_string(),
-                    images: None,
-                })
-                .await
-                .expect("send background command prompt");
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
-            let mut tool_call_id: Option<String> = None;
-            let mut saw_matching_completion = false;
-            let mut saw_final_message = false;
-            let mut saw_typing_stopped = false;
-
-            while tokio::time::Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
-                    Ok(Some(event)) => {
-                        if live_test_verbose() {
-                            live_test_log(&format!("event(raw): {event}"));
-                        } else {
-                            live_test_log(&format!("event: {}", summarize_live_event(&event)));
-                        }
-
-                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
-                            panic!("Codex emitted error during live background test: {event}");
-                        }
-
-                        match event.get("kind").and_then(Value::as_str) {
-                            Some("ToolRequest") => {
-                                let data = event.get("data").expect("ToolRequest data");
-                                let command = data
-                                    .pointer("/tool_type/command")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                if command.contains("background_test.sh") {
-                                    let id = data
-                                        .get("tool_call_id")
-                                        .and_then(Value::as_str)
-                                        .expect("ToolRequest tool_call_id")
-                                        .to_string();
-                                    assert!(
-                                        tool_call_id.as_ref().is_none_or(|known| known == &id),
-                                        "background command changed tool identity: old={tool_call_id:?} new={id}"
-                                    );
-                                    tool_call_id = Some(id);
-                                }
-                            }
-                            Some("ToolExecutionCompleted") => {
-                                let data = event
-                                    .get("data")
-                                    .expect("ToolExecutionCompleted data");
-                                let id = data
-                                    .get("tool_call_id")
-                                    .and_then(Value::as_str)
-                                    .expect("ToolExecutionCompleted tool_call_id");
-                                if tool_call_id.as_deref() == Some(id) {
-                                    assert_eq!(
-                                        data.get("success").and_then(Value::as_bool),
-                                        Some(true),
-                                        "background command completion failed: {event}"
-                                    );
-                                    saw_matching_completion = true;
-                                }
-                            }
-                            Some("StreamEnd") => {
-                                let content = event
-                                    .pointer("/data/message/content")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                if content.trim().contains("LIVE_BACKGROUND_OK") {
-                                    saw_final_message = true;
-                                }
-                            }
-                            Some("TypingStatusChanged")
-                                if event.get("data").and_then(Value::as_bool) == Some(false) =>
-                            {
-                                saw_typing_stopped = true;
-                            }
-                            _ => {}
-                        }
-
-                        if saw_matching_completion && saw_final_message && saw_typing_stopped {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {}
-                }
-            }
-
-            assert!(
-                tool_call_id.is_some(),
-                "expected a ToolRequest for background_test.sh"
-            );
-            assert!(
-                saw_matching_completion,
-                "expected a successful completion with the original tool identity"
-            );
-            assert!(saw_final_message, "expected LIVE_BACKGROUND_OK final response");
-            assert!(saw_typing_stopped, "expected typing to stop after completion");
-            assert_eq!(
-                std::fs::read_to_string(&output_path).expect("read background completion proof"),
-                "LIVE_BACKGROUND_OK"
-            );
-
-            let follow_up = "Reply exactly `LIVE_BACKGROUND_FOLLOWUP_OK` without using tools.";
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message: follow_up.to_string(),
-                    images: None,
-                })
-                .await
-                .expect("send background follow-up prompt");
-
-            let follow_up_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let mut saw_follow_up = false;
-            while tokio::time::Instant::now() < follow_up_deadline {
-                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
-                    Ok(Some(event)) => {
-                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
-                            panic!("Codex emitted error after background command: {event}");
-                        }
-                        assert_ne!(
-                            event.get("kind").and_then(Value::as_str),
-                            Some("ToolRequest"),
-                            "late background activity contaminated follow-up: {event}"
-                        );
-                        assert_ne!(
-                            event.get("kind").and_then(Value::as_str),
-                            Some("ToolExecutionCompleted"),
-                            "late background completion contaminated follow-up: {event}"
-                        );
-                        if event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                            && event
-                                .pointer("/data/message/content")
-                                .and_then(Value::as_str)
-                                .is_some_and(|content| {
-                                    content.trim().contains("LIVE_BACKGROUND_FOLLOWUP_OK")
-                                })
-                        {
-                            saw_follow_up = true;
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {}
-                }
-            }
-            assert!(saw_follow_up, "expected clean follow-up after background command");
-
-            session.shutdown().await;
-            let _ = std::fs::remove_dir_all(&workspace);
-        });
-    }
-
-    #[test]
-    fn conflicting_collab_sender_blocks_child_activity_registration() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "parent-thread".to_string();
-            }
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "parent-thread",
-                        "item": {
-                            "type": "collabAgentToolCall",
-                            "id": "conflicting-spawn",
-                            "senderThreadId": "other-parent",
-                            "receiverThreadId": "child-thread",
-                            "prompt": "inspect",
-                            "receiverAgentType": "worker"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "parent-thread",
-                        "item": {
-                            "type": "subAgentActivity",
-                            "kind": "started",
-                            "agentThreadId": "child-thread",
-                            "agentPath": "/root/worker"
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                !inner
-                    .state
-                    .lock()
-                    .await
-                    .subagent_streams
-                    .contains_key("child-thread")
-            );
-            let events = drain_events(&mut parent_rx);
-            assert!(events.iter().any(|event| {
-                event
-                    .pointer("/data/content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("names sender 'other-parent'")
-                            && content.contains("child thread 'child-thread'")
-                    })
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn child_relay_registration_failure_is_a_parent_error_without_a_phantom_child() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "parent-thread".to_string();
-                state.active_turn_id = Some("parent-turn".to_string());
-                // The shared fixture has a published seed response. Remove it so
-                // this test reaches child registration rather than correctly
-                // rejecting a tool container that overlaps that response.
-                state.active_stream = None;
-                state.subagent_emitter = Some(Arc::new(FailingSubAgentEmitter));
-            }
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "parent-thread",
-                        "item": {
-                            "type": "collabAgentToolCall",
-                            "id": "019f60f0-7a69-73f0-9ab3-7ddc24062e30",
-                            "senderThreadId": "parent-thread",
-                            "receiverThreadId": "native-quick-child-thread",
-                            "prompt": "reply exactly QUICK_DONE",
-                            "receiverAgentType": "sub-agent",
-                            "receiverAgentName": "/root/quick_child"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "parent-thread",
-                        "item": {
-                            "type": "subAgentActivity",
-                            "id": "activity-quick-child",
-                            "kind": "started",
-                            "agentThreadId": "native-quick-child-thread",
-                            "agentPath": "/root/quick_child"
-                        }
-                    }),
-                )
-                .await;
-
-            let state = inner.state.lock().await;
-            assert!(
-                !state
-                    .subagent_streams
-                    .contains_key("native-quick-child-thread")
-            );
-            assert!(
-                !state
-                    .registering_subagent_threads
-                    .contains("native-quick-child-thread")
-            );
-            drop(state);
-            let events = drain_events(&mut parent_rx);
-            // drain_events applies the same backend Error normalization as the
-            // agent forwarder, so this assertion pins the client-visible shape.
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                    && event.pointer("/data/sender").and_then(Value::as_str) == Some("Error")
-                    && event
-                        .pointer("/data/content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| {
-                            content.contains("Codex child relay registration failed")
-                                && content.contains("parent session is unavailable")
-                        })
-            }));
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false)
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn connection_scoped_notifications_preserve_global_semantics_without_thread_id() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "mcpServer/startupStatus/updated",
-                    &json!({"serverName": "tyde-agent-control", "status": "ready"}),
-                )
-                .await;
-            inner
-                .handle_notification("account/rateLimits/updated", &json!({"rateLimits": []}))
-                .await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "error",
-                    &json!({"message": "connection failed", "fatal": true}),
-                )
-                .await;
-            let events = drain_events(&mut parent_rx);
-            assert!(events.iter().any(|event| {
-                event.pointer("/data/content").and_then(Value::as_str) == Some("connection failed")
-            }));
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false)
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn thread_scoped_notification_without_thread_id_is_an_ownership_invariant() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            inner
-                .handle_notification("turn/started", &json!({"turn": {"id": "missing-owner"}}))
-                .await;
-            let events = drain_events(&mut parent_rx);
-            assert!(events.iter().any(|event| {
-                event
-                    .pointer("/data/content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("thread-scoped notification 'turn/started'")
-                            && content.contains("<missing>")
-                    })
-            }));
-            assert!(
-                !events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamStart")
-                })
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn unknown_child_thread_surfaces_ownership_error_without_parent_content() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "unknown-child-thread",
-                        "itemId": "unknown-message",
-                        "delta": "must not reach parent"
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut parent_rx);
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                    && event
-                        .pointer("/data/content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| content.contains("ownership invariant failed"))
-            }));
-            assert!(!events.iter().any(|event| {
-                event.pointer("/data/content").and_then(Value::as_str)
-                    == Some("must not reach parent")
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_thread_notifications_route_to_subagent_channel_not_parent() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-1").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "turn": { "id": "turn-sub-1" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-1"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cmd-sub-1",
-                            "command": "cat hello.txt",
-                            "cwd": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cmd-sub-1",
-                            "exitCode": 0,
-                            "aggregatedOutput": "LIVE_SUBAGENT_OK"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-1",
-                            "text": "LIVE_SUBAGENT_OK"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "turn": {
-                            "id": "turn-sub-1",
-                            "status": "completed"
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "sub-agent thread notifications should not emit into parent conversation: {parent_events:?}"
-            );
-
-            let subagent_events = drain_events(&mut subagent_rx);
-            assert_eq!(
-                event_kinds(&subagent_events),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "ToolRequest",
-                    "ToolExecutionCompleted",
-                    "StreamEnd",
-                    "StreamStart",
-                    "StreamEnd",
-                    "TypingStatusChanged"
-                ],
-                "an unpublished provider reservation must remain distinct from the tool container: {subagent_events:?}"
-            );
-            assert_eq!(
-                subagent_events[1]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-1")
-            );
-            assert_eq!(
-                subagent_events[2]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-1")
-            );
-            assert_eq!(
-                subagent_events[2]
-                    .pointer("/data/tool_name")
-                    .and_then(Value::as_str),
-                Some("run_command")
-            );
-            assert_eq!(
-                subagent_events[3]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-1")
-            );
-            assert_eq!(
-                subagent_events[3]
-                    .pointer("/data/tool_name")
-                    .and_then(Value::as_str),
-                Some("run_command")
-            );
-            assert_eq!(
-                subagent_events[4]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-1")
-            );
-            assert_eq!(
-                subagent_events[4]
-                    .pointer("/data/message/tool_calls/0/id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-1")
-            );
-            assert_eq!(
-                subagent_events[5]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-sub-1")
-            );
-            assert_eq!(
-                subagent_events[6]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-sub-1")
-            );
-            assert_eq!(
-                subagent_events[6]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("LIVE_SUBAGENT_OK")
-            );
-            assert!(
-                subagent_events[6]
-                    .pointer("/data/message/tool_calls")
-                    .and_then(Value::as_array)
-                    .is_none_or(Vec::is_empty),
-                "the synthetic tool container, not the unpublished provider reservation, owns the tool"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "turn": { "id": "turn-sub-foreign-tool" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": { "type": "reasoning", "id": "reasoning-sub-foreign-tool" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "itemId": "reasoning-sub-foreign-tool",
-                        "delta": "Published reasoning owns this boundary."
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-1",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cmd-sub-foreign-tool",
-                            "command": "pwd",
-                            "cwd": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            let foreign_boundary = drain_events(&mut subagent_rx);
-            assert_eq!(
-                event_kinds(&foreign_boundary),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "StreamReasoningDelta",
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ],
-                "a published reasoning stream must still reject a foreign tool container"
-            );
-            assert!(foreign_boundary.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("ToolRequest")
-            }));
-            assert!(drain_events(&mut parent_rx).is_empty());
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_child_unpublished_reasoning_allows_tool_container_then_resumes() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (child_thread, item_id) in [
-                ("child-reserved-provider", Some("child-reasoning-provider")),
-                ("child-reserved-idless", None),
-            ] {
-                let (inner, mut parent_rx) = test_codex_inner();
-                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "turn": { "id": format!("turn-{child_thread}") }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut child_rx);
-
-                let mut started = json!({ "type": "reasoning" });
-                if let Some(item_id) = item_id {
-                    started["id"] = Value::String(item_id.to_owned());
-                }
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({ "threadId": child_thread, "item": started }),
-                    )
-                    .await;
-                assert!(drain_events(&mut child_rx).is_empty());
-
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "item": {
-                                "type": "commandExecution",
-                                "id": "child-reserved-tool",
-                                "command": "pwd",
-                                "cwd": "/tmp"
-                            }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": child_thread,
-                            "item": {
-                                "type": "commandExecution",
-                                "id": "child-reserved-tool",
-                                "exitCode": 0,
-                                "aggregatedOutput": "/tmp"
-                            }
-                        }),
-                    )
-                    .await;
-                let tool_events = drain_events(&mut child_rx);
-                assert_eq!(
-                    event_kinds(&tool_events),
-                    vec![
-                        "StreamStart",
-                        "ToolRequest",
-                        "ToolExecutionCompleted",
-                        "StreamEnd"
-                    ]
-                );
-                assert_eq!(
-                    tool_events[3]
-                        .pointer("/data/message/tool_calls/0/id")
-                        .and_then(Value::as_str),
-                    Some("child-reserved-tool")
-                );
-
-                let mut delta = json!({
-                    "threadId": child_thread,
-                    "delta": "Child reasoning resumed."
-                });
-                if let Some(item_id) = item_id {
-                    delta["itemId"] = Value::String(item_id.to_owned());
-                }
-                inner
-                    .handle_notification("item/reasoning/delta", &delta)
-                    .await;
-                let resumed = drain_events(&mut child_rx);
-                assert_eq!(
-                    event_kinds(&resumed)
-                        .into_iter()
-                        .filter(|kind| *kind != "TypingStatusChanged")
-                        .collect::<Vec<_>>(),
-                    vec!["StreamStart", "StreamReasoningDelta"]
-                );
-                let resumed_id = resumed
-                    .iter()
-                    .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .and_then(codex_event_message_id)
-                    .expect("resumed child reasoning message id")
-                    .to_owned();
-                if let Some(item_id) = item_id {
-                    assert_eq!(resumed_id, item_id);
-                } else {
-                    assert!(resumed_id.starts_with("server-generated:idless_reasoning:"));
-                }
-
-                let mut completion = json!({
-                    "threadId": child_thread,
-                    "item": {
-                        "type": "reasoning",
-                        "summary": "Child reasoning resumed."
-                    }
-                });
-                if let Some(item_id) = item_id {
-                    completion["item"]["id"] = Value::String(item_id.to_owned());
-                }
-                inner
-                    .handle_notification("item/completed", &completion)
-                    .await;
-                let terminal = drain_events(&mut child_rx);
-                assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
-                assert_eq!(
-                    codex_event_message_id(&terminal[0]),
-                    Some(resumed_id.as_str())
-                );
-                assert!(drain_events(&mut parent_rx).is_empty());
-                assert_codex_protocol_valid(&[tool_events, resumed, terminal].concat());
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn codex_child_overlapping_tools_share_container_with_optional_reservation() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (child_thread, reserve_reasoning) in [
-                ("child-overlap-no-provider", false),
-                ("child-overlap-reserved", true),
-            ] {
-                let (inner, mut parent_rx) = test_codex_inner();
-                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "turn": { "id": format!("turn-{child_thread}") }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut child_rx);
-                if reserve_reasoning {
-                    inner
-                        .handle_notification(
-                            "item/started",
-                            &json!({
-                                "threadId": child_thread,
-                                "item": {
-                                    "type": "reasoning",
-                                    "id": "overlap-reservation"
-                                }
-                            }),
-                        )
-                        .await;
-                }
-
-                for tool_id in ["overlap-tool-a", "overlap-tool-b"] {
-                    inner
-                        .handle_notification(
-                            "item/started",
-                            &json!({
-                                "threadId": child_thread,
-                                "item": {
-                                    "type": "commandExecution",
-                                    "id": tool_id,
-                                    "command": "pwd",
-                                    "cwd": "/tmp"
-                                }
-                            }),
-                        )
-                        .await;
-                }
-                for tool_id in ["overlap-tool-a", "overlap-tool-b"] {
-                    inner
-                        .handle_notification(
-                            "item/completed",
-                            &json!({
-                                "threadId": child_thread,
-                                "item": {
-                                    "type": "commandExecution",
-                                    "id": tool_id,
-                                    "exitCode": 0,
-                                    "aggregatedOutput": "/tmp"
-                                }
-                            }),
-                        )
-                        .await;
-                }
-
-                let events = drain_events(&mut child_rx);
-                assert_eq!(
-                    event_kinds(&events),
-                    vec![
-                        "StreamStart",
-                        "ToolRequest",
-                        "ToolRequest",
-                        "ToolExecutionCompleted",
-                        "ToolExecutionCompleted",
-                        "StreamEnd"
-                    ]
-                );
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| {
-                            event.get("kind").and_then(Value::as_str) == Some("ToolRequest")
-                        })
-                        .filter_map(|event| {
-                            event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                        })
-                        .collect::<Vec<_>>(),
-                    vec!["overlap-tool-a", "overlap-tool-b"]
-                );
-                assert_eq!(
-                    events[5]
-                        .pointer("/data/message/tool_calls")
-                        .and_then(Value::as_array)
-                        .expect("shared child tool container declarations")
-                        .iter()
-                        .filter_map(|tool| tool.get("id").and_then(Value::as_str))
-                        .collect::<Vec<_>>(),
-                    vec!["overlap-tool-a", "overlap-tool-b"]
-                );
-                assert!(events.iter().all(|event| {
-                    !matches!(
-                        event.get("kind").and_then(Value::as_str),
-                        Some("MessageAdded" | "OperationCancelled" | "Error")
-                    )
-                }));
-                assert!(drain_events(&mut parent_rx).is_empty());
-                assert_codex_protocol_valid(&events);
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn child_completion_container_requires_exact_pending_tool_id() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (child_thread, completion_id, accepted) in [
-                ("child-exact-requested", "pending-tool", true),
-                ("child-exact-unrequested", "foreign-tool", false),
-            ] {
-                let (inner, mut parent_rx) = test_codex_inner();
-                let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-                attach_test_codex_subagent(&inner, child_tx, child_thread).await;
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "turn": { "id": format!("turn-{child_thread}") }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "item": { "type": "reasoning", "id": "exact-reservation" }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut child_rx);
-                {
-                    let mut state = inner.state.lock().await;
-                    state
-                        .subagent_streams
-                        .get_mut(child_thread)
-                        .expect("child stream")
-                        .pending_tool_call_ids
-                        .insert("pending-tool".to_owned());
-                }
-
-                inner
-                    .record_subagent_tool_container(
-                        child_thread,
-                        completion_id,
-                        Some(ChatMessageId("completion-container".to_owned())),
-                    )
-                    .await;
-                let events = drain_events(&mut child_rx);
-                if accepted {
-                    assert!(events.is_empty());
-                    let state = inner.state.lock().await;
-                    assert_eq!(
-                        state
-                            .subagent_streams
-                            .get(child_thread)
-                            .and_then(|stream| stream.tool_container.as_ref())
-                            .map(|container| container.0.as_str()),
-                        Some("completion-container")
-                    );
-                } else {
-                    assert!(events.iter().any(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
-                    }));
-                    assert!(events.iter().any(|event| {
-                        event
-                            .pointer("/data/content")
-                            .and_then(Value::as_str)
-                            .is_some_and(|content| content.contains("foreign active message id"))
-                    }));
-                }
-                assert!(drain_events(&mut parent_rx).is_empty());
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn child_unknown_tool_completion_terminates_reserved_message_boundary() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, child_tx, "thread-sub-unknown-tool").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "turn": { "id": "turn-sub-unknown-tool" }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut child_rx)),
-                vec!["TypingStatusChanged"]
-            );
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "item": { "type": "agentMessage", "id": "msg-sub-reserved" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut child_rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cmd-sub-without-request",
-                            "exitCode": 0,
-                            "aggregatedOutput": "tool output"
-                        }
-                    }),
-                )
-                .await;
-            let cancellation = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&cancellation),
-                vec![
-                    "StreamStart",
-                    "ToolRequest",
-                    "ToolExecutionCompleted",
-                    "MessageAdded",
-                    "StreamEnd",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert_eq!(
-                cancellation[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-without-request")
-            );
-            assert_eq!(
-                cancellation[1]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-without-request")
-            );
-            assert_eq!(
-                cancellation[2]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("cmd-sub-without-request")
-            );
-            assert_eq!(
-                cancellation[2]
-                    .pointer("/data/tool_result/stdout")
-                    .and_then(Value::as_str),
-                Some("tool output")
-            );
-            assert_eq!(
-                codex_event_message_id(&cancellation[4]),
-                Some("cmd-sub-without-request")
-            );
-
-            let emitter = {
-                let state = inner.state.lock().await;
-                let stream = state
-                    .subagent_streams
-                    .get("thread-sub-unknown-tool")
-                    .expect("child stream remains owned after typed cancellation");
-                assert_eq!(
-                    stream
-                        .terminated_turns
-                        .back()
-                        .map(|turn| turn.turn_id.as_str()),
-                    Some("turn-sub-unknown-tool"),
-                );
-                assert!(stream.active_turn_id.is_none());
-                assert!(stream.current_message_id.is_none());
-                assert!(stream.current_tool_call_ids.is_empty());
-                assert!(stream.tool_container.is_none());
-                assert!(stream.pending_tool_call_ids.is_empty());
-                Arc::clone(&stream.emitter)
-            };
-            assert!(!emitter.has_open_stream());
-
-            for (method, params) in [
-                (
-                    "item/completed",
-                    json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-reserved",
-                            "text": "must not publish"
-                        }
-                    }),
-                ),
-                (
-                    "item/completed",
-                    json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cmd-sub-without-request",
-                            "exitCode": 0,
-                            "aggregatedOutput": "duplicate"
-                        }
-                    }),
-                ),
-                (
-                    "turn/completed",
-                    json!({
-                        "threadId": "thread-sub-unknown-tool",
-                        "turn": { "id": "turn-sub-unknown-tool", "status": "completed" }
-                    }),
-                ),
-            ] {
-                inner.handle_notification(method, &params).await;
-            }
-            assert!(drain_events(&mut child_rx).is_empty());
-            assert!(drain_events(&mut parent_rx).is_empty());
-            assert!(!emitter.has_open_stream());
-
-            inner.complete_all_codex_subagents().await;
-            assert!(drain_events(&mut child_rx).is_empty());
-            assert!(drain_events(&mut parent_rx).is_empty());
-            assert!(!emitter.has_open_stream());
-
-            inner.rpc.shutdown().await;
-            assert!(drain_events(&mut child_rx).is_empty());
-            assert!(drain_events(&mut parent_rx).is_empty());
-            assert!(!emitter.has_open_stream());
-        });
-    }
-
-    #[test]
-    fn child_collab_completion_without_tool_field_completes_original_request() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, child_tx, "thread-sub-collab").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-collab",
-                        "turn": { "id": "turn-sub-collab" }
-                    }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-collab",
-                        "item": { "type": "collabToolCall", "id": "collab-child-1" }
-                    }),
-                )
-                .await;
-            let started = drain_events(&mut child_rx);
-            let requests = started
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                .collect::<Vec<_>>();
-            assert_eq!(requests.len(), 1, "one request card: {started:?}");
-            assert_eq!(
-                requests[0]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("collab-child-1")
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-collab",
-                        "item": {
-                            "type": "collabToolCall",
-                            "id": "collab-child-1",
-                            "status": "completed"
-                        }
-                    }),
-                )
-                .await;
-            let completed = drain_events(&mut child_rx);
-            let completions = completed
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                completions.len(),
-                1,
-                "the completion must land exactly once: {completed:?}"
-            );
-            assert_eq!(
-                completions[0]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("collab-child-1"),
-                "the completion must land on the emitted request id"
-            );
-            assert!(
-                completed.iter().all(|event| {
-                    !matches!(
-                        event.get("kind").and_then(Value::as_str),
-                        Some("ToolRequest" | "OperationCancelled" | "Error")
-                    )
-                }),
-                "no synthetic request card and no identity violation: {completed:?}"
-            );
-            for event in started.iter().chain(completed.iter()) {
-                let encoded = serde_json::to_string(event).expect("serialize child event");
-                assert!(
-                    !encoded.contains(":occurrence-"),
-                    "no phantom occurrence id: {encoded}"
-                );
-            }
-            {
-                let state = inner.state.lock().await;
-                let stream = state
-                    .subagent_streams
-                    .get("thread-sub-collab")
-                    .expect("child stream stays owned");
-                assert!(stream.pending_tool_call_ids.is_empty());
-            }
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn child_late_delta_after_completed_item_absorbs_quietly() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, child_tx, "thread-sub-late").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-late",
-                        "turn": { "id": "turn-sub-late" }
-                    }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-sub-late",
-                Some("child-msg-done"),
-                CodexProviderItemKind::AgentMessage,
-                "Hello",
-            )
-            .await;
-            drain_events(&mut child_rx);
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-sub-late",
-                "child-msg-done",
-                CodexProviderItemKind::AgentMessage,
-                "Hello",
-            )
-            .await;
-            drain_events(&mut child_rx);
-
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-sub-late",
-                Some("child-msg-done"),
-                CodexProviderItemKind::AgentMessage,
-                " straggler",
-            )
-            .await;
-            start_test_codex_provider_item(
-                &inner,
-                "thread-sub-late",
-                Some("child-msg-done"),
-                CodexProviderItemKind::AgentMessage,
-            )
-            .await;
-            assert!(
-                drain_events(&mut child_rx).is_empty(),
-                "late events for the completed child item absorb quietly"
-            );
-            {
-                let state = inner.state.lock().await;
-                let stream = state
-                    .subagent_streams
-                    .get("thread-sub-late")
-                    .expect("child stream stays owned");
-                assert_eq!(stream.active_turn_id.as_deref(), Some("turn-sub-late"));
-                assert!(stream.terminated_turns.is_empty());
-                let tombstone = stream
-                    .provider_item_tombstones
-                    .iter()
-                    .find(|tombstone| tombstone.message_id.0 == "child-msg-done")
-                    .expect("completed child tombstone");
-                assert_eq!(
-                    tombstone.disposition,
-                    CodexProviderItemDisposition::Completed
-                );
-            }
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn child_empty_file_change_completion_without_request_is_skipped() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, child_tx, "thread-sub-empty-fc").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-empty-fc",
-                        "turn": { "id": "turn-sub-empty-fc" }
-                    }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-sub-empty-fc",
-                        "item": { "type": "fileChange", "id": "fc-empty", "changes": [] }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut child_rx).is_empty(),
-                "an empty fileChange start emits no request"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-empty-fc",
-                        "item": {
-                            "type": "fileChange",
-                            "id": "fc-empty",
-                            "status": "completed",
-                            "changes": []
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut child_rx).is_empty(),
-                "an empty fileChange completion without an emitted request is skipped"
-            );
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn parent_interruption_does_not_cancel_idle_completed_child_turn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, _parent_rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "thread-parent".to_string();
-                state.active_turn_id = Some("parent-turn".to_string());
-                // The parent completion below must own the live parent turn;
-                // test_codex_state otherwise supplies turn-test/msg-seed.
-                state.active_stream = None;
-            }
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-idle").await;
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({"threadId":"thread-sub-idle","turn":{"id":"turn-sub-idle"}}),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({"threadId":"thread-sub-idle","item":{"id":"message-idle","type":"agentMessage","text":"done"}}),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({"threadId":"thread-sub-idle","turn":{"id":"turn-sub-idle","status":"completed"}}),
-                )
-                .await;
-            let completed_events = drain_events(&mut subagent_rx);
-            assert!(
-                completed_events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                        && event
-                            .get("data")
-                            .and_then(|data| data.get("message"))
-                            .and_then(|message| message.get("content"))
-                            .and_then(Value::as_str)
-                            == Some("done")
-                }),
-                "the child must retain its clean terminal content before the parent ends: {completed_events:?}"
-            );
-            assert!(
-                !completed_events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
-                }),
-                "a clean child turn must not be labelled cancelled before parent teardown: {completed_events:?}"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({"threadId":"thread-parent","turn":{"id":"parent-turn","status":"interrupted"}}),
-                )
-                .await;
-            let events = drain_events(&mut subagent_rx);
-            assert!(
-                !events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
-                }),
-                "a completed child must never be retroactively cancelled: {events:?}"
-            );
-            let state = inner.state.lock().await;
-            assert!(!state.subagent_streams.contains_key("thread-sub-idle"));
-            assert!(state.completed_subagent_streams.contains_key("thread-sub-idle"));
-            drop(state);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn abandoning_parent_terminally_cancels_live_subagents() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, _parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-cancel").await;
-            inner
-                .update_codex_subagent_stream("thread-sub-cancel", |stream| {
-                    stream.active_turn_id = Some("turn-sub-cancel".to_string());
-                    stream.current_message_id = Some(ChatMessageId("child-message".to_string()));
-                })
-                .await
-                .expect("active child stream");
-            let emitter = inner
-                .codex_subagent_emitter("thread-sub-cancel")
-                .await
-                .expect("sub-agent emitter");
-            emitter.typing_status_changed(true);
-            emitter.stream_start_with_id(
-                ChatMessageId("child-message".to_string()),
-                AgentName(CODEX_AGENT_NAME),
-                Some("test-model"),
-            );
-            emitter.stream_delta_with_id(ChatMessageId("child-message".to_string()), "working");
-
-            inner.complete_all_codex_subagents().await;
-
-            let events = drain_events(&mut subagent_rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "StreamDelta",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert_eq!(
-                events.last().and_then(|event| event.get("data")),
-                Some(&Value::Bool(false))
-            );
-            assert!(inner.state.lock().await.subagent_streams.is_empty());
-        });
-    }
-
-    #[test]
-    fn root_late_token_usage_after_turn_completed_updates_message_metadata() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-root-late-usage" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-root-late-usage",
-                            "text": "root done"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": {
-                            "id": "turn-root-late-usage",
-                            "status": "completed"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-root-late-usage",
-                        "tokenUsage": {
-                            "input_tokens": 19,
-                            "output_tokens": 8,
-                            "total_tokens": 27
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "StreamEnd",
-                    "MessageMetadataUpdated",
-                    "TypingStatusChanged",
-                    "MessageMetadataUpdated"
-                ],
-                "late usage must patch the completed provider item without creating another message: {events:?}"
-            );
-            let response_message_ids = events
-                .iter()
-                .filter_map(|event| match event.get("kind").and_then(Value::as_str) {
-                    Some("StreamStart") | Some("MessageMetadataUpdated") => event
-                        .pointer("/data/message_id")
-                        .and_then(Value::as_str),
-                    Some("StreamEnd") => event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                response_message_ids,
-                vec![
-                    "msg-root-late-usage",
-                    "msg-root-late-usage",
-                    "msg-root-late-usage",
-                    "msg-root-late-usage"
-                ],
-                "the provider item start, end, initial metadata, and late metadata patch must retain one immutable message identity"
-            );
-            let metadata_updates = events
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                metadata_updates.len(),
-                2,
-                "expected initial metadata plus late token usage patch: {events:?}"
-            );
-            let known_updates = metadata_updates
-                .iter()
-                .filter(|event| {
-                    event
-                        .pointer("/data/token_usage/turn/usage/total_tokens")
-                        .and_then(Value::as_u64)
-                        == Some(27)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                known_updates.len(),
-                1,
-                "late root usage should emit exactly one known metadata patch: {events:?}"
-            );
-            assert_eq!(
-                known_updates[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-root-late-usage")
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state.token_usage_by_turn.is_empty(),
-                    "late usage should not remain orphaned in root state"
-                );
-                assert!(
-                    state.completed_message_metadata_by_turn.is_empty(),
-                    "late usage target should be consumed after patching"
-                );
-            }
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_stream_end_uses_token_usage_reported_before_completion() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-usage").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-usage",
-                        "turn": { "id": "turn-sub-usage" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-sub-usage",
-                        "turnId": "turn-sub-usage",
-                        "tokenUsage": {
-                            "input_tokens": 8,
-                            "output_tokens": 4,
-                            "total_tokens": 12
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-usage",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-usage",
-                            "text": "sub done"
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "child token usage must not emit into parent stream: {parent_events:?}"
-            );
-
-            let mut subagent_events = Vec::new();
-            while let Ok(event) = subagent_rx.try_recv() {
-                subagent_events.push(event);
-            }
-            let model_usage = subagent_events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
-                })
-                .unwrap_or_else(|| {
-                    panic!("authoritative child model-request usage; events={subagent_events:#?}")
-                });
-            assert_eq!(
-                model_usage
-                    .pointer("/data/request/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(12)
-            );
-            let stream_end = subagent_events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("sub-agent StreamEnd");
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/request/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(12)
-            );
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(12)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_empty_token_usage_becomes_explicitly_unavailable() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-empty-usage").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-empty-usage",
-                        "turn": { "id": "turn-sub-empty-usage" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-sub-empty-usage",
-                        "turnId": "turn-sub-empty-usage",
-                        "tokenUsage": {}
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-empty-usage",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-empty-usage",
-                            "text": "sub done"
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "empty child token usage must not emit into parent stream: {parent_events:?}"
-            );
-
-            let subagent_events = drain_events(&mut subagent_rx);
-            let stream_end = subagent_events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("sub-agent StreamEnd");
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/kind")
-                    .and_then(Value::as_str),
-                Some("unavailable")
-            );
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/reason")
-                    .and_then(Value::as_str),
-                Some("backend_did_not_report")
-            );
-            assert!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/usage/total_tokens")
-                    .is_none(),
-                "empty usage must not be emitted as Known(0): {stream_end:?}"
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_late_token_usage_after_removal_patches_child_not_parent() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-removed-usage").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-removed-usage",
-                        "turn": { "id": "turn-sub-removed-usage" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-removed-usage",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-removed-usage",
-                            "text": "sub done"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .complete_codex_subagent_if_needed("thread-sub-removed-usage")
-                .await;
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-sub-removed-usage",
-                        "turnId": "turn-sub-removed-usage",
-                        "tokenUsage": {
-                            "input_tokens": 11,
-                            "output_tokens": 6,
-                            "total_tokens": 17
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "removed child token usage must not emit into parent stream: {parent_events:?}"
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state.token_usage_by_turn.is_empty(),
-                    "removed child token usage must not pollute root pending usage"
-                );
-            }
-
-            let subagent_events = drain_events(&mut subagent_rx);
-            let stream_end = subagent_events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("sub-agent StreamEnd");
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/reason")
-                    .and_then(Value::as_str),
-                Some("backend_did_not_report")
-            );
-
-            let metadata_update = subagent_events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-                })
-                .expect("sub-agent MessageMetadataUpdated");
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-sub-removed-usage")
-            );
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(17)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_turn_completed_usage_after_removal_patches_child_not_parent() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-removed-turn").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-removed-turn",
-                        "turn": { "id": "turn-sub-removed-turn" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-removed-turn",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-removed-turn",
-                            "text": "sub done"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .complete_codex_subagent_if_needed("thread-sub-removed-turn")
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-sub-removed-turn",
-                        "turn": {
-                            "id": "turn-sub-removed-turn",
-                            "status": "completed",
-                            "usage": {
-                                "input_tokens": 23,
-                                "output_tokens": 5,
-                                "total_tokens": 28
-                            }
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "removed child turn usage must not emit into parent stream: {parent_events:?}"
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state.token_usage_by_turn.is_empty(),
-                    "removed child turn usage must not pollute root pending usage"
-                );
-            }
-
-            let subagent_events = drain_events(&mut subagent_rx);
-            let metadata_update = subagent_events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-                })
-                .expect("sub-agent MessageMetadataUpdated");
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-sub-removed-turn")
-            );
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(28)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn subagent_turn_completed_usage_updates_subagent_message_metadata() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
-            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-late-usage").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-sub-late-usage",
-                        "turn": { "id": "turn-sub-late-usage" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-sub-late-usage",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "msg-sub-late-usage",
-                            "text": "sub done"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-sub-late-usage",
-                        "turn": {
-                            "id": "turn-sub-late-usage",
-                            "status": "completed",
-                            "usage": {
-                                "input_tokens": 13,
-                                "output_tokens": 8,
-                                "total_tokens": 21
-                            }
-                        }
-                    }),
-                )
-                .await;
-
-            let parent_events = drain_events(&mut parent_rx);
-            assert!(
-                parent_events.is_empty(),
-                "late child token usage must not emit into parent stream: {parent_events:?}"
-            );
-
-            let subagent_events = drain_events(&mut subagent_rx);
-            let stream_end = subagent_events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("sub-agent StreamEnd");
-            assert_eq!(
-                stream_end
-                    .pointer("/data/message/token_usage/turn/reason")
-                    .and_then(Value::as_str),
-                Some("backend_did_not_report")
-            );
-
-            let metadata_update = subagent_events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-                })
-                .expect("sub-agent MessageMetadataUpdated");
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("msg-sub-late-usage")
-            );
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/token_usage/request/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(21)
-            );
-            assert_eq!(
-                metadata_update
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(21)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn idless_reasoning_streams_immediately_and_keeps_generated_identity() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-idless" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({ "threadId": "thread-test", "delta": "Inspecting constraints." }),
-                )
-                .await;
-            let reasoning_events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&reasoning_events),
-                vec!["StreamStart", "StreamReasoningDelta"]
-            );
-            let generated_id = reasoning_events[0]
-                .pointer("/data/message_id")
-                .and_then(Value::as_str)
-                .expect("generated reasoning id")
-                .to_string();
-            assert!(generated_id.starts_with("server-generated:idless_reasoning:"));
-            assert_eq!(
-                reasoning_events[1]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some(generated_id.as_str())
-            );
-
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "reasoning-tool",
-                            "command": "pwd",
-                            "cwd": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "reasoning-tool",
-                            "exitCode": 0,
-                            "aggregatedOutput": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec!["ToolRequest", "ToolExecutionCompleted"]
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "reasoning", "summary": "Inspecting constraints." }
-                    }),
-                )
-                .await;
-            let end_events = drain_events(&mut rx);
-            assert_eq!(event_kinds(&end_events), vec!["StreamEnd"]);
-            assert_eq!(
-                end_events[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some(generated_id.as_str())
-            );
-            assert_eq!(
-                end_events[0]
-                    .pointer("/data/message/reasoning/text")
-                    .and_then(Value::as_str),
-                Some("Inspecting constraints.")
-            );
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-idless", "status": "completed" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            assert!(drain_events(&mut rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn idless_reasoning_interrupt_persists_partial_message_before_cancel() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-cancel" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({ "threadId": "thread-test", "delta": "Still thinking" }),
-                )
-                .await;
-            let open_events = drain_events(&mut rx);
-            let generated_id = open_events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                .and_then(|event| event.pointer("/data/message_id"))
-                .and_then(Value::as_str)
-                .expect("generated reasoning id")
-                .to_string();
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-cancel", "status": "interrupted" } }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some(generated_id.as_str())
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/reasoning/text")
-                    .and_then(Value::as_str),
-                Some("Still thinking")
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("")
-            );
-            assert_codex_protocol_valid(&[open_events, terminal.clone()].concat());
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "reasoning", "summary": "late" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            assert!(generated_id.starts_with("server-generated:idless_reasoning:"));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn idless_reasoning_turn_completion_persists_partial_message_before_cancel() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-partial" } }),
-                )
-                .await;
-            let mut replay_shaped_events = drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({ "threadId": "thread-test", "delta": "Partial reasoning" }),
-                )
-                .await;
-            let live = drain_events(&mut rx);
-            let generated_id = live
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                .and_then(|event| event.pointer("/data/message_id"))
-                .and_then(Value::as_str)
-                .expect("generated reasoning id")
-                .to_string();
-            replay_shaped_events.extend(live);
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-partial", "status": "completed" } }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some(generated_id.as_str())
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/reasoning/text")
-                    .and_then(Value::as_str),
-                Some("Partial reasoning")
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("")
-            );
-            replay_shaped_events.extend(terminal);
-            assert_codex_protocol_valid(&replay_shaped_events);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "reasoning", "summary": "late" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-after-partial" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "after-partial-message",
-                            "text": "continued"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-after-partial", "status": "completed" }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "StreamEnd",
-                    "MessageMetadataUpdated",
-                    "TypingStatusChanged"
-                ],
-                "a distinct later turn must proceed past the prior turn tombstone"
-            );
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-partial",
-                        "tokenUsage": {
-                            "input_tokens": 1,
-                            "output_tokens": 1,
-                            "total_tokens": 2
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "the old terminated turn must remain suppressed by its explicit tombstone"
-            );
-
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-after-partial",
-                        "tokenUsage": {
-                            "input_tokens": 31,
-                            "output_tokens": 9,
-                            "total_tokens": 40,
-                            "context_window": 200000
-                        }
-                    }),
-                )
-                .await;
-            let metadata = drain_events(&mut rx);
-            assert_eq!(event_kinds(&metadata), vec!["MessageMetadataUpdated"]);
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("after-partial-message")
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(40)
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/context_breakdown/input_tokens")
-                    .and_then(Value::as_u64),
-                Some(31)
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/context_breakdown/context_window")
-                    .and_then(Value::as_u64),
-                Some(200_000)
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_metadata_update_targets_last_visible_segment() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-segmented" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-1",
-                            "summary": "Inspecting the failure first."
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec!["StreamStart", "StreamReasoningDelta", "StreamEnd"]
-            );
-
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "answer-1", "delta": "Done" }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "answer-1",
-                            "text": "Done"
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec!["StreamEnd"]
-            );
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": {
-                            "id": "turn-segmented",
-                            "status": "completed",
-                            "usage": {
-                                "inputTokens": 20,
-                                "outputTokens": 7,
-                                "totalTokens": 27
-                            }
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec!["MessageMetadataUpdated", "TypingStatusChanged"]
-            );
-            assert_eq!(
-                events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("answer-1")
-            );
-            assert_eq!(
-                events[0]
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(27)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_thread_settings_notification_updates_effective_model_only() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "thread/settings/updated",
-                    &json!({
-                        "threadId": "thread-test",
-                        "threadSettings": {
-                            "model": "gpt-effective",
-                            "modelProvider": "openai"
-                        }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            {
-                let state = inner.state.lock().await;
-                assert_eq!(state.effective_model.as_deref(), Some("gpt-effective"));
-                assert!(state.model_override.is_none());
-            }
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-effective" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "message-effective",
-                            "text": "effective model"
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamEnd"]);
-            assert_eq!(
-                events[0].pointer("/data/model").and_then(Value::as_str),
-                Some("gpt-effective")
-            );
-            assert_eq!(
-                events[1]
-                    .pointer("/data/message/model_info/model")
-                    .and_then(Value::as_str),
-                Some("gpt-effective")
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn wrong_completed_item_id_finalizes_once_and_terminates() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-wrong-end" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "open-item", "delta": "partial" }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "wrong-item", "text": "wrong" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            // The provider never completed open-item, but its "partial" delta
-            // was already accepted and published. Ending that exact identity
-            // and content preserves the anti-fabrication contract without
-            // discarding accepted output during strict termination.
-            assert_eq!(
-                event_kinds(&terminal),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert_eq!(codex_event_message_id(&terminal[0]), Some("open-item"));
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("partial")
-            );
-
-            for item_id in ["open-item", "wrong-item", "another-late-item"] {
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "agentMessage", "id": item_id, "text": "late" }
-                        }),
-                    )
-                    .await;
-            }
-            for (method, params) in [
-                (
-                    "turn/plan/updated",
-                    json!({
-                        "threadId": "thread-test",
-                        "explanation": "late plan",
-                        "plan": [{ "step": "must not render", "status": "pending" }]
-                    }),
-                ),
-                (
-                    "model/rerouted",
-                    json!({ "threadId": "thread-test", "toModel": "late-model" }),
-                ),
-                (
-                    "error",
-                    json!({ "threadId": "thread-test", "message": "late error", "fatal": true }),
-                ),
-                (
-                    "thread/tokenUsage/updated",
-                    json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-wrong-end",
-                        "tokenUsage": { "inputTokens": 1, "outputTokens": 1, "totalTokens": 2 }
-                    }),
-                ),
-                (
-                    "item/reasoning/delta",
-                    json!({ "threadId": "thread-test", "delta": "late reasoning" }),
-                ),
-                (
-                    "item/started",
-                    json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "late-start" }
-                    }),
-                ),
-                (
-                    "item/agentMessage/delta",
-                    json!({
-                        "threadId": "thread-test",
-                        "itemId": "late-start",
-                        "delta": "late text"
-                    }),
-                ),
-                (
-                    "turn/completed",
-                    json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-wrong-end", "status": "completed" }
-                    }),
-                ),
-                (
-                    "turn/started",
-                    json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-wrong-end" }
-                    }),
-                ),
-            ] {
-                inner.handle_notification(method, &params).await;
-            }
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "terminated-turn tombstones must suppress later root notifications"
-            );
-            assert_eq!(
-                inner.state.lock().await.effective_model.as_deref(),
-                Some("codex")
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_agent_message_items_keep_distinct_stream_boundaries() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            let mut all_events = Vec::new();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-items" } }),
-                )
-                .await;
-            all_events.extend(drain_events(&mut rx));
-
-            for (item_id, delta, text) in [
-                ("item-alpha", "alpha delta", "alpha complete"),
-                ("item-beta", "beta delta", "beta complete"),
-                ("item-gamma", "gamma delta", "gamma complete"),
-            ] {
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "agentMessage", "id": item_id }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/agentMessage/delta",
-                        &json!({ "threadId": "thread-test", "item_id": item_id, "delta": delta }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "agentMessage", "id": item_id, "text": text }
-                        }),
-                )
-                .await;
-                all_events.extend(drain_events(&mut rx));
-            }
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-items", "status": "completed" }
-                    }),
-                )
-                .await;
-            all_events.extend(drain_events(&mut rx));
-
-            assert_eq!(
-                all_events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
-            );
-            assert_eq!(
-                all_events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamDelta"))
-                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
-            );
-            assert_eq!(
-                all_events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                    .map(|event| event.pointer("/data/message/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
-            );
-            assert_codex_protocol_valid(&all_events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_completion_only_items_and_duplicate_completion_are_item_scoped() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-            let mut all_events = Vec::new();
-            for (item_id, text) in [
-                ("complete-alpha", "alpha"),
-                ("complete-beta", "beta"),
-                ("complete-gamma", "gamma"),
-            ] {
-                let event = json!({
-                    "threadId": "thread-test",
-                    "item": { "type": "agentMessage", "id": item_id, "text": text }
-                });
-                inner.handle_notification("item/completed", &event).await;
-                all_events.extend(drain_events(&mut rx));
-                if item_id == "complete-alpha" {
-                    inner.handle_notification("item/completed", &event).await;
-                    assert!(
-                        drain_events(&mut rx).is_empty(),
-                        "byte-equivalent completion must not create another relay"
-                    );
-                }
-            }
-
-            assert_eq!(
-                all_events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .count(),
-                3
-            );
-            assert_eq!(
-                all_events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                    .map(|event| event.pointer("/data/message/content").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("alpha"), Some("beta"), Some("gamma")]
-            );
-            assert_codex_protocol_valid(&all_events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_duplicate_completion_compares_resolved_stream_content() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "resolved-duplicate-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "itemId": "resolved-duplicate",
-                        "delta": "resolved content"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "resolved-duplicate",
-                            "text": " \n"
-                        }
-                    }),
-                )
-                .await;
-            let first = drain_events(&mut rx);
-            assert_eq!(
-                first
-                    .iter()
-                    .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                    .filter(|kind| matches!(*kind, "StreamStart" | "StreamDelta" | "StreamEnd"))
-                    .collect::<Vec<_>>(),
-                vec!["StreamStart", "StreamDelta", "StreamEnd"]
-            );
-            assert!(first.iter().all(|event| {
-                match event.get("kind").and_then(Value::as_str) {
-                    Some("StreamStart") | Some("StreamDelta") => {
-                        event.pointer("/data/message_id").and_then(Value::as_str)
-                            == Some("resolved-duplicate")
-                    }
-                    Some("StreamEnd") => {
-                        event
-                            .pointer("/data/message/message_id")
-                            .and_then(Value::as_str)
-                            == Some("resolved-duplicate")
-                    }
-                    _ => true,
-                }
-            }));
-            assert_eq!(
-                first
-                    .iter()
-                    .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                    .and_then(|event| event.pointer("/data/message/content"))
-                    .and_then(Value::as_str),
-                Some("resolved content")
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "resolved-duplicate",
-                            "text": " \n"
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "identical whitespace snapshot replay must deduplicate"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "resolved-duplicate",
-                            "text": "resolved content"
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "full snapshot of resolved content must deduplicate"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "resolved-duplicate",
-                            "text": " \t"
-                        }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_contentless_reservations_never_publish_and_still_enforce_identity() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "empty-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "empty-item" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "itemId": "empty-item",
-                        "delta": " \n\t"
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-
-            let empty_completion = json!({
-                "threadId": "thread-test",
-                "item": { "type": "agentMessage", "id": "empty-item", "text": " \n\t" }
-            });
-            inner
-                .handle_notification("item/completed", &empty_completion)
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            {
-                let state = inner.state.lock().await;
-                assert!(state.pending_message_metadata.is_none());
-                assert!(state
-                    .completed_agent_messages
-                    .contains_key(&ChatMessageId("empty-item".to_owned())));
-            }
-            inner
-                .handle_notification("item/completed", &empty_completion)
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "completion-only-empty", "text": "" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "started-empty" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "started-empty", "text": "" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "empty-item", "text": "now visible" }
-                    }),
-                )
-                .await;
-            let conflict = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&conflict),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(conflict.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("StreamStart")
-                    && event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_unpublished_reasoning_allows_tool_container_then_resumes() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (turn_id, item_id) in [
-                ("reserved-provider-id", Some("reasoning-provider-id")),
-                ("reserved-idless", None),
-            ] {
-                let (inner, mut rx) = test_codex_inner();
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({ "threadId": "thread-test", "turn": { "id": turn_id } }),
-                    )
-                    .await;
-                drain_events(&mut rx);
-
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    item_id,
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                assert!(drain_events(&mut rx).is_empty());
-
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": {
-                                "type": "commandExecution",
-                                "id": "reserved-tool",
-                                "command": "pwd",
-                                "cwd": "/tmp"
-                            }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": {
-                                "type": "commandExecution",
-                                "id": "reserved-tool",
-                                "exitCode": 0,
-                                "aggregatedOutput": "/tmp"
-                            }
-                        }),
-                    )
-                    .await;
-                let tool_events = drain_events(&mut rx);
-                assert_eq!(
-                    event_kinds(&tool_events),
-                    vec![
-                        "StreamStart",
-                        "ToolRequest",
-                        "ToolExecutionCompleted",
-                        "StreamEnd"
-                    ]
-                );
-                assert_eq!(
-                    tool_events[3]
-                        .pointer("/data/message/tool_calls/0/id")
-                        .and_then(Value::as_str),
-                    Some("reserved-tool")
-                );
-
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    item_id,
-                    CodexProviderItemKind::Reasoning,
-                    "Resumed reasoning.",
-                )
-                .await;
-                let resumed = drain_events(&mut rx);
-                assert_eq!(
-                    event_kinds(&resumed)
-                        .into_iter()
-                        .filter(|kind| *kind != "TypingStatusChanged")
-                        .collect::<Vec<_>>(),
-                    vec!["StreamStart", "StreamReasoningDelta"]
-                );
-                let resumed_id = resumed
-                    .iter()
-                    .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .and_then(codex_event_message_id)
-                    .expect("resumed reasoning message id")
-                    .to_owned();
-                if let Some(item_id) = item_id {
-                    assert_eq!(resumed_id, item_id);
-                } else {
-                    assert!(resumed_id.starts_with("server-generated:idless_reasoning:"));
-                }
-
-                let mut completion = json!({
-                    "threadId": "thread-test",
-                    "item": { "type": "reasoning", "summary": "Resumed reasoning." }
-                });
-                if let Some(item_id) = item_id {
-                    completion["item"]["id"] = Value::String(item_id.to_owned());
-                }
-                inner
-                    .handle_notification("item/completed", &completion)
-                    .await;
-                let terminal = drain_events(&mut rx);
-                assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
-                assert_eq!(
-                    codex_event_message_id(&terminal[0]),
-                    Some(resumed_id.as_str())
-                );
-                assert_codex_protocol_valid(&[tool_events, resumed, terminal].concat());
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn codex_published_provider_stream_rejects_foreign_tool_container() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "published" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("published-reasoning"),
-                CodexProviderItemKind::Reasoning,
-                "Already visible.",
-            )
-            .await;
-            drain_events(&mut rx);
-
-            inner
-                .record_tool_container(Some(ChatMessageId("foreign-tool-container".to_owned())))
-                .await;
-            let rejected = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&rejected),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert!(rejected.iter().any(|event| {
-                event
-                    .pointer("/data/content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| content.contains("foreign active message id"))
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_spawn_screenshot_order_tolerates_unpublished_reasoning_reservation() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "spawn-screenshot-order" }
-                    }),
-                )
-                .await;
-
-            let spawn_item = |id: &str, name: &str, status: &str| {
-                json!({
-                    "type": "mcpToolCall",
-                    "id": id,
-                    "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
-                    "arguments": { "name": name },
-                    "status": status,
-                    "output": format!(r#"{{"agent_id":"agent-{name}","name":"{name}"}}"#)
-                })
-            };
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": spawn_item("spawn-one", "One", "inProgress")
-                    }),
-                )
-                .await;
-            start_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                None,
-                CodexProviderItemKind::Reasoning,
-            )
-            .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": spawn_item("spawn-one", "One", "completed")
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": spawn_item("spawn-two", "Two", "inProgress")
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let tool_positions = events
-                .iter()
-                .enumerate()
-                .filter_map(|(index, event)| {
-                    (event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            let first_completion = events
-                .iter()
-                .position(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .expect("first spawn completion");
-            assert_eq!(tool_positions.len(), 2);
-            assert!(tool_positions[0] < first_completion && first_completion < tool_positions[1]);
-            assert!(events.iter().all(|event| {
-                !matches!(
-                    event.get("kind").and_then(Value::as_str),
-                    Some("OperationCancelled" | "Error")
-                )
-            }));
-            {
-                let state = inner.state.lock().await;
-                let reservation = state.active_stream.as_ref().expect("reasoning reservation");
-                assert!(!reservation.stream_published);
-                assert!(state.tool_container.is_some());
-            }
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_cancellation_clears_unpublished_reservation_without_stream_terminal() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "cancel-empty" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "reserved-only" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "cancel-empty", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(
-                terminal.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-                })
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn late_cancelled_tool_completion_does_not_contaminate_next_turn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "cancelled-turn" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx)
-                    .iter()
-                    .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
-                "a started command must not claim a tray row before unified exec yields"
-            );
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "cancelled-turn", json!(4242)),
-                )
-                .await;
-            let started = drain_events(&mut rx);
-            let running = started
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                        && event.pointer("/data/update/status").and_then(Value::as_str)
-                            == Some("running")
-                })
-                .count();
-            assert_eq!(running, 1, "unified exec must publish one Running row");
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "cancelled-turn", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let interrupted = drain_events(&mut rx);
-            assert_eq!(
-                interrupted
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                    })
-                    .count(),
-                1,
-                "interrupt owns the cancelled tool-card completion"
-            );
-            assert_eq!(
-                interrupted
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                            && event.pointer("/data/update/status").and_then(Value::as_str)
-                                == Some("stopped")
-                    })
-                    .count(),
-                1,
-                "interrupt must retire the yielded Running row"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "next-turn" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "next-message",
-                            "text": "next response"
-                        }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "cancelled-turn", json!(4242)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "a late yielded result resurrected an interrupted command"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert!(
-                terminal.is_empty(),
-                "a suppressed late exit changed already-terminal UI: {terminal:?}"
-            );
-            assert!(
-                !inner
-                    .state
-                    .lock()
-                    .await
-                    .cancelled_tool_call_ids
-                    .contains("cancelled-command")
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    !state
-                        .cancelled_tool_call_ids
-                        .contains("codex:thread-test:cancelled-turn:cancelled-command")
-                );
-                assert!(
-                    state.background_commands.is_empty()
-                        && state.outstanding_command_executions.is_empty()
-                );
-            }
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "a duplicate real exit must be an exact no-op"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn interrupted_root_late_completion_then_raw_is_inert() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "cancelled-turn" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "cancelled-turn", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "cancelled-turn", json!(4242)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "late completion/raw ordering resurrected terminal UI"
-            );
-            let state = inner.state.lock().await;
-            assert!(
-                state.background_commands.is_empty()
-                    && state.outstanding_command_executions.is_empty()
-            );
-            drop(state);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn interrupted_root_raw_then_late_completion_is_inert() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "cancelled-turn" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "cancelled-turn", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let interrupted = drain_events(&mut rx);
-            assert_eq!(
-                interrupted
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                    })
-                    .count(),
-                1,
-                "the interrupt owns the only tool-card completion"
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state
-                        .terminated_turns
-                        .iter()
-                        .any(|turn| turn.turn_id == "cancelled-turn"),
-                    "the interrupted turn must be rejected before either late notification"
-                );
-                assert_eq!(
-                    state.terminated_turn_awaiting_replacement.as_deref(),
-                    Some("cancelled-turn")
-                );
-                assert!(
-                    state.background_commands.is_empty()
-                        && state.outstanding_command_executions.is_empty()
-                );
-            }
-
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "cancelled-turn", json!(4242)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "a raw result after turn termination must not publish Running"
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "cancelled-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "cancelled-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "4242",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-            let late = drain_events(&mut rx);
-            assert!(
-                late.is_empty(),
-                "terminated-turn rejection must suppress the late completion: {late:?}"
-            );
-            let state = inner.state.lock().await;
-            assert!(
-                state.background_commands.is_empty()
-                    && state.outstanding_command_executions.is_empty()
-            );
-            assert!(
-                !state
-                    .cancelled_tool_call_ids
-                    .contains("codex:thread-test:cancelled-turn:cancelled-command"),
-                "late completion cleanup must not retain cancelled tool bookkeeping"
-            );
-            drop(state);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    /// Apply a parsed snapshot without the RPC for focused reconciliation
-    /// tests. Poll lifecycle tests below exercise the fake app-server path.
-    async fn apply_background_terminal_snapshot(
-        inner: &Arc<CodexInner>,
-        thread_id: &str,
-        rows: &[CodexBackgroundTerminalRow],
-    ) {
-        let progress = {
-            let mut state = inner.state.lock().await;
-            if !rows.is_empty() && state.first_background_list_thread_id.is_none() {
-                state.first_background_list_thread_id = Some(thread_id.to_owned());
-            }
-            reconcile_codex_background_terminals(&mut state, thread_id, rows)
-        };
-        for update in &progress {
-            inner.emitter.tool_progress(update);
-        }
-    }
-
-    fn background_terminal_row(
-        item_id: &str,
-        process_id: &str,
-        command: &str,
-    ) -> CodexBackgroundTerminalRow {
-        CodexBackgroundTerminalRow {
-            item_id: item_id.to_owned(),
-            process_id: process_id.to_owned(),
-            command: Some(command.to_owned()),
-        }
-    }
-
-    fn yielded_raw_result(thread_id: &str, turn_id: &str, session_id: Value) -> Value {
-        let result = serde_json::to_string(&json!({
-            "chunk_id": "chunk-fixture",
-            "wall_time_seconds": 1.001,
-            "session_id": session_id,
-            "original_token_count": 0,
-            "output": ""
-        }))
-        .expect("serialize yielded result fixture");
-        json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "item": {
-                "type": "custom_tool_call_output",
-                "call_id": "exec-call",
-                "output": [
-                    {
-                        "type": "input_text",
-                        "text": "Script completed\nWall time 1.2 seconds\nOutput:\n"
-                    },
-                    {
-                        "type": "input_text",
-                        "text": result
-                    }
-                ]
-            }
-        })
-    }
-
-    #[test]
-    fn raw_custom_tool_output_extracts_yielded_session_id() {
-        assert_eq!(
-            codex_yielded_session_id(&yielded_raw_result(
-                "thread-test",
-                "turn-test",
-                json!(71411)
-            ))
-            .as_deref(),
-            Some("71411")
-        );
-        assert_eq!(
-            codex_yielded_session_id(&yielded_raw_result(
-                "thread-test",
-                "turn-test",
-                json!("71412")
-            ))
-            .as_deref(),
-            Some("71412")
-        );
-        assert_eq!(
-            codex_yielded_session_id(&json!({
-                "item": {
-                    "type": "custom_tool_call_output",
-                    "output": [{
-                        "type": "input_text",
-                        "text": "Script completed\nOutput:\nCODEX_RAW_FG_OK"
-                    }]
-                }
-            })),
-            None
-        );
-        assert_eq!(
-            codex_yielded_session_id(&json!({
-                "item": {
-                    "type": "custom_tool_call_output",
-                    "output": [{
-                        "type": "input_text",
-                        "text": "prefix {\"session_id\":71411}"
-                    }]
-                }
-            })),
-            None
-        );
-        assert_eq!(
-            codex_yielded_session_id(&json!({
-                "item": {
-                    "type": "custom_tool_call",
-                    "output": [{
-                        "type": "input_text",
-                        "text": "{\"session_id\":71411}"
-                    }]
-                }
-            })),
-            None
-        );
-    }
-
-    #[test]
-    fn raw_contract_drift_warns_once_without_classification_fallback() {
-        let mut state = test_codex_state();
-        state.active_stream = None;
-        state.first_background_list_thread_id = Some("thread-test".to_owned());
-        state
-            .observed_notification_methods
-            .extend(["item/started".to_owned(), "item/completed".to_owned()]);
-        state.outstanding_command_executions.insert(
-            ("thread-test".to_owned(), "call".to_owned()),
-            CodexOutstandingCommand {
-                tool_call_id: "call".to_owned(),
-                command: Some("sleep 30".to_owned()),
-                process_id: Some("12".to_owned()),
-                turn_id: "turn-test".to_owned(),
-            },
-        );
-        let outstanding_before = state.outstanding_command_executions.len();
-        let promoted_before = state.background_commands.len();
-
-        assert_eq!(
-            take_codex_raw_contract_drift_warning(&mut state),
-            Some(CodexRawContractDriftWarning {
-                thread_id: "thread-test".to_owned(),
-                observed_notification_methods: vec![
-                    "item/completed".to_owned(),
-                    "item/started".to_owned(),
-                ],
-                methods_truncated: false,
-            })
-        );
-        assert_eq!(take_codex_raw_contract_drift_warning(&mut state), None);
-        assert_eq!(
-            state.outstanding_command_executions.len(),
-            outstanding_before
-        );
-        assert_eq!(state.background_commands.len(), promoted_before);
-
-        let mut raw_seen = test_codex_state();
-        raw_seen.first_background_list_thread_id = Some("thread-test".to_owned());
-        raw_seen.raw_response_item_completed_seen = true;
-        assert_eq!(take_codex_raw_contract_drift_warning(&mut raw_seen), None);
-
-        let mut raw_not_requested = test_codex_state();
-        raw_not_requested.experimental_raw_events_requested = false;
-        raw_not_requested.first_background_list_thread_id = Some("thread-test".to_owned());
-        assert_eq!(
-            take_codex_raw_contract_drift_warning(&mut raw_not_requested),
-            None
-        );
-
-        let mut no_list_row = test_codex_state();
-        assert_eq!(
-            take_codex_raw_contract_drift_warning(&mut no_list_row),
-            None
-        );
-    }
-
-    #[test]
-    fn root_yield_requires_matching_live_thread_turn_and_process() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-                state.outstanding_command_executions.insert(
-                    ("thread-test".to_owned(), "call".to_owned()),
-                    CodexOutstandingCommand {
-                        tool_call_id: "call".to_owned(),
-                        command: Some("sleep 30".to_owned()),
-                        process_id: Some("71411".to_owned()),
-                        turn_id: "turn-test".to_owned(),
-                    },
-                );
-            }
-
-            for params in [
-                yielded_raw_result("other-thread", "turn-test", json!(71411)),
-                yielded_raw_result("thread-test", "other-turn", json!(71411)),
-                yielded_raw_result("thread-test", "turn-test", json!(99999)),
-            ] {
-                inner
-                    .handle_notification("rawResponseItem/completed", &params)
-                    .await;
-            }
-            assert!(drain_events(&mut rx).is_empty());
-            assert!(inner.state.lock().await.background_commands.is_empty());
-
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "turn-test", json!(71411)),
-                )
-                .await;
-            let running = drain_events(&mut rx);
-            assert_eq!(
-                running
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                            && event.pointer("/data/update/status").and_then(Value::as_str)
-                                == Some("running")
-                    })
-                    .count(),
-                1
-            );
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "turn-test", json!(71411)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "duplicate yielded result re-announced Running"
-            );
-
-            {
-                let mut state = inner.state.lock().await;
-                state.background_commands.clear();
-                state.outstanding_command_executions.insert(
-                    ("thread-test".to_owned(), "ambiguous".to_owned()),
-                    CodexOutstandingCommand {
-                        tool_call_id: "ambiguous".to_owned(),
-                        command: Some("sleep 30".to_owned()),
-                        process_id: Some("71411".to_owned()),
-                        turn_id: "turn-test".to_owned(),
-                    },
-                );
-            }
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "turn-test", json!(71411)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "ambiguous yielded result chose a command"
-            );
-
-            inner.state.lock().await.background_command_owner_active = false;
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "turn-test", json!(71411)),
-                )
-                .await;
-            assert!(drain_events(&mut rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    /// A slow *foreground* command interleaved with a later agent message.
-    ///
-    /// The fixture keeps its `processId` because every unified-exec command has
-    /// one. Current Codex also lists foreground processes, so neither field is
-    /// a background discriminator; only a matched yielded-session result may
-    /// produce background progress.
-    #[test]
-    fn foreground_command_completes_during_later_codex_message() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "background-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "message-before-command",
-                            "text": "Starting the command."
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "background-command",
-                            "command": "sleep 12",
-                            "cwd": "/tmp",
-                            "processId": "1234",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "message-while-command-runs"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "itemId": "message-while-command-runs",
-                        "delta": "Waiting for the process."
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "background-command",
-                            "command": "sleep 12",
-                            "cwd": "/tmp",
-                            "processId": "1234",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": "done"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "message-while-command-runs",
-                            "text": "Waiting for the process."
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "background-turn", "status": "completed" }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            assert_codex_protocol_valid(&events);
-            assert_eq!(
-                event_kinds(&events),
-                vec![
-                    "StreamStart",
-                    "StreamEnd",
-                    "StreamStart",
-                    "ToolRequest",
-                    "StreamEnd",
-                    "StreamStart",
-                    "StreamDelta",
-                    "ToolExecutionCompleted",
-                    "StreamEnd",
-                    "MessageMetadataUpdated",
-                    "TypingStatusChanged",
-                ]
-            );
-            let completions = events
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(completions.len(), 1);
-            assert_eq!(
-                completions[0]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some("codex:thread-test:background-turn:background-command")
-            );
-            assert_eq!(
-                completions[0]
-                    .pointer("/data/success")
-                    .and_then(Value::as_bool),
-                Some(true)
-            );
-            // The in-flight tray counts exactly the BackgroundTask rows, and a
-            // foreground command is not background work — its own `processId`
-            // must not put it there.
-            let progress = events
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-                .collect::<Vec<_>>();
-            assert!(
-                progress.is_empty(),
-                "foreground command emitted background progress: {progress:?}"
-            );
-            // It is still tracked while it runs so a yielded-session result
-            // can match it exactly, and it is released on exit.
-            assert!(
-                inner
-                    .state
-                    .lock()
-                    .await
-                    .outstanding_command_executions
-                    .is_empty(),
-                "completed command execution stayed outstanding"
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "background-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "background-command",
-                            "command": "sleep 12",
-                            "cwd": "/tmp",
-                            "processId": "1234",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "aggregatedOutput": "done"
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "normal command completion must emit progress and card completion exactly once"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    /// Current `thread/backgroundTerminals/list` payload shape for both
-    /// foreground and yielded unified-exec processes.
-    fn background_terminal_list_result(rows: Value) -> Value {
-        json!({ "data": rows, "nextCursor": Value::Null })
-    }
-
-    #[test]
-    fn latest_root_foreground_list_row_is_not_announced() {
-        let listed = parse_codex_background_terminals(&background_terminal_list_result(json!([{
-            "itemId": "call_foreground",
-            "processId": "24852",
-            "command": "echo hi",
-            "cwd": "/tmp",
-            "osPid": Value::Null,
-            "cpuPercent": Value::Null,
-            "rssKb": Value::Null,
-        }])));
-
-        let mut state = test_codex_state();
-        state.outstanding_command_executions.insert(
-            ("thread-test".to_owned(), "call_foreground".to_owned()),
-            CodexOutstandingCommand {
-                tool_call_id: "codex:thread-test:turn:call_foreground".to_owned(),
-                command: Some("echo hi".to_owned()),
-                process_id: Some("24852".to_owned()),
-                turn_id: "turn-test".to_owned(),
-            },
-        );
-        let progress = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
-        assert!(
-            progress.is_empty(),
-            "an outstanding foreground command produced background progress: {progress:?}"
-        );
-        assert!(state.background_commands.is_empty());
-    }
-
-    #[test]
-    fn root_list_row_only_refreshes_a_raw_confirmed_command() {
-        let listed = parse_codex_background_terminals(&background_terminal_list_result(json!([{
-            "itemId": "call_background",
-            "processId": "14671",
-            "command": "sleep 240",
-            "cwd": "/tmp",
-            "osPid": Value::Null,
-            "cpuPercent": Value::Null,
-            "rssKb": Value::Null,
-        }])));
-        assert_eq!(
-            listed,
-            vec![background_terminal_row(
-                "call_background",
-                "14671",
-                "sleep 240"
-            )]
-        );
-
-        let mut state = test_codex_state();
-        state.outstanding_command_executions.insert(
-            ("thread-test".to_owned(), "call_background".to_owned()),
-            CodexOutstandingCommand {
-                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
-                command: Some("sleep 240".to_owned()),
-                process_id: Some("14671".to_owned()),
-                turn_id: "turn-test".to_owned(),
-            },
-        );
-
-        let unconfirmed = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
-        assert!(
-            unconfirmed.is_empty() && state.background_commands.is_empty(),
-            "a root list row classified an unconfirmed command: {unconfirmed:?}"
-        );
-        state.background_commands.insert(
-            ("thread-test".to_owned(), "call_background".to_owned()),
-            CodexBackgroundCommand {
-                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
-                task_id: "14671".to_owned(),
-                description: Some("sleep 240".to_owned()),
-                missing_polls: 1,
-            },
-        );
-
-        let confirmed = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
-        assert!(confirmed.is_empty());
-        assert_eq!(
-            state
-                .background_commands
-                .get(&("thread-test".to_owned(), "call_background".to_owned()))
-                .map(|command| command.missing_polls),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn background_terminal_stops_only_after_repeated_absence() {
-        let mut state = test_codex_state();
-        state.outstanding_command_executions.insert(
-            ("thread-test".to_owned(), "call_background".to_owned()),
-            CodexOutstandingCommand {
-                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
-                command: Some("sleep 240".to_owned()),
-                process_id: Some("14671".to_owned()),
-                turn_id: "turn-test".to_owned(),
-            },
-        );
-        state.background_commands.insert(
-            ("thread-test".to_owned(), "call_background".to_owned()),
-            CodexBackgroundCommand {
-                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
-                task_id: "14671".to_owned(),
-                description: Some("sleep 240".to_owned()),
-                missing_polls: 0,
-            },
-        );
-
-        // The first absent poll stays quiet so the authoritative
-        // `item/completed`, which carries the exit code, can land first.
-        let first = reconcile_codex_background_terminals(&mut state, "thread-test", &[]);
-        assert!(
-            first.is_empty(),
-            "reported a stop on the first absence: {first:?}"
-        );
-        assert!(
-            state
-                .background_commands
-                .contains_key(&("thread-test".to_owned(), "call_background".to_owned()))
-        );
-
-        let second = reconcile_codex_background_terminals(&mut state, "thread-test", &[]);
-        assert_eq!(second.len(), 1);
-        let ToolProgressUpdate::BackgroundTask(task) = &second[0].update else {
-            panic!(
-                "expected a BackgroundTask update, got {:?}",
-                second[0].update
-            );
-        };
-        assert_eq!(task.status, BackgroundTaskStatus::Stopped);
-        assert_eq!(task.task_id, "14671");
-        assert!(
-            state.background_commands.is_empty(),
-            "a stopped terminal stayed tracked and would report again"
-        );
-    }
-
-    /// The full background lifecycle: a matched yielded-session result creates
-    /// Running, list snapshots keep it live without duplication, and
-    /// `item/completed` supplies the terminal exit code.
-    #[test]
-    fn background_terminal_completion_reports_its_exit_code() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-1" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-1",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "call_background",
-                            "command": "/bin/zsh -lc 'sleep 18'",
-                            "cwd": "/tmp",
-                            "processId": "71411",
-                            "source": "unifiedExecStartup",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "turn-1", json!(71411)),
-                )
-                .await;
-            let running = drain_events(&mut rx);
-            let running = running
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-                .collect::<Vec<_>>();
-            assert_eq!(running.len(), 1, "expected one running row: {running:?}");
-            let tool_call_id = running[0]
-                .pointer("/data/tool_call_id")
-                .and_then(Value::as_str)
-                .expect("running row carries a tool call id")
-                .to_owned();
-            assert_eq!(
-                running[0]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("running")
-            );
-
-            apply_background_terminal_snapshot(
-                &inner,
-                "thread-test",
-                &[background_terminal_row(
-                    "call_background",
-                    "71411",
-                    "sleep 18",
-                )],
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "list liveness re-announced a raw-confirmed command"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-1", "status": "completed" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            let wake_request = install_codex_request_observer("turn/start");
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-1",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "call_background",
-                            "command": "/bin/zsh -lc 'sleep 18'",
-                            "cwd": "/tmp",
-                            "processId": "71411",
-                            "source": "unifiedExecStartup",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "durationMs": 17973,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-
-            tokio::time::timeout(Duration::from_secs(1), wake_request)
-                .await
-                .expect("background completion did not schedule a continuation turn")
-                .expect("Codex request observer closed before the continuation turn");
-
-            let events = drain_events(&mut rx);
-            let progress = events
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                progress.len(),
-                1,
-                "expected exactly one terminal progress: {progress:?}"
-            );
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/tool_call_id")
-                    .and_then(Value::as_str),
-                Some(tool_call_id.as_str()),
-                "the terminal row must land on the card that opened it"
-            );
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("completed")
-            );
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/update/task_id")
-                    .and_then(Value::as_str),
-                Some("71411")
-            );
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/update/summary")
-                    .and_then(Value::as_str),
-                Some("Exited with code 0")
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state.background_commands.is_empty()
-                        && state.outstanding_command_executions.is_empty(),
-                    "a finished background terminal stayed tracked"
-                );
-            }
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    /// A native child backgrounds a process exactly like the root thread does.
-    /// Its rows belong to the child's own stream, not the parent's.
-    #[test]
-    fn subagent_background_terminal_reports_on_the_child_stream() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "thread-child").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-child", "turn": { "id": "child-turn" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-child",
-                        "turnId": "child-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "child-command",
-                            "command": "/bin/zsh -lc 'sleep 18'",
-                            "cwd": "/tmp",
-                            "processId": "3312",
-                            "source": "unifiedExecStartup",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            drain_events(&mut parent_rx);
-            drain_events(&mut child_rx);
-
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-child", "child-turn", json!(3312)),
-                )
-                .await;
-            assert!(
-                drain_events(&mut parent_rx).is_empty() && drain_events(&mut child_rx).is_empty(),
-                "unproven child raw semantics changed classification or routing"
-            );
-
-            // The child's thread is polled on its own key, and its snapshot
-            // publishes to the child's emitter.
-            let progress = {
-                let mut state = inner.state.lock().await;
-                reconcile_codex_background_terminals(
-                    &mut state,
-                    "thread-child",
-                    &[background_terminal_row("child-command", "3312", "sleep 18")],
-                )
-            };
-            assert_eq!(
-                progress.len(),
-                1,
-                "child background terminal was not tracked"
-            );
-            let emitter = inner
-                .background_progress_emitter("thread-child")
-                .await
-                .expect("child stream owns its background rows");
-            for update in &progress {
-                emitter.tool_progress(update);
-            }
-
-            let running = drain_events(&mut child_rx);
-            let running = running
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-                .collect::<Vec<_>>();
-            assert_eq!(running.len(), 1, "expected one running row: {running:?}");
-            assert_eq!(
-                running[0]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("running")
-            );
-            assert_eq!(
-                running[0]
-                    .pointer("/data/update/task_id")
-                    .and_then(Value::as_str),
-                Some("3312")
-            );
-            assert!(
-                drain_events(&mut parent_rx).iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
-                }),
-                "a child's background row must not leak into the parent transcript"
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-child",
-                        "turnId": "child-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "child-command",
-                            "command": "/bin/zsh -lc 'sleep 18'",
-                            "cwd": "/tmp",
-                            "processId": "3312",
-                            "source": "unifiedExecStartup",
-                            "status": "completed",
-                            "exitCode": 0,
-                            "durationMs": 17973,
-                            "aggregatedOutput": ""
-                        }
-                    }),
-                )
-                .await;
-
-            let terminal = drain_events(&mut child_rx);
-            let terminal = terminal
-                .iter()
-                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                terminal.len(),
-                1,
-                "expected exactly one terminal progress: {terminal:?}"
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("completed")
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/update/summary")
-                    .and_then(Value::as_str),
-                Some("Exited with code 0")
-            );
-            {
-                let state = inner.state.lock().await;
-                assert!(
-                    state.background_commands.is_empty()
-                        && state.outstanding_command_executions.is_empty(),
-                    "a finished child background terminal stayed tracked"
-                );
-            }
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn interrupted_child_late_command_orders_are_inert() {
-        for raw_first in [true, false] {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-
-            rt.block_on(async {
-                let (inner, mut parent_rx) = test_codex_inner();
-                let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-                attach_test_codex_subagent(&inner, child_tx, "thread-child").await;
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": "thread-child",
-                            "turn": { "id": "child-turn" }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-child",
-                            "turnId": "child-turn",
-                            "item": {
-                                "type": "commandExecution",
-                                "id": "child-command",
-                                "command": "sleep 30",
-                                "cwd": "/tmp",
-                                "processId": "3312",
-                                "status": "inProgress"
-                            }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut parent_rx);
-                drain_events(&mut child_rx);
-                let progress = {
-                    let mut state = inner.state.lock().await;
-                    reconcile_codex_background_terminals(
-                        &mut state,
-                        "thread-child",
-                        &[background_terminal_row("child-command", "3312", "sleep 30")],
-                    )
-                };
-                let child_emitter = inner
-                    .background_progress_emitter("thread-child")
-                    .await
-                    .expect("child emitter");
-                for update in progress {
-                    child_emitter.tool_progress(&update);
-                }
-                drain_events(&mut child_rx);
-
-                inner
-                    .handle_notification(
-                        "turn/completed",
-                        &json!({
-                            "threadId": "thread-child",
-                            "turn": { "id": "child-turn", "status": "interrupted" }
-                        }),
-                    )
-                    .await;
-                let interrupted = drain_events(&mut child_rx);
-                assert_eq!(
-                    interrupted
-                        .iter()
-                        .filter(|event| {
-                            event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                                && event.pointer("/data/update/status").and_then(Value::as_str)
-                                    == Some("stopped")
-                        })
-                        .count(),
-                    1
-                );
-                inner
-                    .complete_codex_subagent_if_needed("thread-child")
-                    .await;
-                drain_events(&mut child_rx);
-
-                let raw = yielded_raw_result("thread-child", "child-turn", json!(3312));
-                let completed = json!({
-                    "threadId": "thread-child",
-                    "turnId": "child-turn",
-                    "item": {
-                        "type": "commandExecution",
-                        "id": "child-command",
-                        "command": "sleep 30",
-                        "cwd": "/tmp",
-                        "processId": "3312",
-                        "status": "completed",
-                        "exitCode": 0,
-                        "aggregatedOutput": ""
-                    }
-                });
-                if raw_first {
-                    inner
-                        .handle_notification("rawResponseItem/completed", &raw)
-                        .await;
-                    inner
-                        .handle_notification("item/completed", &completed)
-                        .await;
-                } else {
-                    inner
-                        .handle_notification("item/completed", &completed)
-                        .await;
-                    inner
-                        .handle_notification("rawResponseItem/completed", &raw)
-                        .await;
-                }
-                assert!(
-                    drain_events(&mut parent_rx).is_empty()
-                        && drain_events(&mut child_rx).is_empty(),
-                    "late child command ordering changed terminal UI"
-                );
-                let state = inner.state.lock().await;
-                assert!(
-                    state.background_commands.is_empty()
-                        && state.outstanding_command_executions.is_empty()
-                );
-                drop(state);
-                inner.rpc.shutdown().await;
-            });
-        }
-    }
-
-    #[test]
-    fn codex_owner_loss_stops_running_unified_exec_once() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "owner-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "owner-turn",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "owner-command",
-                            "command": "sleep 30",
-                            "cwd": "/tmp",
-                            "processId": "5252",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            // `item/started` alone says nothing about backgrounding.
-            assert!(
-                drain_events(&mut rx).iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
-                }),
-                "a started command must not claim a tray row before unified exec yields"
-            );
-            inner
-                .handle_notification(
-                    "rawResponseItem/completed",
-                    &yielded_raw_result("thread-test", "owner-turn", json!(5252)),
-                )
-                .await;
-            let started = drain_events(&mut rx);
-            assert_eq!(
-                started
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                            && event.pointer("/data/update/status").and_then(Value::as_str)
-                                == Some("running")
-                    })
-                    .count(),
-                1
-            );
-
-            inner
-                .rpc
-                .terminate()
-                .await
-                .expect("terminate fake app-server");
-            inner
-                .handle_inbound(CodexInbound::Closed { exit_code: Some(9) })
-                .await;
-            let exited = drain_events(&mut rx);
-            assert_eq!(
-                exited
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
-                            && event.pointer("/data/update/status").and_then(Value::as_str)
-                                == Some("stopped")
-                    })
-                    .count(),
-                1,
-                "owner loss must retire the Running tray row"
-            );
-            assert_eq!(
-                exited
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                    })
-                    .count(),
-                1,
-                "owner loss must complete a still-pending tool card"
-            );
-
-            inner
-                .handle_inbound(CodexInbound::Closed { exit_code: Some(9) })
-                .await;
-            let duplicate = drain_events(&mut rx);
-            assert!(duplicate.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
-                    && event.get("kind").and_then(Value::as_str) != Some("ToolExecutionCompleted")
-            }));
-        });
-    }
-
-    #[test]
-    fn codex_interruption_closes_published_stream_before_cancellation() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "published-interrupt" } }),
-                )
-                .await;
-            let mut events = drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "itemId": "published-interrupt-item",
-                        "delta": "visible before interrupt"
-                    }),
-                )
-                .await;
-            events.extend(drain_events(&mut rx));
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "published-interrupt", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("published-interrupt-item")
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("visible before interrupt")
-            );
-            assert!(terminal.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("MessageAdded")
-            }));
-            events.extend(terminal);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamStart")
-                    })
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                    })
-                    .count(),
-                1
-            );
-            assert_codex_protocol_valid(&events);
-
-            for (method, params) in [
-                (
-                    "item/completed",
-                    json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "published-interrupt-item",
-                            "text": "visible before interrupt"
-                        }
-                    }),
-                ),
-                (
-                    "turn/completed",
-                    json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "published-interrupt", "status": "interrupted" }
-                    }),
-                ),
-            ] {
-                inner.handle_notification(method, &params).await;
-            }
-            assert!(drain_events(&mut rx).is_empty());
-            inner.rpc.shutdown().await;
-            assert!(drain_events(&mut rx).is_empty());
-        });
-    }
-
-    #[test]
-    fn codex_unpublished_item_missing_completion_remains_a_loud_violation() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "missing-completion" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "missing-item" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "missing-completion", "status": "completed" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(
-                terminal.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-                })
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_replaces_abandoned_unpublished_provider_item() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "rollover" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for item_id in ["abandoned-reasoning", "replacement-reasoning"] {
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "reasoning", "id": item_id }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "itemId": "replacement-reasoning",
-                        "delta": "replacement survived"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "replacement-reasoning",
-                            "summary": "replacement survived"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "abandoned-reasoning",
-                            "summary": ""
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "rollover", "status": "completed" }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec![
-                    "StreamStart",
-                    "StreamReasoningDelta",
-                    "StreamEnd",
-                    "MessageMetadataUpdated",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert!(events.iter().all(|event| {
-                event
-                    .pointer("/data/message_id")
-                    .or_else(|| event.pointer("/data/message/message_id"))
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id == "replacement-reasoning")
-            }));
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_supersedes_all_provider_stream_kind_pairs() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (index, (first_kind, second_kind)) in [
-                (
-                    CodexProviderItemKind::Reasoning,
-                    CodexProviderItemKind::Reasoning,
-                ),
-                (
-                    CodexProviderItemKind::Reasoning,
-                    CodexProviderItemKind::AgentMessage,
-                ),
-                (
-                    CodexProviderItemKind::AgentMessage,
-                    CodexProviderItemKind::Reasoning,
-                ),
-                (
-                    CodexProviderItemKind::AgentMessage,
-                    CodexProviderItemKind::AgentMessage,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let (inner, mut rx) = test_codex_inner();
-                let turn_id = format!("supersession-turn-{index}");
-                let first_id = format!("superseded-{index}");
-                let second_id = format!("replacement-{index}");
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "turn": { "id": turn_id }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut rx);
-                start_test_codex_provider_item(&inner, "thread-test", Some(&first_id), first_kind)
-                    .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(&first_id),
-                    first_kind,
-                    "accepted first output",
-                )
-                .await;
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(&second_id),
-                    second_kind,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(&second_id),
-                    second_kind,
-                    "replacement output",
-                )
-                .await;
-                complete_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    &second_id,
-                    second_kind,
-                    "replacement output",
-                )
-                .await;
-                inner
-                    .handle_notification(
-                        "turn/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "turn": { "id": turn_id, "status": "completed" }
-                        }),
-                    )
-                    .await;
-
-                let events = drain_events(&mut rx);
-                let first_end = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                            && codex_event_message_id(event) == Some(first_id.as_str())
-                    })
-                    .expect("superseded stream must end");
-                let warning = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                            && event.pointer("/data/sender").and_then(Value::as_str)
-                                == Some("Warning")
-                            && event.pointer("/data/content").and_then(Value::as_str)
-                                == Some(CODEX_SUPERSESSION_WARNING)
-                    })
-                    .expect("supersession warning must be visible");
-                let second_start = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamStart")
-                            && codex_event_message_id(event) == Some(second_id.as_str())
-                    })
-                    .expect("replacement stream must start");
-                assert!(
-                    first_end < warning && warning < second_start,
-                    "required End(A) -> Warning -> Start(B) order: {events:?}"
-                );
-                let first_terminal = &events[first_end];
-                match first_kind {
-                    CodexProviderItemKind::AgentMessage => assert_eq!(
-                        first_terminal
-                            .pointer("/data/message/content")
-                            .and_then(Value::as_str),
-                        Some("accepted first output")
-                    ),
-                    CodexProviderItemKind::Reasoning => assert_eq!(
-                        first_terminal
-                            .pointer("/data/message/reasoning/text")
-                            .and_then(Value::as_str),
-                        Some("accepted first output")
-                    ),
-                }
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| {
-                            event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                                && event.pointer("/data/sender").and_then(Value::as_str)
-                                    == Some("Warning")
-                        })
-                        .count(),
-                    1
-                );
-                assert!(events.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("OperationCancelled")
-                        && !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                            && event.pointer("/data/sender").and_then(Value::as_str)
-                                == Some("Error"))
-                }));
-                assert_codex_protocol_valid(&events);
-                let state = inner.state.lock().await;
-                assert_eq!(state.provider_supersessions_this_turn, 1);
-                assert!(state.active_stream.is_none());
-                assert!(
-                    state
-                        .completed_agent_messages
-                        .contains_key(&ChatMessageId(first_id.clone()))
-                );
-                assert!(
-                    !state
-                        .retired_unpublished_message_ids
-                        .contains(&ChatMessageId(first_id))
-                );
-                assert!(
-                    state
-                        .provider_item_tombstones
-                        .iter()
-                        .all(|tombstone| tombstone.disposition
-                            != CodexProviderItemDisposition::TurnTerminated)
-                );
-                drop(state);
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn codex_supersession_preserves_the_remainder_of_the_turn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "production-order" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for (item_id, output) in [
-                ("tool-before-rollover", "before"),
-                ("tool-after-rollover", "after"),
-            ] {
-                if item_id == "tool-after-rollover" {
-                    start_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("reasoning-a"),
-                        CodexProviderItemKind::Reasoning,
-                    )
-                    .await;
-                    delta_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("reasoning-a"),
-                        CodexProviderItemKind::Reasoning,
-                        "partial reasoning A",
-                    )
-                    .await;
-                    start_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("reasoning-b"),
-                        CodexProviderItemKind::Reasoning,
-                    )
-                    .await;
-                    delta_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("reasoning-b"),
-                        CodexProviderItemKind::Reasoning,
-                        "reasoning B",
-                    )
-                    .await;
-                    complete_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        "reasoning-b",
-                        CodexProviderItemKind::Reasoning,
-                        "reasoning B",
-                    )
-                    .await;
-                }
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": {
-                                "type": "commandExecution",
-                                "id": item_id,
-                                "command": "printf test",
-                                "cwd": "/tmp"
-                            }
-                        }),
-                    )
-                    .await;
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": {
-                                "type": "commandExecution",
-                                "id": item_id,
-                                "exitCode": 0,
-                                "aggregatedOutput": output
-                            }
-                        }),
-                    )
-                    .await;
-            }
-            start_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("final-answer"),
-                CodexProviderItemKind::AgentMessage,
-            )
-            .await;
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("final-answer"),
-                CodexProviderItemKind::AgentMessage,
-                "turn survived",
-            )
-            .await;
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "final-answer",
-                CodexProviderItemKind::AgentMessage,
-                "turn survived",
-            )
-            .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "production-order", "status": "completed" }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            for tool_id in ["tool-before-rollover", "tool-after-rollover"] {
-                assert!(events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
-                            == Some(tool_id)
-                }));
-            }
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                    && codex_event_message_id(event) == Some("final-answer")
-                    && event
-                        .pointer("/data/message/content")
-                        .and_then(Value::as_str)
-                        == Some("turn survived")
-            }));
-            let metadata_updates = events
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                metadata_updates.len(),
-                1,
-                "the surviving final segment must own the turn metadata: {events:?}"
-            );
-            assert_eq!(
-                metadata_updates[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("final-answer"),
-                "superseded reasoning must not retain the metadata target"
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                            && event.pointer("/data/sender").and_then(Value::as_str)
-                                == Some("Warning")
-                    })
-                    .count(),
-                1
-            );
-            assert!(events.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("OperationCancelled")
-                    && !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                        && event.pointer("/data/sender").and_then(Value::as_str) == Some("Error"))
-            }));
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_absorbs_additive_late_superseded_events() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "late-superseded-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for (item_id, content) in [("late-first", "accepted"), ("late-second", "replacement")] {
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::AgentMessage,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::AgentMessage,
-                    content,
-                )
-                .await;
-            }
-            drain_events(&mut rx);
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("late-first"),
-                CodexProviderItemKind::AgentMessage,
-                " plus more",
-            )
-            .await;
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "late-first",
-                CodexProviderItemKind::AgentMessage,
-                "accepted plus more",
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "compatible late A events must not emit duplicate stream events"
-            );
-
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "late-first",
-                CodexProviderItemKind::AgentMessage,
-                "contradiction",
-            )
-            .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ],
-                "a live-turn contradiction must finalize B then emit one terminal tail"
-            );
-            assert_eq!(codex_event_message_id(&terminal[0]), Some("late-second"));
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("replacement")
-            );
-            assert_eq!(
-                inner.state.lock().await.terminated_turns.len(),
-                1,
-                "the affected turn must latch one bounded termination"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "later-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "late-first",
-                CodexProviderItemKind::AgentMessage,
-                "another contradiction",
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "old-turn contradictions must not terminate a newer live turn"
-            );
-            assert_eq!(
-                inner.state.lock().await.active_turn_id.as_deref(),
-                Some("later-turn")
-            );
-            inner.rpc.shutdown().await;
-
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "late-reasoning-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for item_id in ["late-reasoning-a", "late-reasoning-b"] {
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::Reasoning,
-                    item_id,
-                )
-                .await;
-            }
-            drain_events(&mut rx);
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("late-reasoning-a"),
-                CodexProviderItemKind::Reasoning,
-                " additive detail",
-            )
-            .await;
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "late-reasoning-a",
-                CodexProviderItemKind::Reasoning,
-                "a non-prefix provider summary",
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "same-kind reasoning deltas and summaries are compatible late events"
-            );
-            {
-                let mut state = inner.state.lock().await;
-                let tombstone = state
-                    .provider_item_tombstones
-                    .iter_mut()
-                    .find(|tombstone| tombstone.message_id.0 == "late-reasoning-a")
-                    .expect("superseded reasoning tombstone");
-                tombstone.late_event_count = MAX_CODEX_LATE_SUPERSEDED_EVENTS;
-            }
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("late-reasoning-a"),
-                CodexProviderItemKind::Reasoning,
-                "overflow",
-            )
-            .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ],
-                "late-event bounds must terminate the still-live affected turn once"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_provider_item_tombstones_are_bounded() {
-        let mut tombstones = VecDeque::new();
-        for index in 0..=MAX_CODEX_PROVIDER_ITEM_TOMBSTONES {
-            push_codex_provider_item_tombstone(
-                &mut tombstones,
-                CodexProviderItemTombstone {
-                    owner_thread_id: "bounded-thread".to_string(),
-                    turn_id: format!("bounded-turn-{index}"),
-                    message_id: ChatMessageId(format!("bounded-item-{index}")),
-                    kind: CodexProviderItemKind::Reasoning,
-                    disposition: CodexProviderItemDisposition::Superseded,
-                    accepted_text: String::new(),
-                    accepted_reasoning: "accepted".to_string(),
-                    late_text: String::new(),
-                    late_reasoning: String::new(),
-                    late_event_count: 0,
-                    late_bytes: 0,
-                },
-            );
-        }
-        assert_eq!(tombstones.len(), MAX_CODEX_PROVIDER_ITEM_TOMBSTONES);
-        assert_eq!(
-            tombstones
-                .front()
-                .map(|tombstone| tombstone.message_id.0.as_str()),
-            Some("bounded-item-1")
-        );
-        assert_eq!(
-            tombstones
-                .back()
-                .map(|tombstone| tombstone.message_id.0.as_str()),
-            Some("bounded-item-8")
-        );
-    }
-
-    #[test]
-    fn late_started_and_delta_after_completed_item_absorb_quietly() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-done" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("done-item"),
-                CodexProviderItemKind::AgentMessage,
-                "Hello",
-            )
-            .await;
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "done-item",
-                CodexProviderItemKind::AgentMessage,
-                "Hello",
-            )
-            .await;
-            drain_events(&mut rx);
-
-            start_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("done-item"),
-                CodexProviderItemKind::AgentMessage,
-            )
-            .await;
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("done-item"),
-                CodexProviderItemKind::AgentMessage,
-                " straggler",
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "late started/delta for a completed item absorb quietly"
-            );
-            {
-                let state = inner.state.lock().await;
-                let tombstone = state
-                    .provider_item_tombstones
-                    .iter()
-                    .find(|tombstone| tombstone.message_id.0 == "done-item")
-                    .expect("completed-item tombstone");
-                assert_eq!(
-                    tombstone.disposition,
-                    CodexProviderItemDisposition::Completed
-                );
-                assert_eq!(tombstone.late_event_count, 2);
-                assert_eq!(tombstone.accepted_text, "Hello");
-                assert!(state.terminated_turns.is_empty());
-                assert_eq!(state.active_turn_id.as_deref(), Some("turn-done"));
-            }
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn late_old_turn_events_leave_new_turn_untouched() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-old" } }),
-                )
-                .await;
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("old-item"),
-                CodexProviderItemKind::AgentMessage,
-                "Old turn text",
-            )
-            .await;
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "old-item",
-                CodexProviderItemKind::AgentMessage,
-                "Old turn text",
-            )
-            .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "turn-old", "status": "completed" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-new" } }),
-                )
-                .await;
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("new-item"),
-                CodexProviderItemKind::AgentMessage,
-                "New",
-            )
-            .await;
-            drain_events(&mut rx);
-
-            start_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("old-item"),
-                CodexProviderItemKind::AgentMessage,
-            )
-            .await;
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("old-item"),
-                CodexProviderItemKind::AgentMessage,
-                " late",
-            )
-            .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "late old-turn events must not touch the new turn"
-            );
-
-            delta_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("new-item"),
-                CodexProviderItemKind::AgentMessage,
-                " turn",
-            )
-            .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec!["StreamDelta"],
-                "the new turn's stream keeps flowing"
-            );
-            complete_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                "new-item",
-                CodexProviderItemKind::AgentMessage,
-                "New turn",
-            )
-            .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(event_kinds(&terminal), vec!["StreamEnd"]);
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("New turn")
-            );
-            assert_eq!(
-                inner.state.lock().await.active_turn_id.as_deref(),
-                Some("turn-new"),
-                "the new turn stays live after the late old-turn events"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn empty_file_change_completion_without_request_is_skipped() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-fc" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "fileChange", "id": "fc-empty-root", "changes": [] }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "an empty fileChange start emits no request"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "fileChange",
-                            "id": "fc-empty-root",
-                            "status": "completed",
-                            "changes": []
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "an empty fileChange completion without an emitted request is skipped"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_rejects_second_or_ambiguous_supersession() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "bounded-supersession" }
-                    }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for item_id in ["bounded-a", "bounded-b"] {
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some(item_id),
-                    CodexProviderItemKind::Reasoning,
-                    item_id,
-                )
-                .await;
-            }
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": { "id": "bounded-supersession" }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "a duplicate turn start must not reset the recovery latch"
-            );
-            start_test_codex_provider_item(
-                &inner,
-                "thread-test",
-                Some("bounded-c"),
-                CodexProviderItemKind::AgentMessage,
-            )
-            .await;
-            let second_conflict = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&second_conflict),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert!(second_conflict.iter().all(|event| {
-                !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                    && event.pointer("/data/sender").and_then(Value::as_str) == Some("Warning"))
-            }));
-            inner.rpc.shutdown().await;
-
-            for (case, first_id, first_start_id, second_id) in [
-                ("generated-a", None, None, Some("provider-b")),
-                ("generated-b", Some("provider-a"), Some("provider-a"), None),
-            ] {
-                let (inner, mut rx) = test_codex_inner();
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "turn": { "id": case }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut rx);
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    first_start_id,
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    first_id,
-                    CodexProviderItemKind::Reasoning,
-                    "generated guard",
-                )
-                .await;
-                drain_events(&mut rx);
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    second_id,
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                let terminal = drain_events(&mut rx);
-                assert!(terminal.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
-                }));
-                assert!(terminal.iter().all(|event| {
-                    !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                        && event.pointer("/data/sender").and_then(Value::as_str) == Some("Warning"))
-                }));
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn codex_never_supersedes_from_delta_or_pending_tool() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for pending_tool in [false, true] {
-                let (inner, mut rx) = test_codex_inner();
-                let turn_id = if pending_tool {
-                    "tool-owned-turn"
-                } else {
-                    "foreign-delta-turn"
-                };
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "turn": { "id": turn_id }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut rx);
-                start_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some("guarded-a"),
-                    CodexProviderItemKind::Reasoning,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    "thread-test",
-                    Some("guarded-a"),
-                    CodexProviderItemKind::Reasoning,
-                    "accepted A",
-                )
-                .await;
-                drain_events(&mut rx);
-                if pending_tool {
-                    inner
-                        .state
-                        .lock()
-                        .await
-                        .pending_tool_call_ids
-                        .insert("pending-tool".to_string());
-                    start_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("guarded-b"),
-                        CodexProviderItemKind::AgentMessage,
-                    )
-                    .await;
-                } else {
-                    delta_test_codex_provider_item(
-                        &inner,
-                        "thread-test",
-                        Some("guarded-b"),
-                        CodexProviderItemKind::AgentMessage,
-                        "orphan B",
-                    )
-                    .await;
-                }
-                let events = drain_events(&mut rx);
-                assert_eq!(
-                    event_kinds(&events),
-                    vec![
-                        "StreamEnd",
-                        "MessageAdded",
-                        "OperationCancelled",
-                        "TypingStatusChanged"
-                    ]
-                );
-                assert_eq!(codex_event_message_id(&events[0]), Some("guarded-a"));
-                assert!(events.iter().all(|event| {
-                    !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                        && event.pointer("/data/sender").and_then(Value::as_str) == Some("Warning"))
-                }));
-                assert_eq!(inner.state.lock().await.provider_supersessions_this_turn, 0);
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn codex_rejects_late_content_for_retired_item() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "late-content" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for item_id in ["retired-item", "current-item"] {
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "reasoning", "id": item_id }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "retired-item",
-                            "summary": "late provider content"
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                    && event
-                        .pointer("/data/content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| content.contains("foreign active message id"))
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_resume_preserves_reasoning_only_and_skips_contentless_items() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            let restored_bytes = inner
-                .emit_resumed_thread_history(
-                    &[json!({
-                        "items": [
-                            {
-                                "type": "agentMessage",
-                                "id": "resume-empty",
-                                "text": ""
-                            },
-                            {
-                                "type": "agentMessage",
-                                "id": "resume-reasoning",
-                                "text": "",
-                                "reasoning": "preserved reasoning"
-                            },
-                            {
-                                "type": "reasoning",
-                                "id": "resume-reasoning-item",
-                                "summary": "preserved summary"
-                            }
-                        ]
-                    })],
-                    "codex",
-                )
-                .await;
-            assert_eq!(restored_bytes, 0);
-            let events = drain_events(&mut rx);
-            assert_eq!(event_kinds(&events), vec!["MessageAdded", "MessageAdded"]);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec!["resume-reasoning", "resume-reasoning-item"]
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event
-                        .pointer("/data/reasoning/text")
-                        .and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec!["preserved reasoning", "preserved summary"]
-            );
-            assert!(events.iter().all(|event| {
-                event.pointer("/data/message_id").and_then(Value::as_str) != Some("resume-empty")
-            }));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn shared_message_renderability_includes_reasoning_tools_and_images() {
-        assert!(!codex_message_is_renderable(" \n", Some("\t"), 0, 0));
-        assert!(codex_message_is_renderable("text", None, 0, 0));
-        assert!(codex_message_is_renderable("", Some("reasoning"), 0, 0));
-        assert!(codex_message_is_renderable("", None, 1, 0));
-        assert!(codex_message_is_renderable("", None, 0, 1));
-    }
-
-    #[test]
-    fn codex_generated_image_requires_valid_bounded_image_bytes() {
-        let image = parse_codex_generated_image(&json!({
-            "status": "completed",
-            "result": "iVBORw0KGgo="
-        }))
-        .expect("PNG signature should be accepted");
-        assert_eq!(image.media_type, "image/png");
-        assert_eq!(image.data, "iVBORw0KGgo=");
-
-        assert!(
-            parse_codex_generated_image(&json!({
-                "status": "completed",
-                "result": "not base64"
-            }))
-            .unwrap_err()
-            .contains("base64")
-        );
-        assert!(
-            parse_codex_generated_image(&json!({
-                "status": "failed",
-                "result": "iVBORw0KGgo="
-            }))
-            .unwrap_err()
-            .contains("failed")
-        );
-    }
-
-    #[test]
-    fn codex_image_generation_completes_typed_tool_with_inline_image() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "inProgress",
-                            "revisedPrompt": "A blue prototype"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "completed",
-                            "revisedPrompt": "A blue prototype",
-                            "result": "iVBORw0KGgo="
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec![
-                    "StreamStart",
-                    "ToolRequest",
-                    "ToolExecutionCompleted",
-                    "StreamEnd"
-                ]
-            );
-            let request = events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                .expect("typed image request");
-            assert_eq!(
-                request
-                    .pointer("/data/tool_type/kind")
-                    .and_then(Value::as_str),
-                Some("GenerateImage")
-            );
-            let completion = events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                })
-                .expect("typed image completion");
-            assert_eq!(
-                completion
-                    .pointer("/data/tool_result/kind")
-                    .and_then(Value::as_str),
-                Some("GenerateImage")
-            );
-            let end = events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("image tool container completes");
-            assert_eq!(
-                end.pointer("/data/message/images/0/media_type")
-                    .and_then(Value::as_str),
-                Some("image/png")
-            );
-            assert_eq!(
-                end.pointer("/data/message/images/0/data")
-                    .and_then(Value::as_str),
-                Some("iVBORw0KGgo=")
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_image_attached_to_reasoning_stream_reaches_stream_end() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "itemId": "image-reasoning",
-                        "delta": "Creating the prototype"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "inProgress",
-                            "revisedPrompt": "A blue prototype"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "completed",
-                            "revisedPrompt": "A blue prototype",
-                            "result": "iVBORw0KGgo="
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "image-reasoning",
-                            "summary": ["Creating the prototype"]
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str)
-                        == Some("ToolExecutionCompleted"))
-                    .count(),
-                1
-            );
-            let end = events
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                .expect("reasoning stream completes");
-            assert_eq!(
-                end.pointer("/data/message/images/0/media_type")
-                    .and_then(Value::as_str),
-                Some("image/png")
-            );
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_image_survives_intervening_reasoning_item() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "inProgress",
-                            "revisedPrompt": "A blue prototype"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": { "type": "reasoning", "id": "image-reasoning" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "image-reasoning",
-                            "summary": ["Waiting for image output"]
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "imageGeneration",
-                            "id": "image-call",
-                            "status": "completed",
-                            "revisedPrompt": "A blue prototype",
-                            "result": "iVBORw0KGgo="
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": { "type": "agentMessage", "id": "final-message" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "image-turn",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "final-message",
-                            "text": "IMAGE_DONE"
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let end = events
-                .iter()
-                .find(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                        && event
-                            .pointer("/data/message/message_id")
-                            .and_then(Value::as_str)
-                            == Some("final-message")
-                })
-                .expect("final response must claim the late image output");
-            assert_eq!(
-                end.pointer("/data/message/images/0/media_type")
-                    .and_then(Value::as_str),
-                Some("image/png")
-            );
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_native_tools_complete_as_visible_typed_tools() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "native-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            for (item_type, item_fields, expected_kind) in [
-                ("webSearch", json!({ "query": "Bedrock news" }), "WebSearch"),
-                (
-                    "imageView",
-                    json!({ "path": "/tmp/chart.png" }),
-                    "ViewImage",
-                ),
-                ("sleep", json!({ "durationMs": 250 }), "Sleep"),
-            ] {
-                let item_id = format!("{item_type}-call");
-                let mut item = item_fields.as_object().cloned().expect("object fields");
-                item.insert("type".to_owned(), json!(item_type));
-                item.insert("id".to_owned(), json!(item_id));
-                item.insert("status".to_owned(), json!("inProgress"));
-                let started = json!({
-                    "threadId": "thread-test",
-                    "turnId": "native-turn",
-                    "item": item
-                });
-                inner.handle_notification("item/started", &started).await;
-
-                let mut completed = started;
-                completed["item"]["status"] = json!("completed");
-                inner
-                    .handle_notification("item/completed", &completed)
-                    .await;
-
-                let events = drain_events(&mut rx);
-                assert_eq!(
-                    event_kinds(&events),
-                    vec![
-                        "StreamStart",
-                        "ToolRequest",
-                        "ToolExecutionCompleted",
-                        "StreamEnd"
-                    ]
-                );
-                assert_eq!(
-                    events[1]
-                        .pointer("/data/tool_type/kind")
-                        .and_then(Value::as_str),
-                    Some(expected_kind)
-                );
-                assert_eq!(
-                    events[2]
-                        .pointer("/data/tool_result/kind")
-                        .and_then(Value::as_str),
-                    Some(expected_kind)
-                );
-                assert_codex_protocol_valid(&events);
-            }
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_reused_provider_call_ids_remain_distinct_within_one_turn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-one" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            for (method, status) in [
-                ("item/started", "inProgress"),
-                ("item/completed", "completed"),
-            ] {
-                inner
-                    .handle_notification(
-                        method,
-                        &json!({
-                            "threadId": "thread-test",
-                            "turnId": "turn-one",
-                            "item": {
-                                "type": "mcpToolCall",
-                                "id": "call_1",
-                                "tool": "InternalSearch",
-                                "status": status
-                            }
-                        }),
-                    )
-                    .await;
-            }
-            let first = drain_events(&mut rx);
-            let first_id = first
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                .and_then(|event| event.pointer("/data/tool_call_id"))
-                .and_then(Value::as_str)
-                .expect("first tool request")
-                .to_owned();
-
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turnId": "turn-one",
-                        "item": {
-                            "type": "collabAgentToolCall",
-                            "id": "call_1",
-                            "tool": "spawnAgent",
-                            "senderThreadId": "thread-test",
-                            "receiverThreadId": "child-thread",
-                            "receiverAgentName": "Pierce",
-                            "prompt": "Search Bedrock news",
-                            "status": "inProgress"
-                        }
-                    }),
-                )
-                .await;
-            let second = drain_events(&mut rx);
-            let second_id = second
-                .iter()
-                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                .and_then(|event| event.pointer("/data/tool_call_id"))
-                .and_then(Value::as_str)
-                .expect("second tool request")
-                .to_owned();
-            assert_ne!(first_id, second_id);
-            assert_eq!(first_id, "codex:thread-test:turn-one:call_1");
-            assert_eq!(second_id, "codex:thread-test:turn-one:call_1:occurrence-2");
-
-            inner.emitter.tool_progress(&ToolProgressData {
-                tool_call_id: second_id,
-                tool_name: "spawnAgent".to_owned(),
-                update: ToolProgressUpdate::Other {
-                    payload: json!({ "status": "running" }),
-                },
-            });
-            let progress = drain_events(&mut rx);
-            assert_eq!(event_kinds(&progress), vec!["ToolProgress"]);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn resumed_codex_history_preserves_generated_images() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .emit_resumed_thread_history(
-                    &[json!({
-                        "items": [{
-                            "type": "imageGeneration",
-                            "id": "historic-image",
-                            "status": "completed",
-                            "result": "iVBORw0KGgo="
-                        }]
-                    })],
-                    "gpt-5.6",
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(event_kinds(&events), vec!["MessageAdded"]);
-            assert_eq!(
-                events[0]
-                    .pointer("/data/images/0/media_type")
-                    .and_then(Value::as_str),
-                Some("image/png")
-            );
-            assert_eq!(
-                events[0]
-                    .pointer("/data/model_info/model")
-                    .and_then(Value::as_str),
-                Some("gpt-5.6")
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_tool_first_container_closes_before_real_message() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "tool-first" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "tool-first-call",
-                            "command": "pwd",
-                            "cwd": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "tool-first-call",
-                            "exitCode": 0,
-                            "aggregatedOutput": "/tmp"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "thread-test",
-                        "itemId": "real-after-tool",
-                        "delta": "done"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "real-after-tool",
-                            "text": "done"
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                    .count(),
-                2
-            );
-            assert!(events.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("Error")
-            }));
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_child_agent_messages_use_provider_item_ids_without_turn_streams() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-thread").await;
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "child-thread", "turn": { "id": "child-turn" } }),
-                )
-                .await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            drain_events(&mut child_rx);
-
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({
-                        "threadId": "child-thread",
-                        "itemId": "child-reasoning",
-                        "delta": "considering"
-                    }),
-                )
-                .await;
-            for summary in ["", "", "considering"] {
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "child-thread",
-                            "item": {
-                                "type": "reasoning",
-                                "id": "child-reasoning",
-                                "summary": summary
-                            }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "child-thread", "itemId": "child-alpha", "delta": "alpha" }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-thread",
-                        "item": { "type": "agentMessage", "id": "child-alpha", "text": " \n" }
-                    }),
-                )
-                .await;
-            for text in [" \n", "alpha"] {
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "child-thread",
-                            "item": { "type": "agentMessage", "id": "child-alpha", "text": text }
-                        }),
-                    )
-                    .await;
-            }
-            for _ in 0..2 {
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "child-thread",
-                            "item": { "type": "agentMessage", "id": "child-beta", "text": "" }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "child-thread",
-                        "item": { "type": "agentMessage", "id": "child-started-empty" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-thread",
-                        "item": { "type": "agentMessage", "id": "child-started-empty", "text": "" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "child-thread",
-                        "itemId": "child-whitespace",
-                        "delta": " \n\t"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-thread",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "child-whitespace",
-                            "text": " \n\t"
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut child_rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("child-reasoning"), Some("child-alpha")]
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .find(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                            && event
-                                .pointer("/data/message/message_id")
-                                .and_then(Value::as_str)
-                                == Some("child-alpha")
-                    })
-                    .and_then(|event| event.pointer("/data/message/content"))
-                    .and_then(Value::as_str),
-                Some("alpha")
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-                    .map(|event| event.pointer("/data/message/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("child-reasoning"), Some("child-alpha")]
-            );
-            assert!(events.iter().all(|event| {
-                event.pointer("/data/message_id").and_then(Value::as_str) != Some("child-beta")
-                    && event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str)
-                        != Some("child-beta")
-                    && event.pointer("/data/message_id").and_then(Value::as_str)
-                        != Some("child-whitespace")
-                    && event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str)
-                        != Some("child-whitespace")
-                    && event.pointer("/data/message_id").and_then(Value::as_str)
-                        != Some("child-started-empty")
-                    && event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str)
-                        != Some("child-started-empty")
-            }));
-            assert!(
-                events.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("Error")),
-                "child item streams must not emit identity errors: {events:?}"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_child_replaces_abandoned_unpublished_item() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-rollover").await;
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "child-rollover",
-                        "turn": { "id": "child-rollover-turn" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            drain_events(&mut child_rx);
-            for item_id in ["child-abandoned", "child-replacement"] {
-                inner
-                    .handle_notification(
-                        "item/started",
-                        &json!({
-                            "threadId": "child-rollover",
-                            "item": { "type": "reasoning", "id": item_id }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({
-                        "threadId": "child-rollover",
-                        "itemId": "child-replacement",
-                        "delta": "child replacement survived"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-rollover",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "child-replacement",
-                            "summary": "child replacement survived"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-rollover",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "child-abandoned",
-                            "summary": ""
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&events),
-                vec!["StreamStart", "StreamReasoningDelta", "StreamEnd"]
-            );
-            assert!(events.iter().all(|event| {
-                event
-                    .pointer("/data/message_id")
-                    .or_else(|| event.pointer("/data/message/message_id"))
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id == "child-replacement")
-            }));
-            assert_codex_protocol_valid(&events);
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_child_supersedes_all_provider_stream_kind_pairs() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            for (index, (first_kind, second_kind)) in [
-                (
-                    CodexProviderItemKind::Reasoning,
-                    CodexProviderItemKind::Reasoning,
-                ),
-                (
-                    CodexProviderItemKind::Reasoning,
-                    CodexProviderItemKind::AgentMessage,
-                ),
-                (
-                    CodexProviderItemKind::AgentMessage,
-                    CodexProviderItemKind::Reasoning,
-                ),
-                (
-                    CodexProviderItemKind::AgentMessage,
-                    CodexProviderItemKind::AgentMessage,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let (inner, mut parent_rx) = test_codex_inner();
-                let child_thread = format!("child-supersession-{index}");
-                let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-                attach_test_codex_subagent(&inner, child_tx, &child_thread).await;
-                let turn_id = format!("child-turn-{index}");
-                let first_id = format!("child-first-{index}");
-                let second_id = format!("child-second-{index}");
-                inner
-                    .handle_notification(
-                        "turn/started",
-                        &json!({
-                            "threadId": child_thread,
-                            "turn": { "id": turn_id }
-                        }),
-                    )
-                    .await;
-                drain_events(&mut child_rx);
-                start_test_codex_provider_item(&inner, &child_thread, Some(&first_id), first_kind)
-                    .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    Some(&first_id),
-                    first_kind,
-                    "child accepted A",
-                )
-                .await;
-                start_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    Some(&second_id),
-                    second_kind,
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    Some(&second_id),
-                    second_kind,
-                    "child replacement B",
-                )
-                .await;
-                delta_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    Some(&first_id),
-                    first_kind,
-                    " late detail",
-                )
-                .await;
-                complete_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    &first_id,
-                    first_kind,
-                    if first_kind == CodexProviderItemKind::AgentMessage {
-                        "child accepted A late detail"
-                    } else {
-                        "child non-prefix reasoning summary"
-                    },
-                )
-                .await;
-                complete_test_codex_provider_item(
-                    &inner,
-                    &child_thread,
-                    &second_id,
-                    second_kind,
-                    "child replacement B",
-                )
-                .await;
-                inner
-                    .handle_notification(
-                        "turn/completed",
-                        &json!({
-                            "threadId": child_thread,
-                            "turn": { "id": turn_id, "status": "completed" }
-                        }),
-                    )
-                    .await;
-                assert!(drain_events(&mut parent_rx).is_empty());
-                let events = drain_events(&mut child_rx);
-                let first_end = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                            && codex_event_message_id(event) == Some(first_id.as_str())
-                    })
-                    .expect("child superseded stream must end");
-                let warning = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                            && event.pointer("/data/sender").and_then(Value::as_str)
-                                == Some("Warning")
-                            && event.pointer("/data/content").and_then(Value::as_str)
-                                == Some(CODEX_SUPERSESSION_WARNING)
-                    })
-                    .expect("child supersession warning must be visible");
-                let second_start = events
-                    .iter()
-                    .position(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamStart")
-                            && codex_event_message_id(event) == Some(second_id.as_str())
-                    })
-                    .expect("child replacement stream must start");
-                assert!(first_end < warning && warning < second_start);
-                assert!(events.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("OperationCancelled")
-                        && !(event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                            && event.pointer("/data/sender").and_then(Value::as_str)
-                                == Some("Error"))
-                }));
-                assert_codex_protocol_valid(&events);
-                let state = inner.state.lock().await;
-                let child = state
-                    .subagent_streams
-                    .get(&child_thread)
-                    .expect("child stream remains owned");
-                assert_eq!(child.provider_supersessions_this_turn, 1);
-                assert!(child.current_message_id.is_none());
-                assert!(
-                    child
-                        .completed_agent_messages
-                        .contains_key(&ChatMessageId(first_id))
-                );
-                drop(state);
-                inner.rpc.shutdown().await;
-            }
-        });
-    }
-
-    #[test]
-    fn child_conflicting_duplicate_completion_stays_loud() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-conflict").await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            let completion = |text: &str| {
-                json!({
-                    "threadId": "child-conflict",
-                    "item": {
-                        "type": "agentMessage",
-                        "id": "child-conflict-item",
-                        "text": text
-                    }
-                })
-            };
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "child-conflict",
-                        "itemId": "child-conflict-item",
-                        "delta": "child canonical"
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification("item/completed", &completion(" \n"))
-                .await;
-            let first = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&first),
-                vec!["StreamStart", "StreamDelta", "StreamEnd"]
-            );
-            assert_eq!(
-                first[2]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("child canonical")
-            );
-            inner
-                .handle_notification("item/completed", &completion(" \n"))
-                .await;
-            assert!(drain_events(&mut child_rx).is_empty());
-            inner
-                .handle_notification("item/completed", &completion("child canonical"))
-                .await;
-            assert!(drain_events(&mut child_rx).is_empty());
-            inner
-                .handle_notification("item/completed", &completion(" \t"))
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut child_rx)),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn child_cancellation_clears_unpublished_reservation_without_stream_terminal() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-empty-cancel").await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "turn": { "id": "child-empty-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "item": { "type": "agentMessage", "id": "child-reserved" }
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut child_rx).is_empty());
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "turn": { "id": "child-empty-turn", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(
-                terminal.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-                })
-            );
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "turn": { "id": "child-missing-turn" }
-                    }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-            inner
-                .handle_notification(
-                    "item/started",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "item": { "type": "agentMessage", "id": "child-missing" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "child-empty-cancel",
-                        "turn": { "id": "child-missing-turn", "status": "completed" }
-                    }),
-                )
-                .await;
-            let violation = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&violation),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(
-                violation.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-                })
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn child_interruption_closes_published_stream_before_cancellation() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-published-interrupt").await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turn": { "id": "child-published-turn" }
-                    }),
-                )
-                .await;
-            let mut events = drain_events(&mut child_rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "itemId": "child-published-item",
-                        "delta": "child visible before interrupt"
-                    }),
-                )
-                .await;
-            events.extend(drain_events(&mut child_rx));
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turn": { "id": "child-published-turn", "status": "interrupted" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut child_rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("child-published-item")
-            );
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("child visible before interrupt")
-            );
-            assert!(terminal.iter().all(|event| {
-                event.get("kind").and_then(Value::as_str) != Some("MessageAdded")
-            }));
-            events.extend(terminal);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamStart")
-                    })
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                    })
-                    .count(),
-                1
-            );
-            assert_codex_protocol_valid(&events);
-
-            for (method, params) in [
-                (
-                    "item/completed",
-                    json!({
-                        "threadId": "child-published-interrupt",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "child-published-item",
-                            "text": "child visible before interrupt"
-                        }
-                    }),
-                ),
-                (
-                    "turn/completed",
-                    json!({
-                        "threadId": "child-published-interrupt",
-                        "turn": { "id": "child-published-turn", "status": "interrupted" }
-                    }),
-                ),
-            ] {
-                inner.handle_notification(method, &params).await;
-            }
-            assert!(drain_events(&mut child_rx).is_empty());
-            assert!(drain_events(&mut parent_rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turn": { "id": "child-after-interrupt-turn" }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "child-after-interrupt-message",
-                            "text": "child continued"
-                        }
-                    }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turn": {
-                            "id": "child-after-interrupt-turn",
-                            "status": "completed"
-                        }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut child_rx)),
-                vec![
-                    "TypingStatusChanged",
-                    "StreamStart",
-                    "StreamEnd",
-                    "TypingStatusChanged"
-                ],
-                "a distinct child turn must proceed past the prior turn tombstone"
-            );
-            assert!(drain_events(&mut parent_rx).is_empty());
-
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turnId": "child-published-turn",
-                        "tokenUsage": {
-                            "input_tokens": 1,
-                            "output_tokens": 1,
-                            "total_tokens": 2
-                        }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut child_rx).is_empty(),
-                "the old child turn must remain suppressed by its explicit tombstone"
-            );
-
-            inner
-                .handle_notification(
-                    "thread/tokenUsage/updated",
-                    &json!({
-                        "threadId": "child-published-interrupt",
-                        "turnId": "child-after-interrupt-turn",
-                        "tokenUsage": {
-                            "input_tokens": 23,
-                            "output_tokens": 7,
-                            "total_tokens": 30,
-                            "context_window": 200000
-                        }
-                    }),
-                )
-                .await;
-            let metadata = drain_events(&mut child_rx);
-            assert_eq!(event_kinds(&metadata), vec!["MessageMetadataUpdated"]);
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("child-after-interrupt-message")
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(30)
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/context_breakdown/input_tokens")
-                    .and_then(Value::as_u64),
-                Some(23)
-            );
-            assert_eq!(
-                metadata[0]
-                    .pointer("/data/context_breakdown/context_window")
-                    .and_then(Value::as_u64),
-                Some(200_000)
-            );
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-            assert!(drain_events(&mut child_rx).is_empty());
-        });
-    }
-
-    #[test]
-    fn child_wrong_completion_id_finalizes_once_and_terminates() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "child-quarantine").await;
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "child-quarantine", "turn": { "id": "child-turn" } }),
-                )
-                .await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            drain_events(&mut child_rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "child-quarantine", "itemId": "child-open", "delta": "partial" }),
-                )
-                .await;
-            drain_events(&mut child_rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "child-quarantine",
-                        "item": { "type": "agentMessage", "id": "child-wrong", "text": "wrong" }
-                    }),
-                )
-                .await;
-            let terminal = drain_events(&mut child_rx);
-            // The child provider never completed child-open, but its "partial"
-            // delta was already accepted and published. Ending that exact
-            // identity and content preserves the anti-fabrication contract
-            // without discarding accepted output during strict termination.
-            assert_eq!(
-                event_kinds(&terminal),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ]
-            );
-            assert_eq!(codex_event_message_id(&terminal[0]), Some("child-open"));
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("partial")
-            );
-
-            for (method, params) in [
-                (
-                    "item/completed",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "item": { "type": "agentMessage", "id": "child-open", "text": "late" }
-                    }),
-                ),
-                (
-                    "item/started",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "item": { "type": "agentMessage", "id": "child-late" }
-                    }),
-                ),
-                (
-                    "item/reasoning/delta",
-                    json!({ "threadId": "child-quarantine", "delta": "late reasoning" }),
-                ),
-                (
-                    "turn/plan/updated",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "explanation": "late plan",
-                        "plan": [{ "step": "must not render", "status": "pending" }]
-                    }),
-                ),
-                (
-                    "model/rerouted",
-                    json!({ "threadId": "child-quarantine", "toModel": "late-model" }),
-                ),
-                (
-                    "error",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "message": "late child error",
-                        "fatal": true
-                    }),
-                ),
-                (
-                    "thread/tokenUsage/updated",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "turnId": "child-turn",
-                        "tokenUsage": { "inputTokens": 1, "outputTokens": 1, "totalTokens": 2 }
-                    }),
-                ),
-                (
-                    "turn/completed",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "turn": { "id": "child-turn", "status": "completed" }
-                    }),
-                ),
-                (
-                    "turn/started",
-                    json!({
-                        "threadId": "child-quarantine",
-                        "turn": { "id": "child-turn" }
-                    }),
-                ),
-            ] {
-                inner.handle_notification(method, &params).await;
-            }
-            assert!(
-                drain_events(&mut child_rx).is_empty(),
-                "terminated-turn tombstones must suppress later child notifications"
-            );
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn conflicting_duplicate_completion_terminates_once() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-            let first = json!({
-                "threadId": "thread-test",
-                "item": { "type": "agentMessage", "id": "conflict-id", "text": "first" }
-            });
-            inner.handle_notification("item/completed", &first).await;
-            let completed = drain_events(&mut rx);
-            assert_eq!(event_kinds(&completed), vec!["StreamStart", "StreamEnd"]);
-            assert_eq!(
-                completed[1]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("first")
-            );
-            assert!(
-                inner.state.lock().await.pending_message_metadata.is_some(),
-                "the first completion must establish the stale-target regression fixture"
-            );
-
-            let conflicting = json!({
-                "threadId": "thread-test",
-                "item": { "type": "agentMessage", "id": "conflict-id", "text": "second" }
-            });
-            inner
-                .handle_notification("item/completed", &conflicting)
-                .await;
-            let terminal = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&terminal),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            assert!(
-                terminal.iter().all(|event| {
-                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
-                })
-            );
-            assert!(
-                inner.state.lock().await.pending_message_metadata.is_none(),
-                "strict termination must clear metadata even without an active stream"
-            );
-
-            inner
-                .handle_notification("item/completed", &conflicting)
-                .await;
-            inner.handle_notification("item/completed", &first).await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "a terminated duplicate must have zero extra tails"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_turn_completed_finalizes_uncompleted_root_item() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "open-item", "delta": "partial" }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open", "status": "completed" } }),
-                )
-                .await;
-            let terminal = drain_events(&mut rx);
-            // turn/completed did not complete open-item, but the "partial"
-            // delta was already accepted and published. Ending that exact
-            // identity and content preserves the anti-fabrication contract
-            // without inventing provider-supplied completion bytes.
-            assert_eq!(
-                event_kinds(&terminal),
-                vec![
-                    "StreamEnd",
-                    "MessageAdded",
-                    "OperationCancelled",
-                    "TypingStatusChanged"
-                ],
-                "uncompleted item needs accepted content plus one terminal tail: {terminal:?}"
-            );
-            assert_eq!(codex_event_message_id(&terminal[0]), Some("open-item"));
-            assert_eq!(
-                terminal[0]
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str),
-                Some("partial"),
-                "turn completion must preserve accepted content"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "open-item", "text": "late" }
-                    }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "late completion must not resurrect a terminated turn"
-            );
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "another-late", "delta": "late" }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open", "status": "completed" } }),
-                )
-                .await;
-            assert!(
-                drain_events(&mut rx).is_empty(),
-                "late notifications must have zero extra discard tails"
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_reasoning_item_and_assistant_item_keep_separate_ids() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-reasoning" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "item/reasoning/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "reasoning-item", "delta": "thinking" }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "reasoning", "id": "reasoning-item", "summary": "" }
-                    }),
-                )
-                .await;
-            for summary in ["", "thinking"] {
-                inner
-                    .handle_notification(
-                        "item/completed",
-                        &json!({
-                            "threadId": "thread-test",
-                            "item": { "type": "reasoning", "id": "reasoning-item", "summary": summary }
-                        }),
-                    )
-                    .await;
-            }
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "threadId": "thread-test", "itemId": "answer-item", "delta": "answer" }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": { "type": "agentMessage", "id": "answer-item", "text": "answer" }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec![Some("reasoning-item"), Some("answer-item")]
-            );
-            assert!(
-                events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                        && event.pointer("/data/message/message_id").and_then(Value::as_str)
-                            == Some("reasoning-item")
-                }),
-                "provider reasoning completion must close its own response: {events:?}"
-            );
-            assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                    && event
-                        .pointer("/data/message/message_id")
-                        .and_then(Value::as_str)
-                        == Some("answer-item")
-            }));
-            assert!(
-                events.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("MessageAdded")),
-                "distinct provider boundaries must not raise a foreign-ID error: {events:?}"
-            );
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-item",
-                            "summary": "different reasoning"
-                        }
-                    }),
-                )
-                .await;
-            assert_eq!(
-                event_kinds(&drain_events(&mut rx)),
-                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn extract_codex_reasoning_delta_text_preserves_leading_whitespace() {
-        let payload = json!({ "delta": " targeted web search" });
-        assert_eq!(
-            extract_codex_reasoning_delta_text(&payload),
-            Some(" targeted web search".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_reasoning_delta_text_parses_nested_shapes() {
-        let payload = json!({
-            "itemId": "abc",
-            "delta": {
-                "summary": {
-                    "text": "Need to inspect parser edge-cases."
-                }
-            }
-        });
-
-        assert_eq!(
-            extract_codex_reasoning_delta_text(&payload),
-            Some("Need to inspect parser edge-cases.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_item_reasoning_reads_reasoning_content_blocks() {
-        let item = json!({
-            "type": "agentMessage",
-            "content": [
-                { "type": "text", "text": "Visible answer" },
-                { "type": "reasoning_summary", "summary": "Checking assumptions first." }
-            ]
-        });
-
-        assert_eq!(
-            extract_codex_item_reasoning(&item),
-            Some("Checking assumptions first.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_item_reasoning_preserves_boundary_whitespace() {
-        let item = json!({
-            "type": "reasoning",
-            "reasoning": " user"
-        });
-
-        assert_eq!(
-            extract_codex_item_reasoning(&item),
-            Some(" user".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_reasoning_delta_text_accepts_reasoning_summary_aliases() {
-        let payload = json!({
-            "itemId": "abc",
-            "reasoningSummary": {
-                "output_text": "Need to confirm assumptions before edits."
-            }
-        });
-
-        assert_eq!(
-            extract_codex_reasoning_delta_text(&payload),
-            Some("Need to confirm assumptions before edits.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_reasoning_delta_text_accepts_legacy_event_msg_shape() {
-        let payload = json!({
-            "msg": {
-                "type": "agent_reasoning_raw_content_delta",
-                "delta": "Inspecting event payload shape."
-            }
-        });
-
-        assert_eq!(
-            extract_codex_reasoning_delta_text(&payload),
-            Some("Inspecting event payload shape.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_event_type_reads_legacy_method_suffix() {
-        let payload = json!({});
-        assert_eq!(
-            extract_codex_event_type("codex/event/agent_reasoning_raw_content_delta", &payload),
-            Some("agent_reasoning_raw_content_delta".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_delta_from_legacy_codex_event_parses_reasoning_delta() {
-        let payload = json!({
-            "msg": {
-                "type": "agent_reasoning_raw_content_delta",
-                "delta": "Evaluating alternatives."
-            }
-        });
-        assert_eq!(
-            extract_reasoning_delta_from_legacy_codex_event(
-                "codex/event/agent_reasoning_raw_content_delta",
-                &payload
-            ),
-            Some("Evaluating alternatives.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_delta_from_legacy_codex_event_maps_section_break() {
-        assert_eq!(
-            extract_reasoning_delta_from_legacy_codex_event(
-                "codex/event/agent_reasoning_section_break",
-                &json!({})
-            ),
-            Some("\n\n".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reasoning_delta_from_legacy_codex_event_ignores_non_reasoning() {
-        let payload = json!({
-            "msg": {
-                "type": "agent_message_delta",
-                "delta": "Visible answer text."
-            }
-        });
-        assert_eq!(
-            extract_reasoning_delta_from_legacy_codex_event(
-                "codex/event/agent_message_delta",
-                &payload
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn is_codex_event_reasoning_type_handles_supported_values() {
-        assert!(is_codex_event_reasoning_type("agent_reasoning"));
-        assert!(is_codex_event_reasoning_type(
-            "agent_reasoning_raw_content_delta"
-        ));
-        assert!(!is_codex_event_reasoning_type("agent_message_delta"));
-    }
-
-    #[test]
-    fn is_reasoning_notification_method_accepts_alias_shapes() {
-        assert!(is_reasoning_notification_method(
-            "item/reasoning/summaryTextDelta"
-        ));
-        assert!(is_reasoning_notification_method(
-            "item/reasoningSummaryText/delta"
-        ));
-        assert!(is_reasoning_notification_method(
-            "item/reasoning_summary_text/delta"
-        ));
-        assert!(is_reasoning_notification_method("item/thinking/textDelta"));
-        assert!(!is_reasoning_notification_method("item/agentMessage/delta"));
-    }
-
-    #[test]
-    fn codex_error_notifications_are_non_terminal_while_turn_is_active() {
-        let state = test_codex_state();
-        assert!(!is_terminal_codex_error_notification(
-            &state,
-            &json!({ "message": "Tool warning" })
-        ));
-    }
-
-    #[test]
-    fn nested_error_then_failed_turn_emits_recoverable_idle_tail() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "failed-turn" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
-                    "error",
-                    &json!({ "error": { "message": "Internal server error" } }),
-                )
-                .await;
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "threadId": "thread-test",
-                        "turn": {
-                            "id": "failed-turn",
-                            "status": "failed",
-                            "error": { "message": "Internal server error" }
-                        }
-                    }),
-                )
-                .await;
-
-            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-            let mut normalization_failures = HashMap::new();
-            while let Ok(event) = rx.try_recv() {
-                assert!(forward_codex_backend_event(
-                    event,
-                    &events_tx,
-                    &mut normalization_failures,
-                ));
-            }
-            drop(events_tx);
-            let mut events = Vec::new();
-            while let Some(event) = events_rx.recv().await {
-                events.push(serde_json::to_value(event).expect("serialize projected Codex event"));
-            }
-            assert_eq!(
-                event_kinds(&events),
-                vec!["MessageAdded", "TypingStatusChanged", "MessageAdded"]
-            );
-            assert_eq!(
-                events[0].pointer("/data/sender").and_then(Value::as_str),
-                Some("Warning")
-            );
-            assert_eq!(
-                events[0].pointer("/data/content").and_then(Value::as_str),
-                Some("Codex warning: Internal server error")
-            );
-            assert_eq!(
-                events[1].pointer("/data").and_then(Value::as_bool),
-                Some(false)
-            );
-            assert_eq!(
-                events[2].pointer("/data/sender").and_then(Value::as_str),
-                Some("Error")
-            );
-            assert_eq!(
-                events[2].pointer("/data/content").and_then(Value::as_str),
-                Some("Internal server error")
-            );
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn codex_error_tool_call_id_accepts_provider_aliases() {
-        assert_eq!(
-            codex_error_tool_call_id(&json!({ "toolCallId": "call-1" })),
-            Some("call-1".to_owned())
-        );
-        assert_eq!(
-            codex_error_tool_call_id(&json!({ "item": { "id": "call-2" } })),
-            Some("call-2".to_owned())
-        );
-        assert_eq!(codex_error_tool_call_id(&json!({ "call_id": " " })), None);
-    }
-
-    #[test]
-    fn codex_error_notifications_are_terminal_when_idle_or_explicitly_fatal() {
-        let mut idle_state = test_codex_state();
-        idle_state.active_turn_id = None;
-        idle_state.active_stream = None;
-        idle_state.pending_request = None;
-
-        assert!(is_terminal_codex_error_notification(
-            &idle_state,
-            &json!({ "message": "Session failed" })
-        ));
-
-        let active_state = test_codex_state();
-        assert!(is_terminal_codex_error_notification(
-            &active_state,
-            &json!({ "message": "Fatal turn error", "fatal": true })
-        ));
-        assert!(is_terminal_codex_error_notification(
-            &active_state,
-            &json!({ "message": "Fatal turn error", "recoverable": false })
-        ));
-    }
-
-    #[test]
-    fn extract_codex_item_reasoning_reads_reasoning_thread_item_summary() {
-        let item = json!({
-            "type": "reasoning",
-            "id": "reasoning-item-1",
-            "summary": ["Check constraints", "Then produce final answer"],
-            "content": []
-        });
-
-        assert_eq!(
-            extract_codex_item_reasoning(&item),
-            Some("Check constraints\nThen produce final answer".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_token_usage_accepts_flat_snake_case_payloads() {
-        let normalized = normalize_token_usage_with_envelope(
-            &json!({
-            "input_tokens": 120,
-            "output_tokens": 80,
-            "total_tokens": 200,
-            "cached_prompt_tokens": 20,
-            "cache_creation_input_tokens": 5,
-            "reasoning_tokens": 7,
-            "context_window": 200000
-            }),
-            None,
-            None,
-        )
-        .expect("valid token usage");
-
-        assert_eq!(normalized["input_tokens"], json!(120));
-        assert_eq!(normalized["output_tokens"], json!(80));
-        assert_eq!(normalized["total_tokens"], json!(200));
-        assert_eq!(normalized["cached_prompt_tokens"], json!(20));
-        assert_eq!(normalized["cache_creation_input_tokens"], json!(5));
-        assert_eq!(normalized["reasoning_tokens"], json!(7));
-        assert_eq!(normalized["context_window"], json!(200000));
-    }
-
-    #[test]
-    fn extract_turn_token_usage_ignores_null_empty_and_context_only_usage() {
-        let null_usage = json!({
-            "turn": {
-                "id": "turn_null",
-                "usage": Value::Null
-            }
-        });
-        assert!(extract_turn_token_usage(&null_usage, None).is_none());
-
-        let empty_usage = json!({
-            "turnId": "turn_empty",
-            "tokenUsage": {}
-        });
-        assert!(extract_turn_token_usage(&empty_usage, None).is_none());
-
-        let context_only_usage = json!({
-            "turn": {
-                "id": "turn_context",
-                "usage": {
-                    "contextWindow": 400_000
-                }
-            }
-        });
-        assert!(extract_turn_token_usage(&context_only_usage, None).is_none());
-    }
-
-    #[test]
-    fn extract_turn_token_usage_reads_nested_turn_shape() {
-        let payload = json!({
-            "turn": {
-                "id": "turn_123",
-                "usage": {
-                    "input_tokens": 90,
-                    "output_tokens": 30,
-                    "total_tokens": 120
-                }
-            }
-        });
-
-        let (turn_id, usage) = extract_turn_token_usage(&payload, None).expect("turn usage");
-        assert_eq!(turn_id, "turn_123");
-        assert_eq!(usage["input_tokens"], json!(90));
-        assert_eq!(usage["output_tokens"], json!(30));
-        assert_eq!(usage["total_tokens"], json!(120));
-    }
-
-    #[test]
-    fn extract_turn_token_usage_reads_context_window_from_event_wrapper() {
-        let payload = json!({
-            "turn": {
-                "id": "turn_123",
-                "usage": {
-                    "input_tokens": 90,
-                    "output_tokens": 30,
-                    "total_tokens": 120
-                }
-            },
-            "modelUsage": {
-                "gpt-5.3-codex": {
-                    "contextWindow": 400_000
-                }
-            }
-        });
-
-        let (_, usage) =
-            extract_turn_token_usage(&payload, Some("gpt-5.3-codex")).expect("turn usage");
-        assert_eq!(usage["context_window"], json!(400_000));
-    }
-
-    #[test]
-    fn model_request_usage_keeps_last_turn_and_thread_scopes() {
-        let first_payload = json!({
-            "turnId": "turn_123",
-            "tokenUsage": {
-                "last": {
-                    "inputTokens": 100,
-                    "cachedInputTokens": 80,
-                    "outputTokens": 10,
-                    "reasoningOutputTokens": 4,
-                    "totalTokens": 110
-                },
-                "total": {
-                    "inputTokens": 1_000,
-                    "cachedInputTokens": 900,
-                    "outputTokens": 100,
-                    "reasoningOutputTokens": 40,
-                    "totalTokens": 1_100
-                },
-                "modelContextWindow": 400_000
-            }
-        });
-        let second = json!({
-            "turnId": "turn_123",
-            "tokenUsage": {
-                "last": {
-                    "inputTokens": 120,
-                    "cachedInputTokens": 90,
-                    "outputTokens": 20,
-                    "reasoningOutputTokens": 5,
-                    "totalTokens": 140
-                },
-                "total": {
-                    "inputTokens": 1_120,
-                    "cachedInputTokens": 990,
-                    "outputTokens": 120,
-                    "reasoningOutputTokens": 45,
-                    "totalTokens": 1_240
-                }
-            }
-        });
-        let mut by_turn = HashMap::new();
-
-        let (turn_id, request, cumulative, context_window) =
-            extract_model_request_token_usage(&first_payload, Some("gpt-5.5"))
-                .expect("first usage");
-        let first = record_model_request_token_usage(
-            &mut by_turn,
-            turn_id,
-            request,
-            cumulative,
-            context_window,
-        )
-        .expect("first request");
-        assert_eq!(first.request_id.sequence, 1);
-        assert_eq!(first.request.total_tokens, 110);
-        assert_eq!(first.turn.total_tokens, 110);
-        assert_eq!(first.cumulative.total_tokens, 1_100);
-        assert_eq!(
-            first.current_context_usage,
-            Some(CurrentContextUsage::Known {
-                input_tokens: 100,
-                context_window: 400_000,
-            })
-        );
-        let (turn_id, request, cumulative, context_window) =
-            extract_model_request_token_usage(&first_payload, Some("gpt-5.5"))
-                .expect("duplicate usage");
-        assert!(
-            record_model_request_token_usage(
-                &mut by_turn,
-                turn_id,
-                request,
-                cumulative,
-                context_window,
-            )
-            .is_none(),
-            "duplicate cumulative snapshots must not invent requests"
-        );
-
-        let (turn_id, request, cumulative, context_window) =
-            extract_model_request_token_usage(&second, Some("gpt-5.5")).expect("second usage");
-        assert_eq!(
-            context_window, None,
-            "the later request intentionally omits the provider window"
-        );
-        let second = record_model_request_token_usage(
-            &mut by_turn,
-            turn_id,
-            request,
-            cumulative,
-            context_window,
-        )
-        .expect("second request");
-        assert_eq!(second.request_id.sequence, 2);
-        assert_eq!(second.request.total_tokens, 140);
-        assert_eq!(second.turn.total_tokens, 250);
-        assert_eq!(second.cumulative.total_tokens, 1_240);
-        assert_eq!(second.model_context_window, Some(400_000));
-        assert_eq!(
-            second.current_context_usage,
-            Some(CurrentContextUsage::Known {
-                input_tokens: 120,
-                context_window: 400_000,
-            })
-        );
-
-        let (request, turn, cumulative) = codex_message_usage_values(None, by_turn.get("turn_123"));
-        assert_eq!(request.expect("request usage")["total_tokens"], json!(140));
-        assert_eq!(turn.expect("turn usage")["total_tokens"], json!(250));
-        assert_eq!(
-            cumulative.expect("cumulative usage")["total_tokens"],
-            json!(1_240)
-        );
-    }
-
-    #[test]
-    fn current_context_requires_an_explicit_provider_window() {
-        let payload = json!({
-            "turnId": "turn-no-window",
-            "tokenUsage": {
-                "last": {
-                    "inputTokens": 120,
-                    "cachedInputTokens": 90,
-                    "outputTokens": 20,
-                    "totalTokens": 140
-                },
-                "total": {
-                    "inputTokens": 1_120,
-                    "cachedInputTokens": 990,
-                    "outputTokens": 120,
-                    "totalTokens": 1_240
-                }
-            }
-        });
-        let (turn_id, request, cumulative, context_window) =
-            extract_model_request_token_usage(&payload, Some("gpt-5.5"))
-                .expect("provider usage without a window");
-        assert_eq!(context_window, None);
-        let usage = record_model_request_token_usage(
-            &mut HashMap::new(),
-            turn_id,
-            request,
-            cumulative,
-            context_window,
-        )
-        .expect("request usage");
-        assert_eq!(usage.model_context_window, None);
-        assert_eq!(
-            usage.current_context_usage,
-            Some(CurrentContextUsage::Unknown)
-        );
-        assert_eq!(usage.estimated_context_breakdown, None);
-    }
-
-    #[test]
-    fn explicit_window_enriches_same_usage_without_inventing_a_request() {
-        let request = TokenUsage {
-            input_tokens: 30,
-            output_tokens: 20,
-            total_tokens: 140,
-            cached_prompt_tokens: Some(90),
-            cache_creation_input_tokens: None,
-            reasoning_tokens: None,
-        };
-        let cumulative = TokenUsage {
-            total_tokens: 1_240,
-            ..TokenUsage::default()
-        };
-        let mut by_turn = HashMap::new();
-        let first = record_model_request_token_usage(
-            &mut by_turn,
-            "turn-window-later".to_owned(),
-            request.clone(),
-            cumulative.clone(),
-            None,
-        )
-        .expect("initial request");
-        assert_eq!(
-            first.current_context_usage,
-            Some(CurrentContextUsage::Unknown)
-        );
-
-        let enriched = record_model_request_token_usage(
-            &mut by_turn,
-            "turn-window-later".to_owned(),
-            request,
-            cumulative,
-            Some(400_000),
-        )
-        .expect("new explicit provider window");
-        assert_eq!(enriched.request_id.sequence, 1);
-        assert_eq!(
-            enriched.current_context_usage,
-            Some(CurrentContextUsage::Known {
-                input_tokens: 120,
-                context_window: 400_000,
-            })
-        );
-        assert_eq!(
-            by_turn
-                .get("turn-window-later")
-                .expect("turn state")
-                .request_count,
-            1
-        );
-    }
-
-    #[test]
-    fn model_request_breakdown_requires_observed_context_bytes() {
-        let mut usage = ModelRequestTokenUsage {
-            request_id: ModelRequestId {
-                turn_id: ModelTurnId("turn-estimate".to_owned()),
-                sequence: 0,
-            },
-            request: TokenUsage {
-                input_tokens: 30,
-                cached_prompt_tokens: Some(90),
-                ..TokenUsage::default()
-            },
-            turn: TokenUsage::default(),
-            cumulative: TokenUsage::default(),
-            model_context_window: Some(400_000),
-            current_context_usage: Some(CurrentContextUsage::Known {
-                input_tokens: 120,
-                context_window: 400_000,
-            }),
-            estimated_context_breakdown: None,
-        };
-
-        attach_estimated_context_breakdown(
-            &mut usage,
-            &TurnContextEstimate::default(),
-            Some("gpt-5.5"),
-        );
-        assert_eq!(
-            usage.estimated_context_breakdown, None,
-            "late root and child rows without observed context bytes must stay neutral"
-        );
-
-        attach_estimated_context_breakdown(
-            &mut usage,
-            &TurnContextEstimate {
-                conversation_history_bytes: 64,
-                ..TurnContextEstimate::default()
-            },
-            Some("gpt-5.5"),
-        );
-        assert!(usage.estimated_context_breakdown.is_some());
-    }
-
-    #[test]
-    fn estimate_context_breakdown_uses_model_aware_context_fallback() {
-        let usage = json!({
-            "input_tokens": 90,
-            "output_tokens": 30,
-            "total_tokens": 120,
-            "cached_prompt_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0,
-            "context_window": Value::Null
-        });
-        let turn_context = TurnContextEstimate::default();
-        let breakdown =
-            estimate_context_breakdown(Some(&usage), &turn_context, Some("gpt-5.3-codex"));
-        assert_eq!(
-            breakdown.get("context_window").and_then(Value::as_u64),
-            Some(CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY)
-        );
-    }
-
-    #[test]
-    fn codex_estimated_context_window_covers_gpt5_family_and_prefixes() {
-        // Whole gpt-5 family is 400k, regardless of suffix or provider prefix.
-        for model in [
-            "gpt-5",
-            "gpt-5.1",
-            "gpt-5.4",
-            "gpt-5.5",
-            "gpt-5.4-mini",
-            "gpt-5-codex",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            // The CLI now reports provider-prefixed ids.
-            "openai.gpt-5.5",
-            "openai.gpt-5.3-codex",
-        ] {
-            assert_eq!(
-                codex_estimated_context_window_for_model(Some(model)),
-                CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY,
-                "{model} should map to the gpt-5 family window"
-            );
-        }
-
-        // codex-mini-latest is the 200k exception and must not be swept into
-        // the gpt-5 family branch.
-        assert_eq!(
-            codex_estimated_context_window_for_model(Some("codex-mini-latest")),
-            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
-        );
-
-        // Unknown / unset models fall back to the conservative default.
-        assert_eq!(
-            codex_estimated_context_window_for_model(None),
-            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
-        );
-        assert_eq!(
-            codex_estimated_context_window_for_model(Some("some-future-model")),
-            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
-        );
-    }
-
-    #[test]
-    fn parse_codex_subagent_collab_reads_authoritative_thread_ids() {
-        let item = json!({
-            "type": "collabAgentToolCall",
-            "id": "collab-1",
-            "senderThreadId": "thread-parent",
-            "receiverThreadId": "thread-child",
-            "prompt": "Review src/auth.ts",
-            "receiverAgentType": "reviewer",
-            "receiverAgentName": "Auth Reviewer"
-        });
-
-        let parsed = parse_codex_subagent_collab(&item).expect("collab item");
-        assert_eq!(parsed.item_id, "collab-1");
-        assert_eq!(parsed.sender_thread_id, "thread-parent");
-        assert_eq!(parsed.receiver_thread_id, "thread-child");
-        assert_eq!(parsed.name, "Auth Reviewer");
-    }
-
-    #[test]
-    fn later_codex_spawn_metadata_enriches_only_generic_child_name() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, _parent_rx) = test_codex_inner();
-            let (child_tx, _child_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_tx, "thread-child").await;
-            let (name_tx, mut name_rx) = mpsc::unbounded_channel();
-            {
-                let mut state = inner.state.lock().await;
-                let stream = state.subagent_streams.get_mut("thread-child").unwrap();
-                stream.agent_name = "Sub-agent".to_owned();
-                stream.name_update_tx = Some(name_tx);
-            }
-
-            inner
-                .record_codex_subagent_spawn_metadata_if_needed(
-                    None,
-                    None,
-                    &json!({
-                        "type": "collabAgentToolCall",
-                        "id": "spawn-child",
-                        "tool": "spawnAgent",
-                        "senderThreadId": "thread-parent",
-                        "receiverThreadId": "thread-child",
-                        "receiverAgentName": "Auth Reviewer",
-                        "receiverAgentType": "reviewer",
-                        "prompt": "Review authentication"
-                    }),
-                )
-                .await;
-            assert_eq!(name_rx.try_recv().unwrap(), "Auth Reviewer");
-            assert_eq!(
-                inner
-                    .state
-                    .lock()
-                    .await
-                    .subagent_streams
-                    .get("thread-child")
-                    .unwrap()
-                    .agent_name,
-                "Auth Reviewer"
-            );
-
-            inner
-                .record_codex_subagent_spawn_metadata_if_needed(
-                    None,
-                    None,
-                    &json!({
-                        "type": "collabAgentToolCall",
-                        "id": "spawn-child",
-                        "tool": "spawnAgent",
-                        "senderThreadId": "thread-parent",
-                        "receiverThreadId": "thread-child",
-                        "receiverAgentName": "Sub-agent",
-                        "prompt": "Review authentication"
-                    }),
-                )
-                .await;
-            assert!(name_rx.try_recv().is_err());
-            assert_eq!(
-                inner
-                    .state
-                    .lock()
-                    .await
-                    .subagent_streams
-                    .get("thread-child")
-                    .unwrap()
-                    .agent_name,
-                "Auth Reviewer"
-            );
-        });
-    }
-
-    #[test]
-    fn completed_spawn_agent_array_registers_child_before_child_turn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let emitter = Arc::new(RecordingSubAgentEmitter::new());
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "thread-parent".to_owned();
-                state.subagent_emitter = Some(emitter.clone() as Arc<dyn SubAgentEmitter>);
-            }
-            inner
-                .record_codex_subagent_spawn_metadata_if_needed(
-                    None,
-                    None,
-                    &json!({
-                        "type": "collabAgentToolCall",
-                        "id": "spawn-array",
-                        "senderThreadId": "thread-parent",
-                        "receiverThreadIds": ["thread-child"],
-                        "agentsStates": {"thread-child": {"status": "pendingInit"}},
-                        "prompt": "inspect",
-                        "status": "completed",
-                        "tool": "spawnAgent"
-                    }),
-                )
-                .await;
-            assert_eq!(emitter.spawn_count().await, 1);
-            assert!(
-                inner
-                    .state
-                    .lock()
-                    .await
-                    .subagent_streams
-                    .contains_key("thread-child")
-            );
-            let events = drain_events(&mut parent_rx);
-            assert_eq!(
-                events.len(),
-                1,
-                "native spawn emits one typed progress event"
-            );
-            let event: ChatEvent = serde_json::from_value(events[0].clone())
-                .expect("native spawn progress is a chat event");
-            let ChatEvent::ToolProgress(progress) = event else {
-                panic!("native spawn must emit typed ToolProgress: {events:?}");
-            };
-            assert_eq!(progress.tool_call_id, "spawn-array");
-            assert_eq!(progress.tool_name, "spawnAgent");
-            let ToolProgressUpdate::AgentControl(spawn) = progress.update else {
-                panic!("native spawn must use AgentControl progress");
-            };
-            assert_eq!(spawn.progress_kind, AgentControlProgressKind::Spawn);
-            assert_eq!(spawn.agents.len(), 1);
-            assert_eq!(spawn.agents[0].agent_id, AgentId("subagent-1".to_owned()));
-
-            inner
-                .handle_notification(
-                    "turn/started",
-                    &json!({
-                        "threadId": "thread-child",
-                        "turn": {"id": "child-turn"}
-                    }),
-                )
-                .await;
-            assert!(drain_events(&mut parent_rx).is_empty());
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn activity_only_native_spawn_gets_a_typed_synthetic_tool() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let emitter = Arc::new(RecordingSubAgentEmitter::new());
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "thread-parent".to_owned();
-                state.subagent_emitter = Some(emitter.clone() as Arc<dyn SubAgentEmitter>);
-            }
-
-            inner
-                .handle_notification(
-                    "subAgentActivity",
-                    &json!({
-                        "id": "call-native-spawn",
-                        "kind": "started",
-                        "agentThreadId": "thread-child",
-                        "agentPath": "/root/reviewer"
-                    }),
-                )
-                .await;
-
-            assert_eq!(emitter.spawn_count().await, 1);
-            let raw_events = drain_events(&mut parent_rx);
-            assert!(
-                raw_events
-                    .iter()
-                    .all(|event| event.get("kind").and_then(Value::as_str) != Some("Error"))
-            );
-            let events = raw_events
-                .into_iter()
-                .filter_map(|event| serde_json::from_value::<ChatEvent>(event).ok())
-                .collect::<Vec<_>>();
-            let request = events.iter().find_map(|event| match event {
-                ChatEvent::ToolRequest(request) => Some(request),
-                _ => None,
-            });
-            let request = request.expect("activity-only spawn emits a typed request");
-            assert_eq!(request.tool_call_id, "codex-native-spawn:call-native-spawn");
-            assert_eq!(request.tool_name, "spawnAgent");
-            assert!(matches!(
-                &request.tool_type,
-                protocol::ToolRequestType::AgentSpawn {
-                    prompt: None,
-                    name: Some(name),
-                } if name == "/root/reviewer"
-            ));
-            assert!(events.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    tool_name,
-                    update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                        progress_kind: AgentControlProgressKind::Spawn,
-                        agents,
-                    }),
-                }) if tool_call_id == "codex-native-spawn:call-native-spawn"
-                    && tool_name == "spawnAgent"
-                    && agents.len() == 1
-            )));
-            assert!(events.iter().any(|event| matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(completion)
-                    if completion.tool_call_id == "codex-native-spawn:call-native-spawn"
-                        && completion.tool_name == "spawnAgent"
-                        && completion.success
-            )));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn parse_codex_subagent_activity_reads_authoritative_child_thread() {
-        let item = json!({
-            "type": "subAgentActivity",
-            "kind": "started",
-            "agentThreadId": "thread-child",
-            "agentPath": "/root/reviewer"
-        });
-        let parsed = parse_codex_subagent_activity(&item).expect("activity item");
-        assert_eq!(parsed.kind, "started");
-        assert_eq!(parsed.agent_thread_id, "thread-child");
-        assert_eq!(parsed.agent_path, "/root/reviewer");
-    }
-
-    #[test]
-    fn native_wait_thread_ids_cover_live_and_completed_shapes() {
-        assert_eq!(
-            codex_native_wait_thread_ids(&json!({
-                "receiverThreadId": "child-a",
-                "receiverThreadIds": ["child-a", "child-b", ""]
-            })),
-            vec!["child-a", "child-b"]
-        );
-        assert_eq!(
-            codex_native_wait_thread_ids(&json!({
-                "agentsStates": {
-                    "child-b": {"status": "completed"},
-                    "child-a": {"status": "completed"}
-                }
-            })),
-            vec!["child-a", "child-b"]
-        );
-    }
-
-    #[test]
-    fn collaboration_projection_excludes_codex_transport_metadata() {
-        let item = json!({
-            "type": "collabAgentToolCall",
-            "id": "provider-item-id",
-            "tool": "wait",
-            "senderThreadId": "parent-thread-secret",
-            "receiverThreadId": "child-thread-secret",
-            "agentsStates": {
-                "child-thread-secret": {
-                    "status": "completed",
-                    "outputPath": "/private/tmp/codex/output.txt",
-                    "message": "provider control prose"
-                }
-            }
-        });
-
-        let request = codex_public_tool_request_type("wait", &item);
-        let result = codex_public_collaboration_result(&item, true);
-        assert_eq!(
-            request.pointer("/args/action").and_then(Value::as_str),
-            Some("wait")
-        );
-        assert_eq!(
-            request.pointer("/args/agent_count").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            result.pointer("/result/status").and_then(Value::as_str),
-            Some("completed")
-        );
-        let encoded = serde_json::to_string(&(request, result)).expect("serialize projection");
-        assert!(!encoded.contains("provider-item-id"));
-        assert!(!encoded.contains("parent-thread-secret"));
-        assert!(!encoded.contains("child-thread-secret"));
-        assert!(!encoded.contains("/private/tmp"));
-        assert!(!encoded.contains("provider control prose"));
-        assert!(!encoded.contains("agentsStates"));
-    }
-
-    #[test]
-    fn collaboration_spawn_projection_is_typed_without_thread_ids() {
-        let item = json!({
-            "type": "collabAgentToolCall",
-            "id": "spawn-call",
-            "tool": "spawnAgent",
-            "senderThreadId": "parent-thread-secret",
-            "receiverThreadId": "child-thread-secret",
-            "receiverAgentName": "Reviewer",
-            "receiverAgentType": "worker",
-            "prompt": "Review the adapter"
-        });
-
-        let request = codex_public_tool_request_type("spawnAgent", &item);
-        let parsed: protocol::ToolRequestType =
-            serde_json::from_value(request.clone()).expect("typed Codex spawn request");
-        assert!(matches!(
-            parsed,
-            protocol::ToolRequestType::AgentSpawn { prompt, name }
-                if prompt.as_deref() == Some("Review the adapter")
-                    && name.as_deref() == Some("Reviewer")
-        ));
-        let encoded = serde_json::to_string(&request).expect("serialize request");
-        assert!(!encoded.contains("parent-thread-secret"));
-        assert!(!encoded.contains("child-thread-secret"));
-    }
-
-    #[test]
-    fn native_wait_progress_maps_all_codex_threads_to_tyde_agents() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let (inner, mut parent_rx) = test_codex_inner();
-            let (child_a_tx, _child_a_rx) = mpsc::unbounded_channel();
-            let (child_b_tx, _child_b_rx) = mpsc::unbounded_channel();
-            attach_test_codex_subagent(&inner, child_a_tx, "child-a").await;
-            attach_test_codex_subagent(&inner, child_b_tx, "child-b").await;
-
-            inner
-                .emit_agent_control_await_progress_if_needed(
-                    "native-wait",
-                    "wait",
-                    &json!({"receiverThreadIds": []}),
-                )
-                .await;
-
-            let events = drain_events(&mut parent_rx);
-            assert_eq!(events.len(), 1);
-            let event: ChatEvent =
-                serde_json::from_value(events.into_iter().next().expect("wait progress"))
-                    .expect("typed wait progress");
-            assert!(matches!(
-                event,
-                ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id,
-                    update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                        progress_kind: AgentControlProgressKind::Await,
-                        agents,
-                    }),
-                    ..
-                }) if tool_call_id == "native-wait"
-                    && agents.iter().map(|agent| agent.agent_id.0.as_str()).collect::<Vec<_>>()
-                        == vec!["agent-child-a", "agent-child-b"]
-            ));
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn parse_captured_rollout_subagent_activity_shape() {
-        let item = json!({
-            "type": "sub_agent_activity",
-            "kind": "started",
-            "agent_thread_id": "019f5938-c06a-actual-child",
-            "agent_path": "/root/map_planner"
-        });
-        let parsed = parse_codex_subagent_activity(&item).expect("captured rollout activity");
-        assert_eq!(parsed.kind, "started");
-        assert_eq!(parsed.agent_thread_id, "019f5938-c06a-actual-child");
-        assert_eq!(parsed.agent_path, "/root/map_planner");
-    }
-
-    #[test]
-    fn collab_wait_followup_and_interrupt_do_not_become_spawn_metadata() {
-        for item in [
-            json!({"type":"collabAgentToolCall","id":"wait","senderThreadId":"parent","receiverThreadId":"child","agentsStates":{},"prompt":"wait","receiverAgentType":"worker"}),
-            json!({"type":"collabAgentToolCall","id":"followup","senderThreadId":"parent","receiverThreadId":"child","prompt":"continue"}),
-            json!({"type":"collabToolCall","id":"interrupt","senderThreadId":"parent","receiverThreadId":"child","prompt":"stop","receiverAgentType":"worker"}),
-        ] {
-            assert!(parse_codex_subagent_collab(&item).is_none(), "{item}");
-        }
-    }
-
-    #[test]
-    fn codex_item_success_uses_status_and_success_flag() {
-        assert!(codex_item_success(&json!({ "status": "completed" })));
-        assert!(!codex_item_success(&json!({ "status": "failed" })));
-        assert!(!codex_item_success(
-            &json!({ "success": false, "status": "completed" })
-        ));
-    }
-
-    #[test]
-    fn codex_mcp_elicitation_approves_tyde_review_tools() {
-        let result = codex_mcp_elicitation_result(&json!({
-            "serverName": REVIEW_FEEDBACK_MCP_SERVER_NAME,
-            "_meta": {
-                "codex_approval_kind": "mcp_tool_call"
-            }
-        }));
-
-        assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
-        assert!(result.get("content").and_then(Value::as_object).is_some());
-    }
-
-    #[test]
-    fn codex_mcp_elicitation_cancels_unknown_tools() {
-        let result = codex_mcp_elicitation_result(&json!({
-            "serverName": "external-mcp",
-            "_meta": {
-                "codex_approval_kind": "mcp_tool_call"
-            }
-        }));
-
-        assert_eq!(result.get("action").and_then(Value::as_str), Some("cancel"));
-    }
-
-    #[test]
-    fn codex_server_request_result_uses_elicitation_policy() {
-        let result = codex_server_request_result(
-            "mcpServer/elicitation/request",
-            &json!({
-                "serverName": REVIEW_FEEDBACK_MCP_SERVER_NAME,
-                "_meta": {
-                    "codex_approval_kind": "mcp_tool_call"
-                }
-            }),
-        );
-
-        assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
-    }
-
-    #[test]
-    fn codex_server_request_result_resolves_unknown_requests() {
-        let result = codex_server_request_result("unknown/request", &json!({}));
-
-        assert_eq!(result.get("ignored").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            result.get("reason").and_then(Value::as_str),
-            Some("unsupported_server_request")
-        );
-    }
-
-    #[test]
-    fn codex_danger_full_access_sandbox_policy_is_danger_full_access() {
-        let policy = codex_danger_full_access_sandbox_policy(false);
-        assert_eq!(
-            policy.get("type").and_then(Value::as_str),
-            Some("dangerFullAccess")
-        );
-        assert_eq!(policy.get("networkAccess"), None);
-    }
-
-    #[test]
-    fn codex_danger_full_access_sandbox_policy_ignores_network_flag() {
-        let policy = codex_danger_full_access_sandbox_policy(true);
-        assert_eq!(
-            policy.get("type").and_then(Value::as_str),
-            Some("dangerFullAccess")
-        );
-        assert_eq!(policy.get("networkAccess"), None);
-    }
-
-    #[test]
-    fn codex_read_only_access_mode_keeps_unrestricted_sandbox() {
-        let args = codex_app_server_args(
-            BackendAccessMode::ReadOnly,
-            BackendExecutionMode::Agent,
-            &[],
-        );
-        assert_eq!(
-            args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
-            ["--sandbox", "danger-full-access", "app-server"]
-        );
-
-        let policy = codex_sandbox_policy(
-            BackendAccessMode::ReadOnly,
-            true,
-            BackendExecutionMode::Agent,
-        );
-        assert_eq!(
-            policy.get("type").and_then(Value::as_str),
-            Some("dangerFullAccess")
-        );
-        assert_eq!(policy.get("networkAccess"), None);
-    }
-
-    #[test]
-    fn codex_unrestricted_access_mode_keeps_danger_full_sandbox() {
-        let args = codex_app_server_args(
-            BackendAccessMode::Unrestricted,
-            BackendExecutionMode::Agent,
-            &[],
-        );
-        assert_eq!(
-            args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
-            ["--sandbox", "danger-full-access", "app-server"]
-        );
-
-        let policy = codex_sandbox_policy(
-            BackendAccessMode::Unrestricted,
-            true,
-            BackendExecutionMode::Agent,
-        );
-        assert_eq!(
-            policy.get("type").and_then(Value::as_str),
-            Some("dangerFullAccess")
-        );
-        assert_eq!(policy.get("networkAccess"), None);
-    }
-
-    #[test]
-    fn codex_has_http_mcp_servers_detects_http_transports() {
-        assert!(codex_has_http_mcp_servers(&[StartupMcpServer {
-            name: "tyde-debug".to_string(),
-            transport: StartupMcpTransport::Http {
-                url: "http://127.0.0.1:4012/mcp".to_string(),
-                headers: HashMap::new(),
-                bearer_token_env_var: None,
-            },
-        }]));
-        assert!(!codex_has_http_mcp_servers(&[StartupMcpServer {
-            name: "stdio-server".to_string(),
-            transport: StartupMcpTransport::Stdio {
-                command: "mcp-server".to_string(),
-                args: vec!["serve".to_string()],
-                env: HashMap::new(),
-            },
-        }]));
-    }
-
-    #[test]
-    fn codex_http_mcp_config_includes_url_and_headers() {
-        let overrides = codex_mcp_config_overrides(&[StartupMcpServer {
-            name: "tyde-debug".to_string(),
-            transport: StartupMcpTransport::Http {
-                url: "http://127.0.0.1:4012/mcp?repo_root=%2Ftmp%2Fproj".to_string(),
-                headers: HashMap::from([("x-ignored".to_string(), "value".to_string())]),
-                bearer_token_env_var: None,
-            },
-        }]);
-
-        assert!(overrides.iter().any(|entry| {
-            entry
-                == "mcp_servers.tyde-debug.url=\"http://127.0.0.1:4012/mcp?repo_root=%2Ftmp%2Fproj\""
-        }));
-        assert!(
-            overrides
-                .iter()
-                .any(|entry| entry == "mcp_servers.tyde-debug.http_headers.x-ignored=\"value\""),
-            "expected Codex MCP config to emit HTTP header overrides: {overrides:?}"
-        );
-    }
-
-    #[test]
-    fn codex_only_await_mcp_has_session_scale_deadline() {
-        let servers = [
-            StartupMcpServer {
-                name: "tyde-agent-control".to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: "http://127.0.0.1:4012/mcp".to_string(),
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
-                },
-            },
-            StartupMcpServer {
-                name: AGENT_CONTROL_AWAIT_MCP_SERVER_NAME.to_string(),
-                transport: StartupMcpTransport::Http {
-                    url: "http://127.0.0.1:4012/await".to_string(),
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
-                },
-            },
-        ];
-        let overrides = codex_mcp_config_overrides(&servers);
-
-        assert!(
-            !overrides
-                .iter()
-                .any(|entry| entry.starts_with("mcp_servers.tyde-agent-control.tool_timeout_sec="))
-        );
-        assert!(overrides.iter().any(|entry| {
-            entry
-                == &format!(
-                    "mcp_servers.{AGENT_CONTROL_AWAIT_MCP_SERVER_NAME}.tool_timeout_sec={CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS}"
-                )
-        }));
-    }
-
-    #[test]
-    fn compaction_capability_never_gates_on_provider_version() {
-        for user_agent in [
-            None,
-            Some("tyde/999.0.0 (Future OS 99.88.77; x86_64)"),
-            Some("tyde/999.0.0-nightly.1 (Future OS)"),
-            Some("tyde/development (Future OS)"),
-            Some("Future OS without-a-tyde-product-token"),
-            Some("tyde/one tyde/two"),
-        ] {
-            let capability = codex_compaction_capability(user_agent);
-            assert!(matches!(
-                capability.availability,
-                BackendCompactionAvailability::Native {
-                    mechanism: BackendCompactionMechanism::JsonRpcRequest
-                }
-            ));
-            assert!(
-                crate::backend::compaction::not_dispatched_for_capability(&capability).is_none()
-            );
-            assert_eq!(
-                capability.evidence,
-                BackendCompactionCapabilityEvidence::CodexMethodProbe
-            );
-        }
-    }
-
-    #[test]
-    fn installed_version_is_diagnostic_only_for_legacy_user_agents() {
-        let legacy_user_agent = "codex-app-server (Mac OS 15.6.0; arm64)";
-        for installed_line in [
-            "codex-cli 999.0.0",
-            "codex-cli 999.0.0-nightly.1",
-            "codex-cli development",
-            "malformed version output",
-        ] {
-            let capability = codex_compaction_capability_with_installed_version(
-                Some(legacy_user_agent),
-                Some(installed_line),
-            );
-            assert!(matches!(
-                capability.availability,
-                BackendCompactionAvailability::Native {
-                    mechanism: BackendCompactionMechanism::JsonRpcRequest
-                }
-            ));
-            assert_eq!(capability.provider_version.as_deref(), Some(installed_line));
-        }
-
-        let anchored = codex_compaction_capability_with_installed_version(
-            Some("tyde/999.0.0-nightly.1 (Future OS)"),
-            Some("installed fallback"),
-        );
-        assert_eq!(
-            anchored.provider_version.as_deref(),
-            Some("999.0.0-nightly.1")
-        );
-    }
-
-    #[test]
-    fn thread_fork_unsupported_requires_method_specific_evidence() {
-        assert!(is_codex_thread_fork_unsupported_error(
-            "Codex thread/fork failed: Codex JSON-RPC error -32601: method not found"
-        ));
-        assert!(is_codex_thread_fork_unsupported_error(
-            "thread/fork failed: unknown variant `thread/fork`"
-        ));
-        assert!(!is_codex_thread_fork_unsupported_error(
-            "skills/list failed: Codex JSON-RPC error -32601: method not found"
-        ));
-        assert!(!is_codex_thread_fork_unsupported_error(
-            "thread/fork failed: provider disconnected"
-        ));
-        assert!(!codex_thread_fork_unsupported_message().contains("or newer"));
-        assert!(!codex_skills_extra_roots_unsupported_message().contains("or newer"));
-    }
-
-    #[test]
-    fn real_codex_method_absence_signal_is_cached_for_safe_fallback() {
-        let previous = codex_compaction_capability(Some(
-            "tyde/999.0.0-nightly.1 (Future OS; arm64) dumb (tyde; 0.1)",
-        ));
-        let stored = std::sync::Mutex::new(previous.clone());
-        let routed_missing = codex_rpc_error(&json!({
-            "code": -32600,
-            "message": concat!(
-                "Invalid request: unknown variant `thread/compact/start`, ",
-                "expected one of `initialize`, `thread/start`",
-            )
-        }));
-        assert!(cache_codex_manual_trigger_absent(
-            &stored,
-            &previous,
-            "thread/compact/start",
-            &routed_missing,
-        ));
-        assert!(routed_missing.rejected_before_dispatch("thread/compact/start"));
-        let cached = stored.lock().expect("cached capability").clone();
-        assert!(matches!(
-            &cached.availability,
-            BackendCompactionAvailability::Unavailable {
-                reason: BackendCompactionUnavailableReason::ManualTriggerAbsent
-            }
-        ));
-        assert_eq!(cached.provider_version, previous.provider_version);
-        assert_eq!(cached.evidence, previous.evidence);
-        assert!(matches!(
-            crate::backend::compaction::not_dispatched_for_capability(&cached),
-            Some(BackendCompactionStart::NotDispatched {
-                fallback_safe: true,
-                ..
-            })
-        ));
-
-        let thread_missing = codex_rpc_error(&json!({
-            "code": -32600,
-            "message": "thread not found: 00000000-0000-0000-0000-000000000000"
-        }));
-        assert!(!thread_missing.method_unavailable("thread/compact/start"));
-        assert!(!thread_missing.rejected_before_dispatch("thread/compact/start"));
-        assert!(
-            codex_rpc_error(&json!({"code": -32601, "message": "Method not found"}))
-                .method_unavailable("thread/compact/start")
-        );
-    }
-
-    #[tokio::test]
-    async fn deserializer_rejection_is_not_reported_as_provider_acceptance() {
-        let (inner, _events) = test_codex_inner();
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        inner.state.lock().await.pending_compaction = Some(PendingCodexCompaction {
-            request: BackendCompactionRequest {
-                operation_id: protocol::CompactionOperationId("deserializer-rejection".to_owned()),
-                trigger: CompactionTrigger::UserRequested,
-                focus: None,
-                transcript_authoritative: true,
-            },
-            terminal_tx: Some(terminal_tx),
-            accepted: false,
-            turn_id: None,
-            item_id: None,
-            item_started: false,
-            item_completed: false,
-            turn_status: None,
-            deprecated_notification_seen: false,
-        });
-
-        inner
-            .finish_compaction_failure_with_dispatch(
-                BackendCompactionFailureKind::ProviderRejected,
-                "Codex JSON-RPC error -32600: Invalid request".to_owned(),
-                Some(BackendCompactionDispatchState::Rejected),
-            )
-            .await;
-        let result = terminal_rx.await.expect("compaction terminal result");
-        assert_eq!(result.dispatch, BackendCompactionDispatchState::Rejected);
-        assert_eq!(result.mutation, BackendCompactionMutationState::NotObserved);
-        inner.rpc.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn compaction_success_requires_correlated_item_and_turn_terminal() {
-        let (inner, mut events) = test_codex_inner();
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn_id = None;
-            state.active_stream = None;
-            state.pending_compaction = Some(PendingCodexCompaction {
-                request: BackendCompactionRequest {
-                    operation_id: protocol::CompactionOperationId("compact-op".to_string()),
-                    trigger: CompactionTrigger::UserRequested,
-                    focus: None,
-                    transcript_authoritative: true,
-                },
-                terminal_tx: Some(terminal_tx),
-                accepted: true,
-                turn_id: None,
-                item_id: None,
-                item_started: false,
-                item_completed: false,
-                turn_status: None,
-                deprecated_notification_seen: false,
-            });
-        }
-
-        assert!(
-            inner
-                .intercept_compaction_notification(
-                    "turn/started",
-                    &json!({"threadId":"thread-test","turn":{"id":"turn-compact"}}),
-                )
-                .await
-        );
-        assert!(
-            inner
-                .intercept_compaction_notification(
-                    "item/started",
-                    &json!({"threadId":"thread-test","turnId":"turn-compact","item":{"id":"item-compact","type":"contextCompaction"}}),
-                )
-                .await
-        );
-        assert!(
-            inner
-                .intercept_compaction_notification(
-                    "item/completed",
-                    &json!({"threadId":"thread-test","turnId":"turn-compact","item":{"id":"item-compact","type":"contextCompaction"}}),
-                )
-                .await
-        );
-        assert!(
-            inner
-                .intercept_compaction_notification(
-                    "turn/completed",
-                    &json!({"threadId":"thread-test","turn":{"id":"turn-compact","status":"completed"}}),
-                )
-                .await
-        );
-
-        let result = terminal_rx.await.expect("terminal compaction result");
-        assert!(result.outcome.is_ok());
-        assert_eq!(result.mutation, BackendCompactionMutationState::Completed);
-        while let Ok(event) = events.try_recv() {
-            assert_ne!(
-                event.get("kind").and_then(Value::as_str),
-                Some("StreamStart"),
-                "structured Codex compaction must not open a public stream"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn cancel_without_active_turn_resolves_and_interrupts_the_raced_turn() {
-        let (inner, mut events) = test_codex_inner();
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn_id = None;
-            state.active_stream = None;
-        }
-
-        inner
-            .execute(SessionCommand::CancelConversation)
-            .await
-            .expect("cancel with no active turn");
-        let mut cancelled = 0;
-        let mut typing_false = 0;
-        while let Ok(event) = events.try_recv() {
-            match event.get("kind").and_then(Value::as_str) {
-                Some("OperationCancelled") => cancelled += 1,
-                Some("TypingStatusChanged") if event.get("data") == Some(&json!(false)) => {
-                    typing_false += 1;
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            cancelled, 1,
-            "an idle cancel must resolve visibly instead of silently succeeding"
-        );
-        assert_eq!(
-            typing_false, 1,
-            "an idle cancel must return the chat to idle"
-        );
-        assert!(inner.state.lock().await.interrupt_next_root_turn);
-
-        inner
-            .handle_notification(
-                "turn/started",
-                &json!({"threadId":"thread-test","turn":{"id":"turn-raced-cancel"}}),
-            )
-            .await;
-        {
-            let state = inner.state.lock().await;
-            assert!(
-                state.active_turn_id.is_none(),
-                "a turn that raced a cancel must not be adopted as active"
-            );
-            assert!(
-                state
-                    .terminated_turns
-                    .iter()
-                    .any(|turn| turn.turn_id == "turn-raced-cancel"),
-                "the raced turn must be tombstoned so its late events stay inert"
-            );
-            assert!(!state.interrupt_next_root_turn);
-        }
-        while let Ok(event) = events.try_recv() {
-            assert!(
-                !(event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                    && event.get("data") == Some(&json!(true))),
-                "a turn that raced a cancel must not resurrect the typing indicator"
-            );
-        }
-        inner.rpc.shutdown().await;
     }
 }

@@ -21,7 +21,11 @@ pub mod turn_emitter;
 pub mod tycode;
 pub mod tycode_config;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
@@ -41,15 +45,17 @@ pub(crate) use compaction::{
     BackendAcceptedCompaction, BackendBindingPrepareError, BackendBindingReadyEvidence,
     BackendCompactionAvailability, BackendCompactionCapability,
     BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
-    BackendCompactionDeferredReason, BackendCompactionDispatchState, BackendCompactionEvent,
-    BackendCompactionFailure, BackendCompactionFailureKind, BackendCompactionMechanism,
-    BackendCompactionMutationState, BackendCompactionNotDispatchedReason,
-    BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionRequest,
-    BackendCompactionResult, BackendCompactionStart, BackendCompactionSuccess,
-    BackendCompactionTerminalEvidence, BackendCompactionUnavailableReason,
-    BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionDeferredReason, BackendCompactionEvent, BackendCompactionFailure,
+    BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionNotDispatchedReason,
+    BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionResult,
+    BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendContextSeed, BackendObservedCompaction,
     PostCompactionTokenCount,
+};
+pub use compaction::{
+    BackendCompactionDispatchState, BackendCompactionMutationState, BackendCompactionRequest,
+    BackendCompactionStart,
 };
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
@@ -62,6 +68,131 @@ pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "use write/edit/apply-patch tools. Agent orchestration, including spawning ",
     "and messaging other agents, is allowed."
 );
+
+/// Private bridge field used to carry the authoritative MCP result through
+/// providers that otherwise flatten `CallToolResult` before reporting it.
+pub(crate) const TYDE_MCP_RESULT_ENVELOPE_KEY: &str =
+    "__tyde_internal_mcp_call_tool_result_v1_8d6f0f6b9f4c4e1a";
+
+pub(crate) struct NormalizedMcpToolResult {
+    pub tool_result: Value,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Projects an authoritative MCP `CallToolResult` onto Tyde's public tool
+/// completion contract. Callers must establish MCP identity before invoking
+/// this function; arbitrary opaque tools are not MCP results.
+pub(crate) fn normalize_mcp_call_tool_result(raw: &Value) -> NormalizedMcpToolResult {
+    let source = find_mcp_call_tool_result(raw).unwrap_or(raw);
+    let content = match source.get("content") {
+        Some(Value::Array(content)) => Value::Array(content.clone()),
+        Some(Value::String(text)) => serde_json::json!([{
+            "type": "text",
+            "text": text,
+        }]),
+        Some(other) if !other.is_null() => serde_json::json!([{
+            "type": "text",
+            "text": other.to_string(),
+        }]),
+        _ if source.get("result").and_then(Value::as_str).is_some() => serde_json::json!([{
+            "type": "text",
+            "text": source.get("result").and_then(Value::as_str).unwrap_or_default(),
+        }]),
+        _ => match source {
+            Value::String(text) => serde_json::json!([{
+                "type": "text",
+                "text": text,
+            }]),
+            _ => Value::Array(Vec::new()),
+        },
+    };
+    let is_error = source
+        .get("isError")
+        .or_else(|| source.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut canonical = serde_json::Map::new();
+    canonical.insert("content".to_owned(), content);
+    canonical.insert("isError".to_owned(), Value::Bool(is_error));
+    for key in ["structuredContent", "_meta"] {
+        if let Some(value) = source.get(key).filter(|value| !value.is_null()) {
+            canonical.insert(key.to_owned(), value.clone());
+        }
+    }
+    let canonical = Value::Object(canonical);
+    if is_error {
+        let detail =
+            serde_json::to_string_pretty(&canonical).unwrap_or_else(|_| canonical.to_string());
+        let short = canonical
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.iter().find_map(|part| part.get("text")))
+            .and_then(Value::as_str)
+            .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| line.trim().chars().take(140).collect::<String>())
+            .unwrap_or_else(|| "MCP tool execution failed".to_owned());
+        NormalizedMcpToolResult {
+            tool_result: serde_json::json!({
+                "kind": "Error",
+                "short_message": short,
+                "detailed_message": detail,
+            }),
+            success: false,
+            error: Some("MCP tool returned isError: true".to_owned()),
+        }
+    } else {
+        NormalizedMcpToolResult {
+            tool_result: serde_json::json!({
+                "kind": "Other",
+                "result": canonical,
+            }),
+            success: true,
+            error: None,
+        }
+    }
+}
+
+fn find_mcp_call_tool_result(value: &Value) -> Option<&Value> {
+    if let Some(envelope) = value
+        .get("structuredContent")
+        .and_then(|structured| structured.get(TYDE_MCP_RESULT_ENVELOPE_KEY))
+        .filter(|candidate| is_mcp_call_tool_result(candidate))
+    {
+        return Some(envelope);
+    }
+    if is_mcp_call_tool_result(value) {
+        return Some(value);
+    }
+    if let Some(result) = value.get("result") {
+        if let Some(envelope) = result
+            .get("structuredContent")
+            .and_then(|structured| structured.get(TYDE_MCP_RESULT_ENVELOPE_KEY))
+            .filter(|candidate| is_mcp_call_tool_result(candidate))
+        {
+            return Some(envelope);
+        }
+        if is_mcp_call_tool_result(result) {
+            return Some(result);
+        }
+    }
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("Json"))
+        .filter(|candidate| is_mcp_call_tool_result(candidate))
+}
+
+fn is_mcp_call_tool_result(value: &Value) -> bool {
+    value
+        .get("content")
+        .is_some_and(|content| content.is_array() || content.is_string())
+        && value
+            .get("isError")
+            .or_else(|| value.get("is_error"))
+            .is_none_or(Value::is_boolean)
+}
 
 pub(crate) fn protocol_images_to_attachments(
     images: Option<Vec<ImageData>>,
@@ -144,7 +275,72 @@ pub enum StartupMcpTransport {
 #[derive(Debug, Clone)]
 pub struct StartupMcpServer {
     pub name: String,
+    pub supports_parallel_tool_calls: bool,
     pub transport: StartupMcpTransport,
+}
+
+pub(crate) async fn validate_startup_mcp_configuration(
+    servers: &[StartupMcpServer],
+) -> Result<(), String> {
+    for server in servers {
+        match &server.transport {
+            StartupMcpTransport::Stdio { command, .. } => {
+                if command.trim().is_empty() {
+                    return Err(format!(
+                        "MCP server '{}' has an empty stdio command",
+                        server.name
+                    ));
+                }
+            }
+            StartupMcpTransport::Http {
+                headers,
+                bearer_token_env_var,
+                ..
+            } => {
+                validate_http_mcp_configuration(server, headers, bearer_token_env_var.as_deref())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_mcp_configuration(
+    server: &StartupMcpServer,
+    headers: &HashMap<String, String>,
+    bearer_token_env_var: Option<&str>,
+) -> Result<(), String> {
+    for (name, value) in headers {
+        reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            format!(
+                "MCP server '{}' has invalid HTTP header name '{name}': {error}",
+                server.name
+            )
+        })?;
+        reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            format!(
+                "MCP server '{}' has an invalid HTTP header value: {error}",
+                server.name
+            )
+        })?;
+    }
+    if let Some(variable) = bearer_token_env_var
+        .map(str::trim)
+        .filter(|variable| !variable.is_empty())
+    {
+        let token = std::env::var(variable).map_err(|error| {
+            format!(
+                "MCP server '{}' bearer token environment variable '{variable}' is unavailable: {error}",
+                server.name
+            )
+        })?;
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+            format!(
+                "MCP server '{}' bearer token is not a valid HTTP header value: {error}",
+                server.name
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -244,6 +440,7 @@ enum EventStreamReceiver {
 
 pub struct EventStream {
     rx: EventStreamReceiver,
+    buffered: VecDeque<BackendEvent>,
     resume_replay_complete: Option<oneshot::Receiver<()>>,
     transcript_metadata_projector: Option<BackendTranscriptMetadataProjector>,
 }
@@ -252,6 +449,7 @@ impl EventStream {
     pub fn new(rx: mpsc::UnboundedReceiver<ChatEvent>) -> Self {
         Self {
             rx: EventStreamReceiver::Chat(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -260,6 +458,7 @@ impl EventStream {
     pub(crate) fn new_backend(rx: mpsc::UnboundedReceiver<BackendEvent>) -> Self {
         Self {
             rx: EventStreamReceiver::Backend(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -271,6 +470,7 @@ impl EventStream {
     ) -> Self {
         Self {
             rx: EventStreamReceiver::Backend(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -282,6 +482,7 @@ impl EventStream {
     ) -> Self {
         Self {
             rx: EventStreamReceiver::Chat(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -293,6 +494,7 @@ impl EventStream {
     ) -> Self {
         Self {
             rx: EventStreamReceiver::Backend(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -305,6 +507,7 @@ impl EventStream {
     ) -> Self {
         Self {
             rx: EventStreamReceiver::Backend(rx),
+            buffered: VecDeque::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -328,7 +531,26 @@ impl EventStream {
             BackendEvent::ModelRequestTokenUsage(usage) => {
                 tyde_agent_adapter::BackendObservation::ModelRequestTokenUsage(usage)
             }
-            BackendEvent::Compaction(_) => tyde_agent_adapter::BackendObservation::Other,
+            BackendEvent::Compaction(event) => {
+                tyde_agent_adapter::BackendObservation::Compaction(match event {
+                    BackendCompactionEvent::Progress(progress) => {
+                        tyde_agent_adapter::BackendCompactionObservation::Progress {
+                            operation_id: progress.operation_id,
+                            stage: progress.stage,
+                            elapsed_ms: progress.elapsed_ms,
+                        }
+                    }
+                    BackendCompactionEvent::Observed(observed) => {
+                        tyde_agent_adapter::BackendCompactionObservation::Observed {
+                            observation_id: observed.observation_id,
+                            trigger: observed.trigger,
+                            method: observed.method,
+                            provider_session_id: observed.provider_session_id,
+                            metrics: observed.metrics,
+                        }
+                    }
+                })
+            }
         })
     }
 
@@ -344,6 +566,9 @@ impl EventStream {
     }
 
     pub(crate) async fn recv_backend(&mut self) -> Option<BackendEvent> {
+        if let Some(event) = self.buffered.pop_front() {
+            return Some(event);
+        }
         match &mut self.rx {
             EventStreamReceiver::Chat(rx) => rx.recv().await.map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.recv().await,
@@ -351,9 +576,22 @@ impl EventStream {
     }
 
     pub(crate) fn try_recv_backend(&mut self) -> Result<BackendEvent, mpsc::error::TryRecvError> {
+        if let Some(event) = self.buffered.pop_front() {
+            return Ok(event);
+        }
         match &mut self.rx {
             EventStreamReceiver::Chat(rx) => rx.try_recv().map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.try_recv(),
+        }
+    }
+
+    pub(crate) fn restore_backend_events(
+        &mut self,
+        events: impl IntoIterator<Item = BackendEvent>,
+    ) {
+        let restored = events.into_iter().collect::<Vec<_>>();
+        for event in restored.into_iter().rev() {
+            self.buffered.push_front(event);
         }
     }
 
@@ -575,6 +813,28 @@ pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
         BackendKind::Codex => codex::CodexBackend::capabilities(),
         BackendKind::Antigravity => antigravity::AntigravityBackend::capabilities(),
         BackendKind::Hermes => hermes::HermesBackend::capabilities(),
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn compaction_capability_is_native(capability: &BackendCompactionCapability) -> bool {
+    matches!(
+        capability.availability,
+        BackendCompactionAvailability::Native { .. }
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub async fn list_sessions_for_backend_kind(
+    kind: BackendKind,
+) -> Result<Vec<BackendSession>, String> {
+    match kind {
+        BackendKind::Tycode => tycode::TycodeBackend::list_sessions().await,
+        BackendKind::Acp => kiro::KiroBackend::list_sessions().await,
+        BackendKind::Claude => claude::ClaudeBackend::list_sessions().await,
+        BackendKind::Codex => codex::CodexBackend::list_sessions().await,
+        BackendKind::Antigravity => antigravity::AntigravityBackend::list_sessions().await,
+        BackendKind::Hermes => hermes::HermesBackend::list_sessions().await,
     }
 }
 
@@ -1158,6 +1418,12 @@ pub(crate) fn validate_session_settings_values(
         .collect::<HashMap<_, _>>();
 
     for (key, value) in &values.0 {
+        if schema.backend_kind == BackendKind::Tycode
+            && key == "tyde_conformance_model"
+            && matches!(value, SessionSettingValue::String(_))
+        {
+            continue;
+        }
         let Some(field) = fields_by_key.get(key.as_str()) else {
             return Err(format!(
                 "unknown session setting '{}' for backend {:?}",
@@ -1372,492 +1638,5 @@ fn session_setting_value_to_json(value: &SessionSettingValue) -> Value {
         SessionSettingValue::Bool(value) => Value::Bool(*value),
         SessionSettingValue::Integer(value) => Value::Number((*value).into()),
         SessionSettingValue::Null => Value::Null,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use protocol::{
-        BackendAccessMode, BackendConfigField, BackendConfigFieldType,
-        BackendConfigPersistenceMode, BackendConfigSchema, BackendConfigValues, BackendKind,
-        SessionSettingValue,
-    };
-
-    use super::{
-        Backend, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, backend_config_schema_catalog,
-        capabilities_for_backend_kind, merge_backend_config_update,
-        merge_backend_config_update_with_schema, render_combined_spawn_instructions,
-        sanitize_backend_config_values, sanitize_backend_config_values_with_schema,
-        validate_backend_config_values_with_schema,
-    };
-    use crate::agent::customization::ResolvedSpawnConfig;
-    use tyde_agent_adapter::BackendCapability;
-
-    #[test]
-    fn every_backend_capability_declaration_is_valid() {
-        for kind in [
-            BackendKind::Tycode,
-            BackendKind::Acp,
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Antigravity,
-            BackendKind::Hermes,
-        ] {
-            capabilities_for_backend_kind(kind)
-                .validate()
-                .unwrap_or_else(|error| panic!("invalid {kind:?} capabilities: {error}"));
-        }
-        super::mock::MockBackend::capabilities()
-            .validate()
-            .expect("invalid mock capabilities");
-    }
-
-    #[test]
-    fn built_in_backend_capability_matrix_is_exact() {
-        let expected = [
-            (
-                BackendKind::Tycode,
-                &[
-                    BackendCapability::ListSessions,
-                    BackendCapability::ResumeSession,
-                    BackendCapability::Interrupt,
-                    BackendCapability::SessionSettings,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::TurnUsageReported,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-            (
-                BackendKind::Acp,
-                &[
-                    BackendCapability::ListSessions,
-                    BackendCapability::ResumeSession,
-                    BackendCapability::Interrupt,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-            (
-                BackendKind::Claude,
-                &[
-                    BackendCapability::ResumeSession,
-                    BackendCapability::ForkSession,
-                    BackendCapability::ImageInput,
-                    BackendCapability::Interrupt,
-                    BackendCapability::SessionSettings,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::TurnUsageReported,
-                    BackendCapability::Subagents,
-                    BackendCapability::BackgroundTasks,
-                    BackendCapability::AgentInitiatedTurns,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-            (
-                BackendKind::Codex,
-                &[
-                    BackendCapability::ResumeSession,
-                    BackendCapability::ForkSession,
-                    BackendCapability::ImageInput,
-                    BackendCapability::Interrupt,
-                    BackendCapability::SessionSettings,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::TurnUsageReported,
-                    BackendCapability::ModelRequestUsageReported,
-                    BackendCapability::ContextUsageReported,
-                    BackendCapability::Subagents,
-                    BackendCapability::BackgroundTasks,
-                    BackendCapability::AgentInitiatedTurns,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-            (
-                BackendKind::Antigravity,
-                &[
-                    BackendCapability::ResumeSession,
-                    BackendCapability::Interrupt,
-                    BackendCapability::SessionSettings,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-            (
-                BackendKind::Hermes,
-                &[
-                    BackendCapability::ListSessions,
-                    BackendCapability::ResumeSession,
-                    BackendCapability::Interrupt,
-                    BackendCapability::SessionSettings,
-                    BackendCapability::StartupMcpServers,
-                    BackendCapability::TurnUsageReported,
-                    BackendCapability::ContextUsageReported,
-                    BackendCapability::Subagents,
-                    BackendCapability::BackgroundTasks,
-                    BackendCapability::WorkspaceInstructions,
-                    BackendCapability::Customization,
-                ][..],
-            ),
-        ];
-
-        for (kind, expected) in expected {
-            let actual = capabilities_for_backend_kind(kind)
-                .iter()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                actual, expected,
-                "incorrect capability matrix row for {kind:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_backend_claims_an_authoritative_context_breakdown() {
-        for kind in [
-            BackendKind::Tycode,
-            BackendKind::Acp,
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Antigravity,
-            BackendKind::Hermes,
-        ] {
-            assert!(
-                !capabilities_for_backend_kind(kind)
-                    .contains(BackendCapability::ContextBreakdownReported),
-                "{kind:?} must not advertise an estimated context breakdown as reported"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn mock_backend_stream_passes_universal_conformance_validation() {
-        let capabilities = super::mock::MockBackend::capabilities();
-        let mut validator = tyde_agent_adapter::BackendConformanceValidator::new(capabilities)
-            .expect("valid mock capability declaration");
-        validator.input_accepted().expect("record initial input");
-        let (backend, mut events) = super::mock::MockBackend::spawn(
-            vec!["/tmp".to_owned()],
-            super::BackendSpawnConfig::default(),
-            protocol::SendMessagePayload {
-                message: "universal backend conformance".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        .expect("spawn mock backend");
-
-        loop {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv_backend())
-                    .await
-                    .expect("mock conformance event timeout")
-                    .expect("mock conformance stream closed early");
-            match &event {
-                super::BackendEvent::Chat(event) => {
-                    validator
-                        .observe_chat_event(event)
-                        .unwrap_or_else(|error| panic!("mock event violated contract: {error}"));
-                }
-                super::BackendEvent::ModelRequestTokenUsage(usage) => {
-                    validator
-                        .observe_model_request_usage(usage)
-                        .unwrap_or_else(|error| panic!("mock usage violated contract: {error}"));
-                }
-                super::BackendEvent::Compaction(_) => {}
-            }
-            if matches!(
-                event,
-                super::BackendEvent::Chat(protocol::ChatEvent::TypingStatusChanged(false))
-            ) {
-                break;
-            }
-        }
-
-        backend.shutdown().await;
-        let snapshot = validator.finish().expect("complete mock conformance run");
-        assert_eq!(snapshot.completed_turns, 1);
-    }
-
-    /// Deep-config validation/merge semantics are schema-driven; no built-in
-    /// backend currently publishes a typed schema (Hermes moved to
-    /// backend-native settings), so these contracts are pinned against a
-    /// hand-built schema through the `_with_schema` seam.
-    fn test_backend_config_schema() -> BackendConfigSchema {
-        BackendConfigSchema {
-            backend_kind: BackendKind::Hermes,
-            persistence_mode: BackendConfigPersistenceMode::TydeSettingsStore,
-            fields: vec![
-                BackendConfigField {
-                    key: "default_model".to_string(),
-                    label: "Default Model".to_string(),
-                    description: None,
-                    field_type: BackendConfigFieldType::Text {
-                        default: None,
-                        placeholder: None,
-                        multiline: false,
-                    },
-                },
-                BackendConfigField {
-                    key: "default_provider".to_string(),
-                    label: "Default Provider".to_string(),
-                    description: None,
-                    field_type: BackendConfigFieldType::Text {
-                        default: None,
-                        placeholder: None,
-                        multiline: false,
-                    },
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn backend_config_sanitization_drops_unknown_and_mistyped_values() {
-        let schema = test_backend_config_schema();
-        let mut good = BackendConfigValues::default();
-        good.0.insert(
-            "default_model".to_string(),
-            SessionSettingValue::String("anthropic/claude-sonnet-5".to_string()),
-        );
-
-        // Unknown keys and wrong-typed values are silently dropped; valid
-        // Text values are kept.
-        let mut mixed = BackendConfigValues::default();
-        mixed.0.insert(
-            "default_model".to_string(),
-            SessionSettingValue::String("x/y".to_string()),
-        );
-        mixed
-            .0
-            .insert("bogus_key".to_string(), SessionSettingValue::Bool(true));
-        mixed.0.insert(
-            "default_provider".to_string(),
-            SessionSettingValue::Integer(3),
-        );
-
-        let sanitized = sanitize_backend_config_values_with_schema(Some(&schema), &mixed);
-        assert_eq!(sanitized.0.len(), 1);
-        assert!(sanitized.0.contains_key("default_model"));
-
-        // A backend with no config schema sanitizes everything away; today
-        // that is every backend, exercised through the public kind-based path.
-        for kind in [BackendKind::Claude, BackendKind::Hermes] {
-            let sanitized = sanitize_backend_config_values(kind, &good);
-            assert!(sanitized.0.is_empty(), "{kind:?} must sanitize to empty");
-        }
-    }
-
-    #[test]
-    fn backend_config_schema_catalog_includes_configurable_backends_only() {
-        // Hermes now manages its real config through backend-native settings,
-        // leaving no built-in backend with a typed deep-config schema. The
-        // catalog must reflect that instead of advertising stale schemas.
-        assert!(backend_config_schema_catalog().is_empty());
-    }
-
-    #[test]
-    fn backend_config_update_validation_surfaces_bad_keys_and_merges() {
-        let schema = test_backend_config_schema();
-        let mut previous = BackendConfigValues::default();
-        previous.0.insert(
-            "default_model".to_string(),
-            SessionSettingValue::String("anthropic/claude-sonnet-5".to_string()),
-        );
-
-        let mut update = BackendConfigValues::default();
-        update.0.insert(
-            "default_provider".to_string(),
-            SessionSettingValue::String("anthropic".to_string()),
-        );
-        let merged = merge_backend_config_update_with_schema(
-            BackendKind::Hermes,
-            Some(&schema),
-            Some(&previous),
-            &update,
-        )
-        .expect("valid update merges");
-        assert_eq!(merged.0.len(), 2);
-        assert!(merged.0.contains_key("default_model"));
-        assert!(merged.0.contains_key("default_provider"));
-
-        let mut clear = BackendConfigValues::default();
-        clear
-            .0
-            .insert("default_model".to_string(), SessionSettingValue::Null);
-        let merged = merge_backend_config_update_with_schema(
-            BackendKind::Hermes,
-            Some(&schema),
-            Some(&merged),
-            &clear,
-        )
-        .expect("explicit null clears");
-        assert_eq!(merged.0.len(), 1);
-        assert!(merged.0.contains_key("default_provider"));
-
-        let mut unknown = BackendConfigValues::default();
-        unknown
-            .0
-            .insert("bogus_key".to_string(), SessionSettingValue::Bool(true));
-        let err = validate_backend_config_values_with_schema(
-            BackendKind::Hermes,
-            Some(&schema),
-            &unknown,
-        )
-        .expect_err("unknown backend config key should be rejected");
-        assert!(
-            err.contains("bogus_key"),
-            "error should include rejected key: {err}"
-        );
-
-        // Without a schema the same update is a visible refusal, not a merge.
-        let err = merge_backend_config_update(BackendKind::Hermes, None, &update)
-            .expect_err("schema-less backend must refuse config updates");
-        assert!(
-            err.contains("does not support backend configuration"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn only_inline_delivery_puts_skill_bodies_in_spawn_instructions() {
-        use crate::agent::customization::{ResolvedSkill, SkillDelivery};
-
-        let sentinel = "SHARED_RENDERER_BODY_SENTINEL";
-        let skills = vec![ResolvedSkill::test_fixture("lint", sentinel)];
-
-        for delivery in [SkillDelivery::NativeDiscovery, SkillDelivery::NamesOnly] {
-            let rendered = render_combined_spawn_instructions(&ResolvedSpawnConfig {
-                skills: skills.clone(),
-                skill_delivery: delivery,
-                ..ResolvedSpawnConfig::default()
-            });
-            assert_eq!(
-                rendered, None,
-                "{delivery:?} must receive no skill section here"
-            );
-        }
-
-        let inline = render_combined_spawn_instructions(&ResolvedSpawnConfig {
-            skills,
-            skill_delivery: SkillDelivery::InlineBodies,
-            ..ResolvedSpawnConfig::default()
-        })
-        .expect("inline-body instructions");
-        assert!(inline.contains("Skill: lint"));
-        assert!(inline.contains(sentinel));
-
-        // A body-free skill under inline delivery must not render an empty
-        // block that reads as "this skill has no instructions".
-        let empty = render_combined_spawn_instructions(&ResolvedSpawnConfig {
-            skills: vec![ResolvedSkill::test_fixture("lint", "")],
-            skill_delivery: SkillDelivery::InlineBodies,
-            ..ResolvedSpawnConfig::default()
-        });
-        assert_eq!(empty, None);
-    }
-
-    #[test]
-    fn read_only_spawn_instructions_allow_inspection_and_forbid_mutation() {
-        let instructions = render_combined_spawn_instructions(&ResolvedSpawnConfig {
-            access_mode: BackendAccessMode::ReadOnly,
-            ..ResolvedSpawnConfig::default()
-        })
-        .expect("read-only instructions");
-
-        assert_eq!(instructions, READ_ONLY_ACCESS_MODE_INSTRUCTIONS);
-        assert!(instructions.contains("You MAY freely inspect anything"));
-        assert!(instructions.contains("read files"));
-        assert!(instructions.contains("list directories"));
-        assert!(instructions.contains("run read-only shell commands"));
-        assert!(instructions.contains("`git status`/`log`/`diff`"));
-        assert!(instructions.contains("`grep`/`rg`"));
-        assert!(instructions.contains("`cat`"));
-        assert!(instructions.contains("`ls`"));
-        assert!(instructions.contains("`find`"));
-        assert!(instructions.contains("do not create, edit, or delete files"));
-        assert!(instructions.contains("spawning and messaging other agents, is allowed"));
-        assert!(
-            instructions
-                .contains("do not run commands that modify files, processes, or external state")
-        );
-        assert!(instructions.contains("do not use write/edit/apply-patch tools"));
-        assert!(!instructions.contains("do not run shell commands"));
-    }
-
-    #[tokio::test]
-    async fn prepared_binding_drain_requires_bootstrap_terminal_before_idle() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(super::BackendEvent::Chat(
-            protocol::ChatEvent::TypingStatusChanged(false),
-        ))
-        .expect("setup idle");
-        tx.send(super::BackendEvent::Chat(protocol::ChatEvent::StreamEnd(
-            protocol::StreamEndData {
-                message: protocol::ChatMessage {
-                    message_id: None,
-                    timestamp: 1,
-                    sender: protocol::MessageSender::Assistant {
-                        agent: "mock".to_owned(),
-                    },
-                    content: "READY".to_owned(),
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    model_info: None,
-                    token_usage: None,
-                    context_breakdown: None,
-                    images: None,
-                },
-            },
-        )))
-        .expect("bootstrap terminal");
-        tx.send(super::BackendEvent::Chat(
-            protocol::ChatEvent::TypingStatusChanged(false),
-        ))
-        .expect("bootstrap idle");
-        drop(tx);
-        let mut events = super::EventStream::new_backend(rx);
-        let ready = super::drain_prepared_binding_bootstrap(
-            BackendKind::Claude,
-            protocol::SessionId("provider-session".to_owned()),
-            &mut events,
-        )
-        .await
-        .expect("prepared binding ready");
-        assert!(ready.bootstrap_terminal_seen);
-        assert!(ready.provider_idle_seen);
-        assert_eq!(ready.provider_session_id.0, "provider-session");
-    }
-
-    #[tokio::test]
-    async fn mock_prepared_binding_drains_seed_and_reopens_original_configuration() {
-        let mut prepared = super::prepare_mock_compacted_backend_binding(
-            BackendKind::Claude,
-            super::BackendSpawnConfig::default(),
-            super::BackendContextSeed {
-                workspace_roots: vec!["/tmp".to_owned()],
-                summary: "Preserve the compacted mock state.".to_owned(),
-            },
-        )
-        .await
-        .expect("prepare mock binding");
-        assert!(prepared.ready.bootstrap_terminal_seen);
-        assert!(prepared.ready.provider_idle_seen);
-        assert!(prepared.ready.replay_or_setup_drained);
-        assert_eq!(prepared.ready.backend_kind, BackendKind::Claude);
-        assert!(matches!(
-            prepared.events.try_recv_backend(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            &prepared.backend,
-            super::PreparedBackendHandle::Mock { .. }
-        ));
-        prepared.backend.shutdown().await;
     }
 }

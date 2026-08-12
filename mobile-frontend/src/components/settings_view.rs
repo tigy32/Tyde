@@ -763,6 +763,7 @@ mod wasm_tests {
                 McpServerConfig {
                     id: McpServerId("m-1".to_owned()),
                     name: "search-mcp".to_owned(),
+                    supports_parallel_tool_calls: false,
                     transport: McpTransportConfig::Http {
                         url: "https://example.com/mcp".to_owned(),
                         headers: HashMap::new(),

@@ -426,6 +426,9 @@ pub(crate) enum BackendCompactionObservationSource {
     HermesEvent {
         event_id: String,
     },
+    HermesRpc {
+        operation_id: CompactionOperationId,
+    },
     MockEvent {
         event_id: String,
     },
@@ -472,91 +475,4 @@ pub(crate) fn stable_observation_id(
     CompactionObservationId(format!(
         "{backend}:{provider_session_id}:{provider_event_id}"
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const UNKNOWN_REASON_COUNT: usize = 2;
-    const UNAVAILABLE_REASON_COUNT: usize = 4;
-
-    #[test]
-    fn every_unknown_reason_stays_fail_closed() {
-        fn reason_name(reason: &BackendCompactionUnknownReason) -> &'static str {
-            match reason {
-                BackendCompactionUnknownReason::ProcessNotInitialized => "process_not_initialized",
-                BackendCompactionUnknownReason::CapabilityProbeFailed(_) => {
-                    "capability_probe_failed"
-                }
-            }
-        }
-        let reasons: [BackendCompactionUnknownReason; UNKNOWN_REASON_COUNT] = [
-            BackendCompactionUnknownReason::ProcessNotInitialized,
-            BackendCompactionUnknownReason::CapabilityProbeFailed("probe".to_owned()),
-        ];
-        for reason in reasons {
-            assert!(!reason_name(&reason).is_empty());
-            let capability = BackendCompactionCapability::unknown(
-                reason,
-                None,
-                BackendCompactionCapabilityEvidence::None,
-            );
-            assert!(matches!(
-                not_dispatched_for_capability(&capability),
-                Some(BackendCompactionStart::NotDispatched {
-                    fallback_safe: false,
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn every_affirmative_unavailable_reason_is_safe_before_dispatch() {
-        fn reason_name(reason: &BackendCompactionUnavailableReason) -> &'static str {
-            match reason {
-                BackendCompactionUnavailableReason::ManualTriggerAbsent => "manual_trigger_absent",
-                BackendCompactionUnavailableReason::AdapterHasNoManualTransport => {
-                    "adapter_has_no_manual_transport"
-                }
-                BackendCompactionUnavailableReason::TranscriptNotAuthoritative => {
-                    "transcript_not_authoritative"
-                }
-                BackendCompactionUnavailableReason::ProviderDisabledCommand => {
-                    "provider_disabled_command"
-                }
-            }
-        }
-        let reasons: [BackendCompactionUnavailableReason; UNAVAILABLE_REASON_COUNT] = [
-            BackendCompactionUnavailableReason::ManualTriggerAbsent,
-            BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-            BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
-            BackendCompactionUnavailableReason::ProviderDisabledCommand,
-        ];
-        for reason in reasons {
-            assert!(!reason_name(&reason).is_empty());
-            let capability = BackendCompactionCapability::context_unavailable(reason);
-            assert!(matches!(
-                not_dispatched_for_capability(&capability),
-                Some(BackendCompactionStart::NotDispatched {
-                    fallback_safe: true,
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn hidden_seed_renders_summary_without_user_origin_metadata() {
-        let seed = BackendContextSeed {
-            workspace_roots: vec!["/tmp/workspace".to_owned()],
-            summary: "Keep cursor `opaque:00/+==` verbatim.".to_owned(),
-        };
-        let rendered = seed.render_hidden_bootstrap().expect("render seed");
-        assert!(rendered.contains("Keep cursor `opaque:00/+==` verbatim."));
-        assert!(rendered.starts_with(
-            "Restore this compacted working context. Do not call tools. Acknowledge only with READY."
-        ));
-    }
 }

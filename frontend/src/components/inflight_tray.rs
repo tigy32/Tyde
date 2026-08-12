@@ -1919,6 +1919,7 @@ mod wasm_tests {
                     agent_id: AgentId(agent_id.to_owned()),
                     name: Some(name.to_owned()),
                 }],
+                status: protocol::AgentControlProgressStatus::Completed,
             }),
         }
     }
@@ -2658,6 +2659,7 @@ mod wasm_tests {
                         last_tool_name: Some("Read".to_owned()),
                         tool_calls: 12,
                         completed: false,
+                        status: protocol::SubAgentProgressStatus::Running,
                     }),
                 },
             );
@@ -2797,6 +2799,7 @@ mod wasm_tests {
                         agent_id: AgentId("agent-a".to_owned()),
                         name: Some("Worker".to_owned()),
                     }],
+                    status: protocol::AgentControlProgressStatus::Running,
                 }),
             }
         }

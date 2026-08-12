@@ -500,6 +500,7 @@ pub struct AcpToolCallCompletion {
     pub success: bool,
     pub tool_result: Value,
     pub error: Option<String>,
+    pub is_mcp_tool: bool,
 }
 
 pub fn parse_tool_call_request(params: &Value) -> Option<AcpToolCallRequest> {
@@ -595,11 +596,12 @@ pub fn parse_tool_call_completion(
         .unwrap_or("")
         .to_string();
 
-    let success = status == "completed" || status == "success";
     let tool_result = params
         .get("rawOutput")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
+    let success =
+        (status == "completed" || status == "success") && !value_contains_mcp_error(&tool_result);
 
     let error = if success {
         None
@@ -622,7 +624,23 @@ pub fn parse_tool_call_completion(
         success,
         tool_result,
         error,
+        is_mcp_tool: false,
     })
+}
+
+fn value_contains_mcp_error(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("isError")
+                .or_else(|| object.get("is_error"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                || object.values().any(value_contains_mcp_error)
+        }
+        Value::Array(values) => values.iter().any(value_contains_mcp_error),
+        _ => false,
+    }
 }
 
 pub fn extract_text_from_update(update: &Value) -> String {
@@ -1320,21 +1338,5 @@ impl Drop for AcpRpc {
         self.stdout_task.abort();
         self.stderr_task.abort();
         crate::backend::subprocess::reap_group_child_slot(&self.child);
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn permission_selection_prefers_allow_once() {
-        let options = json!([
-            { "kind": "reject_once", "optionId": "deny" },
-            { "kind": "allow_always", "optionId": "always" },
-            { "kind": "allow_once", "optionId": "once" }
-        ]);
-        let options = options.as_array().expect("options");
-
-        assert_eq!(select_permission_option(options), Some("once".to_string()));
     }
 }

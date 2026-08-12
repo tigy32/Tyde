@@ -39,7 +39,7 @@ use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
     BackendStartupError, EventStream, SendOutcome, apply_session_settings_update,
     resolve_backend_session_settings, validate_runtime_session_settings_update,
-    validate_session_settings_values,
+    validate_session_settings_values, validate_startup_mcp_configuration,
 };
 use crate::host::{
     HostCapacityTx, HostSessionSummaryCountEvent, HostSessionSummaryCountTx,
@@ -120,6 +120,7 @@ struct TerminalFailureContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
+    session_store: &'a Arc<Mutex<SessionStore>>,
     compaction: Option<TerminalCompactionFailureContext<'a>>,
 }
 
@@ -152,6 +153,31 @@ struct InitialFollowUpContext<'a> {
     next_queue_sequence: &'a mut u64,
     pending_inputs: &'a mut VecDeque<AgentInput>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
+}
+
+struct QueueDispatchTerminalContext<'a> {
+    accepting_input: &'a Arc<AtomicBool>,
+    status_handle: &'a registry::AgentStatusHandle,
+    canonical_stream: &'a str,
+    event_log: &'a mut Vec<Envelope>,
+    replay_state: &'a mut AgentReplayState,
+    subscribers: &'a mut Vec<Stream>,
+    queue: &'a mut VecDeque<SequencedQueuedMessage>,
+    session_store: &'a Arc<Mutex<SessionStore>>,
+    transcript_store: &'a TranscriptStore,
+    context_compaction: &'a mut Option<CompactionFlight>,
+    activity_stats: &'a mut AgentActivityStatsTracker,
+    current_session_id: Option<&'a SessionId>,
+    pending_alias: &'a mut Option<InitialAgentAlias>,
+    current_start: &'a mut AgentStartPayload,
+    start_tx: &'a watch::Sender<AgentStartPayload>,
+    latest_output: &'a mut AgentControlLatestOutput,
+    pending_inputs: &'a mut VecDeque<AgentInput>,
+    rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
+    open_tool_call_ids: &'a mut HashSet<String>,
+    open_tool_call_names: &'a mut HashMap<String, String>,
+    pending_tool_response_ids: &'a mut HashSet<String>,
+    active_agent_await_ids: &'a mut HashSet<String>,
 }
 
 struct AgentNameChangeContext<'a> {
@@ -324,6 +350,10 @@ enum AgentCommand {
     },
     Close {
         reply: oneshot::Sender<()>,
+    },
+    #[cfg(feature = "test-support")]
+    ForceBackendShutdownForConformance {
+        reply: oneshot::Sender<bool>,
     },
     Attach {
         stream: Stream,
@@ -590,6 +620,7 @@ struct AgentReplayState {
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     recorded_message_senders: HashMap<ChatMessageId, MessageSender>,
     typing: bool,
+    operation_cancelled: bool,
     resume_history_settled_idle: bool,
     /// Position in the event_log of the single retained `ToolProgress`
     /// envelope per tool_call_id. Progress snapshots are coalesced
@@ -597,7 +628,9 @@ struct AgentReplayState {
     /// background tasks don't bloat the replay log. Safe because the
     /// event_log is append-only.
     progress_log_index: HashMap<String, usize>,
+    active_tool_progress: HashMap<String, protocol::ToolProgressData>,
     active_background_progress: HashMap<String, protocol::ToolProgressData>,
+    active_subagent_progress: HashMap<String, protocol::ToolProgressData>,
 }
 
 impl AgentReplayState {
@@ -776,6 +809,7 @@ impl CompletedStreamHistoryFilter {
     }
 }
 
+#[derive(Clone)]
 struct ReplayActiveStream {
     message_id: ChatMessageId,
     start: StreamStartData,
@@ -1835,6 +1869,19 @@ impl AgentHandle {
         reply_rx.await.is_ok()
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn force_backend_shutdown_for_conformance(&self) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ForceBackendShutdownForConformance { reply: reply_tx })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
     pub fn begin_attach(&self, stream: Stream) -> Option<oneshot::Receiver<bool>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -1859,8 +1906,18 @@ type StartupCompletionTestGates =
     std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;
 
 #[cfg(feature = "test-support")]
+type StartupBackendReadyTestGates =
+    std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;
+
+#[cfg(feature = "test-support")]
 fn startup_completion_test_gates() -> &'static StartupCompletionTestGates {
     static GATES: std::sync::OnceLock<StartupCompletionTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+fn startup_backend_ready_test_gates() -> &'static StartupBackendReadyTestGates {
+    static GATES: std::sync::OnceLock<StartupBackendReadyTestGates> = std::sync::OnceLock::new();
     GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1880,6 +1937,21 @@ pub(crate) fn install_startup_completion_test_gate(
 }
 
 #[cfg(feature = "test-support")]
+pub(crate) fn install_startup_backend_ready_test_gate(
+    agent_name: String,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    let replaced = startup_backend_ready_test_gates()
+        .lock()
+        .expect("startup backend-ready test gate mutex poisoned")
+        .insert(agent_name, gate);
+    assert!(
+        replaced.is_none(),
+        "startup backend-ready test gate already installed"
+    );
+}
+
+#[cfg(feature = "test-support")]
 async fn wait_for_startup_completion_test_gate(agent_name: &str) {
     let gate = startup_completion_test_gates()
         .lock()
@@ -1887,10 +1959,30 @@ async fn wait_for_startup_completion_test_gate(agent_name: &str) {
         .get(agent_name)
         .cloned();
     if let Some(gate) = gate {
+        eprintln!("TYDE STARTUP PRE-READY GATE ENTER name={agent_name}");
         crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+        eprintln!("TYDE STARTUP PRE-READY GATE RELEASE name={agent_name}");
         startup_completion_test_gates()
             .lock()
             .expect("startup completion test gate mutex poisoned")
+            .remove(agent_name);
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_startup_backend_ready_test_gate(agent_name: &str) {
+    let gate = startup_backend_ready_test_gates()
+        .lock()
+        .expect("startup backend-ready test gate mutex poisoned")
+        .get(agent_name)
+        .cloned();
+    if let Some(gate) = gate {
+        eprintln!("TYDE STARTUP READY GATE ENTER name={agent_name}");
+        crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+        eprintln!("TYDE STARTUP READY GATE RELEASE name={agent_name}");
+        startup_backend_ready_test_gates()
+            .lock()
+            .expect("startup backend-ready test gate mutex poisoned")
             .remove(agent_name);
     }
 }
@@ -1905,6 +1997,101 @@ fn notify_startup_name_stashed_test_gate(agent_name: &str) {
     if let Some(gate) = gate {
         crate::host::notify_spawn_operation_test_gate_inner(&gate);
     }
+}
+
+#[cfg(feature = "test-support")]
+type ResumeQueueDispatchTestGates =
+    std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;
+
+#[cfg(feature = "test-support")]
+fn resume_queue_dispatch_test_gates() -> &'static ResumeQueueDispatchTestGates {
+    static GATES: std::sync::OnceLock<ResumeQueueDispatchTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_resume_queue_dispatch_test_gate(
+    agent_name: String,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    let replaced = resume_queue_dispatch_test_gates()
+        .lock()
+        .expect("resume queue dispatch test gate mutex poisoned")
+        .insert(agent_name, gate);
+    assert!(
+        replaced.is_none(),
+        "resume queue dispatch test gate already installed"
+    );
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_resume_queue_dispatch_test_gate(agent_name: &str) {
+    let gate = resume_queue_dispatch_test_gates()
+        .lock()
+        .expect("resume queue dispatch test gate mutex poisoned")
+        .get(agent_name)
+        .cloned();
+    if let Some(gate) = gate {
+        crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+        resume_queue_dispatch_test_gates()
+            .lock()
+            .expect("resume queue dispatch test gate mutex poisoned")
+            .remove(agent_name);
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+async fn wait_for_resume_queue_dispatch_test_gate(_agent_name: &str) {}
+
+#[cfg(feature = "test-support")]
+async fn hold_resume_queue_dispatch_boundary(
+    agent_name: &str,
+    agent_id: &AgentId,
+    backend: &mut Option<BackendHandle>,
+    actor_tx: &mpsc::UnboundedSender<AgentCommand>,
+    rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+) -> bool {
+    let mut gate = Box::pin(wait_for_resume_queue_dispatch_test_gate(agent_name));
+    let mut deferred = Vec::new();
+    let mut forced_closed = false;
+    let mut rx_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            command = rx.recv(), if rx_open => {
+                match command {
+                    Some(AgentCommand::ForceBackendShutdownForConformance { reply }) => {
+                        let closed = if let Some(live_backend) = backend.take() {
+                            shutdown_backend_with_timeout(live_backend, agent_id).await;
+                            forced_closed = true;
+                            true
+                        } else {
+                            false
+                        };
+                        let _ = reply.send(closed);
+                    }
+                    Some(command) => deferred.push(command),
+                    None => rx_open = false,
+                }
+            }
+            () = &mut gate => break,
+        }
+    }
+    for command in deferred {
+        let _ = actor_tx.send(command);
+    }
+    forced_closed
+}
+
+#[cfg(not(feature = "test-support"))]
+async fn hold_resume_queue_dispatch_boundary(
+    _agent_name: &str,
+    _agent_id: &AgentId,
+    _backend: &mut Option<BackendHandle>,
+    _actor_tx: &mpsc::UnboundedSender<AgentCommand>,
+    _rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+) -> bool {
+    false
 }
 
 enum ActorLifecycle {
@@ -3004,8 +3191,25 @@ pub(crate) fn spawn_agent_actor(
                 resolved_spawn_config,
             },
         );
-        let mut queue = VecDeque::new();
-        let mut next_queue_sequence = 1_u64;
+        let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
+            session_store
+                .lock()
+                .await
+                .get(session_id)
+                .map(|record| record.queued_messages)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut queue = persisted_queue
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| SequencedQueuedMessage {
+                sequence: index as u64 + 1,
+                entry,
+            })
+            .collect::<VecDeque<_>>();
+        let mut next_queue_sequence = queue.len() as u64 + 1;
         let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
         // Checked deliveries this actor has already acknowledged as accepted
         // and parked in `pending_inputs` behind a gate — either the startup
@@ -3028,6 +3232,11 @@ pub(crate) fn spawn_agent_actor(
         );
         let starts_with_initial_turn = resume_session_id.is_none();
         let is_resume = resume_session_id.is_some();
+        let fork_source_session_id = fork_from_session_id.clone();
+        let resume_uses_authoritative_transcript = match resume_session_id.as_ref() {
+            Some(session_id) => transcript_is_authoritative(&transcript_store, session_id).await,
+            None => false,
+        };
 
         #[cfg(feature = "test-support")]
         let startup_gate_name = current_start.name.clone();
@@ -3036,6 +3245,15 @@ pub(crate) fn spawn_agent_actor(
             wait_for_startup_completion_test_gate(&startup_gate_name).await;
             #[cfg(test)]
             wait_for_agent_startup_test_gate(&agent_id).await;
+            let mcp_config_validation = if use_mock_backend {
+                Ok(())
+            } else {
+                validate_startup_mcp_configuration(&spawn_config.startup_mcp_servers).await
+            };
+            eprintln!(
+                "TYDE MCP CONFIG VALIDATION agent={} result={:?}",
+                agent_id, mcp_config_validation
+            );
             let startup_result: Result<
                 (
                     BackendHandle,
@@ -3044,7 +3262,9 @@ pub(crate) fn spawn_agent_actor(
                     Option<SendMessagePayload>,
                 ),
                 AgentStartupFailure,
-            > = if let Some(err) = startup_failure {
+            > = if let Err(error) = mcp_config_validation {
+                Err(AgentStartupFailure::backend_failed(error))
+            } else if let Some(err) = startup_failure {
                 Err(err)
             } else {
                 match resume_session_id {
@@ -3137,6 +3357,10 @@ pub(crate) fn spawn_agent_actor(
                     }
                 }
             };
+            #[cfg(feature = "test-support")]
+            if startup_result.is_ok() {
+                wait_for_startup_backend_ready_test_gate(&startup_gate_name).await;
+            }
             startup_result
         });
         let startup_cancellation_supported = backend_startup_drop_cancels_workers(backend_kind);
@@ -3158,10 +3382,20 @@ pub(crate) fn spawn_agent_actor(
                     };
                     match command {
                         AgentCommand::Interrupt { reply } => {
+                            tracing::debug!(
+                                agent_id = %current_start.agent_id,
+                                ?backend_kind,
+                                "interrupting agent during backend startup"
+                            );
                             let _ = reply.send(InterruptOutcome::Interrupted);
                             break Err(AgentStartupFailure::internal("agent startup interrupted"));
                         }
                         AgentCommand::Close { reply } => {
+                            tracing::debug!(
+                                agent_id = %current_start.agent_id,
+                                ?backend_kind,
+                                "closing agent during backend startup"
+                            );
                             accepting_input_task.store(false, Ordering::SeqCst);
                             status_handle
                                 .update(|status| {
@@ -3293,6 +3527,13 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(Ok(()));
                         }
                         AgentCommand::ResumeReplayBarrier { .. } => {}
+                        #[cfg(feature = "test-support")]
+                        AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                            let _ = reply.send(true);
+                            break Err(AgentStartupFailure::backend_failed(
+                                "agent backend owner died during startup",
+                            ));
+                        }
                     }
                 }
             }
@@ -3305,6 +3546,12 @@ pub(crate) fn spawn_agent_actor(
         let (backend, mut events, actor_session_id, initial_follow_up) = match startup_result {
             Ok(result) => result,
             Err(err) => {
+                eprintln!(
+                    "TYDE STARTUP FAILURE agent={} pending_attaches={} message={}",
+                    current_start.agent_id,
+                    pending_startup_attaches.len(),
+                    err.message
+                );
                 let _ = startup_tx.send(Err(err.message.clone()));
                 let payload = AgentErrorPayload {
                     agent_id: current_start.agent_id.clone(),
@@ -3337,6 +3584,7 @@ pub(crate) fn spawn_agent_actor(
                         replay_state: &mut replay_state,
                         subscribers: &mut subscribers,
                         queue: &mut queue,
+                        session_store: &session_store,
                         compaction: None,
                     },
                     &payload,
@@ -3368,6 +3616,11 @@ pub(crate) fn spawn_agent_actor(
                 return;
             }
         };
+        tracing::debug!(
+            agent_id = %current_start.agent_id,
+            ?backend_kind,
+            "agent backend startup completed"
+        );
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
@@ -3384,6 +3637,13 @@ pub(crate) fn spawn_agent_actor(
         let mut backend_typing = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
+        let mut open_tool_call_names: HashMap<String, String> = HashMap::new();
+        let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
+        let mut completed_tool_call_ids = if resume_uses_authoritative_transcript {
+            load_authoritative_completed_tool_call_ids(&transcript_store, &actor_session_id).await
+        } else {
+            HashSet::new()
+        };
         let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
@@ -3396,6 +3656,7 @@ pub(crate) fn spawn_agent_actor(
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = false;
+        let mut deferred_authoritative_resume_events = Vec::new();
         let mut pending_resume_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
         let mut resume_replay_barrier_task = None;
         if is_resume && let Some(barrier_rx) = events.take_resume_replay_complete() {
@@ -3453,6 +3714,38 @@ pub(crate) fn spawn_agent_actor(
             &current_start,
         )
         .await;
+        if resume_uses_authoritative_transcript
+            && let Err(error) = seed_existing_transcript_history(
+                &transcript_store,
+                &actor_session_id,
+                &canonical_stream,
+                &mut event_log,
+            )
+            .await
+        {
+            tracing::error!(
+                session_id = %actor_session_id,
+                %error,
+                "failed to seed authoritative resume transcript"
+            );
+        }
+        if let Some(source_session_id) = fork_source_session_id.as_ref()
+            && let Err(error) = seed_fork_transcript_history(
+                &transcript_store,
+                source_session_id,
+                &actor_session_id,
+                &canonical_stream,
+                &mut event_log,
+            )
+            .await
+        {
+            tracing::error!(
+                source_session_id = %source_session_id,
+                fork_session_id = %actor_session_id,
+                %error,
+                "failed to seed fork transcript history"
+            );
+        }
         upsert_activity_stats_snapshot(
             &canonical_stream,
             &mut event_log,
@@ -3510,6 +3803,7 @@ pub(crate) fn spawn_agent_actor(
             &mut event_log,
             &mut subscribers,
             &queue,
+            &session_store,
         )
         .await;
         if !resume_replay_gate_pending {
@@ -3616,6 +3910,9 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                         }
                         if resume_replay_gate_pending {
+                            event_log.retain(|event| event.kind != FrameKind::ChatEvent);
+                            replay_state = AgentReplayState::default();
+                            latest_output = AgentControlLatestOutput::default();
                             let payload = AgentErrorPayload {
                                 agent_id: current_start.agent_id.clone(),
                                 code: AgentErrorCode::BackendFailed,
@@ -3623,6 +3920,21 @@ pub(crate) fn spawn_agent_actor(
                                     .to_owned(),
                                 fatal: true,
                             };
+                            terminalize_live_activity(
+                                LiveActivityTerminalContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    open_tool_call_names: &mut open_tool_call_names,
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                },
+                                LiveActivityTerminalStatus::Failed,
+                                "agent backend closed before resume replay completed",
+                            )
+                            .await;
                             enter_terminal_failure(
                                 TerminalFailureContext {
                                     accepting_input: &accepting_input_task,
@@ -3632,6 +3944,7 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     queue: &mut queue,
+                                    session_store: &session_store,
                                     compaction: Some(TerminalCompactionFailureContext {
                                         flight: &mut context_compaction,
                                         session_store: &session_store,
@@ -3683,6 +3996,21 @@ pub(crate) fn spawn_agent_actor(
                                 shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
                             }
                             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                            terminalize_live_activity(
+                                LiveActivityTerminalContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    open_tool_call_names: &mut open_tool_call_names,
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                },
+                                LiveActivityTerminalStatus::Stopped,
+                                "agent closed",
+                            )
+                            .await;
                             finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                             return;
                         }
@@ -3692,6 +4020,21 @@ pub(crate) fn spawn_agent_actor(
                             message: "agent backend closed".to_owned(),
                             fatal: true,
                         };
+                        terminalize_live_activity(
+                            LiveActivityTerminalContext {
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                replay_state: &mut replay_state,
+                                subscribers: &mut subscribers,
+                                open_tool_call_ids: &mut open_tool_call_ids,
+                                open_tool_call_names: &mut open_tool_call_names,
+                                pending_tool_response_ids: &mut pending_tool_response_ids,
+                                active_agent_await_ids: &mut active_agent_await_ids,
+                            },
+                            LiveActivityTerminalStatus::Failed,
+                            "agent backend closed",
+                        )
+                        .await;
                         enter_terminal_failure(
                             TerminalFailureContext {
                                 accepting_input: &accepting_input_task,
@@ -3701,6 +4044,7 @@ pub(crate) fn spawn_agent_actor(
                                 replay_state: &mut replay_state,
                                 subscribers: &mut subscribers,
                                 queue: &mut queue,
+                                session_store: &session_store,
                                 compaction: Some(TerminalCompactionFailureContext {
                                     flight: &mut context_compaction,
                                     session_store: &session_store,
@@ -3730,6 +4074,19 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
+                    if resume_replay_gate_pending && resume_uses_authoritative_transcript {
+                        // The backend owns this barrier and closes it before it
+                        // accepts live conversation work. Chat events on its
+                        // pre-barrier side are provider replay even when their
+                        // normalized shape differs from the authoritative
+                        // journal; backend-only accounting can be newly
+                        // observed and must survive the gate.
+                        if matches!(event, BackendEvent::Chat(_)) {
+                            continue;
+                        }
+                        deferred_authoritative_resume_events.push(event);
+                        continue;
+                    }
                     let mut event = match event {
                         BackendEvent::Chat(event) => event,
                         BackendEvent::ModelRequestTokenUsage(usage) => {
@@ -3798,6 +4155,15 @@ pub(crate) fn spawn_agent_actor(
                         BackendEvent::Compaction(
                             crate::backend::BackendCompactionEvent::Observed(observed),
                         ) => {
+                            let belongs_to_requested_operation = observed.trigger
+                                == CompactionTrigger::BackendObservedManual
+                                && context_compaction.as_ref().is_some_and(|flight| {
+                                    matches!(
+                                        flight.state,
+                                        StoredCompactionState::NativeDispatchPossible
+                                            | StoredCompactionState::NativeAccepted
+                                    )
+                                });
                             let post_tokens = observed.metrics.after_tokens;
                             if let Some(session_id) = current_session_id.as_ref() {
                                 let session_id = session_id.clone();
@@ -3829,6 +4195,18 @@ pub(crate) fn spawn_agent_actor(
                                     activity_stats.snapshot(),
                                 )
                                 .await;
+                            }
+                            if belongs_to_requested_operation {
+                                eprintln!(
+                                    "TYDE COMPACTION CORRELATED observed={} operation={}",
+                                    observed.observation_id.0,
+                                    context_compaction
+                                        .as_ref()
+                                        .expect("correlated compaction flight disappeared")
+                                        .operation_id
+                                        .0,
+                                );
+                                continue;
                             }
                             let marker = ContextCompactionTimelineEvent {
                                 marker_id: observed.observation_id,
@@ -3868,6 +4246,10 @@ pub(crate) fn spawn_agent_actor(
                     if let Err(violation) =
                         validate_chat_event_stream_identity(&replay_state, &event)
                     {
+                        eprintln!(
+                            "TYDE RESUME IDENTITY VIOLATION agent={} violation={violation:?} event={event:?}",
+                            current_start.agent_id
+                        );
                         if last_stream_identity_violation != Some(violation) {
                             last_stream_identity_violation = Some(violation);
                             let error = stream_identity_violation_event(violation);
@@ -3908,18 +4290,20 @@ pub(crate) fn spawn_agent_actor(
                         last_stream_identity_violation = None;
                     }
                     if resume_replay_gate_pending {
-                        ingest_gated_replay_event(
-                            &mut event,
-                            &canonical_stream,
-                            &current_start.agent_id,
-                            &mut event_log,
-                            &mut subscribers,
-                            &mut replay_state,
-                            &mut activity_stats,
-                            &mut active_stream_text,
-                            &mut activity_event_seq,
-                        )
-                        .await;
+                        if !resume_uses_authoritative_transcript {
+                            ingest_gated_replay_event(
+                                &mut event,
+                                &canonical_stream,
+                                &current_start.agent_id,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut replay_state,
+                                &mut activity_stats,
+                                &mut active_stream_text,
+                                &mut activity_event_seq,
+                            )
+                            .await;
+                        }
                         continue;
                     }
                     // Any live backend event is observable turn progress, so it
@@ -4068,31 +4452,53 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::ToolRequest(request) => {
                             open_tool_call_ids.insert(request.tool_call_id.clone());
+                            open_tool_call_names.insert(
+                                request.tool_call_id.clone(),
+                                request.tool_name.clone(),
+                            );
+                            open_tool_requests
+                                .insert(request.tool_call_id.clone(), request.clone());
                             if matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::TydeAwaitAgents { .. }
                             ) {
                                 active_agent_await_ids.insert(request.tool_call_id.clone());
                             }
-                            let waiting_for_plan_approval = matches!(
-                                &request.tool_type,
-                                protocol::ToolRequestType::ExitPlanMode { .. }
-                            );
-                            if waiting_for_plan_approval {
+                            let pending_response_kind = match &request.tool_type {
+                                protocol::ToolRequestType::AskUserQuestion { .. } => {
+                                    Some(registry::PendingUserResponseKind::UserQuestion)
+                                }
+                                protocol::ToolRequestType::ExitPlanMode { .. } => {
+                                    Some(registry::PendingUserResponseKind::PlanApproval)
+                                }
+                                _ => None,
+                            };
+                            if pending_response_kind.is_some() {
                                 pending_tool_response_ids.insert(request.tool_call_id.clone());
                                 in_turn = true;
                                 idle_transition_armed = false;
                             }
                             status_handle.update(|s| {
-                                if waiting_for_plan_approval {
-                                    s.pending_user_response =
-                                        Some(registry::PendingUserResponseKind::PlanApproval);
+                                if let Some(pending_response_kind) = pending_response_kind {
+                                    s.pending_user_response = Some(pending_response_kind);
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
+                            if completed_tool_call_ids.contains(&completion.tool_call_id) {
+                                eprintln!(
+                                    "TYDE DUPLICATE TOOL COMPLETION DROPPED agent={} tool_call_id={} tool_name={}",
+                                    current_start.agent_id,
+                                    completion.tool_call_id,
+                                    completion.tool_name,
+                                );
+                                continue;
+                            }
+                            completed_tool_call_ids.insert(completion.tool_call_id.clone());
                             open_tool_call_ids.remove(&completion.tool_call_id);
+                            open_tool_call_names.remove(&completion.tool_call_id);
+                            open_tool_requests.remove(&completion.tool_call_id);
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
@@ -4260,6 +4666,21 @@ pub(crate) fn spawn_agent_actor(
                             .expect("backend must exist while closing a live actor");
                         shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
                         abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                        terminalize_live_activity(
+                            LiveActivityTerminalContext {
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                replay_state: &mut replay_state,
+                                subscribers: &mut subscribers,
+                                open_tool_call_ids: &mut open_tool_call_ids,
+                                open_tool_call_names: &mut open_tool_call_names,
+                                pending_tool_response_ids: &mut pending_tool_response_ids,
+                                active_agent_await_ids: &mut active_agent_await_ids,
+                            },
+                            LiveActivityTerminalStatus::Stopped,
+                            "agent closed",
+                        )
+                        .await;
                         finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                         return;
                     }
@@ -4343,6 +4764,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut event_log,
                             &mut subscribers,
                             &queue,
+                            &session_store,
                         )
                         .await;
                         in_turn = true;
@@ -4371,6 +4793,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &queue,
+                                    &session_store,
                                 )
                                 .await;
                             }
@@ -4389,6 +4812,21 @@ pub(crate) fn spawn_agent_actor(
                                     message: "agent backend closed".to_owned(),
                                     fatal: true,
                                 };
+                                terminalize_live_activity(
+                                    LiveActivityTerminalContext {
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        replay_state: &mut replay_state,
+                                        subscribers: &mut subscribers,
+                                        open_tool_call_ids: &mut open_tool_call_ids,
+                                        open_tool_call_names: &mut open_tool_call_names,
+                                        pending_tool_response_ids: &mut pending_tool_response_ids,
+                                        active_agent_await_ids: &mut active_agent_await_ids,
+                                    },
+                                    LiveActivityTerminalStatus::Failed,
+                                    &payload.message,
+                                )
+                                .await;
                                 enter_terminal_failure(
                                     TerminalFailureContext {
                                         accepting_input: &accepting_input_task,
@@ -4398,6 +4836,7 @@ pub(crate) fn spawn_agent_actor(
                                         replay_state: &mut replay_state,
                                         subscribers: &mut subscribers,
                                         queue: &mut queue,
+                                        session_store: &session_store,
                                         compaction: Some(TerminalCompactionFailureContext {
                                             flight: &mut context_compaction,
                                             session_store: &session_store,
@@ -4482,6 +4921,12 @@ pub(crate) fn spawn_agent_actor(
                             if !resume_replay_gate_pending {
                                 continue;
                             }
+                            tracing::info!(
+                                agent_id = %current_start.agent_id,
+                                replay_result = ?result,
+                                has_initial_follow_up = initial_follow_up.is_some(),
+                                "resume replay barrier settled"
+                            );
                             // Drain any replay events already buffered on the
                             // backend stream before closing the gate. The
                             // select! is unbiased, so the barrier command can be
@@ -4490,6 +4935,16 @@ pub(crate) fn spawn_agent_actor(
                             // now-ungated `events.recv()`) keeps the full resume
                             // transcript off the live broadcast path.
                             while let Ok(event) = events.try_recv_backend() {
+                                if resume_uses_authoritative_transcript {
+                                    // See the gated receive path above: the
+                                    // barrier, not event serialization, is the
+                                    // authoritative replay/live boundary.
+                                    if matches!(event, BackendEvent::Chat(_)) {
+                                        continue;
+                                    }
+                                    deferred_authoritative_resume_events.push(event);
+                                    continue;
+                                }
                                 match event {
                                     BackendEvent::Chat(mut event) => {
                                         ingest_gated_replay_event(
@@ -4571,8 +5026,12 @@ pub(crate) fn spawn_agent_actor(
                                     ) => {}
                                 }
                             }
+                            events.restore_backend_events(
+                                deferred_authoritative_resume_events.drain(..),
+                            );
                             if result.is_ok()
                                 && let Some(task_list) = persisted_resume_task_list.take()
+                                && !replay_log_latest_task_snapshot_is(&event_log, &task_list)
                             {
                                 let mut event = ChatEvent::TaskUpdate(task_list);
                                 ingest_gated_replay_event(
@@ -4634,6 +5093,7 @@ pub(crate) fn spawn_agent_actor(
                                     // next wait return before the turn starts.
                                     if initial_follow_up.is_none()
                                         && acknowledged_gated_deliveries == 0
+                                        && queue.is_empty()
                                     {
                                         publish_resumed_agent_idle(
                                             &status_handle,
@@ -4653,6 +5113,119 @@ pub(crate) fn spawn_agent_actor(
                                         &status_handle,
                                     )
                                     .await;
+                                    if initial_follow_up.is_none()
+                                        && acknowledged_gated_deliveries == 0
+                                        && !queue.is_empty()
+                                        && !compaction_blocked
+                                        && context_compaction.as_ref().is_none_or(|flight| {
+                                            queue.front().is_some_and(|queued| {
+                                                flight.admits_queue_sequence(queued.sequence)
+                                            })
+                                        })
+                                    {
+                                        let forced_closed =
+                                            hold_resume_queue_dispatch_boundary(
+                                                &current_start.name,
+                                                &current_start.agent_id,
+                                                &mut backend,
+                                                &actor_tx,
+                                                &mut rx,
+                                            )
+                                            .await;
+                                        let dispatch = if forced_closed {
+                                            QueuedMessageDispatchOutcome::Closed
+                                        } else {
+                                            dispatch_queued_message(
+                                                QueuedMessageDispatchContext {
+                                                    backend: backend.as_ref().expect(
+                                                        "backend must exist after replay barrier",
+                                                    ),
+                                                queue: &mut queue,
+                                                in_turn: &mut in_turn,
+                                                idle_transition_armed:
+                                                    &mut idle_transition_armed,
+                                                canonical_stream: &canonical_stream,
+                                                event_log: &mut event_log,
+                                                subscribers: &mut subscribers,
+                                                agent_id: &current_start.agent_id,
+                                                session_store: &session_store,
+                                                status_handle: &status_handle,
+                                                review_registry: &review_registry,
+                                                session_id: current_session_id.as_ref(),
+                                                },
+                                            )
+                                            .await
+                                        };
+                                        if dispatch == QueuedMessageDispatchOutcome::Closed {
+                                            let payload = AgentErrorPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                code: AgentErrorCode::Internal,
+                                                message: "agent backend closed".to_owned(),
+                                                fatal: true,
+                                            };
+                                            terminalize_live_activity(
+                                                LiveActivityTerminalContext {
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    open_tool_call_ids:
+                                                        &mut open_tool_call_ids,
+                                                    open_tool_call_names:
+                                                        &mut open_tool_call_names,
+                                                    pending_tool_response_ids:
+                                                        &mut pending_tool_response_ids,
+                                                    active_agent_await_ids:
+                                                        &mut active_agent_await_ids,
+                                                },
+                                                LiveActivityTerminalStatus::Failed,
+                                                &payload.message,
+                                            )
+                                            .await;
+                                            enter_terminal_failure(
+                                                TerminalFailureContext {
+                                                    accepting_input: &accepting_input_task,
+                                                    status_handle: &status_handle,
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    queue: &mut queue,
+                                                    session_store: &session_store,
+                                                    compaction: Some(
+                                                        TerminalCompactionFailureContext {
+                                                            flight: &mut context_compaction,
+                                                            session_store: &session_store,
+                                                            session_id: current_session_id
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "live agent must have session_id",
+                                                                ),
+                                                            start: &current_start,
+                                                            activity_stats: &mut activity_stats,
+                                                        },
+                                                    ),
+                                                },
+                                                &payload,
+                                            )
+                                            .await;
+                                            park_terminal_agent(
+                                                &session_store,
+                                                &transcript_store,
+                                                current_session_id.as_ref(),
+                                                &mut pending_alias,
+                                                &mut current_start,
+                                                &start_tx,
+                                                &mut event_log,
+                                                &mut latest_output,
+                                                &mut subscribers,
+                                                &mut pending_inputs,
+                                                &mut rx,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
                                     if let Some(input) = initial_follow_up.take()
                                         && !send_initial_follow_up_or_park(
                                             input,
@@ -4698,6 +5271,21 @@ pub(crate) fn spawn_agent_actor(
                                         ),
                                         fatal: true,
                                     };
+                                    terminalize_live_activity(
+                                        LiveActivityTerminalContext {
+                                            canonical_stream: &canonical_stream,
+                                            event_log: &mut event_log,
+                                            replay_state: &mut replay_state,
+                                            subscribers: &mut subscribers,
+                                            open_tool_call_ids: &mut open_tool_call_ids,
+                                            open_tool_call_names: &mut open_tool_call_names,
+                                            pending_tool_response_ids: &mut pending_tool_response_ids,
+                                            active_agent_await_ids: &mut active_agent_await_ids,
+                                        },
+                                        LiveActivityTerminalStatus::Failed,
+                                        &payload.message,
+                                    )
+                                    .await;
                                     enter_terminal_failure(
                                         TerminalFailureContext {
                                             accepting_input: &accepting_input_task,
@@ -4707,6 +5295,7 @@ pub(crate) fn spawn_agent_actor(
                                             replay_state: &mut replay_state,
                                             subscribers: &mut subscribers,
                                             queue: &mut queue,
+                                            session_store: &session_store,
                                             compaction: Some(TerminalCompactionFailureContext {
                                                 flight: &mut context_compaction,
                                                 session_store: &session_store,
@@ -4825,6 +5414,9 @@ pub(crate) fn spawn_agent_actor(
                             }
                             match input {
                                 AgentInput::SendMessage(msg) => {
+                                    let admitted_tool_response = msg.tool_response.clone();
+                                    let admitted_message = msg.message.clone();
+                                    let admitted_images = msg.images.clone();
                                     let review_origin = match msg.origin.as_ref() {
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
@@ -4837,9 +5429,108 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
                                         Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
                                     };
+                                    let stale_tool_response = matches!(
+                                        msg.tool_response.as_ref(),
+                                        Some(
+                                            protocol::SendMessageToolResponse::ExitPlanMode {
+                                                tool_call_id,
+                                                ..
+                                            }
+                                            | protocol::SendMessageToolResponse::AskUserQuestion {
+                                                tool_call_id,
+                                                ..
+                                            }
+                                        ) if !pending_tool_response_ids.contains(tool_call_id)
+                                    );
+                                    if stale_tool_response {
+                                        if !reject_agent_delivery(
+                                            delivery_ack.take(),
+                                            "tool response does not match a pending interaction",
+                                        ) {
+                                            let event = stale_tool_response_rejected_event();
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &event,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    let invalid_tool_response = msg
+                                        .tool_response
+                                        .as_ref()
+                                        .and_then(|response| {
+                                            let tool_call_id = match response {
+                                                protocol::SendMessageToolResponse::ExitPlanMode {
+                                                    tool_call_id,
+                                                    ..
+                                                }
+                                                | protocol::SendMessageToolResponse::AskUserQuestion {
+                                                    tool_call_id,
+                                                    ..
+                                                } => tool_call_id,
+                                            };
+                                            let request = open_tool_requests.get(tool_call_id)?;
+                                            match (response, &request.tool_type) {
+                                                (
+                                                    protocol::SendMessageToolResponse::AskUserQuestion {
+                                                        answer,
+                                                        ..
+                                                    },
+                                                    protocol::ToolRequestType::AskUserQuestion { .. },
+                                                ) if answer.trim().is_empty() => Some(
+                                                    "A question response must contain an answer",
+                                                ),
+                                                (
+                                                    protocol::SendMessageToolResponse::ExitPlanMode {
+                                                        decision: protocol::ExitPlanModeDecision::Approve,
+                                                        feedback: Some(_),
+                                                        ..
+                                                    },
+                                                    protocol::ToolRequestType::ExitPlanMode { .. },
+                                                ) => Some(
+                                                    "Plan approval cannot include rejection feedback",
+                                                ),
+                                                (
+                                                    protocol::SendMessageToolResponse::AskUserQuestion { .. },
+                                                    protocol::ToolRequestType::AskUserQuestion { .. },
+                                                )
+                                                | (
+                                                    protocol::SendMessageToolResponse::ExitPlanMode { .. },
+                                                    protocol::ToolRequestType::ExitPlanMode { .. },
+                                                ) => None,
+                                                _ => Some(
+                                                    "Tool response kind does not match the pending request",
+                                                ),
+                                            }
+                                        });
+                                    if let Some(message) = invalid_tool_response {
+                                        if !reject_agent_delivery(
+                                            delivery_ack.take(),
+                                            message,
+                                        ) {
+                                            let event = tool_response_rejected_event(message);
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &event,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
                                     let is_tool_response = msg.tool_response.is_some();
-                                    let plan_response = match msg.tool_response.as_ref() {
+                                    let clear_pending_response = match msg.tool_response.as_ref() {
                                         Some(protocol::SendMessageToolResponse::ExitPlanMode {
+                                            tool_call_id,
+                                            ..
+                                        }
+                                        | protocol::SendMessageToolResponse::AskUserQuestion {
                                             tool_call_id,
                                             ..
                                         }) if pending_tool_response_ids.contains(tool_call_id) => {
@@ -4892,6 +5583,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut event_log,
                                             &mut subscribers,
                                             &queue,
+                                            &session_store,
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
@@ -4954,6 +5646,7 @@ pub(crate) fn spawn_agent_actor(
                                                         &mut event_log,
                                                         &mut subscribers,
                                                         &queue,
+                                                        &session_store,
                                                     )
                                                     .await;
                                                     if let Some(reply) = delivery_ack.take() {
@@ -5015,6 +5708,21 @@ pub(crate) fn spawn_agent_actor(
                                                 message: "agent backend closed".to_owned(),
                                                 fatal: true,
                                             };
+                                            terminalize_live_activity(
+                                                LiveActivityTerminalContext {
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                                    open_tool_call_names: &mut open_tool_call_names,
+                                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                                },
+                                                LiveActivityTerminalStatus::Failed,
+                                                &payload.message,
+                                            )
+                                            .await;
                                             enter_terminal_failure(
                                                 TerminalFailureContext {
                                                     accepting_input: &accepting_input_task,
@@ -5024,6 +5732,7 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
+                                                    session_store: &session_store,
                                                     compaction: Some(TerminalCompactionFailureContext {
                                                         flight: &mut context_compaction,
                                                         session_store: &session_store,
@@ -5056,7 +5765,145 @@ pub(crate) fn spawn_agent_actor(
                                         if !is_tool_response {
                                             mark_agent_turn_active(&status_handle).await;
                                         }
-                                        if let Some(clear_pending_response) = plan_response {
+                                        if let Some(tool_response) = admitted_tool_response {
+                                            let tool_call_id = match &tool_response {
+                                                protocol::SendMessageToolResponse::AskUserQuestion {
+                                                    tool_call_id,
+                                                    ..
+                                                }
+                                                | protocol::SendMessageToolResponse::ExitPlanMode {
+                                                    tool_call_id,
+                                                    ..
+                                                } => tool_call_id.clone(),
+                                            };
+                                            let request = open_tool_requests
+                                                .remove(&tool_call_id)
+                                                .unwrap_or_else(|| {
+                                                    panic!(
+                                                        "admitted tool response lost request {tool_call_id}"
+                                                    )
+                                                });
+                                            let result = match (&tool_response, &request.tool_type) {
+                                                (
+                                                    protocol::SendMessageToolResponse::AskUserQuestion {
+                                                        answer,
+                                                        ..
+                                                    },
+                                                    protocol::ToolRequestType::AskUserQuestion { .. },
+                                                ) => serde_json::json!({ "answer": answer }),
+                                                (
+                                                    protocol::SendMessageToolResponse::ExitPlanMode {
+                                                        decision,
+                                                        feedback,
+                                                        ..
+                                                    },
+                                                    protocol::ToolRequestType::ExitPlanMode {
+                                                        plan,
+                                                        plan_path,
+                                                    },
+                                                ) => {
+                                                    let mut result = serde_json::Map::new();
+                                                    result.insert(
+                                                        "decision".to_owned(),
+                                                        serde_json::Value::String(
+                                                            match decision {
+                                                                protocol::ExitPlanModeDecision::Approve => "approved",
+                                                                protocol::ExitPlanModeDecision::Reject => "rejected",
+                                                            }
+                                                            .to_owned(),
+                                                        ),
+                                                    );
+                                                    if let Some(feedback) = feedback {
+                                                        result.insert(
+                                                            "feedback".to_owned(),
+                                                            serde_json::Value::String(feedback.clone()),
+                                                        );
+                                                    }
+                                                    if let Some(plan) = plan {
+                                                        result.insert(
+                                                            "plan".to_owned(),
+                                                            serde_json::Value::String(plan.clone()),
+                                                        );
+                                                    }
+                                                    if let Some(plan_path) = plan_path {
+                                                        result.insert(
+                                                            "plan_path".to_owned(),
+                                                            serde_json::Value::String(plan_path.clone()),
+                                                        );
+                                                    }
+                                                    serde_json::Value::Object(result)
+                                                }
+                                                _ => panic!(
+                                                    "tool response kind did not match request {request:?}"
+                                                ),
+                                            };
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &ChatEvent::MessageAdded(ChatMessage {
+                                                    message_id: None,
+                                                    timestamp: now_ms(),
+                                                    sender: MessageSender::User,
+                                                    content: admitted_message,
+                                                    reasoning: None,
+                                                    tool_calls: Vec::new(),
+                                                    model_info: None,
+                                                    token_usage: None,
+                                                    context_breakdown: None,
+                                                    images: admitted_images,
+                                                }),
+                                            )
+                                            .await;
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &ChatEvent::ToolExecutionCompleted(
+                                                    ToolExecutionCompletedData {
+                                                        tool_call_id: tool_call_id.clone(),
+                                                        tool_name: request.tool_name,
+                                                        tool_result: ToolExecutionResult::Other {
+                                                            result,
+                                                        },
+                                                        success: true,
+                                                        error: None,
+                                                        normalization_failure: None,
+                                                    },
+                                                ),
+                                            )
+                                            .await;
+                                            completed_tool_call_ids.insert(tool_call_id.clone());
+                                            mark_transcript_authoritative(
+                                                &transcript_store,
+                                                current_session_id.as_ref().expect(
+                                                    "live agent must have session_id",
+                                                ),
+                                            )
+                                            .await;
+                                            eprintln!(
+                                                "TYDE TOOL RESPONSE COMMIT session={} tool_call_id={} event_log_len={}",
+                                                current_session_id
+                                                    .as_ref()
+                                                    .expect("live agent must have session_id")
+                                                    .0,
+                                                tool_call_id,
+                                                event_log.len(),
+                                            );
+                                            open_tool_call_ids.remove(&tool_call_id);
+                                            open_tool_call_names.remove(&tool_call_id);
+                                            let completed_pending_response =
+                                                pending_tool_response_ids.remove(&tool_call_id);
+                                            if completed_pending_response
+                                                && pending_tool_response_ids.is_empty()
+                                                && in_turn
+                                            {
+                                                idle_transition_armed = true;
+                                            }
+                                        }
+                                        if let Some(clear_pending_response) = clear_pending_response {
                                             status_handle
                                                 .update(|s| {
                                                     if clear_pending_response {
@@ -5116,6 +5963,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
+                                        &session_store,
                                     )
                                     .await;
                                 }
@@ -5143,6 +5991,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
+                                        &session_store,
                                     )
                                     .await;
                                 }
@@ -5186,6 +6035,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
+                                        &session_store,
                                     )
                                     .await;
 
@@ -5244,6 +6094,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
+                                        &session_store,
                                     )
                                     .await;
                                     in_turn = true;
@@ -5268,6 +6119,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &queue,
+                                                &session_store,
                                             )
                                             .await;
                                         }
@@ -5286,6 +6138,21 @@ pub(crate) fn spawn_agent_actor(
                                                 message: "agent backend closed".to_owned(),
                                                 fatal: true,
                                             };
+                                            terminalize_live_activity(
+                                                LiveActivityTerminalContext {
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                                    open_tool_call_names: &mut open_tool_call_names,
+                                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                                },
+                                                LiveActivityTerminalStatus::Failed,
+                                                &payload.message,
+                                            )
+                                            .await;
                                             enter_terminal_failure(
                                                 TerminalFailureContext {
                                                     accepting_input: &accepting_input_task,
@@ -5295,6 +6162,7 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
+                                                    session_store: &session_store,
                                                     compaction: Some(TerminalCompactionFailureContext {
                                                         flight: &mut context_compaction,
                                                         session_store: &session_store,
@@ -5532,7 +6400,7 @@ pub(crate) fn spawn_agent_actor(
                                 Some(SupervisorVerdictStartRejection::SettingsChanged)
                             } else if live_status.terminated
                                 || live_status.is_active()
-                                || live_status.is_plan_approval_pending()
+                                || live_status.is_user_response_pending()
                                 || matches!(lifecycle, ActorLifecycle::Closing)
                                 || in_turn
                                 || !queue.is_empty()
@@ -5571,7 +6439,7 @@ pub(crate) fn spawn_agent_actor(
                             } else if live_status.terminated {
                                 AppendSupervisorWarningOutcome::Closed
                             } else if live_status.is_active()
-                                || live_status.is_plan_approval_pending()
+                                || live_status.is_user_response_pending()
                                 || matches!(lifecycle, ActorLifecycle::Closing)
                                 || in_turn
                                 || !queue.is_empty()
@@ -5625,7 +6493,7 @@ pub(crate) fn spawn_agent_actor(
                                 SupervisorStallInterruptOutcome::Closed
                             } else if !in_turn
                                 || !live_status.is_active()
-                                || live_status.is_plan_approval_pending()
+                                || live_status.is_user_response_pending()
                             {
                                 // Waiting on the user is not stalling, and the
                                 // clock restarts when that turn resumes.
@@ -6273,7 +7141,7 @@ pub(crate) fn spawn_agent_actor(
                                 &current_start.agent_id,
                             )
                             .await;
-                            release_context_compaction_barrier(
+                            let dispatch = release_context_compaction_barrier(
                                 backend
                                     .as_ref()
                                     .expect("prepared backend must be adopted"),
@@ -6284,8 +7152,42 @@ pub(crate) fn spawn_agent_actor(
                                 &mut event_log,
                                 &mut subscribers,
                                 &current_start.agent_id,
+                                &session_store,
+                                &status_handle,
+                                &review_registry,
+                                current_session_id.as_ref(),
                             )
                             .await;
+                            if dispatch == QueuedMessageDispatchOutcome::Closed {
+                                terminalize_closed_queue_dispatch(
+                                    QueueDispatchTerminalContext {
+                                        accepting_input: &accepting_input_task,
+                                        status_handle: &status_handle,
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        replay_state: &mut replay_state,
+                                        subscribers: &mut subscribers,
+                                        queue: &mut queue,
+                                        session_store: &session_store,
+                                        transcript_store: &transcript_store,
+                                        context_compaction: &mut context_compaction,
+                                        activity_stats: &mut activity_stats,
+                                        current_session_id: current_session_id.as_ref(),
+                                        pending_alias: &mut pending_alias,
+                                        current_start: &mut current_start,
+                                        start_tx: &start_tx,
+                                        latest_output: &mut latest_output,
+                                        pending_inputs: &mut pending_inputs,
+                                        rx: &mut rx,
+                                        open_tool_call_ids: &mut open_tool_call_ids,
+                                        open_tool_call_names: &mut open_tool_call_names,
+                                        pending_tool_response_ids: &mut pending_tool_response_ids,
+                                        active_agent_await_ids: &mut active_agent_await_ids,
+                                    },
+                                )
+                                .await;
+                                return;
+                            }
                         }
                         AgentCommand::ContextCompactionTerminal {
                             operation_id,
@@ -6396,7 +7298,7 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         if matches!(lifecycle, ActorLifecycle::Running) {
-                                            release_context_compaction_barrier(
+                                            let dispatch = release_context_compaction_barrier(
                                                 backend.as_ref().expect(
                                                     "backend must exist while releasing compaction",
                                                 ),
@@ -6407,8 +7309,50 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &current_start.agent_id,
+                                                &session_store,
+                                                &status_handle,
+                                                &review_registry,
+                                                current_session_id.as_ref(),
                                             )
                                             .await;
+                                            if dispatch
+                                                == QueuedMessageDispatchOutcome::Closed
+                                            {
+                                                terminalize_closed_queue_dispatch(
+                                                    QueueDispatchTerminalContext {
+                                                        accepting_input: &accepting_input_task,
+                                                        status_handle: &status_handle,
+                                                        canonical_stream: &canonical_stream,
+                                                        event_log: &mut event_log,
+                                                        replay_state: &mut replay_state,
+                                                        subscribers: &mut subscribers,
+                                                        queue: &mut queue,
+                                                        session_store: &session_store,
+                                                        transcript_store: &transcript_store,
+                                                        context_compaction:
+                                                            &mut context_compaction,
+                                                        activity_stats: &mut activity_stats,
+                                                        current_session_id:
+                                                            current_session_id.as_ref(),
+                                                        pending_alias: &mut pending_alias,
+                                                        current_start: &mut current_start,
+                                                        start_tx: &start_tx,
+                                                        latest_output: &mut latest_output,
+                                                        pending_inputs: &mut pending_inputs,
+                                                        rx: &mut rx,
+                                                        open_tool_call_ids:
+                                                            &mut open_tool_call_ids,
+                                                        open_tool_call_names:
+                                                            &mut open_tool_call_names,
+                                                        pending_tool_response_ids:
+                                                            &mut pending_tool_response_ids,
+                                                        active_agent_await_ids:
+                                                            &mut active_agent_await_ids,
+                                                    },
+                                                )
+                                                .await;
+                                                return;
+                                            }
                                         }
                                         continue;
                                     }
@@ -6536,7 +7480,7 @@ pub(crate) fn spawn_agent_actor(
                                 idle_transition_armed = false;
                             }
                             if matches!(lifecycle, ActorLifecycle::Running) {
-                                release_context_compaction_barrier(
+                                let dispatch = release_context_compaction_barrier(
                                     backend
                                         .as_ref()
                                         .expect("backend must exist while releasing compaction"),
@@ -6547,8 +7491,43 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
+                                    &session_store,
+                                    &status_handle,
+                                    &review_registry,
+                                    current_session_id.as_ref(),
                                 )
                                 .await;
+                                if dispatch == QueuedMessageDispatchOutcome::Closed {
+                                    terminalize_closed_queue_dispatch(
+                                        QueueDispatchTerminalContext {
+                                            accepting_input: &accepting_input_task,
+                                            status_handle: &status_handle,
+                                            canonical_stream: &canonical_stream,
+                                            event_log: &mut event_log,
+                                            replay_state: &mut replay_state,
+                                            subscribers: &mut subscribers,
+                                            queue: &mut queue,
+                                            session_store: &session_store,
+                                            transcript_store: &transcript_store,
+                                            context_compaction: &mut context_compaction,
+                                            activity_stats: &mut activity_stats,
+                                            current_session_id: current_session_id.as_ref(),
+                                            pending_alias: &mut pending_alias,
+                                            current_start: &mut current_start,
+                                            start_tx: &start_tx,
+                                            latest_output: &mut latest_output,
+                                            pending_inputs: &mut pending_inputs,
+                                            rx: &mut rx,
+                                            open_tool_call_ids: &mut open_tool_call_ids,
+                                            open_tool_call_names: &mut open_tool_call_names,
+                                            pending_tool_response_ids:
+                                                &mut pending_tool_response_ids,
+                                            active_agent_await_ids: &mut active_agent_await_ids,
+                                        },
+                                    )
+                                    .await;
+                                    return;
+                                }
                             }
                         }
                         AgentCommand::CompactIfInactive {
@@ -6799,24 +7778,33 @@ pub(crate) fn spawn_agent_actor(
                             limit,
                             reply,
                         } => {
-                            let window = authoritative_session_history_window(
-                                &transcript_store,
-                                current_session_id
-                                    .as_ref()
-                                    .expect("live agent must have session_id"),
-                                before_seq,
-                                limit,
-                                replay_state.active_completed_stream_history_filter(),
-                            )
-                            .await
-                            .unwrap_or_else(|| {
+                            let window = if before_seq.is_some() {
                                 session_history_window(
                                     &event_log,
                                     before_seq,
                                     limit,
                                     Some(&replay_state),
                                 )
-                            });
+                            } else {
+                                authoritative_session_history_window(
+                                    &transcript_store,
+                                    current_session_id
+                                        .as_ref()
+                                        .expect("live agent must have session_id"),
+                                    before_seq,
+                                    limit,
+                                    replay_state.active_completed_stream_history_filter(),
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    session_history_window(
+                                        &event_log,
+                                        before_seq,
+                                        limit,
+                                        Some(&replay_state),
+                                    )
+                                })
+                            };
                             let _ = reply.send(window);
                         }
                         AgentCommand::ReadActivityHistory {
@@ -6844,6 +7832,11 @@ pub(crate) fn spawn_agent_actor(
                             ));
                         }
                         AgentCommand::Interrupt { reply } => {
+                            tracing::debug!(
+                                agent_id = %current_start.agent_id,
+                                ?backend_kind,
+                                "interrupting active agent"
+                            );
                             // A closing agent is still running, and interrupting
                             // it is exactly what ends the turn the close is
                             // waiting on. Reporting `NotRunning` here used to
@@ -6916,6 +7909,75 @@ pub(crate) fn spawn_agent_actor(
                             };
                             let _ = reply.send(outcome);
                         }
+                        #[cfg(feature = "test-support")]
+                        AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                            let Some(live_backend) = backend.take() else {
+                                let _ = reply.send(false);
+                                continue;
+                            };
+                            shutdown_backend_with_timeout(live_backend, &current_start.agent_id)
+                                .await;
+                            terminalize_live_activity(
+                                LiveActivityTerminalContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    open_tool_call_names: &mut open_tool_call_names,
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                },
+                                LiveActivityTerminalStatus::Failed,
+                                "backend transport closed",
+                            )
+                            .await;
+                            let _ = reply.send(true);
+                            let payload = AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(),
+                                code: AgentErrorCode::BackendFailed,
+                                message: "agent backend transport closed".to_owned(),
+                                fatal: true,
+                            };
+                            enter_terminal_failure(
+                                TerminalFailureContext {
+                                    accepting_input: &accepting_input_task,
+                                    status_handle: &status_handle,
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    queue: &mut queue,
+                                    session_store: &session_store,
+                                    compaction: Some(TerminalCompactionFailureContext {
+                                        flight: &mut context_compaction,
+                                        session_store: &session_store,
+                                        session_id: current_session_id
+                                            .as_ref()
+                                            .expect("live agent must have session_id"),
+                                        start: &current_start,
+                                        activity_stats: &mut activity_stats,
+                                    }),
+                                },
+                                &payload,
+                            )
+                            .await;
+                            park_terminal_agent(
+                                &session_store,
+                                &transcript_store,
+                                current_session_id.as_ref(),
+                                &mut pending_alias,
+                                &mut current_start,
+                                &start_tx,
+                                &mut event_log,
+                                &mut latest_output,
+                                &mut subscribers,
+                                &mut pending_inputs,
+                                &mut rx,
+                            )
+                            .await;
+                            return;
+                        }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -6972,6 +8034,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &queue,
+                                    &session_store,
                                 )
                                 .await;
                             }
@@ -6988,6 +8051,21 @@ pub(crate) fn spawn_agent_actor(
                                     .expect("backend must exist while closing a live actor");
                                 shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
                                 abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                                terminalize_live_activity(
+                                    LiveActivityTerminalContext {
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        replay_state: &mut replay_state,
+                                        subscribers: &mut subscribers,
+                                        open_tool_call_ids: &mut open_tool_call_ids,
+                                        open_tool_call_names: &mut open_tool_call_names,
+                                        pending_tool_response_ids: &mut pending_tool_response_ids,
+                                        active_agent_await_ids: &mut active_agent_await_ids,
+                                    },
+                                    LiveActivityTerminalStatus::Stopped,
+                                    "agent closed",
+                                )
+                                .await;
                                 finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                                 return;
                             }
@@ -6997,11 +8075,16 @@ pub(crate) fn spawn_agent_actor(
                             // `tyde_await_agents` is the common case — so the
                             // idle transition this close needs may never come
                             // on its own. Interrupt first, then bound the wait.
-                            if !backend
-                                .as_ref()
-                                .expect("backend must exist while closing a live actor")
-                                .interrupt()
-                                .await
+                            let interrupted = tokio::time::timeout(
+                                CLOSE_TURN_GRACE,
+                                backend
+                                    .as_ref()
+                                    .expect("backend must exist while closing a live actor")
+                                    .interrupt(),
+                            )
+                            .await
+                            .unwrap_or(false);
+                            if !interrupted
                             {
                                 tracing::warn!(
                                     agent_id = %current_start.agent_id,
@@ -7012,6 +8095,11 @@ pub(crate) fn spawn_agent_actor(
                                 Some(tokio::time::Instant::now() + CLOSE_TURN_GRACE);
                         }
                         AgentCommand::Attach { stream, reply } => {
+                            tracing::debug!(
+                                agent_id = %current_start.agent_id,
+                                stream = %stream.path(),
+                                "attaching stream to active agent"
+                            );
                             if resume_replay_gate_pending {
                                 pending_resume_attaches.push((stream, reply));
                                 continue;
@@ -7045,6 +8133,21 @@ pub(crate) fn spawn_agent_actor(
                         shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
                     }
                     abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                    terminalize_live_activity(
+                        LiveActivityTerminalContext {
+                            canonical_stream: &canonical_stream,
+                            event_log: &mut event_log,
+                            replay_state: &mut replay_state,
+                            subscribers: &mut subscribers,
+                            open_tool_call_ids: &mut open_tool_call_ids,
+                            open_tool_call_names: &mut open_tool_call_names,
+                            pending_tool_response_ids: &mut pending_tool_response_ids,
+                            active_agent_await_ids: &mut active_agent_await_ids,
+                        },
+                        LiveActivityTerminalStatus::Stopped,
+                        "agent closed",
+                    )
+                    .await;
                     finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                     return;
                 }
@@ -7073,7 +8176,11 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
     // backend explicitly cancels or reaps work after its returned future drops.
     matches!(
         backend_kind,
-        BackendKind::Claude | BackendKind::Codex | BackendKind::Tycode
+        BackendKind::Claude
+            | BackendKind::Codex
+            | BackendKind::Acp
+            | BackendKind::Hermes
+            | BackendKind::Tycode
     )
 }
 
@@ -7368,7 +8475,10 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut current_start = start;
         let mut pending_alias = None;
         let mut in_turn = false;
+        let mut open_tool_call_ids: HashSet<String> = HashSet::new();
+        let mut open_tool_call_names: HashMap<String, String> = HashMap::new();
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
+        let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut close_deadline: Option<tokio::time::Instant> = None;
@@ -7476,8 +8586,34 @@ pub(crate) fn spawn_relay_agent_actor(
                             let reply = close_reply
                                 .take()
                                 .expect("close requested without pending close reply");
+                            terminalize_live_activity(
+                                LiveActivityTerminalContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    open_tool_call_names: &mut open_tool_call_names,
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                },
+                                LiveActivityTerminalStatus::Stopped,
+                                "agent closed",
+                            )
+                            .await;
                             finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                             return;
+                        }
+                        if status_handle.snapshot().await.is_active() {
+                            let idle = ChatEvent::TypingStatusChanged(false);
+                            append_chat_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut replay_state,
+                                &idle,
+                            )
+                            .await;
                         }
                         accepting_input_task.store(false, Ordering::SeqCst);
                         replay_state.clear_active_stream();
@@ -7606,6 +8742,17 @@ pub(crate) fn spawn_relay_agent_actor(
                             }).await;
                         }
                         ChatEvent::ToolRequest(request) => {
+                            open_tool_call_ids.insert(request.tool_call_id.clone());
+                            open_tool_call_names.insert(
+                                request.tool_call_id.clone(),
+                                request.tool_name.clone(),
+                            );
+                            if matches!(
+                                &request.tool_type,
+                                protocol::ToolRequestType::TydeAwaitAgents { .. }
+                            ) {
+                                active_agent_await_ids.insert(request.tool_call_id.clone());
+                            }
                             let waiting_for_plan_approval = matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::ExitPlanMode { .. }
@@ -7622,6 +8769,9 @@ pub(crate) fn spawn_relay_agent_actor(
                             }).await;
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
+                            open_tool_call_ids.remove(&completion.tool_call_id);
+                            open_tool_call_names.remove(&completion.tool_call_id);
+                            active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
                             status_handle.update(|s| {
@@ -7683,6 +8833,21 @@ pub(crate) fn spawn_relay_agent_actor(
                         let reply = close_reply
                             .take()
                             .expect("close requested without pending close reply");
+                        terminalize_live_activity(
+                            LiveActivityTerminalContext {
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                replay_state: &mut replay_state,
+                                subscribers: &mut subscribers,
+                                open_tool_call_ids: &mut open_tool_call_ids,
+                                open_tool_call_names: &mut open_tool_call_names,
+                                pending_tool_response_ids: &mut pending_tool_response_ids,
+                                active_agent_await_ids: &mut active_agent_await_ids,
+                            },
+                            LiveActivityTerminalStatus::Stopped,
+                            "agent closed",
+                        )
+                        .await;
                         finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                         return;
                     }
@@ -7825,22 +8990,31 @@ pub(crate) fn spawn_relay_agent_actor(
                             limit,
                             reply,
                         } => {
-                            let window = authoritative_session_history_window(
-                                &transcript_store,
-                                &session_id,
-                                before_seq,
-                                limit,
-                                replay_state.active_completed_stream_history_filter(),
-                            )
-                            .await
-                            .unwrap_or_else(|| {
+                            let window = if before_seq.is_some() {
                                 session_history_window(
                                     &event_log,
                                     before_seq,
                                     limit,
                                     Some(&replay_state),
                                 )
-                            });
+                            } else {
+                                authoritative_session_history_window(
+                                    &transcript_store,
+                                    &session_id,
+                                    before_seq,
+                                    limit,
+                                    replay_state.active_completed_stream_history_filter(),
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    session_history_window(
+                                        &event_log,
+                                        before_seq,
+                                        limit,
+                                        Some(&replay_state),
+                                    )
+                                })
+                            };
                             let _ = reply.send(window);
                         }
                         AgentCommand::ReadActivityHistory {
@@ -7883,6 +9057,21 @@ pub(crate) fn spawn_relay_agent_actor(
                                 let reply = close_reply
                                     .take()
                                     .expect("close requested without pending close reply");
+                                terminalize_live_activity(
+                                    LiveActivityTerminalContext {
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        replay_state: &mut replay_state,
+                                        subscribers: &mut subscribers,
+                                        open_tool_call_ids: &mut open_tool_call_ids,
+                                        open_tool_call_names: &mut open_tool_call_names,
+                                        pending_tool_response_ids: &mut pending_tool_response_ids,
+                                        active_agent_await_ids: &mut active_agent_await_ids,
+                                    },
+                                    LiveActivityTerminalStatus::Stopped,
+                                    "agent closed",
+                                )
+                                .await;
                                 finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                                 return;
                             }
@@ -7893,6 +9082,39 @@ pub(crate) fn spawn_relay_agent_actor(
                             // for good.
                             close_deadline =
                                 Some(tokio::time::Instant::now() + CLOSE_TURN_GRACE);
+                        }
+                        #[cfg(feature = "test-support")]
+                        AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle
+                                .update(|status| {
+                                    status.terminated = true;
+                                    status.is_thinking = false;
+                                    status.turn_completed = true;
+                                    status.pending_user_response = None;
+                                    status.last_error = Some(
+                                        "backend-native child transport closed".to_owned(),
+                                    );
+                                    status.activity_counter =
+                                        status.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                            let payload = AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(),
+                                code: AgentErrorCode::BackendFailed,
+                                message: "backend-native child transport closed".to_owned(),
+                                fatal: true,
+                            };
+                            append_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                FrameKind::AgentError,
+                                &payload,
+                            )
+                            .await;
+                            let _ = reply.send(true);
+                            return;
                         }
                         AgentCommand::Attach { stream, reply } => {
                             let attached = attach_subscriber_with_latest_output(
@@ -7918,6 +9140,21 @@ pub(crate) fn spawn_relay_agent_actor(
                         grace_ms = CLOSE_TURN_GRACE.as_millis(),
                         "relay turn did not settle after close; forcing shutdown"
                     );
+                    terminalize_live_activity(
+                        LiveActivityTerminalContext {
+                            canonical_stream: &canonical_stream,
+                            event_log: &mut event_log,
+                            replay_state: &mut replay_state,
+                            subscribers: &mut subscribers,
+                            open_tool_call_ids: &mut open_tool_call_ids,
+                            open_tool_call_names: &mut open_tool_call_names,
+                            pending_tool_response_ids: &mut pending_tool_response_ids,
+                            active_agent_await_ids: &mut active_agent_await_ids,
+                        },
+                        LiveActivityTerminalStatus::Stopped,
+                        "agent closed",
+                    )
+                    .await;
                     finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                     return;
                 }
@@ -8133,6 +9370,25 @@ fn compaction_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
     }
 }
 
+fn stale_tool_response_rejected_event() -> ChatEvent {
+    tool_response_rejected_event("No matching pending tool request for this response")
+}
+
+fn tool_response_rejected_event(message: &str) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Error,
+        content: message.to_owned(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
 fn push_summary_capped(summary: &mut String, text: &str, max_summary_bytes: usize) {
     let remaining = max_summary_bytes.saturating_sub(summary.len());
     if remaining == 0 {
@@ -8236,6 +9492,7 @@ async fn enter_terminal_failure(
         context.event_log,
         context.subscribers,
         context.queue,
+        context.session_store,
     )
     .await;
     append_event(
@@ -8246,6 +9503,160 @@ async fn enter_terminal_failure(
         payload,
     )
     .await;
+}
+
+#[derive(Clone, Copy)]
+enum LiveActivityTerminalStatus {
+    Failed,
+    Stopped,
+}
+
+struct LiveActivityTerminalContext<'a> {
+    canonical_stream: &'a str,
+    event_log: &'a mut Vec<Envelope>,
+    replay_state: &'a mut AgentReplayState,
+    subscribers: &'a mut Vec<Stream>,
+    open_tool_call_ids: &'a mut HashSet<String>,
+    open_tool_call_names: &'a mut HashMap<String, String>,
+    pending_tool_response_ids: &'a mut HashSet<String>,
+    active_agent_await_ids: &'a mut HashSet<String>,
+}
+
+async fn terminalize_live_activity(
+    mut context: LiveActivityTerminalContext<'_>,
+    status: LiveActivityTerminalStatus,
+    message: &str,
+) {
+    let canonical_stream = context.canonical_stream;
+    let event_log = &mut context.event_log;
+    let replay_state = &mut context.replay_state;
+    let subscribers = &mut context.subscribers;
+    let open_tool_call_ids = &mut context.open_tool_call_ids;
+    let open_tool_call_names = &mut context.open_tool_call_names;
+    let pending_tool_response_ids = &mut context.pending_tool_response_ids;
+    let active_agent_await_ids = &mut context.active_agent_await_ids;
+    if let Some(active) = replay_state.active_stream.clone() {
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &synthesized_end_for_abandoned_stream(&active),
+        )
+        .await;
+    }
+
+    let open_tools = open_tool_call_names.drain().collect::<Vec<_>>();
+    for (tool_call_id, tool_name) in open_tools {
+        open_tool_call_ids.remove(&tool_call_id);
+        pending_tool_response_ids.remove(&tool_call_id);
+        let tool_result = match status {
+            LiveActivityTerminalStatus::Failed => ToolExecutionResult::Error {
+                short_message: message.to_owned(),
+                detailed_message: message.to_owned(),
+            },
+            LiveActivityTerminalStatus::Stopped => ToolExecutionResult::Cancelled {
+                message: message.to_owned(),
+            },
+        };
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                tool_call_id,
+                tool_name,
+                tool_result,
+                success: false,
+                error: Some(message.to_owned()),
+                normalization_failure: None,
+            }),
+        )
+        .await;
+    }
+    open_tool_call_ids.clear();
+    pending_tool_response_ids.clear();
+    active_agent_await_ids.clear();
+
+    let active_progress = replay_state
+        .active_tool_progress
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for mut progress in active_progress {
+        match &mut progress.update {
+            protocol::ToolProgressUpdate::BackgroundTask(task) => {
+                task.status = match status {
+                    LiveActivityTerminalStatus::Failed => protocol::BackgroundTaskStatus::Failed,
+                    LiveActivityTerminalStatus::Stopped => protocol::BackgroundTaskStatus::Stopped,
+                };
+                task.summary = Some(message.to_owned());
+            }
+            protocol::ToolProgressUpdate::SubAgent(child) => {
+                child.completed = true;
+                child.status = match status {
+                    LiveActivityTerminalStatus::Failed => protocol::SubAgentProgressStatus::Failed,
+                    LiveActivityTerminalStatus::Stopped => {
+                        protocol::SubAgentProgressStatus::Stopped
+                    }
+                };
+            }
+            protocol::ToolProgressUpdate::Workflow(workflow) => {
+                workflow.status = protocol::WorkflowRunStatus::Failed;
+            }
+            protocol::ToolProgressUpdate::AgentControl(control) => {
+                control.status = match status {
+                    LiveActivityTerminalStatus::Failed => {
+                        protocol::AgentControlProgressStatus::Failed
+                    }
+                    LiveActivityTerminalStatus::Stopped => {
+                        protocol::AgentControlProgressStatus::Stopped
+                    }
+                };
+            }
+            protocol::ToolProgressUpdate::Other { status: opaque, .. } => {
+                *opaque = match status {
+                    LiveActivityTerminalStatus::Failed => {
+                        protocol::OpaqueToolProgressStatus::Failed
+                    }
+                    LiveActivityTerminalStatus::Stopped => {
+                        protocol::OpaqueToolProgressStatus::Stopped
+                    }
+                };
+            }
+        }
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::ToolProgress(progress),
+        )
+        .await;
+    }
+    if replay_state.typing {
+        if !replay_state.operation_cancelled {
+            append_chat_event(
+                canonical_stream,
+                event_log,
+                subscribers,
+                replay_state,
+                &ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                    message: message.to_owned(),
+                }),
+            )
+            .await;
+        }
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .await;
+    }
 }
 
 async fn next_agent_command(
@@ -8334,21 +9745,26 @@ async fn park_terminal_agent(
                 limit,
                 reply,
             } => {
-                let authoritative = match session_id {
-                    Some(session_id) => {
-                        authoritative_session_history_window(
-                            transcript_store,
-                            session_id,
-                            before_seq,
-                            limit,
-                            None,
-                        )
-                        .await
-                    }
-                    None => None,
+                let window = if before_seq.is_some() {
+                    session_history_window(event_log, before_seq, limit, None)
+                } else {
+                    let authoritative = match session_id {
+                        Some(session_id) => {
+                            authoritative_session_history_window(
+                                transcript_store,
+                                session_id,
+                                before_seq,
+                                limit,
+                                None,
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+                    authoritative.unwrap_or_else(|| {
+                        session_history_window(event_log, before_seq, limit, None)
+                    })
                 };
-                let window = authoritative
-                    .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -8450,6 +9866,10 @@ async fn park_terminal_agent(
             AgentCommand::Interrupt { reply } => {
                 let _ = reply.send(InterruptOutcome::NotRunning);
             }
+            #[cfg(feature = "test-support")]
+            AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                let _ = reply.send(false);
+            }
         }
     }
 }
@@ -8531,15 +9951,19 @@ async fn park_relay_terminal_agent(
                 limit,
                 reply,
             } => {
-                let window = authoritative_session_history_window(
-                    transcript_store,
-                    session_id,
-                    before_seq,
-                    limit,
-                    None,
-                )
-                .await
-                .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None));
+                let window = if before_seq.is_some() {
+                    session_history_window(event_log, before_seq, limit, None)
+                } else {
+                    authoritative_session_history_window(
+                        transcript_store,
+                        session_id,
+                        before_seq,
+                        limit,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|| session_history_window(event_log, before_seq, limit, None))
+                };
                 let _ = reply.send(window);
             }
             AgentCommand::ReadActivityHistory {
@@ -8651,6 +10075,10 @@ async fn park_relay_terminal_agent(
                 )
                 .await;
                 let _ = reply.send(InterruptOutcome::Rejected);
+            }
+            #[cfg(feature = "test-support")]
+            AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                let _ = reply.send(false);
             }
         }
     }
@@ -8987,6 +10415,7 @@ async fn persist_agent_session(
             current_start.custom_agent_id.clone(),
             current_start.launch_profile_id.clone(),
         )?;
+        store.set_access_mode(session_id, resolved_spawn_config.access_mode)?;
         store.set_session_settings(session_id, current_session_settings.clone())?;
         if let Some(alias) = pending_alias.take() {
             match alias.persistence {
@@ -9134,15 +10563,40 @@ async fn append_chat_event_with_transcript_metadata(
     }
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event)
         .expect("preflighted replay event remains valid");
-    let provider_identities =
-        transcript_provider_identities(event_log, replay_len_before, transcript_metadata);
-    journal_new_replay_records(
-        canonical_stream,
-        event_log,
-        replay_len_before,
-        provider_identities,
-    )
-    .await;
+    if event_log.len() == replay_len_before
+        && replay_state.active_stream.is_none()
+        && matches!(event, ChatEvent::ToolProgress(_))
+    {
+        // The bounded in-memory replay log replaces progress snapshots in
+        // place. The durable transcript is append-only, so persist the new
+        // state as its own revision rather than mistaking an unchanged vector
+        // length for "nothing happened". A revision intentionally has no
+        // provider identity: several states of one tool share the provider's
+        // tool id and must not deduplicate each other.
+        let revision = replay_envelope(
+            canonical_stream,
+            event_log.len() as u64,
+            FrameKind::ChatEvent,
+            event,
+        );
+        journal_new_replay_records(
+            canonical_stream,
+            std::slice::from_ref(&revision),
+            0,
+            HashMap::new(),
+        )
+        .await;
+    } else {
+        let provider_identities =
+            transcript_provider_identities(event_log, replay_len_before, transcript_metadata);
+        journal_new_replay_records(
+            canonical_stream,
+            event_log,
+            replay_len_before,
+            provider_identities,
+        )
+        .await;
+    }
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
 }
 
@@ -9205,6 +10659,118 @@ fn register_transcript_session(
         );
 }
 
+async fn seed_fork_transcript_history(
+    store: &TranscriptStore,
+    source_session_id: &SessionId,
+    fork_session_id: &SessionId,
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+) -> Result<(), String> {
+    if !store.actor_io_enabled() {
+        return Ok(());
+    }
+    let store_for_load = store.clone();
+    let source_for_load = source_session_id.clone();
+    let source_records = tokio::task::spawn_blocking(move || store_for_load.load(&source_for_load))
+        .await
+        .map_err(|error| format!("fork transcript load task failed: {error}"))??;
+    let mut fork_records = Vec::new();
+    for source in source_records.into_iter().filter(|record| {
+        matches!(
+            record.visibility,
+            crate::store::transcript::TranscriptVisibility::Visible
+                | crate::store::transcript::TranscriptVisibility::TimelineMarker
+        )
+    }) {
+        let sequence = event_log.len() as u64;
+        event_log.push(replay_envelope(
+            canonical_stream,
+            sequence,
+            FrameKind::ChatEvent,
+            &source.event,
+        ));
+        fork_records.push(crate::store::transcript::TranscriptRecord {
+            logical_session_id: fork_session_id.clone(),
+            sequence,
+            event_id: format!("fork:{}:{}", source_session_id.0, source.event_id),
+            visibility: source.visibility,
+            provider_identity: source.provider_identity,
+            event: source.event,
+            timestamp_ms: source.timestamp_ms,
+        });
+    }
+    let store_for_write = store.clone();
+    let fork_for_write = fork_session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        for record in &fork_records {
+            store_for_write.append_import_if_missing(record)?;
+        }
+        store_for_write.mark_authoritative(&fork_for_write)
+    })
+    .await
+    .map_err(|error| format!("fork transcript write task failed: {error}"))?
+}
+
+async fn seed_existing_transcript_history(
+    store: &TranscriptStore,
+    session_id: &SessionId,
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+) -> Result<(), String> {
+    if !store.actor_io_enabled() {
+        return Ok(());
+    }
+    let store_for_load = store.clone();
+    let session_for_load = session_id.clone();
+    let records = tokio::task::spawn_blocking(move || store_for_load.load(&session_for_load))
+        .await
+        .map_err(|error| format!("resume transcript load task failed: {error}"))??;
+    for record in records.into_iter().filter(|record| {
+        matches!(
+            record.visibility,
+            crate::store::transcript::TranscriptVisibility::Visible
+                | crate::store::transcript::TranscriptVisibility::TimelineMarker
+        )
+    }) {
+        event_log.push(replay_envelope(
+            canonical_stream,
+            event_log.len() as u64,
+            FrameKind::ChatEvent,
+            &record.event,
+        ));
+    }
+    Ok(())
+}
+
+async fn load_authoritative_completed_tool_call_ids(
+    store: &TranscriptStore,
+    session_id: &SessionId,
+) -> HashSet<String> {
+    if !store.actor_io_enabled() {
+        return HashSet::new();
+    }
+    let store = store.clone();
+    let session_id = session_id.clone();
+    let records = match tokio::task::spawn_blocking(move || store.load(&session_id)).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to load authoritative transcript dedupe state");
+            return HashSet::new();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "authoritative transcript dedupe task failed");
+            return HashSet::new();
+        }
+    };
+    let mut completed_tool_call_ids = HashSet::new();
+    for record in records {
+        if let ChatEvent::ToolExecutionCompleted(completion) = &record.event {
+            completed_tool_call_ids.insert(completion.tool_call_id.clone());
+        }
+    }
+    completed_tool_call_ids
+}
+
 async fn journal_new_replay_records(
     canonical_stream: &str,
     event_log: &[Envelope],
@@ -9235,7 +10801,7 @@ async fn journal_new_replay_records(
                     crate::store::transcript::TranscriptVisibility::TimelineMarker,
                 ),
                 _ => (
-                    format!("{}:{}", envelope.seq, envelope.kind),
+                    uuid::Uuid::new_v4().to_string(),
                     crate::store::transcript::TranscriptVisibility::Visible,
                 ),
             };
@@ -9253,9 +10819,19 @@ async fn journal_new_replay_records(
     if records.is_empty() {
         return;
     }
+    let persistence_session_id = session_id.clone();
     let persistence = tokio::task::spawn_blocking(move || {
-        for record in &records {
-            store.append_import_if_missing(record)?;
+        let mut next_sequence = store
+            .load(&persistence_session_id)?
+            .into_iter()
+            .map(|record| record.sequence)
+            .max()
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        for mut record in records {
+            record.sequence = next_sequence;
+            if store.append_import_if_missing(&record)? {
+                next_sequence = next_sequence.saturating_add(1);
+            }
         }
         Ok::<(), String>(())
     })
@@ -9395,6 +10971,10 @@ async fn send_initial_follow_up_or_park(
     input: SendMessagePayload,
     context: InitialFollowUpContext<'_>,
 ) -> bool {
+    tracing::info!(
+        agent_id = %context.current_start.agent_id,
+        "dispatching initial resumed-session follow-up"
+    );
     *context.in_turn = true;
     *context.idle_transition_armed = false;
     match context
@@ -9405,6 +10985,10 @@ async fn send_initial_follow_up_or_park(
         .await
     {
         SendOutcome::Accepted => {
+            tracing::info!(
+                agent_id = %context.current_start.agent_id,
+                "initial resumed-session follow-up accepted by backend"
+            );
             mark_agent_turn_active(context.status_handle).await;
             return true;
         }
@@ -9425,6 +11009,7 @@ async fn send_initial_follow_up_or_park(
                     context.event_log,
                     context.subscribers,
                     context.queue,
+                    context.session_store,
                 )
                 .await;
             } else {
@@ -9453,6 +11038,7 @@ async fn send_initial_follow_up_or_park(
             replay_state: context.replay_state,
             subscribers: context.subscribers,
             queue: context.queue,
+            session_store: context.session_store,
             compaction: None,
         },
         &payload,
@@ -9473,6 +11059,67 @@ async fn send_initial_follow_up_or_park(
     )
     .await;
     false
+}
+
+async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext<'_>) {
+    let payload = AgentErrorPayload {
+        agent_id: context.current_start.agent_id.clone(),
+        code: AgentErrorCode::BackendFailed,
+        message: "agent backend closed while dispatching a queued message".to_owned(),
+        fatal: true,
+    };
+    terminalize_live_activity(
+        LiveActivityTerminalContext {
+            canonical_stream: context.canonical_stream,
+            event_log: context.event_log,
+            replay_state: context.replay_state,
+            subscribers: context.subscribers,
+            open_tool_call_ids: context.open_tool_call_ids,
+            open_tool_call_names: context.open_tool_call_names,
+            pending_tool_response_ids: context.pending_tool_response_ids,
+            active_agent_await_ids: context.active_agent_await_ids,
+        },
+        LiveActivityTerminalStatus::Failed,
+        &payload.message,
+    )
+    .await;
+    enter_terminal_failure(
+        TerminalFailureContext {
+            accepting_input: context.accepting_input,
+            status_handle: context.status_handle,
+            canonical_stream: context.canonical_stream,
+            event_log: context.event_log,
+            replay_state: context.replay_state,
+            subscribers: context.subscribers,
+            queue: context.queue,
+            session_store: context.session_store,
+            compaction: context.current_session_id.map(|session_id| {
+                TerminalCompactionFailureContext {
+                    flight: context.context_compaction,
+                    session_store: context.session_store,
+                    session_id,
+                    start: &*context.current_start,
+                    activity_stats: context.activity_stats,
+                }
+            }),
+        },
+        &payload,
+    )
+    .await;
+    park_terminal_agent(
+        context.session_store,
+        context.transcript_store,
+        context.current_session_id,
+        context.pending_alias,
+        context.current_start,
+        context.start_tx,
+        context.event_log,
+        context.latest_output,
+        context.subscribers,
+        context.pending_inputs,
+        context.rx,
+    )
+    .await;
 }
 
 async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
@@ -9751,6 +11398,30 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::ToolProgress(data) => {
+            let running = match &data.update {
+                protocol::ToolProgressUpdate::SubAgent(state) => {
+                    state.status == protocol::SubAgentProgressStatus::Running && !state.completed
+                }
+                protocol::ToolProgressUpdate::Workflow(state) => {
+                    state.status == protocol::WorkflowRunStatus::Running
+                }
+                protocol::ToolProgressUpdate::AgentControl(state) => {
+                    state.status == protocol::AgentControlProgressStatus::Running
+                }
+                protocol::ToolProgressUpdate::BackgroundTask(state) => {
+                    state.status == protocol::BackgroundTaskStatus::Running
+                }
+                protocol::ToolProgressUpdate::Other { status, .. } => {
+                    *status == protocol::OpaqueToolProgressStatus::Running
+                }
+            };
+            if running {
+                replay_state
+                    .active_tool_progress
+                    .insert(data.tool_call_id.clone(), data.clone());
+            } else {
+                replay_state.active_tool_progress.remove(&data.tool_call_id);
+            }
             if let protocol::ToolProgressUpdate::BackgroundTask(task) = &data.update {
                 if task.status == protocol::BackgroundTaskStatus::Running {
                     replay_state
@@ -9760,6 +11431,17 @@ fn record_chat_event_for_replay(
                     replay_state
                         .active_background_progress
                         .remove(&data.tool_call_id);
+                }
+            }
+            if let protocol::ToolProgressUpdate::SubAgent(child) = &data.update {
+                if child.completed {
+                    replay_state
+                        .active_subagent_progress
+                        .remove(&data.tool_call_id);
+                } else {
+                    replay_state
+                        .active_subagent_progress
+                        .insert(data.tool_call_id.clone(), data.clone());
                 }
             }
             if let Some(active) = replay_state.active_stream.as_mut() {
@@ -9786,6 +11468,7 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::OperationCancelled(_) => {
+            replay_state.operation_cancelled = true;
             if let Some(stream) = replay_state.active_stream.take() {
                 replay_state
                     .terminal_stream_message_ids
@@ -9811,6 +11494,7 @@ fn record_chat_event_for_replay(
         ChatEvent::TypingStatusChanged(typing) => {
             replay_state.typing = *typing;
             if *typing {
+                replay_state.operation_cancelled = false;
                 replay_state.resume_history_settled_idle = false;
             }
             if !typing {
@@ -10134,6 +11818,24 @@ fn push_chat_event_to_replay_log(
     event_log.push(envelope);
 }
 
+fn replay_log_latest_task_snapshot_is(
+    event_log: &[Envelope],
+    expected: &protocol::TaskList,
+) -> bool {
+    let expected = serde_json::to_value(expected).expect("serialize persisted task snapshot");
+    event_log
+        .iter()
+        .rev()
+        .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+        .find_map(
+            |envelope| match envelope.parse_payload::<ChatEvent>().ok()? {
+                ChatEvent::TaskUpdate(tasks) => serde_json::to_value(tasks).ok(),
+                _ => None,
+            },
+        )
+        .is_some_and(|tasks| tasks == expected)
+}
+
 fn replay_envelope<T: serde::Serialize>(
     canonical_stream: &str,
     seq: u64,
@@ -10255,18 +11957,6 @@ fn agent_usage_snapshot_from_tracker(
         usage,
         model,
     }
-}
-
-#[cfg(test)]
-pub(crate) fn task_usage_scope_from_chat_events_for_test(
-    backend_kind: BackendKind,
-    events: impl IntoIterator<Item = ChatEvent>,
-) -> TaskTokenUsageScope {
-    let mut tracker = AgentActivityStatsTracker::for_backend(backend_kind);
-    for (source_seq, mut event) in events.into_iter().enumerate() {
-        tracker.observe_chat_event(&mut event, source_seq as u64, "");
-    }
-    tracker.usage_snapshot().0
 }
 
 fn agent_usage_snapshot_from_log(
@@ -10445,7 +12135,10 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
             (!text.is_empty())
                 .then(|| format!("Assistant finished: {}", cap_activity_text(text, 1200)))
         }
-        ChatEvent::ToolRequest(request) => Some(format!("Tool requested: {}", request.tool_name)),
+        ChatEvent::ToolRequest(request) => Some(format!(
+            "Tool requested: {} [{}]",
+            request.tool_name, request.tool_call_id
+        )),
         ChatEvent::ToolProgress(progress) => Some(format!("Tool progress: {}", progress.tool_name)),
         ChatEvent::ToolExecutionCompleted(completion) => Some(format!(
             "Tool {} {}",
@@ -10510,10 +12203,26 @@ async fn update_queued_messages_snapshot(
     event_log: &mut Vec<Envelope>,
     subscribers: &mut Vec<Stream>,
     queue: &VecDeque<SequencedQueuedMessage>,
+    session_store: &Arc<Mutex<SessionStore>>,
 ) {
     let payload = QueuedMessagesPayload {
         messages: queue.iter().map(|queued| queued.entry.clone()).collect(),
     };
+    if let Some(session_id) = event_log.iter().find_map(|event| {
+        (event.kind == FrameKind::AgentStart)
+            .then(|| event.parse_payload::<AgentStartPayload>().ok())
+            .flatten()
+            .and_then(|start| start.session_id)
+    }) {
+        let messages = payload.messages.clone();
+        if let Err(error) = session_store
+            .lock()
+            .await
+            .update(&session_id, |record| record.queued_messages = messages)
+        {
+            tracing::error!(%session_id, %error, "failed to persist queued messages");
+        }
+    }
     let value =
         serde_json::to_value(&payload).expect("failed to serialize queued messages payload");
 
@@ -10725,41 +12434,127 @@ async fn release_context_compaction_barrier(
     event_log: &mut Vec<Envelope>,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
-) {
+    session_store: &Arc<Mutex<SessionStore>>,
+    status_handle: &registry::AgentStatusHandle,
+    review_registry: &ReviewRegistryHandle,
+    session_id: Option<&SessionId>,
+) -> QueuedMessageDispatchOutcome {
     if *in_turn {
-        return;
+        return QueuedMessageDispatchOutcome::Empty;
     }
-    let Some(queued) = queue.pop_front() else {
-        return;
+    dispatch_queued_message(QueuedMessageDispatchContext {
+        backend,
+        queue,
+        in_turn,
+        idle_transition_armed,
+        canonical_stream,
+        event_log,
+        subscribers,
+        agent_id,
+        session_store,
+        status_handle,
+        review_registry,
+        session_id,
+    })
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedMessageDispatchOutcome {
+    Empty,
+    Accepted,
+    Busy,
+    Closed,
+}
+
+struct QueuedMessageDispatchContext<'a> {
+    backend: &'a BackendHandle,
+    queue: &'a mut VecDeque<SequencedQueuedMessage>,
+    in_turn: &'a mut bool,
+    idle_transition_armed: &'a mut bool,
+    canonical_stream: &'a str,
+    event_log: &'a mut Vec<Envelope>,
+    subscribers: &'a mut Vec<Stream>,
+    agent_id: &'a AgentId,
+    session_store: &'a Arc<Mutex<SessionStore>>,
+    status_handle: &'a registry::AgentStatusHandle,
+    review_registry: &'a ReviewRegistryHandle,
+    session_id: Option<&'a SessionId>,
+}
+
+async fn dispatch_queued_message(
+    context: QueuedMessageDispatchContext<'_>,
+) -> QueuedMessageDispatchOutcome {
+    let Some(queued) = context.queue.pop_front() else {
+        return QueuedMessageDispatchOutcome::Empty;
     };
-    update_queued_messages_snapshot(canonical_stream, event_log, subscribers, queue).await;
-    *in_turn = true;
-    *idle_transition_armed = false;
-    match backend
+    let review_id = match queued.origin.as_ref() {
+        Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
+        _ => None,
+    };
+    update_queued_messages_snapshot(
+        context.canonical_stream,
+        context.event_log,
+        context.subscribers,
+        context.queue,
+        context.session_store,
+    )
+    .await;
+    *context.in_turn = true;
+    *context.idle_transition_armed = false;
+    match context
+        .backend
         .send_with_outcome(AgentInput::SendMessage(queued.clone().into_send_payload()))
         .await
     {
-        SendOutcome::Accepted => {}
-        SendOutcome::Busy(_) => {
-            queue.push_front(queued);
-            update_queued_messages_snapshot(canonical_stream, event_log, subscribers, queue).await;
+        SendOutcome::Accepted => {
+            eprintln!(
+                "TYDE RESUME QUEUE DISPATCH agent={} session={} queued_message_id={}",
+                context.agent_id,
+                context
+                    .session_id
+                    .map_or("<none>", |session_id| session_id.0.as_str()),
+                queued.id,
+            );
+            mark_agent_turn_active(context.status_handle).await;
+            if let Some(review_id) = review_id {
+                notify_review_bundle_consumed(context.review_registry, review_id, context.agent_id)
+                    .await;
+            }
+            QueuedMessageDispatchOutcome::Accepted
         }
-        SendOutcome::Closed => {
-            *in_turn = false;
-            append_event(
-                canonical_stream,
-                event_log,
-                subscribers,
-                FrameKind::AgentError,
-                &AgentErrorPayload {
-                    agent_id: agent_id.clone(),
-                    code: AgentErrorCode::Internal,
-                    message: "agent backend closed while releasing the compaction barrier"
-                        .to_owned(),
-                    fatal: true,
-                },
+        SendOutcome::Busy(_) => {
+            eprintln!(
+                "TYDE RESUME QUEUE BUSY agent={} session={} queued_message_id={}",
+                context.agent_id,
+                context
+                    .session_id
+                    .map_or("<none>", |session_id| session_id.0.as_str()),
+                queued.id,
+            );
+            context.queue.push_front(queued);
+            update_queued_messages_snapshot(
+                context.canonical_stream,
+                context.event_log,
+                context.subscribers,
+                context.queue,
+                context.session_store,
             )
             .await;
+            mark_agent_turn_active(context.status_handle).await;
+            QueuedMessageDispatchOutcome::Busy
+        }
+        SendOutcome::Closed => {
+            *context.in_turn = false;
+            eprintln!(
+                "TYDE RESUME QUEUE CLOSED agent={} session={} queued_message_id={}",
+                context.agent_id,
+                context
+                    .session_id
+                    .map_or("<none>", |session_id| session_id.0.as_str()),
+                queued.id,
+            );
+            QueuedMessageDispatchOutcome::Closed
         }
     }
 }
@@ -11330,14 +13125,13 @@ fn attach_subscriber_with_latest_output(
                 .into_iter()
                 .map(AgentBootstrapEvent::ChatEvent),
         );
-        let mut active_background_progress = replay_state
-            .active_background_progress
+        let mut active_tool_progress = replay_state
+            .active_tool_progress
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        active_background_progress
-            .sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
-        for progress in active_background_progress {
+        active_tool_progress.sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
+        for progress in active_tool_progress {
             let already_included = events.iter().any(|event| {
                 matches!(
                     event,
@@ -11593,7 +13387,11 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
                 if prompt.is_some()
                     && matches!(action.to_ascii_lowercase().as_str(), "spawn" | "spawnagent")
                 {
-                    request.tool_type = ToolRequestType::AgentSpawn { prompt, name };
+                    request.tool_type = ToolRequestType::AgentSpawn {
+                        prompt,
+                        name,
+                        execution_mode: protocol::AgentExecutionMode::Background,
+                    };
                 } else {
                     request.tool_type = ToolRequestType::Other {
                         args: serde_json::json!({
@@ -11608,7 +13406,20 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
                     .find_map(|key| nonempty_json_string(args, key));
                 let name = nonempty_json_string(args, "description")
                     .or_else(|| nonempty_json_string(args, "subagent_type"));
-                request.tool_type = ToolRequestType::AgentSpawn { prompt, name };
+                let execution_mode = if args
+                    .get("run_in_background")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    protocol::AgentExecutionMode::Background
+                } else {
+                    protocol::AgentExecutionMode::Foreground
+                };
+                request.tool_type = ToolRequestType::AgentSpawn {
+                    prompt,
+                    name,
+                    execution_mode,
+                };
             }
         }
         ChatEvent::ToolExecutionCompleted(completion) => {
@@ -13301,6 +15112,10 @@ mod tests {
                             stream,
                         );
                         let _ = reply.send(attached);
+                    }
+                    #[cfg(feature = "test-support")]
+                    AgentCommand::ForceBackendShutdownForConformance { reply } => {
+                        let _ = reply.send(false);
                     }
                     AgentCommand::SetName { reply, .. } => {
                         let _ = reply.send(false);
@@ -15906,7 +17721,7 @@ mod tests {
         assert!(matches!(
             &events[0],
             ChatEvent::ToolRequest(protocol::ToolRequest {
-                tool_type: ToolRequestType::AgentSpawn { prompt, name }, ..
+                tool_type: ToolRequestType::AgentSpawn { prompt, name, .. }, ..
             }) if prompt.as_deref() == Some("Inspect authentication")
                 && name.as_deref() == Some("Auth investigator")
         ));

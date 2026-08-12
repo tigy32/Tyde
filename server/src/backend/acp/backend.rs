@@ -24,11 +24,11 @@ use crate::acp::{
     extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
-    AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+    AgentName, RetryAttemptPayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
     BackendStartupError, SessionCommand, StartupMcpServer, backend_fork_unsupported_message,
-    render_combined_spawn_instructions,
+    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
@@ -38,6 +38,24 @@ pub(crate) const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
 pub(crate) const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const KIRO_PROMPT_MAX_RETRIES: u64 = 5;
+
+fn kiro_prompt_error_is_retryable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "dispatch failure",
+        "response stream",
+        "connection reset",
+        "connection closed",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "transport",
+        "network",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
 
 #[derive(Clone, Copy, Debug)]
 enum KiroSchemaProbeStage {
@@ -77,9 +95,7 @@ struct KiroSpawnMode<'a> {
 /// Build the adapter for the built-in Kiro agent.
 ///
 /// `program_override` points the adapter at a specific binary; `None` lets it
-/// resolve `kiro-cli-chat` as a sibling of `kiro-cli`. Tests use the override
-/// to substitute a fake ACP agent, which means they exercise the same
-/// adapter-driven spawn path as production.
+/// resolve `kiro-cli-chat` as a sibling of `kiro-cli`.
 fn kiro_adapter(program_override: Option<String>) -> Arc<dyn AcpAgentAdapter> {
     adapter_for_spec(&protocol::AcpAgentSpec {
         command: program_override.unwrap_or_default(),
@@ -547,6 +563,7 @@ impl KiroSession {
                 replaying_history: false,
                 replay_session_id: None,
                 replay_next_event_ordinal: 0,
+                replay_assistant_message_count: 0,
                 replay_assistant_identity: None,
                 replay_assistant_text: String::new(),
                 replay_assistant_reasoning: String::new(),
@@ -615,6 +632,7 @@ struct KiroState {
     replaying_history: bool,
     replay_session_id: Option<String>,
     replay_next_event_ordinal: u64,
+    replay_assistant_message_count: u64,
     replay_assistant_identity: Option<KiroReplayMessageIdentity>,
     replay_assistant_text: String,
     replay_assistant_reasoning: String,
@@ -765,8 +783,19 @@ struct PendingToolCompletion {
 pub(crate) struct KiroToolContext {
     tool_name: String,
     pub(crate) tool_type: Value,
+    is_mcp_tool: bool,
     request_emitted: bool,
     pending_completion: Option<PendingToolCompletion>,
+}
+
+fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bool {
+    servers.iter().any(|server| {
+        let marker = format!("@{}/", server.name);
+        tool_name
+            .split_whitespace()
+            .any(|part| part.contains(&marker))
+            || tool_name.contains(&marker)
+    })
 }
 
 struct KiroInner {
@@ -780,6 +809,41 @@ struct KiroInner {
 }
 
 impl KiroInner {
+    async fn request_prompt_with_retry(&self, params: Value) -> Result<Value, String> {
+        let mut attempt = 0u64;
+        loop {
+            match self.bridge.request("session/prompt", params.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt < KIRO_PROMPT_MAX_RETRIES
+                        && kiro_prompt_error_is_retryable(&error) =>
+                {
+                    if self.state.lock().await.cancelled {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                    let backoff_ms = 250u64
+                        .saturating_mul(1u64 << attempt.saturating_sub(1))
+                        .min(2_000);
+                    eprintln!(
+                        "TYDE KIRO PROMPT RETRY attempt={attempt} max_retries={KIRO_PROMPT_MAX_RETRIES} backoff_ms={backoff_ms} error={error}"
+                    );
+                    self.emitter.retry_attempt(RetryAttemptPayload {
+                        attempt,
+                        max_retries: KIRO_PROMPT_MAX_RETRIES,
+                        error: &error,
+                        backoff_ms,
+                    });
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    if self.state.lock().await.cancelled {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
@@ -836,7 +900,7 @@ impl KiroInner {
 
                 self.state.lock().await.cancelled = false;
 
-                let response = match self.bridge.request("session/prompt", params).await {
+                let response = match self.request_prompt_with_retry(params).await {
                     Ok(value) => value,
                     Err(err) => {
                         // CancelConversation sets `cancelled = true` before sending
@@ -1133,6 +1197,8 @@ impl KiroInner {
             state.provider_turn_quarantined = false;
             state.replay_session_id = Some(session_id.clone());
             state.replay_next_event_ordinal = 0;
+            state.replay_assistant_message_count = 0;
+            state.idless_message_ordinal = 0;
             state.replay_assistant_identity = None;
             state.replay_assistant_text.clear();
             state.replay_assistant_reasoning.clear();
@@ -1230,6 +1296,15 @@ impl KiroInner {
                 ));
             }
             state.session_id = session_id;
+            state.idless_message_ordinal = state
+                .idless_message_ordinal
+                .max(state.replay_assistant_message_count);
+            tracing::debug!(
+                session_id = %state.session_id,
+                replay_assistant_message_count = state.replay_assistant_message_count,
+                next_idless_message_ordinal = state.idless_message_ordinal,
+                "Seeded ACP idless live-message identity after replay"
+            );
             if let Some(model) = extract_current_model(&response) {
                 state.model = Some(model);
             }
@@ -1270,6 +1345,7 @@ impl KiroInner {
         }
 
         self.bridge.shutdown().await;
+        self.emitter.close("ACP session closed");
     }
 
     async fn handle_inbound(&self, inbound: AcpInbound) {
@@ -1314,6 +1390,7 @@ impl KiroInner {
     async fn handle_notification(&self, method: &str, params: &Value) {
         match method {
             "session/update" => {
+                tracing::debug!(?params, "ACP session/update notification");
                 if !self.accept_replay_notification_session(params).await {
                     return;
                 }
@@ -1491,7 +1568,7 @@ impl KiroInner {
         }
 
         self.flush_replay_assistant_message().await;
-        self.emitter.user_message(&text, Vec::new());
+        self.emitter.user_message(&text, None);
         self.state
             .lock()
             .await
@@ -1602,7 +1679,11 @@ impl KiroInner {
                     first_event,
                     event_ordinal,
                 ) {
-                    Ok(identity) => identity,
+                    Ok(identity) => {
+                        state.replay_assistant_message_count =
+                            state.replay_assistant_message_count.saturating_add(1);
+                        identity
+                    }
                     Err(error) => {
                         state.replay_error = Some(error);
                         return;
@@ -1830,7 +1911,13 @@ impl KiroInner {
             .await;
             return;
         };
-        let workspace_root = self.state.lock().await.workspace_root.clone();
+        let (workspace_root, is_mcp_tool) = {
+            let state = self.state.lock().await;
+            (
+                state.workspace_root.clone(),
+                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
+            )
+        };
         let tool_type = self
             .map_tool_request(params, &request.args, &workspace_root)
             .await;
@@ -1850,6 +1937,7 @@ impl KiroInner {
                 KiroToolContext {
                     tool_name: request.tool_name.clone(),
                     tool_type: tool_type.clone(),
+                    is_mcp_tool,
                     request_emitted: true,
                     pending_completion: None,
                 },
@@ -1919,15 +2007,23 @@ impl KiroInner {
             };
 
             completion.tool_name = context.tool_name.clone();
+            completion.is_mcp_tool = context.is_mcp_tool;
             let tool_result = self
                 .adapter
                 .map_tool_result(&completion, Some(&context.tool_type));
+            let (success, error) = normalize_mapped_tool_outcome(
+                &completion.tool_call_id,
+                &completion.tool_name,
+                &tool_result,
+                completion.success,
+                completion.error.clone(),
+            );
             let output = (
                 completion.tool_call_id.clone(),
                 completion.tool_name.clone(),
                 tool_result,
-                completion.success,
-                completion.error.clone(),
+                success,
+                error,
             );
 
             state.active_tool_contexts.remove(&completion.tool_call_id);
@@ -1983,11 +2079,16 @@ impl KiroInner {
                 .await;
             return;
         }
-        let workspace_root = self.state.lock().await.workspace_root.clone();
+        let (workspace_root, is_mcp_tool) = {
+            let state = self.state.lock().await;
+            (
+                state.workspace_root.clone(),
+                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
+            )
+        };
 
         let mut start_event: Option<(ChatMessageId, String)> = None;
         let mut should_finalize_current = false;
-        let mut refresh_tool_request: Option<(String, String, Value)> = None;
         {
             let mut state = self.state.lock().await;
             let stream_message_id = incoming_message_id.clone();
@@ -2005,12 +2106,14 @@ impl KiroInner {
                 .or_insert_with(|| KiroToolContext {
                     tool_name: request.tool_name.clone(),
                     tool_type: tool_type.clone(),
+                    is_mcp_tool,
                     request_emitted: false,
                     pending_completion: None,
                 });
             let prev_tool_type = context.tool_type.clone();
             let request_already_emitted = context.request_emitted;
             context.tool_type = tool_type.clone();
+            context.is_mcp_tool |= is_mcp_tool;
 
             if duplicate_request && request_already_emitted {
                 let changed = prev_tool_type != tool_type;
@@ -2024,11 +2127,6 @@ impl KiroInner {
                     if request.tool_name != "tool" {
                         context.tool_name = request.tool_name.clone();
                     }
-                    refresh_tool_request = Some((
-                        canonical_id.clone(),
-                        context.tool_name.clone(),
-                        tool_type.clone(),
-                    ));
                 }
             }
 
@@ -2052,7 +2150,7 @@ impl KiroInner {
                 let tool_call_entry = json!({
                     "id": canonical_id.clone(),
                     "name": request.tool_name.clone(),
-                    "arguments": request.args.clone(),
+                    "arguments": public_acp_tool_arguments(&request.args),
                 });
                 let already_present = state.active_stream_tool_calls.iter().any(|call| {
                     call.get("id").and_then(Value::as_str) == Some(canonical_id.as_str())
@@ -2077,11 +2175,6 @@ impl KiroInner {
 
         if should_finalize_current {
             self.finalize_active_stream_if_any(None, false).await;
-        }
-
-        if let Some((tool_call_id, tool_name, tool_type)) = refresh_tool_request {
-            self.emitter
-                .tool_request(&tool_call_id, &tool_name, tool_type);
         }
     }
 
@@ -2172,7 +2265,6 @@ impl KiroInner {
         };
 
         let mut emit_completion_now: Option<(String, String, Value, bool, Option<String>)> = None;
-        let mut refresh_tool_request: Option<(String, String, Value)> = None;
         {
             let mut state = self.state.lock().await;
             if let Some(context) = state.active_tool_contexts.get_mut(&completion.tool_call_id) {
@@ -2182,31 +2274,32 @@ impl KiroInner {
                         .get("after")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if current_after != after_contents {
-                        if let Some(obj) = context.tool_type.as_object_mut() {
-                            obj.insert("after".to_string(), Value::String(after_contents));
-                        }
-                        if context.request_emitted {
-                            refresh_tool_request = Some((
-                                completion.tool_call_id.clone(),
-                                context.tool_name.clone(),
-                                context.tool_type.clone(),
-                            ));
-                        }
+                    if current_after != after_contents
+                        && let Some(obj) = context.tool_type.as_object_mut()
+                    {
+                        obj.insert("after".to_string(), Value::String(after_contents));
                     }
                 }
 
                 if completion.tool_name == "tool" {
                     completion.tool_name = context.tool_name.clone();
                 }
+                completion.is_mcp_tool = context.is_mcp_tool;
                 let tool_result = self
                     .adapter
                     .map_tool_result(&completion, Some(&context.tool_type));
+                let (success, error) = normalize_mapped_tool_outcome(
+                    &completion.tool_call_id,
+                    &completion.tool_name,
+                    &tool_result,
+                    completion.success,
+                    completion.error.clone(),
+                );
                 let pending = PendingToolCompletion {
                     tool_name: completion.tool_name.clone(),
                     tool_result,
-                    success: completion.success,
-                    error: completion.error.clone(),
+                    success,
+                    error,
                 };
                 if context.request_emitted {
                     emit_completion_now = Some((
@@ -2235,11 +2328,6 @@ impl KiroInner {
                     message_id.as_deref(),
                 );
             }
-        }
-
-        if let Some((tool_call_id, tool_name, tool_type)) = refresh_tool_request {
-            self.emitter
-                .tool_request(&tool_call_id, &tool_name, tool_type);
         }
 
         if let Some((tool_call_id, tool_name, tool_result, success, error)) = emit_completion_now {
@@ -2397,10 +2485,9 @@ impl KiroInner {
                 context_breakdown: None,
                 images: Vec::new(),
             });
-        self.state
-            .lock()
-            .await
-            .replay_assistant_message_emitted_since_user = true;
+        let mut state = self.state.lock().await;
+        state.replay_assistant_message_emitted_since_user = true;
+        state.idless_message_ordinal = state.idless_message_ordinal.saturating_add(1);
     }
 
     async fn flush_replay_assistant_message(&self) {
@@ -2585,16 +2672,17 @@ impl KiroInner {
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
-        let image_payload = images
-            .unwrap_or(&[])
-            .iter()
-            .map(|image| {
-                json!({
-                    "media_type": image.media_type,
-                    "data": image.data,
+        let image_payload = images.map(|images| {
+            images
+                .iter()
+                .map(|image| {
+                    json!({
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        });
         self.emitter.user_message(content, image_payload);
     }
 }
@@ -2915,9 +3003,17 @@ pub(crate) async fn map_tool_request_type(
         }
         _ => json!({
             "kind": "Other",
-            "args": args,
+            "args": public_acp_tool_arguments(args),
         }),
     }
+}
+
+fn public_acp_tool_arguments(args: &Value) -> Value {
+    let mut arguments = args.clone();
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.remove("__tool_use_purpose");
+    }
+    arguments
 }
 
 fn extract_kiro_message_id(value: &Value) -> Option<String> {
@@ -2951,6 +3047,34 @@ fn extract_kiro_tool_call_id(value: &Value) -> Option<String> {
     })
 }
 
+fn normalize_mapped_tool_outcome(
+    tool_call_id: &str,
+    tool_name: &str,
+    tool_result: &Value,
+    provider_success: bool,
+    provider_error: Option<String>,
+) -> (bool, Option<String>) {
+    let nonzero_exit = tool_result
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| *kind == "RunCommand")
+        .and_then(|_| tool_result.get("exit_code"))
+        .and_then(Value::as_i64)
+        .filter(|exit_code| *exit_code != 0);
+    if provider_success && let Some(exit_code) = nonzero_exit {
+        tracing::warn!(
+            tool_call_id,
+            exit_code,
+            "ACP provider marked a nonzero command completion successful; normalized to failure"
+        );
+        return (
+            false,
+            Some(format!("{tool_name} exited with status {exit_code}")),
+        );
+    }
+    (provider_success, provider_error)
+}
+
 /// Maps a Kiro ACP tool completion to Tyde's internal result representation.
 /// Uses the ACP `kind` field: "execute" → RunCommand, "edit" → ModifyFile, "read" → ReadFiles.
 /// The `rawOutput` for execute completions is: `{"items": [{"Json": {"exit_status": "exit status: N", "stdout": "...", "stderr": "..."}}]}`
@@ -2960,6 +3084,23 @@ pub(crate) fn map_tool_completion_result(
     completion: &crate::acp::AcpToolCallCompletion,
     request_payload: Option<&Value>,
 ) -> Value {
+    if completion.is_mcp_tool {
+        let normalized = normalize_mcp_call_tool_result(&completion.tool_result);
+        if normalized.success && !completion.success {
+            let canonical = normalized
+                .tool_result
+                .get("result")
+                .cloned()
+                .unwrap_or(Value::Null);
+            return json!({
+                "kind": "Error",
+                "short_message": completion.error.clone().unwrap_or_else(|| format!("{} failed", completion.tool_name)),
+                "detailed_message": serde_json::to_string_pretty(&canonical)
+                    .unwrap_or_else(|_| canonical.to_string()),
+            });
+        }
+        return normalized.tool_result;
+    }
     if !completion.success {
         let short_message = completion
             .error
@@ -2998,6 +3139,10 @@ pub(crate) fn map_tool_completion_result(
             })
         }
         "edit" => {
+            eprintln!(
+                "TYDE KIRO EDIT COMPLETION request_payload={request_payload:?} result={}",
+                completion.tool_result
+            );
             let before = request_payload
                 .and_then(|payload| payload.get("before"))
                 .and_then(Value::as_str)
@@ -3079,16 +3224,36 @@ fn extract_first_item_json(value: &Value) -> Option<&Value> {
 }
 
 fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
-    if before == after {
-        return (0, 0);
-    }
-    let before_lines = before.lines().count() as i64;
-    let after_lines = after.lines().count() as i64;
-    if after_lines >= before_lines {
-        ((after_lines - before_lines) as u64, 0)
+    let before_lines = if before.is_empty() {
+        Vec::new()
     } else {
-        (0, (before_lines - after_lines) as u64)
+        before.lines().collect::<Vec<_>>()
+    };
+    let after_lines = if after.is_empty() {
+        Vec::new()
+    } else {
+        after.lines().collect::<Vec<_>>()
+    };
+    let mut start = 0usize;
+    while start < before_lines.len()
+        && start < after_lines.len()
+        && before_lines[start] == after_lines[start]
+    {
+        start += 1;
     }
+    let mut end_before = before_lines.len();
+    let mut end_after = after_lines.len();
+    while end_before > start
+        && end_after > start
+        && before_lines[end_before - 1] == after_lines[end_after - 1]
+    {
+        end_before -= 1;
+        end_after -= 1;
+    }
+    (
+        end_after.saturating_sub(start) as u64,
+        end_before.saturating_sub(start) as u64,
+    )
 }
 
 fn extract_first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -4024,6 +4189,26 @@ pub struct KiroBackend {
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
+struct KiroStartupTaskGuard(Option<tokio::task::AbortHandle>);
+
+impl KiroStartupTaskGuard {
+    fn new(task: &tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(task.abort_handle()))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KiroStartupTaskGuard {
+    fn drop(&mut self) {
+        if let Some(abort) = self.0.take() {
+            abort.abort();
+        }
+    }
+}
+
 fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
     match cost_hint {
         Some(SpawnCostHint::Low) => Some("claude-haiku-4.5"),
@@ -4062,8 +4247,13 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
+            tyde_agent_adapter::BackendCapability::GenericModifyFile,
+            tyde_agent_adapter::BackendCapability::GenericReadFiles,
+            tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            tyde_agent_adapter::BackendCapability::RetryTelemetry,
         ]
         .into()
     }
@@ -4093,7 +4283,7 @@ impl Backend for KiroBackend {
         let session_id_task = Arc::clone(&session_id);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        tokio::spawn(async move {
+        let startup_task = tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
@@ -4240,11 +4430,13 @@ impl Backend for KiroBackend {
             let _ = forward_task.await;
         });
 
+        let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
         match ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err("Kiro spawn initialization task ended early".to_string()),
         }
+        startup_guard.disarm();
 
         Ok((
             Self {
@@ -4271,7 +4463,7 @@ impl Backend for KiroBackend {
         let known_session_id_task = Arc::clone(&known_session_id);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        tokio::spawn(async move {
+        let startup_task = tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
@@ -4426,11 +4618,13 @@ impl Backend for KiroBackend {
             let _ = forward_task.await;
         });
 
+        let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
         match ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err("Kiro resume initialization task ended early".to_string()),
         }
+        startup_guard.disarm();
 
         Ok((
             Self {
@@ -4587,3093 +4781,5 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
             }))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
-    use tracing::field::{Field, Visit};
-    use tracing::instrument::WithSubscriber;
-    use tracing::span::{Attributes, Record};
-    use tracing::{Event, Id, Metadata, Subscriber};
-
-    const AUTH_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-    #[derive(Clone, Default)]
-    struct WarningRecorder {
-        events: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
-    }
-
-    struct WarningFieldVisitor<'a> {
-        fields: &'a mut BTreeMap<String, String>,
-    }
-
-    impl Visit for WarningFieldVisitor<'_> {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.fields
-                .insert(field.name().to_string(), format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.fields
-                .insert(field.name().to_string(), value.to_string());
-        }
-    }
-
-    impl Subscriber for WarningRecorder {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            *metadata.level() == tracing::Level::WARN
-        }
-
-        fn new_span(&self, _span: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &Id, _values: &Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut fields = BTreeMap::new();
-            event.record(&mut WarningFieldVisitor {
-                fields: &mut fields,
-            });
-            self.events.lock().expect("record warning").push(fields);
-        }
-
-        fn enter(&self, _span: &Id) {}
-
-        fn exit(&self, _span: &Id) {}
-    }
-
-    #[test]
-    fn kiro_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
-        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
-
-        assert!(std::path::Path::new(&root).is_dir());
-        assert!(
-            std::path::Path::new(&root)
-                .ends_with(std::path::Path::new(".tyde").join("kiro").join("no-root"))
-        );
-    }
-
-    #[test]
-    fn kiro_pick_workspace_root_keeps_ssh_only_roots_invalid() {
-        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
-            .expect_err("ssh-only local roots should remain invalid");
-
-        assert!(err.contains("requires at least one local workspace root"));
-    }
-
-    #[test]
-    fn extract_known_models_dedupes_case_variants() {
-        let models = extract_known_models(&json!({
-            "models": {
-                "availableModels": [
-                    { "id": "Auto", "name": "Auto", "isDefault": false },
-                    { "id": "auto", "name": "Auto", "isDefault": true },
-                    { "id": "claude-sonnet", "name": "Claude Sonnet", "isDefault": false }
-                ]
-            }
-        }));
-
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0]["id"], Value::String("auto".to_string()));
-        assert_eq!(models[0]["isDefault"], Value::Bool(true));
-        assert_eq!(models[1]["id"], Value::String("claude-sonnet".to_string()));
-    }
-
-    #[test]
-    fn stock_models_list_rejects_malformed_entry_without_echoing_it() {
-        let error = session_settings_schema_from_known_models(&[json!({
-            "displayName": "sentinel-private-model",
-            "providerMetadata": {
-                "credential": "sentinel-secret"
-            }
-        })])
-        .expect_err("a Stock ModelsList entry without id must be rejected");
-
-        assert_eq!(error, "ACP agent model entry missing id");
-        assert!(!error.contains("Kiro"));
-        assert!(!error.contains("sentinel-private-model"));
-        assert!(!error.contains("sentinel-secret"));
-    }
-
-    #[test]
-    fn stock_models_list_rejects_empty_models_without_kiro_identity() {
-        let error = session_settings_schema_from_known_models(&[])
-            .expect_err("an empty Stock ModelsList must not produce a schema");
-
-        assert_eq!(error, "ACP agent reported no selectable models");
-        assert!(!error.contains("Kiro"));
-    }
-
-    // Real Kiro ACP events captured from a live session.
-
-    #[tokio::test]
-    async fn test_execute_tool_request_maps_to_run_command() {
-        let params = json!({"kind":"execute","rawInput":{"__tool_use_purpose":"Run the hello.py script with python3","command":"python3 hello.py","working_dir":"."},"sessionUpdate":"tool_call","title":"Running: python3 hello.py","toolCallId":"tooluse_969cHK9lEAMViobov6gYma"});
-        let args = params.get("rawInput").cloned().unwrap();
-        let result = map_tool_request_type(&params, &args, "/workspace").await;
-
-        assert_eq!(result["kind"], "RunCommand");
-        assert_eq!(result["command"], "python3 hello.py");
-        assert_eq!(result["working_directory"], ".");
-    }
-
-    #[tokio::test]
-    async fn test_edit_tool_request_maps_to_modify_file() {
-        let params = json!({"content":[{"newText":"new content","oldText":"old content","path":"hello.py","type":"diff"}],"kind":"edit","locations":[{"line":25,"path":"hello.py"}],"rawInput":{"command":"strReplace","newStr":"new content","oldStr":"old content","path":"hello.py"},"sessionUpdate":"tool_call","title":"Editing hello.py","toolCallId":"tooluse_TovOchWXoPj9HmcMiNlrCl"});
-        let args = params.get("rawInput").cloned().unwrap();
-        let result = map_tool_request_type(&params, &args, "/workspace").await;
-
-        assert_eq!(result["kind"], "ModifyFile");
-        assert_eq!(result["file_path"], "hello.py");
-        assert_eq!(result["before"], "old content");
-        assert_eq!(result["after"], "new content");
-    }
-
-    #[tokio::test]
-    async fn latest_kiro_read_request_maps_operations_without_title_or_locations() {
-        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
-        let params = json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": "T1",
-            "kind": "read",
-            "locations": [{ "path": "/wrong/location-must-not-win.txt" }],
-            "title": "Reading wrong-title-path.txt",
-            "rawInput": {
-                "__tool_use_purpose": "Reading the specified file using the native file read tool",
-                "operations": [{
-                    "mode": "Line",
-                    "path": path
-                }]
-            }
-        });
-        let args = params.get("rawInput").cloned().unwrap();
-        let result = map_tool_request_type(&params, &args, "/workspace").await;
-
-        assert_eq!(result["kind"], "ReadFiles");
-        assert_eq!(result["file_paths"], json!([path]));
-    }
-
-    #[tokio::test]
-    async fn stock_adapter_uses_shared_latest_operations_decoder() {
-        let adapter = adapter_for_spec(&protocol::AcpAgentSpec {
-            command: "stock-agent".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            adapter: protocol::AcpAdapterId::Stock,
-        });
-        let args = json!({
-            "operations": [
-                { "path": "/workspace/first.txt" },
-                { "path": "/workspace/second.txt" }
-            ]
-        });
-
-        let result = adapter.map_tool_request("read", &args, "/workspace").await;
-
-        assert_eq!(
-            result,
-            json!({
-                "kind": "ReadFiles",
-                "file_paths": [
-                    "/workspace/first.txt",
-                    "/workspace/second.txt"
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn kiro_initialize_params_keeps_write_and_terminal_capabilities() {
-        // The capability declaration moved onto the adapter; assert through the
-        // real spawn-time path so this still guards what the agent is told.
-        let params = acp_initialize_params(kiro_adapter(None).as_ref());
-
-        assert_eq!(
-            params["clientCapabilities"]["fs"]["readTextFile"],
-            Value::Bool(true)
-        );
-        assert_eq!(
-            params["clientCapabilities"]["fs"]["writeTextFile"],
-            Value::Bool(true)
-        );
-        assert_eq!(params["clientCapabilities"]["terminal"], Value::Bool(true));
-        assert_eq!(
-            params["protocolVersion"],
-            json!(ACP_CLIENT_PROTOCOL_VERSION),
-            "the client, not the adapter, owns the protocol version"
-        );
-    }
-
-    #[test]
-    fn capabilities_default_to_unsupported_when_the_agent_is_silent() {
-        let caps = parse_capabilities(&json!({ "protocolVersion": 1 }));
-        assert!(
-            !caps.load_session,
-            "session/load must not be attempted against an agent that never advertised it"
-        );
-        assert!(!caps.image);
-        assert!(caps.auth_methods.is_empty());
-    }
-
-    #[test]
-    fn capabilities_are_read_from_the_initialize_response() {
-        let caps = parse_capabilities(&json!({
-            "protocolVersion": 1,
-            "agentCapabilities": {
-                "loadSession": true,
-                "promptCapabilities": { "image": true }
-            },
-            "authMethods": [
-                {
-                    "id": "oauth",
-                    "name": "Browser login",
-                    "description": "Complete login in the browser"
-                },
-                {
-                    "methodId": "api-key",
-                    "name": "API key"
-                }
-            ],
-            "agentInfo": { "name": "some-agent" }
-        }));
-        assert!(caps.load_session);
-        assert!(caps.image);
-        assert_eq!(
-            caps.auth_methods,
-            vec![
-                AcpAuthMethod {
-                    id: "oauth".to_string(),
-                    name: Some("Browser login".to_string()),
-                    description: Some("Complete login in the browser".to_string()),
-                },
-                AcpAuthMethod {
-                    id: "api-key".to_string(),
-                    name: Some("API key".to_string()),
-                    description: None,
-                },
-            ]
-        );
-        assert_eq!(caps.agent_info.as_deref(), Some("some-agent"));
-    }
-
-    #[test]
-    fn malformed_auth_methods_cannot_become_invocable_or_retain_extra_fields() {
-        let caps = parse_capabilities(&json!({
-            "protocolVersion": 1,
-            "authMethods": [
-                { "id": "" },
-                { "id": 7, "name": "invalid" },
-                {
-                    "id": "valid",
-                    "name": { "unexpected": true },
-                    "description": ["not", "text"],
-                    "credential": "must-not-survive"
-                },
-                {
-                    "id": " ",
-                    "methodId": "fallback-id",
-                    "name": " Fallback "
-                }
-            ]
-        }));
-
-        assert_eq!(
-            caps.auth_methods,
-            vec![
-                AcpAuthMethod {
-                    id: "valid".to_string(),
-                    name: None,
-                    description: None,
-                },
-                AcpAuthMethod {
-                    id: "fallback-id".to_string(),
-                    name: Some("Fallback".to_string()),
-                    description: None,
-                },
-            ]
-        );
-    }
-
-    struct ExternalAuthTestAdapter {
-        stock: crate::acp::adapters::stock::StockAdapter,
-    }
-
-    impl ExternalAuthTestAdapter {
-        fn new(spec: protocol::AcpAgentSpec) -> Self {
-            Self {
-                stock: crate::acp::adapters::stock::StockAdapter::new(spec),
-            }
-        }
-    }
-
-    impl AcpAgentAdapter for ExternalAuthTestAdapter {
-        fn id(&self) -> protocol::AcpAdapterId {
-            protocol::AcpAdapterId::Stock
-        }
-
-        fn display_name(&self) -> &str {
-            "External-auth agent"
-        }
-
-        fn resolve_roots<'a>(
-            &'a self,
-            workspace_roots: &'a [String],
-            ssh_host: Option<&'a str>,
-            kind: AcpSessionKind,
-        ) -> futures_util::future::BoxFuture<'a, Result<crate::acp::adapter::AcpSessionRoots, String>>
-        {
-            self.stock.resolve_roots(workspace_roots, ssh_host, kind)
-        }
-
-        fn spawn_spec(
-            &self,
-            roots: &crate::acp::adapter::AcpSessionRoots,
-            ssh_host: Option<&str>,
-        ) -> Result<crate::acp::AcpSpawnSpec, String> {
-            self.stock.spawn_spec(roots, ssh_host)
-        }
-
-        fn auth_method_handling(&self, method: &AcpAuthMethod) -> AcpAuthMethodHandling {
-            AcpAuthMethodHandling::ExternalSetup {
-                instruction: method
-                    .description
-                    .clone()
-                    .expect("external auth fixture must provide an instruction"),
-            }
-        }
-    }
-
-    fn write_auth_lifecycle_program(body: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-acp-auth-lifecycle-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create ACP auth lifecycle tempdir");
-        let program = dir.join("fake-acp-agent");
-        let log = dir.join("requests.jsonl");
-        let mut script = format!("#!/bin/sh\nLOG='{}'\n", log.to_string_lossy());
-        script.push_str(
-            r#"read_logged() {
-    IFS= read -r line || return 1
-    printf '%s\n' "$line" >> "$LOG"
-}
-"#,
-        );
-        script.push_str(body);
-        std::fs::write(&program, script).expect("write ACP auth lifecycle program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&program)
-                .expect("stat ACP auth lifecycle program")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&program, permissions)
-                .expect("chmod ACP auth lifecycle program");
-        }
-        (program, log)
-    }
-
-    fn auth_lifecycle_workspace() -> PathBuf {
-        let workspace = std::env::temp_dir().join(format!(
-            "tyde-acp-auth-lifecycle-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace).expect("create ACP auth lifecycle workspace");
-        workspace
-    }
-
-    fn auth_lifecycle_agent(
-        program: &Path,
-        adapter: protocol::AcpAdapterId,
-    ) -> protocol::AcpAgentSpec {
-        protocol::AcpAgentSpec {
-            command: program.to_string_lossy().to_string(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            adapter,
-        }
-    }
-
-    fn logged_auth_lifecycle_requests(log: &Path) -> Vec<Value> {
-        std::fs::read_to_string(log)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("logged request is JSON"))
-            .collect()
-    }
-
-    fn logged_auth_lifecycle_methods(log: &Path) -> Vec<String> {
-        logged_auth_lifecycle_requests(log)
-            .iter()
-            .filter_map(|request| request.get("method").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn cleanup_auth_lifecycle_fixture(program: &Path, workspace: &Path) {
-        if let Some(parent) = program.parent() {
-            let _ = std::fs::remove_dir_all(parent);
-        }
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    async fn spawn_read_warning_test_session(
-        adapter: protocol::AcpAdapterId,
-    ) -> (KiroSession, PathBuf, PathBuf) {
-        let (program, _log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"warning-test-session"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, adapter);
-        let (session, _events) = KiroSession::spawn_for_agent(
-            &[workspace.to_string_lossy().to_string()],
-            Some(&agent),
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        .expect("spawn read warning test session");
-        (session, program, workspace)
-    }
-
-    #[tokio::test]
-    async fn read_degradation_warns_once_for_kiro_and_stock_without_raw_values() {
-        let recorder = WarningRecorder::default();
-        let (kiro, kiro_program, kiro_workspace) =
-            spawn_read_warning_test_session(protocol::AcpAdapterId::Kiro).await;
-        let stale = json!({ "ops": [{ "path": "secret-value-must-not-be-logged.txt" }] });
-        let degraded = kiro
-            .inner
-            .map_tool_request(
-                &json!({ "kind": "read", "toolCallId": "kiro-read-1" }),
-                &stale,
-                "/workspace",
-            )
-            .with_subscriber(recorder.clone())
-            .await;
-        assert_eq!(
-            degraded,
-            json!({
-                "kind": "Other",
-                "args": stale,
-            })
-        );
-
-        let latest = json!({ "operations": [{ "path": "latest.txt" }] });
-        let latest_mapped = kiro
-            .inner
-            .map_tool_request(
-                &json!({ "kind": "read", "toolCallId": "kiro-read-2" }),
-                &latest,
-                "/workspace",
-            )
-            .with_subscriber(recorder.clone())
-            .await;
-        assert_eq!(latest_mapped["kind"], "ReadFiles");
-        let singular_mapped = kiro
-            .inner
-            .map_tool_request(
-                &json!({ "kind": "read", "toolCallId": "kiro-read-3" }),
-                &json!({ "filePath": "singular.txt" }),
-                "/workspace",
-            )
-            .with_subscriber(recorder.clone())
-            .await;
-        assert_eq!(singular_mapped["kind"], "ReadFiles");
-        kiro.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&kiro_program, &kiro_workspace);
-
-        let (stock, stock_program, stock_workspace) =
-            spawn_read_warning_test_session(protocol::AcpAdapterId::Stock).await;
-        let stock_stale = json!({ "ops": [{ "path": "also-secret.txt" }] });
-        let stock_degraded = stock
-            .inner
-            .map_tool_request(
-                &json!({ "kind": "read", "tool_call_id": "stock-read-1" }),
-                &stock_stale,
-                "/workspace",
-            )
-            .with_subscriber(recorder.clone())
-            .await;
-        assert_eq!(
-            stock_degraded,
-            json!({
-                "kind": "Other",
-                "args": stock_stale,
-            })
-        );
-        stock.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&stock_program, &stock_workspace);
-
-        let warnings = recorder.events.lock().expect("read warnings").clone();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert_eq!(
-            warnings[0].get("message").map(String::as_str),
-            Some("ACP read normalization degraded to Other")
-        );
-        assert_eq!(warnings[0].get("agent").map(String::as_str), Some("Kiro"));
-        assert_eq!(
-            warnings[0].get("tool_call_id").map(String::as_str),
-            Some("kiro-read-1")
-        );
-        assert_eq!(
-            warnings[0].get("raw_input_keys").map(String::as_str),
-            Some("[\"ops\"]")
-        );
-        assert_eq!(
-            warnings[1].get("agent").map(String::as_str),
-            Some("fake-acp-agent")
-        );
-        assert_eq!(
-            warnings[1].get("tool_call_id").map(String::as_str),
-            Some("stock-read-1")
-        );
-        assert_eq!(
-            warnings[1].get("raw_input_keys").map(String::as_str),
-            Some("[\"ops\"]")
-        );
-        assert!(
-            warnings
-                .iter()
-                .flat_map(|warning| warning.values())
-                .all(|value| !value.contains("secret")),
-            "warnings must include keys, never raw values: {warnings:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn kiro_external_auth_blocks_new_and_resume_session_requests() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"kiro-login","name":"Kiro Login","description":"Run '\''kiro-cli login'\'' in terminal to authenticate. See https://kiro.dev/docs"}]}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-
-        let result = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("external auth gate must not hang");
-        let error = match result {
-            Ok(_) => panic!("external auth must block startup"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error,
-            "Kiro authentication required via 'kiro-login'. Run 'kiro-cli login' in terminal to authenticate. See https://kiro.dev/docs"
-        );
-        assert_eq!(
-            logged_auth_lifecycle_methods(&log),
-            vec!["initialize"],
-            "external setup must not invoke authenticate, session/new, or session/load"
-        );
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn every_external_auth_method_is_reported_without_protocol_requests() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"browser-login","description":"Open the browser login."},{"id":"device-login","description":"Run the device login."}]}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let adapter: Arc<dyn AcpAgentAdapter> = Arc::new(ExternalAuthTestAdapter::new(
-            auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock),
-        ));
-
-        let result = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_with_mode(
-                &[workspace.to_string_lossy().to_string()],
-                KiroSpawnMode {
-                    adapter,
-                    ephemeral: false,
-                    admin_session: false,
-                    initial_model: None,
-                    ssh_host: None,
-                    startup_mcp_servers: &[],
-                    steering_content: None,
-                    probe_deadline: None,
-                },
-            ),
-        )
-        .await
-        .expect("external auth gate must not hang");
-        let error = match result {
-            Ok(_) => panic!("external auth must block startup"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error,
-            "External-auth agent authentication requires external setup. Complete one of: \
-             'browser-login': Open the browser login.; \
-             'device-login': Run the device login."
-        );
-        assert_eq!(
-            logged_auth_lifecycle_methods(&log),
-            vec!["initialize"],
-            "external setup must not invoke authenticate or create a session"
-        );
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn empty_auth_methods_create_session_without_authenticate() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"no-auth-session"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-
-        let (session, _events) = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("unauthenticated startup must not hang")
-        .expect("empty auth methods should permit session creation");
-
-        assert_eq!(
-            logged_auth_lifecycle_methods(&log),
-            vec!["initialize", "session/new"]
-        );
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn stock_protocol_auth_succeeds_before_session_new() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-auth-session"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
-
-        let (session, _events) = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("protocol auth startup must not hang")
-        .expect("stock protocol auth should succeed");
-
-        let requests = logged_auth_lifecycle_requests(&log);
-        assert_eq!(
-            requests
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["initialize", "authenticate", "session/new"]
-        );
-        assert_eq!(requests[1]["params"]["methodId"], "api-key");
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn rejected_protocol_auth_blocks_session_new() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"invalid credential"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Stock);
-
-        let result = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("rejected protocol auth must not hang");
-        let error = match result {
-            Ok(_) => panic!("rejected protocol auth must block startup"),
-            Err(error) => error,
-        };
-
-        assert!(error.contains("invalid credential"), "{error}");
-        assert_eq!(
-            logged_auth_lifecycle_methods(&log),
-            vec!["initialize", "authenticate"]
-        );
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn failed_protocol_auth_prefers_external_setup_error() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"},{"id":"kiro-login","name":"Kiro login","description":"Run kiro-cli login outside Tyde."}]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"invalid credential"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-
-        let result = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("mixed auth failure must not hang");
-        let error = match result {
-            Ok(_) => panic!("mixed auth failure must block startup"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error,
-            "Kiro authentication required via 'kiro-login'. Run kiro-cli login outside Tyde."
-        );
-        let requests = logged_auth_lifecycle_requests(&log);
-        assert_eq!(
-            requests
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["initialize", "authenticate"]
-        );
-        assert_eq!(requests[1]["params"]["methodId"], "api-key");
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn external_setup_first_then_protocol_auth_success_creates_session() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"kiro-login","name":"Kiro login","description":"Run kiro-cli login outside Tyde."},{"id":"api-key","name":"API key"}]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"mixed-auth-session"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-
-        let (session, _events) = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("mixed auth success must not hang")
-        .expect("later protocol auth should satisfy startup");
-
-        let requests = logged_auth_lifecycle_requests(&log);
-        assert_eq!(
-            requests
-                .iter()
-                .filter_map(|request| request.get("method").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["initialize", "authenticate", "session/new"],
-            "external setup must not consume an RPC and later protocol success must create once"
-        );
-        assert_eq!(requests[1]["params"]["methodId"], "api-key");
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn authenticated_kiro_startup_allows_session_load_replay() {
-        let (program, log) = write_auth_lifecycle_program(
-            r#"read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[]}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"initial-session"}}'
-read_logged
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"restored-session"}}'
-while read_logged; do :; done
-"#,
-        );
-        let workspace = auth_lifecycle_workspace();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-
-        let (session, _events) = tokio::time::timeout(
-            AUTH_LIFECYCLE_TEST_TIMEOUT,
-            KiroSession::spawn_for_agent(
-                &[workspace.to_string_lossy().to_string()],
-                Some(&agent),
-                None,
-                None,
-                &[],
-                None,
-            ),
-        )
-        .await
-        .expect("authenticated startup must not hang")
-        .expect("protocol auth should permit startup");
-        session
-            .command_handle()
-            .execute(SessionCommand::ResumeSession {
-                session_id: "restored-session".to_string(),
-            })
-            .await
-            .expect("authenticated session should load replay");
-
-        assert_eq!(
-            logged_auth_lifecycle_methods(&log),
-            vec!["initialize", "session/new", "session/load"]
-        );
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn schema_probe_workspace_setup_timeout_is_stage_specific() {
-        let result = await_kiro_stage(
-            Some(tokio::time::Instant::now()),
-            KiroSchemaProbeStage::WorkspaceSetup,
-            std::future::pending::<Result<(), String>>(),
-        )
-        .await;
-
-        assert_eq!(
-            result.expect_err("expired workspace setup deadline should time out"),
-            "ACP schema probe stage 'workspace_setup' timed out"
-        );
-    }
-
-    fn write_stock_schema_probe_without_session_id() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-stock-schema-probe-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake stock schema-probe tempdir");
-        let path = dir.join("fake-stock-schema-agent");
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
-"#;
-        std::fs::write(&path, script).expect("write fake stock schema-probe program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake stock schema-probe program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake stock schema-probe program");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn stock_schema_probe_failure_never_claims_kiro_identity() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-stock-schema-probe-ws-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root).expect("create schema-probe workspace");
-        let program = write_stock_schema_probe_without_session_id();
-        let agent = protocol::AcpAgentSpec {
-            command: program.to_string_lossy().to_string(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            adapter: protocol::AcpAdapterId::Stock,
-        };
-
-        let error = probe_session_settings_schema(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            Some(&agent),
-        )
-        .await
-        .expect_err("missing sessionId must fail the stock schema probe");
-
-        assert_eq!(
-            error, "fake-stock-schema-agent session/new response missing sessionId",
-            "post-response validation must preserve the actual Stock agent identity"
-        );
-        assert!(
-            !error.contains("Kiro"),
-            "shared schema-probe control flow must not claim Kiro identity: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn kiro_schema_probe_keeps_only_adapter_specific_kiro_identity() {
-        let missing_program = std::env::temp_dir().join(format!(
-            "missing-kiro-schema-agent-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let error = probe_session_settings_schema(
-            &[],
-            Some(missing_program.to_string_lossy().to_string()),
-            None,
-        )
-        .await
-        .expect_err("missing Kiro executable must fail the schema probe");
-
-        assert!(
-            error.starts_with("ACP schema probe stage 'acp_spawn' failed:"),
-            "shared probe stage must remain backend-neutral: {error}"
-        );
-        assert!(
-            error.contains("Failed to start Kiro executable"),
-            "the adapter-specific executable identity may truthfully name Kiro: {error}"
-        );
-    }
-
-    #[test]
-    fn kiro_normalize_token_usage_maps_reported_counts() {
-        let usage = normalize_token_usage(Some(&json!({
-            "tokenUsage": {
-                "inputTokens": 15,
-                "cachedInputTokens": 4,
-                "cacheCreationInputTokens": 3,
-                "outputTokens": 7,
-                "totalTokens": 22,
-                "reasoningTokens": 2
-            },
-            "contextWindow": 200000
-        })))
-        .expect("reported usage should normalize");
-
-        assert_eq!(usage["input_tokens"], json!(8));
-        assert_eq!(usage["output_tokens"], json!(7));
-        assert_eq!(usage["total_tokens"], json!(22));
-        assert_eq!(usage["cached_prompt_tokens"], json!(4));
-        assert_eq!(usage["cache_creation_input_tokens"], json!(3));
-        assert_eq!(usage["reasoning_tokens"], json!(2));
-        assert_eq!(usage["context_window"], json!(200000));
-    }
-
-    #[test]
-    fn test_execute_completion_maps_to_run_command() {
-        let completion = crate::acp::AcpToolCallCompletion {
-            tool_call_id: "tooluse_JlKHotZOrwGPRT9StkV4hw".to_string(),
-            tool_name: "Running: python3 hello.py".to_string(),
-            kind: "execute".to_string(),
-            success: true,
-            tool_result: json!({"items":[{"Json":{"exit_status":"exit status: 0","stderr":"","stdout":"hello world\n"}}]}),
-            error: None,
-        };
-        let result = map_tool_completion_result(&completion, None);
-
-        assert_eq!(result["kind"], "RunCommand");
-        assert_eq!(result["exit_code"], 0);
-        assert_eq!(result["stdout"], "hello world\n");
-        assert_eq!(result["stderr"], "");
-    }
-
-    #[test]
-    fn test_execute_completion_nonzero_exit() {
-        let completion = crate::acp::AcpToolCallCompletion {
-            tool_call_id: "tooluse_gI6kXzqrBXCEjGIqUMooRg".to_string(),
-            tool_name: "Running: python hello.py".to_string(),
-            kind: "execute".to_string(),
-            success: true,
-            tool_result: json!({"items":[{"Json":{"exit_status":"exit status: 127","stderr":"bash: python: command not found\n","stdout":""}}]}),
-            error: None,
-        };
-        let result = map_tool_completion_result(&completion, None);
-
-        assert_eq!(result["kind"], "RunCommand");
-        assert_eq!(result["exit_code"], 127);
-        assert_eq!(result["stderr"], "bash: python: command not found\n");
-        assert_eq!(result["stdout"], "");
-    }
-
-    #[test]
-    fn test_edit_completion_maps_to_modify_file() {
-        let context = KiroToolContext {
-            tool_name: "write".to_string(),
-            tool_type: json!({"kind": "ModifyFile", "file_path": "hello.py", "before": "line1\nline2\n", "after": "line1\nline2\nline3\n"}),
-            request_emitted: true,
-            pending_completion: None,
-        };
-        let completion = crate::acp::AcpToolCallCompletion {
-            tool_call_id: "tooluse_TovOchWXoPj9HmcMiNlrCl".to_string(),
-            tool_name: "Editing hello.py".to_string(),
-            kind: "edit".to_string(),
-            success: true,
-            tool_result: json!({"items":[{"Text":""}]}),
-            error: None,
-        };
-        let result = map_tool_completion_result(&completion, Some(&context.tool_type));
-
-        assert_eq!(result["kind"], "ModifyFile");
-        assert_eq!(result["lines_added"], 1);
-        assert_eq!(result["lines_removed"], 0);
-    }
-
-    fn read_completion(request: Option<&Value>, tool_result: Value) -> Value {
-        map_tool_completion_result(
-            &crate::acp::AcpToolCallCompletion {
-                tool_call_id: "T1".to_string(),
-                tool_name: "Reading file".to_string(),
-                kind: "read".to_string(),
-                success: true,
-                tool_result,
-                error: None,
-            },
-            request,
-        )
-    }
-
-    #[test]
-    fn latest_kiro_read_completion_reports_exact_utf8_bytes() {
-        let path = "/workspace/acp-read-20260730T180905Z-24232.txt";
-        let request = json!({ "kind": "ReadFiles", "file_paths": [path] });
-        let text = "ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π";
-        assert_eq!(text.len(), 70);
-        assert_eq!(text.chars().count(), 69);
-
-        let result = read_completion(Some(&request), json!({ "items": [{ "Text": text }] }));
-
-        assert_eq!(
-            result,
-            json!({
-                "kind": "ReadFiles",
-                "files": [{ "path": path, "bytes": 70 }]
-            })
-        );
-    }
-
-    #[test]
-    fn multi_path_read_completion_correlates_distinct_utf8_lengths() {
-        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt", "beta.txt"] });
-
-        let result = read_completion(
-            Some(&request),
-            json!({ "items": [{ "Text": "π" }, { "Text": "snowman ☃" }] }),
-        );
-
-        assert_eq!(
-            result,
-            json!({
-                "kind": "ReadFiles",
-                "files": [
-                    { "path": "alpha.txt", "bytes": 2 },
-                    { "path": "beta.txt", "bytes": 11 }
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn mismatched_read_output_degrades_atomically_to_other() {
-        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt", "beta.txt"] });
-        let raw = json!({ "items": [{ "Text": "only one output" }] });
-
-        let result = read_completion(Some(&request), raw.clone());
-
-        assert_eq!(result, json!({ "kind": "Other", "result": raw }));
-        assert!(result.get("files").is_none());
-        assert!(!result.to_string().contains("\"bytes\""));
-    }
-
-    #[test]
-    fn missing_or_malformed_read_text_never_becomes_false_zero_bytes() {
-        let request = json!({ "kind": "ReadFiles", "file_paths": ["alpha.txt"] });
-
-        for raw in [
-            json!({}),
-            json!({ "items": [] }),
-            json!({ "items": "not-an-array" }),
-            json!({ "items": [{}] }),
-            json!({ "items": [{ "Text": 0 }] }),
-        ] {
-            let result = read_completion(Some(&request), raw.clone());
-            assert_eq!(result, json!({ "kind": "Other", "result": raw }));
-            assert!(!result.to_string().contains("\"bytes\":0"));
-        }
-    }
-
-    #[test]
-    fn measured_empty_read_text_is_a_legitimate_zero_bytes() {
-        let request = json!({ "kind": "ReadFiles", "file_paths": ["empty.txt"] });
-
-        let result = read_completion(Some(&request), json!({ "items": [{ "Text": "" }] }));
-
-        assert_eq!(
-            result,
-            json!({
-                "kind": "ReadFiles",
-                "files": [{ "path": "empty.txt", "bytes": 0 }]
-            })
-        );
-    }
-
-    #[test]
-    fn read_completion_without_valid_typed_request_is_other() {
-        let raw = json!({ "items": [{ "Text": "content" }] });
-
-        for request in [
-            None,
-            Some(json!({ "kind": "Other", "file_paths": ["alpha.txt"] })),
-            Some(json!({ "kind": "ReadFiles", "file_paths": [] })),
-            Some(json!({ "kind": "ReadFiles", "file_paths": [""] })),
-            Some(json!({ "kind": "ReadFiles", "file_paths": [7] })),
-        ] {
-            let result = read_completion(request.as_ref(), raw.clone());
-            assert_eq!(result, json!({ "kind": "Other", "result": raw }));
-        }
-    }
-
-    #[test]
-    fn idless_stream_epoch_is_deterministic_and_session_scoped() {
-        // Names for id-less messages must survive a restart unchanged: nothing
-        // persists the id, so any path that re-derives it for the same events
-        // has to land on the same value or the client renders duplicates.
-        assert_eq!(
-            idless_stream_epoch("session-a"),
-            idless_stream_epoch("session-a")
-        );
-        assert_ne!(
-            idless_stream_epoch("session-a"),
-            idless_stream_epoch("session-b")
-        );
-
-        let first = ServerGeneratedChatMessageIdentity {
-            origin: ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
-            stream_epoch: idless_stream_epoch("session-a"),
-            item_ordinal: 0,
-        };
-        let second = ServerGeneratedChatMessageIdentity {
-            item_ordinal: 1,
-            ..first.clone()
-        };
-        assert_ne!(
-            first.message_id(),
-            second.message_id(),
-            "successive id-less messages in one session must not share an id"
-        );
-    }
-
-    /// A spec-only ACP agent that is deliberately *not* Kiro: it advertises an
-    /// auth method and requires `authenticate` before `session/new`, declares
-    /// `loadSession: false`, sends no `messageId` on any chunk, and uses none of
-    /// Kiro's extensions. This is the fixture that proves the generic path works
-    /// for a third-party agent rather than only for the agent it grew up around.
-    /// A spec-conforming agent that advertises `sessionCapabilities.list` and
-    /// paginates its answer, so the generic `session/list` path is exercised
-    /// end to end including `nextCursor`.
-    #[test]
-    fn session_list_capability_is_gated_on_the_key_being_present() {
-        // The spec gates `session/list` on the key existing; the object itself
-        // carries only `_meta`, so testing for `true` would never match a real
-        // agent.
-        let advertised = parse_capabilities(&json!({
-            "agentCapabilities": {"sessionCapabilities": {"list": {}}}
-        }));
-        assert!(advertised.session_list);
-
-        let silent = parse_capabilities(&json!({
-            "agentCapabilities": {"sessionCapabilities": {}}
-        }));
-        assert!(
-            !silent.session_list,
-            "an agent that does not advertise the method must fall back to its adapter"
-        );
-
-        let none = parse_capabilities(&json!({"agentCapabilities": {}}));
-        assert!(!none.session_list);
-
-        let explicit_null = parse_capabilities(&json!({
-            "agentCapabilities": {"sessionCapabilities": {"list": null}}
-        }));
-        assert!(
-            !explicit_null.session_list,
-            "an explicit null is not an advertisement"
-        );
-    }
-
-    #[test]
-    fn acp_session_info_maps_only_what_the_spec_actually_carries() {
-        let mapped = acp_session_info_to_backend_session(&json!({
-            "sessionId": "s1",
-            "cwd": "/repo",
-            "title": "Title",
-            "updatedAt": "2026-07-01T00:00:00Z"
-        }))
-        .expect("a complete SessionInfo maps");
-        assert_eq!(mapped.id.0, "s1");
-        assert_eq!(mapped.workspace_roots, vec!["/repo".to_string()]);
-        assert_eq!(mapped.title.as_deref(), Some("Title"));
-        assert!(mapped.updated_at_ms.is_some());
-        assert!(
-            mapped.created_at_ms.is_none() && mapped.token_count.is_none(),
-            "the spec carries neither, so neither may be invented from updatedAt"
-        );
-
-        assert!(
-            acp_session_info_to_backend_session(&json!({"cwd": "/repo"})).is_none(),
-            "an entry with no sessionId cannot be resumed and must be dropped"
-        );
-        assert!(
-            acp_session_info_to_backend_session(&json!({"sessionId": "   "})).is_none(),
-            "a blank sessionId is as unusable as a missing one"
-        );
-
-        let sparse = acp_session_info_to_backend_session(&json!({"sessionId": "s2"}))
-            .expect("sessionId is the only required field");
-        assert!(sparse.workspace_roots.is_empty());
-        assert_eq!(sparse.title, None);
-        assert_eq!(sparse.updated_at_ms, None);
-    }
-
-    fn write_fake_session_list_program() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tyde-acp-session-list-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create fake session-list tempdir");
-        let path = dir.join("fake-session-list-acp");
-        let script = r#"#!/bin/sh
-read line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"list":{}}}}}'
-read line
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"live-session"}}'
-read line
-case "$line" in
-  *'"cursor"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessions":[{"sessionId":"s2","cwd":"/repo/two","title":"Second","updatedAt":"2026-07-02T00:00:00Z"}]}}'
-    ;;
-  *)
-    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessions":[{"sessionId":"s1","cwd":"/repo/one","title":"First","updatedAt":"2026-07-01T00:00:00Z"},{"cwd":"/repo/broken"}],"nextCursor":"page-2"}}'
-    read line
-    printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessions":[{"sessionId":"s2","cwd":"/repo/two","title":"Second","updatedAt":"2026-07-02T00:00:00Z"}]}}'
-    ;;
-esac
-sleep 5
-"#;
-        std::fs::write(&path, script).expect("write fake session-list program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake session-list program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake session-list program");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn an_agent_advertising_session_list_is_enumerated_over_acp() {
-        let workspace_root =
-            std::env::temp_dir().join(format!("tyde-acp-list-ws-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace_root).expect("create session-list workspace");
-        let program = write_fake_session_list_program();
-
-        let agent = protocol::AcpAgentSpec {
-            command: program.to_string_lossy().to_string(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            adapter: protocol::AcpAdapterId::Stock,
-        };
-
-        let (session, mut raw_events) = KiroSession::spawn_for_agent(
-            &[workspace_root.to_string_lossy().to_string()],
-            Some(&agent),
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        .expect("spawn session-list agent");
-
-        session
-            .command_handle()
-            .execute(SessionCommand::ListSessions)
-            .await
-            .expect("list sessions");
-
-        let events = collect_kiro_turn_events(&mut raw_events).await;
-        let listed = events
-            .iter()
-            .find(|event| event.get("kind").and_then(Value::as_str) == Some("SessionsList"))
-            .and_then(|event| event.pointer("/data/sessions"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_else(|| panic!("no SessionsList event: {events:?}"));
-
-        let ids = listed
-            .iter()
-            .filter_map(|session| session.get("session_id").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            vec!["s2", "s1"],
-            "both pages must be followed via nextCursor, newest first: {listed:?}"
-        );
-        assert_eq!(
-            listed[1].get("title").and_then(Value::as_str),
-            Some("First")
-        );
-        assert_eq!(
-            listed[1].get("workspace_root").and_then(Value::as_str),
-            Some("/repo/one")
-        );
-        assert!(
-            listed
-                .iter()
-                .all(|session| session.get("session_id").and_then(Value::as_str) != Some("")),
-            "an entry with no sessionId is unusable and must be dropped, not listed blank"
-        );
-        assert_eq!(
-            listed.len(),
-            2,
-            "the malformed entry with no sessionId must not appear: {listed:?}"
-        );
-
-        session.shutdown().await;
-    }
-
-    fn write_fake_stock_acp_program() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tyde-stock-acp-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create fake stock acp tempdir");
-        let path = dir.join("fake-stock-acp");
-        let script = r#"#!/bin/sh
-read line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}],"agentCapabilities":{"loadSession":false},"promptCapabilities":{"image":false}}}'
-read line
-case "$line" in
-  *authenticate*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
-    read line
-    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-session"}}'
-    ;;
-  *)
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"auth_required"}}'
-    read line
-    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-session"}}'
-    ;;
-esac
-read line
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stock-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"stock "}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stock-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"agent ok"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
-sleep 5
-"#;
-        std::fs::write(&path, script).expect("write fake stock acp program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake stock acp program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake stock acp program");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn a_stock_acp_agent_completes_a_turn_without_any_kiro_behaviour() {
-        let workspace_root =
-            std::env::temp_dir().join(format!("tyde-stock-acp-ws-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace_root).expect("create stock acp workspace");
-        let program = write_fake_stock_acp_program();
-
-        let agent = protocol::AcpAgentSpec {
-            command: program.to_string_lossy().to_string(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            adapter: protocol::AcpAdapterId::Stock,
-        };
-
-        let (session, mut raw_events) = KiroSession::spawn_for_agent(
-            &[workspace_root.to_string_lossy().to_string()],
-            Some(&agent),
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        .expect("a spec-only ACP agent must spawn through the generic backend");
-
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "hello".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send message to stock acp agent");
-
-        let events = collect_kiro_turn_events(&mut raw_events).await;
-        let stream_events = events
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.get("kind").and_then(Value::as_str) == Some("Error")),
-            "a conforming spec-only agent must not trip any error path: {events:?}"
-        );
-        assert_eq!(
-            stream_events
-                .last()
-                .and_then(|event| event.pointer("/data/message/content"))
-                .and_then(Value::as_str),
-            Some("stock agent ok"),
-            "the agent's text must reach the user: {events:?}"
-        );
-
-        session.shutdown().await;
-    }
-
-    fn write_fake_kiro_acp_program() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tyde-kiro-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create fake kiro tempdir");
-        let path = dir.join("fake-kiro-acp");
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-test-session","models":{"currentModelId":"auto"}}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-test-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-fast","content":{"type":"text","text":"FAST_TURN_OK"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-"#;
-        std::fs::write(&path, script).expect("write fake kiro acp program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake kiro acp program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake kiro acp program");
-        }
-        path
-    }
-
-    fn write_fake_kiro_read_lifecycle_program() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-kiro-read-lifecycle-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake Kiro read lifecycle tempdir");
-        let path = dir.join("fake-kiro-read-lifecycle-acp");
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-read-lifecycle-session"}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-read-lifecycle-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-read-message","toolCallId":"T1","kind":"read","locations":[{"path":"/workspace/acp-read-20260730T180905Z-24232.txt"}],"rawInput":{"__tool_use_purpose":"Reading the specified file using the native file read tool","operations":[{"mode":"Line","path":"/workspace/acp-read-20260730T180905Z-24232.txt"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-read-lifecycle-session","update":{"sessionUpdate":"tool_call_update","toolCallId":"T1","kind":"read","status":"completed","rawInput":{"operations":[{"mode":"Line","path":"/workspace/acp-read-20260730T180905Z-24232.txt"}]},"rawOutput":{"items":[{"Text":"ACP_READ_METADATA_SENTINEL_acp-read-20260730T180905Z-24232\nline-two-π"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-"#;
-        std::fs::write(&path, script).expect("write fake Kiro read lifecycle program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&path)
-                .expect("stat fake Kiro read lifecycle program")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions)
-                .expect("chmod fake Kiro read lifecycle program");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn kiro_read_lifecycle_emits_one_correlated_measured_pair() {
-        let workspace = auth_lifecycle_workspace();
-        let program = write_fake_kiro_read_lifecycle_program();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-        let (session, mut raw_events) = KiroSession::spawn_for_agent(
-            &[workspace.to_string_lossy().to_string()],
-            Some(&agent),
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        .expect("spawn fake Kiro read lifecycle");
-        session
-            .command_handle()
-            .execute(SessionCommand::SendMessage {
-                message: "read the fixture".to_string(),
-                images: None,
-            })
-            .await
-            .expect("run fake Kiro read lifecycle");
-        let events = collect_kiro_turn_events(&mut raw_events)
-            .await
-            .into_iter()
-            .filter_map(|event| serde_json::from_value::<ChatEvent>(event).ok())
-            .collect::<Vec<_>>();
-        let requests = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolRequest(request) => Some(request),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let completions = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(requests.len(), 1, "{events:?}");
-        assert_eq!(completions.len(), 1, "{events:?}");
-        assert_eq!(requests[0].tool_call_id, "T1");
-        assert_eq!(requests[0].tool_call_id, completions[0].tool_call_id);
-        assert!(completions[0].success);
-        assert_eq!(
-            requests[0].tool_type,
-            protocol::ToolRequestType::ReadFiles {
-                file_paths: vec!["/workspace/acp-read-20260730T180905Z-24232.txt".to_string()]
-            }
-        );
-        assert_eq!(
-            completions[0].tool_result,
-            protocol::ToolExecutionResult::ReadFiles {
-                files: vec![protocol::FileInfo {
-                    path: "/workspace/acp-read-20260730T180905Z-24232.txt".to_string(),
-                    bytes: 70,
-                }]
-            }
-        );
-
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    fn write_fake_kiro_tool_identity_program() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-kiro-tool-identity-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake Kiro tool identity tempdir");
-        let path = dir.join("fake-kiro-tool-identity-acp");
-        // Handshake only: the tests drive tool frames straight through
-        // KiroInner, so fixture timing cannot race the assertions.
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-tool-identity-session","models":{"currentModelId":"auto"}}}'
-while read _; do :; done
-"#;
-        std::fs::write(&path, script).expect("write fake Kiro tool identity program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake Kiro tool identity program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro tool identity program");
-        }
-        path
-    }
-
-    async fn spawn_tool_identity_session() -> (
-        KiroSession,
-        mpsc::UnboundedReceiver<Value>,
-        PathBuf,
-        PathBuf,
-    ) {
-        let workspace = auth_lifecycle_workspace();
-        let program = write_fake_kiro_tool_identity_program();
-        let agent = auth_lifecycle_agent(&program, protocol::AcpAdapterId::Kiro);
-        let (session, raw_events) = KiroSession::spawn_for_agent(
-            &[workspace.to_string_lossy().to_string()],
-            Some(&agent),
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        .expect("spawn fake Kiro tool identity session");
-        (session, raw_events, program, workspace)
-    }
-
-    fn drain_tool_identity_events(
-        raw_events: &mut mpsc::UnboundedReceiver<Value>,
-    ) -> Vec<ChatEvent> {
-        let mut events = Vec::new();
-        while let Ok(value) = raw_events.try_recv() {
-            if let Ok(event) = serde_json::from_value::<ChatEvent>(value) {
-                events.push(event);
-            }
-        }
-        events
-    }
-
-    /// The emitted tool request is the single authority for an id's
-    /// identity: identity churn — a "superseded" pseudo-completion or a
-    /// synthetic replacement request — means two halves of the pipeline
-    /// disagreed about who a tool call is.
-    fn assert_no_tool_identity_churn(events: &[ChatEvent]) {
-        for event in events {
-            match event {
-                ChatEvent::ToolExecutionCompleted(completion) => {
-                    assert!(
-                        !completion
-                            .error
-                            .as_deref()
-                            .unwrap_or_default()
-                            .contains("superseded"),
-                        "supersede churn reached the user: {completion:?}"
-                    );
-                }
-                ChatEvent::ToolRequest(request) => {
-                    let tool_type = serde_json::to_value(&request.tool_type)
-                        .expect("serialize tool request type");
-                    assert!(
-                        tool_type.pointer("/args/synthetic").is_none(),
-                        "synthetic request card reached the user: {request:?}"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn kiro_refreshed_title_stays_authoritative_for_titleless_completion() {
-        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
-
-        session
-            .inner
-            .handle_tool_call(&json!({
-                "sessionUpdate": "tool_call",
-                "messageId": "kiro-refresh-msg",
-                "toolCallId": "T-refresh",
-                "kind": "execute",
-                "title": "Running: python3 hello.py",
-                "rawInput": {"command": "python3 hello.py", "working_dir": "."},
-            }))
-            .await;
-        session
-            .inner
-            .handle_tool_call(&json!({
-                "sessionUpdate": "tool_call",
-                "messageId": "kiro-refresh-msg",
-                "toolCallId": "T-refresh",
-                "kind": "execute",
-                "title": "Running: python3 hello.py --verbose",
-                "rawInput": {"command": "python3 hello.py --verbose", "working_dir": "."},
-            }))
-            .await;
-
-        {
-            let state = session.inner.state.lock().await;
-            let context = state
-                .active_tool_contexts
-                .get("T-refresh")
-                .expect("live context for T-refresh");
-            assert_eq!(
-                context.tool_name, "Running: python3 hello.py --verbose",
-                "stored context must advance with the re-emitted request"
-            );
-        }
-
-        session
-            .inner
-            .handle_tool_call_update(&json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "T-refresh",
-                "kind": "execute",
-                "status": "completed",
-                "rawOutput": {"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "ok\n", "stderr": ""}}]},
-            }))
-            .await;
-
-        let events = drain_tool_identity_events(&mut raw_events);
-        assert_no_tool_identity_churn(&events);
-
-        let requests = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolRequest(request) => Some(request),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let last_request = requests.last().expect("emitted request");
-        assert_eq!(last_request.tool_call_id, "T-refresh");
-        assert_eq!(
-            last_request.tool_name,
-            "Running: python3 hello.py --verbose"
-        );
-
-        let completions = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 1, "{events:?}");
-        assert_eq!(completions[0].tool_call_id, "T-refresh");
-        assert_eq!(
-            completions[0].tool_name, "Running: python3 hello.py --verbose",
-            "titleless completion must land under the last emitted name"
-        );
-        assert!(completions[0].success, "{events:?}");
-
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn kiro_after_backfill_reemits_under_the_current_tool_name() {
-        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
-        std::fs::write(workspace.join("hello.py"), "new content from disk\n")
-            .expect("write backfill fixture file");
-
-        session
-            .inner
-            .handle_tool_call(&json!({
-                "sessionUpdate": "tool_call",
-                "messageId": "kiro-edit-msg",
-                "toolCallId": "T-edit",
-                "kind": "edit",
-                "title": "Editing",
-                "rawInput": {"path": "hello.py", "oldStr": "old content"},
-            }))
-            .await;
-        session
-            .inner
-            .handle_tool_call(&json!({
-                "sessionUpdate": "tool_call",
-                "messageId": "kiro-edit-msg",
-                "toolCallId": "T-edit",
-                "kind": "edit",
-                "title": "Editing hello.py",
-                "rawInput": {"path": "hello.py", "oldStr": "old content v2"},
-            }))
-            .await;
-        session
-            .inner
-            .handle_tool_call_update(&json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "T-edit",
-                "kind": "edit",
-                "status": "completed",
-                "rawOutput": {"items": [{"Text": ""}]},
-            }))
-            .await;
-
-        let events = drain_tool_identity_events(&mut raw_events);
-        assert_no_tool_identity_churn(&events);
-
-        let requests = events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                ChatEvent::ToolRequest(request) => Some((index, request)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            requests.first().expect("initial request").1.tool_name,
-            "Editing"
-        );
-        let (last_request_index, last_request) = requests.last().expect("backfill re-emit");
-        assert_eq!(last_request.tool_call_id, "T-edit");
-        assert_eq!(
-            last_request.tool_name, "Editing hello.py",
-            "backfill must re-emit under the current name, not the first title"
-        );
-        let protocol::ToolRequestType::ModifyFile { after, .. } = &last_request.tool_type else {
-            panic!("backfill re-emit must stay a typed edit: {events:?}");
-        };
-        assert_eq!(after, "new content from disk\n");
-
-        let (completion_index, completion) = events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                ChatEvent::ToolExecutionCompleted(completion) => Some((index, completion)),
-                _ => None,
-            })
-            .expect("edit completion");
-        assert!(
-            *last_request_index < completion_index,
-            "backfilled request must precede its completion: {events:?}"
-        );
-        assert_eq!(completion.tool_call_id, "T-edit");
-        assert_eq!(completion.tool_name, "Editing hello.py");
-        assert!(completion.success, "{events:?}");
-        assert!(
-            matches!(
-                completion.tool_result,
-                protocol::ToolExecutionResult::ModifyFile { .. }
-            ),
-            "{events:?}"
-        );
-
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    #[tokio::test]
-    async fn kiro_reused_tool_call_id_yields_distinct_card_pairs() {
-        let (session, mut raw_events, program, workspace) = spawn_tool_identity_session().await;
-
-        for (message_id, command) in [
-            ("kiro-reuse-msg-1", "python3 one.py"),
-            ("kiro-reuse-msg-2", "python3 two.py"),
-        ] {
-            session
-                .inner
-                .handle_tool_call(&json!({
-                    "sessionUpdate": "tool_call",
-                    "messageId": message_id,
-                    "toolCallId": "T1",
-                    "kind": "execute",
-                    "title": format!("Running: {command}"),
-                    "rawInput": {"command": command, "working_dir": "."},
-                }))
-                .await;
-            session
-                .inner
-                .handle_tool_call_update(&json!({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "T1",
-                    "kind": "execute",
-                    "status": "completed",
-                    "rawOutput": {"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "", "stderr": ""}}]},
-                }))
-                .await;
-        }
-
-        let events = drain_tool_identity_events(&mut raw_events);
-        assert_no_tool_identity_churn(&events);
-
-        let requests = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolRequest(request) => Some(request),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(requests.len(), 2, "{events:?}");
-        assert_eq!(requests[0].tool_call_id, "T1");
-        assert_eq!(
-            requests[1].tool_call_id, "T1:occurrence-2",
-            "a reused id must mint a distinct deterministic identity"
-        );
-        assert_eq!(requests[0].tool_name, "Running: python3 one.py");
-        assert_eq!(requests[1].tool_name, "Running: python3 two.py");
-        assert_eq!(
-            requests[0].tool_type,
-            protocol::ToolRequestType::RunCommand {
-                command: "python3 one.py".to_string(),
-                working_directory: ".".to_string(),
-            }
-        );
-        assert_eq!(
-            requests[1].tool_type,
-            protocol::ToolRequestType::RunCommand {
-                command: "python3 two.py".to_string(),
-                working_directory: ".".to_string(),
-            }
-        );
-
-        let completions = events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 2, "{events:?}");
-        for (completion, request) in completions.iter().zip(&requests) {
-            assert_eq!(completion.tool_call_id, request.tool_call_id);
-            assert_eq!(completion.tool_name, request.tool_name);
-            assert!(completion.success, "{events:?}");
-        }
-
-        session.shutdown().await;
-        cleanup_auth_lifecycle_fixture(&program, &workspace);
-    }
-
-    fn write_fake_kiro_identity_program() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tyde-kiro-identity-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create fake Kiro identity tempdir");
-        let path = dir.join("fake-kiro-identity-acp");
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-identity-session","models":{"currentModelId":"auto"}}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reason-one "}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reason-two"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"hello "}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"world"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-two","content":{"type":"text","text":"next reason"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-two","content":{"type":"text","text":"second"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"unidentified"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part-one "}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part-two"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reused"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"stopReason":"end_turn"}}'
-"#;
-        std::fs::write(&path, script).expect("write fake Kiro identity program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake Kiro identity program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro identity program");
-        }
-        path
-    }
-
-    fn write_fake_kiro_provider_error_program() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-kiro-provider-error-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake Kiro provider error tempdir");
-        let path = dir.join("fake-kiro-provider-error-acp");
-        let script = r#"#!/bin/sh
-emit_request_events() {
-  case "$1" in
-    *"active provider error"*)
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-partial","content":{"type":"text","text":"partial response"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"kiro-provider-error-session","type":"error","message":"provider exploded"}}'
-      ;;
-    *"recover active error"*)
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-next","content":{"type":"text","text":"recovered"}}}}'
-      ;;
-    *"idle provider error"*)
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"kiro-provider-error-session","type":"error","message":"idle provider failure"}}'
-      ;;
-    *"recover idle error"*)
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-after-idle","content":{"type":"text","text":"idle recovered"}}}}'
-      ;;
-  esac
-}
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-provider-error-session","models":{"currentModelId":"auto"}}}'
-read request
-emit_request_events "$request"
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-read request
-emit_request_events "$request"
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
-"#;
-        std::fs::write(&path, script).expect("write fake Kiro provider error program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake Kiro provider error program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro provider error program");
-        }
-        path
-    }
-
-    async fn collect_kiro_turn_events(
-        raw_events: &mut mpsc::UnboundedReceiver<Value>,
-    ) -> Vec<Value> {
-        let mut events = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
-                Ok(Some(value)) => events.push(value),
-                Ok(None) | Err(_) => break,
-            }
-        }
-        events
-    }
-
-    fn stream_event_message_id(event: &Value) -> Option<&str> {
-        match event.get("kind").and_then(Value::as_str) {
-            Some("StreamEnd") => event
-                .pointer("/data/message/message_id")
-                .and_then(Value::as_str),
-            Some("StreamStart") | Some("StreamDelta") | Some("StreamReasoningDelta") => {
-                event.pointer("/data/message_id").and_then(Value::as_str)
-            }
-            _ => None,
-        }
-    }
-
-    fn replay_assistant_snapshots(events: &[Value]) -> Vec<(String, String, Option<String>)> {
-        events
-            .iter()
-            .filter(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                    && event.pointer("/data/sender/Assistant").is_some()
-            })
-            .map(|event| {
-                (
-                    event
-                        .pointer("/data/message_id")
-                        .and_then(Value::as_str)
-                        .expect("replayed assistant message must have an identity")
-                        .to_string(),
-                    event
-                        .pointer("/data/content")
-                        .and_then(Value::as_str)
-                        .expect("replayed assistant message must have content")
-                        .to_string(),
-                    event
-                        .pointer("/data/reasoning/text")
-                        .and_then(Value::as_str)
-                        .map(|reasoning| reasoning.to_string()),
-                )
-            })
-            .collect()
-    }
-
-    fn write_fake_kiro_restore_program() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tyde-kiro-restore-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create fake kiro restore tempdir");
-        let path = dir.join("fake-kiro-restore-acp");
-        let script = r#"#!/bin/sh
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"restore this"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"operations":[{"mode":"Line","path":"README.md"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","title":"read","toolCallId":"tooluse_restore_read","status":"completed","rawInput":{"operations":[{"mode":"Line","path":"README.md"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","rawInput":{"command":"grep missing README.md","working_dir":"."}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","status":"cancelled","rawOutput":{"items":[]},"error":{"message":"grep was cancelled"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-restored-response","content":{"type":"text","text":"restored done"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-session","models":{"currentModelId":"auto"}}}'
-"#;
-        std::fs::write(&path, script).expect("write fake kiro restore program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake kiro restore program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake kiro restore program");
-        }
-        path
-    }
-
-    fn write_fake_kiro_legacy_replay_program() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tyde-kiro-legacy-replay-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake Kiro legacy replay tempdir");
-        let path = dir.join("fake-kiro-legacy-replay-acp");
-        let script = r#"#!/bin/sh
-emit_history() {
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first request"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"first reason "}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"continued"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first "}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"second request"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second answer"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"third request"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"third reason"}}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"third answer"}}}}'
-}
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read _
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
-read _
-emit_history
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-real-legacy-session","models":{"currentModelId":"auto"}}}'
-read _
-emit_history
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-session","models":{"currentModelId":"auto"}}}'
-"#;
-        std::fs::write(&path, script).expect("write fake Kiro legacy replay program");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .expect("stat fake Kiro legacy replay program")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro legacy replay program");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn resume_session_replays_tool_history_as_valid_transcript_events() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-kiro-restore-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root).expect("create fake restore workspace");
-        let program = write_fake_kiro_restore_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake restore kiro session");
-
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::ResumeSession {
-                session_id: "kiro-restored-session".to_string(),
-            })
-            .await
-            .expect("resume fake kiro session");
-
-        let mut events = Vec::new();
-        loop {
-            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
-                Ok(Some(value)) => {
-                    if let Some(event) = map_kiro_value_to_chat_event(&value) {
-                        events.push(event);
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ChatEvent::StreamStart(_) | ChatEvent::StreamEnd(_))),
-            "restored transcript should not synthesize live stream boundaries: {events:?}"
-        );
-
-        let tool_requests = events
-            .iter()
-            .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
-            .count();
-        let failed_completions = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ChatEvent::ToolExecutionCompleted(completion) if !completion.success
-                )
-            })
-            .count();
-        assert_eq!(
-            tool_requests, 2,
-            "expected replayed tool requests: {events:?}"
-        );
-        assert_eq!(
-            failed_completions, 1,
-            "expected cancelled replayed tool completion: {events:?}"
-        );
-        let read_request = events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                ChatEvent::ToolRequest(request) if request.tool_name == "read" => {
-                    Some((index, request))
-                }
-                _ => None,
-            })
-            .expect("replayed read request");
-        let protocol::ToolRequestType::ReadFiles { file_paths } = &read_request.1.tool_type else {
-            panic!("replayed read request must retain typed paths: {events:?}");
-        };
-        assert_eq!(file_paths, &vec!["README.md".to_string()]);
-        let read_completion = events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                ChatEvent::ToolExecutionCompleted(completion) if completion.tool_name == "read" => {
-                    Some((index, completion))
-                }
-                _ => None,
-            })
-            .expect("replayed read completion");
-        assert!(
-            read_request.0 < read_completion.0,
-            "request must precede correlated terminal replay: {events:?}"
-        );
-        assert_eq!(read_request.1.tool_call_id, read_completion.1.tool_call_id);
-        assert!(read_completion.1.success);
-        assert_eq!(
-            read_completion.1.tool_result,
-            protocol::ToolExecutionResult::Other { result: json!({}) }
-        );
-        assert!(
-            !serde_json::to_string(&read_completion.1.tool_result)
-                .expect("serialize replayed read completion")
-                .contains("\"bytes\""),
-            "native replay omitted content, so it must not claim bytes"
-        );
-
-        let host_stream = protocol::StreamPath("/host/test".to_string());
-        let agent_stream = protocol::StreamPath("/agent/test-agent/test-instance".to_string());
-        let agent_id = protocol::AgentId("test-agent".to_string());
-        let workspace_roots = vec![workspace_root.to_string_lossy().to_string()];
-        let mut validator = protocol::ProtocolValidator::new();
-        let new_agent = protocol::NewAgentPayload {
-            agent_id: agent_id.clone(),
-            name: "test".to_string(),
-            origin: protocol::AgentOrigin::User,
-            backend_kind: protocol::BackendKind::Acp,
-            launch_profile_id: None,
-            workspace_roots: workspace_roots.clone(),
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            workflow: None,
-            created_at_ms: 0,
-            instance_stream: agent_stream.clone(),
-            activity_summary: Default::default(),
-        };
-        let welcome = protocol::Envelope::from_payload(
-            host_stream.clone(),
-            protocol::FrameKind::Welcome,
-            0,
-            &protocol::WelcomePayload {
-                protocol_version: protocol::PROTOCOL_VERSION,
-                tyde_version: protocol::Version {
-                    major: 0,
-                    minor: 0,
-                    patch: 0,
-                },
-                release_version: None,
-            },
-        )
-        .expect("serialize Welcome");
-        validator
-            .validate_envelope(&welcome)
-            .expect("validate Welcome");
-
-        let host_bootstrap = protocol::Envelope::from_payload(
-            host_stream,
-            protocol::FrameKind::HostBootstrap,
-            1,
-            &protocol::HostBootstrapPayload {
-                settings: protocol::HostSettings {
-                    enabled_backends: vec![protocol::BackendKind::Acp],
-                    default_backend: Some(protocol::BackendKind::Acp),
-                    enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    tyde_debug_mcp_enabled: false,
-                    tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
-                    complexity_tiers_enabled: false,
-                    backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: Default::default(),
-                    supervisor: Default::default(),
-                    code_intel: Default::default(),
-                    backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
-                    hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
-                },
-                mobile_access: protocol::MobileAccessStatePayload {
-                    broker_status: protocol::MobileBrokerStatus::Disabled,
-                    pairing: protocol::MobilePairingState::Idle,
-                    paired_devices: vec![],
-                },
-                backend_setup: protocol::BackendSetupPayload { backends: vec![] },
-                session_schemas: vec![],
-                backend_config_schemas: vec![],
-                backend_config_snapshots: vec![],
-                launch_profile_catalog: Default::default(),
-                sessions: vec![],
-                session_list: Default::default(),
-                projects: vec![],
-                mcp_servers: vec![],
-                skills: vec![],
-                steering: vec![],
-                custom_agents: vec![],
-                team_preset_catalog: protocol::TeamPresetCatalog {
-                    role_presets: vec![],
-                    personality_traits: vec![],
-                    personality_presets: vec![],
-                    team_templates: vec![],
-                },
-                team_drafts: vec![],
-                teams: vec![],
-                team_members: vec![],
-                team_member_bindings: vec![],
-                agents: vec![new_agent],
-                task_token_usages: Vec::new(),
-                workflow_summaries: vec![],
-                workflow_diagnostics: vec![],
-                workflow_runs: vec![],
-                workflow_locations: vec![],
-                agents_view_preferences: None,
-            },
-        )
-        .expect("serialize HostBootstrap");
-        validator
-            .validate_envelope(&host_bootstrap)
-            .expect("validate HostBootstrap");
-
-        let agent_bootstrap = protocol::Envelope::from_payload(
-            agent_stream.clone(),
-            protocol::FrameKind::AgentBootstrap,
-            0,
-            &protocol::AgentBootstrapPayload {
-                events: vec![protocol::AgentBootstrapEvent::AgentStart(
-                    protocol::AgentStartPayload {
-                        agent_id,
-                        name: "test".to_string(),
-                        origin: protocol::AgentOrigin::User,
-                        backend_kind: protocol::BackendKind::Acp,
-                        launch_profile_id: None,
-                        workspace_roots,
-                        custom_agent_id: None,
-                        team_id: None,
-                        team_member_id: None,
-                        project_id: None,
-                        parent_agent_id: None,
-                        session_id: None,
-                        workflow: None,
-                        created_at_ms: 0,
-                    },
-                )],
-                latest_output: Default::default(),
-                turn_active: false,
-            },
-        )
-        .expect("serialize AgentBootstrap");
-        validator
-            .validate_envelope(&agent_bootstrap)
-            .expect("validate AgentBootstrap");
-
-        for (index, event) in events.iter().enumerate() {
-            let env = protocol::Envelope::from_payload(
-                agent_stream.clone(),
-                protocol::FrameKind::ChatEvent,
-                index as u64 + 1,
-                event,
-            )
-            .expect("serialize ChatEvent");
-            validator
-                .validate_envelope(&env)
-                .unwrap_or_else(|error| panic!("restored event violated protocol: {error}"));
-        }
-
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn legacy_replay_identity_is_stable_across_repeated_resume() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-kiro-legacy-replay-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root).expect("create fake Kiro legacy replay workspace");
-        let program = write_fake_kiro_legacy_replay_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake Kiro legacy replay session");
-        let handle = session.command_handle();
-
-        handle
-            .execute(SessionCommand::ResumeSession {
-                session_id: "kiro-real-legacy-session".to_string(),
-            })
-            .await
-            .expect("first legacy Kiro replay should resume");
-        let first_events = collect_kiro_turn_events(&mut raw_events).await;
-        assert!(
-            !first_events
-                .iter()
-                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
-        );
-        let first = replay_assistant_snapshots(&first_events);
-        assert_eq!(
-            first
-                .iter()
-                .map(|(_, content, reasoning)| (content.as_str(), reasoning.as_deref()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("first answer", Some("first reason continued")),
-                ("second answer", None),
-                ("third answer", Some("third reason")),
-            ]
-        );
-        assert!(first.iter().all(|(message_id, _, _)| {
-            message_id.starts_with("server-generated:legacy_replay:")
-        }));
-        assert_eq!(
-            first
-                .iter()
-                .map(|(message_id, _, _)| {
-                    message_id
-                        .rsplit(':')
-                        .next()
-                        .expect("generated identity has item ordinal")
-                })
-                .collect::<Vec<_>>(),
-            vec!["0", "13", "15"]
-        );
-        let other_session_identity = KiroReplayMessageIdentity::legacy_migration(
-            "kiro-other-legacy-session".to_string(),
-            0,
-            KiroLegacyReplayEventKind::Reasoning,
-        )
-        .expect("derive other-session legacy identity");
-        assert_ne!(
-            other_session_identity.message_id.0.as_str(),
-            first[0].0.as_str()
-        );
-        assert_eq!(
-            first
-                .iter()
-                .map(|(message_id, _, _)| message_id)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            3
-        );
-
-        handle
-            .execute(SessionCommand::ResumeSession {
-                session_id: "kiro-real-legacy-session".to_string(),
-            })
-            .await
-            .expect("second legacy Kiro replay should resume");
-        let second_events = collect_kiro_turn_events(&mut raw_events).await;
-        assert!(
-            !second_events
-                .iter()
-                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
-        );
-        let second = replay_assistant_snapshots(&second_events);
-        assert_eq!(second, first);
-
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn provider_error_discards_active_partial_stream_and_accepts_next_id() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-kiro-provider-error-active-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root)
-            .expect("create fake active provider error workspace");
-        let program = write_fake_kiro_provider_error_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake active provider error session");
-        let handle = session.command_handle();
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "active provider error".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send active provider error request");
-        let failed = collect_kiro_turn_events(&mut raw_events).await;
-        let stream_start = failed
-            .iter()
-            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
-            .expect("active provider error must start its identified partial stream");
-        assert_eq!(
-            failed[stream_start..]
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![
-                "StreamStart",
-                "StreamDelta",
-                "Error",
-                "OperationCancelled",
-                "TypingStatusChanged",
-            ],
-            "active provider error must discard with one exact terminal tail: {failed:?}"
-        );
-        assert!(failed[stream_start..stream_start + 2].iter().all(|event| {
-            stream_event_message_id(event) == Some("kiro-provider-error-partial")
-        }));
-        assert_eq!(
-            failed[stream_start + 1]
-                .pointer("/data/text")
-                .and_then(Value::as_str),
-            Some("partial response")
-        );
-        assert_eq!(
-            failed[stream_start + 2].get("data").and_then(Value::as_str),
-            Some("Stream identity violation: missing message id")
-        );
-        assert_eq!(
-            failed[stream_start + 3]
-                .pointer("/data/message")
-                .and_then(Value::as_str),
-            Some("Stream identity violation")
-        );
-        assert_eq!(
-            failed[stream_start + 4]
-                .get("data")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(
-            !failed
-                .iter()
-                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("StreamEnd") })
-        );
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "recover active error".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send recovery after active provider error");
-        let recovered = collect_kiro_turn_events(&mut raw_events).await;
-        let recovered_stream_events = recovered
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recovered_stream_events
-                .iter()
-                .map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![Some("StreamStart"), Some("StreamDelta"), Some("StreamEnd"),]
-        );
-        assert!(
-            recovered_stream_events.iter().all(|event| {
-                stream_event_message_id(event) == Some("kiro-provider-error-next")
-            })
-        );
-        assert!(
-            !recovered
-                .iter()
-                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
-        );
-
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn provider_error_without_stream_emits_error_then_idle_and_recovers() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-kiro-provider-error-idle-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root)
-            .expect("create fake idle provider error workspace");
-        let program = write_fake_kiro_provider_error_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake idle provider error session");
-        let handle = session.command_handle();
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "idle provider error".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send idle provider error request");
-        let failed = collect_kiro_turn_events(&mut raw_events).await;
-        let error = failed
-            .iter()
-            .position(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
-            .expect("idle provider error must remain visible");
-        assert_eq!(
-            failed[error..]
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["Error", "TypingStatusChanged"],
-            "idle provider error must emit one error/idle tail: {failed:?}"
-        );
-        assert_eq!(
-            failed[error].get("data").and_then(Value::as_str),
-            Some("idle provider failure")
-        );
-        assert_eq!(
-            failed[error + 1].get("data").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(!failed.iter().any(|event| {
-            matches!(
-                event.get("kind").and_then(Value::as_str),
-                Some("StreamStart")
-                    | Some("StreamDelta")
-                    | Some("StreamReasoningDelta")
-                    | Some("StreamEnd")
-                    | Some("OperationCancelled")
-            )
-        }));
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "recover idle error".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send recovery after idle provider error");
-        let recovered = collect_kiro_turn_events(&mut raw_events).await;
-        let recovered_stream_events = recovered
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recovered_stream_events
-                .iter()
-                .map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![Some("StreamStart"), Some("StreamDelta"), Some("StreamEnd"),]
-        );
-        assert!(recovered_stream_events.iter().all(|event| {
-            stream_event_message_id(event) == Some("kiro-provider-error-after-idle")
-        }));
-        assert!(
-            !recovered
-                .iter()
-                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
-        );
-
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn kiro_stream_identity_is_stable_and_request_scoped() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "tyde-kiro-identity-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace_root).expect("create fake identity workspace");
-        let program = write_fake_kiro_identity_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake Kiro identity session");
-        let handle = session.command_handle();
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "first".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send first fake Kiro request");
-        let first = collect_kiro_turn_events(&mut raw_events).await;
-        let first_stream_events = first
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            first_stream_events
-                .iter()
-                .map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![
-                Some("StreamStart"),
-                Some("StreamReasoningDelta"),
-                Some("StreamReasoningDelta"),
-                Some("StreamDelta"),
-                Some("StreamDelta"),
-                Some("StreamEnd"),
-            ]
-        );
-        assert!(
-            first_stream_events
-                .iter()
-                .all(|event| { stream_event_message_id(event) == Some("kiro-response-one") })
-        );
-        assert_eq!(
-            first_stream_events
-                .iter()
-                .filter(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamReasoningDelta")
-                })
-                .filter_map(|event| event.pointer("/data/text").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["reason-one ", "reason-two"]
-        );
-        assert_eq!(
-            first_stream_events
-                .last()
-                .and_then(|event| event.pointer("/data/message/content"))
-                .and_then(Value::as_str),
-            Some("hello world")
-        );
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "second".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send second fake Kiro request");
-        let second = collect_kiro_turn_events(&mut raw_events).await;
-        let second_stream_events = second
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-        assert!(
-            second_stream_events
-                .iter()
-                .all(|event| { stream_event_message_id(event) == Some("kiro-response-two") })
-        );
-        assert!(
-            !second_stream_events
-                .iter()
-                .any(|event| { stream_event_message_id(event) == Some("kiro-response-one") })
-        );
-        assert_eq!(
-            second_stream_events
-                .last()
-                .and_then(|event| event.pointer("/data/message/content"))
-                .and_then(Value::as_str),
-            Some("second")
-        );
-
-        // `messageId` is optional in ACP (the schema marks it "UNSTABLE — not
-        // part of the spec yet"), and real Kiro 2.15.1 omits it on every chunk.
-        // This turn therefore models a *conforming* agent, not a misbehaving
-        // one, and the contract to enforce is the same one the identified turns
-        // above enforce: a turn resolves to exactly one identity, every chunk
-        // in it renders under that identity, and it is never confused with
-        // another turn's. Asserting these events were dropped asserted the
-        // opposite — that a conforming agent's whole visible response is
-        // discarded — so the assertions below replace that with the stricter
-        // per-event identity and content checks.
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "missing identity".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send missing-identity fake Kiro request");
-        let missing = collect_kiro_turn_events(&mut raw_events).await;
-        assert!(
-            !missing
-                .iter()
-                .any(|event| event.get("kind").and_then(Value::as_str) == Some("Error")),
-            "an agent that omits the optional messageId is conforming, not in violation: {missing:?}"
-        );
-        let missing_stream_events = missing
-            .iter()
-            .filter(|event| stream_event_message_id(event).is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            missing_stream_events
-                .iter()
-                .map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![
-                Some("StreamStart"),
-                Some("StreamReasoningDelta"),
-                Some("StreamDelta"),
-                Some("StreamDelta"),
-                Some("StreamEnd"),
-            ],
-            "an id-less turn must stream and terminate like any other: {missing:?}"
-        );
-        let synthesized_id = stream_event_message_id(missing_stream_events[0])
-            .expect("id-less turn must still open under some identity")
-            .to_string();
-        assert!(
-            missing_stream_events
-                .iter()
-                .all(|event| stream_event_message_id(event) == Some(synthesized_id.as_str())),
-            "every chunk of an id-less turn must share the one identity that turn resolved to"
-        );
-        assert!(
-            synthesized_id.starts_with("server-generated:"),
-            "an id-less turn must be named by the server-generated identity contract, \
-             not by a provider value or the message text: {synthesized_id}"
-        );
-        assert!(
-            !["kiro-response-one", "kiro-response-two"].contains(&synthesized_id.as_str()),
-            "a synthesized identity must never collide with a provider identity"
-        );
-        assert_eq!(
-            missing_stream_events
-                .last()
-                .and_then(|event| event.pointer("/data/message/content"))
-                .and_then(Value::as_str),
-            Some("part-one part-two"),
-            "id-less chunks after the first must join the open message, not start new ones"
-        );
-
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "reuse identity".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send reused-identity fake Kiro request");
-        let reused = collect_kiro_turn_events(&mut raw_events).await;
-        let reused_identity_errors = reused
-            .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
-            .filter_map(|event| event.get("data").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            reused_identity_errors,
-            vec!["Stream identity violation: duplicate terminal message id"],
-            "terminal provider ID reuse must emit exactly one typed error: {reused:?}"
-        );
-        assert!(
-            !reused
-                .iter()
-                .any(|event| stream_event_message_id(event).is_some())
-        );
-
-        session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_message_waits_for_prior_inbound_updates_before_finalizing_stream() {
-        let workspace_root =
-            std::env::temp_dir().join(format!("tyde-kiro-workspace-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace_root).expect("create fake workspace");
-        let program = write_fake_kiro_acp_program();
-
-        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-            &[workspace_root.to_string_lossy().to_string()],
-            None,
-            None,
-            &[],
-            None,
-            Some(program.to_string_lossy().to_string()),
-        )
-        .await
-        .expect("spawn fake kiro session");
-
-        let handle = session.command_handle();
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "hello".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send fake kiro message");
-
-        let mut events = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
-                Ok(Some(value)) => {
-                    let kind = value
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let is_typing_false = kind == "TypingStatusChanged"
-                        && value.get("data").and_then(Value::as_bool) == Some(false);
-                    events.push(value);
-                    if is_typing_false {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        let first_typing_true = events.iter().position(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                && event.get("data").and_then(Value::as_bool) == Some(true)
-        });
-        let stream_start = events
-            .iter()
-            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"));
-        let stream_delta = events
-            .iter()
-            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamDelta"));
-        let stream_end = events
-            .iter()
-            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"));
-        let typing_false = events.iter().position(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                && event.get("data").and_then(Value::as_bool) == Some(false)
-        });
-
-        assert!(
-            first_typing_true.is_some()
-                && stream_start.is_some()
-                && stream_delta.is_some()
-                && stream_end.is_some()
-                && typing_false.is_some(),
-            "expected full stream lifecycle after prompt completion, got {events:?}"
-        );
-        let first_typing_true = first_typing_true.expect("typing true checked above");
-        let stream_start = stream_start.expect("stream start checked above");
-        let stream_delta = stream_delta.expect("stream delta checked above");
-        let stream_end = stream_end.expect("stream end checked above");
-        let typing_false = typing_false.expect("typing false checked above");
-        assert_eq!(
-            events[stream_end]
-                .pointer("/data/message/token_usage/turn/reason")
-                .and_then(Value::as_str),
-            Some("backend_did_not_report"),
-            "Kiro StreamEnd without reported counts must be explicitly unavailable: {events:?}"
-        );
-        assert!(
-            first_typing_true < stream_start
-                && stream_start < stream_delta
-                && stream_delta < stream_end
-                && stream_end < typing_false,
-            "expected ordered stream lifecycle after prompt completion, got {events:?}"
-        );
-        assert!(
-            !events[..stream_end].iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
-                    && event.get("data").and_then(Value::as_bool) == Some(false)
-            }),
-            "saw TypingStatusChanged(false) before StreamEnd: {events:?}"
-        );
-
-        session.shutdown().await;
     }
 }

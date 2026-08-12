@@ -3863,6 +3863,10 @@ pub enum MessageOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum SendMessageToolResponse {
+    AskUserQuestion {
+        tool_call_id: String,
+        answer: String,
+    },
     ExitPlanMode {
         tool_call_id: String,
         decision: ExitPlanModeDecision,
@@ -4830,6 +4834,8 @@ pub struct Skill {
 pub struct McpServerConfig {
     pub id: McpServerId,
     pub name: String,
+    #[serde(default)]
+    pub supports_parallel_tool_calls: bool,
     pub transport: McpTransportConfig,
 }
 
@@ -7600,11 +7606,12 @@ pub enum OrchestrationWorkflowPhase {
 /// `ToolExecutionCompleted` with the same `tool_call_id`.
 ///
 /// ### Activity
-/// `TypingStatusChanged` is the authoritative backend activity signal. Once a
-/// backend emits `true`, it must not emit `false` until foreground turns,
-/// background tasks, subagents, workflows, and any provider-initiated
-/// continuation have all quiesced. Turn and stream boundaries do not by
-/// themselves make a backend idle.
+/// `TypingStatusChanged` is the authoritative foreground-turn activity signal.
+/// Detached background tasks, subagents, and workflows remain visible through
+/// their own progress events and must not keep the foreground turn active.
+/// A backend emits `false` as soon as it can accept another user turn, even
+/// while detached work continues. Provider-initiated continuation starts a new
+/// foreground turn and therefore emits its own paired activity signals.
 ///
 /// ### Cancellation ordering
 /// When a turn is cancelled the backend must, in this order:
@@ -8058,6 +8065,12 @@ pub enum ToolRequestType {
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// Whether the provider keeps this child attached to the invoking turn
+        /// or lets it outlive that foreground turn. Older persisted requests
+        /// predate this field and deserialize as `Unknown`; current backend
+        /// emitters must supply an authoritative mode.
+        #[serde(default)]
+        execution_mode: AgentExecutionMode,
     },
     GenerateImage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8089,6 +8102,16 @@ pub enum ToolRequestType {
     Other {
         args: Value,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutionMode {
+    Foreground,
+    Background,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// One watched agent's terminal status in a `tyde_await_agents` completion.
@@ -8133,7 +8156,22 @@ pub enum ToolProgressUpdate {
     Workflow(WorkflowRunState),
     AgentControl(AgentControlProgress),
     BackgroundTask(BackgroundTaskState),
-    Other { payload: Value },
+    Other {
+        #[serde(default)]
+        status: OpaqueToolProgressStatus,
+        payload: Value,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpaqueToolProgressStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    #[default]
+    Unknown,
 }
 
 /// Live status of a backgrounded shell command, reduced server-side from
@@ -8183,6 +8221,20 @@ pub struct SubAgentProgress {
     pub last_tool_name: Option<String>,
     pub tool_calls: u64,
     pub completed: bool,
+    #[serde(default)]
+    pub status: SubAgentProgressStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentProgressStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// Live Tyde agent-control MCP progress for tool cards that spawn or wait on
@@ -8191,6 +8243,20 @@ pub struct SubAgentProgress {
 pub struct AgentControlProgress {
     pub progress_kind: AgentControlProgressKind,
     pub agents: Vec<AgentControlAgentRef>,
+    #[serde(default)]
+    pub status: AgentControlProgressStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlProgressStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -9855,6 +9921,7 @@ mod tool_progress_serde_tests {
                     agent_id: AgentId("agent-123".to_owned()),
                     name: Some("Worker".to_owned()),
                 }],
+                status: AgentControlProgressStatus::Running,
             }),
         };
 
@@ -9870,7 +9937,8 @@ mod tool_progress_serde_tests {
                     "agents": [{
                         "agent_id": "agent-123",
                         "name": "Worker"
-                    }]
+                    }],
+                    "status": "running"
                 }
             })
         );

@@ -66,9 +66,29 @@ pub async fn spawn_remote_process(
     args: &[String],
     cwd: Option<&str>,
 ) -> Result<AsyncGroupChild, String> {
+    spawn_remote_process_with_env(host, program, args, cwd, &[]).await
+}
+
+pub async fn spawn_remote_process_with_env(
+    host: &str,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: &[(&str, &str)],
+) -> Result<AsyncGroupChild, String> {
     let mut remote_parts = Vec::new();
     if let Some(path) = cwd.map(str::trim).filter(|v| !v.is_empty()) {
         remote_parts.push(format!("cd {} &&", shell_quote_arg(path)));
+    }
+    for (name, value) in env {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            return Err(format!("invalid remote environment variable name {name:?}"));
+        }
+        remote_parts.push(format!("{name}={}", shell_quote_arg(value)));
     }
     remote_parts.push(shell_quote_arg(program));
     if !args.is_empty() {

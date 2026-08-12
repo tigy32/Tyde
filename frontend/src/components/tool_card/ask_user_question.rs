@@ -5,7 +5,7 @@
 //! Rather than dumping the raw JSON, this card renders the questions as
 //! selectable options plus a custom-text field and a Submit button.
 //!
-//! MVP answer flow: submitting composes the chosen answers into a plain message
+//! Submitting composes the chosen answers into a typed tool response
 //! and sends it through the normal `SendMessage` path, resuming Claude on the
 //! next turn. There is no live stdin channel.
 
@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
-    AskUserQuestion, FrameKind, SendMessagePayload, StreamPath, ToolExecutionResult,
-    ToolRequestType,
+    AskUserQuestion, FrameKind, SendMessagePayload, SendMessageToolResponse, StreamPath,
+    ToolExecutionResult, ToolRequestType,
 };
 use wasm_bindgen_futures::spawn_local;
 
@@ -51,6 +51,7 @@ fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String
 
 pub(crate) fn render(
     agent_ref: Signal<Option<ActiveAgentRef>>,
+    tool_call_id: &str,
     req: &ToolRequestType,
     _result: Option<&ToolExecutionResult>,
     _mode: ToolOutputMode,
@@ -59,7 +60,14 @@ pub(crate) fn render(
         unreachable!("ask_user_question::render dispatched on non-AskUserQuestion request");
     };
 
-    view! { <AskUserQuestionCard agent_ref=agent_ref questions=questions.clone() /> }.into_any()
+    view! {
+        <AskUserQuestionCard
+            agent_ref=agent_ref
+            tool_call_id=tool_call_id.to_owned()
+            questions=questions.clone()
+        />
+    }
+    .into_any()
 }
 
 #[derive(Clone, Copy)]
@@ -84,6 +92,7 @@ fn target_is_fatal_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgen
 #[component]
 fn AskUserQuestionCard(
     agent_ref: Signal<Option<ActiveAgentRef>>,
+    tool_call_id: String,
     questions: Vec<AskUserQuestion>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -130,6 +139,7 @@ fn AskUserQuestionCard(
     let on_submit = {
         let questions = questions.clone();
         let states = states.clone();
+        let tool_call_id = tool_call_id.clone();
         move |_| {
             if submitted.get_untracked()
                 || sending.get_untracked()
@@ -161,7 +171,15 @@ fn AskUserQuestionCard(
                 }
             };
             sending.set(true);
-            send_answer(host_id, stream, message, submitted, sending, send_error);
+            send_answer(
+                host_id,
+                stream,
+                tool_call_id.clone(),
+                message,
+                submitted,
+                sending,
+                send_error,
+            );
         }
     };
 
@@ -332,6 +350,7 @@ fn answer_target(
 fn send_answer(
     host_id: String,
     stream: StreamPath,
+    tool_call_id: String,
     message: String,
     submitted: RwSignal<bool>,
     sending: RwSignal<bool>,
@@ -339,10 +358,13 @@ fn send_answer(
 ) {
     spawn_local(async move {
         let payload = SendMessagePayload {
-            message,
+            message: message.clone(),
             images: None,
             origin: None,
-            tool_response: None,
+            tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                tool_call_id,
+                answer: message,
+            }),
         };
         match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
             Ok(()) => {
@@ -678,6 +700,21 @@ mod wasm_tests {
         (host_id, stream)
     }
 
+    fn last_send_line(calls: &js_sys::Array) -> String {
+        assert_eq!(calls.length(), 1, "one control activation must send once");
+        let entry = calls
+            .get(0)
+            .dyn_into::<js_sys::Array>()
+            .expect("call entry");
+        let args: serde_json::Value =
+            serde_json::from_str(&entry.get(1).as_string().expect("serialized invoke args"))
+                .expect("invoke args JSON");
+        args.get("line")
+            .and_then(|value| value.as_str())
+            .expect("serialized envelope")
+            .to_owned()
+    }
+
     fn install_deferred_send_stub() -> js_sys::Array {
         let code = r#"
             (function() {
@@ -801,8 +838,15 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn renders_question_text_and_all_options() {
         let req = single_select_req();
-        let container =
-            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
+        let container = mount_with_state(move || {
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
         next_tick().await;
 
         let body = text(&container);
@@ -897,8 +941,15 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn submit_disabled_until_an_option_is_chosen() {
         let req = single_select_req();
-        let container =
-            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
+        let container = mount_with_state(move || {
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
         next_tick().await;
 
         assert!(
@@ -918,8 +969,15 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn single_select_replaces_previous_choice() {
         let req = single_select_req();
-        let container =
-            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
+        let container = mount_with_state(move || {
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
         next_tick().await;
 
         let buttons = option_buttons(&container);
@@ -937,8 +995,15 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn multi_select_keeps_multiple_choices() {
         let req = multi_select_req();
-        let container =
-            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
+        let container = mount_with_state(move || {
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
         next_tick().await;
 
         let buttons = option_buttons(&container);
@@ -959,8 +1024,15 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn submit_without_active_agent_shows_retryable_error() {
         let req = single_select_req();
-        let container =
-            mount_with_state(move || render(no_agent_ref(), &req, None, ToolOutputMode::Summary));
+        let container = mount_with_state(move || {
+            render(
+                no_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
         next_tick().await;
 
         option_buttons(&container)[0].click();
@@ -1001,7 +1073,15 @@ mod wasm_tests {
                     "the callback target resolver must reject a fatal owner"
                 );
             },
-            move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary),
+            move || {
+                render(
+                    test_agent_ref(),
+                    "toolu_test",
+                    &req,
+                    None,
+                    ToolOutputMode::Summary,
+                )
+            },
         );
         next_tick().await;
 
@@ -1024,7 +1104,13 @@ mod wasm_tests {
         let calls = install_deferred_send_stub();
         let req = single_select_req();
         let container = mount_with_state_setup(configure_active_agent, move || {
-            render(test_agent_ref(), &req, None, ToolOutputMode::Summary)
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
         });
         next_tick().await;
 
@@ -1034,6 +1120,10 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(calls.length(), 1, "send_frame should be invoked once");
+        let line = last_send_line(&calls);
+        assert!(line.contains("AskUserQuestion"));
+        assert!(line.contains("toolu_test"));
+        assert!(line.contains("Rust"));
         assert!(
             submit_button(&container).disabled(),
             "disabled while sending"
@@ -1061,7 +1151,13 @@ mod wasm_tests {
         install_failing_send_stub();
         let req = single_select_req();
         let container = mount_with_state_setup(configure_active_agent, move || {
-            render(test_agent_ref(), &req, None, ToolOutputMode::Summary)
+            render(
+                test_agent_ref(),
+                "toolu_test",
+                &req,
+                None,
+                ToolOutputMode::Summary,
+            )
         });
         next_tick().await;
 

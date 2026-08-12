@@ -334,6 +334,9 @@ impl PendingSubmission {
             return self.text.clone();
         }
         match &self.tool_response {
+            Some(protocol::SendMessageToolResponse::AskUserQuestion { answer, .. }) => {
+                format!("Answered — {answer}")
+            }
             Some(protocol::SendMessageToolResponse::ExitPlanMode {
                 decision, feedback, ..
             }) => {

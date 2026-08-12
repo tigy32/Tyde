@@ -7905,17 +7905,20 @@ dependencies = [
 name = "tests"
 version = "0.0.0"
 dependencies = [
+ "axum 0.8.9",
  "client",
  "futures-util",
  "mqtt-transport",
  "opus",
  "paste",
+ "proc-macro2",
  "protocol",
  "rmcp",
  "rumqttd",
  "serde",
  "serde_json",
  "server",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

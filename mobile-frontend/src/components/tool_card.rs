@@ -2910,6 +2910,9 @@ mod wasm_tests {
                     "the held record must carry the actual decision"
                 );
             }
+            Some(SendMessageToolResponse::AskUserQuestion { .. }) => {
+                panic!("held plan decision carried a user-question response")
+            }
             None => panic!(
                 "the tool response must be held, or a resend degrades into an empty chat message"
             ),
