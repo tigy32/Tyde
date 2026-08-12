@@ -112,6 +112,15 @@ input, textarea, select {
     flex-direction: column;
     height: 100vh;
     height: 100dvh;
+    /* Home-screen (standalone) launches can compute 100dvh short of the
+       real visible viewport, stranding the bottom nav above a dead band.
+       The app measures the visual viewport at mount and publishes it as
+       --app-height (main.rs install_app_height_probe); max() lets that
+       measurement recover the missing height, while keyboard-driven
+       visual-viewport shrinkage can never squeeze the shell below 100dvh.
+       Viewport units only — percentage heights have no resolvable chain in
+       the production loader page, which drops the bundle's index.html. */
+    height: max(100dvh, var(--app-height, 0px));
     min-height: 0;
     overflow: hidden;
     padding-top: var(--safe-area-top);
