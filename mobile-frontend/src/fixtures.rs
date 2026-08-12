@@ -106,15 +106,24 @@ pub fn seed_state(state: &AppState) {
         round_trips.insert(host.clone(), 47);
     });
     state.host_settings_by_host.update(|settings| {
-        settings.insert(
-            host.clone(),
-            HostSettings {
-                enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
-                default_backend: Some(BackendKind::Codex),
-                ..HostSettings::default()
-            },
-        );
+        let mut host_settings = HostSettings {
+            enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+            default_backend: Some(BackendKind::Codex),
+            ..HostSettings::default()
+        };
+        if name == "voice" {
+            host_settings.voice.enabled = true;
+        }
+        settings.insert(host.clone(), host_settings);
     });
+    if name == "voice" {
+        state.voice_capabilities_by_host.update(|capabilities| {
+            capabilities.insert(
+                host.clone(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+            );
+        });
+    }
     state.custom_agents_by_host.update(|agents| {
         agents.entry(host.clone()).or_default().insert(
             CustomAgentId("fixture-reviewer".to_owned()),
@@ -164,7 +173,7 @@ pub fn seed_state(state: &AppState) {
             state.active_agent.set(None);
             state.viewing_chat.set(true);
         }
-        "chat" | "chat-light" | "disconnected" | "error" => {
+        "chat" | "chat-light" | "disconnected" | "error" | "voice" => {
             state.viewing_chat.set(true);
         }
         _ => {

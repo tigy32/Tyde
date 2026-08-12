@@ -604,9 +604,12 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
         let start_state = state.clone();
         let stop_state = state.clone();
         let interrupt_state = state.clone();
+        let cancel_state = state.clone();
+        let dismiss_state = state.clone();
         match state.voice_ui.get() {
             MobileVoiceState::Idle => view! {
                 <button
+                    class="mobile-voice-toggle"
                     on:click=move |_| start(start_state.clone())
                     aria-label="Start voice"
                 >
@@ -614,7 +617,18 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
                 </button>
             }
             .into_any(),
-            MobileVoiceState::Starting { .. } => view! { <span>"Connecting…"</span> }.into_any(),
+            MobileVoiceState::Starting { .. } => view! {
+                <span>"Connecting…"</span>
+                <button
+                    aria-label="Cancel voice"
+                    on:click=move |_| {
+                        stop(cancel_state.clone(), protocol::VoiceStopReason::UserExited)
+                    }
+                >
+                    "Cancel"
+                </button>
+            }
+            .into_any(),
             MobileVoiceState::Active {
                 phase, transcript, ..
             } => view! {
@@ -633,7 +647,18 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
                 </button>
             }
             .into_any(),
-            MobileVoiceState::Failed(error) => view! { <span>{error}</span> }.into_any(),
+            MobileVoiceState::Failed(error) => view! {
+                <span>{error}</span>
+                <button
+                    aria-label="Dismiss voice error"
+                    on:click=move |_| {
+                        stop(dismiss_state.clone(), protocol::VoiceStopReason::UserExited)
+                    }
+                >
+                    "Dismiss"
+                </button>
+            }
+            .into_any(),
         }
     }
 }
@@ -676,12 +701,26 @@ pub fn MobileVoiceBar() -> impl IntoView {
                 .voice_capabilities_by_host
                 .with(|v| v.get(&host).is_some_and(|c| c.nova_available))
     });
+    let mode_state = state.clone();
+    // Voice mode = any non-idle session state. Idle renders only the compact
+    // floating toggle; the full bar (which overlays chat content) appears
+    // exclusively while the user is actually in a voice session, so an idle
+    // voice-capable host never covers the conversation.
+    let in_voice_mode =
+        Memo::new(move |_| !matches!(mode_state.voice_ui.get(), MobileVoiceState::Idle));
     let render_state = StoredValue::new(state);
     view! {
         <Show when=move || visible.get()>
-            <aside class="mobile-voice-bar">
-                <MobileVoiceControls state=render_state.get_value() />
-            </aside>
+            <Show
+                when=move || in_voice_mode.get()
+                fallback=move || {
+                    view! { <MobileVoiceControls state=render_state.get_value() /> }
+                }
+            >
+                <aside class="mobile-voice-bar">
+                    <MobileVoiceControls state=render_state.get_value() />
+                </aside>
+            </Show>
         </Show>
     }
 }
@@ -695,6 +734,20 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    /// The real stylesheet, so geometry assertions measure what users see.
+    const PROD_STYLES: &str = include_str!("../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("prod-styles").is_some() {
+            return;
+        }
+        let style = document.create_element("style").unwrap();
+        style.set_id("prod-styles");
+        style.set_text_content(Some(PROD_STYLES));
+        document.head().unwrap().append_child(&style).unwrap();
+    }
 
     fn container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -821,6 +874,129 @@ mod wasm_tests {
             "the Voice button must appear once a chat is active on a \
              voice-capable host"
         );
+        drop(mount);
+        container.remove();
+    }
+
+    /// **An idle voice-capable chat shows only a compact toggle, never the
+    /// full-width bar.** The bar overlays chat content, so it may appear only
+    /// while the user is actually in a voice session — and a failed session
+    /// must offer a way back out (Dismiss) instead of wedging the overlay
+    /// open.
+    #[wasm_bindgen_test]
+    async fn idle_voice_ui_is_compact_and_the_bar_only_shows_in_voice_mode() {
+        ensure_styles_loaded();
+        let container = container();
+        let state = AppState::new();
+        let mount_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <MobileVoiceBar /> }
+        });
+
+        let host = LocalHostId("compact-host".to_owned());
+        let agent_id = protocol::AgentId("compact-agent".to_owned());
+        state.voice_capabilities_by_host.update(|caps| {
+            caps.insert(
+                host.clone(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+            );
+        });
+        let mut settings = protocol::HostSettings::default();
+        settings.voice.enabled = true;
+        state.host_settings_by_host.update(|map| {
+            map.insert(host.clone(), settings);
+        });
+        state.agents.set(vec![crate::state::AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Compact agent".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: protocol::StreamPath("/agent/compact-agent/instance".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host,
+            agent_id,
+        }));
+        next_tick().await;
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let viewport_width = web_sys::window()
+            .unwrap()
+            .inner_width()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+
+        // Idle: the only voice surface is the compact toggle.
+        let toggle = document
+            .query_selector("button[aria-label='Start voice']")
+            .unwrap()
+            .expect("idle voice UI must render the Start voice toggle");
+        let toggle_width = toggle.get_bounding_client_rect().width();
+        assert!(
+            toggle_width > 0.0 && toggle_width < viewport_width * 0.4,
+            "idle voice toggle must be compact, got {toggle_width}px of \
+             {viewport_width}px viewport"
+        );
+        assert!(
+            document.query_selector("aside").unwrap().is_none(),
+            "the voice bar surface must not render while idle"
+        );
+
+        // Entering voice mode replaces the toggle with the full bar.
+        state.voice_ui.set(MobileVoiceState::Failed(
+            "microphone unavailable".to_owned(),
+        ));
+        next_tick().await;
+        let bar = document
+            .query_selector("aside")
+            .unwrap()
+            .expect("voice mode must render the bar surface");
+        let bar_width = bar.get_bounding_client_rect().width();
+        assert!(
+            bar_width > viewport_width * 0.7,
+            "the in-session bar spans the viewport, got {bar_width}px of \
+             {viewport_width}px"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("microphone unavailable"),
+            "the failure reason must be visible"
+        );
+
+        // Dismiss exits voice mode and returns to the compact toggle.
+        let dismiss = document
+            .query_selector("button[aria-label='Dismiss voice error']")
+            .unwrap()
+            .expect("a failed session must offer Dismiss")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        dismiss.click();
+        next_tick().await;
+        assert!(
+            document.query_selector("aside").unwrap().is_none(),
+            "Dismiss must close the voice bar"
+        );
+        assert!(
+            document
+                .query_selector("button[aria-label='Start voice']")
+                .unwrap()
+                .is_some(),
+            "Dismiss must return to the compact toggle"
+        );
+
         drop(mount);
         container.remove();
     }
