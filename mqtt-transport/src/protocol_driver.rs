@@ -65,7 +65,7 @@ const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
 #[cfg(not(test))]
 const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(300);
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Outbound managed-service data budget: sustained rate and burst allowance for
 /// encrypted data publishes. AWS IoT enforces a fixed 512 KiB/s per-connection
 /// throughput cap (inbound + outbound) and delays traffic beyond it; publishing
@@ -2137,7 +2137,7 @@ mod tests {
         let ack_rx = send_full_chunk(&mut harness.outbound_tx, 1).await.unwrap();
         let publish = next_data_publish(&mut harness.publish_rx).await;
 
-        let event = timeout(Duration::from_secs(1), harness.inbound_rx.recv())
+        let event = timeout(Duration::from_secs(2), harness.inbound_rx.recv())
             .await
             .expect("PUBACK watchdog did not fire")
             .expect("driver closed without reporting the timeout");
@@ -2166,7 +2166,7 @@ mod tests {
         let ack_rx_b = send_full_chunk(&mut harness.outbound_tx, 2).await.unwrap();
         let publish_b = next_data_publish(&mut harness.publish_rx).await;
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         ack_success(&harness.poll_tx, publish_a.token);
         timeout(Duration::from_secs(1), ack_rx_a)
             .await
@@ -2174,10 +2174,10 @@ mod tests {
             .expect("ack A sender dropped")
             .expect("ack A failed");
 
-        // 150ms past the original enqueue-anchored deadline: the ack for A
+        // 250ms past the original enqueue-anchored deadline: the ack for A
         // must have re-anchored the watchdog, so no error may surface yet.
         assert!(
-            timeout(Duration::from_millis(250), harness.inbound_rx.recv())
+            timeout(Duration::from_millis(750), harness.inbound_rx.recv())
                 .await
                 .is_err(),
             "watchdog fired despite PUBACK progress"
