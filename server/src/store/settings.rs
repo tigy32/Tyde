@@ -8,7 +8,8 @@ use protocol::{
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
     SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
-    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN,
+    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, TYDE_AGENT_CONTROL_MAX_DEPTH_MAX,
+    TYDE_AGENT_CONTROL_MAX_DEPTH_MIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -462,6 +463,17 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::TydeAgentControlMcpEnabled { enabled } => {
             settings.tyde_agent_control_mcp_enabled = enabled;
         }
+        HostSettingValue::TydeAgentControlMaxDepth { depth } => {
+            if !(TYDE_AGENT_CONTROL_MAX_DEPTH_MIN..=TYDE_AGENT_CONTROL_MAX_DEPTH_MAX)
+                .contains(&depth)
+            {
+                return Err(format!(
+                    "Tyde sub-agent depth must be between {} and {}",
+                    TYDE_AGENT_CONTROL_MAX_DEPTH_MIN, TYDE_AGENT_CONTROL_MAX_DEPTH_MAX,
+                ));
+            }
+            settings.tyde_agent_control_max_depth = depth;
+        }
         HostSettingValue::ComplexityTiersEnabled { enabled } => {
             settings.complexity_tiers_enabled = enabled;
             // Seed editable per-backend configs from the built-in defaults so
@@ -715,6 +727,7 @@ fn empty_settings() -> HostSettings {
         mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
+        tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
@@ -745,6 +758,15 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         .is_some_and(|url| url.as_str().trim().is_empty())
     {
         return Err("mobile_broker_url must not be empty".to_owned());
+    }
+
+    if !(TYDE_AGENT_CONTROL_MAX_DEPTH_MIN..=TYDE_AGENT_CONTROL_MAX_DEPTH_MAX)
+        .contains(&settings.tyde_agent_control_max_depth)
+    {
+        return Err(format!(
+            "Tyde sub-agent depth must be between {} and {}",
+            TYDE_AGENT_CONTROL_MAX_DEPTH_MIN, TYDE_AGENT_CONTROL_MAX_DEPTH_MAX,
+        ));
     }
 
     if !(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
@@ -835,6 +857,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         mobile_broker_url: settings.mobile_broker_url,
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
+        tyde_agent_control_max_depth: settings.tyde_agent_control_max_depth,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
@@ -1237,6 +1260,7 @@ mod tests {
         let store = HostSettingsStore::load(path).expect("load legacy store");
         let settings = store.get().expect("get settings");
         assert!(!settings.complexity_tiers_enabled);
+        assert_eq!(settings.tyde_agent_control_max_depth, 3);
         assert!(settings.backend_tier_configs.is_empty());
     }
 
@@ -1346,7 +1370,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(
             &path,
-            r#"{"settings":{"enabled_backends":["claude","codex"],"default_backend":"codex","enable_mobile_connections":true,"mobile_broker_url":null,"tyde_debug_mcp_enabled":true,"tyde_agent_control_mcp_enabled":true,"complexity_tiers_enabled":true,"backend_tier_configs":{"codex":{"low":{"reasoning_effort":{"string":"low"}},"high":{"reasoning_effort":{"string":"xhigh"}}}}}}"#,
+            r#"{"settings":{"enabled_backends":["claude","codex"],"default_backend":"codex","enable_mobile_connections":true,"mobile_broker_url":null,"tyde_debug_mcp_enabled":true,"tyde_agent_control_mcp_enabled":true,"tyde_agent_control_max_depth":3,"complexity_tiers_enabled":true,"backend_tier_configs":{"codex":{"low":{"reasoning_effort":{"string":"low"}},"high":{"reasoning_effort":{"string":"xhigh"}}}}}}"#,
         )
         .expect("write store file");
 
@@ -1377,6 +1401,34 @@ mod tests {
             .expect("apply no-op setting");
         assert_eq!(after, before);
         assert_eq!(store.get().expect("re-read settings"), before);
+    }
+
+    #[test]
+    fn validates_and_persists_agent_control_max_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            HostSettingsStore::load(dir.path().join("settings.json")).expect("load settings store");
+
+        let updated = store
+            .apply(HostSettingValue::TydeAgentControlMaxDepth { depth: 4 })
+            .expect("save valid depth");
+        assert_eq!(updated.tyde_agent_control_max_depth, 4);
+
+        let error = store
+            .apply(HostSettingValue::TydeAgentControlMaxDepth { depth: 0 })
+            .expect_err("reject depth zero");
+        assert!(
+            error.contains("between 1 and 10"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store
+                .get()
+                .expect("re-read settings")
+                .tyde_agent_control_max_depth,
+            4,
+            "a rejected depth must not mutate the stored setting"
+        );
     }
 
     #[test]

@@ -616,6 +616,12 @@ pub fn ChatView() -> impl IntoView {
         set_timeout(
             move || {
                 pending.set(false);
+                log::debug!(
+                    "chat auto-scroll: scrollTop={} clientHeight={} scrollHeight={}",
+                    el.scroll_top(),
+                    el.client_height(),
+                    el.scroll_height()
+                );
                 scroll_chat_to_bottom(&el);
             },
             std::time::Duration::from_millis(0),
@@ -627,6 +633,13 @@ pub fn ChatView() -> impl IntoView {
         let Some(el) = scroll_ref_for_scroll.get_untracked() else {
             return;
         };
+        log::debug!(
+            "chat scroll event: scrollTop={} clientHeight={} scrollHeight={} nearBottom={}",
+            el.scroll_top(),
+            el.client_height(),
+            el.scroll_height(),
+            chat_is_near_bottom(&el)
+        );
         user_scrolled_up.set(!chat_is_near_bottom(&el));
     };
 
@@ -1784,7 +1797,10 @@ mod wasm_tests {
         next_tick().await;
         let scroller = chat_scroller(&container);
         scroller
-            .set_attribute("style", "height: 96px; overflow-y: auto; display: block;")
+            .set_attribute(
+                "style",
+                "height: 96px; flex: 0 0 96px; overflow-y: auto; display: block;",
+            )
             .unwrap();
 
         fill_chat(&state, 40);
@@ -1806,7 +1822,10 @@ mod wasm_tests {
         next_tick().await;
         let scroller = chat_scroller(&container);
         scroller
-            .set_attribute("style", "height: 96px; overflow-y: auto; display: block;")
+            .set_attribute(
+                "style",
+                "height: 96px; flex: 0 0 96px; overflow-y: auto; display: block;",
+            )
             .unwrap();
         fill_chat(&state, 40);
         settle_autoscroll().await;
@@ -1834,7 +1853,12 @@ mod wasm_tests {
         );
         assert!(
             distance_from_bottom(&scroller) > CHAT_STICKY_BOTTOM_THRESHOLD_PX,
-            "user-scrolled chat should remain away from bottom"
+            "user-scrolled chat should remain away from bottom; before={} after={} clientHeight={} scrollHeight={} distance={}",
+            before,
+            scroller.scroll_top(),
+            scroller.client_height(),
+            scroller.scroll_height(),
+            distance_from_bottom(&scroller)
         );
     }
 

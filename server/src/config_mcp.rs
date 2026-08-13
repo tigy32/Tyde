@@ -105,6 +105,8 @@ enum SettingInput {
     TydeDebugMcpEnabled { enabled: bool },
     /// Expose the tyde-agent-control MCP server to agents.
     TydeAgentControlMcpEnabled { enabled: bool },
+    /// Limit Tyde agent-control ancestry, counting the root agent as depth 1.
+    TydeAgentControlMaxDepth { depth: u8 },
     /// Allow paired mobile devices to connect.
     EnableMobileConnections { enabled: bool },
     /// Set (or clear, with null) a code-intelligence language-server binary path.
@@ -129,6 +131,9 @@ impl From<SettingInput> for HostSettingValue {
             SettingInput::TydeDebugMcpEnabled { enabled } => Self::TydeDebugMcpEnabled { enabled },
             SettingInput::TydeAgentControlMcpEnabled { enabled } => {
                 Self::TydeAgentControlMcpEnabled { enabled }
+            }
+            SettingInput::TydeAgentControlMaxDepth { depth } => {
+                Self::TydeAgentControlMaxDepth { depth }
             }
             SettingInput::EnableMobileConnections { enabled } => {
                 Self::EnableMobileConnections { enabled }

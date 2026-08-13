@@ -2528,6 +2528,8 @@ pub struct HostSettings {
     pub tyde_debug_mcp_enabled: bool,
     #[serde(default = "default_agent_control_mcp_enabled")]
     pub tyde_agent_control_mcp_enabled: bool,
+    #[serde(default = "default_agent_control_max_depth")]
+    pub tyde_agent_control_max_depth: u8,
     /// When false (default), spawn cost hints are ignored: every spawn uses
     /// the backend's own default model/effort and the hint is hidden from
     /// spawn UIs and the agent-control MCP tool schema.
@@ -2575,6 +2577,7 @@ impl Default for HostSettings {
             mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
+            tyde_agent_control_max_depth: default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
             background_agent_features: default_background_agent_features(),
@@ -2816,6 +2819,13 @@ fn default_agent_control_mcp_enabled() -> bool {
     true
 }
 
+pub const TYDE_AGENT_CONTROL_MAX_DEPTH_MIN: u8 = 1;
+pub const TYDE_AGENT_CONTROL_MAX_DEPTH_MAX: u8 = 10;
+
+pub fn default_agent_control_max_depth() -> u8 {
+    3
+}
+
 pub fn default_auto_generate_agent_names_enabled() -> bool {
     true
 }
@@ -2865,6 +2875,9 @@ pub enum HostSettingValue {
     },
     TydeAgentControlMcpEnabled {
         enabled: bool,
+    },
+    TydeAgentControlMaxDepth {
+        depth: u8,
     },
     ComplexityTiersEnabled {
         enabled: bool,
@@ -2967,6 +2980,9 @@ impl HostSettingValue {
             Self::TydeAgentControlMcpEnabled { .. } => {
                 HostSettingErrorTarget::TydeAgentControlMcpEnabled
             }
+            Self::TydeAgentControlMaxDepth { .. } => {
+                HostSettingErrorTarget::TydeAgentControlMaxDepth
+            }
             Self::ComplexityTiersEnabled { .. } => HostSettingErrorTarget::ComplexityTiersEnabled,
             Self::BackendTiers { .. } => HostSettingErrorTarget::BackendTiers,
             Self::BackgroundAgentFeatureEnabled { .. } => {
@@ -3027,6 +3043,7 @@ pub enum HostSettingErrorTarget {
     MobileBrokerUrl,
     TydeDebugMcpEnabled,
     TydeAgentControlMcpEnabled,
+    TydeAgentControlMaxDepth,
     ComplexityTiersEnabled,
     BackendTiers,
     BackgroundAgentFeatureEnabled,
@@ -9209,6 +9226,7 @@ mod search_serde_tests {
                 mobile_broker_url: None,
                 tyde_debug_mcp_enabled: false,
                 tyde_agent_control_mcp_enabled: true,
+                tyde_agent_control_max_depth: default_agent_control_max_depth(),
                 complexity_tiers_enabled: false,
                 backend_tier_configs: HashMap::new(),
                 background_agent_features: BackgroundAgentFeaturesSettings::default(),

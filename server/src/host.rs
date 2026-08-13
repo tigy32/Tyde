@@ -4799,6 +4799,7 @@ impl HostHandle {
             capacity_tx,
             removing_projects,
             parent_session_id,
+            parent_agent_depth,
             antigravity_conversations_dir,
         ) = {
             let state = self.state.lock().await;
@@ -4833,6 +4834,10 @@ impl HostHandle {
                         )))
                     }
                 }),
+                payload
+                    .parent_agent_id
+                    .as_ref()
+                    .and_then(|agent_id| state.registry.agent_depth(agent_id)),
                 state.antigravity_conversations_dir.clone(),
             )
         };
@@ -4846,6 +4851,9 @@ impl HostHandle {
             .await
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for spawn: {err}"));
+        let agent_depth = parent_agent_depth
+            .and_then(|depth| depth.checked_add(1))
+            .unwrap_or(1);
 
         let mut generated_name_request = None;
         let request = match payload.params {
@@ -4897,6 +4905,7 @@ impl HostHandle {
                     &agent_control_mcp,
                     &config_mcp,
                     payload.custom_agent_id.as_ref(),
+                    agent_depth,
                 );
                 let requested_custom_agent_id = payload.custom_agent_id.clone();
                 let (
@@ -5173,6 +5182,7 @@ impl HostHandle {
                     &agent_control_mcp,
                     &config_mcp,
                     record.custom_agent_id.as_ref(),
+                    agent_depth,
                 );
                 let (
                     effective_custom_agent_id,
@@ -5471,6 +5481,7 @@ impl HostHandle {
                     &agent_control_mcp,
                     &config_mcp,
                     record.custom_agent_id.as_ref(),
+                    agent_depth,
                 );
                 let (
                     effective_custom_agent_id,
@@ -9891,6 +9902,27 @@ impl HostHandle {
         mut payload: SpawnAgentPayload,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<AgentId, String> {
+        if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
+            let (parent_depth, settings_store) = {
+                let state = self.state.lock().await;
+                let parent_depth =
+                    state.registry.agent_depth(parent_agent_id).ok_or_else(|| {
+                        format!("cannot determine agent-control depth for {parent_agent_id}")
+                    })?;
+                (parent_depth, Arc::clone(&state.settings_store))
+            };
+            let max_depth = settings_store
+                .lock()
+                .await
+                .get()
+                .map_err(|error| format!("failed to load host settings: {error}"))?
+                .tyde_agent_control_max_depth;
+            if parent_depth >= max_depth {
+                return Err(format!(
+                    "Tyde sub-agent depth limit of {max_depth} reached; agent {parent_agent_id} cannot spawn another level"
+                ));
+            }
+        }
         // A closing agent must not grow the subtree being torn down.
         // `close_agent` snapshots the subtree once, so a child spawned after
         // that snapshot is never part of the teardown: it outlives the parent
@@ -10436,6 +10468,7 @@ impl HostHandle {
                 &state.agent_control_mcp,
                 &state.config_mcp,
                 None,
+                1,
             )
         };
         if !workflow_mcp.url.is_empty() {
@@ -12492,6 +12525,7 @@ impl HostHandle {
             &agent_control_mcp,
             &config_mcp,
             None,
+            1,
         );
         let mut resolved_spawn_config = {
             let custom_agents = custom_agent_store.lock().await;
@@ -16930,6 +16964,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
     agent_control_mcp: &AgentControlMcpHandle,
     config_mcp: &ConfigMcpHandle,
     custom_agent_id: Option<&protocol::CustomAgentId>,
+    agent_depth: u8,
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
 
@@ -16976,7 +17011,10 @@ pub(crate) fn startup_mcp_servers_for_settings(
         });
     }
 
-    if settings.tyde_agent_control_mcp_enabled && !agent_control_mcp.url.is_empty() {
+    if settings.tyde_agent_control_mcp_enabled
+        && agent_depth < settings.tyde_agent_control_max_depth
+        && !agent_control_mcp.url.is_empty()
+    {
         servers.push(StartupMcpServer {
             name: crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME.to_string(),
             transport: StartupMcpTransport::Http {
@@ -23180,6 +23218,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: false,
+            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
             background_agent_features: Default::default(),
@@ -23204,6 +23243,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &agent_control,
             &config_mcp,
             Some(&help_id),
+            1,
         );
         assert_eq!(
             servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
@@ -23220,6 +23260,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 &agent_control,
                 &config_mcp,
                 custom_agent_id,
+                1,
             );
             assert!(
                 servers.iter().all(|s| s.name != "tyde-config"),

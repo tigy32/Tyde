@@ -3555,6 +3555,7 @@ fn SubagentsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_checked = state.clone();
     let state_for_disabled = state.clone();
+    let state_for_toggle = state.clone();
 
     let checked = Signal::derive(move || {
         state_for_checked
@@ -3564,9 +3565,24 @@ fn SubagentsTab() -> impl IntoView {
     let disabled = Signal::derive(move || state_for_disabled.selected_host_settings().is_none());
     let on_toggle = Callback::new(move |enabled: bool| {
         send_host_setting(
-            &state,
+            &state_for_toggle,
             HostSettingValue::TydeAgentControlMcpEnabled { enabled },
         );
+    });
+    let state_for_depth = state.clone();
+    let depth = Signal::derive(move || {
+        state_for_depth
+            .selected_host_settings()
+            .map(|settings| settings.tyde_agent_control_max_depth.to_string())
+            .unwrap_or_default()
+    });
+    let state_for_depth_disabled = state.clone();
+    let depth_disabled =
+        Signal::derive(move || state_for_depth_disabled.selected_host_settings().is_none());
+    let on_depth_change = Callback::new(move |value: String| {
+        if let Ok(depth) = value.parse::<u8>() {
+            send_host_setting(&state, HostSettingValue::TydeAgentControlMaxDepth { depth });
+        }
     });
 
     view! {
@@ -3586,6 +3602,19 @@ fn SubagentsTab() -> impl IntoView {
             checked=checked
             disabled=disabled
             on_toggle=on_toggle
+        />
+
+        <SupervisorNumberField
+            label="Maximum agent depth"
+            description="Count the main task as level 1. Agents at the maximum level are started without Tyde agent-control or await tools, and the server rejects attempts to create another level. The default of 3 allows the main task, its children, and their children."
+            aria_label="Maximum agent depth"
+            min=protocol::TYDE_AGENT_CONTROL_MAX_DEPTH_MIN as f64
+            max=Some(protocol::TYDE_AGENT_CONTROL_MAX_DEPTH_MAX as f64)
+            step="1"
+            unit=Some("levels")
+            value=depth
+            disabled=depth_disabled
+            on_change=on_depth_change
         />
 
         <h3 class="settings-section-title">"How sub-agents are configured"</h3>
@@ -8600,6 +8629,7 @@ mod wasm_tests {
                         .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
@@ -9973,6 +10003,7 @@ mod wasm_tests {
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: protocol::BackgroundAgentFeaturesSettings {
@@ -10611,6 +10642,7 @@ mod wasm_tests {
             mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
+            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
@@ -11185,6 +11217,15 @@ mod wasm_tests {
         );
         toggle.set_checked(false);
         dispatch_change(&toggle);
+        let depth: HtmlInputElement = container
+            .query_selector("input[aria-label='Maximum agent depth']")
+            .unwrap()
+            .expect("subagents tab must render the maximum depth setting")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(depth.value(), "3", "the default maximum depth must be 3");
+        depth.set_value("4");
+        dispatch_change(&depth);
         for _ in 0..4 {
             next_tick().await;
         }
@@ -11202,6 +11243,14 @@ mod wasm_tests {
             Some(false),
             "turning sub-agents off must carry enabled=false: {frame:?}"
         );
+        let depth_frame = settings
+            .iter()
+            .find(|setting| {
+                setting.get("kind").and_then(|kind| kind.as_str())
+                    == Some("tyde_agent_control_max_depth")
+            })
+            .expect("the depth input must commit TydeAgentControlMaxDepth");
+        assert_eq!(depth_frame.get("depth").and_then(Value::as_u64), Some(4));
     }
 
     /// The sidebar has a dedicated Backends group: a stable Overview entry, a
@@ -11515,6 +11564,7 @@ mod wasm_tests {
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
@@ -12161,6 +12211,7 @@ mod wasm_tests {
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),

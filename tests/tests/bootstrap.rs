@@ -219,6 +219,7 @@ fn write_host_settings_with_launch_profiles(
         mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
+        tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),

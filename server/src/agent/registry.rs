@@ -400,6 +400,23 @@ impl AgentRegistry {
         self.agents.keys().cloned().collect()
     }
 
+    pub fn agent_depth(&self, agent_id: &AgentId) -> Option<u8> {
+        let mut current = agent_id;
+        let mut depth = 1_u8;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                return None;
+            }
+            let entry = self.agents.get(current)?;
+            let Some(parent_agent_id) = entry.parent_agent_id.as_ref() else {
+                return Some(depth);
+            };
+            depth = depth.checked_add(1)?;
+            current = parent_agent_id;
+        }
+    }
+
     pub fn agent_subtree_post_order(&self, agent_id: &AgentId) -> Vec<(AgentId, AgentHandle)> {
         if !self.agents.contains_key(agent_id) {
             return Vec::new();

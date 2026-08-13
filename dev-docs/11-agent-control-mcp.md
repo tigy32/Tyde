@@ -126,8 +126,12 @@ This exactly follows the rewrite philosophy:
 And matches the proven debug MCP pattern:
 
 - server starts an HTTP MCP listener on `127.0.0.1:0`
-- when spawning an agent, if `tyde_agent_control_mcp_enabled` is true, the
-  server adds the agent-control MCP URL to `startup_mcp_servers`
+- when spawning an agent, if `tyde_agent_control_mcp_enabled` is true and the
+  agent is below `tyde_agent_control_max_depth`, the server adds the
+  agent-control MCP URL to `startup_mcp_servers`
+- depth counts the root agent as level 1; agents at the configured maximum
+  depth receive no agent-control or await tools, and the server rejects any
+  authenticated attempt to create another level
 - the agent discovers the MCP surface automatically
 
 ---
@@ -629,6 +633,7 @@ Agent control MCP follows the same pattern as debug MCP:
 - embedded loopback HTTP MCP server in `tyde-server`
 - injected into agents as a startup MCP server
 - `HostSettings.tyde_agent_control_mcp_enabled` (default: true)
+- `HostSettings.tyde_agent_control_max_depth` (default: 3)
 - no external process, no shell involvement, no separate protocol connection
 - server has direct access to agent lifecycle — simpler implementation
 - explicit await/read flow; no child-output injection into parent user queues

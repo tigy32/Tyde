@@ -4591,6 +4591,96 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
 }
 
 #[tokio::test]
+async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "depth-root").await;
+    let parent_caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let child_id = mcp_spawn_agent_as(
+        &parent_caller,
+        json!({
+            "workspace_roots": ["/tmp/depth-child"],
+            "prompt": "depth two",
+            "backend_kind": "claude",
+            "name": "depth-child"
+        }),
+    )
+    .await;
+    let child =
+        expect_replayed_new_agent(&mut fixture.client, &child_id, "depth child NewAgent").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "depth child AgentStart",
+    )
+    .await;
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "mock backend response to: depth two",
+    )
+    .await;
+
+    let child_caller = fixture.agent_control_caller(&child_id).await;
+    let grandchild_id = mcp_spawn_agent_as(
+        &child_caller,
+        json!({
+            "workspace_roots": ["/tmp/depth-grandchild"],
+            "prompt": "depth three",
+            "backend_kind": "claude",
+            "name": "depth-grandchild"
+        }),
+    )
+    .await;
+    let grandchild = expect_replayed_new_agent(
+        &mut fixture.client,
+        &grandchild_id,
+        "depth grandchild NewAgent",
+    )
+    .await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &grandchild.instance_stream,
+        "depth grandchild AgentStart",
+    )
+    .await;
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &grandchild.instance_stream,
+        "mock backend response to: depth three",
+    )
+    .await;
+
+    let control = fixture.connect_agent_control().await;
+    let read = control
+        .read_agent_debug(grandchild_id.clone(), None, None, None)
+        .await
+        .expect("read depth-three agent");
+    assert!(
+        !read
+            .events
+            .iter()
+            .any(|event| chat_event_contains(event, "startup_mcp_servers")),
+        "depth-three agents must not receive Tyde agent-control MCP tools: {:?}",
+        read.events
+    );
+
+    let grandchild_caller = fixture.agent_control_caller(&grandchild_id).await;
+    let error = mcp_spawn_agent_error_as(
+        &grandchild_caller,
+        json!({
+            "workspace_roots": ["/tmp/depth-four"],
+            "prompt": "must be rejected",
+            "backend_kind": "claude"
+        }),
+    )
+    .await;
+    assert!(
+        error.contains("depth limit of 3 reached"),
+        "depth refusal must explain the configured limit: {error}"
+    );
+}
+
+#[tokio::test]
 async fn agent_control_http_rejects_unknown_tool_arguments() {
     let fixture = Fixture::new().await;
     let base_url = fixture.agent_control_http_url().await;

@@ -6975,6 +6975,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
