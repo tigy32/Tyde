@@ -7710,6 +7710,184 @@ fn compaction_status_is_started(status: &protocol::ContextCompactionStatus) -> b
     )
 }
 
+async fn assert_compaction_resume_exactly_once(backend_kind: BackendKind) {
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let setup_prompt = compaction_context_prompt(backend_kind, 1);
+    let roots = fixture.workspace_roots();
+    let (stream, start) = spawn_agent_via_protocol_with_start(
+        &mut fixture.client,
+        roots,
+        backend_kind,
+        "compaction-resume-exactly-once",
+        &setup_prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await;
+    let session_id = start.session_id.clone().expect("compaction session id");
+    let setup =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, &setup_prompt).await;
+    assert!(setup.final_text.contains("COMPACTION_MATRIX_CONTEXT_1"));
+    for turn in 2..=2 {
+        let prompt = compaction_context_prompt(backend_kind, turn);
+        fixture
+            .client
+            .send_message(&stream, prompt.clone())
+            .await
+            .unwrap();
+        let response =
+            expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, &prompt).await;
+        assert!(
+            response
+                .final_text
+                .contains(&format!("COMPACTION_MATRIX_CONTEXT_{turn}"))
+        );
+    }
+
+    fixture
+        .client
+        .compact_agent(&stream, protocol::AgentCompactPayload::default())
+        .await
+        .unwrap();
+    let mut terminal = None;
+    let mut marker = None;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let envelope = expect_next_event(&mut fixture.client, "completed compaction").await;
+            if envelope.stream != stream {
+                continue;
+            }
+            match envelope.kind {
+                FrameKind::ContextCompactionNotify => {
+                    let notify: protocol::ContextCompactionNotifyPayload =
+                        envelope.parse_payload().unwrap();
+                    if notify.status.is_terminal() {
+                        assert!(terminal.replace(notify).is_none());
+                    }
+                }
+                FrameKind::ChatEvent => {
+                    if let ChatEvent::ContextCompaction(candidate) =
+                        envelope.parse_payload::<ChatEvent>().unwrap()
+                    {
+                        assert!(marker.replace(candidate).is_none());
+                    }
+                }
+                FrameKind::AgentError => {
+                    let error: protocol::AgentErrorPayload = envelope.parse_payload().unwrap();
+                    panic!("compaction failed before resume: {}", error.message);
+                }
+                _ => {}
+            }
+            if terminal.is_some() && marker.is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("compaction did not complete before resume");
+    let terminal = terminal.unwrap();
+    assert_eq!(
+        terminal.status,
+        protocol::ContextCompactionStatus::Completed
+    );
+    let marker = marker.unwrap();
+    assert_eq!(
+        marker.status,
+        protocol::ContextCompactionTimelineStatus::Completed
+    );
+
+    fixture.host.shutdown_agents_for_conformance().await;
+    fixture.restart_host().await;
+    let follow_up = "Do not use tools. Reply exactly COMPACTION_RESUME_CONTINUES.";
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("compaction-resume-exactly-once".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: Some(follow_up.to_owned()),
+            },
+        })
+        .await
+        .unwrap();
+    let new_agent: NewAgentPayload = expect_next_event_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "compaction resume NewAgent",
+    )
+    .await
+    .parse_payload()
+    .unwrap();
+    let resumed = new_agent.instance_stream;
+    let bootstrap = loop {
+        let envelope =
+            expect_next_unfiltered_event(&mut fixture.client, "compaction resume bootstrap").await;
+        if envelope.kind == FrameKind::AgentBootstrap && envelope.stream == resumed {
+            break envelope.parse_payload::<AgentBootstrapPayload>().unwrap();
+        }
+    };
+    let matching_bootstrap_markers = bootstrap
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker)) => Some(marker),
+            _ => None,
+        })
+        .filter(|candidate| *candidate == &marker)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_bootstrap_markers,
+        vec![&marker],
+        "resume bootstrap changed or duplicated the completed compaction under test"
+    );
+
+    let mut saw_user = false;
+    let mut saw_response = false;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let envelope = fixture
+                .client
+                .inner
+                .next_event()
+                .await
+                .expect("read compaction resume follow-up")
+                .expect("connection closed during compaction resume follow-up");
+            if envelope.stream != resumed {
+                continue;
+            }
+            if envelope.kind == FrameKind::AgentError {
+                let error: protocol::AgentErrorPayload = envelope.parse_payload().unwrap();
+                panic!("compaction resume failed: {}", error.message);
+            }
+            if envelope.kind != FrameKind::ChatEvent {
+                continue;
+            }
+            match envelope.parse_payload::<ChatEvent>().unwrap() {
+                ChatEvent::ContextCompaction(duplicate) => {
+                    panic!("resume emitted replayed compaction as live: {duplicate:?}")
+                }
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::User,
+                    content,
+                    ..
+                }) if content == follow_up => saw_user = true,
+                ChatEvent::StreamEnd(end)
+                    if saw_user && end.message.content.contains("COMPACTION_RESUME_CONTINUES") =>
+                {
+                    saw_response = true;
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_user && saw_response => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("resumed compaction session did not complete its follow-up");
+}
+
 async fn assert_compaction_lifecycle_matrix(backend_kind: BackendKind) {
     let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
     let all_rows = [
@@ -32331,7 +32509,16 @@ async fn start_mcp_activity_ambient(
     HashSet<String>,
     Option<tokio::task::JoinHandle<()>>,
 ) {
-    let prompt = format!("Do not use tools. Reply exactly {context}_READY.");
+    let expected = format!("{context}_READY");
+    std::fs::write(
+        fixture.workspace_dir.path().join("MCP_AMBIENT_READY.txt"),
+        &expected,
+    )
+    .expect("write MCP ambient readiness file");
+    let prompt = match backend_kind {
+        BackendKind::Acp => "Read MCP_AMBIENT_READY.txt from the current workspace and reply with its exact contents. This is a normal repository inspection task.".to_owned(),
+        _ => format!("Do not use tools. Reply exactly {context}_READY."),
+    };
     let roots = fixture.workspace_roots();
     let stream = spawn_agent_via_protocol(
         &mut fixture.client,
@@ -32342,7 +32529,11 @@ async fn start_mcp_activity_ambient(
     )
     .await;
     let ready = expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, &prompt).await;
-    assert_eq!(ready.final_text.trim(), format!("{context}_READY"));
+    assert_eq!(
+        ready.final_text.matches(&expected).count(),
+        1,
+        "MCP ambient readiness response did not contain its unique marker exactly once"
+    );
     let ids = start_agent_control_ambient_work(fixture, backend_kind, &stream, activity).await;
     ambient_before_stimulus(
         fixture,
@@ -33500,6 +33691,72 @@ async fn assert_no_adversarial_mcp_activity(
     collector.restore();
 }
 
+async fn expect_nonfatal_mcp_startup_turn(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+    prompt: &str,
+    sentinel: &str,
+) {
+    let mut stream = None;
+    let mut saw_user = false;
+    let mut saw_response = false;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let envelope =
+                expect_next_unfiltered_event(&mut fixture.client, "nonfatal custom MCP startup")
+                    .await;
+            if envelope.kind == FrameKind::NewAgent {
+                let new_agent: NewAgentPayload = envelope.parse_payload().unwrap();
+                stream = Some(new_agent.instance_stream);
+                continue;
+            }
+            if stream
+                .as_ref()
+                .is_some_and(|stream| stream != &envelope.stream)
+            {
+                continue;
+            }
+            if envelope.kind == FrameKind::AgentError {
+                let error: protocol::AgentErrorPayload = envelope.parse_payload().unwrap();
+                panic!(
+                    "{backend_kind:?} made custom MCP startup failure fatal: {}",
+                    error.message
+                );
+            }
+            if envelope.kind != FrameKind::ChatEvent {
+                continue;
+            }
+            match envelope.parse_payload::<ChatEvent>().unwrap() {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Warning,
+                    ..
+                }) => {}
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("{backend_kind:?} emitted a fatal-looking MCP error: {content}"),
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::User,
+                    content,
+                    ..
+                }) if content == prompt => saw_user = true,
+                ChatEvent::StreamEnd(end) if saw_user && end.message.content.contains(sentinel) => {
+                    saw_response = true;
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_user && saw_response => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{backend_kind:?} did not complete after a custom MCP server failed")
+    });
+}
+
 async fn assert_mcp_startup_adversarial_activity_row(
     backend_kind: BackendKind,
     activity: ActivityCondition,
@@ -33551,7 +33808,7 @@ async fn assert_mcp_startup_adversarial_activity_row(
             start_mcp_activity_ambient(&mut fixture, backend_kind, activity, &ambient_context)
                 .await;
         install_adversarial_mcp(&mut fixture, mode).await;
-        let prompt = "Do not use tools. Reply exactly MCP_STARTUP_SHOULD_NOT_RUN.";
+        let prompt = "Do not use tools. Reply exactly MCP_STARTUP_CONTINUES.";
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
@@ -33572,52 +33829,13 @@ async fn assert_mcp_startup_adversarial_activity_row(
             })
             .await
             .expect("submit adversarial MCP startup");
-        let mut stream = None;
-        let diagnostic = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let envelope = fixture.client.next_event().await.unwrap().unwrap();
-                eprintln!(
-                    "MCP STARTUP EVENT mode={mode} kind={:?} stream={}",
-                    envelope.kind, envelope.stream
-                );
-                if envelope.kind == FrameKind::NewAgent {
-                    let new_agent: NewAgentPayload = envelope.parse_payload().unwrap();
-                    stream = Some(new_agent.instance_stream);
-                    continue;
-                }
-                if envelope.kind == FrameKind::AgentError
-                    && stream
-                        .as_ref()
-                        .is_none_or(|stream| stream == &envelope.stream)
-                {
-                    let error: protocol::AgentErrorPayload = envelope.parse_payload().unwrap();
-                    break error.message;
-                }
-                if envelope.kind != FrameKind::ChatEvent
-                    || stream
-                        .as_ref()
-                        .is_some_and(|stream| stream != &envelope.stream)
-                {
-                    continue;
-                }
-                match envelope.parse_payload::<ChatEvent>().unwrap() {
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error | MessageSender::Warning,
-                        content,
-                        ..
-                    }) if content.to_ascii_lowercase().contains("mcp") => break content,
-                    ChatEvent::TypingStatusChanged(false) => {
-                        panic!(
-                            "{backend_kind:?} silently ignored adversarial MCP startup mode {mode}"
-                        )
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{backend_kind:?} hung on adversarial MCP startup mode {mode}"));
-        assert!(!diagnostic.trim().is_empty());
+        expect_nonfatal_mcp_startup_turn(
+            &mut fixture,
+            backend_kind,
+            prompt,
+            "MCP_STARTUP_CONTINUES",
+        )
+        .await;
         wait_for_adversarial_process_exit(adversarial_mcp_journal(&fixture)).await;
         finish_mcp_activity_ambient(
             &mut fixture,
@@ -33669,7 +33887,7 @@ async fn assert_mcp_startup_adversarial_activity_row(
                 project_id: None,
                 params: SpawnAgentParams::New {
                     workspace_roots: fixture.workspace_roots(),
-                    prompt: "Do not use tools. Reply exactly MCP_HTTP_SHOULD_NOT_RUN.".to_owned(),
+                    prompt: "Do not use tools. Reply exactly MCP_HTTP_CONTINUES.".to_owned(),
                     images: None,
                     backend_kind,
                     launch_profile_id: None,
@@ -33680,36 +33898,13 @@ async fn assert_mcp_startup_adversarial_activity_row(
             })
             .await
             .expect("submit unreachable HTTP MCP startup");
-        let diagnostic = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let envelope = expect_next_unfiltered_event(
-                    &mut fixture.client,
-                    "unreachable HTTP MCP startup failure",
-                )
-                .await;
-                if envelope.kind == FrameKind::AgentError {
-                    break envelope
-                        .parse_payload::<protocol::AgentErrorPayload>()
-                        .unwrap()
-                        .message;
-                }
-                if envelope.kind == FrameKind::ChatEvent
-                    && let ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error | MessageSender::Warning,
-                        content,
-                        ..
-                    }) = envelope.parse_payload::<ChatEvent>().unwrap()
-                {
-                    break content;
-                }
-            }
-        })
-        .await
-        .expect("unreachable HTTP MCP startup was not bounded");
-        assert!(
-            diagnostic.to_ascii_lowercase().contains("mcp"),
-            "unreachable HTTP MCP failure was unnamed: {diagnostic}"
-        );
+        expect_nonfatal_mcp_startup_turn(
+            &mut fixture,
+            backend_kind,
+            "Do not use tools. Reply exactly MCP_HTTP_CONTINUES.",
+            "MCP_HTTP_CONTINUES",
+        )
+        .await;
         failure_ledger
             .record(McpFailureConsistencyCell::StartupHttpUnreachable)
             .unwrap();
@@ -44492,6 +44687,9 @@ async fn run_certification_case_for_backend(
         CertificationCase::CompactionLifecycleMatrix => {
             assert_compaction_lifecycle_matrix(backend_kind).await;
         }
+        CertificationCase::CompactionResumeExactlyOnce => {
+            assert_compaction_resume_exactly_once(backend_kind).await;
+        }
         CertificationCase::TeamContextCompactionContract => {
             assert_team_context_compaction_contract(backend_kind).await;
         }
@@ -47318,6 +47516,7 @@ live_certification_tests! {
     real_cert_orchestration_lifecycle_matrix => OrchestrationLifecycleMatrix,
     real_cert_compaction_observed => CompactionObserved,
     real_cert_compaction_lifecycle_matrix => CompactionLifecycleMatrix,
+    real_cert_compaction_resume_exactly_once => CompactionResumeExactlyOnce,
     real_cert_team_context_compaction_contract => TeamContextCompactionContract,
     real_cert_compaction_capability_contract => CompactionCapabilityContract,
     real_cert_tool_request_emitted => ToolRequestEmitted,

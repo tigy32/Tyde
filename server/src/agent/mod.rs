@@ -4079,12 +4079,15 @@ pub(crate) fn spawn_agent_actor(
                         // accepts live conversation work. Chat events on its
                         // pre-barrier side are provider replay even when their
                         // normalized shape differs from the authoritative
-                        // journal; backend-only accounting can be newly
-                        // observed and must survive the gate.
-                        if matches!(event, BackendEvent::Chat(_)) {
-                            continue;
+                        // journal. Compaction observations on this side are
+                        // replay too: restoring them as live events duplicates
+                        // the authoritative timeline with provider-local ids.
+                        match event {
+                            event @ BackendEvent::ModelRequestTokenUsage(_) => {
+                                deferred_authoritative_resume_events.push(event);
+                            }
+                            BackendEvent::Chat(_) | BackendEvent::Compaction(_) => {}
                         }
-                        deferred_authoritative_resume_events.push(event);
                         continue;
                     }
                     let mut event = match event {
@@ -4939,10 +4942,12 @@ pub(crate) fn spawn_agent_actor(
                                     // See the gated receive path above: the
                                     // barrier, not event serialization, is the
                                     // authoritative replay/live boundary.
-                                    if matches!(event, BackendEvent::Chat(_)) {
-                                        continue;
+                                    match event {
+                                        event @ BackendEvent::ModelRequestTokenUsage(_) => {
+                                            deferred_authoritative_resume_events.push(event);
+                                        }
+                                        BackendEvent::Chat(_) | BackendEvent::Compaction(_) => {}
                                     }
-                                    deferred_authoritative_resume_events.push(event);
                                     continue;
                                 }
                                 match event {

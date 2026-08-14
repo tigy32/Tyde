@@ -80,6 +80,7 @@ exhaustive_certification_cases! {
     OrchestrationLifecycleMatrix,
     CompactionObserved,
     CompactionLifecycleMatrix,
+    CompactionResumeExactlyOnce,
     TeamContextCompactionContract,
     CompactionCapabilityContract,
     ToolRequestEmitted,
@@ -277,6 +278,7 @@ impl CertificationCase {
             Self::OrchestrationLifecycleMatrix => "orchestration_lifecycle_matrix",
             Self::CompactionObserved => "compaction_observed",
             Self::CompactionLifecycleMatrix => "compaction_lifecycle_matrix",
+            Self::CompactionResumeExactlyOnce => "compaction_resume_exactly_once",
             Self::TeamContextCompactionContract => "team_context_compaction_contract",
             Self::CompactionCapabilityContract => "compaction_capability_contract",
             Self::ToolRequestEmitted => "tool_request_emitted",
@@ -557,6 +559,7 @@ impl CertificationCase {
             | Self::ImagePersistenceContractMatrix
             | Self::CompactionObserved
             | Self::CompactionLifecycleMatrix
+            | Self::CompactionResumeExactlyOnce
             | Self::TeamContextCompactionContract
             | Self::CompactionCapabilityContract
             | Self::GenericToolLifecycleMatrix
@@ -617,6 +620,9 @@ impl CertificationCase {
             Self::CompactionObserved
             | Self::CompactionLifecycleMatrix
             | Self::TeamContextCompactionContract => &[Capability::CompactionReported],
+            Self::CompactionResumeExactlyOnce => {
+                &[Capability::CompactionReported, Capability::ResumeSession]
+            }
             Self::InterruptEmitsCancellation
             | Self::InterruptReturnsIdle
             | Self::InterruptStopsCommand

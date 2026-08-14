@@ -3138,6 +3138,11 @@ impl ClaudeInner {
         &self,
         expected_names: &HashSet<String>,
     ) -> Result<(), String> {
+        let required_names = expected_names
+            .iter()
+            .filter(|name| claude_startup_mcp_is_required(name))
+            .cloned()
+            .collect::<HashSet<_>>();
         let deadline = tokio::time::Instant::now() + CLAUDE_INITIALIZE_TIMEOUT;
         loop {
             let response = self
@@ -3147,6 +3152,27 @@ impl ClaudeInner {
                 .get("mcpServers")
                 .and_then(Value::as_array)
                 .ok_or_else(|| "Claude MCP status omitted mcpServers".to_owned())?;
+            let observed = servers
+                .iter()
+                .map(|server| {
+                    (
+                        server
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>"),
+                        server
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                expected_names = ?expected_names,
+                required_names = ?required_names,
+                observed = ?observed,
+                "Claude startup MCP readiness observation"
+            );
             let configured = servers
                 .iter()
                 .filter(|server| {
@@ -3156,14 +3182,38 @@ impl ClaudeInner {
                         .is_some_and(|name| expected_names.contains(name))
                 })
                 .collect::<Vec<_>>();
-            if configured.len() == expected_names.len()
-                && configured.iter().all(|server| {
+            let required = configured
+                .iter()
+                .copied()
+                .filter(|server| {
+                    server
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| required_names.contains(name))
+                })
+                .collect::<Vec<_>>();
+            if required.len() == required_names.len()
+                && required.iter().all(|server| {
                     server
                         .get("status")
                         .and_then(Value::as_str)
                         .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
                 })
             {
+                for server in configured {
+                    let Some(name) = server.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let status = server
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    if !required_names.contains(name) && !status.eq_ignore_ascii_case("connected") {
+                        self.emitter.warning_message(&format!(
+                            "Claude custom MCP server '{name}' is {status}; continuing without it"
+                        ));
+                    }
+                }
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -5197,6 +5247,17 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
             "mcpServers": servers,
         })
         .to_string(),
+    )
+}
+
+fn claude_startup_mcp_is_required(name: &str) -> bool {
+    matches!(
+        name,
+        "tyde-config"
+            | "tyde-debug"
+            | "tyde-agent-control"
+            | "tyde-agent-await"
+            | "tyde-review-feedback"
     )
 }
 
