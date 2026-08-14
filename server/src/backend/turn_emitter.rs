@@ -64,6 +64,7 @@ struct TurnEmitterState {
     current_stream_message_id: Option<ChatMessageId>,
     synthetic_tool_container_id: Option<ChatMessageId>,
     synthetic_tool_call_ids: Vec<String>,
+    declared_tool_owners: HashMap<String, ChatMessageId>,
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     identity_violation_reported: bool,
     emitted_tool_requests: IndexMap<String, EmittedToolRequest>,
@@ -180,6 +181,7 @@ impl TurnEmitter {
                 current_stream_message_id: None,
                 synthetic_tool_container_id: None,
                 synthetic_tool_call_ids: Vec::new(),
+                declared_tool_owners: HashMap::new(),
                 terminal_stream_message_ids: HashSet::new(),
                 identity_violation_reported: false,
                 emitted_tool_requests: IndexMap::new(),
@@ -286,7 +288,17 @@ impl TurnEmitter {
     pub fn tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
         let _ = self
             .lock()
-            .tool_request(tool_call_id, tool_name, tool_type, None, false);
+            .tool_request(tool_call_id, tool_name, tool_type, None, false, true);
+    }
+
+    pub fn tool_request_for_declared_response(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> bool {
+        self.lock()
+            .tool_request_for_declared_response(tool_call_id, tool_name, tool_type)
     }
 
     pub fn tool_request_in_container(
@@ -296,7 +308,7 @@ impl TurnEmitter {
         tool_type: Value,
     ) -> Option<ChatMessageId> {
         self.lock()
-            .tool_request(tool_call_id, tool_name, tool_type, None, true)
+            .tool_request(tool_call_id, tool_name, tool_type, None, true, true)
     }
 
     pub fn tool_request_with_normalization_failure(
@@ -312,6 +324,7 @@ impl TurnEmitter {
             tool_type,
             Some(normalization_failure),
             false,
+            true,
         );
     }
 
@@ -327,6 +340,7 @@ impl TurnEmitter {
             tool_name,
             tool_type,
             Some(normalization_failure),
+            true,
             true,
         )
     }
@@ -711,6 +725,7 @@ impl TurnEmitter {
         state.reset_turn_state();
         state.typing_active = false;
         state.detached_tool_requests.clear();
+        state.declared_tool_owners.clear();
         state.terminal_stream_message_ids.clear();
         // Terminal ids and retired ids live on the same clock: a cleared
         // conversation forgets both together.
@@ -881,6 +896,17 @@ impl TurnEmitterState {
             self.stream_identity_violation(StreamIdentityViolation::MismatchedEndMessageId);
             return;
         }
+        for tool_call in &payload.tool_calls {
+            if let Some(tool_call_id) = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|tool_call_id| !tool_call_id.is_empty())
+            {
+                self.declared_tool_owners
+                    .insert(tool_call_id.to_owned(), message_id.clone());
+            }
+        }
         self.stream_open = false;
         self.current_stream_message_id = None;
         if self.synthetic_tool_container_id.as_ref() == Some(&message_id) {
@@ -937,6 +963,7 @@ impl TurnEmitterState {
         provider_tool_type: Value,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
         own_container: bool,
+        allow_synthetic_container: bool,
     ) -> Option<ChatMessageId> {
         let mut normalization_failure =
             normalization_failure.map(|kind| PendingToolNormalizationFailure {
@@ -987,11 +1014,12 @@ impl TurnEmitterState {
             );
             return None;
         }
-        let opened_container = if own_container || !self.assistant_turn_open {
-            self.ensure_assistant_turn_open(tool_call_id)
-        } else {
-            None
-        };
+        let opened_container =
+            if allow_synthetic_container && (own_container || !self.assistant_turn_open) {
+                self.ensure_assistant_turn_open(tool_call_id)
+            } else {
+                None
+            };
         // A re-emitted request for a still-pending id is a refresh: ACP
         // agents legitimately re-title and re-argue a streaming tool call.
         // The old behavior completed the pending card as a "superseded"
@@ -1047,6 +1075,40 @@ impl TurnEmitterState {
             self.send_tool_progress(&progress);
         }
         opened_container
+    }
+
+    fn tool_request_for_declared_response(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> bool {
+        let owner = self.declared_tool_owners.get(tool_call_id).cloned();
+        tracing::info!(
+            tool_call_id,
+            owner_id = owner
+                .as_ref()
+                .map(|message_id| message_id.0.as_str())
+                .unwrap_or("<undeclared>"),
+            assistant_turn_open = self.assistant_turn_open,
+            "Resolving declared provider-response tool ownership"
+        );
+        let Some(owner) = owner else {
+            self.send(json!({
+                "kind": "Error",
+                "data": "Tool request was not declared by a provider response",
+            }));
+            return false;
+        };
+        if !self.terminal_stream_message_ids.contains(&owner) {
+            self.send(json!({
+                "kind": "Error",
+                "data": "Tool request owner is not a completed provider response",
+            }));
+            return false;
+        }
+        let _ = self.tool_request(tool_call_id, tool_name, tool_type, None, false, false);
+        self.is_tool_pending(tool_call_id)
     }
 
     fn tool_completed(
@@ -1167,6 +1229,7 @@ impl TurnEmitterState {
                 }),
                 None,
                 true,
+                true,
             );
         }
         let normalization_failure = merge_normalization_failures(
@@ -1275,6 +1338,7 @@ impl TurnEmitterState {
         self.completed_tool_requests
             .insert(tool_call_id.to_string());
         self.detached_tool_requests.shift_remove(tool_call_id);
+        self.declared_tool_owners.remove(tool_call_id);
         let error_value = error
             .map(|s| Value::String(s.to_owned()))
             .unwrap_or(Value::Null);
@@ -1577,6 +1641,9 @@ impl TurnEmitterState {
         self.synthetic_tool_container_id = None;
         self.synthetic_tool_call_ids.clear();
         self.emitted_tool_requests.clear();
+        let detached_tool_requests = &self.detached_tool_requests;
+        self.declared_tool_owners
+            .retain(|tool_call_id, _| detached_tool_requests.contains_key(tool_call_id));
         // Retire rather than erase: terminal message ids survive this
         // reset, so completion memory must survive with them or a late
         // duplicate completion re-opens a terminal container id.
@@ -1785,4 +1852,158 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain(receiver: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn undeclared_tool_request_is_refused_without_fabricating_a_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("claude"));
+
+        assert!(!emitter.tool_request_for_declared_response(
+            "toolu_undeclared",
+            "Read",
+            json!({ "kind": "Other", "args": {} }),
+        ));
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("Error"));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("StreamStart" | "MessageAdded" | "ToolRequest")
+            )
+        }));
+    }
+
+    #[test]
+    fn claude_declared_tool_sequence_keeps_provider_message_identity() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("claude"));
+        let message_id = ChatMessageId("claude-msg-9".to_owned());
+        let tool_call_id = "toolu_01declared";
+
+        emitter.stream_start_with_id(
+            message_id.clone(),
+            AgentName("claude"),
+            Some("claude-sonnet-5"),
+        );
+        emitter.stream_end_with_id(
+            message_id,
+            StreamEndPayload {
+                tool_calls: vec![json!({
+                    "id": tool_call_id,
+                    "name": "Read",
+                    "arguments": { "file_path": "/tmp/a" },
+                })],
+                ..StreamEndPayload::default()
+            },
+        );
+        emitter.lock().assistant_turn_open = false;
+
+        assert!(emitter.tool_request_for_declared_response(
+            tool_call_id,
+            "Read",
+            json!({ "kind": "Other", "args": { "file_path": "/tmp/a" } }),
+        ));
+        let _ = emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name: "Read",
+            tool_result: json!({ "kind": "Other", "result": "ok" }),
+            success: true,
+            error: None,
+        });
+        emitter.stream_start(
+            "claude-msg-10",
+            AgentName("claude"),
+            Some("claude-sonnet-5"),
+        );
+
+        let events = drain(&mut rx);
+        let kinds = events
+            .iter()
+            .filter_map(|event| event.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "StreamStart",
+                "StreamEnd",
+                "ToolRequest",
+                "ToolExecutionCompleted",
+                "StreamStart",
+            ]
+        );
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("Error" | "OperationCancelled")
+            )
+        }));
+        assert!(events.iter().all(|event| {
+            event.pointer("/data/message_id").and_then(Value::as_str) != Some(tool_call_id)
+                && event
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str)
+                    != Some(tool_call_id)
+        }));
+    }
+
+    #[test]
+    fn detached_tool_owner_survives_turn_reset_until_completion() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("claude"));
+        let message_id = ChatMessageId("claude-msg-background".to_owned());
+        let tool_call_id = "toolu_background";
+
+        emitter.stream_start_with_id(message_id.clone(), AgentName("claude"), None);
+        emitter.stream_end_with_id(
+            message_id.clone(),
+            StreamEndPayload {
+                tool_calls: vec![json!({
+                    "id": tool_call_id,
+                    "name": "Agent",
+                    "arguments": { "run_in_background": true },
+                })],
+                ..StreamEndPayload::default()
+            },
+        );
+        assert!(emitter.tool_request_for_declared_response(
+            tool_call_id,
+            "Agent",
+            json!({ "kind": "Other", "args": { "run_in_background": true } }),
+        ));
+        assert!(emitter.detach_tool(tool_call_id));
+
+        emitter.lock().reset_turn_state();
+        assert_eq!(
+            emitter.lock().declared_tool_owners.get(tool_call_id),
+            Some(&message_id)
+        );
+        let _ = emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name: "Agent",
+            tool_result: json!({ "kind": "Other", "result": "done" }),
+            success: true,
+            error: None,
+        });
+        assert!(
+            !emitter
+                .lock()
+                .declared_tool_owners
+                .contains_key(tool_call_id)
+        );
+    }
 }
