@@ -412,6 +412,12 @@ impl TurnEmitter {
         !self.lock().detached_tool_requests.is_empty()
     }
 
+    pub(crate) fn is_tool_detached(&self, tool_call_id: &str) -> bool {
+        self.lock()
+            .detached_tool_requests
+            .contains_key(tool_call_id)
+    }
+
     pub(crate) fn tool_request_name(&self, tool_call_id: &str) -> Option<String> {
         let state = self.lock();
         state
