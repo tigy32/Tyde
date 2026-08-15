@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use indexmap::IndexMap;
 use rmcp::ServiceExt;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, ServerResult,
@@ -100,6 +101,13 @@ const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const CODEX_SESSION_META_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const CODEX_LEGACY_AWAIT_WARNING: &str = "This saved Codex session predates Tyde's reliable sub-agent await tool. The installed Codex app-server cannot add dynamic tools while resuming or forking an existing session, so awaiting sub-agents may be unavailable here. Start a new Codex session to enable it.";
 const CODEX_UNVERIFIED_AWAIT_WARNING: &str = "Tyde could not verify that this resumed or forked Codex session contains the reliable sub-agent await tool, and Codex did not report the native await tool as available. Start a new Codex session before relying on sub-agent awaits.";
+const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "This resumed or forked Codex thread cannot expose per-response raw boundaries with the installed app-server. Tyde is retaining the legacy tool-container projection for this thread; start a new Codex session for strict provider-response message identity.";
+
+fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
+    if !strict {
+        emitter.warning_message(CODEX_RAW_EVENTS_UNAVAILABLE_WARNING);
+    }
+}
 
 fn codex_command() -> Command {
     Command::new("codex")
@@ -1910,7 +1918,6 @@ impl CodexSession {
             "sandbox": codex_sandbox_mode(access_mode, BackendExecutionMode::Agent),
             "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
             "ephemeral": false,
-            "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
         fork_params["runtimeWorkspaceRoots"] =
@@ -1985,7 +1992,12 @@ impl CodexSession {
             .ok_or_else(|| format!("Codex {method} response missing thread.id"))?
             .to_string();
         let session_id = SessionId(thread_id.clone());
-        let generated_identity_epoch = codex_generated_identity_epoch(&thread_id);
+        let strict_response_splitting = method == "thread/start";
+        let mut response_splitters = HashMap::new();
+        response_splitters.insert(
+            thread_id.clone(),
+            CodexResponseSplitter::new(&thread_id, strict_response_splitting),
+        );
 
         let model = thread_response
             .get("model")
@@ -2002,69 +2014,15 @@ impl CodexSession {
         let inner = Arc::new(CodexInner {
             rpc,
             emitter,
-            state: Mutex::new(CodexState {
+            state: Mutex::new(initial_codex_state(
                 thread_id,
-                pending_resume_thread_id: None,
-                effective_model: model,
-                model_override: None,
-                reasoning_effort_override: None,
-                approval_policy: None,
-                access_mode: config.access_mode,
-                execution_mode: config.execution_mode,
-                turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
-                active_turn_id: None,
-                foreground_response_completed: false,
-                awaiting_root_turn_start: false,
-                interrupt_next_root_turn: false,
-                pending_compaction: None,
-                active_stream: None,
-                tool_container: None,
-                notification_sequence: 0,
-                completed_agent_messages: HashMap::new(),
-                retired_unpublished_message_ids: HashSet::new(),
-                provider_supersessions_this_turn: 0,
-                supersession_warning_emitted: false,
-                provider_item_tombstones: VecDeque::new(),
-                terminated_turns: VecDeque::new(),
-                terminated_turn_awaiting_replacement: None,
-                generated_identity_epoch,
-                next_generated_identity_ordinal: 1,
-                pending_tool_call_ids: HashSet::new(),
-                tool_call_identities: CodexToolCallIdentities::default(),
-                background_commands: HashMap::new(),
-                background_command_owner_active: true,
-                outstanding_command_executions: HashMap::new(),
-                background_terminal_poll_active: false,
-                pending_background_wakes: VecDeque::new(),
-                background_wake_request_in_flight: false,
-                experimental_raw_events_requested: CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
-                raw_response_item_completed_seen: false,
-                first_background_list_thread_id: None,
-                observed_notification_methods: HashSet::new(),
-                raw_notification_methods_truncated: false,
-                raw_contract_drift_warned: false,
-                tool_container_images: Vec::new(),
-                cancelled_tool_call_ids: HashSet::new(),
-                close_active_stream_when_tools_idle: false,
-                pending_message_metadata: None,
-                completed_message_metadata_by_turn: HashMap::new(),
-                token_usage_by_turn: HashMap::new(),
-                model_token_usage_by_turn: HashMap::new(),
-                turn_context_by_turn: HashMap::new(),
-                file_change_call_ids: HashMap::new(),
-                pending_raw_modify_calls: HashMap::new(),
-                pending_request: None,
-                pending_user_input_bytes: 0,
-                conversation_bytes_total: 0,
+                response_splitters,
+                model,
+                config.access_mode,
+                config.execution_mode,
+                codex_has_http_mcp_servers(config.startup_mcp_servers),
                 subagent_emitter,
-                capacity_refresh_in_flight: false,
-                pending_subagent_spawns: HashMap::new(),
-                conflicting_subagent_threads: HashMap::new(),
-                registering_subagent_threads: HashSet::new(),
-                unknown_owner_notifications: HashSet::new(),
-                subagent_streams: HashMap::new(),
-                completed_subagent_streams: HashMap::new(),
-            }),
+            )),
             steering_tempfile,
             skill_projection: std::sync::Mutex::new(skill_projection),
             dynamic_awaits: Mutex::new(CodexDynamicAwaitState::default()),
@@ -2085,6 +2043,7 @@ impl CodexSession {
         if let Some(warning) = saved_await_warning {
             inner.emitter.warning_message(&warning);
         }
+        emit_codex_raw_events_warning_if_needed(inner.emitter.as_ref(), strict_response_splitting);
 
         let forward_inner = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -2733,6 +2692,2028 @@ struct ActiveStreamState {
     images: Vec<ImageData>,
 }
 
+#[derive(Clone)]
+struct BufferedCodexToolRequest {
+    turn_id: Option<String>,
+    provider_item_id: Option<String>,
+    provider_call_id: Option<String>,
+    raw_completes_tool: bool,
+    tool_call_id: String,
+    tool_name: String,
+    tool_type: Value,
+}
+
+struct OpenCodexProviderResponse {
+    identity: ServerGeneratedChatMessageIdentity,
+    turn_id: String,
+    text: String,
+    reasoning: String,
+    item_text: HashMap<String, String>,
+    item_reasoning: HashMap<String, String>,
+    typed_item_ids: HashSet<String>,
+    raw_item_ids: HashSet<String>,
+    raw_call_ids: HashSet<String>,
+    pending_typed_tool_item_id: Option<String>,
+    pending_typed_tool_call_id: Option<String>,
+    tool_requests: Vec<BufferedCodexToolRequest>,
+    raw_tool_requests: Vec<BufferedCodexToolRequest>,
+}
+
+struct ClosedCodexProviderResponse {
+    message_id: ChatMessageId,
+    response_id: Option<String>,
+    usage: Option<Value>,
+    failed: bool,
+}
+
+struct CodexResponseSplitter {
+    enabled: bool,
+    thread_id: String,
+    stream_epoch: u64,
+    next_ordinal: u64,
+    open: Option<OpenCodexProviderResponse>,
+    closed: VecDeque<ClosedCodexProviderResponse>,
+    provider_typed_tool_item_ids: HashSet<String>,
+    execution_only_typed_tool_item_ids: HashSet<String>,
+    execution_only_typed_tool_owners: HashMap<String, BufferedCodexToolRequest>,
+    claimed_raw_tool_calls: HashSet<String>,
+    pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
+}
+
+struct CodexResponseDelta {
+    opened: Option<ServerGeneratedChatMessageIdentity>,
+    message_id: ChatMessageId,
+    delta: String,
+}
+
+struct FinalizedCodexProviderResponse {
+    opened: Option<ServerGeneratedChatMessageIdentity>,
+    message_id: ChatMessageId,
+    turn_id: String,
+    content: String,
+    reasoning: Option<String>,
+    tool_requests: Vec<BufferedCodexToolRequest>,
+    evicted_tool_requests: Vec<BufferedCodexToolRequest>,
+    response_id: Option<String>,
+    usage: Option<Value>,
+    failed: bool,
+}
+
+impl CodexResponseSplitter {
+    fn new(thread_id: &str, enabled: bool) -> Self {
+        Self {
+            enabled,
+            thread_id: thread_id.to_owned(),
+            stream_epoch: codex_generated_identity_epoch(thread_id),
+            next_ordinal: 1,
+            open: None,
+            closed: VecDeque::new(),
+            provider_typed_tool_item_ids: HashSet::new(),
+            execution_only_typed_tool_item_ids: HashSet::new(),
+            execution_only_typed_tool_owners: HashMap::new(),
+            claimed_raw_tool_calls: HashSet::new(),
+            pending_raw_tool_owners: IndexMap::new(),
+        }
+    }
+
+    fn ensure_open(
+        &mut self,
+        turn_id: Option<&str>,
+    ) -> Option<(Option<ServerGeneratedChatMessageIdentity>, ChatMessageId)> {
+        if !self.enabled {
+            return None;
+        }
+        let opened = if self.open.is_none() {
+            let identity = ServerGeneratedChatMessageIdentity {
+                origin: ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
+                stream_epoch: self.stream_epoch,
+                item_ordinal: self.next_ordinal,
+            };
+            self.next_ordinal = self.next_ordinal.saturating_add(1);
+            self.open = Some(OpenCodexProviderResponse {
+                identity: identity.clone(),
+                turn_id: turn_id.unwrap_or("turn").to_owned(),
+                text: String::new(),
+                reasoning: String::new(),
+                item_text: HashMap::new(),
+                item_reasoning: HashMap::new(),
+                typed_item_ids: HashSet::new(),
+                raw_item_ids: HashSet::new(),
+                raw_call_ids: HashSet::new(),
+                pending_typed_tool_item_id: None,
+                pending_typed_tool_call_id: None,
+                tool_requests: Vec::new(),
+                raw_tool_requests: Vec::new(),
+            });
+            Some(identity)
+        } else {
+            None
+        };
+        let message_id = self
+            .open
+            .as_ref()
+            .expect("Codex response splitter opened a response")
+            .identity
+            .message_id();
+        Some((opened, message_id))
+    }
+
+    fn observe_typed_item_started(
+        &mut self,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+        tool_item: bool,
+    ) -> Option<(Option<ServerGeneratedChatMessageIdentity>, ChatMessageId)> {
+        if tool_item {
+            let item_id = item_id.filter(|item_id| !item_id.trim().is_empty())?;
+            if let Some(owner) = self.claim_raw_tool_owner(item_id, call_id) {
+                self.execution_only_typed_tool_item_ids
+                    .insert(item_id.to_owned());
+                self.execution_only_typed_tool_owners
+                    .insert(item_id.to_owned(), owner);
+                return None;
+            }
+            let Some(response) = self.open.as_mut() else {
+                self.execution_only_typed_tool_item_ids
+                    .insert(item_id.to_owned());
+                return None;
+            };
+            let matches_raw = response.raw_item_ids.contains(item_id)
+                || response.raw_call_ids.contains(item_id)
+                || call_id.is_some_and(|call_id| {
+                    response.raw_item_ids.contains(call_id)
+                        || response.raw_call_ids.contains(call_id)
+                });
+            if !matches_raw {
+                self.execution_only_typed_tool_item_ids
+                    .insert(item_id.to_owned());
+                return None;
+            }
+            response.typed_item_ids.insert(item_id.to_owned());
+            response.pending_typed_tool_item_id = Some(item_id.to_owned());
+            response.pending_typed_tool_call_id = call_id
+                .filter(|call_id| !call_id.trim().is_empty())
+                .map(str::to_owned);
+            self.provider_typed_tool_item_ids.insert(item_id.to_owned());
+            return Some((None, response.identity.message_id()));
+        }
+        let opened = self.ensure_open(turn_id)?;
+        if let Some(item_id) = item_id.filter(|item_id| !item_id.trim().is_empty()) {
+            let response = self.open.as_mut().expect("open Codex response");
+            response.typed_item_ids.insert(item_id.to_owned());
+        }
+        Some(opened)
+    }
+
+    fn claim_raw_tool_owner(
+        &mut self,
+        item_id: &str,
+        call_id: Option<&str>,
+    ) -> Option<BufferedCodexToolRequest> {
+        let matches_identity = |owner: &&BufferedCodexToolRequest| {
+            [Some(item_id), call_id]
+                .into_iter()
+                .flatten()
+                .any(|identity| {
+                    owner.provider_item_id.as_deref() == Some(identity)
+                        || owner.provider_call_id.as_deref() == Some(identity)
+                })
+        };
+        let mut owners = self
+            .open
+            .as_ref()
+            .into_iter()
+            .flat_map(|response| response.raw_tool_requests.iter())
+            .chain(self.pending_raw_tool_owners.values())
+            .filter(matches_identity)
+            .filter(|owner| !self.claimed_raw_tool_calls.contains(&owner.tool_call_id))
+            .cloned();
+        let owner = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        self.claimed_raw_tool_calls
+            .insert(owner.tool_call_id.clone());
+        Some(owner)
+    }
+
+    fn observe_raw_item(
+        &mut self,
+        turn_id: Option<&str>,
+        item: &Value,
+    ) -> Option<(Option<ServerGeneratedChatMessageIdentity>, ChatMessageId)> {
+        if !is_raw_codex_provider_output_item(item) {
+            return None;
+        }
+        let opened = self.ensure_open(turn_id)?;
+        let Some(item_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|item_id| !item_id.trim().is_empty())
+        else {
+            return Some(opened);
+        };
+        let response = self.open.as_mut().expect("open Codex response");
+        if !response.raw_item_ids.insert(item_id.to_owned()) {
+            return Some(opened);
+        }
+        if let Some(call_id) = item
+            .get("call_id")
+            .or_else(|| item.get("callId"))
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.trim().is_empty())
+        {
+            response.raw_call_ids.insert(call_id.to_owned());
+        }
+        if let Some(mut request) = raw_codex_tool_request(item_id, item) {
+            if let Some(turn_id) = turn_id {
+                request.turn_id = Some(turn_id.to_owned());
+                request.tool_call_id = format!("codex:{}:{turn_id}:{item_id}", self.thread_id);
+            }
+            response.raw_tool_requests.push(request);
+        }
+        Some(opened)
+    }
+
+    fn observe_delta(
+        &mut self,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        delta: &str,
+        reasoning: bool,
+    ) -> Option<CodexResponseDelta> {
+        let (opened, message_id) = self.ensure_open(turn_id)?;
+        let response = self.open.as_mut().expect("open Codex response");
+        let item_id = item_id
+            .filter(|item_id| !item_id.trim().is_empty())
+            .unwrap_or(if reasoning {
+                "<idless-reasoning>"
+            } else {
+                "<idless-text>"
+            });
+        response.typed_item_ids.insert(item_id.to_owned());
+        if reasoning {
+            response
+                .item_reasoning
+                .entry(item_id.to_owned())
+                .or_default()
+                .push_str(delta);
+            response.reasoning.push_str(delta);
+        } else {
+            response
+                .item_text
+                .entry(item_id.to_owned())
+                .or_default()
+                .push_str(delta);
+            response.text.push_str(delta);
+        }
+        Some(CodexResponseDelta {
+            opened,
+            message_id,
+            delta: delta.to_owned(),
+        })
+    }
+
+    fn observe_item_completed(
+        &mut self,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        completed: &str,
+        reasoning: bool,
+    ) -> Option<CodexResponseDelta> {
+        let (opened, message_id) = self.ensure_open(turn_id)?;
+        let response = self.open.as_mut().expect("open Codex response");
+        let item_id = item_id
+            .filter(|item_id| !item_id.trim().is_empty())
+            .unwrap_or(if reasoning {
+                "<idless-reasoning>"
+            } else {
+                "<idless-text>"
+            });
+        response.typed_item_ids.insert(item_id.to_owned());
+        let observed = if reasoning {
+            response
+                .item_reasoning
+                .entry(item_id.to_owned())
+                .or_default()
+        } else {
+            response.item_text.entry(item_id.to_owned()).or_default()
+        };
+        let missing = completed
+            .strip_prefix(observed.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if missing.is_empty() {
+            return Some(CodexResponseDelta {
+                opened,
+                message_id,
+                delta: String::new(),
+            });
+        }
+        observed.push_str(&missing);
+        if reasoning {
+            response.reasoning.push_str(&missing);
+        } else {
+            response.text.push_str(&missing);
+        }
+        Some(CodexResponseDelta {
+            opened,
+            message_id,
+            delta: missing,
+        })
+    }
+
+    fn buffer_tool_request(
+        &mut self,
+        turn_id: Option<&str>,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> Option<(Option<ServerGeneratedChatMessageIdentity>, ChatMessageId)> {
+        if !self.enabled {
+            return None;
+        }
+        let response = self.open.as_mut()?;
+        if response.turn_id == "turn"
+            && let Some(turn_id) = turn_id
+        {
+            response.turn_id = turn_id.to_owned();
+        }
+        let opened = (None, response.identity.message_id());
+        let provider_item_id = response.pending_typed_tool_item_id.clone();
+        let provider_call_id = response.pending_typed_tool_call_id.clone();
+        response.raw_tool_requests.retain(|raw| {
+            let raw_item_id = raw.provider_item_id.as_deref().unwrap_or_default();
+            let typed_matches_raw_item = provider_item_id.as_ref().is_some_and(|typed_item_id| {
+                typed_item_id == raw_item_id || raw.provider_call_id.as_ref() == Some(typed_item_id)
+            });
+            let typed_call_matches_raw = provider_call_id.as_ref().is_some_and(|typed_call_id| {
+                typed_call_id == raw_item_id || raw.provider_call_id.as_ref() == Some(typed_call_id)
+            });
+            !typed_matches_raw_item && !typed_call_matches_raw
+        });
+        if let Some(existing) = response
+            .tool_requests
+            .iter_mut()
+            .find(|request| request.tool_call_id == tool_call_id)
+        {
+            existing.turn_id = turn_id.map(str::to_owned);
+            existing.provider_item_id = provider_item_id;
+            existing.provider_call_id = provider_call_id;
+            existing.raw_completes_tool = false;
+            existing.tool_call_id = tool_call_id.to_owned();
+            existing.tool_name = tool_name.to_owned();
+            existing.tool_type = tool_type;
+        } else {
+            response.tool_requests.push(BufferedCodexToolRequest {
+                turn_id: turn_id.map(str::to_owned),
+                provider_item_id,
+                provider_call_id,
+                raw_completes_tool: false,
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_type,
+            });
+        }
+        Some(opened)
+    }
+
+    fn finalize(
+        &mut self,
+        turn_id: Option<&str>,
+        response_id: Option<String>,
+        usage: Option<Value>,
+        failed: bool,
+    ) -> Option<FinalizedCodexProviderResponse> {
+        if failed && self.open.is_none() {
+            return None;
+        }
+        let (opened, _) = self.ensure_open(turn_id)?;
+        let response = self.open.take().expect("open Codex response");
+        let mut tool_requests = response.tool_requests;
+        for raw in response.raw_tool_requests {
+            if !tool_requests.iter().any(|request| {
+                request.tool_call_id == raw.tool_call_id
+                    || request.provider_item_id == raw.provider_item_id
+                    || request.provider_item_id == raw.provider_call_id
+                    || request.provider_call_id == raw.provider_item_id
+                    || (request.provider_call_id.is_some()
+                        && request.provider_call_id == raw.provider_call_id)
+            }) {
+                tool_requests.push(raw);
+            }
+        }
+        for request in &tool_requests {
+            if !failed
+                && request.raw_completes_tool
+                && let Some(call_id) = request.provider_call_id.as_ref()
+            {
+                self.pending_raw_tool_owners
+                    .insert(call_id.clone(), request.clone());
+            }
+        }
+        let mut evicted_tool_requests = Vec::new();
+        while self.pending_raw_tool_owners.len() > 256 {
+            if let Some((_, owner)) = self.pending_raw_tool_owners.shift_remove_index(0) {
+                self.claimed_raw_tool_calls.remove(&owner.tool_call_id);
+                evicted_tool_requests.push(owner);
+            }
+        }
+        let message_id = response.identity.message_id();
+        self.closed.push_back(ClosedCodexProviderResponse {
+            message_id: message_id.clone(),
+            response_id: response_id.clone(),
+            usage: usage.clone(),
+            failed,
+        });
+        while self.closed.len() > 128 {
+            self.closed.pop_front();
+        }
+        if let Some(record) = self.closed.back() {
+            tracing::debug!(
+                message_id = record.message_id.0,
+                response_id = ?record.response_id,
+                usage = ?record.usage,
+                failed = record.failed,
+                "Retained Codex response identity and exact usage"
+            );
+        }
+        Some(FinalizedCodexProviderResponse {
+            opened,
+            message_id,
+            turn_id: response.turn_id,
+            content: response.text,
+            reasoning: contains_non_whitespace(&response.reasoning).then_some(response.reasoning),
+            tool_requests,
+            evicted_tool_requests,
+            response_id,
+            usage,
+            failed,
+        })
+    }
+
+    fn take_execution_only_typed_tool_owner(
+        &mut self,
+        item_id: Option<&str>,
+    ) -> Option<BufferedCodexToolRequest> {
+        let item_id = item_id.filter(|item_id| !item_id.trim().is_empty())?;
+        self.execution_only_typed_tool_owners.get(item_id).cloned()
+    }
+
+    fn finish_typed_tool(
+        &mut self,
+        item_id: Option<&str>,
+    ) -> Option<(bool, Option<BufferedCodexToolRequest>)> {
+        let Some(item_id) = item_id.filter(|item_id| !item_id.trim().is_empty()) else {
+            return Some((false, None));
+        };
+        let execution_only = self.execution_only_typed_tool_item_ids.remove(item_id);
+        let owner = self.execution_only_typed_tool_owners.remove(item_id);
+        let provider_owned = self.provider_typed_tool_item_ids.remove(item_id);
+        (execution_only || provider_owned).then_some((provider_owned, owner))
+    }
+
+    fn raw_tool_owner(&self, call_id: &str) -> Option<BufferedCodexToolRequest> {
+        self.pending_raw_tool_owners.get(call_id).cloned()
+    }
+
+    fn pending_raw_owner_count_for_turn(&self, turn_id: &str) -> usize {
+        self.pending_raw_tool_owners
+            .values()
+            .filter(|owner| owner.turn_id.as_deref() == Some(turn_id))
+            .count()
+    }
+
+    fn claim_raw_tool_call(&mut self, tool_call_id: &str) {
+        self.claimed_raw_tool_calls.insert(tool_call_id.to_owned());
+    }
+
+    fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
+        let owner = self.pending_raw_tool_owners.shift_remove(call_id);
+        if let Some(owner) = owner.as_ref() {
+            self.claimed_raw_tool_calls.remove(&owner.tool_call_id);
+        }
+        owner
+    }
+
+    fn remove_raw_tool_owner_by_tool_call_id(&mut self, tool_call_id: &str) {
+        let call_id = self
+            .pending_raw_tool_owners
+            .iter()
+            .find(|(_, owner)| owner.tool_call_id == tool_call_id)
+            .map(|(call_id, _)| call_id.clone());
+        if let Some(call_id) = call_id {
+            self.remove_raw_tool_owner(&call_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_splitter_tests {
+    use super::*;
+
+    fn raw_tool_notification(
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        call_id: &str,
+        name: &str,
+    ) -> Value {
+        json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {
+                "type": "custom_tool_call",
+                "id": item_id,
+                "call_id": call_id,
+                "name": name,
+                "input": "{\"path\":\"/tmp/captured\"}",
+                "status": "completed"
+            }
+        })
+    }
+
+    fn observe_raw_notification(splitter: &mut CodexResponseSplitter, params: &Value) {
+        splitter.observe_raw_item(
+            extract_turn_id(params).as_deref(),
+            params.get("item").expect("captured raw item"),
+        );
+    }
+
+    fn emit_finalized_response(
+        emitter: &TurnEmitter,
+        model: &str,
+        finalized: FinalizedCodexProviderResponse,
+    ) {
+        if let Some(identity) = finalized.opened.as_ref() {
+            emitter.stream_start_with_generated_identity(
+                identity,
+                AgentName(CODEX_AGENT_NAME),
+                Some(model),
+            );
+        }
+        let tool_calls = finalized
+            .tool_requests
+            .iter()
+            .map(|request| {
+                json!({
+                    "id": request.tool_call_id,
+                    "name": request.tool_name,
+                    "arguments": request.tool_type,
+                })
+            })
+            .collect();
+        emitter.stream_end_with_id(
+            finalized.message_id,
+            StreamEndPayload {
+                content: finalized.content,
+                model: Some(model.to_owned()),
+                request_usage: finalized.usage,
+                reasoning: finalized.reasoning,
+                tool_calls,
+                ..StreamEndPayload::default()
+            },
+        );
+        for request in finalized.tool_requests {
+            assert!(emitter.tool_request_for_declared_response(
+                &request.tool_call_id,
+                &request.tool_name,
+                request.tool_type,
+            ));
+        }
+    }
+
+    fn drain(receiver: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    struct NotificationHarness {
+        inner: Arc<CodexInner>,
+        events: mpsc::UnboundedReceiver<Value>,
+        rpc_requests: PathBuf,
+        _inbound: mpsc::UnboundedReceiver<CodexInbound>,
+        _server_dir: tempfile::TempDir,
+    }
+
+    async fn notification_harness(strict: bool) -> NotificationHarness {
+        notification_harness_with_background_terminals(strict, Vec::new()).await
+    }
+
+    async fn notification_harness_with_background_terminals(
+        strict: bool,
+        background_terminals: Vec<Value>,
+    ) -> NotificationHarness {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server_dir = tempfile::tempdir().expect("temporary Codex test app-server directory");
+        let server = server_dir.path().join("codex-test-app-server");
+        let rpc_requests = server_dir.path().join("requests.jsonl");
+        let rpc_requests_literal =
+            serde_json::to_string(&rpc_requests).expect("serialize Codex test request log path");
+        let background_terminals_literal = serde_json::to_string(&background_terminals)
+            .expect("serialize Codex background terminal rows");
+        std::fs::write(
+            &server,
+            format!(
+                "#!/usr/bin/env python3\nimport json, sys\npath = {rpc_requests_literal}\nbackground_terminals = {background_terminals_literal}\nfor line in sys.stdin:\n    with open(path, 'a') as log:\n        log.write(line)\n        log.flush()\n    request = json.loads(line)\n    if 'id' in request:\n        result = {{'data': background_terminals, 'nextCursor': None}} if request.get('method') == 'thread/backgroundTerminals/list' else {{}}\n        print(json.dumps({{'jsonrpc': '2.0', 'id': request['id'], 'result': result}}), flush=True)\n"
+            ),
+        )
+        .expect("write Codex test app-server");
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700))
+            .expect("make Codex test app-server executable");
+        let (rpc, inbound) = CodexRpc::spawn_with_local_program(
+            None,
+            &[],
+            None,
+            BackendAccessMode::Unrestricted,
+            BackendExecutionMode::Agent,
+            server.to_str(),
+        )
+        .await
+        .expect("spawn Codex notification router harness");
+        let thread_id = "0199-thread-notification".to_owned();
+        let turn_id = "0199-turn-notification".to_owned();
+        let splitters = HashMap::from([(
+            thread_id.clone(),
+            CodexResponseSplitter::new(&thread_id, strict),
+        )]);
+        let mut state = initial_codex_state(
+            thread_id.clone(),
+            splitters,
+            Some("gpt-5-codex".to_owned()),
+            BackendAccessMode::Unrestricted,
+            BackendExecutionMode::Agent,
+            false,
+            None,
+        );
+        state.active_turn_id = Some(turn_id);
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let inner = Arc::new(CodexInner {
+            rpc,
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(CODEX_AGENT_NAME),
+            )),
+            state: Mutex::new(state),
+            steering_tempfile: None,
+            skill_projection: std::sync::Mutex::new(None),
+            dynamic_awaits: Mutex::new(CodexDynamicAwaitState::default()),
+            dynamic_await_endpoint: None,
+        });
+        NotificationHarness {
+            inner,
+            events,
+            rpc_requests,
+            _inbound: inbound,
+            _server_dir: server_dir,
+        }
+    }
+
+    async fn wait_for_rpc_method(requests: &Path, method: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = std::fs::read_to_string(requests)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|request| request.get("method").and_then(Value::as_str) == Some(method));
+                if observed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex test app-server did not receive expected request");
+    }
+
+    async fn add_notification_child(
+        harness: &NotificationHarness,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> mpsc::UnboundedReceiver<Value> {
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            event_tx,
+            AgentName(CODEX_AGENT_NAME),
+        ));
+        let mut state = harness.inner.state.lock().await;
+        let sender_thread_id = state.thread_id.clone();
+        state.response_splitters.insert(
+            thread_id.to_owned(),
+            CodexResponseSplitter::new(thread_id, true),
+        );
+        state.subagent_streams.insert(
+            thread_id.to_owned(),
+            CodexSubAgentStream {
+                emitter,
+                agent_id: protocol::AgentId("child-agent".to_owned()),
+                spawn_item_id: "spawn-child".to_owned(),
+                activity_item_id: Some("activity-child".to_owned()),
+                agent_path: "Child".to_owned(),
+                agent_name: "Child".to_owned(),
+                name_update_tx: None,
+                sender_thread_id,
+                active_turn_id: Some(turn_id.to_owned()),
+                current_message_id: None,
+                current_generated_identity: None,
+                current_reasoning_only: false,
+                current_stream_published: false,
+                current_text: String::new(),
+                current_reasoning: String::new(),
+                current_tool_call_ids: Vec::new(),
+                current_images: Vec::new(),
+                tool_container: None,
+                pending_tool_call_ids: HashSet::new(),
+                tool_container_images: Vec::new(),
+                completed_agent_messages: HashMap::new(),
+                retired_unpublished_message_ids: HashSet::new(),
+                provider_supersessions_this_turn: 0,
+                supersession_warning_emitted: false,
+                provider_item_tombstones: VecDeque::new(),
+                terminated_turns: VecDeque::new(),
+                terminated_turn_awaiting_replacement: None,
+                pending_spawn_terminal_status: None,
+                background_work_failed: false,
+                generated_identity_epoch: codex_generated_identity_epoch(thread_id),
+                next_generated_identity_ordinal: 1,
+                pending_message_metadata: None,
+                token_usage_by_turn: HashMap::new(),
+                model_token_usage_by_turn: HashMap::new(),
+                provider_usage_baseline: None,
+            },
+        );
+        events
+    }
+
+    fn raw_response_completed(thread_id: &str, turn_id: &str, response_id: &str) -> Value {
+        json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "responseId": response_id,
+            "usage": { "input_tokens": 5, "output_tokens": 2, "total_tokens": 7 }
+        })
+    }
+
+    fn assert_tool_terminal(events: &[Value]) {
+        assert!(events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                && event.pointer("/data/success").and_then(Value::as_bool) == Some(false)
+        }));
+    }
+
+    #[test]
+    fn captured_multi_tool_response_stays_one_message() {
+        let thread_id = "0199-thread-root";
+        let turn_id = "0199-turn-one";
+        let mut splitter = CodexResponseSplitter::new(thread_id, true);
+        let first =
+            raw_tool_notification(thread_id, turn_id, "ctc_first", "call_first", "read_file");
+        let second =
+            raw_tool_notification(thread_id, turn_id, "ctc_second", "call_second", "read_file");
+
+        observe_raw_notification(&mut splitter, &first);
+        observe_raw_notification(&mut splitter, &second);
+        let completion = json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "responseId": "resp_multi_tool",
+            "usage": { "input_tokens": 41, "output_tokens": 17, "total_tokens": 58 }
+        });
+        let finalized = splitter
+            .finalize(
+                extract_turn_id(&completion).as_deref(),
+                completion
+                    .get("responseId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                completion.get("usage").cloned(),
+                false,
+            )
+            .expect("one real provider response");
+
+        assert_eq!(finalized.tool_requests.len(), 2);
+        assert_eq!(finalized.response_id.as_deref(), Some("resp_multi_tool"));
+        assert_eq!(finalized.usage, completion.get("usage").cloned());
+        assert_eq!(splitter.closed.len(), 1);
+    }
+
+    #[test]
+    fn captured_two_responses_in_one_turn_become_two_messages() {
+        let mut splitter = CodexResponseSplitter::new("0199-thread-root", true);
+        let first_delta = splitter
+            .observe_delta(Some("0199-turn-shared"), Some("msg_first"), "first", false)
+            .expect("first provider evidence");
+        let first = splitter
+            .finalize(
+                Some("0199-turn-shared"),
+                Some("resp_first".to_owned()),
+                Some(json!({ "input_tokens": 10, "output_tokens": 2 })),
+                false,
+            )
+            .expect("first response boundary");
+        let second_delta = splitter
+            .observe_delta(
+                Some("0199-turn-shared"),
+                Some("msg_second"),
+                "second",
+                false,
+            )
+            .expect("second provider evidence");
+        let second = splitter
+            .finalize(
+                Some("0199-turn-shared"),
+                Some("resp_second".to_owned()),
+                Some(json!({ "input_tokens": 12, "output_tokens": 3 })),
+                false,
+            )
+            .expect("second response boundary");
+
+        assert_eq!(first_delta.message_id, first.message_id);
+        assert_eq!(second_delta.message_id, second.message_id);
+        assert_ne!(first.message_id, second.message_id);
+        assert_eq!(first.turn_id, second.turn_id);
+        assert_eq!(splitter.closed.len(), 2);
+        assert_eq!(
+            splitter.closed[0].response_id.as_deref(),
+            Some("resp_first")
+        );
+        assert_eq!(
+            splitter.closed[1].response_id.as_deref(),
+            Some("resp_second")
+        );
+    }
+
+    #[test]
+    fn interleaved_root_and_child_responses_are_partitioned_by_thread() {
+        let mut splitters = HashMap::from([
+            (
+                "0199-thread-root".to_owned(),
+                CodexResponseSplitter::new("0199-thread-root", true),
+            ),
+            (
+                "0199-thread-child".to_owned(),
+                CodexResponseSplitter::new("0199-thread-child", true),
+            ),
+        ]);
+        splitters
+            .get_mut("0199-thread-root")
+            .expect("root splitter")
+            .observe_delta(Some("turn-root"), Some("msg-root"), "root", false);
+        splitters
+            .get_mut("0199-thread-child")
+            .expect("child splitter")
+            .observe_delta(Some("turn-child"), Some("msg-child"), "child", false);
+
+        let child = splitters
+            .get_mut("0199-thread-child")
+            .expect("child splitter")
+            .finalize(
+                Some("turn-child"),
+                Some("resp-child".to_owned()),
+                Some(json!({ "input_tokens": 5, "output_tokens": 1 })),
+                false,
+            )
+            .expect("child boundary");
+        let root = splitters
+            .get_mut("0199-thread-root")
+            .expect("root splitter")
+            .finalize(
+                Some("turn-root"),
+                Some("resp-root".to_owned()),
+                Some(json!({ "input_tokens": 8, "output_tokens": 2 })),
+                false,
+            )
+            .expect("root boundary");
+
+        assert_eq!(root.content, "root");
+        assert_eq!(child.content, "child");
+        assert_ne!(root.message_id, child.message_id);
+        assert_eq!(root.response_id.as_deref(), Some("resp-root"));
+        assert_eq!(child.response_id.as_deref(), Some("resp-child"));
+    }
+
+    #[test]
+    fn late_tool_completion_keeps_closed_response_owner() {
+        let thread_id = "0199-thread-late";
+        let turn_id = "0199-turn-late";
+        let provider_item_id = "ctc_late";
+        let tool_call_id = format!("codex:{thread_id}:{turn_id}:{provider_item_id}");
+        let mut splitter = CodexResponseSplitter::new(thread_id, true);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName(CODEX_AGENT_NAME));
+        let raw = raw_tool_notification(
+            thread_id,
+            turn_id,
+            provider_item_id,
+            "call_late",
+            "read_file",
+        );
+        observe_raw_notification(&mut splitter, &raw);
+        let owner_identity = splitter
+            .open
+            .as_ref()
+            .expect("raw provider evidence opened a response")
+            .identity
+            .clone();
+        emitter.stream_start_with_generated_identity(
+            &owner_identity,
+            AgentName(CODEX_AGENT_NAME),
+            Some("gpt-5-codex"),
+        );
+        splitter.observe_typed_item_started(
+            Some(turn_id),
+            Some(provider_item_id),
+            Some("call_late"),
+            true,
+        );
+        splitter.buffer_tool_request(
+            Some(turn_id),
+            &tool_call_id,
+            "read_file",
+            json!({ "kind": "Other", "args": { "path": "/tmp/captured" } }),
+        );
+        let owner = splitter
+            .finalize(
+                Some(turn_id),
+                Some("resp_tool_owner".to_owned()),
+                Some(json!({ "input_tokens": 9, "output_tokens": 4 })),
+                false,
+            )
+            .expect("tool owner response");
+        emit_finalized_response(&emitter, "gpt-5-codex", owner);
+        let later_delta = splitter
+            .observe_delta(Some(turn_id), Some("msg_after_tool"), "after tool", false)
+            .expect("later provider evidence");
+        emitter.stream_start_with_generated_identity(
+            later_delta
+                .opened
+                .as_ref()
+                .expect("later response opened a message"),
+            AgentName(CODEX_AGENT_NAME),
+            Some("gpt-5-codex"),
+        );
+        let later = splitter
+            .finalize(
+                Some(turn_id),
+                Some("resp_after_tool".to_owned()),
+                Some(json!({ "input_tokens": 15, "output_tokens": 2 })),
+                false,
+            )
+            .expect("later response");
+        emit_finalized_response(&emitter, "gpt-5-codex", later);
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: &tool_call_id,
+            tool_name: "read_file",
+            tool_result: json!({ "kind": "Other", "result": "captured" }),
+            success: true,
+            error: None,
+        });
+
+        let events = drain(&mut rx);
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("Error" | "OperationCancelled")
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                .count(),
+            2
+        );
+        assert!(events.iter().all(|event| {
+            event.pointer("/data/message_id").and_then(Value::as_str) != Some(tool_call_id.as_str())
+                && event
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str)
+                    != Some(tool_call_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn visible_retry_closes_provisional_response() {
+        let mut splitter = CodexResponseSplitter::new("0199-thread-retry", true);
+        let first = splitter
+            .observe_delta(
+                Some("0199-turn-retry"),
+                Some("reasoning_attempt_one"),
+                "partial",
+                true,
+            )
+            .expect("failed attempt evidence");
+        let failed = splitter
+            .finalize(Some("0199-turn-retry"), None, None, true)
+            .expect("visible retry boundary");
+        let retry = splitter
+            .observe_delta(
+                Some("0199-turn-retry"),
+                Some("reasoning_attempt_two"),
+                "retry",
+                true,
+            )
+            .expect("retry evidence");
+
+        assert!(failed.failed);
+        assert_eq!(failed.message_id, first.message_id);
+        assert_ne!(failed.message_id, retry.message_id);
+        assert!(splitter.open.is_some());
+    }
+
+    #[test]
+    fn response_id_proves_an_empty_provider_response() {
+        let mut splitter = CodexResponseSplitter::new("0199-thread-empty", true);
+        let empty = splitter
+            .finalize(
+                Some("0199-turn-empty"),
+                Some("resp_empty".to_owned()),
+                Some(json!({ "input_tokens": 3, "output_tokens": 0 })),
+                false,
+            )
+            .expect("response id proves a real empty response");
+
+        assert!(empty.opened.is_some());
+        assert!(empty.content.is_empty());
+        assert!(empty.tool_requests.is_empty());
+        assert_eq!(empty.response_id.as_deref(), Some("resp_empty"));
+    }
+
+    #[test]
+    fn tool_request_without_provider_evidence_does_not_open_a_message() {
+        let mut splitter = CodexResponseSplitter::new("0199-thread-orphan", true);
+
+        assert!(
+            splitter
+                .observe_typed_item_started(
+                    Some("0199-turn-orphan"),
+                    Some("exec-nested-tool"),
+                    None,
+                    true,
+                )
+                .is_none()
+        );
+        let (provider_owned, owner) = splitter
+            .finish_typed_tool(Some("exec-nested-tool"))
+            .expect("execution-only typed item was tracked");
+        assert!(!provider_owned);
+        assert!(owner.is_none());
+        assert!(
+            splitter
+                .buffer_tool_request(
+                    Some("0199-turn-orphan"),
+                    "orphan-call",
+                    "exec",
+                    json!({ "kind": "Other", "args": {} }),
+                )
+                .is_none()
+        );
+        assert!(splitter.open.is_none());
+    }
+
+    #[test]
+    fn raw_custom_tool_output_resolves_the_provider_call_owner() {
+        let thread_id = "0199-thread-raw-owner";
+        let turn_id = "0199-turn-raw-owner";
+        let mut splitter = CodexResponseSplitter::new(thread_id, true);
+        let raw = raw_tool_notification(
+            thread_id,
+            turn_id,
+            "ctc_raw_owner",
+            "call_raw_owner",
+            "exec",
+        );
+        observe_raw_notification(&mut splitter, &raw);
+        let finalized = splitter
+            .finalize(
+                Some(turn_id),
+                Some("resp_raw_owner".to_owned()),
+                Some(json!({ "input_tokens": 6, "output_tokens": 2 })),
+                false,
+            )
+            .expect("raw tool response boundary");
+
+        let owner = splitter
+            .remove_raw_tool_owner("call_raw_owner")
+            .expect("raw output call id retains its provider request owner");
+        assert_eq!(finalized.tool_requests.len(), 1);
+        assert_eq!(owner.tool_call_id, finalized.tool_requests[0].tool_call_id);
+        assert!(splitter.raw_tool_owner("call_raw_owner").is_none());
+    }
+
+    #[test]
+    fn captured_typed_and_raw_tool_views_are_deduplicated() {
+        let thread_id = "0199-thread-dedupe";
+        let turn_id = "0199-turn-dedupe";
+        let provider_item_id = "ctc_same_item";
+        let tool_call_id = format!("codex:{thread_id}:{turn_id}:{provider_item_id}");
+        let mut splitter = CodexResponseSplitter::new(thread_id, true);
+        let raw = raw_tool_notification(
+            thread_id,
+            turn_id,
+            provider_item_id,
+            "call_same_item",
+            "exec",
+        );
+
+        observe_raw_notification(&mut splitter, &raw);
+        observe_raw_notification(&mut splitter, &raw);
+        assert!(
+            splitter
+                .observe_typed_item_started(Some(turn_id), Some("call_same_item"), None, true,)
+                .is_none()
+        );
+        let owner = splitter
+            .take_execution_only_typed_tool_owner(Some("call_same_item"))
+            .expect("typed execution retained the raw declaration owner");
+        let finalized = splitter
+            .finalize(
+                Some(turn_id),
+                Some("resp_dedupe".to_owned()),
+                Some(json!({ "input_tokens": 7, "output_tokens": 1 })),
+                false,
+            )
+            .expect("deduplicated response");
+
+        assert_eq!(finalized.tool_requests.len(), 1);
+        assert_eq!(finalized.tool_requests[0].tool_call_id, tool_call_id);
+        assert_eq!(owner.tool_call_id, finalized.tool_requests[0].tool_call_id);
+    }
+
+    #[tokio::test]
+    async fn raw_tool_owner_eviction_is_ordered_and_visible() {
+        let thread_id = "0199-thread-owner-cap";
+        let turn_id = "0199-turn-owner-cap";
+        let mut harness = notification_harness(true).await;
+        {
+            let mut state = harness.inner.state.lock().await;
+            state.thread_id = thread_id.to_owned();
+            state.active_turn_id = Some(turn_id.to_owned());
+            state.response_splitters = HashMap::from([(
+                thread_id.to_owned(),
+                CodexResponseSplitter::new(thread_id, true),
+            )]);
+        }
+        for index in 0..257 {
+            let raw = raw_tool_notification(
+                thread_id,
+                turn_id,
+                &format!("ctc-{index}"),
+                &format!("call-{index}"),
+                "exec",
+            );
+            harness
+                .inner
+                .handle_notification("rawResponseItem/completed", &raw)
+                .await;
+        }
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(thread_id, turn_id, "resp-owner-cap"),
+            )
+            .await;
+
+        let first_tool_call_id = format!("codex:{thread_id}:{turn_id}:ctc-0");
+        let events = drain(&mut harness.events);
+        assert!(events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                && event.pointer("/data/success").and_then(Value::as_bool) == Some(false)
+                && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                    == Some(first_tool_call_id.as_str())
+        }));
+        let state = harness.inner.state.lock().await;
+        let splitter = state
+            .response_splitters
+            .get(thread_id)
+            .expect("owner-cap splitter");
+        assert!(splitter.raw_tool_owner("call-0").is_none());
+        assert!(splitter.raw_tool_owner("call-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn retry_notification_terminalizes_incomplete_tool() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-retry",
+            "call-retry",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "error",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "willRetry": true,
+                    "message": "captured retry"
+                }),
+            )
+            .await;
+
+        assert_tool_terminal(&drain(&mut harness.events));
+    }
+
+    #[tokio::test]
+    async fn turn_completion_without_raw_completion_terminalizes_tool() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-turn-end",
+            "call-turn-end",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "turn/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "turn": { "status": "completed" }
+                }),
+            )
+            .await;
+
+        assert_tool_terminal(&drain(&mut harness.events));
+    }
+
+    #[tokio::test]
+    async fn transport_loss_terminalizes_incomplete_tool() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-transport",
+            "call-transport",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_inbound(CodexInbound::Closed { exit_code: None })
+            .await;
+
+        assert_tool_terminal(&drain(&mut harness.events));
+    }
+
+    #[tokio::test]
+    async fn strict_unified_exec_promotes_before_raw_completion() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-unified",
+            "call-unified",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-unified",
+                        "command": "sleep 1",
+                        "processId": "71037"
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-unified",
+                ),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponseItem/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-unified",
+                        "output": "Script running with cell ID 71037\nWall time 10.0 seconds\nOutput:\n"
+                    }
+                }),
+            )
+            .await;
+        let promoted = drain(&mut harness.events);
+        assert!(promoted.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                && event
+                    .pointer("/data/update/task_id")
+                    .and_then(Value::as_str)
+                    == Some("71037")
+                && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                    == Some("codex:0199-thread-notification:0199-turn-notification:ctc-unified")
+        }));
+        assert!(promoted.iter().all(|event| {
+            event.get("kind").and_then(Value::as_str) != Some("ToolExecutionCompleted")
+        }));
+
+        harness
+            .inner
+            .handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-unified",
+                        "command": "sleep 1",
+                        "processId": "71037",
+                        "status": "completed",
+                        "exitCode": 0,
+                        "aggregatedOutput": "done"
+                    }
+                }),
+            )
+            .await;
+        let terminal = drain(&mut harness.events);
+        assert!(terminal.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+        }));
+    }
+
+    #[tokio::test]
+    async fn strict_child_unified_exec_preserves_execution_lifecycle() {
+        let harness = notification_harness(true).await;
+        let thread_id = "0199-thread-child-notification";
+        let turn_id = "0199-turn-child-notification";
+        let mut events = add_notification_child(&harness, thread_id, turn_id).await;
+        let raw = raw_tool_notification(
+            thread_id,
+            turn_id,
+            "ctc-child-unified",
+            "call-child-unified",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-child-unified",
+                        "command": "sleep 1",
+                        "processId": "50240"
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(thread_id, turn_id, "resp-child-unified"),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponseItem/completed",
+                &json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-child-unified",
+                        "output": "Script running with cell ID 50240\nWall time 10.0 seconds\nOutput:\n"
+                    }
+                }),
+            )
+            .await;
+        let promoted = drain(&mut events);
+        assert!(
+            promoted
+                .iter()
+                .any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                        && event.pointer("/data/update/task_id").and_then(Value::as_str)
+                            == Some("50240")
+                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                            == Some(
+                                "codex:0199-thread-child-notification:0199-turn-child-notification:ctc-child-unified",
+                            )
+                })
+        );
+        assert!(promoted.iter().all(|event| {
+            event.get("kind").and_then(Value::as_str) != Some("ToolExecutionCompleted")
+        }));
+        harness
+            .inner
+            .handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-child-unified",
+                        "processId": "50240",
+                        "status": "completed",
+                        "exitCode": 0,
+                        "aggregatedOutput": "child done"
+                    }
+                }),
+            )
+            .await;
+        assert!(drain(&mut events).iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+        }));
+    }
+
+    #[tokio::test]
+    async fn strict_parallel_forwarded_sessions_match_call_identity() {
+        let mut harness = notification_harness(true).await;
+        for raw in [
+            raw_tool_notification(
+                "0199-thread-notification",
+                "0199-turn-notification",
+                "ctc-parallel-a",
+                "call-parallel-a",
+                "exec",
+            ),
+            raw_tool_notification(
+                "0199-thread-notification",
+                "0199-turn-notification",
+                "ctc-parallel-b",
+                "call-parallel-b",
+                "exec",
+            ),
+        ] {
+            harness
+                .inner
+                .handle_notification("rawResponseItem/completed", &raw)
+                .await;
+        }
+        for (call_id, process_id) in [
+            ("call-parallel-b", "parallel-session-b"),
+            ("call-parallel-a", "parallel-session-a"),
+        ] {
+            harness
+                .inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "0199-thread-notification",
+                        "turnId": "0199-turn-notification",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": call_id,
+                            "command": format!("run {call_id}"),
+                            "processId": process_id
+                        }
+                    }),
+                )
+                .await;
+        }
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-parallel",
+                ),
+            )
+            .await;
+        let _ = drain(&mut harness.events);
+
+        for (call_id, session_id) in [
+            ("call-parallel-b", "parallel-session-b"),
+            ("call-parallel-a", "parallel-session-a"),
+        ] {
+            harness
+                .inner
+                .handle_notification(
+                    "rawResponseItem/completed",
+                    &json!({
+                        "threadId": "0199-thread-notification",
+                        "turnId": "0199-turn-notification",
+                        "item": {
+                            "type": "custom_tool_call_output",
+                            "call_id": call_id,
+                            "output": [{
+                                "type": "input_text",
+                                "text": format!("{{\"session_id\":\"{session_id}\"}}")
+                            }]
+                        }
+                    }),
+                )
+                .await;
+        }
+
+        let progress = drain(&mut harness.events)
+            .into_iter()
+            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+            .map(|event| {
+                let task_id = event
+                    .pointer("/data/update/task_id")
+                    .and_then(Value::as_str)
+                    .expect("progress background task id")
+                    .to_owned();
+                let tool_call_id = event
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str)
+                    .expect("progress tool owner")
+                    .to_owned();
+                (task_id, tool_call_id)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            progress,
+            HashMap::from([
+                (
+                    "parallel-session-a".to_owned(),
+                    "codex:0199-thread-notification:0199-turn-notification:ctc-parallel-a"
+                        .to_owned(),
+                ),
+                (
+                    "parallel-session-b".to_owned(),
+                    "codex:0199-thread-notification:0199-turn-notification:ctc-parallel-b"
+                        .to_owned(),
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_parallel_unlinked_nested_execs_fail_without_guessing() {
+        let mut harness = notification_harness_with_background_terminals(
+            true,
+            vec![
+                json!({
+                    "itemId": "exec-unlinked-a",
+                    "processId": "unlinked-session-a",
+                    "command": "sleep 30"
+                }),
+                json!({
+                    "itemId": "exec-unlinked-b",
+                    "processId": "unlinked-session-b",
+                    "command": "sleep 30"
+                }),
+            ],
+        )
+        .await;
+        for raw in [
+            raw_tool_notification(
+                "0199-thread-notification",
+                "0199-turn-notification",
+                "ctc-unlinked-a",
+                "call-unlinked-a",
+                "exec",
+            ),
+            raw_tool_notification(
+                "0199-thread-notification",
+                "0199-turn-notification",
+                "ctc-unlinked-b",
+                "call-unlinked-b",
+                "exec",
+            ),
+        ] {
+            harness
+                .inner
+                .handle_notification("rawResponseItem/completed", &raw)
+                .await;
+        }
+        for (item_id, process_id) in [
+            ("exec-unlinked-a", "unlinked-session-a"),
+            ("exec-unlinked-b", "unlinked-session-b"),
+        ] {
+            harness
+                .inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "0199-thread-notification",
+                        "turnId": "0199-turn-notification",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": item_id,
+                            "command": "sleep 30",
+                            "processId": process_id
+                        }
+                    }),
+                )
+                .await;
+        }
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-unlinked-parallel",
+                ),
+            )
+            .await;
+        let _ = drain(&mut harness.events);
+
+        for call_id in ["call-unlinked-a", "call-unlinked-b"] {
+            harness
+                .inner
+                .handle_notification(
+                    "rawResponseItem/completed",
+                    &json!({
+                        "threadId": "0199-thread-notification",
+                        "turnId": "0199-turn-notification",
+                        "item": {
+                            "type": "custom_tool_call_output",
+                            "call_id": call_id,
+                            "output": "Script running with cell ID hidden\nWall time 10.0 seconds\nOutput:\n"
+                        }
+                    }),
+                )
+                .await;
+        }
+        let events = drain(&mut harness.events);
+        let failed = events
+            .iter()
+            .filter(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                    && event.pointer("/data/success").and_then(Value::as_bool) == Some(false)
+            })
+            .filter_map(|event| {
+                event
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            failed,
+            HashSet::from([
+                "codex:0199-thread-notification:0199-turn-notification:ctc-unlinked-a".to_owned(),
+                "codex:0199-thread-notification:0199-turn-notification:ctc-unlinked-b".to_owned(),
+            ])
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("ToolProgress") })
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_non_yielding_nested_exec_keeps_plain_success() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-non-yielding",
+            "call-non-yielding",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-non-yielding",
+                        "command": "printf done",
+                        "processId": "non-yielding-process"
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-non-yielding",
+                ),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "exec-non-yielding",
+                        "command": "printf done",
+                        "processId": "non-yielding-process",
+                        "status": "completed",
+                        "exitCode": 0,
+                        "aggregatedOutput": "done"
+                    }
+                }),
+            )
+            .await;
+        let _ = drain(&mut harness.events);
+        harness
+            .inner
+            .handle_notification(
+                "rawResponseItem/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-non-yielding",
+                        "output": [
+                            {
+                                "type": "input_text",
+                                "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+                            },
+                            { "type": "input_text", "text": "done" }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        let events = drain(&mut harness.events);
+        assert!(events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)
+        }));
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("ToolProgress") })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_after_intermediate_text_and_tool_response_interrupts_active_turn() {
+        let mut harness = notification_harness(true).await;
+        harness
+            .inner
+            .handle_notification(
+                "item/agentMessage/delta",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "itemId": "msg-cancel",
+                    "delta": "I will run the command now."
+                }),
+            )
+            .await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-cancel",
+            "call-cancel",
+            "exec",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "call-cancel",
+                        "command": "sleep 30",
+                        "processId": "cancel-session"
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-cancel-tool",
+                ),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponseItem/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-cancel",
+                        "output": "Script running with cell ID cancel-session\nWall time 10.0 seconds\nOutput:\n"
+                    }
+                }),
+            )
+            .await;
+        let _ = drain(&mut harness.events);
+
+        harness
+            .inner
+            .execute(SessionCommand::CancelConversation)
+            .await
+            .expect("cancel active Codex turn");
+        wait_for_rpc_method(&harness.rpc_requests, "turn/interrupt").await;
+        assert!(drain(&mut harness.events).iter().all(|event| {
+            event.get("kind").and_then(Value::as_str) != Some("InterruptAcknowledged")
+        }));
+    }
+
+    #[tokio::test]
+    async fn strict_image_completion_carries_to_next_response() {
+        let mut harness = notification_harness(true).await;
+        let raw = raw_tool_notification(
+            "0199-thread-notification",
+            "0199-turn-notification",
+            "ctc-image",
+            "call-image",
+            "generate_image",
+        );
+        harness
+            .inner
+            .handle_notification("rawResponseItem/completed", &raw)
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-image-tool",
+                ),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": { "type": "imageGeneration", "id": "typed-image" }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "imageGeneration",
+                        "id": "typed-image",
+                        "status": "completed",
+                        "result": "iVBORw0KGgo="
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponseItem/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "item": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-image",
+                        "output": [{ "type": "input_text", "text": "generated" }]
+                    }
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "item/agentMessage/delta",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "itemId": "message-after-image",
+                    "delta": "done"
+                }),
+            )
+            .await;
+        harness
+            .inner
+            .handle_notification(
+                "rawResponse/completed",
+                &raw_response_completed(
+                    "0199-thread-notification",
+                    "0199-turn-notification",
+                    "resp-after-image",
+                ),
+            )
+            .await;
+
+        let events = drain(&mut harness.events);
+        assert!(events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                && event
+                    .pointer("/data/message/images")
+                    .and_then(Value::as_array)
+                    .is_some_and(|images| !images.is_empty())
+        }));
+        harness
+            .inner
+            .handle_notification(
+                "turn/completed",
+                &json!({
+                    "threadId": "0199-thread-notification",
+                    "turnId": "0199-turn-notification",
+                    "turn": { "status": "completed" },
+                    "usage": { "input_tokens": 8, "output_tokens": 3, "total_tokens": 11 }
+                }),
+            )
+            .await;
+        assert!(drain(&mut harness.events).iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
+                && event.pointer("/data/context_breakdown").is_some()
+        }));
+    }
+
+    #[test]
+    fn raw_event_warning_is_legacy_only() {
+        let (strict_tx, mut strict_rx) = mpsc::unbounded_channel();
+        let strict = TurnEmitter::new_for_agent(strict_tx, AgentName(CODEX_AGENT_NAME));
+        emit_codex_raw_events_warning_if_needed(&strict, true);
+        assert!(drain(&mut strict_rx).is_empty());
+
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
+        let legacy = TurnEmitter::new_for_agent(legacy_tx, AgentName(CODEX_AGENT_NAME));
+        emit_codex_raw_events_warning_if_needed(&legacy, false);
+        let events = drain(&mut legacy_rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("kind").and_then(Value::as_str),
+            Some("MessageAdded")
+        );
+    }
+}
+
 impl ActiveStreamState {
     fn is_replaceable_provider_reservation(&self) -> bool {
         self.generated_identity.is_none()
@@ -3177,6 +5158,7 @@ struct CodexSubAgentActivity {
 /// A command execution Codex reports as a live background terminal.
 struct CodexBackgroundCommand {
     tool_call_id: String,
+    tool_name: String,
     task_id: String,
     description: Option<String>,
     /// Consecutive polls this terminal has been absent from
@@ -3199,9 +5181,23 @@ struct CodexBackgroundWake {
 #[derive(Clone)]
 struct CodexOutstandingCommand {
     tool_call_id: String,
+    tool_name: String,
     command: Option<String>,
     process_id: Option<String>,
     turn_id: String,
+}
+
+#[derive(Clone)]
+struct CodexUnownedCommand {
+    command: Option<String>,
+    process_id: String,
+    turn_id: String,
+}
+
+enum CodexUnlinkedRawToolResolution {
+    OrdinaryCompletion,
+    Correlated(String),
+    Failed,
 }
 
 /// One row of a `thread/backgroundTerminals/list` result.
@@ -3240,7 +5236,7 @@ impl CodexBackgroundCommand {
         };
         ToolProgressData {
             tool_call_id: self.tool_call_id.clone(),
-            tool_name: "run_command".to_owned(),
+            tool_name: self.tool_name.clone(),
             update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
                 task_id: self.task_id.clone(),
                 description: self.description.clone(),
@@ -3261,6 +5257,7 @@ enum CodexNotificationOwner {
 
 struct CodexState {
     thread_id: String,
+    response_splitters: HashMap<String, CodexResponseSplitter>,
     pending_resume_thread_id: Option<String>,
     effective_model: Option<String>,
     model_override: Option<String>,
@@ -3299,6 +5296,7 @@ struct CodexState {
     /// the process lives, so this is exactly the set of commands that could
     /// still be — or become — a background terminal.
     outstanding_command_executions: HashMap<(String, String), CodexOutstandingCommand>,
+    unowned_command_executions: HashMap<(String, String), CodexUnownedCommand>,
     /// Whether the background-terminal poll loop is already running.
     background_terminal_poll_active: bool,
     pending_background_wakes: VecDeque<CodexBackgroundWake>,
@@ -3330,6 +5328,86 @@ struct CodexState {
     unknown_owner_notifications: HashSet<String>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
+}
+
+fn initial_codex_state(
+    thread_id: String,
+    response_splitters: HashMap<String, CodexResponseSplitter>,
+    model: Option<String>,
+    access_mode: BackendAccessMode,
+    execution_mode: BackendExecutionMode,
+    turn_network_access: bool,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+) -> CodexState {
+    let generated_identity_epoch = codex_generated_identity_epoch(&thread_id);
+    let strict_response_splitting = response_splitters
+        .get(&thread_id)
+        .is_some_and(|splitter| splitter.enabled);
+    CodexState {
+        thread_id,
+        response_splitters,
+        pending_resume_thread_id: None,
+        effective_model: model,
+        model_override: None,
+        reasoning_effort_override: None,
+        approval_policy: None,
+        access_mode,
+        execution_mode,
+        turn_network_access,
+        active_turn_id: None,
+        foreground_response_completed: false,
+        awaiting_root_turn_start: false,
+        interrupt_next_root_turn: false,
+        pending_compaction: None,
+        active_stream: None,
+        tool_container: None,
+        notification_sequence: 0,
+        completed_agent_messages: HashMap::new(),
+        retired_unpublished_message_ids: HashSet::new(),
+        provider_supersessions_this_turn: 0,
+        supersession_warning_emitted: false,
+        provider_item_tombstones: VecDeque::new(),
+        terminated_turns: VecDeque::new(),
+        terminated_turn_awaiting_replacement: None,
+        generated_identity_epoch,
+        next_generated_identity_ordinal: 1,
+        pending_tool_call_ids: HashSet::new(),
+        tool_call_identities: CodexToolCallIdentities::default(),
+        background_commands: HashMap::new(),
+        background_command_owner_active: true,
+        outstanding_command_executions: HashMap::new(),
+        unowned_command_executions: HashMap::new(),
+        background_terminal_poll_active: false,
+        pending_background_wakes: VecDeque::new(),
+        background_wake_request_in_flight: false,
+        experimental_raw_events_requested: strict_response_splitting,
+        raw_response_item_completed_seen: false,
+        first_background_list_thread_id: None,
+        observed_notification_methods: HashSet::new(),
+        raw_notification_methods_truncated: false,
+        raw_contract_drift_warned: false,
+        tool_container_images: Vec::new(),
+        cancelled_tool_call_ids: HashSet::new(),
+        close_active_stream_when_tools_idle: false,
+        pending_message_metadata: None,
+        completed_message_metadata_by_turn: HashMap::new(),
+        token_usage_by_turn: HashMap::new(),
+        model_token_usage_by_turn: HashMap::new(),
+        turn_context_by_turn: HashMap::new(),
+        file_change_call_ids: HashMap::new(),
+        pending_raw_modify_calls: HashMap::new(),
+        pending_request: None,
+        pending_user_input_bytes: 0,
+        conversation_bytes_total: 0,
+        subagent_emitter,
+        capacity_refresh_in_flight: false,
+        pending_subagent_spawns: HashMap::new(),
+        conflicting_subagent_threads: HashMap::new(),
+        registering_subagent_threads: HashSet::new(),
+        unknown_owner_notifications: HashSet::new(),
+        subagent_streams: HashMap::new(),
+        completed_subagent_streams: HashMap::new(),
+    }
 }
 
 struct PendingCodexCompaction {
@@ -3719,10 +5797,258 @@ impl CodexInner {
         }
     }
 
-    async fn promote_yielded_root_command(&self, params: &Value) {
+    async fn correlate_yielded_command_owner(&self, params: &Value) -> bool {
+        let Some(session_id) = codex_yielded_session_id(params) else {
+            return false;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let Some(turn_id) = extract_turn_id(params) else {
+            return false;
+        };
+        let Some(call_id) = params
+            .pointer("/item/call_id")
+            .or_else(|| params.pointer("/item/callId"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let mut state = self.state.lock().await;
+        let owner = state
+            .response_splitters
+            .get(&thread_id)
+            .and_then(|splitter| splitter.raw_tool_owner(call_id));
+        let Some(owner) = owner else {
+            return false;
+        };
+        let matches = state
+            .unowned_command_executions
+            .iter()
+            .filter(|((owner_thread_id, _), command)| {
+                owner_thread_id == &thread_id
+                    && command.turn_id == turn_id
+                    && command.process_id == session_id
+            })
+            .map(|(key, command)| (key.clone(), command.clone()))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return false;
+        }
+        let (key, command) = matches.into_iter().next().expect("one process-id match");
+        state.unowned_command_executions.remove(&key);
+        state.outstanding_command_executions.insert(
+            key,
+            CodexOutstandingCommand {
+                tool_call_id: owner.tool_call_id.clone(),
+                tool_name: owner.tool_name.clone(),
+                command: command.command,
+                process_id: Some(command.process_id),
+                turn_id: command.turn_id,
+            },
+        );
+        if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+            splitter.claim_raw_tool_call(&owner.tool_call_id);
+        }
+        true
+    }
+
+    async fn resolve_unlinked_raw_tool_output(
+        &self,
+        params: &Value,
+    ) -> CodexUnlinkedRawToolResolution {
+        if codex_yielded_session_id(params).is_some() {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        }
+        let Some(item) = params.get("item") else {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        }
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        };
+        let Some(turn_id) = extract_turn_id(params) else {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        };
+        let Some(call_id) = item
+            .get("call_id")
+            .or_else(|| item.get("callId"))
+            .and_then(Value::as_str)
+        else {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        };
+        let snapshot = {
+            let state = self.state.lock().await;
+            let owner = state
+                .response_splitters
+                .get(&thread_id)
+                .and_then(|splitter| splitter.raw_tool_owner(call_id));
+            let owner_count = state
+                .response_splitters
+                .get(&thread_id)
+                .map(|splitter| splitter.pending_raw_owner_count_for_turn(&turn_id))
+                .unwrap_or(0);
+            let candidates = state
+                .unowned_command_executions
+                .iter()
+                .filter(|((owner_thread_id, _), command)| {
+                    owner_thread_id == &thread_id && command.turn_id == turn_id
+                })
+                .map(|(key, command)| (key.clone(), command.clone()))
+                .collect::<Vec<_>>();
+            (owner, owner_count, candidates)
+        };
+        let (Some(owner), owner_count, candidates) = snapshot else {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        };
+        if !owner.tool_name.eq_ignore_ascii_case("exec") {
+            return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+        }
+        if owner_count == 1 && candidates.len() == 1 {
+            let (key, command) = candidates
+                .into_iter()
+                .next()
+                .expect("one unowned command candidate");
+            let process_id = command.process_id.clone();
+            let mut state = self.state.lock().await;
+            state.unowned_command_executions.remove(&key);
+            state.outstanding_command_executions.insert(
+                key,
+                CodexOutstandingCommand {
+                    tool_call_id: owner.tool_call_id.clone(),
+                    tool_name: owner.tool_name.clone(),
+                    command: command.command,
+                    process_id: Some(command.process_id),
+                    turn_id: command.turn_id,
+                },
+            );
+            if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+                splitter.claim_raw_tool_call(&owner.tool_call_id);
+            }
+            return CodexUnlinkedRawToolResolution::Correlated(process_id);
+        }
+
+        let (listed, list_authoritative) = match self
+            .rpc
+            .request(
+                "thread/backgroundTerminals/list",
+                json!({ "threadId": thread_id }),
+            )
+            .await
+        {
+            Ok(result) => (parse_codex_background_terminals(&result), true),
+            Err(error) => {
+                tracing::warn!(
+                    thread_id,
+                    turn_id,
+                    %error,
+                    "Could not verify an unlinked Codex nested execution"
+                );
+                (Vec::new(), false)
+            }
+        };
+        let resolution = {
+            let mut state = self.state.lock().await;
+            let owner_count = state
+                .response_splitters
+                .get(&thread_id)
+                .map(|splitter| splitter.pending_raw_owner_count_for_turn(&turn_id))
+                .unwrap_or(0);
+            let candidates = state
+                .unowned_command_executions
+                .iter()
+                .filter(|((owner_thread_id, _), command)| {
+                    owner_thread_id == &thread_id && command.turn_id == turn_id
+                })
+                .map(|(key, command)| (key.clone(), command.clone()))
+                .collect::<Vec<_>>();
+            let live_candidates = candidates
+                .iter()
+                .filter(|(key, command)| {
+                    listed
+                        .iter()
+                        .any(|row| row.item_id == key.1 && row.process_id == command.process_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let unknown_live_row_count = listed
+                .iter()
+                .filter(|row| {
+                    let key = (thread_id.clone(), row.item_id.clone());
+                    !state.background_commands.contains_key(&key)
+                        && !state.outstanding_command_executions.contains_key(&key)
+                        && !candidates.iter().any(|(candidate_key, command)| {
+                            candidate_key == &key && command.process_id == row.process_id
+                        })
+                })
+                .count();
+            if owner_count == 1 && live_candidates.len() == 1 && unknown_live_row_count == 0 {
+                let (key, command) = live_candidates
+                    .into_iter()
+                    .next()
+                    .expect("one live unowned command candidate");
+                let process_id = command.process_id.clone();
+                state.unowned_command_executions.remove(&key);
+                state.outstanding_command_executions.insert(
+                    key,
+                    CodexOutstandingCommand {
+                        tool_call_id: owner.tool_call_id.clone(),
+                        tool_name: owner.tool_name.clone(),
+                        command: command.command,
+                        process_id: Some(command.process_id),
+                        turn_id: command.turn_id,
+                    },
+                );
+                if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+                    splitter.claim_raw_tool_call(&owner.tool_call_id);
+                }
+                Some(process_id)
+            } else if list_authoritative
+                && live_candidates.is_empty()
+                && unknown_live_row_count == 0
+            {
+                return CodexUnlinkedRawToolResolution::OrdinaryCompletion;
+            } else {
+                state
+                    .unowned_command_executions
+                    .retain(|(owner_thread_id, _), command| {
+                        owner_thread_id != &thread_id || command.turn_id != turn_id
+                    });
+                None
+            }
+        };
+        if let Some(process_id) = resolution {
+            return CodexUnlinkedRawToolResolution::Correlated(process_id);
+        }
+
+        let message = "Codex could not uniquely correlate a live nested command execution";
+        if let Some((emitter, _)) = self.response_projection_target(&thread_id).await
+            && !emitter.fail_pending_tool(&owner.tool_call_id, message)
+        {
+            emitter.backend_error(message);
+        }
+        if let Some(splitter) = self
+            .state
+            .lock()
+            .await
+            .response_splitters
+            .get_mut(&thread_id)
+        {
+            splitter.remove_raw_tool_owner(call_id);
+        }
+        CodexUnlinkedRawToolResolution::Failed
+    }
+
+    async fn promote_yielded_command(&self, params: &Value) {
         let Some(session_id) = codex_yielded_session_id(params) else {
             return;
         };
+        self.promote_command(params, &session_id).await;
+    }
+
+    async fn promote_command(&self, params: &Value, session_id: &str) {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             tracing::debug!(
                 yielded_session_id = session_id,
@@ -3740,15 +6066,27 @@ impl CodexInner {
         };
         let promoted = {
             let mut state = self.state.lock().await;
-            if thread_id != state.thread_id
-                || !state.background_command_owner_active
-                || state.active_turn_id.as_deref() != Some(turn_id.as_str())
-                || state
-                    .terminated_turns
-                    .iter()
-                    .any(|terminated| terminated.turn_id == turn_id)
-                || state.terminated_turn_awaiting_replacement.is_some()
-            {
+            let owner_is_live = if thread_id == state.thread_id {
+                state.active_turn_id.as_deref() == Some(turn_id.as_str())
+                    && !state
+                        .terminated_turns
+                        .iter()
+                        .any(|terminated| terminated.turn_id == turn_id)
+                    && state.terminated_turn_awaiting_replacement.is_none()
+            } else {
+                state
+                    .subagent_streams
+                    .get(&thread_id)
+                    .is_some_and(|stream| {
+                        stream.active_turn_id.as_deref() == Some(turn_id.as_str())
+                            && !stream
+                                .terminated_turns
+                                .iter()
+                                .any(|terminated| terminated.turn_id == turn_id)
+                            && stream.terminated_turn_awaiting_replacement.is_none()
+                    })
+            };
+            if !state.background_command_owner_active || !owner_is_live {
                 None
             } else {
                 let matches = state
@@ -3757,7 +6095,7 @@ impl CodexInner {
                     .filter(|((owner_thread_id, _), command)| {
                         owner_thread_id == &thread_id
                             && command.turn_id == turn_id
-                            && command.process_id.as_deref() == Some(session_id.as_str())
+                            && command.process_id.as_deref() == Some(session_id)
                     })
                     .map(|(key, command)| (key.clone(), command.clone()))
                     .collect::<Vec<_>>();
@@ -3774,7 +6112,8 @@ impl CodexInner {
                             let tool_call_id = outstanding.tool_call_id.clone();
                             let command = CodexBackgroundCommand {
                                 tool_call_id: outstanding.tool_call_id,
-                                task_id: session_id.clone(),
+                                tool_name: outstanding.tool_name,
+                                task_id: session_id.to_owned(),
                                 description: outstanding.command,
                                 missing_polls: 0,
                             };
@@ -3787,20 +6126,24 @@ impl CodexInner {
             }
         };
         if let Some((progress, tool_call_id)) = promoted {
-            if self.emitter.detach_tool(&tool_call_id) {
-                self.state
-                    .lock()
-                    .await
-                    .pending_tool_call_ids
-                    .remove(&tool_call_id);
+            let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
+                return;
+            };
+            if emitter.detach_tool(&tool_call_id) {
+                let mut state = self.state.lock().await;
+                if thread_id == state.thread_id {
+                    state.pending_tool_call_ids.remove(&tool_call_id);
+                } else if let Some(stream) = state.subagent_streams.get_mut(&thread_id) {
+                    stream.pending_tool_call_ids.remove(&tool_call_id);
+                }
             }
-            self.emitter.tool_progress(&progress);
+            emitter.tool_progress(&progress);
         } else {
             tracing::debug!(
                 thread_id,
                 turn_id,
                 yielded_session_id = session_id,
-                "Codex yielded session result did not match one live root command"
+                "Codex yielded session result did not match one live command"
             );
         }
     }
@@ -3932,6 +6275,7 @@ impl CodexInner {
                         let outstanding = state.outstanding_command_executions.get(&key)?.clone();
                         let command = CodexBackgroundCommand {
                             tool_call_id: outstanding.tool_call_id.clone(),
+                            tool_name: outstanding.tool_name.clone(),
                             task_id: outstanding
                                 .process_id
                                 .clone()
@@ -4221,6 +6565,7 @@ impl CodexInner {
         params: &Value,
         provider_item_id: &str,
         tool_call_id: &str,
+        tool_name: &str,
         item: &Value,
     ) {
         {
@@ -4246,6 +6591,7 @@ impl CodexInner {
                 (thread_id, provider_item_id.to_owned()),
                 CodexOutstandingCommand {
                     tool_call_id: tool_call_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
                     command: codex_command_text(item),
                     process_id: codex_process_id(item),
                     turn_id,
@@ -4255,12 +6601,53 @@ impl CodexInner {
         self.spawn_background_terminal_poll();
     }
 
+    async fn track_unowned_command_execution(
+        &self,
+        params: &Value,
+        provider_item_id: &str,
+        item: &Value,
+    ) -> bool {
+        let Some(process_id) = codex_process_id(item) else {
+            return false;
+        };
+        let mut state = self.state.lock().await;
+        if !state.background_command_owner_active {
+            return false;
+        }
+        let thread_id =
+            extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+        let turn_id = extract_turn_id(params)
+            .or_else(|| {
+                if thread_id == state.thread_id {
+                    state.active_turn_id.clone()
+                } else {
+                    state
+                        .subagent_streams
+                        .get(&thread_id)
+                        .and_then(|stream| stream.active_turn_id.clone())
+                }
+            })
+            .unwrap_or_else(|| "turn".to_owned());
+        state.unowned_command_executions.insert(
+            (thread_id, provider_item_id.to_owned()),
+            CodexUnownedCommand {
+                command: codex_command_text(item),
+                process_id,
+                turn_id,
+            },
+        );
+        true
+    }
+
     async fn forget_command_execution(&self, params: &Value, provider_item_id: &str) {
         let mut state = self.state.lock().await;
         let thread_id =
             extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
         state
             .outstanding_command_executions
+            .remove(&(thread_id.clone(), provider_item_id.to_owned()));
+        state
+            .unowned_command_executions
             .remove(&(thread_id, provider_item_id.to_owned()));
     }
 
@@ -4297,22 +6684,26 @@ impl CodexInner {
     }
 
     async fn terminate_background_terminals(&self) {
-        let terminals = {
-            let state = self.state.lock().await;
-            state
-                .background_commands
-                .iter()
-                .map(|((thread_id, _), command)| (thread_id.clone(), command.task_id.clone()))
-                .chain(state.outstanding_command_executions.iter().filter_map(
-                    |((thread_id, _), command)| {
-                        command
-                            .process_id
-                            .as_ref()
-                            .map(|process_id| (thread_id.clone(), process_id.clone()))
-                    },
-                ))
-                .collect::<HashSet<_>>()
-        };
+        let terminals =
+            {
+                let state = self.state.lock().await;
+                state
+                    .background_commands
+                    .iter()
+                    .map(|((thread_id, _), command)| (thread_id.clone(), command.task_id.clone()))
+                    .chain(state.outstanding_command_executions.iter().filter_map(
+                        |((thread_id, _), command)| {
+                            command
+                                .process_id
+                                .as_ref()
+                                .map(|process_id| (thread_id.clone(), process_id.clone()))
+                        },
+                    ))
+                    .chain(state.unowned_command_executions.iter().map(
+                        |((thread_id, _), command)| (thread_id.clone(), command.process_id.clone()),
+                    ))
+                    .collect::<HashSet<_>>()
+            };
         for (thread_id, process_id) in terminals {
             if let Err(error) = self
                 .rpc
@@ -6421,13 +8812,7 @@ impl CodexInner {
         let resumed = async {
             let response = self
                 .rpc
-                .request(
-                    "thread/resume",
-                    json!({
-                        "threadId": session_id,
-                        "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS
-                    }),
-                )
+                .request("thread/resume", json!({ "threadId": session_id }))
                 .await?;
 
             let thread = response
@@ -6473,6 +8858,13 @@ impl CodexInner {
             let mut state = self.state.lock().await;
             state.pending_resume_thread_id = None;
             state.thread_id = resumed_thread_id;
+            let resumed_thread_id = state.thread_id.clone();
+            state.response_splitters.clear();
+            state.response_splitters.insert(
+                resumed_thread_id.clone(),
+                CodexResponseSplitter::new(&resumed_thread_id, false),
+            );
+            state.experimental_raw_events_requested = false;
             if let Some(model) = resumed_model.clone() {
                 state.effective_model = Some(model);
             }
@@ -6497,6 +8889,7 @@ impl CodexInner {
         }
 
         self.emitter.conversation_cleared();
+        emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), false);
         self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
@@ -6843,6 +9236,10 @@ impl CodexInner {
                 }
             }
             CodexInbound::Closed { exit_code } => {
+                self.finalize_all_incomplete_strict_responses(
+                    "Codex transport closed before rawResponse/completed",
+                )
+                .await;
                 self.terminalize_dynamic_awaits(None).await;
                 self.finish_compaction_failure(
                     BackendCompactionFailureKind::TransportClosed,
@@ -6867,6 +9264,790 @@ impl CodexInner {
             CodexInbound::ServerRequest { id, method, params } => {
                 self.handle_server_request(id, &method, &params).await;
             }
+        }
+    }
+
+    async fn response_projection_target(
+        &self,
+        thread_id: &str,
+    ) -> Option<(Arc<TurnEmitter>, String)> {
+        let state = self.state.lock().await;
+        if !state
+            .response_splitters
+            .get(thread_id)
+            .is_some_and(|splitter| splitter.enabled)
+        {
+            return None;
+        }
+        let model = state
+            .effective_model
+            .clone()
+            .unwrap_or_else(|| "codex".to_owned());
+        if thread_id == state.thread_id {
+            return Some((Arc::clone(&self.emitter), model));
+        }
+        state
+            .subagent_streams
+            .get(thread_id)
+            .map(|stream| (Arc::clone(&stream.emitter), model.clone()))
+            .or_else(|| {
+                state
+                    .completed_subagent_streams
+                    .get(thread_id)
+                    .map(|stream| (Arc::clone(&stream.emitter), model))
+            })
+    }
+
+    fn emit_response_start_if_needed(
+        emitter: &TurnEmitter,
+        model: &str,
+        opened: Option<ServerGeneratedChatMessageIdentity>,
+    ) {
+        if let Some(identity) = opened.as_ref() {
+            Self::emit_stream_start(emitter, identity.message_id(), Some(identity), model);
+        }
+    }
+
+    async fn observe_strict_response_item_started(&self, params: &Value) -> (bool, bool) {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return (false, false);
+        };
+        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+            return (false, false);
+        };
+        let Some(item) = params.get("item") else {
+            return (false, false);
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !is_codex_provider_output_item_type(item_type) {
+            return (false, false);
+        }
+        let tool_item = is_codex_provider_tool_item_type(item_type);
+        let item_id = item.get("id").and_then(Value::as_str);
+        let call_id = item
+            .get("callId")
+            .or_else(|| item.get("call_id"))
+            .and_then(Value::as_str);
+        let turn_id = extract_turn_id(params);
+        let opened = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .and_then(|splitter| {
+                    splitter.observe_typed_item_started(
+                        turn_id.as_deref(),
+                        item_id,
+                        call_id,
+                        is_codex_provider_tool_item_type(item_type),
+                    )
+                })
+                .and_then(|(opened, _)| opened)
+        };
+        let provider_tool = !tool_item || {
+            let state = self.state.lock().await;
+            item_id.is_some_and(|item_id| {
+                state
+                    .response_splitters
+                    .get(&thread_id)
+                    .is_some_and(|splitter| splitter.provider_typed_tool_item_ids.contains(item_id))
+            })
+        };
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, opened);
+        (true, provider_tool)
+    }
+
+    async fn strict_execution_only_tool_owner(
+        &self,
+        params: &Value,
+    ) -> Option<BufferedCodexToolRequest> {
+        let thread_id = extract_notification_thread_id(params)?;
+        let item_id = params.pointer("/item/id").and_then(Value::as_str);
+        let mut state = self.state.lock().await;
+        state
+            .response_splitters
+            .get_mut(&thread_id)?
+            .take_execution_only_typed_tool_owner(item_id)
+    }
+
+    async fn handle_strict_execution_only_tool_started(self: &Arc<Self>, params: &Value) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let provider_item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool-call");
+        let owner = self.strict_execution_only_tool_owner(params).await;
+        match item_type {
+            "commandExecution" => {
+                if let Some(owner) = owner {
+                    self.track_command_execution(
+                        params,
+                        provider_item_id,
+                        &owner.tool_call_id,
+                        &owner.tool_name,
+                        item,
+                    )
+                    .await;
+                } else if !self
+                    .track_unowned_command_execution(params, provider_item_id, item)
+                    .await
+                {
+                    tracing::error!(
+                        provider_item_id,
+                        "Codex typed command execution had no correlatable provider owner"
+                    );
+                }
+            }
+            "collabToolCall" | "collabAgentToolCall" => {
+                self.record_codex_subagent_spawn_metadata_if_needed(
+                    owner.as_ref().map(|owner| owner.tool_call_id.as_str()),
+                    Some(params),
+                    item,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_strict_response_delta(&self, method: &str, params: &Value) -> bool {
+        let (reasoning, delta) = if method == "item/agentMessage/delta" {
+            (
+                false,
+                params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        } else if is_reasoning_notification_method(method) {
+            let Some(delta) = extract_codex_reasoning_delta_text(params) else {
+                return false;
+            };
+            (true, delta)
+        } else {
+            return false;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+            return false;
+        };
+        if delta.is_empty() {
+            return true;
+        }
+        let item_id = params
+            .get("itemId")
+            .or_else(|| params.get("item_id"))
+            .and_then(Value::as_str);
+        let turn_id = extract_turn_id(params);
+        let emission = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .and_then(|splitter| {
+                    splitter.observe_delta(turn_id.as_deref(), item_id, &delta, reasoning)
+                })
+        };
+        let Some(emission) = emission else {
+            return false;
+        };
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, emission.opened);
+        if reasoning {
+            let mut state = self.state.lock().await;
+            if thread_id == state.thread_id {
+                let turn_id = turn_id.unwrap_or_else(|| "turn".to_owned());
+                let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
+                estimate.reasoning_bytes = estimate
+                    .reasoning_bytes
+                    .saturating_add(emission.delta.len() as u64);
+            }
+            drop(state);
+            emitter.stream_reasoning_delta_with_id(emission.message_id, &emission.delta);
+        } else {
+            emitter.stream_delta_with_id(emission.message_id, &emission.delta);
+        }
+        true
+    }
+
+    async fn handle_strict_response_item_completed(&self, params: &Value) -> bool {
+        let Some(item) = params.get("item") else {
+            return false;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(item_type, "agentMessage" | "reasoning") {
+            return false;
+        }
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+            return false;
+        };
+        let reasoning = item_type == "reasoning";
+        let completed = if reasoning {
+            extract_codex_item_reasoning(item).unwrap_or_default()
+        } else {
+            item.get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| extract_codex_item_text(item))
+        };
+        let item_id = item.get("id").and_then(Value::as_str);
+        let turn_id = extract_turn_id(params);
+        let emission = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .and_then(|splitter| {
+                    splitter.observe_item_completed(
+                        turn_id.as_deref(),
+                        item_id,
+                        &completed,
+                        reasoning,
+                    )
+                })
+        };
+        let Some(emission) = emission else {
+            return false;
+        };
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, emission.opened);
+        if !emission.delta.is_empty() {
+            if reasoning {
+                let mut state = self.state.lock().await;
+                if thread_id == state.thread_id {
+                    let turn_id = turn_id.unwrap_or_else(|| "turn".to_owned());
+                    let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
+                    estimate.reasoning_bytes = estimate
+                        .reasoning_bytes
+                        .saturating_add(emission.delta.len() as u64);
+                }
+                drop(state);
+                emitter.stream_reasoning_delta_with_id(emission.message_id, &emission.delta);
+            } else {
+                emitter.stream_delta_with_id(emission.message_id, &emission.delta);
+            }
+        }
+        true
+    }
+
+    async fn finish_strict_typed_tool(
+        &self,
+        params: &Value,
+    ) -> Option<(bool, Option<BufferedCodexToolRequest>)> {
+        let item = params.get("item")?;
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !is_codex_provider_tool_item_type(item_type) {
+            return None;
+        }
+        let thread_id = extract_notification_thread_id(params)?;
+        let item_id = item.get("id").and_then(Value::as_str);
+        let mut state = self.state.lock().await;
+        let splitter = state.response_splitters.get_mut(&thread_id)?;
+        splitter
+            .enabled
+            .then(|| splitter.finish_typed_tool(item_id))?
+    }
+
+    async fn complete_strict_raw_tool_output(&self, params: &Value) -> bool {
+        let Some(item) = params.get("item") else {
+            return false;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+            return false;
+        }
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let Some(call_id) = item
+            .get("call_id")
+            .or_else(|| item.get("callId"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let owner = {
+            let state = self.state.lock().await;
+            state
+                .response_splitters
+                .get(&thread_id)
+                .and_then(|splitter| splitter.raw_tool_owner(call_id))
+        };
+        let Some(owner) = owner else {
+            return false;
+        };
+        let Some((emitter, _)) = self.response_projection_target(&thread_id).await else {
+            return false;
+        };
+        if emitter.is_tool_detached(&owner.tool_call_id)
+            || !emitter.has_pending_tool_request(&owner.tool_call_id)
+        {
+            return true;
+        }
+        if let Some(session_id) = codex_yielded_session_id(params) {
+            let message = format!(
+                "Codex yielded session '{session_id}' without a uniquely correlated command execution"
+            );
+            if !emitter.fail_pending_tool(&owner.tool_call_id, &message) {
+                emitter.backend_error(&message);
+            }
+            let turn_id = extract_turn_id(params);
+            let mut state = self.state.lock().await;
+            state
+                .unowned_command_executions
+                .retain(|(owner_thread_id, _), command| {
+                    owner_thread_id != &thread_id
+                        || command.process_id != session_id
+                        || turn_id
+                            .as_ref()
+                            .is_some_and(|turn_id| command.turn_id != *turn_id)
+                });
+            state
+                .outstanding_command_executions
+                .retain(|(owner_thread_id, _), command| {
+                    owner_thread_id != &thread_id
+                        || command.tool_call_id != owner.tool_call_id
+                        || command.process_id.as_deref() != Some(session_id.as_str())
+                });
+            if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+                splitter.remove_raw_tool_owner(call_id);
+            }
+            return true;
+        }
+        let output = raw_custom_tool_output_text(item);
+        let success = !output.starts_with("Script failed");
+        let error = (!success).then(|| output.clone());
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: &owner.tool_call_id,
+            tool_name: &owner.tool_name,
+            tool_result: if success {
+                json!({ "kind": "Other", "result": output })
+            } else {
+                json!({
+                    "kind": "Error",
+                    "short_message": format!("{} failed", owner.tool_name),
+                    "detailed_message": output,
+                })
+            },
+            success,
+            error: error.as_deref(),
+        });
+        if let Some(splitter) = self
+            .state
+            .lock()
+            .await
+            .response_splitters
+            .get_mut(&thread_id)
+        {
+            splitter.remove_raw_tool_owner(call_id);
+        }
+        true
+    }
+
+    async fn handle_strict_execution_only_tool_completed(
+        self: &Arc<Self>,
+        params: &Value,
+        owner: Option<BufferedCodexToolRequest>,
+    ) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let provider_item_id = item.get("id").and_then(Value::as_str).unwrap_or("item");
+        match item_type {
+            "commandExecution" => {
+                if thread_id == self.state.lock().await.thread_id {
+                    self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
+                        .await;
+                }
+                let background_command =
+                    self.take_background_command(params, provider_item_id).await;
+                self.forget_command_execution(params, provider_item_id)
+                    .await;
+                let Some(command) = background_command else {
+                    return;
+                };
+                let tool_call_id = owner
+                    .as_ref()
+                    .map(|owner| owner.tool_call_id.clone())
+                    .unwrap_or_else(|| command.tool_call_id.clone());
+                let tool_name = owner
+                    .as_ref()
+                    .map(|owner| owner.tool_name.clone())
+                    .unwrap_or_else(|| command.tool_name.clone());
+                let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
+                    return;
+                };
+                let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                let output = item
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let success = exit_code == 0;
+                emitter.tool_completed(ToolCompletedPayload {
+                    tool_call_id: &tool_call_id,
+                    tool_name: &tool_name,
+                    tool_result: json!({
+                        "kind": "RunCommand",
+                        "exit_code": exit_code,
+                        "stdout": output.clone(),
+                        "stderr": ""
+                    }),
+                    success,
+                    error: (!success)
+                        .then(|| format!("Command failed with exit code {exit_code}"))
+                        .as_deref(),
+                });
+                emitter.tool_progress(&command.progress(
+                    if success {
+                        BackgroundTaskStatus::Completed
+                    } else {
+                        BackgroundTaskStatus::Failed
+                    },
+                    Some(exit_code as i64),
+                ));
+                if thread_id == self.state.lock().await.thread_id {
+                    self.enqueue_background_wake(command, exit_code, output)
+                        .await;
+                } else {
+                    let pending_spawn_terminal = {
+                        let mut state = self.state.lock().await;
+                        if !success && let Some(stream) = state.subagent_streams.get_mut(&thread_id)
+                        {
+                            stream.background_work_failed = true;
+                            if stream.pending_spawn_terminal_status.is_some() {
+                                stream.pending_spawn_terminal_status = Some("failed".to_owned());
+                            }
+                        }
+                        let still_running = state
+                            .background_commands
+                            .keys()
+                            .chain(state.outstanding_command_executions.keys())
+                            .any(|(owner_thread_id, _)| owner_thread_id == &thread_id);
+                        (!still_running)
+                            .then(|| {
+                                state
+                                    .subagent_streams
+                                    .get_mut(&thread_id)
+                                    .and_then(|stream| stream.pending_spawn_terminal_status.take())
+                            })
+                            .flatten()
+                    };
+                    if let Some(status) = pending_spawn_terminal {
+                        self.terminalize_codex_subagent_spawn(&thread_id, &status)
+                            .await;
+                    }
+                }
+                if let Some(splitter) = self
+                    .state
+                    .lock()
+                    .await
+                    .response_splitters
+                    .get_mut(&thread_id)
+                {
+                    splitter.remove_raw_tool_owner_by_tool_call_id(&tool_call_id);
+                }
+            }
+            "imageGeneration" => {
+                let Ok(image) = parse_codex_generated_image(item) else {
+                    return;
+                };
+                let mut state = self.state.lock().await;
+                if thread_id == state.thread_id {
+                    state.tool_container_images.push(image);
+                } else if let Some(stream) = state.subagent_streams.get_mut(&thread_id) {
+                    stream.tool_container_images.push(image);
+                }
+            }
+            "collabToolCall" | "collabAgentToolCall" => {
+                if thread_id == self.state.lock().await.thread_id {
+                    self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
+                        .await;
+                }
+                self.record_codex_subagent_spawn_metadata_if_needed(
+                    owner.as_ref().map(|owner| owner.tool_call_id.as_str()),
+                    Some(params),
+                    item,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn observe_strict_raw_response_item(&self, params: &Value) {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+            return;
+        };
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let turn_id = extract_turn_id(params);
+        let opened = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .and_then(|splitter| splitter.observe_raw_item(turn_id.as_deref(), item))
+                .and_then(|(opened, _)| opened)
+        };
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, opened);
+    }
+
+    async fn buffer_strict_tool_request(
+        &self,
+        thread_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> bool {
+        let Some((emitter, model)) = self.response_projection_target(thread_id).await else {
+            return false;
+        };
+        let turn_id = {
+            let state = self.state.lock().await;
+            if thread_id == state.thread_id {
+                state.active_turn_id.clone()
+            } else {
+                state
+                    .subagent_streams
+                    .get(thread_id)
+                    .and_then(|stream| stream.active_turn_id.clone())
+            }
+        };
+        let buffered = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(thread_id)
+                .and_then(|splitter| {
+                    splitter.buffer_tool_request(
+                        turn_id.as_deref(),
+                        tool_call_id,
+                        tool_name,
+                        tool_type,
+                    )
+                })
+        };
+        let Some((opened, _)) = buffered else {
+            tracing::error!(
+                thread_id,
+                tool_call_id,
+                tool_name,
+                "Codex tool request arrived without provider response evidence"
+            );
+            emitter
+                .backend_error("Codex tool request arrived without a declared provider response");
+            return true;
+        };
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, opened);
+        true
+    }
+
+    async fn prepare_strict_response_bookkeeping(
+        &self,
+        thread_id: &str,
+        finalized: &FinalizedCodexProviderResponse,
+        model: &str,
+    ) -> Vec<ImageData> {
+        let mut state = self.state.lock().await;
+        if thread_id == state.thread_id {
+            if !finalized.failed
+                && finalized.tool_requests.is_empty()
+                && contains_non_whitespace(&finalized.content)
+            {
+                state.foreground_response_completed = true;
+            }
+            state.close_active_stream_when_tools_idle = false;
+            if contains_non_whitespace(&finalized.content) {
+                state.conversation_bytes_total = state
+                    .conversation_bytes_total
+                    .saturating_add(finalized.content.len() as u64);
+            }
+            let turn_context = state
+                .turn_context_by_turn
+                .get(&finalized.turn_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(metadata) = metadata_target_for_visible_message(
+                finalized.turn_id.clone(),
+                finalized.message_id.clone(),
+                &finalized.content,
+                finalized.reasoning.as_deref(),
+                model.to_owned(),
+                turn_context,
+            ) {
+                state.pending_message_metadata = Some(metadata);
+            }
+            return if finalized.failed {
+                Vec::new()
+            } else {
+                std::mem::take(&mut state.tool_container_images)
+            };
+        }
+        let Some(stream) = state.subagent_streams.get_mut(thread_id) else {
+            return Vec::new();
+        };
+        if let Some(metadata) = metadata_target_for_visible_message(
+            finalized.turn_id.clone(),
+            finalized.message_id.clone(),
+            &finalized.content,
+            finalized.reasoning.as_deref(),
+            model.to_owned(),
+            TurnContextEstimate::default(),
+        ) {
+            stream.pending_message_metadata = Some(metadata);
+        }
+        if finalized.failed {
+            Vec::new()
+        } else {
+            let mut images = std::mem::take(&mut stream.current_images);
+            images.append(&mut stream.tool_container_images);
+            images
+        }
+    }
+
+    async fn finalize_strict_response(&self, params: &Value, failed: bool) -> bool {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+            return false;
+        };
+        let response_id = params
+            .get("responseId")
+            .or_else(|| params.get("response_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let usage = params.get("usage").and_then(|usage| {
+            normalize_token_usage_with_envelope(usage, Some(params), Some(&model))
+        });
+        let turn_id = extract_turn_id(params);
+        let finalized = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .and_then(|splitter| {
+                    splitter.finalize(turn_id.as_deref(), response_id, usage, failed)
+                })
+        };
+        let Some(finalized) = finalized else {
+            return false;
+        };
+        let images = self
+            .prepare_strict_response_bookkeeping(&thread_id, &finalized, &model)
+            .await;
+        Self::emit_response_start_if_needed(emitter.as_ref(), &model, finalized.opened.clone());
+        let tool_calls = finalized
+            .tool_requests
+            .iter()
+            .map(|request| {
+                json!({
+                    "id": request.tool_call_id,
+                    "name": request.tool_name,
+                    "arguments": request.tool_type,
+                })
+            })
+            .collect();
+        emitter.stream_end_with_id(
+            finalized.message_id.clone(),
+            StreamEndPayload {
+                content: finalized.content,
+                model: Some(model.clone()),
+                request_usage: finalized.usage.clone(),
+                reasoning: finalized.reasoning,
+                tool_calls,
+                token_usage_unavailable_reason: finalized
+                    .usage
+                    .is_none()
+                    .then_some(TokenUsageUnavailableReason::BackendDidNotReport),
+                images,
+                ..StreamEndPayload::default()
+            },
+        );
+        for request in &finalized.tool_requests {
+            emitter.tool_request_for_declared_response(
+                &request.tool_call_id,
+                &request.tool_name,
+                request.tool_type.clone(),
+            );
+            if finalized.failed {
+                emitter.fail_pending_tool(
+                    &request.tool_call_id,
+                    "Codex provider response ended before the tool completed",
+                );
+            }
+        }
+        for request in finalized.evicted_tool_requests {
+            if !emitter.fail_pending_tool(
+                &request.tool_call_id,
+                "Codex discarded an expired tool owner before completion",
+            ) {
+                emitter.backend_error(&format!(
+                    "Codex lost the owner for pending tool '{}'",
+                    request.tool_call_id
+                ));
+            }
+        }
+        tracing::info!(
+            thread_id,
+            turn_id = finalized.turn_id,
+            message_id = finalized.message_id.0,
+            response_id = ?finalized.response_id,
+            failed = finalized.failed,
+            "Finalized Codex provider response boundary"
+        );
+        true
+    }
+
+    async fn finalize_incomplete_strict_response(&self, params: &Value, reason: &str) -> bool {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+        let target = self.response_projection_target(&thread_id).await;
+        if !self.finalize_strict_response(params, true).await {
+            return false;
+        }
+        if let Some((emitter, _)) = target {
+            emitter.backend_error(reason);
+        }
+        true
+    }
+
+    async fn finalize_all_incomplete_strict_responses(&self, reason: &str) {
+        let open_responses = {
+            let state = self.state.lock().await;
+            state
+                .response_splitters
+                .iter()
+                .filter_map(|(thread_id, splitter)| {
+                    splitter
+                        .open
+                        .as_ref()
+                        .map(|response| (thread_id.clone(), response.turn_id.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (thread_id, turn_id) in open_responses {
+            self.finalize_incomplete_strict_response(
+                &json!({ "threadId": thread_id, "turnId": turn_id }),
+                reason,
+            )
+            .await;
         }
     }
 
@@ -6910,7 +10091,30 @@ impl CodexInner {
         }
         self.trace_agent_message_identity_event(method, params)
             .await;
+        if method == "rawResponse/completed" {
+            self.finalize_strict_response(params, false).await;
+            return;
+        }
         if method == "rawResponseItem/completed" {
+            self.observe_strict_raw_response_item(params).await;
+            let unlinked_resolution = if codex_yielded_session_id(params).is_some() {
+                self.correlate_yielded_command_owner(params).await;
+                self.promote_yielded_command(params).await;
+                CodexUnlinkedRawToolResolution::OrdinaryCompletion
+            } else {
+                let resolution = self.resolve_unlinked_raw_tool_output(params).await;
+                if let CodexUnlinkedRawToolResolution::Correlated(process_id) = &resolution {
+                    self.promote_command(params, process_id).await;
+                }
+                resolution
+            };
+            let strict_raw_completion = match unlinked_resolution {
+                CodexUnlinkedRawToolResolution::Failed => true,
+                CodexUnlinkedRawToolResolution::OrdinaryCompletion
+                | CodexUnlinkedRawToolResolution::Correlated(_) => {
+                    self.complete_strict_raw_tool_output(params).await
+                }
+            };
             if matches!(
                 params
                     .get("item")
@@ -6921,9 +10125,29 @@ impl CodexInner {
                 tracing::debug!(?params, "Codex raw custom tool completion");
                 eprintln!("TYDE CODEX RAW CUSTOM TOOL {params}");
             }
-            self.handle_raw_modify_completion(params).await;
-            self.promote_yielded_root_command(params).await;
+            if !strict_raw_completion {
+                self.handle_raw_modify_completion(params).await;
+            }
             return;
+        }
+        if self.handle_strict_response_delta(method, params).await {
+            return;
+        }
+        if method == "error"
+            && params
+                .get("willRetry")
+                .or_else(|| params.get("will_retry"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            self.finalize_strict_response(params, true).await;
+        }
+        if method == "turn/completed" {
+            self.finalize_incomplete_strict_response(
+                params,
+                "Codex turn ended before rawResponse/completed",
+            )
+            .await;
         }
         if matches!(method, "subAgentActivity" | "sub_agent_activity") {
             let mut item = params
@@ -8094,11 +11318,21 @@ impl CodexInner {
                     .pointer("/item/type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                let (strict_response, provider_tool) =
+                    self.observe_strict_response_item_started(params).await;
                 let provider_kind = match item_type {
                     "agentMessage" => Some(CodexProviderItemKind::AgentMessage),
                     "reasoning" => Some(CodexProviderItemKind::Reasoning),
                     _ => None,
                 };
+                if strict_response && provider_kind.is_some() {
+                    return;
+                }
+                if strict_response && is_codex_provider_tool_item_type(item_type) && !provider_tool
+                {
+                    self.handle_strict_execution_only_tool_started(params).await;
+                    return;
+                }
                 if let Some(provider_kind) = provider_kind {
                     let provider_message_id = params
                         .pointer("/item/id")
@@ -8218,7 +11452,7 @@ impl CodexInner {
                     }
                 };
                 let (container, tool_call_ids) = self
-                    .handle_subagent_item_started(params, emitter.as_ref())
+                    .handle_subagent_item_started(params, stream_key, emitter.as_ref())
                     .await;
                 if container.is_some() || !tool_call_ids.is_empty() {
                     let ownership_violation = {
@@ -8268,6 +11502,16 @@ impl CodexInner {
                 }
             }
             "item/completed" => {
+                if let Some((provider_owned, owner)) = self.finish_strict_typed_tool(params).await
+                    && !provider_owned
+                {
+                    self.handle_strict_execution_only_tool_completed(params, owner)
+                        .await;
+                    return;
+                }
+                if self.handle_strict_response_item_completed(params).await {
+                    return;
+                }
                 self.handle_subagent_item_completed(params, stream_key, model)
                     .await;
             }
@@ -8727,6 +11971,7 @@ impl CodexInner {
     async fn handle_subagent_item_started(
         self: &Arc<Self>,
         params: &Value,
+        stream_key: &str,
         emitter: &TurnEmitter,
     ) -> (Option<ChatMessageId>, Vec<String>) {
         let Some(item) = params.get("item") else {
@@ -8763,12 +12008,16 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .filter(|prompt| !prompt.trim().is_empty())
                     .map(str::to_owned);
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    "generate_image",
-                    serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
-                        .expect("serialize Codex image generation request"),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        "generate_image",
+                        serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
+                            .expect("serialize Codex image generation request"),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             "webSearch" => {
@@ -8777,12 +12026,16 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    "web_search",
-                    serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
-                        .expect("serialize Codex web search request"),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        "web_search",
+                        serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
+                            .expect("serialize Codex web search request"),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             "imageView" => {
@@ -8791,22 +12044,30 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    "view_image",
-                    serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
-                        .expect("serialize Codex image view request"),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        "view_image",
+                        serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
+                            .expect("serialize Codex image view request"),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             "sleep" => {
                 let duration_ms = item.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    "sleep",
-                    serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
-                        .expect("serialize Codex sleep request"),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        "sleep",
+                        serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
+                            .expect("serialize Codex sleep request"),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             "commandExecution" => {
@@ -8820,15 +12081,19 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    "run_command",
-                    json!({
-                        "kind": "RunCommand",
-                        "command": command,
-                        "working_directory": cwd
-                    }),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        "run_command",
+                        json!({
+                            "kind": "RunCommand",
+                            "command": command,
+                            "working_directory": cwd
+                        }),
+                    )
+                    .await;
                 // Children background processes exactly like the root thread,
                 // and the poll is keyed by thread id, so the same tracking
                 // gives the child's own tray its rows.
@@ -8838,6 +12103,7 @@ impl CodexInner {
                         .and_then(Value::as_str)
                         .unwrap_or("tool-call"),
                     &item_id,
+                    "run_command",
                     item,
                 )
                 .await;
@@ -8853,14 +12119,21 @@ impl CodexInner {
                 let mut call_ids = Vec::with_capacity(total);
                 for (idx, change) in file_changes.iter().enumerate() {
                     let call_id = codex_file_change_call_id(&item_id, idx, total);
-                    container = emit_modify_file_request_to(
-                        emitter,
-                        &call_id,
-                        &change.path,
-                        &change.before,
-                        &change.after,
-                    )
-                    .or(container);
+                    container = self
+                        .emit_subagent_tool_request(
+                            stream_key,
+                            emitter,
+                            &call_id,
+                            "modify_file",
+                            json!({
+                                "kind": "ModifyFile",
+                                "file_path": change.path,
+                                "before": change.before,
+                                "after": change.after,
+                            }),
+                        )
+                        .await
+                        .or(container);
                     call_ids.push(call_id);
                 }
                 (container, call_ids)
@@ -8871,11 +12144,15 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    &tool_name,
-                    codex_public_tool_request_type(&tool_name, item),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        &tool_name,
+                        codex_public_tool_request_type(&tool_name, item),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             "mcpToolCall" | "dynamicToolCall" => {
@@ -8884,17 +12161,39 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
-                let container = emitter.tool_request_in_container(
-                    &item_id,
-                    &tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": codex_generic_tool_arguments(item)
-                    }),
-                );
+                let container = self
+                    .emit_subagent_tool_request(
+                        stream_key,
+                        emitter,
+                        &item_id,
+                        &tool_name,
+                        json!({
+                            "kind": "Other",
+                            "args": codex_generic_tool_arguments(item)
+                        }),
+                    )
+                    .await;
                 (container, vec![item_id])
             }
             _ => (None, Vec::new()),
+        }
+    }
+
+    async fn emit_subagent_tool_request(
+        &self,
+        stream_key: &str,
+        emitter: &TurnEmitter,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> Option<ChatMessageId> {
+        if self
+            .buffer_strict_tool_request(stream_key, tool_call_id, tool_name, tool_type.clone())
+            .await
+        {
+            None
+        } else {
+            emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
         }
     }
 
@@ -10674,6 +13973,15 @@ impl CodexInner {
         let notification_thread_id = extract_notification_thread_id(params);
         let notification_turn_id = extract_turn_id(params);
         self.state.lock().await.foreground_response_completed = false;
+        let (strict_response, provider_tool) =
+            self.observe_strict_response_item_started(params).await;
+        if strict_response && matches!(item_type, "agentMessage" | "reasoning") {
+            return;
+        }
+        if strict_response && is_codex_provider_tool_item_type(item_type) && !provider_tool {
+            self.handle_strict_execution_only_tool_started(params).await;
+            return;
+        }
 
         match item_type {
             "agentMessage" => {
@@ -10902,8 +14210,14 @@ impl CodexInner {
                     }),
                 )
                 .await;
-                self.track_command_execution(params, provider_item_id, &item_id, item)
-                    .await;
+                self.track_command_execution(
+                    params,
+                    provider_item_id,
+                    &item_id,
+                    "run_command",
+                    item,
+                )
+                .await;
             }
             "fileChange" => {
                 let item_id = self
@@ -10950,18 +14264,21 @@ impl CodexInner {
                     .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
-                let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
+                self.emit_tool_request(
+                    &item_id,
+                    &tool_name,
+                    codex_public_tool_request_type(&tool_name, item),
+                )
+                .await;
                 if is_tyde_agent_control_spawn_tool_name(&tool_name)
                     || is_tyde_agent_control_await_tool_name(&tool_name)
                 {
                     tracing::info!(
                         tool_call_id = item_id,
                         tool_name,
-                        container_id = ?container,
                         "Emitted Codex Tyde agent-control request"
                     );
                 }
-                self.record_tool_container(container).await;
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
                 self.record_codex_subagent_spawn_metadata_if_needed(
@@ -10985,18 +14302,21 @@ impl CodexInner {
                     .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
-                let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
+                self.emit_tool_request(
+                    &item_id,
+                    &tool_name,
+                    codex_public_tool_request_type(&tool_name, item),
+                )
+                .await;
                 if is_tyde_agent_control_spawn_tool_name(&tool_name)
                     || is_tyde_agent_control_await_tool_name(&tool_name)
                 {
                     tracing::info!(
                         tool_call_id = item_id,
                         tool_name,
-                        container_id = ?container,
                         "Emitted Codex Tyde agent-control request"
                     );
                 }
-                self.record_tool_container(container).await;
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
             }
@@ -11011,6 +14331,16 @@ impl CodexInner {
 
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         let item_id = item.get("id").and_then(Value::as_str);
+        if let Some((provider_owned, owner)) = self.finish_strict_typed_tool(params).await
+            && !provider_owned
+        {
+            self.handle_strict_execution_only_tool_completed(params, owner)
+                .await;
+            return;
+        }
+        if self.handle_strict_response_item_completed(params).await {
+            return;
+        }
 
         match item_type {
             "agentMessage" => {
@@ -11869,6 +15199,14 @@ impl CodexInner {
                     sender_thread_id = sender_thread_id.as_str(),
                     "Registered authoritative Codex child thread"
                 );
+                let strict_response_splitting = state
+                    .response_splitters
+                    .get(&state.thread_id)
+                    .is_some_and(|splitter| splitter.enabled);
+                state.response_splitters.insert(
+                    thread_id.clone(),
+                    CodexResponseSplitter::new(&thread_id, strict_response_splitting),
+                );
                 state.subagent_streams.insert(
                     thread_id.clone(),
                     CodexSubAgentStream {
@@ -12481,6 +15819,9 @@ impl CodexInner {
         if !is_codex_native_wait_tool(tool_name) {
             return;
         }
+        if !self.emitter.has_pending_tool_request(tool_call_id) {
+            return;
+        }
 
         let mut thread_ids = codex_native_wait_thread_ids(arguments);
         let agents = {
@@ -12534,6 +15875,13 @@ impl CodexInner {
     }
 
     async fn emit_tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
+        let thread_id = self.state.lock().await.thread_id.clone();
+        if self
+            .buffer_strict_tool_request(&thread_id, tool_call_id, tool_name, tool_type.clone())
+            .await
+        {
+            return;
+        }
         let container = self
             .emitter
             .tool_request_in_container(tool_call_id, tool_name, tool_type);
@@ -12574,25 +15922,6 @@ impl CodexInner {
         });
         self.emitter.user_message(content, image_payload);
     }
-}
-
-fn emit_modify_file_request_to(
-    emitter: &TurnEmitter,
-    tool_call_id: &str,
-    file_path: &str,
-    before: &str,
-    after: &str,
-) -> Option<ChatMessageId> {
-    emitter.tool_request_in_container(
-        tool_call_id,
-        "modify_file",
-        json!({
-            "kind": "ModifyFile",
-            "file_path": file_path,
-            "before": before,
-            "after": after
-        }),
-    )
 }
 
 fn extract_notification_thread_id(params: &Value) -> Option<String> {
@@ -13310,6 +16639,47 @@ fn is_codex_response_side_notification(method: &str) -> bool {
         || method == "thread/tokenUsage/updated"
         || method == "model/rerouted"
         || method == "error"
+}
+
+fn is_codex_provider_tool_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "imageGeneration"
+            | "webSearch"
+            | "imageView"
+            | "sleep"
+            | "collabToolCall"
+            | "collabAgentToolCall"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+    )
+}
+
+fn is_codex_provider_output_item_type(item_type: &str) -> bool {
+    matches!(item_type, "agentMessage" | "reasoning") || is_codex_provider_tool_item_type(item_type)
+}
+
+fn is_raw_codex_provider_output_item(item: &Value) -> bool {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if item_type.ends_with("_output") || item_type.ends_with("Output") {
+        return false;
+    }
+    if item_type == "message" {
+        return item.get("role").and_then(Value::as_str) != Some("user");
+    }
+    matches!(
+        item_type,
+        "reasoning"
+            | "function_call"
+            | "custom_tool_call"
+            | "local_shell_call"
+            | "shell_call"
+            | "computer_call"
+            | "web_search_call"
+            | "image_generation_call"
+    )
 }
 
 fn is_terminal_codex_error_notification(state: &CodexState, params: &Value) -> bool {
@@ -14105,6 +17475,9 @@ fn codex_yielded_session_id(params: &Value) -> Option<String> {
 }
 
 fn raw_custom_tool_output_text(item: &Value) -> String {
+    if let Some(output) = item.get("output").and_then(Value::as_str) {
+        return output.to_owned();
+    }
     item.get("output")
         .and_then(Value::as_array)
         .into_iter()
@@ -14174,6 +17547,11 @@ fn take_codex_commands_for_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> Vec<CodexBackgroundCommand> {
+    state
+        .unowned_command_executions
+        .retain(|(owner_thread_id, _), command| {
+            owner_thread_id != thread_id || command.turn_id != turn_id
+        });
     let keys = state
         .outstanding_command_executions
         .iter()
@@ -14199,6 +17577,9 @@ fn take_codex_commands_for_thread(
     state: &mut CodexState,
     thread_id: &str,
 ) -> Vec<CodexCommandTermination> {
+    state
+        .unowned_command_executions
+        .retain(|(owner_thread_id, _), _| owner_thread_id != thread_id);
     let keys = state
         .outstanding_command_executions
         .keys()
@@ -14241,6 +17622,7 @@ fn take_all_codex_commands(state: &mut CodexState) -> Vec<CodexCommandTerminatio
         .chain(state.background_commands.keys())
         .map(|(thread_id, _)| thread_id.clone())
         .collect::<HashSet<_>>();
+    state.unowned_command_executions.clear();
     thread_ids
         .into_iter()
         .flat_map(|thread_id| take_codex_commands_for_thread(state, &thread_id))
@@ -14284,6 +17666,7 @@ fn reconcile_codex_background_terminals(
         };
         let command = CodexBackgroundCommand {
             tool_call_id: outstanding.tool_call_id.clone(),
+            tool_name: outstanding.tool_name.clone(),
             task_id: row.process_id.clone(),
             description: row.command.clone().or_else(|| outstanding.command.clone()),
             missing_polls: 0,
@@ -16277,14 +19660,51 @@ fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<Backen
     )))
 }
 
-fn emit_codex_tool_request(
-    emitter: &TurnEmitter,
-    tool_call_id: &str,
-    tool_name: &str,
-    arguments: &Value,
-) -> Option<ChatMessageId> {
-    let tool_type = codex_public_tool_request_type(tool_name, arguments);
-    emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
+fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexToolRequest> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if item_type.ends_with("_output") || item_type.ends_with("Output") {
+        return None;
+    }
+    let provider_call_id = item
+        .get("call_id")
+        .or_else(|| item.get("callId"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.trim().is_empty())
+        .map(str::to_owned);
+    let tool_call_id = provider_call_id
+        .clone()
+        .unwrap_or_else(|| item_id.to_owned());
+    let tool_name = item
+        .get("name")
+        .or_else(|| item.get("tool"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            matches!(item_type, "local_shell_call" | "shell_call").then(|| "run_command".to_owned())
+        })?;
+    let arguments = item
+        .get("arguments")
+        .or_else(|| item.get("input"))
+        .or_else(|| item.get("action"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let arguments = arguments
+        .as_str()
+        .and_then(|arguments| serde_json::from_str(arguments).ok())
+        .unwrap_or(arguments);
+    Some(BufferedCodexToolRequest {
+        turn_id: None,
+        provider_item_id: Some(item_id.to_owned()),
+        provider_call_id,
+        raw_completes_tool: item_type == "custom_tool_call",
+        tool_call_id,
+        tool_name,
+        tool_type: json!({
+            "kind": "Other",
+            "args": arguments,
+        }),
+    })
 }
 
 fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {

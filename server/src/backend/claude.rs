@@ -4390,7 +4390,7 @@ impl ClaudeInner {
                     self.emit_replay_message(message);
                 }
                 ClaudeHistoryReplayItem::ToolRequest(tool_call) => {
-                    self.emit_tool_request(&tool_call);
+                    self.emit_replay_tool_request(&tool_call);
                 }
                 ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => {
                     self.emit_tool_execution_completed(
@@ -4476,7 +4476,19 @@ impl ClaudeInner {
         Ok(())
     }
 
-    fn emit_tool_request(&self, tool_call: &ClaudeToolCall) {
+    fn emit_tool_request(&self, tool_call: &ClaudeToolCall) -> bool {
+        self.emit_tool_request_with_ownership(tool_call, true)
+    }
+
+    fn emit_replay_tool_request(&self, tool_call: &ClaudeToolCall) {
+        let _ = self.emit_tool_request_with_ownership(tool_call, false);
+    }
+
+    fn emit_tool_request_with_ownership(
+        &self,
+        tool_call: &ClaudeToolCall,
+        require_declared_response: bool,
+    ) -> bool {
         let task_update = self
             .task_tracker
             .lock()
@@ -4485,11 +4497,21 @@ impl ClaudeInner {
         if let Some(tasks) = task_update {
             self.emitter.task_update(&tasks);
         }
-        self.emitter.tool_request(
-            &tool_call.id,
-            &tool_call.name,
-            claude_tool_request_type(&tool_call.name, &tool_call.arguments),
-        );
+        let tool_type = claude_tool_request_type(&tool_call.name, &tool_call.arguments);
+        let emitted = if require_declared_response {
+            self.emitter.tool_request_for_declared_response(
+                &tool_call.id,
+                &tool_call.name,
+                tool_type,
+            )
+        } else {
+            self.emitter
+                .tool_request(&tool_call.id, &tool_call.name, tool_type);
+            self.emitter.has_pending_tool_request(&tool_call.id)
+        };
+        if !emitted {
+            return false;
+        }
         if is_subagent_tool_name(&tool_call.name) {
             let inserted = self
                 .native_subagent_tasks
@@ -4515,6 +4537,7 @@ impl ClaudeInner {
             );
         }
         self.adopt_background_task_awaiting_tool_request(&tool_call.id);
+        true
     }
 
     /// Claim a background task whose `task_started` frame arrived before Tyde
@@ -4613,7 +4636,7 @@ impl ClaudeInner {
             error: error.as_deref(),
         };
         let pending_before_completion = self.emitter.has_pending_tool_request(tool_call_id);
-        let emitted_message_id = self.emitter.tool_completed(completed);
+        let emitted_message_id = emit_tool_completion_for_known_request(&self.emitter, completed);
         tracing::info!(
             tool_call_id,
             tool_name,
@@ -6404,7 +6427,7 @@ fn ensure_ask_user_question_tool_request_emitted(
             })],
             None,
         );
-        inner.emit_tool_request(&tool_call);
+        let _ = inner.emit_tool_request(&tool_call);
     }
 
     tool_call
@@ -6486,7 +6509,7 @@ fn ensure_exit_plan_mode_tool_request_emitted(
             })],
             None,
         );
-        inner.emit_tool_request(&tool_call);
+        let _ = inner.emit_tool_request(&tool_call);
     }
 
     tool_call
@@ -7673,13 +7696,16 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
     if let Some(result) = entry.output.as_ref()
         && entry.state.status != BackgroundTaskStatus::Stopped
     {
-        emitter.tool_completed(ToolCompletedPayload {
-            tool_call_id: &entry.tool_use_id,
-            tool_name,
-            tool_result: result.as_tool_result(),
-            success: result.exit_code == 0,
-            error: (result.exit_code != 0).then_some("Background command exited non-zero"),
-        });
+        let _ = emit_tool_completion_for_known_request(
+            emitter,
+            ToolCompletedPayload {
+                tool_call_id: &entry.tool_use_id,
+                tool_name,
+                tool_result: result.as_tool_result(),
+                success: result.exit_code == 0,
+                error: (result.exit_code != 0).then_some("Background command exited non-zero"),
+            },
+        );
         return;
     }
     let (success, tool_result, error) = match entry.state.status {
@@ -7720,13 +7746,34 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
         }
         BackgroundTaskStatus::Running => return,
     };
-    emitter.tool_completed(ToolCompletedPayload {
-        tool_call_id: &entry.tool_use_id,
-        tool_name,
-        tool_result,
-        success,
-        error: error.as_deref(),
-    });
+    let _ = emit_tool_completion_for_known_request(
+        emitter,
+        ToolCompletedPayload {
+            tool_call_id: &entry.tool_use_id,
+            tool_name,
+            tool_result,
+            success,
+            error: error.as_deref(),
+        },
+    );
+}
+
+fn emit_tool_completion_for_known_request(
+    emitter: &TurnEmitter,
+    completed: ToolCompletedPayload<'_>,
+) -> Option<protocol::ChatMessageId> {
+    if !emitter.has_pending_tool_request(completed.tool_call_id) {
+        tracing::error!(
+            tool_call_id = completed.tool_call_id,
+            tool_name = completed.tool_name,
+            "Claude tool completion had no pending declared request"
+        );
+        emitter.backend_error(
+            "Claude emitted a tool completion without a pending declared provider-response request",
+        );
+        return None;
+    }
+    emitter.tool_completed(completed)
 }
 
 fn drain_background_task_entries(background_tasks: &mut HashMap<String, BackgroundTaskEntry>) {
@@ -8499,24 +8546,29 @@ fn finalize_ready_background_subagents(streams: &mut HashMap<String, SubAgentStr
         let parent_tool_name = stream.parent_tool_name.clone();
         finalize_subagent_stream(stream, SubAgentFinalOutcome { text, usage: None });
         if succeeded {
-            let _ = parent_emitter.tool_completed(ToolCompletedPayload {
-                tool_call_id: &parent_tool_use_id,
-                tool_name: &parent_tool_name,
-                tool_result: json!({
-                    "kind": "Other",
-                    "result": { "status": status },
-                }),
-                success: true,
-                error: None,
-            });
-        } else {
-            parent_emitter.fail_pending_tool(
-                &parent_tool_use_id,
-                &if status == "completed" {
-                    "Background agent reported a failed tool execution".to_string()
-                } else {
-                    format!("Background agent ended with status '{status}'")
+            let _ = emit_tool_completion_for_known_request(
+                &parent_emitter,
+                ToolCompletedPayload {
+                    tool_call_id: &parent_tool_use_id,
+                    tool_name: &parent_tool_name,
+                    tool_result: json!({
+                        "kind": "Other",
+                        "result": { "status": status },
+                    }),
+                    success: true,
+                    error: None,
                 },
+            );
+        } else if !parent_emitter.fail_pending_tool(
+            &parent_tool_use_id,
+            &if status == "completed" {
+                "Background agent reported a failed tool execution".to_string()
+            } else {
+                format!("Background agent ended with status '{status}'")
+            },
+        ) {
+            parent_emitter.backend_error(
+                "Claude emitted a tool completion without a pending declared provider-response request",
             );
         }
     }
@@ -9238,10 +9290,11 @@ fn emit_tool_request_with_tracking(
     inner: &ClaudeInner,
     tool_call: &ClaudeToolCall,
 ) {
-    inner.emit_tool_request(tool_call);
-    summary
-        .unresolved_tool_requests
-        .insert(tool_call.id.clone(), tool_call.name.clone());
+    if inner.emit_tool_request(tool_call) {
+        summary
+            .unresolved_tool_requests
+            .insert(tool_call.id.clone(), tool_call.name.clone());
+    }
 }
 
 fn auto_close_unresolved_tool_requests(
@@ -13874,5 +13927,43 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
     let mut ready_tx = ready_tx.lock().await;
     if let Some(tx) = ready_tx.take() {
         let _ = tx.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_without_pending_request_is_refused() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName(CLAUDE_AGENT_NAME));
+
+        assert!(
+            emit_tool_completion_for_known_request(
+                &emitter,
+                ToolCompletedPayload {
+                    tool_call_id: "toolu_unknown",
+                    tool_name: "Read",
+                    tool_result: json!({ "kind": "Other", "result": "unexpected" }),
+                    success: true,
+                    error: None,
+                },
+            )
+            .is_none()
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("Error"));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("StreamStart" | "MessageAdded" | "ToolRequest" | "ToolExecutionCompleted")
+            )
+        }));
     }
 }
