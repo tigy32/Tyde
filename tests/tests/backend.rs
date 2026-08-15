@@ -13003,6 +13003,23 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
     const TOOL_OUTPUT: &str = "BUG001_TOOL_OUTPUT";
 
     let mut fixture = RealBackendFixture::new(backend_kind).await;
+    fixture
+        .client
+        .inner
+        .mcp_server_upsert(protocol::McpServerUpsertPayload {
+            mcp_server: protocol::McpServerConfig {
+                id: protocol::McpServerId("bug001-failed-startup".to_owned()),
+                name: "bug001-failed-startup".to_owned(),
+                supports_parallel_tool_calls: false,
+                transport: protocol::McpTransportConfig::Stdio {
+                    command: "/definitely/missing/bug001-mcp-server".to_owned(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+            },
+        })
+        .await
+        .expect("install BUG-001 failed startup MCP server");
     let prompt = match backend_kind {
         BackendKind::Claude => {
             "Use Bash exactly once in the foreground to run `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
