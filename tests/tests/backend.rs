@@ -12998,6 +12998,259 @@ async fn assert_backend_emits_tool_events_for_file_copy(
     // This test's contract is the tool lifecycle and file-copy result above.
 }
 
+async fn assert_tool_response_ownership(backend_kind: BackendKind) {
+    const FINAL_MARKER: &str = "BUG001_TOOL_RESPONSE_DONE";
+    const TOOL_OUTPUT: &str = "BUG001_TOOL_OUTPUT";
+
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    let prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use Bash exactly once in the foreground to run `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
+        }
+        BackendKind::Codex => {
+            "Call exec_command exactly once with cmd `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
+        }
+        BackendKind::Acp => {
+            "Use command execution exactly once in the foreground to run `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
+        }
+        BackendKind::Hermes => {
+            "Use terminal exactly once in the foreground to run `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
+        }
+        BackendKind::Tycode => {
+            "Use command execution exactly once in the foreground to run `printf BUG001_TOOL_OUTPUT`. Do not use another tool. After the tool succeeds, continue with a new response that says exactly BUG001_TOOL_RESPONSE_DONE."
+        }
+        BackendKind::Antigravity => {
+            unreachable!("Antigravity is not in ALL_SUPPORTED_REAL_BACKENDS")
+        }
+    };
+    let workspace_roots = fixture.workspace_roots();
+    let stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "bug001-tool-response-ownership",
+        prompt,
+    )
+    .await;
+
+    let mut saw_user_echo = false;
+    let mut active_stream_id = None::<String>;
+    let mut message_ids = Vec::<(usize, &'static str, String)>::new();
+    let mut declarations = HashMap::<String, Vec<(usize, String)>>::new();
+    let mut requests = Vec::<(usize, ToolRequest)>::new();
+    let mut completions = HashMap::<String, (usize, ToolExecutionCompletedData)>::new();
+    let mut next_streams = Vec::<(usize, String)>::new();
+    let mut saw_terminal_response = false;
+    let mut saw_idle_after_terminal = false;
+    let mut event_index = 0usize;
+
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let envelope = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read BUG-001 ownership event")
+                .expect("BUG-001 ownership stream closed");
+            if envelope.stream != stream {
+                continue;
+            }
+            if envelope.kind == FrameKind::AgentError {
+                let error: protocol::AgentErrorPayload = envelope
+                    .parse_payload()
+                    .expect("parse BUG-001 AgentError");
+                panic!(
+                    "{backend_kind:?} BUG-001 successful turn emitted AgentError: {}",
+                    error.message
+                );
+            }
+            if envelope.kind != FrameKind::ChatEvent {
+                continue;
+            }
+            let event: ChatEvent = envelope
+                .parse_payload()
+                .expect("parse BUG-001 ChatEvent");
+            eprintln!("BUG001 EVENT backend={backend_kind:?} index={event_index} {event:?}");
+
+            match &event {
+                ChatEvent::MessageAdded(message) => {
+                    if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                        saw_user_echo = true;
+                    }
+                    if saw_user_echo && matches!(message.sender, MessageSender::Error) {
+                        panic!(
+                            "{backend_kind:?} BUG-001 successful turn emitted Error: {}",
+                            message.content
+                        );
+                    }
+                    if let Some(message_id) = &message.message_id {
+                        message_ids.push((event_index, "MessageAdded", message_id.0.clone()));
+                    }
+                }
+                ChatEvent::StreamStart(start) if saw_user_echo => {
+                    let message_id = start
+                        .required_message_id()
+                        .unwrap_or_else(|error| panic!("invalid BUG-001 StreamStart: {error:?}"))
+                        .0;
+                    assert!(
+                        active_stream_id.replace(message_id.clone()).is_none(),
+                        "{backend_kind:?} BUG-001 next assistant stream started while another stream was active"
+                    );
+                    if !completions.is_empty() {
+                        next_streams.push((event_index, message_id.clone()));
+                    }
+                    message_ids.push((event_index, "StreamStart", message_id));
+                }
+                ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta)
+                    if saw_user_echo =>
+                {
+                    let message_id = delta
+                        .required_message_id()
+                        .unwrap_or_else(|error| panic!("invalid BUG-001 stream delta: {error:?}"))
+                        .0;
+                    assert_eq!(
+                        active_stream_id.as_deref(),
+                        Some(message_id.as_str()),
+                        "{backend_kind:?} BUG-001 stream delta changed assistant identity"
+                    );
+                    message_ids.push((event_index, "StreamDelta", message_id));
+                }
+                ChatEvent::StreamEnd(end) if saw_user_echo => {
+                    let message_id = end
+                        .required_message_id()
+                        .unwrap_or_else(|error| panic!("invalid BUG-001 StreamEnd: {error:?}"))
+                        .0;
+                    assert_eq!(
+                        active_stream_id.take().as_deref(),
+                        Some(message_id.as_str()),
+                        "{backend_kind:?} BUG-001 StreamEnd did not close its own assistant stream"
+                    );
+                    message_ids.push((event_index, "StreamEnd", message_id.clone()));
+                    for tool_call in &end.message.tool_calls {
+                        declarations
+                            .entry(tool_call.id.clone())
+                            .or_default()
+                            .push((event_index, message_id.clone()));
+                    }
+                    if !completions.is_empty() && end.message.content.contains(FINAL_MARKER) {
+                        saw_terminal_response = true;
+                    }
+                }
+                ChatEvent::MessageMetadataUpdated(update) if saw_user_echo => {
+                    message_ids.push((
+                        event_index,
+                        "MessageMetadataUpdated",
+                        update.message_id.0.clone(),
+                    ));
+                }
+                ChatEvent::ToolRequest(request) if saw_user_echo => {
+                    requests.push((event_index, request.clone()));
+                }
+                ChatEvent::ToolExecutionCompleted(completion) if saw_user_echo => {
+                    assert!(
+                        completion.success,
+                        "{backend_kind:?} BUG-001 tool failed: {completion:?}"
+                    );
+                    if let ToolExecutionResult::RunCommand { stdout, .. } = &completion.tool_result {
+                        assert!(
+                            stdout.contains(TOOL_OUTPUT),
+                            "{backend_kind:?} BUG-001 command returned unexpected output: {completion:?}"
+                        );
+                    }
+                    assert!(
+                        completions
+                            .insert(completion.tool_call_id.clone(), (event_index, completion.clone()))
+                            .is_none(),
+                        "{backend_kind:?} BUG-001 tool completed more than once"
+                    );
+                }
+                ChatEvent::OperationCancelled(cancelled) if saw_user_echo => {
+                    panic!(
+                        "{backend_kind:?} BUG-001 successful turn emitted OperationCancelled: {}",
+                        cancelled.message
+                    );
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_terminal_response => {
+                    saw_idle_after_terminal = true;
+                }
+                _ => {}
+            }
+            event_index += 1;
+
+            if saw_idle_after_terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{backend_kind:?} BUG-001 tool turn did not complete: requests={requests:?} completions={completions:?} declarations={declarations:?} next_streams={next_streams:?}"
+        )
+    });
+
+    assert_eq!(
+        requests.len(),
+        1,
+        "{backend_kind:?} BUG-001 prompt must produce exactly one ToolRequest"
+    );
+    let (request_index, request) = &requests[0];
+    let owners = declarations.get(&request.tool_call_id).unwrap_or_else(|| {
+        panic!(
+            "{backend_kind:?} BUG-001 ToolRequest was not declared by any provider response: {request:?}"
+        )
+    });
+    assert_eq!(
+        owners.len(),
+        1,
+        "{backend_kind:?} BUG-001 ToolRequest was declared by multiple provider responses: {owners:?}"
+    );
+    let (owner_end_index, owner_message_id) = &owners[0];
+    assert_ne!(
+        owner_message_id, &request.tool_call_id,
+        "{backend_kind:?} BUG-001 provider response used its tool call id as its message id"
+    );
+    let (completion_index, _) = completions.get(&request.tool_call_id).unwrap_or_else(|| {
+        panic!(
+            "{backend_kind:?} BUG-001 ToolRequest had no matching successful completion: {request:?}"
+        )
+    });
+    assert!(
+        request_index < completion_index,
+        "{backend_kind:?} BUG-001 tool completed before its request"
+    );
+    assert!(
+        message_ids
+            .iter()
+            .all(|(_, _, message_id)| message_id != &request.tool_call_id),
+        "{backend_kind:?} BUG-001 emitted a message id equal to tool call id {}: {message_ids:?}",
+        request.tool_call_id
+    );
+    let (next_start_index, next_message_id) = next_streams
+        .iter()
+        .find(|(index, _)| index > completion_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "{backend_kind:?} BUG-001 tool completion was not followed by a clean assistant stream: {next_streams:?}"
+            )
+        });
+    assert!(next_start_index > completion_index);
+    assert!(
+        owner_end_index < next_start_index,
+        "{backend_kind:?} BUG-001 next provider response started before the tool owner declared its request"
+    );
+    assert_ne!(next_message_id, owner_message_id);
+    assert_ne!(next_message_id, &request.tool_call_id);
+    assert!(saw_terminal_response);
+    assert!(saw_idle_after_terminal);
+
+    fixture
+        .client
+        .close_agent(&stream)
+        .await
+        .expect("close BUG-001 ownership agent");
+}
+
 async fn assert_backend_interrupts_long_running_command(
     fixture: &mut RealBackendFixture,
     backend_kind: BackendKind,
@@ -44704,6 +44957,9 @@ async fn run_certification_case_for_backend(
             let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_emits_tool_events_for_file_copy(&mut fixture, backend_kind).await;
         }
+        CertificationCase::ToolResponseOwnership => {
+            assert_tool_response_ownership(backend_kind).await;
+        }
         CertificationCase::ToolFailureReported => {
             let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_reports_tool_failure(&mut fixture, backend_kind).await;
@@ -47522,6 +47778,7 @@ live_certification_tests! {
     real_cert_tool_request_emitted => ToolRequestEmitted,
     real_cert_tool_completion_emitted => ToolCompletionEmitted,
     real_cert_tool_call_ids_correlate => ToolCallIdsCorrelate,
+    real_cert_tool_response_ownership => ToolResponseOwnership,
     real_cert_tool_changes_workspace => ToolChangesWorkspace,
     real_cert_tool_failure_reported => ToolFailureReported,
     real_cert_tool_turn_reaches_idle => ToolTurnReachesIdle,
