@@ -1779,7 +1779,12 @@ fn validate_chat_event(
                     state.assistant_turn_open = true;
                     Ok(())
                 }
-                _ => {
+                crate::MessageSender::User => {
+                    state.assistant_turn_open = false;
+                    Ok(())
+                }
+                crate::MessageSender::System | crate::MessageSender::Warning => Ok(()),
+                crate::MessageSender::Error => {
                     state.assistant_turn_open = false;
                     Ok(())
                 }
@@ -2771,6 +2776,27 @@ mod tests {
         })
     }
 
+    fn warning_message_added(content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(ChatMessage {
+            sender: MessageSender::Warning,
+            ..user_message(content)
+        })
+    }
+
+    fn system_message_added(content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(ChatMessage {
+            sender: MessageSender::System,
+            ..user_message(content)
+        })
+    }
+
+    fn error_message_added(content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(ChatMessage {
+            sender: MessageSender::Error,
+            ..user_message(content)
+        })
+    }
+
     fn metadata_updated(message_id: &str) -> ChatEvent {
         ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
             message_id: ChatMessageId(message_id.to_owned()),
@@ -2816,6 +2842,42 @@ mod tests {
             error: None,
             normalization_failure: None,
         })
+    }
+
+    fn validator_after_mid_stream_message(message_event: ChatEvent) -> ProtocolValidator {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(2, &message_event))
+            .unwrap();
+        let mut message = assistant_message_with_id("msg-1", "");
+        message.tool_calls.push(crate::ToolUseData {
+            id: "call-1".to_owned(),
+            name: "run_command".to_owned(),
+            arguments: json!({}),
+            content_offset: None,
+        });
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamEnd(StreamEndData { message }),
+            ))
+            .unwrap();
+        validator
     }
 
     #[test]
@@ -3228,6 +3290,42 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
             .unwrap();
+    }
+
+    #[test]
+    fn warning_during_stream_does_not_close_assistant_turn() {
+        let mut validator =
+            validator_after_mid_stream_message(warning_message_added("optional MCP server failed"));
+        validator
+            .validate_envelope(&chat_envelope(4, &tool_request("call-1")))
+            .expect("a mid-stream warning must not orphan the response's tool request");
+        validator
+            .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
+            .unwrap();
+    }
+
+    #[test]
+    fn system_message_during_stream_does_not_close_assistant_turn() {
+        let mut validator =
+            validator_after_mid_stream_message(system_message_added("history notice"));
+
+        validator
+            .validate_envelope(&chat_envelope(4, &tool_request("call-1")))
+            .expect("a mid-stream system message must not orphan the response's tool request");
+        validator
+            .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
+            .unwrap();
+    }
+
+    #[test]
+    fn error_message_closes_assistant_turn() {
+        let mut validator =
+            validator_after_mid_stream_message(error_message_added("terminal provider failure"));
+
+        let violation = validator
+            .validate_envelope(&chat_envelope(4, &tool_request("call-1")))
+            .expect_err("a ToolRequest after Error must be rejected as orphaned");
+        assert!(violation.to_string().contains("before any assistant turn"));
     }
 
     #[test]
