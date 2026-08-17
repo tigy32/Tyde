@@ -18,8 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::{CodeIntelLanguageId, CodeIntelProviderId, HostExecutablePath};
+use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
 use serde_json::Value;
+use settings_model::HostExecutablePath;
 
 /// Result of discovering a language server's backing binary.
 ///

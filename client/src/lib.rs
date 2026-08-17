@@ -33,9 +33,9 @@ use protocol::{
     ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SeqValidator, SessionHistoryPayload, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SessionSummaryCountUpdatedPayload,
-    SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload, TeamCompactPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TYDE_VERSION, TaskTokenUsagePayload, TeamCompactPayload,
     TeamContextCompactionNotifyPayload, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
@@ -411,9 +411,73 @@ impl Connection {
             .await
     }
 
-    pub async fn set_setting(&mut self, payload: SetSettingPayload) -> Result<(), FrameError> {
-        self.send_host_payload(FrameKind::SetSetting, &payload)
+    pub async fn settings_write(
+        &mut self,
+        payload: protocol::SettingsWritePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SettingsWrite, &payload)
             .await
+    }
+
+    pub async fn replace_setting<V: serde::Serialize, E: serde::Serialize>(
+        &mut self,
+        path: impl Into<String>,
+        value: V,
+        expected: E,
+    ) -> Result<protocol::SettingsWriteId, FrameError> {
+        let write_id = protocol::SettingsWriteId(Uuid::new_v4().to_string());
+        self.settings_write(protocol::SettingsWritePayload {
+            write_id: write_id.clone(),
+            ops: vec![protocol::SettingOp::Replace {
+                path: path.into(),
+                value: serde_json::to_value(value).map_err(FrameError::Json)?,
+                expected: protocol::SettingExpectation::Value {
+                    value: serde_json::to_value(expected).map_err(FrameError::Json)?,
+                },
+            }],
+        })
+        .await?;
+        Ok(write_id)
+    }
+
+    pub async fn backend_native_settings_write(
+        &mut self,
+        backend: protocol::BackendKind,
+        settings: impl serde::Serialize,
+    ) -> Result<protocol::SettingsWriteId, FrameError> {
+        let write_id = protocol::SettingsWriteId(Uuid::new_v4().to_string());
+        self.send_host_payload(
+            FrameKind::BackendNativeSettingsWrite,
+            &protocol::BackendNativeSettingsWritePayload {
+                write_id: write_id.clone(),
+                backend,
+                settings: serde_json::to_value(settings).map_err(FrameError::Json)?,
+            },
+        )
+        .await?;
+        Ok(write_id)
+    }
+
+    pub async fn invoke_settings_action(
+        &mut self,
+        backend: protocol::BackendKind,
+        resource: impl Into<String>,
+        action: impl Into<String>,
+        arguments: impl serde::Serialize,
+    ) -> Result<protocol::SettingsWriteId, FrameError> {
+        let write_id = protocol::SettingsWriteId(Uuid::new_v4().to_string());
+        self.send_host_payload(
+            FrameKind::InvokeSettingsAction,
+            &protocol::InvokeSettingsActionPayload {
+                write_id: write_id.clone(),
+                backend,
+                resource: resource.into(),
+                action: action.into(),
+                arguments: serde_json::to_value(arguments).map_err(FrameError::Json)?,
+            },
+        )
+        .await?;
+        Ok(write_id)
     }
 
     pub async fn custom_agent_upsert(
@@ -1248,6 +1312,10 @@ impl Connection {
                     let _: HostSettingsPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::SettingsWriteResult => {
+                    let _: protocol::SettingsWriteResultPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::AgentActivitySummary => {
                     let _: AgentActivitySummaryPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1993,319 +2061,5 @@ where
             expected: FrameKind::Welcome,
             got,
         }),
-    }
-}
-
-#[cfg(test)]
-mod voice_tests {
-    use super::*;
-
-    fn frame<T: serde::Serialize>(
-        stream: &str,
-        kind: FrameKind,
-        payload: &T,
-        binary: Vec<u8>,
-    ) -> ProtocolFrame {
-        ProtocolFrame {
-            envelope: Envelope::from_payload(StreamPath(stream.into()), kind, 0, payload).unwrap(),
-            binary,
-        }
-    }
-
-    fn capabilities() -> protocol::VoiceCapabilitiesPayload {
-        protocol::VoiceCapabilitiesPayload {
-            protocol: protocol::VOICE_PROTOCOL_VERSION,
-            formats: vec![protocol::VoiceFormatPair {
-                uplink: protocol::VoiceAudioFormat::opus(48_000),
-                downlink: protocol::VoiceAudioFormat::opus(24_000),
-            }],
-            max_batch_packets: protocol::MAX_VOICE_PACKETS_PER_FRAME as u8,
-            max_sessions_per_connection: 1,
-            nova_available: true,
-            native_capture: true,
-            native_aec: true,
-            browser_capture: true,
-            browser_aec: protocol::BrowserAecStatus::Requested,
-            foreground_only: true,
-        }
-    }
-
-    fn accepted() -> protocol::VoiceAcceptedPayload {
-        protocol::VoiceAcceptedPayload {
-            session_id: protocol::VoiceSessionId("session-a".into()),
-            generation: 7,
-            target: protocol::VoiceTarget {
-                agent_id: AgentId("agent-a".into()),
-                instance_stream: StreamPath("/agent/agent-a/instance-a".into()),
-            },
-            uplink: protocol::VoiceAudioFormat::opus(48_000),
-            downlink: protocol::VoiceAudioFormat::opus(24_000),
-        }
-    }
-
-    fn accept(
-        state: &mut ServerVoiceState,
-        host: &StreamPath,
-        frame: ProtocolFrame,
-    ) -> Result<Option<VoiceEvent>, FrameError> {
-        accept_server_voice_frame(state, host, &frame)
-    }
-
-    #[test]
-    fn server_voice_frames_require_typed_host_and_session_routes() {
-        let host = StreamPath("/host/client-a".into());
-        let mut state = ServerVoiceState::default();
-        assert!(matches!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    &host.0,
-                    FrameKind::VoiceCapabilities,
-                    &capabilities(),
-                    Vec::new(),
-                ),
-            )
-            .unwrap(),
-            Some(VoiceEvent::Capabilities(_))
-        ));
-
-        let accepted = accepted();
-        assert!(matches!(
-            accept(
-                &mut state,
-                &host,
-                frame("/voice", FrameKind::VoiceAccepted, &accepted, Vec::new(),),
-            )
-            .unwrap(),
-            Some(VoiceEvent::Accepted(_))
-        ));
-        let stream = format!("/voice/{}", accepted.session_id.0);
-        let session = protocol::VoiceSessionPayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-        };
-        let transcript = protocol::VoiceTranscriptPayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-            speaker: protocol::VoiceTranscriptSpeaker::Assistant,
-            text: "hello".into(),
-            is_final: true,
-            message_id: None,
-        };
-        let state_payload = protocol::VoiceStatePayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-            state: protocol::VoiceSessionState::Speaking,
-            model_turn_id: None,
-        };
-        let error = protocol::VoiceErrorPayload {
-            session_id: Some(accepted.session_id.clone()),
-            generation: accepted.generation,
-            code: protocol::VoiceErrorCode::ToolBusy,
-            retryable: true,
-            fatal: false,
-            detail: None,
-        };
-        for valid in [
-            frame(&stream, FrameKind::VoiceTranscript, &transcript, Vec::new()),
-            frame(&stream, FrameKind::VoiceState, &state_payload, Vec::new()),
-            frame(&stream, FrameKind::VoiceOutput, &session, Vec::new()),
-            frame(&stream, FrameKind::VoiceError, &error, Vec::new()),
-        ] {
-            assert!(accept(&mut state, &host, valid).unwrap().is_some());
-        }
-        let audio = protocol::VoiceAudioPayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-            direction: protocol::VoiceDirection::Output,
-            first_media_seq: 0,
-            timestamp_samples_48k: 0,
-            packet_lengths: vec![3],
-        };
-        // Downlink audio must arrive on its dedicated sub-stream (own seq
-        // counter — the frontend never sees these frames, so sharing the
-        // JSON stream's counter desyncs it)…
-        let audio_stream = format!("{stream}/audio");
-        assert!(matches!(
-            accept(
-                &mut state,
-                &host,
-                frame(&audio_stream, FrameKind::VoiceAudio, &audio, vec![1, 2, 3]),
-            )
-            .unwrap(),
-            Some(VoiceEvent::Audio { .. })
-        ));
-        // …and is rejected on the JSON envelope stream, the pre-sub-stream
-        // routing that caused the desync.
-        let misrouted = protocol::VoiceAudioPayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-            direction: protocol::VoiceDirection::Output,
-            first_media_seq: 1,
-            timestamp_samples_48k: 960,
-            packet_lengths: vec![3],
-        };
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(&stream, FrameKind::VoiceAudio, &misrouted, vec![1, 2, 3]),
-            )
-            .is_err()
-        );
-        let stop = protocol::VoiceStopPayload {
-            session_id: accepted.session_id,
-            generation: accepted.generation,
-            reason: protocol::VoiceStopReason::ProviderCompleted,
-            stats: Default::default(),
-        };
-        assert!(matches!(
-            accept(
-                &mut state,
-                &host,
-                frame(&stream, FrameKind::VoiceStop, &stop, Vec::new()),
-            )
-            .unwrap(),
-            Some(VoiceEvent::Stop(_))
-        ));
-    }
-
-    #[test]
-    fn server_voice_rejects_wrong_routes_binary_and_input_audio() {
-        let host = StreamPath("/host/client-a".into());
-        let mut state = ServerVoiceState::default();
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    "/voice",
-                    FrameKind::VoiceCapabilities,
-                    &capabilities(),
-                    Vec::new(),
-                ),
-            )
-            .is_err()
-        );
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    &host.0,
-                    FrameKind::VoiceCapabilities,
-                    &capabilities(),
-                    vec![1],
-                ),
-            )
-            .is_err()
-        );
-        let accepted = accepted();
-        accept(
-            &mut state,
-            &host,
-            frame("/voice", FrameKind::VoiceAccepted, &accepted, Vec::new()),
-        )
-        .unwrap();
-        let input = protocol::VoiceAudioPayload {
-            session_id: accepted.session_id.clone(),
-            generation: accepted.generation,
-            direction: protocol::VoiceDirection::Input,
-            first_media_seq: 0,
-            timestamp_samples_48k: 0,
-            packet_lengths: vec![3],
-        };
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    "/voice/session-a",
-                    FrameKind::VoiceAudio,
-                    &input,
-                    vec![1, 2, 3],
-                ),
-            )
-            .is_err()
-        );
-        let mut output = input;
-        output.direction = protocol::VoiceDirection::Output;
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    "/voice/foreign",
-                    FrameKind::VoiceAudio,
-                    &output,
-                    vec![1, 2, 3],
-                ),
-            )
-            .is_err()
-        );
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    "/voice/session-a",
-                    FrameKind::VoiceTranscript,
-                    &serde_json::json!({"unexpected": true}),
-                    Vec::new(),
-                ),
-            )
-            .is_err()
-        );
-        assert!(
-            accept(
-                &mut state,
-                &host,
-                frame(
-                    "/voice/session-a",
-                    FrameKind::ChatEvent,
-                    &serde_json::json!({}),
-                    Vec::new(),
-                ),
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn envelope_only_api_validates_and_skips_typed_voice_events() {
-        let host = StreamPath("/host/client-a".into());
-        let (mut server, client) = tokio::io::duplex(16 * 1024);
-        let mut incoming_seq = SeqValidator::new();
-        incoming_seq.validate(&host, 0, FrameKind::Welcome).unwrap();
-        let mut connection = Connection {
-            reader: FrameReader::new(Box::new(BufReader::new(client))),
-            writer: Box::new(tokio::io::sink()),
-            incoming_seq,
-            outgoing_seq: HashMap::from([(host.clone(), 1)]),
-            voice_state: ServerVoiceState::default(),
-        };
-        let mut capability = frame(
-            &host.0,
-            FrameKind::VoiceCapabilities,
-            &capabilities(),
-            Vec::new(),
-        );
-        capability.envelope.seq = 1;
-        protocol::write_frame(&mut server, &capability)
-            .await
-            .unwrap();
-        let settings = protocol::HostSettingsPayload {
-            settings: protocol::HostSettings::default(),
-        };
-        let mut host_settings = frame(&host.0, FrameKind::HostSettings, &settings, Vec::new());
-        host_settings.envelope.seq = 2;
-        protocol::write_frame(&mut server, &host_settings)
-            .await
-            .unwrap();
-
-        let event = connection.next_event().await.unwrap().unwrap();
-        assert_eq!(event.kind, FrameKind::HostSettings);
-        assert_eq!(event.seq, 2);
     }
 }

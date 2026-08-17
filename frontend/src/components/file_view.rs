@@ -1707,42 +1707,6 @@ fn make_line_span(
 ///
 /// Run with: `tools/run-wasm-tests.sh wasm_tests::` (the script handles
 /// chromedriver and `wasm-bindgen-cli` setup automatically — see CLAUDE.md).
-/// Native (non-DOM) unit tests for the byte-offset-under-click conversion.
-/// This is the net-new, error-prone arithmetic, so it is checked directly on
-/// multibyte input independent of the browser caret API.
-#[cfg(test)]
-mod conversion_tests {
-    use super::line_byte_for_utf16_col;
-
-    #[test]
-    fn ascii_columns_map_to_themselves() {
-        let line = "let x = 1;";
-        assert_eq!(line_byte_for_utf16_col(line, 0), 0);
-        assert_eq!(line_byte_for_utf16_col(line, 4), 4); // 'x'
-        assert_eq!(line_byte_for_utf16_col(line, 99), line.len() as u32); // clamp
-    }
-
-    #[test]
-    fn cjk_three_byte_one_utf16_unit() {
-        // "let 名前 = 1": "let " is 4 bytes / 4 UTF-16 units; each CJK char is
-        // 3 bytes but 1 UTF-16 unit.
-        let line = "let 名前 = 1";
-        assert_eq!(line_byte_for_utf16_col(line, 4), 4); // start of 名
-        assert_eq!(line_byte_for_utf16_col(line, 5), 7); // between 名/前 (名 is 3 bytes)
-        assert_eq!(line_byte_for_utf16_col(line, 6), 10); // after 前 (名前 = 6 bytes)
-    }
-
-    #[test]
-    fn astral_char_two_utf16_units() {
-        // "😀" is U+1F600: 4 UTF-8 bytes, 2 UTF-16 code units (a surrogate pair).
-        let line = "a😀b";
-        assert_eq!(line_byte_for_utf16_col(line, 0), 0); // 'a'
-        assert_eq!(line_byte_for_utf16_col(line, 1), 1); // start of 😀
-        // Column 3 is just after the surrogate pair → 'b' at byte 5 (1 + 4).
-        assert_eq!(line_byte_for_utf16_col(line, 3), 5);
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;

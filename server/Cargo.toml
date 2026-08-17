@@ -17,6 +17,7 @@ hmac = "0.12"
 client = { path = "../client" }
 devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
+settings-model = { path = "../settings-model" }
 mqtt-transport = { path = "../mqtt-transport" }
 axum = "0.8"
 base64 = "0.22"
@@ -50,5 +51,14 @@ aws-smithy-types = "1"
 aws-types = "1"
 
 [dev-dependencies]
+server = { path = ".", features = ["test-support"] }
+client = { path = "../client" }
+tyde-dev-driver = { path = "../dev-driver" }
 mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+rmcp = { version = "0.15.0", default-features = false, features = ["client", "server", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true

@@ -29,12 +29,12 @@ use std::{
 
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, BackendTierConfig, ChatEvent, CustomAgentId, ImageData,
-    ModelRequestTokenUsage, SendMessagePayload, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SpawnCostHint,
+    BackendConfigValues, BackendKind, ChatEvent, CustomAgentId, ImageData, ModelRequestTokenUsage,
+    SendMessagePayload, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
+use settings_model::BackendTierConfig;
 use tokio::sync::{mpsc, oneshot};
 use tyde_agent_adapter::BackendCapabilities;
 
@@ -791,6 +791,15 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
+    /// Test support: the live [`mock::MockControl`] handle when this backend
+    /// is the scriptable mock. Every real backend keeps the `None` default;
+    /// the agent actor serves this through `AgentCommand::ReadMockControl`,
+    /// so control ownership stays inside the actor tree.
+    #[cfg(feature = "test-support")]
+    fn mock_control(&self) -> Option<mock::MockControl> {
+        None
+    }
+
     /// Request interruption of the currently active turn, if any.
     /// The returned future may resolve after the backend accepts or dispatches
     /// the interrupt request, before the interrupted turn has fully quiesced.
@@ -1318,43 +1327,6 @@ fn validate_backend_config_values_with_schema(
         sanitized.0.insert(key.clone(), value.clone());
     }
     Ok(sanitized)
-}
-
-pub(crate) fn merge_backend_config_update(
-    backend_kind: BackendKind,
-    previous: Option<&BackendConfigValues>,
-    incoming: &BackendConfigValues,
-) -> Result<BackendConfigValues, String> {
-    merge_backend_config_update_with_schema(
-        backend_kind,
-        backend_config_schema_for_backend(backend_kind).as_ref(),
-        previous,
-        incoming,
-    )
-}
-
-fn merge_backend_config_update_with_schema(
-    backend_kind: BackendKind,
-    schema: Option<&BackendConfigSchema>,
-    previous: Option<&BackendConfigValues>,
-    incoming: &BackendConfigValues,
-) -> Result<BackendConfigValues, String> {
-    if incoming.0.is_empty() {
-        return Ok(BackendConfigValues::default());
-    }
-
-    let update = validate_backend_config_values_with_schema(backend_kind, schema, incoming)?;
-    let mut merged = previous
-        .map(|values| sanitize_backend_config_values_with_schema(schema, values))
-        .unwrap_or_default();
-    for (key, value) in update.0 {
-        if matches!(value, SessionSettingValue::Null) {
-            merged.0.remove(&key);
-        } else {
-            merged.0.insert(key, value);
-        }
-    }
-    Ok(merged)
 }
 
 fn validate_backend_config_value(

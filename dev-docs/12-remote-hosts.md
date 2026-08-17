@@ -729,8 +729,8 @@ configured host, not one implicit global host.
 
 Rules:
 
-- opening Settings requests `DumpSettings` for the selected connected host
-- changing enabled/default backends sends `SetSetting` to that selected host
+- connecting receives the selected host's settings in `HostBootstrap`
+- changing enabled/default backends sends `SettingsWrite` to that selected host
 - if the selected host is disconnected, the Backends tab shows a disconnected
   state instead of pretending settings are available
 

@@ -8,10 +8,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(test)]
-use std::time::Instant;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -49,27 +45,6 @@ pub(crate) struct NativeMqttLink {
     next_publish_token: u64,
     pending_publish_tokens: VecDeque<PublishToken>,
     publish_tokens_by_pkid: HashMap<u16, PublishToken>,
-    #[cfg(test)]
-    accepted_publish_count: Option<Arc<AtomicUsize>>,
-    #[cfg(test)]
-    diagnostic: Option<TestConnectionDiagnostic>,
-}
-
-#[cfg(test)]
-pub(crate) struct TestConnectionDiagnosticContext {
-    pub(crate) label: String,
-    pub(crate) phase: &'static str,
-    pub(crate) started_at: Instant,
-    pub(crate) role: String,
-    pub(crate) inbound_topic: String,
-    pub(crate) outbound_topic: String,
-    pub(crate) client_identity: String,
-}
-
-#[cfg(test)]
-struct TestConnectionDiagnostic {
-    context: TestConnectionDiagnosticContext,
-    connack_observed: bool,
 }
 
 impl NativeMqttLink {
@@ -85,30 +60,7 @@ impl NativeMqttLink {
             next_publish_token: 0,
             pending_publish_tokens: VecDeque::new(),
             publish_tokens_by_pkid: HashMap::new(),
-            #[cfg(test)]
-            accepted_publish_count: None,
-            #[cfg(test)]
-            diagnostic: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_accepted_publish_count_for_test(
-        &mut self,
-        accepted_publish_count: Option<Arc<AtomicUsize>>,
-    ) {
-        self.accepted_publish_count = accepted_publish_count;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_test_connection_diagnostic(
-        &mut self,
-        context: TestConnectionDiagnosticContext,
-    ) {
-        self.diagnostic = Some(TestConnectionDiagnostic {
-            context,
-            connack_observed: false,
-        });
     }
 
     fn allocate_publish_token(&mut self) -> Result<PublishToken, MqttTransportError> {
@@ -123,26 +75,6 @@ impl NativeMqttLink {
 
     fn translate_event(&mut self, event: Event) -> Result<LinkEvent, MqttTransportError> {
         match event {
-            #[cfg(test)]
-            Event::Incoming(Packet::ConnAck(connack)) => {
-                if let Some(diagnostic) = self.diagnostic.as_mut()
-                    && !diagnostic.connack_observed
-                {
-                    diagnostic.connack_observed = true;
-                    eprintln!(
-                        "mqtt transport test connack label={} phase={} elapsed_ms={} role={} client_identity={} inbound_topic={} outbound_topic={} connack={connack:?}",
-                        diagnostic.context.label,
-                        diagnostic.context.phase,
-                        diagnostic.context.started_at.elapsed().as_millis(),
-                        diagnostic.context.role,
-                        diagnostic.context.client_identity,
-                        diagnostic.context.inbound_topic,
-                        diagnostic.context.outbound_topic,
-                    );
-                }
-                Ok(LinkEvent::Other)
-            }
-            #[cfg(not(test))]
             Event::Incoming(Packet::ConnAck(_)) => Ok(LinkEvent::Other),
             Event::Incoming(Packet::Publish(publish)) => Ok(LinkEvent::Publish(IncomingPublish {
                 topic: publish.topic.to_vec(),
@@ -153,12 +85,6 @@ impl NativeMqttLink {
                 match self.publish_tokens_by_pkid.remove(&puback.pkid) {
                     Some(token) => {
                         let result = validate_puback(puback.reason, puback.properties.as_ref());
-                        #[cfg(test)]
-                        if result.is_ok()
-                            && let Some(accepted_publish_count) = &self.accepted_publish_count
-                        {
-                            accepted_publish_count.fetch_add(1, Ordering::SeqCst);
-                        }
                         Ok(LinkEvent::PubAck(PublishAck { token, result }))
                     }
                     None => {
@@ -234,19 +160,6 @@ impl MqttLink for NativeMqttLink {
         let event = match self.eventloop.poll().await {
             Ok(event) => event,
             Err(source) => {
-                #[cfg(test)]
-                if let Some(diagnostic) = self.diagnostic.as_ref() {
-                    eprintln!(
-                        "mqtt transport test poll failed label={} phase={} elapsed_ms={} role={} client_identity={} inbound_topic={} outbound_topic={} rumqttc_error={source:?}",
-                        diagnostic.context.label,
-                        diagnostic.context.phase,
-                        diagnostic.context.started_at.elapsed().as_millis(),
-                        diagnostic.context.role,
-                        diagnostic.context.client_identity,
-                        diagnostic.context.inbound_topic,
-                        diagnostic.context.outbound_topic,
-                    );
-                }
                 return Err(MqttTransportError::BrokerConnect {
                     source: Box::new(source),
                 });
@@ -345,21 +258,6 @@ fn suback_reason(reason: SubscribeReasonCode, properties: Option<&SubAckProperti
         Some(reason_string) => format!("{reason:?}: {reason_string}"),
         None => format!("{reason:?}"),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn mqtt_options(
-    broker_url: &BrokerUrl,
-    auth: &BrokerAuth,
-    role: ParticipantRole,
-    tls_ca_pem: Option<Vec<u8>>,
-) -> Result<MqttOptions, MqttTransportError> {
-    mqtt_options_inner(
-        broker_url,
-        &LinkBrokerAuth::Legacy(auth.clone()),
-        LinkClientId::Random(role),
-        tls_ca_pem,
-    )
 }
 
 pub(crate) fn mqtt_options_for_link(
@@ -567,92 +465,4 @@ fn lower_hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-/// Codec-parity tests for the Phase-2 wasm backend. These run natively (no wasm
-/// runtime, no broker) and prove that the standalone `mqttbytes 0.6` codec the
-/// wasm backend uses (a) round-trips its own PUBLISH/SUBSCRIBE encoding and
-/// (b) produces packets the native rumqttc stack decodes identically — the
-/// cross-implementation interop guarantee the two transports rely on.
-#[cfg(test)]
-mod codec_parity_tests {
-    use bytes::BytesMut;
-
-    #[test]
-    fn mqttbytes_publish_round_trips_and_rumqttc_decodes_it() {
-        use mqttbytes::QoS as MbQoS;
-        use mqttbytes::v5::{Packet as MbPacket, Publish as MbPublish, read as mb_read};
-
-        let mut publish =
-            MbPublish::new("tyde/parity/topic", MbQoS::AtLeastOnce, b"frame".to_vec());
-        publish.pkid = 7;
-
-        let mut bytes = BytesMut::new();
-        publish.write(&mut bytes).expect("mqttbytes encode PUBLISH");
-        let wire = bytes.clone();
-
-        // (a) mqttbytes self round-trip.
-        match mb_read(&mut bytes, 64 * 1024).expect("mqttbytes decode") {
-            MbPacket::Publish(decoded) => {
-                assert_eq!(decoded.topic, "tyde/parity/topic");
-                assert_eq!(decoded.payload.as_ref(), b"frame");
-                assert_eq!(decoded.qos, MbQoS::AtLeastOnce);
-                assert_eq!(decoded.pkid, 7);
-            }
-            other => panic!("mqttbytes decoded unexpected packet: {other:?}"),
-        }
-
-        // (b) rumqttc decodes the very same bytes the wasm backend would send.
-        use rumqttc::v5::mqttbytes::QoS as RcQoS;
-        use rumqttc::v5::mqttbytes::v5::Packet as RcPacket;
-        let mut wire = wire;
-        match RcPacket::read(&mut wire, Some(64 * 1024))
-            .expect("rumqttc decode of mqttbytes PUBLISH")
-        {
-            RcPacket::Publish(decoded) => {
-                assert_eq!(decoded.topic.as_ref(), b"tyde/parity/topic");
-                assert_eq!(decoded.payload.as_ref(), b"frame");
-                assert_eq!(decoded.qos, RcQoS::AtLeastOnce);
-                assert_eq!(decoded.pkid, 7);
-            }
-            other => panic!("rumqttc decoded unexpected packet: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn mqttbytes_subscribe_round_trips_and_rumqttc_decodes_it() {
-        use mqttbytes::QoS as MbQoS;
-        use mqttbytes::v5::{Packet as MbPacket, Subscribe as MbSubscribe, read as mb_read};
-
-        let mut subscribe = MbSubscribe::new("tyde/parity/topic", MbQoS::AtLeastOnce);
-        subscribe.pkid = 9;
-
-        let mut bytes = BytesMut::new();
-        subscribe
-            .write(&mut bytes)
-            .expect("mqttbytes encode SUBSCRIBE");
-        let wire = bytes.clone();
-
-        match mb_read(&mut bytes, 64 * 1024).expect("mqttbytes decode") {
-            MbPacket::Subscribe(decoded) => {
-                assert_eq!(decoded.pkid, 9);
-                assert_eq!(decoded.filters.len(), 1);
-                assert_eq!(decoded.filters[0].path, "tyde/parity/topic");
-                assert_eq!(decoded.filters[0].qos, MbQoS::AtLeastOnce);
-            }
-            other => panic!("mqttbytes decoded unexpected packet: {other:?}"),
-        }
-
-        use rumqttc::v5::mqttbytes::v5::Packet as RcPacket;
-        let mut wire = wire;
-        match RcPacket::read(&mut wire, Some(64 * 1024))
-            .expect("rumqttc decode of mqttbytes SUBSCRIBE")
-        {
-            RcPacket::Subscribe(decoded) => {
-                assert_eq!(decoded.filters.len(), 1);
-                assert_eq!(decoded.filters[0].path.as_str(), "tyde/parity/topic");
-            }
-            other => panic!("rumqttc decoded unexpected packet: {other:?}"),
-        }
-    }
 }

@@ -1422,12 +1422,13 @@ mod wasm_tests {
     use crate::state::{AppState, LocalHostId, ProjectDiffState};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, DiffContextMode, HostSettings, ProjectDiffScope,
-        ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
-        ProjectId, ProjectRootPath, Review, ReviewAiReviewerState, ReviewAiReviewerStatus,
-        ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewId, ReviewLocation,
-        ReviewStatus, ReviewSummary, SessionId, StreamPath,
+        AgentId, AgentOrigin, BackendKind, DiffContextMode, ProjectDiffScope, ProjectGitDiffFile,
+        ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectId, ProjectRootPath,
+        Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewCommentId,
+        ReviewCommentSource, ReviewDiffSelection, ReviewId, ReviewLocation, ReviewStatus,
+        ReviewSummary, SessionId, StreamPath,
     };
+    use settings_model::HostSettings;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -2173,16 +2174,17 @@ mod wasm_tests {
             default_backend: default,
             enable_mobile_connections: false,
             mobile_broker_url: None,
+            mobile_broker_auth: Default::default(),
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: false,
-            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+            tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
-            launch_profiles: Vec::new(),
+            launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
         }

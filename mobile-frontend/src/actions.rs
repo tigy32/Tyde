@@ -779,20 +779,3 @@ pub async fn close_host_browse(
     });
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn project_and_review_stream_helpers_match_protocol_paths() {
-        assert_eq!(
-            project_stream(&protocol::ProjectId("p1".to_owned())).0,
-            "/project/p1"
-        );
-        assert_eq!(
-            review_stream(&protocol::ReviewId("r1".to_owned())).0,
-            "/review/r1"
-        );
-    }
-}

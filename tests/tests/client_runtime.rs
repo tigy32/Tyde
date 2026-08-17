@@ -435,6 +435,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     let _ = session_count_tx.send(payload).await;
                 }
                 HostEvent::HostSettings(_)
+                | HostEvent::SettingsWriteResult(_)
                 | HostEvent::AgentActivitySummary(_)
                 | HostEvent::TaskTokenUsage(_)
                 | HostEvent::AgentsViewPreferencesNotify(_)

@@ -33,48 +33,48 @@ use protocol::{
     CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
-    LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT,
-    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, MessageOrigin, MessageSender,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
-    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
-    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, RequestedCompactionAvailability, RequestedCompactionRoute,
-    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
-    RunBackendSetupPayload, SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload,
-    SessionId, SessionListCursor, SessionListGeneration, SessionListPageInfo,
-    SessionListPageStatus, SessionListPayload, SessionListScope, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
+    HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile,
+    LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
+    LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
+    McpTransportConfig, MessageOrigin, MessageSender, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
+    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
+    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
+    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SUPERVISOR_MESSAGE_PREFIX,
+    SendMessagePayload, SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
+    SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
     SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageAmount,
-    TaskTokenUsageEntry, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
-    TaskTokenUsageUnavailableReason, TeamContextCompactionNotifyPayload,
-    TeamContextCompactionStatus, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
-    TeamMemberContextCompactionResult, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
-    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
-    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, Skill,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
+    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
+    TeamContextCompactionNotifyPayload, TeamContextCompactionStatus, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
+    TeamMemberBindingNotifyPayload, TeamMemberContextCompactionResult, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole,
+    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
+    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkbenchRoot, WorkflowCatalogLocation, WorkflowDiagnostic, WorkflowDiagnosticSeverity,
+    WorkflowInputControl, WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRunId,
+    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSaveMode,
+    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
+    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowTargetDirectory,
+    WorkflowTargetsResponse,
 };
+use settings_model::HostLaunchProfileConfig;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -437,8 +437,9 @@ const SUPERVISION_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(240),
     Duration::from_secs(480),
 ];
-const _: () =
-    assert!(SUPERVISION_RETRY_DELAYS.len() == protocol::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize);
+const _: () = assert!(
+    SUPERVISION_RETRY_DELAYS.len() == settings_model::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize
+);
 /// How long the supervisor waits for an auto-compaction it requested to
 /// reach a terminal notify before giving up on observing it (the compaction
 /// itself keeps running server-side either way).
@@ -556,7 +557,9 @@ fn compaction_barrier_timeout(enabled_stall_timeout: Option<Duration>) -> Durati
     )
 }
 
-fn enabled_supervisor_stall_timeout(settings: protocol::SupervisorSettings) -> Option<Duration> {
+fn enabled_supervisor_stall_timeout(
+    settings: settings_model::SupervisorSettings,
+) -> Option<Duration> {
     settings
         .stall_timeout_enabled
         .then(|| Duration::from_secs(u64::from(settings.stall_timeout_seconds)))
@@ -570,7 +573,7 @@ struct ActivitySummarySettingsSignal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SupervisorSettingsSignal {
-    pub(crate) settings: protocol::SupervisorSettings,
+    pub(crate) settings: settings_model::SupervisorSettings,
     pub(crate) epoch: u64,
 }
 
@@ -590,11 +593,11 @@ struct SupervisionBaseline {
 pub(crate) struct VerdictSettingsFingerprint {
     max_kicks_per_task: u8,
     retry_attempts: u8,
-    cost_tier: protocol::SupervisorCostTier,
+    cost_tier: settings_model::SupervisorCostTier,
 }
 
-impl From<protocol::SupervisorSettings> for VerdictSettingsFingerprint {
-    fn from(settings: protocol::SupervisorSettings) -> Self {
+impl From<settings_model::SupervisorSettings> for VerdictSettingsFingerprint {
+    fn from(settings: settings_model::SupervisorSettings) -> Self {
         Self {
             max_kicks_per_task: settings.max_kicks_per_task,
             retry_attempts: settings.retry_attempts,
@@ -723,7 +726,7 @@ struct SupervisionRetryRequest {
     idle_since: Instant,
     baseline: SupervisionBaseline,
     attempts_started: u8,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
     reason: SupervisionRetryReason,
     message: Option<String>,
     scheduled_at: Instant,
@@ -777,150 +780,8 @@ enum SupervisorCompactionTaskEvent {
     },
 }
 
-#[cfg(test)]
-struct SupervisorVerdictPostSampleTestGate {
-    agent_id: AgentId,
-    entered: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-static SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE: StdMutex<
-    Option<SupervisorVerdictPostSampleTestGate>,
-> = StdMutex::new(None);
-
-#[cfg(test)]
-fn install_supervisor_verdict_post_sample_test_gate(
-    agent_id: AgentId,
-) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let replaced = SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE
-        .lock()
-        .expect("supervisor verdict test gate mutex poisoned")
-        .replace(SupervisorVerdictPostSampleTestGate {
-            agent_id,
-            entered: entered_tx,
-            release: release_rx,
-        });
-    assert!(
-        replaced.is_none(),
-        "supervisor verdict test gate already installed"
-    );
-    (entered_rx, release_tx)
-}
-
-#[cfg(test)]
-async fn wait_for_supervisor_verdict_post_sample_test_gate(agent_id: &AgentId) {
-    let gate = {
-        let mut slot = SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE
-            .lock()
-            .expect("supervisor verdict test gate mutex poisoned");
-        if slot.as_ref().is_some_and(|gate| &gate.agent_id == agent_id) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    if let Some(gate) = gate {
-        let _ = gate.entered.send(());
-        let _ = gate.release.await;
-    }
-}
-
-#[cfg(not(test))]
 async fn wait_for_supervisor_verdict_post_sample_test_gate(_agent_id: &AgentId) {}
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SupervisorVerdictCallStart {
-    agent_id: AgentId,
-    activity_counter: u64,
-    attempts_started: u8,
-    cost_hint: Option<protocol::SpawnCostHint>,
-}
-
-#[cfg(test)]
-struct SupervisorVerdictCallTestGate {
-    agent_id: AgentId,
-    started: mpsc::UnboundedSender<SupervisorVerdictCallStart>,
-    releases: mpsc::UnboundedReceiver<()>,
-}
-
-#[cfg(test)]
-fn supervisor_verdict_call_test_gates()
--> &'static StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>> {
-    static GATES: std::sync::OnceLock<StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>>> =
-        std::sync::OnceLock::new();
-    GATES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-fn install_supervisor_verdict_call_test_gate(
-    agent_id: AgentId,
-) -> (
-    mpsc::UnboundedReceiver<SupervisorVerdictCallStart>,
-    mpsc::UnboundedSender<()>,
-) {
-    let (started_tx, started_rx) = mpsc::unbounded_channel();
-    let (release_tx, release_rx) = mpsc::unbounded_channel();
-    let replaced = supervisor_verdict_call_test_gates()
-        .lock()
-        .expect("supervisor verdict call test gate mutex poisoned")
-        .insert(
-            agent_id.clone(),
-            SupervisorVerdictCallTestGate {
-                agent_id,
-                started: started_tx,
-                releases: release_rx,
-            },
-        );
-    assert!(replaced.is_none(), "call test gate already installed");
-    (started_rx, release_tx)
-}
-
-#[cfg(test)]
-fn remove_supervisor_verdict_call_test_gate(agent_id: &AgentId) {
-    let gate = supervisor_verdict_call_test_gates()
-        .lock()
-        .expect("supervisor verdict call test gate mutex poisoned")
-        .remove(agent_id);
-    assert!(
-        gate.as_ref().is_some_and(|gate| &gate.agent_id == agent_id),
-        "call test gate belonged to another agent"
-    );
-}
-
-#[cfg(test)]
-async fn wait_for_supervisor_verdict_call_test_gate(
-    agent_id: &AgentId,
-    activity_counter: u64,
-    attempts_started: u8,
-    cost_hint: Option<protocol::SpawnCostHint>,
-) {
-    let gate = {
-        supervisor_verdict_call_test_gates()
-            .lock()
-            .expect("supervisor verdict call test gate mutex poisoned")
-            .remove(agent_id)
-    };
-    let Some(mut gate) = gate else {
-        return;
-    };
-    let _ = gate.started.send(SupervisorVerdictCallStart {
-        agent_id: agent_id.clone(),
-        activity_counter,
-        attempts_started,
-        cost_hint,
-    });
-    let _ = gate.releases.recv().await;
-    supervisor_verdict_call_test_gates()
-        .lock()
-        .expect("supervisor verdict call test gate mutex poisoned")
-        .insert(agent_id.clone(), gate);
-}
-
-#[cfg(not(test))]
 async fn wait_for_supervisor_verdict_call_test_gate(
     _agent_id: &AgentId,
     _activity_counter: u64,
@@ -1116,6 +977,11 @@ pub(crate) struct HostState {
     removing_projects: HashSet<ProjectId>,
     #[cfg(feature = "test-support")]
     agent_name_test_gate: Option<Arc<AgentNameTestGateInner>>,
+    /// Host-scoped, single-slot mock launch reservation
+    /// (`HostHandle::reserve_next_mock_launch`). A `std` mutex so the
+    /// reservation guard's `Drop` can cancel it synchronously.
+    #[cfg(feature = "test-support")]
+    mock_launch_reservation: Arc<StdMutex<Option<PendingMockLaunch>>>,
     /// Gated on `any(test, ...)` rather than the `test-support` feature alone
     /// because this crate's own `cfg(test)` build observes it. `cargo test -p
     /// server` resolves `server` with default features, so a feature-only gate
@@ -1150,6 +1016,15 @@ pub struct HostHandle {
     workflow_save_lock: Arc<Mutex<()>>,
     backend_setup_refresh_lock: Arc<Mutex<()>>,
     session_schema_refresh_lock: Arc<Mutex<()>>,
+    /// Serializes the complete lifecycle of a host-settings apply — CAS
+    /// read, commit, backend propagation, fanout, coupled refreshes, and
+    /// result emission — across both write paths. Without it a slow
+    /// propagation or refresh window lets a later write fan out first,
+    /// leaving subscribers on a superseded snapshot and the earlier write
+    /// reporting a stale "current" etag. Never held across non-settings
+    /// work; the general host-state lock is still released around backend
+    /// I/O.
+    settings_apply_lock: Arc<Mutex<()>>,
     spawn_operations: SpawnOperationHandle,
     spawn_operation_owner: Option<Arc<SpawnOperationOwner>>,
 }
@@ -1327,6 +1202,7 @@ struct WeakHostHandle {
     workflow_save_lock: Weak<Mutex<()>>,
     backend_setup_refresh_lock: Weak<Mutex<()>>,
     session_schema_refresh_lock: Weak<Mutex<()>>,
+    settings_apply_lock: Weak<Mutex<()>>,
     spawn_operations: SpawnOperationHandle,
 }
 
@@ -1337,6 +1213,7 @@ impl WeakHostHandle {
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
             backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
             session_schema_refresh_lock: self.session_schema_refresh_lock.upgrade()?,
+            settings_apply_lock: self.settings_apply_lock.upgrade()?,
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         })
@@ -1350,6 +1227,7 @@ impl Clone for HostHandle {
             workflow_save_lock: Arc::clone(&self.workflow_save_lock),
             backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::clone(&self.session_schema_refresh_lock),
+            settings_apply_lock: Arc::clone(&self.settings_apply_lock),
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         }
@@ -1737,6 +1615,86 @@ pub struct InstalledAgentNameGate {
     inner: Arc<AgentNameTestGateInner>,
 }
 
+/// A host-scoped, one-shot mock launch reservation
+/// (`HostHandle::reserve_next_mock_launch`). The next accepted mock backend
+/// launch on this host must be for an agent named exactly `expected_name`; a
+/// mismatching mock launch fails visibly instead of running the script on the
+/// wrong agent. Dropping an unconsumed reservation cancels it.
+#[cfg(feature = "test-support")]
+struct PendingMockLaunch {
+    id: u64,
+    expected_name: String,
+    behavior: PendingMockLaunchBehavior,
+}
+
+/// What a consumed reservation does to the reserved spawn.
+#[cfg(feature = "test-support")]
+enum PendingMockLaunchBehavior {
+    /// Thread a launch behavior (script / close-before-resume-barrier) into
+    /// the mock backend construction.
+    Launch(crate::backend::mock::MockLaunch),
+    /// Fail before constructing a backend.
+    FailSpawn { message: String },
+}
+
+#[cfg(feature = "test-support")]
+pub struct MockLaunchReservation {
+    slot: Arc<StdMutex<Option<PendingMockLaunch>>>,
+    id: u64,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for MockLaunchReservation {
+    fn drop(&mut self) {
+        let mut pending = self
+            .slot
+            .lock()
+            .expect("mock launch reservation mutex poisoned");
+        if pending.as_ref().is_some_and(|entry| entry.id == self.id) {
+            *pending = None;
+        }
+    }
+}
+
+/// Consume the host's pending mock launch reservation into the spawn request,
+/// or fail the spawn visibly on an agent-name mismatch. Runs for every mock
+/// backend launch the host accepts (spawn, resume and fork), inside the host
+/// state lock, so exactly one launch can consume a reservation.
+#[cfg(feature = "test-support")]
+fn consume_mock_launch_reservation(
+    state: &HostState,
+    mut request: ResolvedSpawnRequest,
+) -> ResolvedSpawnRequest {
+    if !request.use_mock_backend || request.startup_failure.is_some() {
+        return request;
+    }
+    let mut pending = state
+        .mock_launch_reservation
+        .lock()
+        .expect("mock launch reservation mutex poisoned");
+    let Some(entry) = pending.as_ref() else {
+        return request;
+    };
+    if entry.expected_name == request.name {
+        let entry = pending.take().expect("reservation entry checked above");
+        match entry.behavior {
+            PendingMockLaunchBehavior::Launch(launch) => {
+                request.mock_launch = Some(launch);
+            }
+            PendingMockLaunchBehavior::FailSpawn { message } => {
+                request.startup_failure = Some(AgentStartupFailure::backend_failed(message));
+            }
+        }
+    } else {
+        // A mismatching spawn must not consume another spawn's reservation.
+        request.startup_failure = Some(AgentStartupFailure::backend_failed(format!(
+            "mock launch reservation expected the next mock spawn to be named {:?}, but this spawn is named {:?}",
+            entry.expected_name, request.name
+        )));
+    }
+    request
+}
+
 #[cfg(feature = "test-support")]
 pub struct InstalledSpawnOperationTestGate {
     inner: Arc<SpawnOperationTestGateInner>,
@@ -2029,6 +1987,83 @@ impl HostHandle {
         assert!(hook.is_none(), "workbench remove hook already installed");
         *hook = Some(Arc::clone(&inner));
         InstalledWorkbenchRemoveHook { inner }
+    }
+
+    /// Install a script for the next mock launch named `expected_name`.
+    pub async fn reserve_next_mock_launch(
+        &self,
+        expected_name: &str,
+        script: crate::backend::mock::MockScript,
+    ) -> MockLaunchReservation {
+        self.reserve_next_mock_launch_behavior(
+            expected_name,
+            PendingMockLaunchBehavior::Launch(crate::backend::mock::MockLaunch::Script(script)),
+        )
+        .await
+    }
+
+    /// Fail the next mock launch named `expected_name` with `message`.
+    pub async fn reserve_next_mock_spawn_failure(
+        &self,
+        expected_name: &str,
+        message: &str,
+    ) -> MockLaunchReservation {
+        self.reserve_next_mock_launch_behavior(
+            expected_name,
+            PendingMockLaunchBehavior::FailSpawn {
+                message: message.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Close the next named resume before its replay barrier completes.
+    pub async fn reserve_next_mock_resume_closing_before_barrier(
+        &self,
+        expected_name: &str,
+    ) -> MockLaunchReservation {
+        self.reserve_next_mock_launch_behavior(
+            expected_name,
+            PendingMockLaunchBehavior::Launch(
+                crate::backend::mock::MockLaunch::CloseBeforeResumeBarrier,
+            ),
+        )
+        .await
+    }
+
+    async fn reserve_next_mock_launch_behavior(
+        &self,
+        expected_name: &str,
+        behavior: PendingMockLaunchBehavior,
+    ) -> MockLaunchReservation {
+        static NEXT_RESERVATION_ID: AtomicU64 = AtomicU64::new(0);
+        let slot = Arc::clone(&self.state.lock().await.mock_launch_reservation);
+        let id = NEXT_RESERVATION_ID.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut pending = slot.lock().expect("mock launch reservation mutex poisoned");
+            assert!(
+                pending.is_none(),
+                "a mock launch reservation is already pending on this host \
+                 (only one unconsumed reservation is allowed)"
+            );
+            *pending = Some(PendingMockLaunch {
+                id,
+                expected_name: expected_name.to_owned(),
+                behavior,
+            });
+        }
+        MockLaunchReservation { slot, id }
+    }
+
+    /// The live mock backend control handle for `agent_id`, retrieved through
+    /// the agent actor. `None` when the agent does not exist, is not running,
+    /// or is not backed by the mock backend.
+    pub async fn mock_control(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<crate::backend::mock::MockControl> {
+        let handle = self.state.lock().await.registry.agent_handle(agent_id)?;
+        handle.mock_control().await
     }
 
     pub async fn install_agent_name_test_gate(&self) -> InstalledAgentNameGate {
@@ -2399,581 +2434,6 @@ fn workbench_remove_hook_cell() -> &'static std::sync::Mutex<Option<Arc<Workbenc
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
-struct InstalledTeamMutationAfterRefsHook {
-    inner: Arc<TeamMutationAfterRefsHook>,
-}
-
-#[cfg(test)]
-struct TeamMutationAfterRefsHook {
-    host_state_ptr: usize,
-    operation: &'static str,
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-type TeamMutationAfterRefsHookCell = std::sync::Mutex<Option<Arc<TeamMutationAfterRefsHook>>>;
-
-#[cfg(test)]
-impl InstalledTeamMutationAfterRefsHook {
-    async fn wait_until_reached(&self) {
-        self.inner.reached.notified().await;
-    }
-
-    fn resume(&self) {
-        self.inner.resume.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledTeamMutationAfterRefsHook {
-    fn drop(&mut self) {
-        let mut hook = team_mutation_after_refs_hook_cell()
-            .lock()
-            .expect("team mutation hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.resume.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_team_mutation_after_refs_test_hook(
-    host: &HostHandle,
-    operation: &'static str,
-) -> InstalledTeamMutationAfterRefsHook {
-    let inner = Arc::new(TeamMutationAfterRefsHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        operation,
-        reached: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-    });
-    let mut hook = team_mutation_after_refs_hook_cell()
-        .lock()
-        .expect("team mutation hook mutex poisoned");
-    assert!(hook.is_none(), "team mutation test hook already installed");
-    *hook = Some(Arc::clone(&inner));
-    InstalledTeamMutationAfterRefsHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_for_team_mutation_after_refs_test_hook(host: &HostHandle, operation: &'static str) {
-    let hook = {
-        team_mutation_after_refs_hook_cell()
-            .lock()
-            .expect("team mutation hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize || hook.operation != operation {
-        return;
-    }
-    hook.reached.notify_one();
-    hook.resume.notified().await;
-}
-
-#[cfg(test)]
-fn team_mutation_after_refs_hook_cell() -> &'static TeamMutationAfterRefsHookCell {
-    static HOOK: std::sync::OnceLock<TeamMutationAfterRefsHookCell> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-struct InstalledSpawnSessionRegistrationHook {
-    inner: Arc<SpawnSessionRegistrationHook>,
-}
-
-#[cfg(test)]
-struct SpawnSessionRegistrationHook {
-    host_state_ptr: usize,
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-type SpawnSessionRegistrationHookCell = std::sync::Mutex<Option<Arc<SpawnSessionRegistrationHook>>>;
-
-#[cfg(test)]
-impl InstalledSpawnSessionRegistrationHook {
-    async fn wait_until_reached(&self) {
-        self.inner.reached.notified().await;
-    }
-
-    fn resume(&self) {
-        self.inner.resume.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledSpawnSessionRegistrationHook {
-    fn drop(&mut self) {
-        let mut hook = spawn_session_registration_hook_cell()
-            .lock()
-            .expect("spawn session registration hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.resume.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_spawn_session_registration_test_hook(
-    host: &HostHandle,
-) -> InstalledSpawnSessionRegistrationHook {
-    let inner = Arc::new(SpawnSessionRegistrationHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        reached: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-    });
-    let mut hook = spawn_session_registration_hook_cell()
-        .lock()
-        .expect("spawn session registration hook mutex poisoned");
-    assert!(
-        hook.is_none(),
-        "spawn session registration hook already installed"
-    );
-    *hook = Some(Arc::clone(&inner));
-    InstalledSpawnSessionRegistrationHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_for_spawn_session_registration_test_hook(host: &HostHandle) {
-    let hook = {
-        spawn_session_registration_hook_cell()
-            .lock()
-            .expect("spawn session registration hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
-        return;
-    }
-    hook.reached.notify_one();
-    hook.resume.notified().await;
-}
-
-#[cfg(test)]
-fn spawn_session_registration_hook_cell() -> &'static SpawnSessionRegistrationHookCell {
-    static HOOK: std::sync::OnceLock<SpawnSessionRegistrationHookCell> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-struct InstalledStartupFailureFanoutRaceHook {
-    inner: Arc<StartupFailureFanoutRaceHook>,
-}
-
-#[cfg(test)]
-struct StartupFailureFanoutRaceHook {
-    host_state_ptr: usize,
-    winner: StartupFailureFanoutRaceWinner,
-    ready: tokio::sync::Barrier,
-    fanout_claimed: tokio::sync::Notify,
-    failure_claimed: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StartupFailureFanoutRaceWinner {
-    Fanout,
-    Failure,
-}
-
-#[cfg(test)]
-type StartupFailureFanoutRaceHookCell = std::sync::Mutex<Option<Arc<StartupFailureFanoutRaceHook>>>;
-
-#[cfg(test)]
-impl InstalledStartupFailureFanoutRaceHook {
-    async fn wait_until_ready(&self) {
-        self.inner.ready.wait().await;
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledStartupFailureFanoutRaceHook {
-    fn drop(&mut self) {
-        let mut hook = startup_failure_fanout_race_hook_cell()
-            .lock()
-            .expect("startup failure fanout race hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.fanout_claimed.notify_waiters();
-        self.inner.failure_claimed.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_startup_failure_fanout_race_test_hook(
-    host: &HostHandle,
-    winner: StartupFailureFanoutRaceWinner,
-) -> InstalledStartupFailureFanoutRaceHook {
-    let inner = Arc::new(StartupFailureFanoutRaceHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        winner,
-        ready: tokio::sync::Barrier::new(3),
-        fanout_claimed: tokio::sync::Notify::new(),
-        failure_claimed: tokio::sync::Notify::new(),
-    });
-    let mut hook = startup_failure_fanout_race_hook_cell()
-        .lock()
-        .expect("startup failure fanout race hook mutex poisoned");
-    assert!(
-        hook.is_none(),
-        "startup failure fanout race hook already installed"
-    );
-    *hook = Some(Arc::clone(&inner));
-    InstalledStartupFailureFanoutRaceHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_before_startup_failure_fanout_test_hook(host: &HostHandle) {
-    let hook = {
-        startup_failure_fanout_race_hook_cell()
-            .lock()
-            .expect("startup failure fanout race hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
-        return;
-    }
-    hook.ready.wait().await;
-    if hook.winner == StartupFailureFanoutRaceWinner::Failure {
-        hook.failure_claimed.notified().await;
-    }
-}
-
-#[cfg(test)]
-fn notify_startup_failure_fanout_claimed_test_hook(host: &HostHandle) {
-    let hook = startup_failure_fanout_race_hook_cell()
-        .lock()
-        .expect("startup failure fanout race hook mutex poisoned")
-        .clone();
-    if let Some(hook) = hook
-        && hook.host_state_ptr == Arc::as_ptr(&host.state) as usize
-    {
-        hook.fanout_claimed.notify_one();
-    }
-}
-
-#[cfg(test)]
-fn notify_startup_failure_claimed_test_hook(host: &HostHandle) {
-    let hook = startup_failure_fanout_race_hook_cell()
-        .lock()
-        .expect("startup failure fanout race hook mutex poisoned")
-        .clone();
-    if let Some(hook) = hook
-        && hook.host_state_ptr == Arc::as_ptr(&host.state) as usize
-    {
-        hook.failure_claimed.notify_one();
-    }
-}
-
-#[cfg(test)]
-async fn wait_for_startup_failure_fanout_race_test_hook(host: &HostHandle) {
-    let hook = {
-        startup_failure_fanout_race_hook_cell()
-            .lock()
-            .expect("startup failure fanout race hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
-        return;
-    }
-    hook.ready.wait().await;
-    if hook.winner == StartupFailureFanoutRaceWinner::Fanout {
-        hook.fanout_claimed.notified().await;
-    }
-}
-
-#[cfg(test)]
-fn startup_failure_fanout_race_hook_cell() -> &'static StartupFailureFanoutRaceHookCell {
-    static HOOK: std::sync::OnceLock<StartupFailureFanoutRaceHookCell> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-struct InstalledSpawnNewAgentFanoutHook {
-    inner: Arc<SpawnNewAgentFanoutHook>,
-}
-
-#[cfg(test)]
-struct SpawnNewAgentFanoutHook {
-    host_state_ptr: usize,
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-    paused_once: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(test)]
-type SpawnNewAgentFanoutHookCell = std::sync::Mutex<Option<Arc<SpawnNewAgentFanoutHook>>>;
-
-#[cfg(test)]
-impl InstalledSpawnNewAgentFanoutHook {
-    async fn wait_until_reached(&self) {
-        self.inner.reached.notified().await;
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledSpawnNewAgentFanoutHook {
-    fn drop(&mut self) {
-        let mut hook = spawn_new_agent_fanout_hook_cell()
-            .lock()
-            .expect("spawn NewAgent fanout hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.resume.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_spawn_new_agent_fanout_test_hook(host: &HostHandle) -> InstalledSpawnNewAgentFanoutHook {
-    let inner = Arc::new(SpawnNewAgentFanoutHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        reached: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-        paused_once: std::sync::atomic::AtomicBool::new(false),
-    });
-    let mut hook = spawn_new_agent_fanout_hook_cell()
-        .lock()
-        .expect("spawn NewAgent fanout hook mutex poisoned");
-    assert!(
-        hook.is_none(),
-        "spawn NewAgent fanout hook already installed"
-    );
-    *hook = Some(Arc::clone(&inner));
-    InstalledSpawnNewAgentFanoutHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_after_spawn_new_agent_fanout_test_hook(host: &HostHandle) {
-    let hook = {
-        spawn_new_agent_fanout_hook_cell()
-            .lock()
-            .expect("spawn NewAgent fanout hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize
-        || hook.paused_once.swap(true, Ordering::SeqCst)
-    {
-        return;
-    }
-    hook.reached.notify_one();
-    hook.resume.notified().await;
-}
-
-#[cfg(test)]
-fn spawn_new_agent_fanout_hook_cell() -> &'static SpawnNewAgentFanoutHookCell {
-    static HOOK: std::sync::OnceLock<SpawnNewAgentFanoutHookCell> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-struct InstalledSpawnVisibleBeforePublicationHook {
-    inner: Arc<SpawnVisibleBeforePublicationHook>,
-}
-
-#[cfg(test)]
-struct SpawnVisibleBeforePublicationHook {
-    host_state_ptr: usize,
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-type SpawnVisibleBeforePublicationHookCell =
-    std::sync::Mutex<Option<Arc<SpawnVisibleBeforePublicationHook>>>;
-
-#[cfg(test)]
-impl InstalledSpawnVisibleBeforePublicationHook {
-    async fn wait_until_reached(&self) {
-        self.inner.reached.notified().await;
-    }
-
-    fn resume(&self) {
-        self.inner.resume.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledSpawnVisibleBeforePublicationHook {
-    fn drop(&mut self) {
-        let mut hook = spawn_visible_before_publication_hook_cell()
-            .lock()
-            .expect("spawn visible-before-publication hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.resume.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_spawn_visible_before_publication_test_hook(
-    host: &HostHandle,
-) -> InstalledSpawnVisibleBeforePublicationHook {
-    let inner = Arc::new(SpawnVisibleBeforePublicationHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        reached: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-    });
-    let mut hook = spawn_visible_before_publication_hook_cell()
-        .lock()
-        .expect("spawn visible-before-publication hook mutex poisoned");
-    assert!(
-        hook.is_none(),
-        "spawn visible-before-publication hook already installed"
-    );
-    *hook = Some(Arc::clone(&inner));
-    InstalledSpawnVisibleBeforePublicationHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_for_spawn_visible_before_publication_test_hook(host: &HostHandle) {
-    let hook = {
-        spawn_visible_before_publication_hook_cell()
-            .lock()
-            .expect("spawn visible-before-publication hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
-        return;
-    }
-    hook.reached.notify_one();
-    hook.resume.notified().await;
-}
-
-#[cfg(test)]
-fn spawn_visible_before_publication_hook_cell() -> &'static SpawnVisibleBeforePublicationHookCell {
-    static HOOK: std::sync::OnceLock<SpawnVisibleBeforePublicationHookCell> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-struct InstalledSpawnCancelledBeforeCleanupHook {
-    inner: Arc<SpawnCancelledBeforeCleanupHook>,
-}
-
-#[cfg(test)]
-struct SpawnCancelledBeforeCleanupHook {
-    host_state_ptr: usize,
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-type SpawnCancelledBeforeCleanupHookCell =
-    std::sync::Mutex<Option<Arc<SpawnCancelledBeforeCleanupHook>>>;
-
-#[cfg(test)]
-impl InstalledSpawnCancelledBeforeCleanupHook {
-    async fn wait_until_reached(&self) {
-        self.inner.reached.notified().await;
-    }
-
-    fn resume(&self) {
-        self.inner.resume.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for InstalledSpawnCancelledBeforeCleanupHook {
-    fn drop(&mut self) {
-        let mut hook = spawn_cancelled_before_cleanup_hook_cell()
-            .lock()
-            .expect("spawn cancelled-before-cleanup hook mutex poisoned");
-        if hook
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
-        {
-            *hook = None;
-        }
-        self.inner.resume.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-fn install_spawn_cancelled_before_cleanup_test_hook(
-    host: &HostHandle,
-) -> InstalledSpawnCancelledBeforeCleanupHook {
-    let inner = Arc::new(SpawnCancelledBeforeCleanupHook {
-        host_state_ptr: Arc::as_ptr(&host.state) as usize,
-        reached: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-    });
-    let mut hook = spawn_cancelled_before_cleanup_hook_cell()
-        .lock()
-        .expect("spawn cancelled-before-cleanup hook mutex poisoned");
-    assert!(
-        hook.is_none(),
-        "spawn cancelled-before-cleanup hook already installed"
-    );
-    *hook = Some(Arc::clone(&inner));
-    InstalledSpawnCancelledBeforeCleanupHook { inner }
-}
-
-#[cfg(test)]
-async fn wait_for_spawn_cancelled_before_cleanup_test_hook(host: &HostHandle) {
-    let hook = {
-        spawn_cancelled_before_cleanup_hook_cell()
-            .lock()
-            .expect("spawn cancelled-before-cleanup hook mutex poisoned")
-            .clone()
-    };
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
-        return;
-    }
-    hook.reached.notify_one();
-    hook.resume.notified().await;
-}
-
-#[cfg(test)]
-fn spawn_cancelled_before_cleanup_hook_cell() -> &'static SpawnCancelledBeforeCleanupHookCell {
-    static HOOK: std::sync::OnceLock<SpawnCancelledBeforeCleanupHookCell> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
 pub(crate) struct HostSubAgentEmitter {
     spawn_tx: HostSubAgentSpawnTx,
     capacity_tx: HostCapacityTx,
@@ -3058,16 +2518,6 @@ impl SubAgentEmitter for HostSubAgentEmitter {
 }
 
 impl HostHandle {
-    #[cfg(test)]
-    pub(crate) async fn register_host_stream(
-        &self,
-        host_stream: Stream,
-        agent_replay: AgentReplayMode,
-    ) -> Vec<DeferredAgentAttachment> {
-        self.register_host_stream_inner(host_stream, agent_replay, None)
-            .await
-    }
-
     pub(crate) async fn register_connection_host_stream(
         &self,
         host_stream: Stream,
@@ -3410,6 +2860,7 @@ impl HostHandle {
         }
         let (usage_handles, closed_usage_snapshots, live_usage_agent_ids, usage_agent_sessions) =
             task_token_usage_sources_for_state(&state);
+        let settings_store_for_projection = Arc::clone(&state.settings_store);
         drop(state);
         let task_token_usages = task_token_usage_rollups_from_handles(
             usage_handles,
@@ -3419,8 +2870,15 @@ impl HostHandle {
         )
         .await;
 
+        let (settings_doc, configured_secrets, settings_etag) = {
+            let store = settings_store_for_projection.lock().await;
+            settings_wire_projection(&store, &settings)
+        };
         let bootstrap = HostBootstrapPayload {
             settings,
+            settings_etag,
+            settings_schema: settings_model::host_settings_schema().clone(),
+            configured_secrets,
             mobile_access,
             backend_setup,
             session_schemas: schemas,
@@ -3448,8 +2906,11 @@ impl HostHandle {
             agents_view_preferences,
         };
 
-        let payload = serde_json::to_value(&bootstrap)
+        let mut payload = serde_json::to_value(&bootstrap)
             .expect("failed to serialize HostBootstrap payload for host stream registration");
+        // Replace the typed settings serialization with the redacted
+        // projection so secret values never reach the wire.
+        payload["settings"] = settings_doc;
         let bootstrap_agent_ids = bootstrap
             .agents
             .iter()
@@ -3698,12 +3159,6 @@ impl HostHandle {
             .workbench_parent_locks
             .insert(parent_project_id.clone(), Arc::downgrade(&lock));
         lock
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AppResult<AgentId> {
-        self.spawn_agent_with_origin(payload, AgentOrigin::User)
-            .await
     }
 
     fn schedule_generated_agent_name(
@@ -4303,23 +3758,6 @@ impl HostHandle {
             .await;
         let mut rx = team_compaction.rx;
         drain_final_agent_compact_notify(&old_agent_id, &mut rx)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn compact_agent(
-        &self,
-        agent_id: AgentId,
-        payload: AgentCompactPayload,
-        stream: Stream,
-    ) -> AppResult<()> {
-        let Some(compaction) = self
-            .begin_agent_compaction(agent_id, payload, stream, None)
-            .await?
-        else {
-            return Ok(());
-        };
-        self.finish_agent_compaction(compaction).await;
-        Ok(())
     }
 
     async fn begin_agent_compaction(
@@ -5141,6 +4579,7 @@ impl HostHandle {
                     startup_failure,
                     initial_alias,
                     use_mock_backend,
+                    mock_launch: None,
                 }
             }
             SpawnAgentParams::Resume { session_id, prompt } => {
@@ -5195,6 +4634,7 @@ impl HostHandle {
                             ))),
                             initial_alias,
                             use_mock_backend,
+                            mock_launch: None,
                         })
                         .await);
                 };
@@ -5247,6 +4687,7 @@ impl HostHandle {
                             ))),
                             initial_alias,
                             use_mock_backend,
+                            mock_launch: None,
                         })
                         .await);
                 }
@@ -5461,6 +4902,7 @@ impl HostHandle {
                     startup_failure: startup_failure.or(schema_failure).or(settings_failure),
                     initial_alias,
                     use_mock_backend,
+                    mock_launch: None,
                 }
             }
             SpawnAgentParams::Fork {
@@ -5527,6 +4969,7 @@ impl HostHandle {
                             ))),
                             initial_alias,
                             use_mock_backend,
+                            mock_launch: None,
                         })
                         .await);
                 };
@@ -5796,6 +5239,7 @@ impl HostHandle {
                     startup_failure,
                     initial_alias,
                     use_mock_backend,
+                    mock_launch: None,
                 }
             }
         };
@@ -5847,6 +5291,8 @@ impl HostHandle {
                 installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let transcript_store = state.transcript_store.clone();
+            #[cfg(feature = "test-support")]
+            let request = consume_mock_launch_reservation(&state, request);
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
@@ -5883,14 +5329,8 @@ impl HostHandle {
             startup_rx,
             visibility.clone(),
         );
-        #[cfg(test)]
-        wait_for_spawn_session_registration_test_hook(self).await;
 
-        #[cfg(test)]
-        wait_before_startup_failure_fanout_test_hook(self).await;
         let fanout_started = visibility.begin_fanout();
-        #[cfg(test)]
-        notify_startup_failure_fanout_claimed_test_hook(self);
         if !fanout_started {
             self.state
                 .lock()
@@ -6018,8 +5458,6 @@ impl HostHandle {
                 .wait_after_success_publication(publication_claimed)
                 .await;
         }
-        #[cfg(test)]
-        wait_after_spawn_new_agent_fanout_test_hook(self).await;
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
@@ -6033,8 +5471,6 @@ impl HostHandle {
             state.spawn_publication_claims.remove(&agent_id);
             cleanup_requested
         };
-        #[cfg(test)]
-        wait_for_spawn_visible_before_publication_test_hook(self).await;
         authorize_agent_session_publication(
             session_registration_publish,
             &session_summary_count_tx,
@@ -6309,6 +5745,8 @@ impl HostHandle {
                 installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let transcript_store = state.transcript_store.clone();
+            #[cfg(feature = "test-support")]
+            let request = consume_mock_launch_reservation(&state, request);
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
@@ -6340,14 +5778,8 @@ impl HostHandle {
             startup_rx,
             visibility.clone(),
         );
-        #[cfg(test)]
-        wait_for_spawn_session_registration_test_hook(self).await;
 
-        #[cfg(test)]
-        wait_before_startup_failure_fanout_test_hook(self).await;
         let fanout_started = visibility.begin_fanout();
-        #[cfg(test)]
-        notify_startup_failure_fanout_claimed_test_hook(self);
         if !fanout_started {
             return agent_id;
         }
@@ -6421,8 +5853,6 @@ impl HostHandle {
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
         }
-        #[cfg(test)]
-        wait_after_spawn_new_agent_fanout_test_hook(self).await;
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
@@ -6436,8 +5866,6 @@ impl HostHandle {
             state.spawn_publication_claims.remove(&agent_id);
             cleanup_requested
         };
-        #[cfg(test)]
-        wait_for_spawn_visible_before_publication_test_hook(self).await;
         authorize_agent_session_publication(
             session_registration_publish,
             &session_summary_count_tx,
@@ -8131,8 +7559,6 @@ impl HostHandle {
         let state = self.state.lock().await;
         let registry = state.team_registry.clone();
         let refs = agent_team_validation_refs(&state, operation).await?;
-        #[cfg(test)]
-        wait_for_team_mutation_after_refs_test_hook(self, operation).await;
         // Hold host_state through the registry mutation so the validation-ref
         // snapshot and persisted team change serialize with project/custom-agent deletes.
         let events = mutate(registry, refs)
@@ -8288,156 +7714,677 @@ impl HostHandle {
         fan_out_task_token_usages(&mut state, payloads).await;
     }
 
-    pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
-        const OPERATION: &str = "set_setting";
-        if let protocol::HostSettingValue::BackendNativeSettings { backend, settings } =
-            &payload.setting
-        {
-            match backend {
-                BackendKind::Tycode => {
-                    crate::backend::tycode::persist_native_settings(settings.clone())
-                        .await
-                        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-                    // A Tycode save can create or delete settings profiles,
-                    // which changes the session schema's `profile` Select —
-                    // re-publish it alongside the settings snapshot.
-                    self.refresh_backend_config_snapshots_after_native_save()
-                        .await;
-                    self.refresh_session_schemas_with_fanout(true).await;
+    pub(crate) async fn backend_native_settings_write(
+        &self,
+        payload: protocol::BackendNativeSettingsWritePayload,
+        host_output_stream: &Stream,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "backend_native_settings_write";
+        let _settings_apply_guard = self.settings_apply_lock.lock().await;
+        let outcome = match payload.backend {
+            BackendKind::Tycode => {
+                match crate::backend::tycode::persist_native_settings(payload.settings).await {
+                    Ok(()) => {
+                        self.refresh_backend_config_snapshots_after_native_save()
+                            .await;
+                        self.refresh_session_schemas_with_fanout(true).await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                BackendKind::Hermes => {
-                    let workspace_root = hermes_probe_workspace_root()
-                        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-                    let outcome = crate::backend::hermes::persist_native_settings(
-                        settings.clone(),
+            }
+            BackendKind::Hermes => {
+                let result = match hermes_probe_workspace_root() {
+                    Ok(workspace_root) => crate::backend::hermes::persist_native_settings(
+                        payload.settings,
                         &[workspace_root],
                     )
                     .await
-                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-                    // A Hermes save can change credentials and model defaults,
-                    // so the session schema (model options per profile) must
-                    // re-probe alongside the settings snapshot.
-                    self.refresh_backend_config_snapshots_after_native_save()
-                        .await;
-                    self.refresh_session_schemas_with_fanout(true).await;
-                    if let Some(error) = outcome.partial_error_message() {
-                        return Err(AppError::invalid(OPERATION, error));
+                    .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                match result {
+                    Ok(outcome) => {
+                        self.refresh_backend_config_snapshots_after_native_save()
+                            .await;
+                        self.refresh_session_schemas_with_fanout(true).await;
+                        outcome.partial_error_message().map_or(Ok(()), Err)
                     }
-                }
-                _ => {
-                    return Err(AppError::invalid(
-                        OPERATION,
-                        format!("{backend:?} does not support backend-native settings saves"),
-                    ));
+                    Err(error) => Err(error),
                 }
             }
-            return Ok(());
-        }
+            backend => Err(format!(
+                "{backend:?} does not support backend-native settings saves"
+            )),
+        };
 
-        if let protocol::HostSettingValue::BackendConfig { backend, values } = &payload.setting
-            && *backend == BackendKind::Tycode
-        {
-            let settings_store = {
-                let state = self.state.lock().await;
-                Arc::clone(&state.settings_store)
-            };
-            let previous = settings_store
-                .lock()
-                .await
+        let current_etag = {
+            let state = self.state.lock().await;
+            let store = state.settings_store.lock().await;
+            let settings = store
                 .get()
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-                .backend_config
-                .get(backend)
-                .map(|values| crate::backend::sanitize_backend_config_values(*backend, values))
-                .unwrap_or_default();
-            let incoming = crate::backend::validate_backend_config_values(*backend, values)
-                .map_err(|error| AppError::invalid(OPERATION, error))?;
-            let persistence_values =
-                crate::backend::tycode::tycode_backend_config_persistence_values(
-                    &incoming, &previous,
-                );
-            crate::backend::tycode::persist_backend_config(persistence_values)
-                .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        }
+            settings_wire_projection(&store, &settings).2
+        };
+        let (applied, field_errors) = match outcome {
+            Ok(()) => (true, Vec::new()),
+            Err(message) => (
+                false,
+                vec![protocol::SettingsFieldError {
+                    pointer: "".to_owned(),
+                    code: protocol::SettingsErrorCode::BackendRejected,
+                    message,
+                }],
+            ),
+        };
+        let result = protocol::SettingsWriteResultPayload {
+            write_id: payload.write_id,
+            applied,
+            current_etag,
+            field_errors,
+        };
+        let value = serde_json::to_value(result).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize SettingsWriteResult payload",
+                error,
+            )
+        })?;
+        let _ = host_output_stream.send_value(FrameKind::SettingsWriteResult, value);
+        Ok(())
+    }
 
-        if let protocol::HostSettingValue::MobileBrokerUrl { broker_url } = &payload.setting {
-            crate::store::settings::validate_mobile_broker_url_for_write(broker_url.as_ref())
-                .map_err(|error| AppError::invalid(OPERATION, error))?;
-        }
-
-        if let protocol::HostSettingValue::BackendTiers { backend, config } = &payload.setting
-            && (!config.low.0.is_empty() || !config.high.0.is_empty())
-        {
-            let schema = {
-                let state = self.state.lock().await;
-                session_schema_for_backend(&state, *backend, None)
-            }
-            .ok_or_else(|| {
-                AppError::invalid(
-                    OPERATION,
-                    format!("{backend:?} session settings schema unavailable"),
+    pub(crate) async fn invoke_settings_action(
+        &self,
+        payload: protocol::InvokeSettingsActionPayload,
+        host_output_stream: &Stream,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "invoke_settings_action";
+        let _settings_apply_guard = self.settings_apply_lock.lock().await;
+        let outcome = match payload.backend {
+            BackendKind::Tycode => {
+                crate::backend::tycode::invoke_settings_action(
+                    &payload.resource,
+                    &payload.action,
+                    payload.arguments,
                 )
-            })?;
-            validate_session_settings_values(&schema, &config.low).map_err(|error| {
-                AppError::invalid(OPERATION, format!("invalid Low tier: {error}"))
-            })?;
-            validate_session_settings_values(&schema, &config.high).map_err(|error| {
-                AppError::invalid(OPERATION, format!("invalid High tier: {error}"))
-            })?;
+                .await
+            }
+            backend => Err(format!(
+                "{backend:?} does not support settings resource actions"
+            )),
+        };
+
+        if let Ok(tombstones) = &outcome {
+            self.refresh_backend_config_snapshots_after_settings_action(tombstones)
+                .await;
+            self.refresh_session_schemas_with_fanout(true).await;
         }
 
-        let mut state = self.state.lock().await;
-        let refresh_session_schemas = matches!(
-            &payload.setting,
-            protocol::HostSettingValue::EnabledBackends { .. }
-        );
-        // Disabling a Hermes provider changes which models the schema offers,
-        // so the picker has to be rebuilt — otherwise a disabled provider's
-        // models stay selectable until something else forces a re-probe. Only
-        // Hermes is re-probed: nothing else reads this list.
-        let refresh_hermes_schema = matches!(
-            &payload.setting,
-            protocol::HostSettingValue::HermesDisabledProviders { .. }
-        );
-        let refresh_backend_config_snapshots = matches!(
-            &payload.setting,
-            protocol::HostSettingValue::EnabledBackends { .. }
-                | protocol::HostSettingValue::BackendConfig {
-                    backend: BackendKind::Tycode,
-                    ..
-                }
-        );
-        let refresh_voice_capabilities = matches!(
-            &payload.setting,
-            protocol::HostSettingValue::VoiceEnabled { .. }
-                | protocol::HostSettingValue::VoiceAwsRegion { .. }
-        );
-        let settings = state
-            .settings_store
-            .lock()
-            .await
-            .apply(payload.setting)
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        fan_out_host_settings(&mut state, settings.clone(), refresh_voice_capabilities).await;
+        let current_etag = {
+            let state = self.state.lock().await;
+            let store = state.settings_store.lock().await;
+            let settings = store
+                .get()
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            settings_wire_projection(&store, &settings).2
+        };
+        let (applied, field_errors) = match outcome {
+            Ok(_) => (true, Vec::new()),
+            Err(message) => (
+                false,
+                vec![protocol::SettingsFieldError {
+                    pointer: payload.resource,
+                    code: protocol::SettingsErrorCode::BackendRejected,
+                    message,
+                }],
+            ),
+        };
+        let result = protocol::SettingsWriteResultPayload {
+            write_id: payload.write_id,
+            applied,
+            current_etag,
+            field_errors,
+        };
+        let value = serde_json::to_value(result).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize SettingsWriteResult payload",
+                error,
+            )
+        })?;
+        let _ = host_output_stream.send_value(FrameKind::SettingsWriteResult, value);
+        Ok(())
+    }
+
+    async fn finish_settings_apply(
+        &self,
+        mut state: tokio::sync::MutexGuard<'_, HostState>,
+        settings: settings_model::HostSettings,
+        effects: SettingsApplyEffects,
+    ) {
+        fan_out_host_settings(
+            &mut state,
+            settings.clone(),
+            effects.refresh_voice_capabilities,
+        )
+        .await;
         apply_agent_activity_summary_setting(&mut state, &settings).await;
         apply_agent_supervisor_setting(&mut state, &settings);
         state.mobile_access.settings_changed(settings);
         fan_out_launch_profile_catalog(&mut state).await;
-        if refresh_session_schemas || refresh_backend_config_snapshots || refresh_hermes_schema {
+        if effects.refresh_session_schemas
+            || effects.refresh_backend_config_snapshots
+            || effects.refresh_hermes_schema
+        {
             drop(state);
-            if refresh_session_schemas {
+            if effects.refresh_session_schemas {
                 self.refresh_session_schemas().await;
             }
-            if refresh_hermes_schema {
+            if effects.refresh_hermes_schema {
                 self.refresh_session_schema_for_backend(BackendKind::Hermes)
                     .await;
             }
-            if refresh_backend_config_snapshots {
+            if effects.refresh_backend_config_snapshots {
                 self.refresh_backend_config_snapshots().await;
             }
         }
+    }
+
+    /// Apply an atomic, compare-and-swap settings write.
+    pub(crate) async fn settings_write(
+        &self,
+        payload: protocol::SettingsWritePayload,
+        host_output_stream: &Stream,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "settings_write";
+        use protocol::{SettingExpectation, SettingsErrorCode, SettingsFieldError};
+
+        let write_id = payload.write_id.clone();
+        let emit_result =
+            |applied: bool, current_etag: String, field_errors: Vec<SettingsFieldError>| {
+                let result = protocol::SettingsWriteResultPayload {
+                    write_id: write_id.clone(),
+                    applied,
+                    current_etag,
+                    field_errors,
+                };
+                let value = serde_json::to_value(&result)
+                    .expect("failed to serialize SettingsWriteResult payload");
+                let _ = host_output_stream.send_value(FrameKind::SettingsWriteResult, value);
+            };
+
+        let schema = settings_model::host_settings_schema();
+        let mut field_errors: Vec<SettingsFieldError> = Vec::new();
+        let push_error = |errors: &mut Vec<SettingsFieldError>,
+                          pointer: &str,
+                          code: SettingsErrorCode,
+                          message: String| {
+            errors.push(SettingsFieldError {
+                pointer: pointer.to_owned(),
+                code,
+                message,
+            });
+        };
+
+        // Keep each write's CAS, backend propagation, fanout, and result in
+        // one order even while the general host-state lock is released for I/O.
+        let _settings_apply_guard = self.settings_apply_lock.lock().await;
+        let state = self.state.lock().await;
+        let settings_store = Arc::clone(&state.settings_store);
+        let store = settings_store.lock().await;
+        let current = store
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let raw_doc = serde_json::to_value(&current)
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let (visible_doc, _configured_secrets, current_etag) =
+            settings_wire_projection(&store, &current);
+
+        if payload.ops.is_empty() {
+            push_error(
+                &mut field_errors,
+                "",
+                SettingsErrorCode::Invalid,
+                "a settings write must carry at least one operation".to_owned(),
+            );
+        }
+        if payload.ops.len() > protocol::SETTINGS_WRITE_MAX_OPS {
+            push_error(
+                &mut field_errors,
+                "",
+                SettingsErrorCode::Invalid,
+                format!(
+                    "a settings write may carry at most {} operations",
+                    protocol::SETTINGS_WRITE_MAX_OPS
+                ),
+            );
+        }
+
+        let mut parsed_ops: Vec<(
+            Vec<String>,
+            settings_model::SecretRelation,
+            &protocol::SettingOp,
+        )> = Vec::new();
+        for op in &payload.ops {
+            let Some(tokens) = protocol::parse_json_pointer(op.path()) else {
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::Invalid,
+                    "not a valid RFC 6901 JSON pointer".to_owned(),
+                );
+                continue;
+            };
+            if tokens.iter().any(|token| token == "-") {
+                // RFC 6901's `-` names the always-absent after-last element:
+                // every stale append would pass an "expected absent"
+                // precondition, so it has no meaningful CAS. Write the
+                // element index or the whole array instead.
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::Invalid,
+                    "array append ('-') is not supported: an always-absent target has no meaningful compare-and-swap precondition; write the element index or the whole array".to_owned(),
+                );
+                continue;
+            }
+            if !settings_model::schema_knows_path(schema, &tokens) {
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::UnknownPath,
+                    "the settings schema knows no such path".to_owned(),
+                );
+                continue;
+            }
+            let relation = settings_model::secret_relation(schema, &tokens);
+            if relation.strict_ancestor_of_secret {
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::SecretSubtree,
+                    "replacing an ancestor of a secret value could silently clear it; write the secret path directly".to_owned(),
+                );
+                continue;
+            }
+            if relation.at_or_inside_secret
+                && matches!(op.expected(), SettingExpectation::Value { .. })
+            {
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::SecretSubtree,
+                    "secret values are never on the wire; use a version-token or absent expectation"
+                        .to_owned(),
+                );
+                continue;
+            }
+            parsed_ops.push((tokens, relation, op));
+        }
+
+        let mut overlap_pointers: Vec<String> = Vec::new();
+        for (index, (tokens_a, _, op_a)) in parsed_ops.iter().enumerate() {
+            for (tokens_b, _, op_b) in parsed_ops.iter().skip(index + 1) {
+                if settings_model::paths_overlap(tokens_a, tokens_b) {
+                    for path in [op_a.path(), op_b.path()] {
+                        if !overlap_pointers.iter().any(|seen| seen == path) {
+                            overlap_pointers.push(path.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        for pointer in &overlap_pointers {
+            push_error(
+                &mut field_errors,
+                pointer,
+                SettingsErrorCode::OverlapRejected,
+                "overlaps another operation in the same write".to_owned(),
+            );
+        }
+
+        // Secret CAS uses a server-issued token because the true value is
+        // absent from the client-visible document.
+        if field_errors.is_empty() {
+            for (tokens, relation, op) in &parsed_ops {
+                let matches = match op.expected() {
+                    // `null` matches both an explicit null and an absent
+                    // member — clients cannot tell those apart in a document.
+                    SettingExpectation::Value { value } => {
+                        settings_model::pointer_get(&visible_doc, tokens)
+                            .unwrap_or(&serde_json::Value::Null)
+                            == value
+                    }
+                    SettingExpectation::Version { token } => {
+                        if relation.at_or_inside_secret {
+                            let key = store
+                                .secret_token_key()
+                                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                            token
+                                == &settings_model::secret_version_token(
+                                    &key,
+                                    op.path(),
+                                    settings_model::pointer_get(&raw_doc, tokens),
+                                )
+                        } else {
+                            token
+                                == &settings_model::version_token(settings_model::pointer_get(
+                                    &visible_doc,
+                                    tokens,
+                                ))
+                        }
+                    }
+                    SettingExpectation::Absent => {
+                        let source = if relation.at_or_inside_secret {
+                            &raw_doc
+                        } else {
+                            &visible_doc
+                        };
+                        matches!(
+                            settings_model::pointer_get(source, tokens),
+                            None | Some(serde_json::Value::Null)
+                        )
+                    }
+                };
+                if !matches {
+                    push_error(
+                        &mut field_errors,
+                        op.path(),
+                        SettingsErrorCode::Conflict,
+                        "the current value is not the expected one (concurrent edit); re-read and retry".to_owned(),
+                    );
+                }
+            }
+        }
+
+        if !field_errors.is_empty() {
+            drop(store);
+            drop(state);
+            emit_result(false, current_etag, field_errors);
+            return Ok(());
+        }
+
+        let mut candidate_doc = raw_doc;
+        for (tokens, _, op) in &parsed_ops {
+            let outcome = match op {
+                protocol::SettingOp::Replace { value, .. } => {
+                    settings_model::pointer_set(&mut candidate_doc, tokens, value.clone())
+                }
+                protocol::SettingOp::Remove { .. } => {
+                    settings_model::pointer_remove(&mut candidate_doc, tokens)
+                }
+            };
+            if let Err(message) = outcome {
+                push_error(
+                    &mut field_errors,
+                    op.path(),
+                    SettingsErrorCode::Invalid,
+                    message,
+                );
+            }
+        }
+        if !field_errors.is_empty() {
+            drop(store);
+            drop(state);
+            emit_result(false, current_etag, field_errors);
+            return Ok(());
+        }
+
+        let mut candidate: settings_model::HostSettings =
+            match serde_json::from_value(candidate_doc) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    drop(store);
+                    drop(state);
+                    push_error(
+                        &mut field_errors,
+                        if parsed_ops.len() == 1 {
+                            parsed_ops[0].2.path()
+                        } else {
+                            ""
+                        },
+                        SettingsErrorCode::Invalid,
+                        format!("the resulting document is not a valid settings document: {error}"),
+                    );
+                    emit_result(false, current_etag, field_errors);
+                    return Ok(());
+                }
+            };
+
+        // Normalizing enabled backends may clear the default. Reject a write
+        // that also edits the default rather than silently clobbering it.
+        candidate.enabled_backends =
+            crate::store::settings::normalize_backend_list(candidate.enabled_backends);
+        if !current.complexity_tiers_enabled && candidate.complexity_tiers_enabled {
+            for kind in [
+                BackendKind::Tycode,
+                BackendKind::Acp,
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Antigravity,
+                BackendKind::Hermes,
+            ] {
+                if kind != BackendKind::Codex {
+                    candidate
+                        .backend_tier_configs
+                        .entry(kind)
+                        .or_insert_with(|| crate::backend::builtin_tier_config(kind));
+                }
+            }
+        }
+        let default_orphaned = candidate
+            .default_backend
+            .is_some_and(|kind| !candidate.enabled_backends.contains(&kind));
+        if default_orphaned {
+            let touched = |field: &str| {
+                parsed_ops
+                    .iter()
+                    .any(|(tokens, _, _)| tokens.first().is_some_and(|token| token == field))
+            };
+            if touched("default_backend") && touched("enabled_backends") {
+                push_error(
+                    &mut field_errors,
+                    "/default_backend",
+                    SettingsErrorCode::OverlapRejected,
+                    "the enabled_backends write implicitly normalizes default_backend, which another operation targets".to_owned(),
+                );
+            } else if touched("default_backend") {
+                push_error(
+                    &mut field_errors,
+                    "/default_backend",
+                    SettingsErrorCode::Invalid,
+                    "default_backend must be one of enabled_backends".to_owned(),
+                );
+            } else {
+                candidate.default_backend = None;
+            }
+        }
+
+        // These live checks depend on the old/new diff, not JSON shape alone.
+        if candidate.supervisor.max_kicks_per_task != current.supervisor.max_kicks_per_task
+            && candidate.supervisor.max_kicks_per_task == 0
+        {
+            push_error(
+                &mut field_errors,
+                "/supervisor/max_kicks_per_task",
+                SettingsErrorCode::Invalid,
+                "supervisor max kicks per task must be at least 1; disable the supervisor instead of setting it to 0".to_owned(),
+            );
+        }
+        if candidate.mobile_broker_url != current.mobile_broker_url
+            && let Err(message) = crate::store::settings::validate_mobile_broker_url_for_write(
+                candidate.mobile_broker_url.as_ref(),
+            )
+        {
+            push_error(
+                &mut field_errors,
+                "/mobile_broker_url",
+                SettingsErrorCode::Invalid,
+                message,
+            );
+        }
+        let backend_tiers_touched = parsed_ops.iter().any(|(tokens, _, _)| {
+            tokens
+                .first()
+                .is_some_and(|token| token == "backend_tier_configs")
+        });
+        for (backend, config) in &candidate.backend_tier_configs {
+            if !backend_tiers_touched {
+                continue;
+            }
+            if current.backend_tier_configs.get(backend) == Some(config)
+                || (config.low.0.is_empty() && config.high.0.is_empty())
+            {
+                continue;
+            }
+            let pointer = format!("/backend_tier_configs/{}", backend_wire_slug(*backend));
+            let Some(schema) = session_schema_for_backend(&state, *backend, None) else {
+                push_error(
+                    &mut field_errors,
+                    &pointer,
+                    SettingsErrorCode::Unavailable,
+                    format!("{backend:?} session settings schema unavailable"),
+                );
+                continue;
+            };
+            if let Err(error) = validate_session_settings_values(&schema, &config.low) {
+                push_error(
+                    &mut field_errors,
+                    &pointer,
+                    SettingsErrorCode::Invalid,
+                    format!("invalid Low tier: {error}"),
+                );
+            }
+            if let Err(error) = validate_session_settings_values(&schema, &config.high) {
+                push_error(
+                    &mut field_errors,
+                    &pointer,
+                    SettingsErrorCode::Invalid,
+                    format!("invalid High tier: {error}"),
+                );
+            }
+        }
+        let mut tycode_config_update: Option<protocol::BackendConfigValues> = None;
+        for (backend, values) in &candidate.backend_config {
+            if current.backend_config.get(backend) == Some(values) || values.0.is_empty() {
+                continue;
+            }
+            match crate::backend::validate_backend_config_values(*backend, values) {
+                Ok(validated) => {
+                    if *backend == BackendKind::Tycode {
+                        tycode_config_update = Some(validated);
+                    }
+                }
+                Err(message) => push_error(
+                    &mut field_errors,
+                    &format!("/backend_config/{}", backend_wire_slug(*backend)),
+                    SettingsErrorCode::Invalid,
+                    message,
+                ),
+            }
+        }
+        if tycode_config_update.is_none()
+            && current.backend_config.contains_key(&BackendKind::Tycode)
+            && !candidate.backend_config.contains_key(&BackendKind::Tycode)
+        {
+            // An explicit clear of the Tycode config still propagates.
+            tycode_config_update = Some(protocol::BackendConfigValues::default());
+        }
+
+        if !field_errors.is_empty() {
+            drop(store);
+            drop(state);
+            emit_result(false, current_etag, field_errors);
+            return Ok(());
+        }
+
+        // Commit before external propagation so a downstream failure cannot
+        // leave external state changed while the host store remains stale.
+        let committed = match store.replace(candidate) {
+            Ok(committed) => committed,
+            Err(message) => {
+                drop(store);
+                drop(state);
+                push_error(
+                    &mut field_errors,
+                    if parsed_ops.len() == 1 {
+                        parsed_ops[0].2.path()
+                    } else {
+                        ""
+                    },
+                    SettingsErrorCode::Invalid,
+                    message,
+                );
+                emit_result(false, current_etag, field_errors);
+                return Ok(());
+            }
+        };
+        drop(store);
+
+        let mut effects = SettingsApplyEffects::from_diff(&current, &committed);
+        if parsed_ops.iter().any(|(tokens, _, _)| {
+            tokens
+                .first()
+                .is_some_and(|token| token == "enabled_backends")
+        }) {
+            effects.refresh_session_schemas = true;
+            effects.refresh_backend_config_snapshots = true;
+        }
+        let mut propagation_errors: Vec<SettingsFieldError> = Vec::new();
+        if let Some(incoming) = tycode_config_update {
+            drop(state);
+            let previous = current
+                .backend_config
+                .get(&BackendKind::Tycode)
+                .map(|values| {
+                    crate::backend::sanitize_backend_config_values(BackendKind::Tycode, values)
+                })
+                .unwrap_or_default();
+            let persistence_values =
+                crate::backend::tycode::tycode_backend_config_persistence_values(
+                    &incoming, &previous,
+                );
+            if let Err(message) =
+                crate::backend::tycode::persist_backend_config(persistence_values).await
+            {
+                propagation_errors.push(SettingsFieldError {
+                    pointer: "/backend_config/tycode".to_owned(),
+                    code: SettingsErrorCode::BackendRejected,
+                    message,
+                });
+            }
+            let state = self.state.lock().await;
+            self.finish_settings_apply(state, committed.clone(), effects)
+                .await;
+        } else {
+            self.finish_settings_apply(state, committed.clone(), effects)
+                .await;
+        }
+
+        let new_etag = {
+            let store = settings_store.lock().await;
+            let (_doc, _configured_secrets, etag) = settings_wire_projection(&store, &committed);
+            etag
+        };
+        emit_result(true, new_etag, propagation_errors);
         Ok(())
+    }
+
+    pub(crate) async fn settings_write_for_internal_caller(
+        &self,
+        payload: protocol::SettingsWritePayload,
+    ) -> AppResult<protocol::SettingsWriteResultPayload> {
+        const OPERATION: &str = "settings_write_for_internal_caller";
+        let (queue, mut receiver) = crate::stream::output_channel();
+        let stream = Stream::new(StreamPath("/host/internal-settings".to_owned()), queue);
+        self.settings_write(payload, &stream).await?;
+        let envelope = receiver.try_recv().map_err(|error| {
+            AppError::internal_message(OPERATION, "settings write produced no result", error)
+        })?;
+        envelope.parse_payload().map_err(|error| {
+            AppError::internal_message(OPERATION, "failed to parse settings write result", error)
+        })
     }
 
     pub(crate) async fn set_agents_view_preferences(
@@ -8706,11 +8653,25 @@ impl HostHandle {
     }
 
     async fn refresh_backend_config_snapshots_after_native_save(&self) {
-        self.refresh_backend_config_snapshots_with_fanout(true)
+        self.refresh_backend_config_snapshots_with_fanout_and_tombstones(true, &[])
+            .await;
+    }
+
+    async fn refresh_backend_config_snapshots_after_settings_action(&self, tombstones: &[String]) {
+        self.refresh_backend_config_snapshots_with_fanout_and_tombstones(true, tombstones)
             .await;
     }
 
     async fn refresh_backend_config_snapshots_with_fanout(&self, force_emit: bool) {
+        self.refresh_backend_config_snapshots_with_fanout_and_tombstones(force_emit, &[])
+            .await;
+    }
+
+    async fn refresh_backend_config_snapshots_with_fanout_and_tombstones(
+        &self,
+        force_emit: bool,
+        tombstones: &[String],
+    ) {
         let (settings_store, skip_real_backend_probe) = {
             let state = self.state.lock().await;
             (
@@ -8726,11 +8687,24 @@ impl HostHandle {
                 panic!("failed to load host settings for backend config snapshots: {err}")
             })
             .enabled_backends;
-        let snapshots = if skip_real_backend_probe {
+        let mut snapshots = if skip_real_backend_probe {
             BackendSettingsSnapshots::default()
         } else {
             backend_config_snapshots_for_enabled_backends(&enabled_backends).await
         };
+        if !tombstones.is_empty()
+            && let Some(settings) = snapshots
+                .native_settings
+                .iter_mut()
+                .find(|snapshot| snapshot.backend_kind == BackendKind::Tycode)
+                .and_then(|snapshot| snapshot.settings.as_mut())
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            settings.insert(
+                "tombstones".to_owned(),
+                serde_json::to_value(tombstones).expect("serialize Tycode resource tombstones"),
+            );
+        }
         let mut state = self.state.lock().await;
         state.backend_config_snapshots = snapshots.backend_config;
         state.backend_native_settings_snapshots = snapshots.native_settings;
@@ -8993,9 +8967,14 @@ impl HostHandle {
             (previous_hermes, None)
         } else if enabled_backends.contains(&protocol::BackendKind::Hermes) {
             if skip_real_backend_probe {
+                // The mock probe is settings-dependent (it applies the same
+                // disabled-provider filter as the real one) so sims can
+                // observe the provider-disable coupling's published effect.
                 (
                     HermesSessionSchemaState::Ready(
-                        <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
+                        crate::backend::hermes::mock_probe_session_settings_schema(
+                            &hermes_disabled_providers,
+                        ),
                     ),
                     Some(Vec::new()),
                 )
@@ -9765,7 +9744,7 @@ impl HostHandle {
         self.state.lock().await.registry.subscribe_status_changes()
     }
 
-    pub(crate) async fn read_settings(&self) -> Result<protocol::HostSettings, String> {
+    pub(crate) async fn read_settings(&self) -> Result<settings_model::HostSettings, String> {
         self.state.lock().await.settings_store.lock().await.get()
     }
 
@@ -10640,6 +10619,7 @@ impl HostHandle {
                 persistence: InitialAgentAliasPersistence::User,
             }),
             use_mock_backend,
+            mock_launch: None,
         };
         let coordinator_agent_id = self.spawn_resolved_agent(request).await;
         self.workflow_note_agent(&run_id, coordinator_agent_id.clone(), true)
@@ -11028,11 +11008,7 @@ impl HostHandle {
                         error = %err,
                         "agent startup failed before session registration"
                     );
-                    #[cfg(test)]
-                    wait_for_startup_failure_fanout_race_test_hook(&host).await;
                     let failure_visibility = visibility.claim_startup_failure();
-                    #[cfg(test)]
-                    notify_startup_failure_claimed_test_hook(&host);
                     if failure_visibility == StartupFailureVisibility::AwaitPublication
                         && (publication_authorized || publish_rx.recv().await.is_some())
                     {
@@ -11171,8 +11147,6 @@ impl HostHandle {
             agent_id = %agent_id,
             "unpublished agent visibility quiesced before actor cleanup"
         );
-        #[cfg(test)]
-        wait_for_spawn_cancelled_before_cleanup_test_hook(self).await;
         let closed = self.close_agent_for_recorded_visibility(&agent_id).await;
         tracing::debug!(
             agent_id = %agent_id,
@@ -12769,6 +12743,7 @@ impl HostHandle {
                 persistence: InitialAgentAliasPersistence::User,
             }),
             use_mock_backend,
+            mock_launch: None,
         };
         let agent_id = self.spawn_resolved_agent(request).await;
         tracing::info!(
@@ -13918,9 +13893,6 @@ fn spawn_host_inner(
             paths.session.with_file_name("transcripts")
         };
     let transcript_store = TranscriptStore::new(transcript_root);
-    #[cfg(test)]
-    let transcript_store =
-        transcript_store.with_actor_io_enabled(runtime_config.enable_actor_transcript_io);
     let antigravity_conversations_dir =
         crate::backend::antigravity::resolve_antigravity_conversations_dir(
             runtime_config.antigravity_conversations_dir.as_deref(),
@@ -14091,7 +14063,7 @@ fn spawn_host_inner(
             codex_session_schema: CodexSessionSchemaState::Pending,
             acp_session_schemas: HashMap::new(),
             hermes_session_schema: HermesSessionSchemaState::Pending,
-            hermes_launch_profiles: Vec::new(),
+            hermes_launch_profiles: Default::default(),
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             backend_capacity: initial_backend_capacity_snapshots(),
@@ -14111,12 +14083,15 @@ fn spawn_host_inner(
             removing_projects: HashSet::new(),
             #[cfg(feature = "test-support")]
             agent_name_test_gate: None,
+            #[cfg(feature = "test-support")]
+            mock_launch_reservation: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             session_schema_probe_count: 0,
         })),
         workflow_save_lock: Arc::new(Mutex::new(())),
         backend_setup_refresh_lock: Arc::new(Mutex::new(())),
         session_schema_refresh_lock: Arc::new(Mutex::new(())),
+        settings_apply_lock: Arc::new(Mutex::new(())),
         spawn_operations: spawn_operation_handle.clone(),
         spawn_operation_owner: Some(Arc::clone(&spawn_operations)),
     };
@@ -14127,6 +14102,7 @@ fn spawn_host_inner(
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
+            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
             spawn_operations: spawn_operation_handle,
         },
         spawn_operation_rx,
@@ -14245,12 +14221,7 @@ fn spawn_host_inner(
     spawn_host_team_status_task(host.clone());
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
-    #[cfg(not(test))]
     spawn_agent_supervisor_task(host.clone());
-    #[cfg(test)]
-    if runtime_config.start_agent_supervisor_worker {
-        spawn_agent_supervisor_task(host.clone());
-    }
 
     Ok(host)
 }
@@ -14759,7 +14730,7 @@ fn finish_supervisor_compaction(
 /// than work this agent just did, so judging it is opt-in.
 fn supervisor_idle_phase(
     status: &crate::agent::registry::AgentStatus,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
     idle_since: Instant,
 ) -> SupervisorPhase {
     if status.restored_without_live_turn && !settings.supervise_restored_agents {
@@ -14818,7 +14789,7 @@ fn supervisor_active_phase_unchanged(
 /// stalled. `None` when the stall timeout is off or the clock is paused.
 fn supervisor_stall_deadline(
     phase: &SupervisorPhase,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
 ) -> Option<Instant> {
     if !settings.stall_timeout_enabled {
         return None;
@@ -14849,7 +14820,7 @@ fn supervised_observation_is_eligible(observation: &ActivitySummaryObservation) 
 
 fn supervisor_phase_for_fresh_observation(
     status: &crate::agent::registry::AgentStatus,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
     now: Instant,
 ) -> SupervisorPhase {
     if status.is_active() {
@@ -14881,7 +14852,7 @@ enum LiveRetrySettingsResult {
 fn apply_live_retry_settings(
     agent_id: &AgentId,
     entry: &mut SupervisorSchedulerEntry,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
 ) -> LiveRetrySettingsResult {
     let maximum_attempts = settings.retry_attempts.saturating_add(1);
     let pending = match &entry.phase {
@@ -15084,7 +15055,7 @@ fn apply_live_stall_settings(
 async fn observe_supervised_agents(
     host: &HostHandle,
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
 ) {
     let observations = host.activity_summary_observations().await;
     let eligible_ids = observations
@@ -15402,7 +15373,7 @@ async fn interrupt_stalled_supervised_agent(
 fn supervisor_defer_stall_check(
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     agent_id: &AgentId,
-    settings: protocol::SupervisorSettings,
+    settings: settings_model::SupervisorSettings,
     now: Instant,
 ) {
     let Some(entry) = entries.get_mut(agent_id) else {
@@ -16924,7 +16895,6 @@ fn emit_spawn_operation_error(terminal: &SpawnOperationTerminal, error: &AppErro
         &terminal.output_stream,
         terminal.request_stream.clone(),
         FrameKind::SpawnAgent,
-        None,
         error,
     );
 }
@@ -17126,7 +17096,7 @@ fn spawn_host_workflow_catalog_task(
 }
 
 pub(crate) fn startup_mcp_servers_for_settings(
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
     workspace_roots: &[String],
     debug_mcp: &DebugMcpHandle,
     agent_control_mcp: &AgentControlMcpHandle,
@@ -18938,26 +18908,6 @@ fn extend_task_token_usage_reasons(
     }
 }
 
-#[cfg(test)]
-fn normalize_antigravity_session_resumability_with<F>(
-    sessions: &mut [SessionSummary],
-    is_antigravity_resumable: F,
-) where
-    F: Fn(&SessionId) -> bool,
-{
-    for session in sessions {
-        if session.backend_kind == protocol::BackendKind::Antigravity {
-            session.resumable = !antigravity_summary_is_permanently_non_resumable(session)
-                && is_antigravity_resumable(&session.id);
-        }
-    }
-}
-
-#[cfg(test)]
-fn antigravity_summary_is_permanently_non_resumable(session: &SessionSummary) -> bool {
-    session.compacted_to_session_id.is_some() || (!session.resumable && session.parent_id.is_some())
-}
-
 async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -19340,9 +19290,50 @@ async fn emit_review_list_changed_for_project(
         .await
 }
 
+/// Which post-commit refreshes a settings apply must trigger. The legacy
+/// typed path derives these from the written variant; the generic write path
+/// derives them from an old/new typed diff. Both feed the same
+/// `finish_settings_apply`, so a coupling cannot exist on one path and be
+/// silently missing from the other.
+#[derive(Debug, Default, Clone, Copy)]
+struct SettingsApplyEffects {
+    refresh_session_schemas: bool,
+    refresh_hermes_schema: bool,
+    refresh_backend_config_snapshots: bool,
+    refresh_voice_capabilities: bool,
+}
+
+impl SettingsApplyEffects {
+    fn from_diff(old: &settings_model::HostSettings, new: &settings_model::HostSettings) -> Self {
+        let enabled_backends_changed = old.enabled_backends != new.enabled_backends;
+        Self {
+            refresh_session_schemas: enabled_backends_changed,
+            // Hermes provider-disable must re-probe the Hermes session
+            // schema (named side-effect requirement (a)).
+            refresh_hermes_schema: old.hermes_disabled_providers != new.hermes_disabled_providers,
+            // EnabledBackends must refresh config snapshots + session
+            // schemas (named side-effect requirement (b)).
+            refresh_backend_config_snapshots: enabled_backends_changed
+                || old.backend_config.get(&BackendKind::Tycode)
+                    != new.backend_config.get(&BackendKind::Tycode),
+            refresh_voice_capabilities: old.voice.enabled != new.voice.enabled
+                || old.voice.aws_region != new.voice.aws_region,
+        }
+    }
+}
+
+/// The serde wire name of a backend kind, for RFC 6901 pointers into the
+/// settings document (`backend_config`/`backend_tier_configs` keys).
+fn backend_wire_slug(kind: BackendKind) -> String {
+    match serde_json::to_value(kind).expect("BackendKind serializes") {
+        serde_json::Value::String(slug) => slug,
+        other => panic!("BackendKind serialized to a non-string value: {other}"),
+    }
+}
+
 async fn fan_out_host_settings(
     state: &mut HostState,
-    settings: protocol::HostSettings,
+    settings: settings_model::HostSettings,
     refresh_voice_capabilities: bool,
 ) {
     if let Err(error) = sync_code_intel_router_roots(state).await {
@@ -19355,6 +19346,14 @@ async fn fan_out_host_settings(
         router.update_settings(settings.code_intel.clone());
     }
 
+    // One projection for every subscriber: the redacted document, the
+    // configured-secret side channel, and the etag are properties of the
+    // settings state, not of the connection.
+    let payload = {
+        let store = state.settings_store.lock().await;
+        host_settings_frame_payload(&store, &settings)
+    };
+
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -19362,7 +19361,7 @@ async fn fan_out_host_settings(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        let result = emit_host_settings_for_subscriber(&settings, subscriber).await;
+        let result = emit_host_settings_for_subscriber(&payload, subscriber).await;
         let result = if refresh_voice_capabilities {
             result.and_then(|()| emit_voice_capabilities_for_subscriber(&settings, subscriber))
         } else {
@@ -19413,7 +19412,7 @@ async fn sync_code_intel_router_roots(state: &mut HostState) -> Result<(), Strin
 
 async fn apply_agent_activity_summary_setting(
     state: &mut HostState,
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
 ) {
     let enabled = settings.background_agent_features.agent_activity_summaries;
     let current = *state.activity_summary_settings_tx.borrow();
@@ -19450,7 +19449,7 @@ async fn apply_agent_activity_summary_setting(
     }
 }
 
-fn apply_agent_supervisor_setting(state: &mut HostState, settings: &protocol::HostSettings) {
+fn apply_agent_supervisor_setting(state: &mut HostState, settings: &settings_model::HostSettings) {
     let current = *state.supervisor_settings_tx.borrow();
     if current.settings == settings.supervisor {
         return;
@@ -20048,19 +20047,66 @@ async fn emit_workflow_run_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::WorkflowRunNotify, payload)
 }
 
-async fn emit_host_settings_for_subscriber(
-    settings: &protocol::HostSettings,
-    subscriber: &mut HostSubscriber,
-) -> Result<(), StreamClosed> {
-    let payload = serde_json::to_value(HostSettingsPayload {
+/// The client-visible projection of a settings document: the serialized
+/// document with every write-only (secret) value omitted, the configured
+/// secrets with their server-issued (keyed) revision tokens, and the
+/// content-derived etag covering both. Every outbound settings document
+/// (bootstrap and fanout) goes through this.
+fn settings_wire_projection(
+    store: &crate::store::settings::HostSettingsStore,
+    settings: &settings_model::HostSettings,
+) -> (serde_json::Value, Vec<protocol::ConfiguredSecret>, String) {
+    let mut doc = serde_json::to_value(settings)
+        .expect("failed to serialize host settings for wire projection");
+    let secret_values =
+        settings_model::redact_write_only(settings_model::host_settings_schema(), &mut doc);
+    let configured_secrets = if secret_values.is_empty() {
+        Vec::new()
+    } else {
+        // Fail visibly, never silently publish secrets without their
+        // revision tokens (no-fallbacks policy).
+        let key = store
+            .secret_token_key()
+            .expect("failed to load the settings secret token key");
+        secret_values
+            .into_iter()
+            .map(|(pointer, value)| protocol::ConfiguredSecret {
+                token: settings_model::secret_version_token(&key, &pointer, Some(&value)),
+                pointer,
+            })
+            .collect()
+    };
+    let etag = settings_model::document_etag(&doc, &configured_secrets);
+    (doc, configured_secrets, etag)
+}
+
+/// The serialized `HostSettings` frame payload for one settings state, with
+/// the redacted document substituted for the typed serialization so secret
+/// values never reach the wire.
+fn host_settings_frame_payload(
+    store: &crate::store::settings::HostSettingsStore,
+    settings: &settings_model::HostSettings,
+) -> serde_json::Value {
+    let (doc, configured_secrets, etag) = settings_wire_projection(store, settings);
+    let mut payload = serde_json::to_value(HostSettingsPayload {
         settings: settings.clone(),
+        etag,
+        configured_secrets,
     })
     .expect("failed to serialize HostSettings payload for host stream fanout");
-    emit_or_queue_host_frame(subscriber, FrameKind::HostSettings, payload)
+    payload["settings"] = doc;
+    payload
+}
+
+async fn emit_host_settings_for_subscriber(
+    payload: &serde_json::Value,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    emit_or_queue_host_frame(subscriber, FrameKind::HostSettings, payload.clone())
 }
 
 fn emit_voice_capabilities_for_subscriber(
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
     let Some(desktop) = subscriber.voice_desktop else {
@@ -20139,7 +20185,7 @@ async fn emit_session_schemas_for_subscriber(
 /// The persisted deep-config values to apply for a spawn of `backend_kind`,
 /// re-sanitized against the current schema. Empty when unconfigured.
 fn resolve_backend_config_for_spawn(
-    host_settings: &protocol::HostSettings,
+    host_settings: &settings_model::HostSettings,
     backend_kind: protocol::BackendKind,
 ) -> protocol::BackendConfigValues {
     host_settings
@@ -20214,7 +20260,7 @@ fn session_schema_resolution_for_backend(
 
 fn tier_values_for_hint(
     hint: protocol::SpawnCostHint,
-    config: &protocol::BackendTierConfig,
+    config: &settings_model::BackendTierConfig,
 ) -> protocol::SessionSettingsValues {
     match hint {
         protocol::SpawnCostHint::Low => config.low.clone(),
@@ -20390,7 +20436,7 @@ fn session_schemas_for_enabled_backends(
 
 fn launch_profile_catalog_for_settings(
     state: &HostState,
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
 ) -> LaunchProfileCatalog {
     let mut entries = Vec::new();
     for backend_kind in settings.enabled_backends.iter().copied() {
@@ -20436,7 +20482,7 @@ fn launch_profile_catalog_for_settings(
         });
     }
 
-    for config in &settings.launch_profiles {
+    for config in settings.launch_profiles.values() {
         if settings.enabled_backends.contains(&config.backend_kind) {
             entries.push(launch_profile_entry_for_config(state, config));
         }
@@ -20486,7 +20532,7 @@ pub(crate) fn builtin_kiro_launch_profile() -> LaunchProfile {
 /// profiles. Returns `None` when the id is unknown so the caller decides what
 /// an unresolvable profile means.
 pub(crate) fn acp_agent_for_profile(
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
     profile_id: &LaunchProfileId,
 ) -> Option<protocol::AcpAgentSpec> {
     if profile_id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
@@ -20494,8 +20540,7 @@ pub(crate) fn acp_agent_for_profile(
     }
     settings
         .launch_profiles
-        .iter()
-        .find(|profile| &profile.id == profile_id)
+        .get(profile_id)
         .and_then(|profile| profile.acp.clone())
 }
 
@@ -20503,10 +20548,10 @@ pub(crate) fn acp_agent_for_profile(
 /// any the user configured. Probing and schema lookup both key off this, so a
 /// user-added agent gets its own schema rather than inheriting Kiro's.
 pub(crate) fn configured_acp_profile_ids(
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
 ) -> Vec<LaunchProfileId> {
     let mut ids = vec![LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned())];
-    for profile in &settings.launch_profiles {
+    for profile in settings.launch_profiles.values() {
         if profile.backend_kind == protocol::BackendKind::Acp
             && profile.id.0 != protocol::KIRO_LAUNCH_PROFILE_ID
         {
@@ -20539,7 +20584,7 @@ fn acp_schema_state<'a>(
 /// The configured ACP agents as the setup probe wants them: one per launch
 /// profile, labelled the way the user sees it in Settings.
 pub(crate) fn configured_acp_setup_agents(
-    settings: &protocol::HostSettings,
+    settings: &settings_model::HostSettings,
 ) -> Vec<crate::backend::setup::ConfiguredAcpAgent> {
     configured_acp_profile_ids(settings)
         .into_iter()
@@ -20550,8 +20595,7 @@ pub(crate) fn configured_acp_setup_agents(
             } else {
                 settings
                     .launch_profiles
-                    .iter()
-                    .find(|profile| profile.id == id)
+                    .get(&id)
                     .map(|profile| profile.label.clone())
                     .unwrap_or_else(|| id.0.clone())
             };
@@ -21068,10293 +21112,4 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::mock::{
-        MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL, MOCK_DIE_AFTER_BUSY_SENTINEL,
-        MOCK_SLOW_TURN_SENTINEL,
-    };
-    use crate::review::ReviewHandle;
-    use crate::store::agent_teams::AgentTeamsStoreFile;
-    use crate::store::transcript::TranscriptVisibility;
-    use protocol::{
-        BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
-        BackendNativeSettingsSnapshot, CompactionMetrics, CompactionTrigger, CustomAgentId,
-        DiffContextMode, HostSettingValue, ProjectDiffScope, ProjectGitDiffFile,
-        ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
-        ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
-    };
-    use tokio::time::timeout;
-
-    static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-    static SPAWN_NEW_AGENT_FANOUT_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-
-    #[test]
-    fn bootstrap_delivery_claims_only_uncovered_visibility() {
-        let visibility = AgentVisibilityRegistry::default();
-        let agent_id = AgentId("coverage-agent".to_owned());
-        let covered = StreamPath("/host/covered".to_owned());
-        let uncovered = StreamPath("/host/uncovered".to_owned());
-
-        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, false));
-        assert!(visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
-
-        visibility.begin_pending(agent_id.clone());
-        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
-        assert!(visibility.begin_fanout(&agent_id));
-        visibility.begin_fanout_batch(&agent_id, HashSet::from([covered.clone()]));
-        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &covered, true));
-        assert!(visibility.claim_bootstrap_delivery(&agent_id, &uncovered, false));
-        assert_eq!(
-            visibility.visible_host_streams(&agent_id),
-            HashSet::from([uncovered.clone()])
-        );
-
-        assert!(!visibility.finish_fanout(&agent_id));
-        assert!(visibility.claim_bootstrap_delivery(&agent_id, &covered, false));
-        visibility.cancel_outer_spawn(&agent_id);
-        assert!(!visibility.claim_bootstrap_delivery(&agent_id, &uncovered, true));
-    }
-
-    #[test]
-    fn installed_backend_version_selects_exact_backend_setup_value() {
-        let mut setup = setup::stub_backend_setup();
-        setup
-            .backends
-            .iter_mut()
-            .find(|entry| entry.backend_kind == BackendKind::Claude)
-            .expect("Claude setup entry")
-            .installed_version = Some("2.1.220".to_owned());
-        setup
-            .backends
-            .iter_mut()
-            .find(|entry| entry.backend_kind == BackendKind::Antigravity)
-            .expect("Antigravity setup entry")
-            .installed_version = Some("antigravity-local-build".to_owned());
-
-        assert_eq!(
-            installed_backend_version(&setup, BackendKind::Claude).as_deref(),
-            Some("2.1.220")
-        );
-        assert_eq!(
-            installed_backend_version(&setup, BackendKind::Antigravity).as_deref(),
-            Some("antigravity-local-build")
-        );
-        assert_eq!(installed_backend_version(&setup, BackendKind::Codex), None);
-    }
-
-    #[test]
-    fn team_member_result_uses_terminal_notify_logical_session() {
-        let result = team_member_context_compaction_result_from_terminal(
-            AgentId("agent".to_owned()),
-            protocol::CompactionOperationId("operation".to_owned()),
-            ContextCompactionNotifyPayload {
-                operation_id: protocol::CompactionOperationId("operation".to_owned()),
-                agent_id: AgentId("agent".to_owned()),
-                logical_session_id: SessionId("session-after-mid-run-change".to_owned()),
-                backend_kind: BackendKind::Claude,
-                trigger: CompactionTrigger::TeamRequested,
-                method: Some(CompactionMethod::InlineFallback),
-                status: ContextCompactionStatus::Completed,
-                provider_version: None,
-                metrics: CompactionMetrics::default(),
-                message: None,
-            },
-        );
-
-        assert_eq!(result.logical_session_id.0, "session-after-mid-run-change");
-        assert_eq!(result.mutation, CompactionMutation::Completed);
-    }
-
-    async fn recv_session_summary_count(
-        rx: &mut crate::stream::OutputReceiver,
-        context: &str,
-    ) -> SessionSummaryCountUpdatedPayload {
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx
-                    .recv()
-                    .await
-                    .unwrap_or_else(|| panic!("{context} stream closed"));
-                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
-                    return envelope.parse_payload().unwrap_or_else(|error| {
-                        panic!("invalid {context} count payload: {error}")
-                    });
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {context} count"))
-    }
-
-    async fn assert_no_session_summary_count(
-        rx: &mut crate::stream::OutputReceiver,
-        context: &str,
-    ) {
-        let received = timeout(Duration::from_millis(50), async {
-            loop {
-                let envelope = rx.recv().await?;
-                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
-                    return Some(envelope);
-                }
-            }
-        })
-        .await;
-        match received {
-            Err(_) => {}
-            Ok(Some(envelope)) => panic!(
-                "{context} received targeted count on {}: {:?}",
-                envelope.stream, envelope.payload
-            ),
-            Ok(None) => panic!("{context} stream closed"),
-        }
-    }
-
-    #[test]
-    fn default_compaction_prompt_matches_approved_handoff_note() {
-        let expected = r#"You are writing a handoff note for the Tyde agent that will replace you after this session is compacted. It will see only this note — not the conversation. Capture the durable context it needs to continue seamlessly, and nothing else.
-
-If there is genuinely nothing durable to carry forward, output exactly `No durable context.` and stop.
-
-Otherwise use these sections; omit any that are empty rather than padding them:
-
-- **Objective & acceptance criteria** — what we are ultimately trying to achieve and what "done" looks like.
-- **Current state & next step** — what is in progress now and the single most important next action.
-- **Open threads** — unfinished work, unanswered questions, and known blockers.
-- **Decisions, rationale & rejected alternatives** — what was decided or ruled out and why, so the replacement neither relitigates nor violates them.
-- **Key paths, artifacts & how to verify** — the specific files, commands, endpoints, and checks needed to continue and to confirm work is correct.
-- **Project & environment facts** — durable, non-obvious facts about the code, tools, and setup.
-- **User preferences** — how this user wants work done.
-- **Learnings & dead-ends** — insights worth keeping, and failed attempts **only** where knowing they failed constrains future work.
-- **Uncertainty & open disagreements** — what is unverified or unresolved.
-
-Rules: Record only what remains true and useful for future work; drop transient chatter, resolved dead-ends, and step-by-step narration. Preserve specifics — exact names, paths, commands, values, and error signatures — over vague description. Mark anything unverified as an assumption; never invent facts, decisions, or outcomes you cannot support from this session, and say plainly when something important is unknown. **Never include secrets, tokens, keys, or credentials.** Be concise: prefer the shortest form a replacement could act on without re-deriving it. Output only the note (or the `No durable context.` sentinel)."#;
-
-        assert_eq!(default_compaction_summary_prompt(), expected);
-    }
-
-    #[test]
-    fn hidden_helpers_keep_hermes_scope_with_non_increasing_effort() {
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
-            protocol::SessionSettingValue::String("qa-minimax".to_owned()),
-        );
-        settings.0.insert(
-            "model".to_owned(),
-            protocol::SessionSettingValue::String(
-                "minimax/minimax-m3 --provider openrouter".to_owned(),
-            ),
-        );
-        settings.0.insert(
-            "reasoning_effort".to_owned(),
-            protocol::SessionSettingValue::String("xhigh".to_owned()),
-        );
-        settings
-            .0
-            .insert("fast".to_owned(), protocol::SessionSettingValue::Bool(true));
-        settings.0.insert(
-            "future_expensive_setting".to_owned(),
-            protocol::SessionSettingValue::Bool(true),
-        );
-
-        let helper_settings = hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
-            .expect("Hermes helper settings");
-        assert_eq!(
-            helper_settings
-                .0
-                .get(crate::backend::hermes::HERMES_PROFILE_SETTING),
-            settings
-                .0
-                .get(crate::backend::hermes::HERMES_PROFILE_SETTING)
-        );
-        assert_eq!(helper_settings.0.get("model"), settings.0.get("model"));
-        assert_eq!(
-            helper_settings.0.get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("low".to_owned()))
-        );
-        assert!(!helper_settings.0.contains_key("fast"));
-        assert!(!helper_settings.0.contains_key("future_expensive_setting"));
-        assert_eq!(helper_settings.0.len(), 3);
-        let default_helper_settings = hidden_helper_session_settings(BackendKind::Hermes, None)
-            .expect("default Hermes helper settings");
-        assert_eq!(
-            default_helper_settings.0.get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("none".to_owned()))
-        );
-        assert_eq!(default_helper_settings.0.len(), 1);
-        settings.0.insert(
-            "reasoning_effort".to_owned(),
-            protocol::SessionSettingValue::String("minimal".to_owned()),
-        );
-        assert_eq!(
-            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
-                .expect("minimal-effort Hermes helper settings")
-                .0
-                .get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("minimal".to_owned()))
-        );
-        settings.0.insert(
-            "reasoning_effort".to_owned(),
-            protocol::SessionSettingValue::String("none".to_owned()),
-        );
-        assert_eq!(
-            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
-                .expect("no-reasoning Hermes helper settings")
-                .0
-                .get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("none".to_owned()))
-        );
-        for backend_kind in [
-            BackendKind::Tycode,
-            BackendKind::Acp,
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Antigravity,
-        ] {
-            assert_eq!(
-                hidden_helper_session_settings(backend_kind, Some(&settings)),
-                None,
-                "{backend_kind:?} helper semantics must remain unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn hermes_profile_launch_entries_synthesize_ready_and_unavailable() {
-        use crate::backend::hermes::HermesLaunchProfileInfo;
-
-        let infos = vec![
-            HermesLaunchProfileInfo {
-                name: "default".to_string(),
-                summary: Some("openrouter/minimax-m3".to_string()),
-                error: None,
-            },
-            HermesLaunchProfileInfo {
-                name: "claude".to_string(),
-                summary: Some("anthropic/claude-sonnet-5".to_string()),
-                error: None,
-            },
-            HermesLaunchProfileInfo {
-                name: "gpt".to_string(),
-                summary: None,
-                error: Some("no authenticated providers".to_string()),
-            },
-        ];
-        let mut entries = Vec::new();
-        synthesize_hermes_profile_entries(&infos, &mut entries);
-
-        // The default profile is covered by "hermes:default", never duplicated.
-        assert_eq!(entries.len(), 2);
-        match &entries[0] {
-            LaunchProfileEntry::Ready { profile } => {
-                assert_eq!(profile.id.0, "hermes:profile:claude");
-                assert_eq!(profile.label, "Hermes — claude");
-                assert_eq!(profile.backend_kind, protocol::BackendKind::Hermes);
-                assert_eq!(
-                    profile.session_settings.0.get("profile"),
-                    Some(&protocol::SessionSettingValue::String("claude".to_string()))
-                );
-                assert!(
-                    profile
-                        .description
-                        .as_deref()
-                        .is_some_and(|d| d.contains("anthropic/claude-sonnet-5"))
-                );
-            }
-            other => panic!("expected ready entry, got {other:?}"),
-        }
-        match &entries[1] {
-            LaunchProfileEntry::Unavailable {
-                id, label, message, ..
-            } => {
-                assert_eq!(id.0, "hermes:profile:gpt");
-                assert_eq!(label, "Hermes — gpt");
-                assert!(message.contains("no authenticated providers"), "{message}");
-            }
-            other => panic!("expected unavailable entry, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn passive_adapter_ingress_is_isolated_per_host_channel() {
-        let (host_one_spawn_tx, _host_one_spawn_rx) = mpsc::unbounded_channel();
-        let (host_two_spawn_tx, _host_two_spawn_rx) = mpsc::unbounded_channel();
-        let (host_one_capacity_tx, mut host_one_capacity_rx) = mpsc::unbounded_channel();
-        let (host_two_capacity_tx, mut host_two_capacity_rx) = mpsc::unbounded_channel();
-        let host_one_emitter = HostSubAgentEmitter::new(
-            host_one_spawn_tx,
-            host_one_capacity_tx,
-            AgentId("host-one-agent".to_owned()),
-            Vec::new(),
-        );
-        let host_two_emitter = HostSubAgentEmitter::new(
-            host_two_spawn_tx,
-            host_two_capacity_tx,
-            AgentId("host-two-agent".to_owned()),
-            Vec::new(),
-        );
-
-        assert!(crate::backend::claude::forward_passive_rate_limit_event(
-            &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
-                "status":"allowed","rateLimitType":"five_hour","utilization":0.25
-            }}),
-            &host_one_emitter,
-        ));
-        crate::backend::codex::forward_passive_rate_limits_updated(
-            &serde_json::json!({"rateLimits":{
-                "limitId":"subscription","limitName":"subscription",
-                "primary":{"usedPercent":50,"windowDurationMins":300,"resetsAt":1},
-                "secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":2},
-                "credits":{"hasCredits":true,"unlimited":false,"balance":"4"},
-                "individualLimit":true,"planType":"pro","rateLimitReachedType":null
-            }}),
-            &host_two_emitter,
-        );
-
-        assert!(matches!(
-            host_one_capacity_rx.recv().await,
-            Some(HostCapacityUpdate::Report {
-                backend_kind: BackendKind::Claude,
-                ..
-            })
-        ));
-        assert!(matches!(
-            host_two_capacity_rx.recv().await,
-            Some(HostCapacityUpdate::Report {
-                backend_kind: BackendKind::Codex,
-                ..
-            })
-        ));
-        assert!(crate::backend::claude::forward_passive_rate_limit_event(
-            &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
-                "status":"allowed","rateLimitType":"five_hour","utilization":2.0
-            }}),
-            &host_one_emitter,
-        ));
-        assert!(matches!(
-            host_one_capacity_rx.recv().await,
-            Some(HostCapacityUpdate::Report {
-                backend_kind: BackendKind::Claude,
-                state: BackendCapacityState::Unavailable {
-                    reason: protocol::CapacityUnavailableReason::MalformedReport,
-                },
-            })
-        ));
-        assert!(host_one_capacity_rx.try_recv().is_err());
-        assert!(host_two_capacity_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn backend_native_child_reply_drop_is_a_typed_error_not_a_panic() {
-        let (spawn_tx, mut spawn_rx) = mpsc::unbounded_channel();
-        let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
-        let parent_agent_id = AgentId("cd8b1f82-a9c0-4f50-bb89-6f61fc71f2c8".to_owned());
-        let emitter = Arc::new(HostSubAgentEmitter::new(
-            spawn_tx,
-            capacity_tx,
-            parent_agent_id.clone(),
-            vec!["/Users/mike/Tyggs/Tyde".to_owned()],
-        ));
-        let waiting = {
-            let emitter = Arc::clone(&emitter);
-            tokio::spawn(async move {
-                emitter
-                    .on_subagent_spawned(
-                        "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
-                        "/root/quick_child".to_owned(),
-                        "/root/quick_child".to_owned(),
-                        "sub-agent".to_owned(),
-                        Some(SessionId("native-quick-child-thread".to_owned())),
-                    )
-                    .await
-            })
-        };
-
-        let request = spawn_rx.recv().await.expect("native child spawn request");
-        assert_eq!(request.parent_agent_id, parent_agent_id);
-        assert_eq!(request.tool_use_id, "019f60f0-7a69-73f0-9ab3-7ddc24062e30");
-        assert_eq!(request.name, "/root/quick_child");
-        drop(request);
-
-        let error = match waiting.await.expect("child relay caller must not panic") {
-            Ok(_) => panic!("dropped host reply must be surfaced to the adapter"),
-            Err(error) => error,
-        };
-        assert!(error.contains("backend-native child spawn reply dropped"));
-        assert!(error.contains(parent_agent_id.0.as_str()));
-    }
-
-    #[tokio::test]
-    async fn session_registration_precedes_later_spawn_work_for_native_children() {
-        let fixture = compact_fixture().await;
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Early Native Child Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start parent".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-
-        hook.wait_until_reached().await;
-        let parent_agent_id = {
-            let state = fixture.host.state.lock().await;
-            let agent_ids = state.registry.agent_ids();
-            assert_eq!(agent_ids.len(), 1, "only the blocked parent is registered");
-            agent_ids
-                .into_iter()
-                .next()
-                .expect("blocked parent agent id")
-        };
-        let emitter = {
-            let state = fixture.host.state.lock().await;
-            HostSubAgentEmitter::new(
-                state.sub_agent_spawn_tx.clone(),
-                state.capacity_tx.clone(),
-                parent_agent_id.clone(),
-                Vec::new(),
-            )
-        };
-        let child_session_id = SessionId("native-quick-child-thread".to_owned());
-        let child = tokio::time::timeout(
-            Duration::from_millis(500),
-            emitter.on_subagent_spawned(
-                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
-                "/root/quick_child".to_owned(),
-                "reply exactly QUICK_DONE".to_owned(),
-                "sub-agent".to_owned(),
-                Some(child_session_id.clone()),
-            ),
-        )
-        .await
-        .expect("early child relay must not wait for the five-second parent-session poll")
-        .expect("early child relay must be created while later parent spawn work is blocked");
-
-        let child_handle = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_handle(&child.agent_id)
-                .expect("registered native child relay")
-        };
-        let prompt_events = tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let events = child_handle
-                    .read_output(None, 100)
-                    .await
-                    .expect("native child output");
-                let prompt_count = events
-                    .iter()
-                    .filter_map(|event| event.parse_payload::<ChatEvent>().ok())
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            ChatEvent::MessageAdded(ChatMessage {
-                                sender: MessageSender::User,
-                                content,
-                                ..
-                            }) if content == "reply exactly QUICK_DONE"
-                        )
-                    })
-                    .count();
-                if prompt_count > 0 {
-                    break (events, prompt_count);
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("native child prompt must enter its relay history");
-        assert_eq!(prompt_events.1, 1, "the child prompt is recorded once");
-        let replayed_prompt_count = child_handle
-            .read_output(None, 100)
-            .await
-            .expect("replayed native child output")
-            .iter()
-            .filter_map(|event| event.parse_payload::<ChatEvent>().ok())
-            .filter(|event| {
-                matches!(
-                    event,
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::User,
-                        content,
-                        ..
-                    }) if content == "reply exactly QUICK_DONE"
-                )
-            })
-            .count();
-        assert_eq!(
-            replayed_prompt_count, 1,
-            "replay must not duplicate the prompt"
-        );
-
-        {
-            let state = fixture.host.state.lock().await;
-            assert_eq!(
-                state.agent_sessions.len(),
-                1,
-                "only the native child relay is publicly session-bound before parent publication"
-            );
-            assert!(
-                !state.agent_sessions.contains_key(&parent_agent_id),
-                "the parent session must remain private before the original publication point"
-            );
-            assert!(
-                state.pending_agent_sessions.contains_key(&parent_agent_id),
-                "the scheduled parent session registration must be available to native child resolution"
-            );
-            assert_eq!(
-                state.agent_sessions.get(&child.agent_id),
-                Some(&child_session_id),
-                "the real host relay must retain the authoritative native child session"
-            );
-            let child_start = state
-                .registry
-                .agent_handle(&child.agent_id)
-                .expect("registered native child relay")
-                .snapshot();
-            assert_eq!(child_start.parent_agent_id, Some(parent_agent_id.clone()));
-            assert_eq!(child_start.origin, AgentOrigin::BackendNative);
-        }
-
-        hook.resume();
-        let spawned_parent = spawn
-            .await
-            .expect("parent spawn task")
-            .expect("parent spawn succeeds after later work resumes");
-        assert_eq!(spawned_parent, parent_agent_id);
-        let public_parent_session_id = tokio::time::timeout(
-            Duration::from_millis(500),
-            fixture
-                .host
-                .wait_for_agent_session_id_result(&parent_agent_id),
-        )
-        .await
-        .expect("parent session publication must complete after fanout resumes")
-        .expect("published parent session id");
-        {
-            let state = fixture.host.state.lock().await;
-            assert_eq!(state.agent_sessions.len(), 2);
-            assert_eq!(
-                state.agent_sessions.get(&parent_agent_id),
-                Some(&public_parent_session_id)
-            );
-            assert!(!state.pending_agent_sessions.contains_key(&parent_agent_id));
-        }
-        assert!(fixture.host.close_agent(&parent_agent_id).await);
-        drop(child);
-    }
-
-    #[tokio::test]
-    async fn early_visible_native_child_closes_without_exposing_its_parent() {
-        let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/early-child-first-{}", Uuid::new_v4())),
-                    first_tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let (second_tx, mut second_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/early-child-second-{}", Uuid::new_v4())),
-                    second_tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        while first_rx.try_recv().is_ok() {}
-        while second_rx.try_recv().is_ok() {}
-
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Hidden Parent With Early Native Child".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start hidden parent".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        let parent_agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("blocked parent agent")
-        };
-        let emitter = {
-            let state = fixture.host.state.lock().await;
-            HostSubAgentEmitter::new(
-                state.sub_agent_spawn_tx.clone(),
-                state.capacity_tx.clone(),
-                parent_agent_id.clone(),
-                Vec::new(),
-            )
-        };
-        let child = tokio::time::timeout(
-            Duration::from_millis(500),
-            emitter.on_subagent_spawned(
-                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
-                "/root/quick_child".to_owned(),
-                "/root/quick_child".to_owned(),
-                "sub-agent".to_owned(),
-                Some(SessionId("native-quick-child-thread".to_owned())),
-            ),
-        )
-        .await
-        .expect("early native child relay must not wait for parent publication")
-        .expect("early native child relay");
-        let child_agent_id = child.agent_id.clone();
-
-        {
-            let state = fixture.host.state.lock().await;
-            assert!(
-                state
-                    .agent_visibility
-                    .visible_host_streams(&parent_agent_id)
-                    .is_empty(),
-                "the blocked parent must have zero public NewAgent visibility"
-            );
-            assert_eq!(
-                state
-                    .agent_visibility
-                    .visible_host_streams(&child_agent_id)
-                    .len(),
-                2,
-                "the independently published native child must retain its own subscribers"
-            );
-        }
-
-        spawn.abort();
-        assert!(
-            spawn
-                .await
-                .expect_err("cancelled parent spawn")
-                .is_cancelled()
-        );
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&parent_agent_id).is_none()
-                    && state.registry.agent_handle(&child_agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&parent_agent_id)
-                    && !state.agent_sessions.contains_key(&child_agent_id)
-                    && !state.pending_agent_sessions.contains_key(&parent_agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&parent_agent_id)
-                        .is_empty()
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&child_agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("parent cancellation must clean parent and independently visible child state");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        for receiver in [&mut first_rx, &mut second_rx] {
-            let mut child_lifecycle = Vec::new();
-            let mut parent_lifecycle = Vec::new();
-            while let Ok(envelope) = receiver.try_recv() {
-                match envelope.kind {
-                    FrameKind::NewAgent => {
-                        let payload: NewAgentPayload =
-                            envelope.parse_payload().expect("NewAgent payload");
-                        if payload.agent_id == child_agent_id {
-                            child_lifecycle.push("new");
-                        } else if payload.agent_id == parent_agent_id {
-                            parent_lifecycle.push("new");
-                        }
-                    }
-                    FrameKind::AgentClosed => {
-                        let payload: AgentClosedPayload =
-                            envelope.parse_payload().expect("AgentClosed payload");
-                        if payload.agent_id == child_agent_id {
-                            child_lifecycle.push("closed");
-                        } else if payload.agent_id == parent_agent_id {
-                            parent_lifecycle.push("closed");
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            assert_eq!(child_lifecycle, vec!["new", "closed"]);
-            assert!(
-                parent_lifecycle.is_empty(),
-                "a zero-visibility parent must not produce orphan, reversed, or duplicate lifecycle events: {parent_lifecycle:?}"
-            );
-        }
-        drop(child);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_records_visible_native_child_but_omits_pending_parent() {
-        let fixture = compact_fixture().await;
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Bootstrap Hidden Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start hidden parent before bootstrap".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        let parent_agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("blocked parent agent")
-        };
-        let emitter = {
-            let state = fixture.host.state.lock().await;
-            HostSubAgentEmitter::new(
-                state.sub_agent_spawn_tx.clone(),
-                state.capacity_tx.clone(),
-                parent_agent_id.clone(),
-                Vec::new(),
-            )
-        };
-        let child = tokio::time::timeout(
-            Duration::from_millis(500),
-            emitter.on_subagent_spawned(
-                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
-                "/root/quick_child".to_owned(),
-                "/root/quick_child".to_owned(),
-                "sub-agent".to_owned(),
-                Some(SessionId("native-quick-child-thread".to_owned())),
-            ),
-        )
-        .await
-        .expect("early child spawn before bootstrap")
-        .expect("early child relay");
-        let child_agent_id = child.agent_id.clone();
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/bootstrap-child-{}", Uuid::new_v4())),
-                    tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::HostBootstrap {
-                    return envelope
-                        .parse_payload::<HostBootstrapPayload>()
-                        .expect("HostBootstrap payload");
-                }
-            }
-        })
-        .await
-        .expect("bootstrap delivery");
-        assert!(
-            bootstrap
-                .agents
-                .iter()
-                .any(|agent| agent.agent_id == child_agent_id)
-        );
-        assert!(
-            !bootstrap
-                .agents
-                .iter()
-                .any(|agent| agent.agent_id == parent_agent_id)
-        );
-        {
-            let state = fixture.host.state.lock().await;
-            assert_eq!(
-                state
-                    .agent_visibility
-                    .visible_host_streams(&child_agent_id)
-                    .len(),
-                1,
-                "successful bootstrap must become the child visibility recipient"
-            );
-            assert!(
-                state
-                    .agent_visibility
-                    .visible_host_streams(&parent_agent_id)
-                    .is_empty()
-            );
-        }
-
-        spawn.abort();
-        assert!(
-            spawn
-                .await
-                .expect_err("cancelled parent spawn")
-                .is_cancelled()
-        );
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&parent_agent_id).is_none()
-                    && state.registry.agent_handle(&child_agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&parent_agent_id)
-                    && !state.agent_sessions.contains_key(&child_agent_id)
-                    && !state.pending_agent_sessions.contains_key(&parent_agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&parent_agent_id)
-                        .is_empty()
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&child_agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("cancelled bootstrap parent and child cleanup");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut child_closed = 0usize;
-        let mut parent_closed = 0usize;
-        let mut child_new = 0usize;
-        let mut parent_new = 0usize;
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    if payload.agent_id == child_agent_id {
-                        child_new += 1;
-                    } else if payload.agent_id == parent_agent_id {
-                        parent_new += 1;
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    if payload.agent_id == child_agent_id {
-                        child_closed += 1;
-                    } else if payload.agent_id == parent_agent_id {
-                        parent_closed += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            child_new, 0,
-            "bootstrap must not duplicate its child as NewAgent"
-        );
-        assert_eq!(parent_new, 0, "hidden parent must not replay as NewAgent");
-        assert_eq!(
-            child_closed, 1,
-            "bootstrapped child must close exactly once"
-        );
-        assert_eq!(parent_closed, 0, "hidden parent must not emit AgentClosed");
-        drop(child);
-    }
-
-    #[tokio::test]
-    async fn cancelled_spawn_cleans_unpublished_session_registration() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_stream = Stream::new(
-            StreamPath(format!("/host/cancelled-unpublished-{}", Uuid::new_v4())),
-            tx,
-        );
-        fixture
-            .host
-            .register_host_stream(host_stream, AgentReplayMode::Lazy)
-            .await;
-        while rx.try_recv().is_ok() {}
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Cancelled Pending Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start then cancel".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-
-        hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("blocked parent agent")
-        };
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let pending = fixture
-                    .host
-                    .state
-                    .lock()
-                    .await
-                    .pending_agent_sessions
-                    .contains_key(&agent_id);
-                if pending {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("cancelled parent reaches pending private session registration");
-        spawn.abort();
-        assert!(
-            spawn
-                .await
-                .expect_err("cancelled spawn task")
-                .is_cancelled()
-        );
-
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("cancelled spawn must not leave an agent or session binding behind");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    assert_ne!(
-                        payload.agent_id, agent_id,
-                        "cancelled unpublished agent must never become visible"
-                    );
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    assert_ne!(
-                        payload.agent_id, agent_id,
-                        "cancelled unpublished agent must not emit orphan AgentClosed"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn startup_failure_cleans_unpublished_session_registration() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_stream = Stream::new(
-            StreamPath(format!("/host/failed-unpublished-{}", Uuid::new_v4())),
-            tx,
-        );
-        fixture
-            .host
-            .register_host_stream(host_stream, AgentReplayMode::Lazy)
-            .await;
-        while rx.try_recv().is_ok() {}
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let cleanup_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Failed Pending Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "__mock_fail_spawn__".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        cleanup_hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("blocked failed parent agent")
-        };
-        cleanup_hook.resume();
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("startup failure must not leave an unpublished session binding behind");
-        hook.resume();
-        let spawned_agent_id = spawn
-            .await
-            .expect("startup-failure spawn task")
-            .expect("spawn request is accepted before asynchronous startup failure");
-        assert_eq!(spawned_agent_id, agent_id);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    assert_ne!(
-                        payload.agent_id, agent_id,
-                        "startup failure must not resurrect an unpublished agent"
-                    );
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    assert_ne!(
-                        payload.agent_id, agent_id,
-                        "startup failure must not emit AgentClosed before NewAgent"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn simultaneous_startup_failure_and_fanout_publish_one_terminal_agent() {
-        let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/failed-fanout-race-{}", Uuid::new_v4()));
-        fixture
-            .host
-            .register_host_stream(Stream::new(host_path.clone(), tx), AgentReplayMode::Eager)
-            .await;
-        while rx.try_recv().is_ok() {}
-
-        let hook = install_startup_failure_fanout_race_test_hook(
-            &fixture.host,
-            StartupFailureFanoutRaceWinner::Fanout,
-        );
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Failed Fanout Race Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "__mock_fail_spawn__".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-
-        hook.wait_until_ready().await;
-        let agent_id = spawn
-            .await
-            .expect("startup-failure fanout race task")
-            .expect("spawn request remains accepted when fanout wins publication");
-
-        let envelopes = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let (new_agent_index, instance_stream) = envelopes
-            .iter()
-            .enumerate()
-            .find_map(|(index, envelope)| {
-                if envelope.kind != FrameKind::NewAgent {
-                    return None;
-                }
-                let payload: NewAgentPayload = envelope.parse_payload().expect("NewAgent payload");
-                (payload.agent_id == agent_id).then_some((index, payload.instance_stream))
-            })
-            .expect("fanout-winning startup failure must publish NewAgent");
-        let (bootstrap_index, bootstrap) = envelopes
-            .iter()
-            .enumerate()
-            .find_map(|(index, envelope)| {
-                if envelope.stream != instance_stream || envelope.kind != FrameKind::AgentBootstrap
-                {
-                    return None;
-                }
-                Some((
-                    index,
-                    envelope
-                        .parse_payload::<protocol::AgentBootstrapPayload>()
-                        .expect("terminal AgentBootstrap payload"),
-                ))
-            })
-            .expect("published failed agent must receive terminal bootstrap");
-        assert!(
-            bootstrap_index > new_agent_index,
-            "terminal bootstrap must follow NewAgent publication"
-        );
-        assert!(bootstrap.events.iter().any(|event| matches!(
-            event,
-            protocol::AgentBootstrapEvent::AgentStart(start) if start.agent_id == agent_id
-        )));
-        assert!(bootstrap.events.iter().any(|event| matches!(
-            event,
-            protocol::AgentBootstrapEvent::AgentError(error)
-                if error.fatal && error.message.contains("mock backend forced spawn failure")
-        )));
-        assert!(envelopes.iter().all(|envelope| {
-            envelope.kind != FrameKind::AgentClosed
-                || envelope
-                    .parse_payload::<AgentClosedPayload>()
-                    .expect("AgentClosed payload")
-                    .agent_id
-                    != agent_id
-        }));
-
-        let status = fixture
-            .host
-            .agent_status_snapshot(&agent_id)
-            .await
-            .expect("published terminal failed agent remains registered");
-        assert!(status.terminated);
-        assert_eq!(status.status(), AgentControlStatus::Failed);
-        let state = fixture.host.state.lock().await;
-        assert!(state.registry.agent_handle(&agent_id).is_some());
-        assert!(!state.agent_sessions.contains_key(&agent_id));
-        assert!(!state.pending_agent_sessions.contains_key(&agent_id));
-        assert_eq!(
-            state.agent_visibility.visible_host_streams(&agent_id),
-            HashSet::from([host_path])
-        );
-    }
-
-    #[tokio::test]
-    async fn simultaneous_startup_failure_claim_prevents_unpublished_fanout() {
-        let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/failed-unpublished-race-{}", Uuid::new_v4())),
-                    tx,
-                ),
-                AgentReplayMode::Eager,
-            )
-            .await;
-        while rx.try_recv().is_ok() {}
-
-        let race_hook = install_startup_failure_fanout_race_test_hook(
-            &fixture.host,
-            StartupFailureFanoutRaceWinner::Failure,
-        );
-        let cleanup_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Failed Unpublished Race Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "__mock_fail_spawn__".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-
-        race_hook.wait_until_ready().await;
-        cleanup_hook.wait_until_reached().await;
-        let agent_id = spawn
-            .await
-            .expect("startup-failure cancellation race task")
-            .expect("spawn request remains accepted when startup failure cancels publication");
-
-        cleanup_hook.resume();
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("failure-first atomic claim must clean unpublished state");
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    assert_ne!(payload.agent_id, agent_id);
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    assert_ne!(payload.agent_id, agent_id);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn synchronous_parent_fanout_closes_every_advertised_subscriber() {
-        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
-        let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = crate::stream::output_channel();
-        let first_stream = Stream::new(
-            StreamPath(format!("/host/partial-first-{}", Uuid::new_v4())),
-            first_tx,
-        );
-        fixture
-            .host
-            .register_host_stream(first_stream, AgentReplayMode::Lazy)
-            .await;
-        let (second_tx, mut second_rx) = crate::stream::output_channel();
-        let second_stream = Stream::new(
-            StreamPath(format!("/host/partial-second-{}", Uuid::new_v4())),
-            second_tx,
-        );
-        fixture
-            .host
-            .register_host_stream(second_stream, AgentReplayMode::Lazy)
-            .await;
-        while first_rx.try_recv().is_ok() {}
-        while second_rx.try_recv().is_ok() {}
-
-        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Partial Fanout Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start then cancel during fanout".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-
-        fanout_hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("partially visible parent agent")
-        };
-        spawn.abort();
-        assert!(
-            spawn
-                .await
-                .expect_err("cancelled fanout task")
-                .is_cancelled()
-        );
-        drop(fanout_hook);
-
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("partial fanout cancellation must clean all agent bindings and visibility");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut first_lifecycle = Vec::new();
-        while let Ok(envelope) = first_rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("first NewAgent payload");
-                    if payload.agent_id == agent_id {
-                        first_lifecycle.push("new");
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("first AgentClosed payload");
-                    if payload.agent_id == agent_id {
-                        first_lifecycle.push("closed");
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut second_lifecycle = Vec::new();
-        while let Ok(envelope) = second_rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("second NewAgent payload");
-                    if payload.agent_id == agent_id {
-                        second_lifecycle.push("new");
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload = envelope
-                        .parse_payload()
-                        .expect("second AgentClosed payload");
-                    if payload.agent_id == agent_id {
-                        second_lifecycle.push("closed");
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        assert_eq!(
-            first_lifecycle,
-            vec!["new", "closed"],
-            "sorted host fanout must preserve NewAgent before AgentClosed for its visible subscriber"
-        );
-        assert_eq!(
-            second_lifecycle,
-            vec!["new", "closed"],
-            "two-phase fanout advertises every eligible subscriber before cancellation"
-        );
-    }
-
-    #[tokio::test]
-    async fn fanout_uncovered_bootstrap_is_exactly_once_and_closes() {
-        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
-        let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/coverage-first-{}", Uuid::new_v4())),
-                    first_tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        while first_rx.try_recv().is_ok() {}
-
-        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Fanout Coverage Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "pause after fanout".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        fanout_hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("agent paused after NewAgent fanout")
-        };
-
-        let (second_tx, mut second_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/coverage-second-{}", Uuid::new_v4())),
-                    second_tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let bootstrap = timeout(Duration::from_millis(500), async {
-            loop {
-                let envelope = second_rx
-                    .recv()
-                    .await
-                    .expect("second host stream remains open");
-                if envelope.kind == FrameKind::HostBootstrap {
-                    return envelope
-                        .parse_payload::<HostBootstrapPayload>()
-                        .expect("second HostBootstrap payload");
-                }
-            }
-        })
-        .await
-        .expect("second HostBootstrap delivery");
-        assert_eq!(
-            bootstrap
-                .agents
-                .iter()
-                .filter(|agent| agent.agent_id == agent_id)
-                .count(),
-            1,
-            "a stream outside the captured fanout must receive one bootstrap agent"
-        );
-
-        drop(fanout_hook);
-        assert_eq!(
-            spawn
-                .await
-                .expect("fanout coverage spawn task")
-                .expect("fanout coverage spawn result"),
-            agent_id
-        );
-        assert!(fixture.host.close_agent(&agent_id).await);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut new_agent_count = 0;
-        let mut closed_count = 0;
-        while let Ok(envelope) = second_rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("second NewAgent payload");
-                    if payload.agent_id == agent_id {
-                        new_agent_count += 1;
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload = envelope
-                        .parse_payload()
-                        .expect("second AgentClosed payload");
-                    if payload.agent_id == agent_id {
-                        closed_count += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            new_agent_count, 0,
-            "bootstrap delivery must not be duplicated"
-        );
-        assert_eq!(
-            closed_count, 1,
-            "bootstrap delivery must confer terminal visibility"
-        );
-        let mut covered_new_agent_count = 0;
-        let mut covered_closed_count = 0;
-        while let Ok(envelope) = first_rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("covered NewAgent payload");
-                    if payload.agent_id == agent_id {
-                        covered_new_agent_count += 1;
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload = envelope
-                        .parse_payload()
-                        .expect("covered AgentClosed payload");
-                    if payload.agent_id == agent_id {
-                        covered_closed_count += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            covered_new_agent_count, 1,
-            "a stream inside the captured fanout must receive one NewAgent"
-        );
-        assert_eq!(
-            covered_closed_count, 1,
-            "covered NewAgent delivery must confer terminal visibility"
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrap_first_publication_claims_spawn_success() {
-        let _fanout_test_guard = SPAWN_NEW_AGENT_FANOUT_TEST_LOCK.lock().await;
-        let fixture = compact_fixture().await;
-        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
-        let (operation_tx, mut operation_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .start_spawn_agent_operation(
-                SpawnAgentPayload {
-                    name: Some("Bootstrap First Operation".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "publish first through bootstrap".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                },
-                StreamPath("/host/bootstrap-first-request".to_owned()),
-                Stream::new(
-                    StreamPath("/host/bootstrap-first-output".to_owned()),
-                    operation_tx,
-                ),
-            )
-            .expect("start bootstrap-first spawn operation");
-        fanout_hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("bootstrap-first operation agent")
-        };
-
-        let (host_tx, mut host_rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/bootstrap-first-{}", Uuid::new_v4())),
-                    host_tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let bootstrap = timeout(Duration::from_millis(500), async {
-            loop {
-                let envelope = host_rx
-                    .recv()
-                    .await
-                    .expect("bootstrap-first host remains open");
-                if envelope.kind == FrameKind::HostBootstrap {
-                    return envelope
-                        .parse_payload::<HostBootstrapPayload>()
-                        .expect("bootstrap-first HostBootstrap payload");
-                }
-            }
-        })
-        .await
-        .expect("bootstrap-first HostBootstrap delivery");
-        assert!(
-            bootstrap
-                .agents
-                .iter()
-                .any(|agent| agent.agent_id == agent_id)
-        );
-        {
-            let state = fixture.host.state.lock().await;
-            let claim = state
-                .spawn_publication_claims
-                .get(&agent_id)
-                .expect("active spawn publication claim");
-            assert!(matches!(
-                *claim
-                    .outcome
-                    .lock()
-                    .expect("spawn operation outcome mutex poisoned"),
-                Some(SpawnOperationOutcome::Success)
-            ));
-        }
-
-        fixture.host.shutdown_spawn_operations().await;
-        drop(fanout_hook);
-        timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleanup_complete = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleanup_complete {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("bootstrap-first shutdown cleanup");
-        assert!(
-            operation_rx.try_recv().is_err(),
-            "shutdown must not reclassify a bootstrap-published spawn as cancelled"
-        );
-        let mut closed_count = 0;
-        while let Ok(envelope) = host_rx.try_recv() {
-            if envelope.kind == FrameKind::AgentClosed {
-                let payload: AgentClosedPayload = envelope
-                    .parse_payload()
-                    .expect("bootstrap-first AgentClosed payload");
-                if payload.agent_id == agent_id {
-                    closed_count += 1;
-                }
-            }
-        }
-        assert_eq!(
-            closed_count, 1,
-            "shutdown cleanup must close bootstrap visibility exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrap_includes_visible_unpublished_normal_spawn_once() {
-        let fixture = compact_fixture().await;
-        let hook = install_spawn_visible_before_publication_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Visible Before Session Publication".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "complete fanout before session publication".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("visible unpublished agent")
-        };
-        {
-            let state = fixture.host.state.lock().await;
-            assert!(
-                !state.agent_sessions.contains_key(&agent_id),
-                "test hook must stop before public session promotion"
-            );
-            assert!(
-                state
-                    .agent_visibility
-                    .inner
-                    .lock()
-                    .expect("agent visibility mutex poisoned")
-                    .get(&agent_id)
-                    .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Visible),
-                "completed NewAgent fanout must make the agent bootstrap-eligible"
-            );
-        }
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/visible-before-publish-{}", Uuid::new_v4())),
-                    tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::HostBootstrap {
-                    return envelope
-                        .parse_payload::<HostBootstrapPayload>()
-                        .expect("HostBootstrap payload");
-                }
-            }
-        })
-        .await
-        .expect("bootstrap delivery");
-        assert_eq!(
-            bootstrap
-                .agents
-                .iter()
-                .filter(|agent| agent.agent_id == agent_id)
-                .count(),
-            1,
-            "visible normal spawn must appear exactly once in bootstrap"
-        );
-        {
-            let state = fixture.host.state.lock().await;
-            assert_eq!(
-                state.agent_visibility.visible_host_streams(&agent_id).len(),
-                1,
-                "successful bootstrap must record its host visibility recipient"
-            );
-        }
-
-        hook.resume();
-        let spawned_agent_id = spawn
-            .await
-            .expect("visible normal spawn task")
-            .expect("visible normal spawn result");
-        assert_eq!(spawned_agent_id, agent_id);
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            fixture.host.wait_for_agent_session_id_result(&agent_id),
-        )
-        .await
-        .expect("session publication after hook resume")
-        .expect("published session");
-        assert!(fixture.host.close_agent(&agent_id).await);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut new_agent_count = 0usize;
-        let mut closed_count = 0usize;
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    if payload.agent_id == agent_id {
-                        new_agent_count += 1;
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    if payload.agent_id == agent_id {
-                        closed_count += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            new_agent_count, 0,
-            "bootstrap must deduplicate pending NewAgent replay"
-        );
-        assert_eq!(
-            closed_count, 1,
-            "visible normal spawn must close exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_visibility_excludes_even_a_publicly_bound_agent_from_bootstrap() {
-        let fixture = compact_fixture().await;
-        let visible_hook = install_spawn_visible_before_publication_test_hook(&fixture.host);
-        let cancelled_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Cancelled Before Bootstrap".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "become visible then cancel".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        visible_hook.wait_until_reached().await;
-        let agent_id = {
-            let mut state = fixture.host.state.lock().await;
-            let agent_id = state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("visible agent before cancellation");
-            state.agent_sessions.insert(
-                agent_id.clone(),
-                SessionId("test-public-binding-before-cancellation".to_owned()),
-            );
-            agent_id
-        };
-
-        spawn.abort();
-        assert!(
-            spawn
-                .await
-                .expect_err("cancelled visible spawn")
-                .is_cancelled()
-        );
-        cancelled_hook.wait_until_reached().await;
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/cancelled-bootstrap-{}", Uuid::new_v4())),
-                    tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::HostBootstrap {
-                    return envelope
-                        .parse_payload::<HostBootstrapPayload>()
-                        .expect("HostBootstrap payload");
-                }
-            }
-        })
-        .await
-        .expect("bootstrap delivery during cancelled cleanup");
-        assert!(
-            !bootstrap
-                .agents
-                .iter()
-                .any(|agent| agent.agent_id == agent_id),
-            "cancelled visibility must override a stale public binding"
-        );
-
-        cancelled_hook.resume();
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let state = fixture.host.state.lock().await;
-                let cleaned = state.registry.agent_handle(&agent_id).is_none()
-                    && !state.agent_sessions.contains_key(&agent_id)
-                    && !state.pending_agent_sessions.contains_key(&agent_id)
-                    && state
-                        .agent_visibility
-                        .visible_host_streams(&agent_id)
-                        .is_empty();
-                drop(state);
-                if cleaned {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("cancelled visibility cleanup");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while let Ok(envelope) = rx.try_recv() {
-            match envelope.kind {
-                FrameKind::NewAgent => {
-                    let payload: NewAgentPayload =
-                        envelope.parse_payload().expect("NewAgent payload");
-                    assert_ne!(payload.agent_id, agent_id);
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("AgentClosed payload");
-                    assert_ne!(payload.agent_id, agent_id);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn session_publication_follows_new_agent_fanout() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_stream = Stream::new(
-            StreamPath(format!(
-                "/host/session-publication-order-{}",
-                Uuid::new_v4()
-            )),
-            tx,
-        );
-        let attachments = fixture
-            .host
-            .register_host_stream(host_stream, AgentReplayMode::Lazy)
-            .await;
-        assert!(
-            attachments.is_empty(),
-            "empty host has no replay attachments"
-        );
-        while rx.try_recv().is_ok() {}
-
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Publication Ordering Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start ordered parent".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), async {
-                loop {
-                    let envelope = rx.recv().await.expect("host stream remains open");
-                    if matches!(
-                        envelope.kind,
-                        FrameKind::NewAgent
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::SessionList
-                    ) {
-                        return envelope;
-                    }
-                }
-            })
-            .await
-            .is_err(),
-            "pending session registration must not publish host or preference events before fanout"
-        );
-
-        hook.resume();
-        let parent_agent_id = spawn
-            .await
-            .expect("ordered parent spawn task")
-            .expect("ordered parent spawn succeeds");
-        let mut new_agent_index = None;
-        let mut preference_index = None;
-        let mut session_list_index = None;
-        let mut index = 0usize;
-        tokio::time::timeout(Duration::from_millis(500), async {
-            while new_agent_index.is_none()
-                || preference_index.is_none()
-                || session_list_index.is_none()
-            {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                match envelope.kind {
-                    FrameKind::NewAgent => {
-                        let payload: NewAgentPayload =
-                            envelope.parse_payload().expect("NewAgent payload");
-                        if payload.agent_id == parent_agent_id {
-                            new_agent_index = Some(index);
-                        }
-                    }
-                    FrameKind::AgentsViewPreferencesNotify => preference_index = Some(index),
-                    FrameKind::SessionList => session_list_index = Some(index),
-                    _ => {}
-                }
-                index += 1;
-            }
-        })
-        .await
-        .expect("parent fanout and published session events");
-        let new_agent_index = new_agent_index.expect("parent NewAgent index");
-        let preference_index = preference_index.expect("preferences publication index");
-        let session_list_index = session_list_index.expect("session-list publication index");
-        assert!(new_agent_index < preference_index);
-        assert!(preference_index < session_list_index);
-        assert!(fixture.host.close_agent(&parent_agent_id).await);
-    }
-
-    #[tokio::test]
-    async fn pending_agent_annotation_promotes_only_at_session_publication() {
-        let fixture = compact_fixture().await;
-        let hook = install_spawn_session_registration_test_hook(&fixture.host);
-        let spawning_host = fixture.host.clone();
-        let spawn = tokio::spawn(async move {
-            spawning_host
-                .spawn_agent(SpawnAgentPayload {
-                    name: Some("Pending Annotation Parent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "start annotation parent".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                })
-                .await
-        });
-        hook.wait_until_reached().await;
-        let agent_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .next()
-                .expect("blocked parent agent")
-        };
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                let pending = fixture
-                    .host
-                    .state
-                    .lock()
-                    .await
-                    .pending_agent_sessions
-                    .contains_key(&agent_id);
-                if pending {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("parent startup must create its private pending session binding");
-
-        fixture
-            .host
-            .set_agent_tags(SetAgentTagsPayload {
-                update: AgentTagsUpdate::CreateTag {
-                    name: "Pending session tag".to_owned(),
-                    color: None,
-                },
-            })
-            .await
-            .expect("create pending-session tag");
-        let tag_id = {
-            let store = fixture
-                .host
-                .state
-                .lock()
-                .await
-                .agents_view_preferences_store
-                .clone()
-                .expect("primary preferences store");
-            store
-                .lock()
-                .await
-                .snapshot()
-                .tags
-                .manual
-                .into_iter()
-                .find(|tag| tag.name == "Pending session tag")
-                .expect("created tag")
-                .id
-        };
-        let transient_target = AgentAnnotationTarget::TransientAgent {
-            host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
-            agent_id: agent_id.clone(),
-        };
-        fixture
-            .host
-            .set_agent_tags(SetAgentTagsPayload {
-                update: AgentTagsUpdate::AssignTag {
-                    target: transient_target.clone(),
-                    tag_id: tag_id.clone(),
-                },
-            })
-            .await
-            .expect("assign tag while session is pending");
-        {
-            let state = fixture.host.state.lock().await;
-            assert!(!state.agent_sessions.contains_key(&agent_id));
-            assert!(state.pending_agent_sessions.contains_key(&agent_id));
-            let snapshot = state
-                .agents_view_preferences_store
-                .as_ref()
-                .expect("primary preferences store")
-                .lock()
-                .await
-                .snapshot();
-            assert!(snapshot.tags.manual_assignments.iter().any(|assignment| {
-                assignment.target == transient_target && assignment.tag_ids.contains(&tag_id)
-            }));
-        }
-
-        hook.resume();
-        let spawned_agent_id = spawn
-            .await
-            .expect("annotation parent spawn task")
-            .expect("annotation parent spawn succeeds");
-        assert_eq!(spawned_agent_id, agent_id);
-        let session_id = tokio::time::timeout(
-            Duration::from_millis(500),
-            fixture.host.wait_for_agent_session_id_result(&agent_id),
-        )
-        .await
-        .expect("session publication completes")
-        .expect("published session");
-        let session_target = AgentAnnotationTarget::Session {
-            host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
-            session_id,
-        };
-        {
-            let state = fixture.host.state.lock().await;
-            let snapshot = state
-                .agents_view_preferences_store
-                .as_ref()
-                .expect("primary preferences store")
-                .lock()
-                .await
-                .snapshot();
-            assert!(!snapshot.tags.manual_assignments.iter().any(|assignment| {
-                assignment.target == transient_target && assignment.tag_ids.contains(&tag_id)
-            }));
-            assert!(snapshot.tags.manual_assignments.iter().any(|assignment| {
-                assignment.target == session_target && assignment.tag_ids.contains(&tag_id)
-            }));
-        }
-        assert!(fixture.host.close_agent(&agent_id).await);
-    }
-
-    #[test]
-    fn startup_mcp_servers_attach_config_only_to_help_agent() {
-        let settings = protocol::HostSettings {
-            enabled_backends: vec![BackendKind::Claude],
-            default_backend: Some(BackendKind::Claude),
-            enable_mobile_connections: false,
-            mobile_broker_url: None,
-            tyde_debug_mcp_enabled: false,
-            tyde_agent_control_mcp_enabled: false,
-            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
-            complexity_tiers_enabled: false,
-            backend_tier_configs: HashMap::new(),
-            background_agent_features: Default::default(),
-            supervisor: Default::default(),
-            code_intel: Default::default(),
-            backend_config: HashMap::new(),
-            launch_profiles: Vec::new(),
-            hermes_disabled_providers: Default::default(),
-            voice: Default::default(),
-        };
-        let debug_mcp = DebugMcpHandle { url: String::new() };
-        let agent_control = AgentControlMcpHandle::disabled();
-        let config_mcp = ConfigMcpHandle {
-            url: "http://127.0.0.1:9/mcp".to_owned(),
-        };
-
-        let help_id = CustomAgentId(crate::store::custom_agents::HELP_CUSTOM_AGENT_ID.to_owned());
-        let servers = startup_mcp_servers_for_settings(
-            &settings,
-            &[],
-            &debug_mcp,
-            &agent_control,
-            &config_mcp,
-            Some(&help_id),
-            1,
-        );
-        assert_eq!(
-            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["tyde-config"],
-            "help agent must get the config tools"
-        );
-
-        let other_id = CustomAgentId("ca-user".to_owned());
-        for custom_agent_id in [None, Some(&other_id)] {
-            let servers = startup_mcp_servers_for_settings(
-                &settings,
-                &[],
-                &debug_mcp,
-                &agent_control,
-                &config_mcp,
-                custom_agent_id,
-                1,
-            );
-            assert!(
-                servers.iter().all(|s| s.name != "tyde-config"),
-                "non-help spawns must not get config tools: {custom_agent_id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn antigravity_session_summary_resumability_requires_native_db() {
-        let missing_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_owned());
-        let existing_id = SessionId("66666666-6666-4666-8666-666666666666".to_owned());
-        let compacted_id = SessionId("77777777-7777-4777-8777-777777777777".to_owned());
-        let backend_native_id = SessionId("88888888-8888-4888-8888-888888888888".to_owned());
-        let replacement_id = SessionId("99999999-9999-4999-8999-999999999999".to_owned());
-        let parent_id = SessionId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned());
-        let synthetic_id = SessionId("antigravity-legacy".to_owned());
-        let claude_id = SessionId("claude-session".to_owned());
-        let mut compacted_summary =
-            test_session_summary(BackendKind::Antigravity, compacted_id.clone(), false);
-        compacted_summary.compacted_to_session_id = Some(replacement_id);
-        let mut backend_native_summary =
-            test_session_summary(BackendKind::Antigravity, backend_native_id.clone(), false);
-        backend_native_summary.parent_id = Some(parent_id);
-        let mut summaries = vec![
-            test_session_summary(BackendKind::Antigravity, missing_id.clone(), true),
-            test_session_summary(BackendKind::Antigravity, existing_id.clone(), false),
-            compacted_summary,
-            backend_native_summary,
-            test_session_summary(BackendKind::Antigravity, synthetic_id, true),
-            test_session_summary(BackendKind::Claude, claude_id.clone(), true),
-        ];
-
-        normalize_antigravity_session_resumability_with(&mut summaries, |session_id| {
-            session_id == &existing_id
-                || session_id == &compacted_id
-                || session_id == &backend_native_id
-        });
-
-        assert!(!summaries[0].resumable);
-        assert!(summaries[1].resumable);
-        assert!(!summaries[2].resumable);
-        assert!(!summaries[3].resumable);
-        assert!(!summaries[4].resumable);
-        assert!(summaries[5].resumable);
-    }
-
-    fn test_session_summary(
-        backend_kind: BackendKind,
-        id: SessionId,
-        resumable: bool,
-    ) -> SessionSummary {
-        SessionSummary {
-            id,
-            backend_kind,
-            launch_profile_id: None,
-            workspace_roots: Vec::new(),
-            project_id: None,
-            alias: None,
-            user_alias: None,
-            parent_id: None,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            message_count: 0,
-            token_count: None,
-            resumable,
-            compacted_from_session_id: None,
-            compacted_to_session_id: None,
-            compacted_at_ms: None,
-            compaction_summary_preview: None,
-        }
-    }
-
-    /// Enough sessions to cross `MAX_SESSION_LIST_PAGE_LIMIT`, which is the
-    /// only threshold that matters here — the reported host had 4014, but the
-    /// defect reproduces identically at 129 for a fraction of the fixtures.
-    fn session_summaries_over_the_page_maximum() -> Vec<SessionSummary> {
-        (0..MAX_SESSION_LIST_PAGE_LIMIT + 1)
-            .map(|index| {
-                test_session_summary(
-                    BackendKind::Hermes,
-                    SessionId(format!("session-{index}")),
-                    true,
-                )
-            })
-            .collect()
-    }
-
-    /// The whole class of defect in one assertion: a client re-requests a view
-    /// by echoing the descriptor it was handed, so whatever the host stamps,
-    /// the host must accept back — and accept back *unchanged*.
-    ///
-    /// Before the fix a full-replay page advertised its own session count, and
-    /// this round trip failed with
-    /// `session list limit 129 exceeds maximum 128`.
-    #[test]
-    fn a_full_replay_page_limit_is_accepted_when_echoed_back() {
-        let sessions = session_summaries_over_the_page_maximum();
-        let request = SessionPageRequest::initial(
-            SessionListGeneration(1),
-            SessionListScope::AllSessions,
-            SessionListReplayMode::Full,
-            None,
-            "test",
-        )
-        .expect("build initial full-replay page request");
-        let (_, page) =
-            page_session_summaries(&sessions, request).expect("page a full-replay snapshot");
-
-        let echoed = session_page_limit(page.limit, SessionListReplayMode::Full, "test")
-            .expect("the host must accept the page limit it advertised");
-        assert_eq!(
-            echoed, page.limit,
-            "echoing an advertised limit must resolve to that same limit"
-        );
-    }
-
-    #[test]
-    fn full_replay_reports_no_limit_rather_than_the_session_count() {
-        let full = SessionListReplayMode::Full;
-        assert_eq!(
-            session_page_limit(None, full, "test").expect("full replay resolves"),
-            None,
-            "full replay is unbounded; naming a count here produced the 4014"
-        );
-
-        let sessions = session_summaries_over_the_page_maximum();
-        let expected = sessions.len() as u32;
-        let request = SessionPageRequest::initial(
-            SessionListGeneration(1),
-            SessionListScope::AllSessions,
-            SessionListReplayMode::Full,
-            None,
-            "test",
-        )
-        .expect("build initial full-replay page request");
-        let (page_sessions, page) =
-            page_session_summaries(&sessions, request).expect("page a full-replay snapshot");
-
-        assert_eq!(page.limit, None);
-        assert_eq!(page.total_count, expected);
-        assert_eq!(
-            page_sessions.len(),
-            expected as usize,
-            "an unbounded page still returns every session in scope"
-        );
-        assert!(
-            matches!(page.status, SessionListPageStatus::Complete),
-            "an unbounded page has nothing left to continue with"
-        );
-    }
-
-    #[test]
-    fn session_page_limit_bounds_resolved_limits_not_just_requested_ones() {
-        let full = SessionListReplayMode::Full;
-        let max = MAX_SESSION_LIST_PAGE_LIMIT;
-
-        assert!(
-            session_page_limit(Some(0), full, "test").is_err(),
-            "a zero page would never terminate"
-        );
-        assert_eq!(
-            session_page_limit(Some(max), full, "test").expect("the maximum is requestable"),
-            Some(max)
-        );
-
-        let error = session_page_limit(Some(max + 1), full, "test")
-            .expect_err("an oversized explicit limit must be rejected");
-        assert!(
-            error.message.contains("exceeds maximum 128"),
-            "unexpected error: {}",
-            error.message
-        );
-
-        // A replay-mode default is resolved before it is bounded, so a paged
-        // subscriber can no longer advertise a page size that requests for it
-        // would be refused.
-        let oversized = SessionListReplayMode::Paged { limit: max + 1 };
-        let error = session_page_limit(None, oversized, "test")
-            .expect_err("an oversized resolved default must be rejected");
-        assert!(
-            error.message.contains("exceeds maximum 128"),
-            "unexpected error: {}",
-            error.message
-        );
-
-        let mobile = SessionListReplayMode::Paged {
-            limit: DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
-        };
-        assert_eq!(
-            session_page_limit(None, mobile, "test").expect("the mobile default resolves"),
-            Some(DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT)
-        );
-    }
-
-    #[test]
-    fn session_count_update_applies_only_to_snapshots_containing_session() {
-        let tracked_session_id = SessionId("tracked-session".to_owned());
-        let mut snapshot = SessionListSnapshot {
-            generation: SessionListGeneration(7),
-            scope: SessionListScope::RootSessions,
-            sessions: vec![test_session_summary(
-                BackendKind::Hermes,
-                tracked_session_id.clone(),
-                true,
-            )],
-        };
-
-        assert!(!apply_session_summary_count_update(
-            None,
-            &SessionSummaryCountUpdatedPayload {
-                session_id: tracked_session_id.clone(),
-                assistant_turn_count: 2,
-                updated_at_ms: 20,
-            },
-        ));
-        assert!(!apply_session_summary_count_update(
-            Some(&mut snapshot),
-            &SessionSummaryCountUpdatedPayload {
-                session_id: SessionId("unlisted-session".to_owned()),
-                assistant_turn_count: 3,
-                updated_at_ms: 30,
-            },
-        ));
-        assert_eq!(snapshot.sessions[0].message_count, 0);
-        assert_eq!(snapshot.sessions[0].updated_at_ms, 2);
-        assert!(apply_session_summary_count_update(
-            Some(&mut snapshot),
-            &SessionSummaryCountUpdatedPayload {
-                session_id: tracked_session_id,
-                assistant_turn_count: 4,
-                updated_at_ms: 40,
-            },
-        ));
-        assert_eq!(snapshot.sessions[0].message_count, 4);
-        assert_eq!(snapshot.sessions[0].updated_at_ms, 40);
-        assert!(!apply_session_summary_count_update(
-            Some(&mut snapshot),
-            &SessionSummaryCountUpdatedPayload {
-                session_id: SessionId("tracked-session".to_owned()),
-                assistant_turn_count: 4,
-                updated_at_ms: 39,
-            },
-        ));
-        assert_eq!(snapshot.sessions[0].message_count, 4);
-        assert_eq!(snapshot.sessions[0].updated_at_ms, 40);
-        assert_eq!(snapshot.generation, SessionListGeneration(7));
-        assert_eq!(snapshot.scope, SessionListScope::RootSessions);
-    }
-
-    #[test]
-    fn cancelled_fanout_still_authorizes_and_signals_publication() {
-        let agent_id = AgentId(Uuid::new_v4().to_string());
-        let visibility = SpawnVisibility::new(agent_id.clone(), AgentVisibilityRegistry::default());
-        assert!(visibility.begin_fanout());
-        visibility.cancel_outer_spawn();
-        let (publish_tx, mut publish_rx) = mpsc::unbounded_channel();
-        let publication = PendingAgentSessionPublication {
-            agent_id: agent_id.clone(),
-            publish_tx: Some(publish_tx),
-        };
-        let (summary_tx, mut summary_rx) = mpsc::unbounded_channel();
-
-        assert!(visibility.finish_new_agent_fanout());
-        authorize_agent_session_publication(publication, &summary_tx, &agent_id);
-        publish_rx
-            .try_recv()
-            .expect("cancelled fanout must still authorize session publication");
-        match summary_rx
-            .try_recv()
-            .expect("cancelled fanout must still settle pending summary updates")
-        {
-            HostSessionSummaryCountEvent::AgentPublished(published_agent_id) => {
-                assert_eq!(published_agent_id, agent_id);
-            }
-            HostSessionSummaryCountEvent::Update(_) => {
-                panic!("publication completion emitted a count update")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn summary_from_same_session_agent_waits_for_other_agent_new_agent() {
-        let (tx, mut rx) = crate::stream::output_channel();
-        let stream = Stream::new(
-            StreamPath(format!("/host/cross-agent-order-{}", Uuid::new_v4())),
-            tx,
-        );
-        let mut subscriber = HostSubscriber {
-            stream: stream.clone(),
-            voice_desktop: None,
-            bootstrapped: true,
-            agent_replay: AgentReplayMode::Eager,
-            session_list_replay: SessionListReplayMode::Full,
-            session_list_snapshot: None,
-            session_summary_updates_subscribed: true,
-            new_agent_fanouts_in_flight: 2,
-            held_summary_count_frames: Vec::new(),
-            known_agent_streams: HashSet::new(),
-            attached_agent_streams: HashSet::new(),
-            bootstrapped_agent_streams: HashSet::new(),
-            pending_bootstrap_new_agents: Vec::new(),
-            pending_bootstrap_frames: Vec::new(),
-            last_session_schemas: None,
-            last_backend_config_schemas: None,
-            last_backend_config_snapshots: None,
-            last_backend_native_settings_snapshots: None,
-            last_backend_capacity: None,
-            capacity_replay_ready: true,
-            last_launch_profile_catalog: None,
-            last_task_token_usages: HashMap::new(),
-        };
-        let shared_session_id = SessionId("shared-resume-session".to_owned());
-        let producer_agent_id = AgentId("existing-session-agent".to_owned());
-        let first_publishing_agent_id = AgentId("first-resumed-session-agent".to_owned());
-        let second_publishing_agent_id = AgentId("second-resumed-session-agent".to_owned());
-        let count_payload = SessionSummaryCountUpdatedPayload {
-            session_id: shared_session_id.clone(),
-            assistant_turn_count: 3,
-            updated_at_ms: 30,
-        };
-        let new_agent_payload = |agent_id: AgentId| NewAgentPayload {
-            agent_id: agent_id.clone(),
-            name: "Resumed session agent".to_owned(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Hermes,
-            launch_profile_id: None,
-            workspace_roots: Vec::new(),
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id: Some(producer_agent_id.clone()),
-            session_id: Some(shared_session_id.clone()),
-            workflow: None,
-            created_at_ms: 31,
-            instance_stream: new_instance_stream(&agent_id),
-            activity_summary: AgentActivitySummaryState::default(),
-        };
-
-        emit_or_queue_host_frame(
-            &mut subscriber,
-            FrameKind::SessionSummaryCountUpdated,
-            serde_json::to_value(&count_payload).expect("serialize count payload"),
-        )
-        .expect("hold count from existing agent");
-        assert!(
-            rx.try_recv().is_err(),
-            "a count from another agent sharing the session must wait for NewAgent"
-        );
-
-        stream
-            .send_value(
-                FrameKind::NewAgent,
-                serde_json::to_value(new_agent_payload(first_publishing_agent_id))
-                    .expect("serialize first NewAgent"),
-            )
-            .expect("send first resumed NewAgent");
-        release_new_agent_fanout_hold(&mut subscriber).expect("release count hold");
-        let first_new_agent = rx.recv().await.expect("first NewAgent frame");
-        assert_eq!(first_new_agent.kind, FrameKind::NewAgent);
-        assert!(
-            rx.try_recv().is_err(),
-            "the count must remain held while another NewAgent fanout is active"
-        );
-
-        stream
-            .send_value(
-                FrameKind::NewAgent,
-                serde_json::to_value(new_agent_payload(second_publishing_agent_id))
-                    .expect("serialize second NewAgent"),
-            )
-            .expect("send second resumed NewAgent");
-        release_new_agent_fanout_hold(&mut subscriber).expect("release final count hold");
-        let second_new_agent = rx.recv().await.expect("second NewAgent frame");
-        assert_eq!(second_new_agent.kind, FrameKind::NewAgent);
-        let count = rx.recv().await.expect("count frame");
-        assert_eq!(count.kind, FrameKind::SessionSummaryCountUpdated);
-        assert_eq!(
-            count
-                .parse_payload::<SessionSummaryCountUpdatedPayload>()
-                .expect("count payload"),
-            count_payload
-        );
-    }
-
-    #[tokio::test]
-    async fn dropped_fanout_batch_releases_subscriber_count_hold() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/dropped-fanout-{}", Uuid::new_v4()));
-        assert!(
-            fixture
-                .host
-                .register_host_stream(Stream::new(host_path.clone(), tx), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let bootstrap = rx.recv().await.expect("HostBootstrap frame");
-        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
-        let count_payload = SessionSummaryCountUpdatedPayload {
-            session_id: SessionId("cancelled-fanout-session".to_owned()),
-            assistant_turn_count: 2,
-            updated_at_ms: 20,
-        };
-        {
-            let mut state = fixture.host.state.lock().await;
-            let subscriber = state
-                .host_streams
-                .get_mut(&host_path)
-                .expect("registered host subscriber");
-            subscriber.new_agent_fanouts_in_flight = 1;
-            emit_or_queue_host_frame(
-                subscriber,
-                FrameKind::SessionSummaryCountUpdated,
-                serde_json::to_value(&count_payload).expect("serialize count payload"),
-            )
-            .expect("hold count during fanout");
-        }
-
-        drop(NewAgentFanoutBatchGuard::new(
-            Arc::clone(&fixture.host.state),
-            vec![host_path.clone()],
-        ));
-
-        let count = timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
-                    break envelope;
-                }
-            }
-        })
-        .await
-        .expect("dropped batch count drain");
-        assert_eq!(count.kind, FrameKind::SessionSummaryCountUpdated);
-        assert_eq!(
-            count
-                .parse_payload::<SessionSummaryCountUpdatedPayload>()
-                .expect("count payload"),
-            count_payload
-        );
-        let state = fixture.host.state.lock().await;
-        assert_eq!(
-            state
-                .host_streams
-                .get(&host_path)
-                .expect("registered host subscriber")
-                .new_agent_fanouts_in_flight,
-            0
-        );
-    }
-
-    #[test]
-    fn spawn_host_with_mock_backend_does_not_require_existing_tokio_runtime() {
-        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp host dir");
-
-        let result = spawn_host_with_mock_backend(
-            dir.join("sessions.json"),
-            dir.join("projects.json"),
-            dir.join("settings.json"),
-        );
-        if let Err(err) = result {
-            panic!("host spawn should succeed without an existing Tokio runtime: {err}");
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    async fn activity_summary_state(
-        host: &HostHandle,
-        agent_id: &AgentId,
-    ) -> AgentActivitySummaryState {
-        let state = host.state.lock().await;
-        current_agent_activity_summary_state(&state, agent_id)
-    }
-
-    #[tokio::test]
-    async fn activity_summary_timeout_error_clears_in_flight_and_emits_error() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "timeout summary target").await;
-        let mut entries = HashMap::new();
-        entries.insert(
-            agent_id.clone(),
-            ActivitySummarySchedulerEntry {
-                in_flight: true,
-                ..Default::default()
-            },
-        );
-
-        finish_activity_summary_call(
-            &fixture.host,
-            &mut entries,
-            ActivitySummaryTaskResult {
-                agent_id: agent_id.clone(),
-                epoch: 7,
-                transient_agent_id: AgentId(Uuid::new_v4().to_string()),
-                source_through_seq: Some(12),
-                result: Err("activity summary generation timed out after 30 seconds".to_owned()),
-            },
-            ActivitySummarySettingsSignal {
-                enabled: true,
-                epoch: 7,
-            },
-        )
-        .await;
-
-        let entry = entries.get(&agent_id).expect("scheduler entry");
-        assert!(
-            !entry.in_flight,
-            "timeout result must clear the in-flight marker"
-        );
-        let state = activity_summary_state(&fixture.host, &agent_id).await;
-        let AgentActivitySummaryState::Error { message, .. } = state else {
-            panic!("expected activity summary error after timeout, got {state:?}");
-        };
-        assert_eq!(
-            message,
-            "activity summary generation timed out after 30 seconds"
-        );
-    }
-
-    #[tokio::test]
-    async fn activity_summary_generation_timeout_returns_error() {
-        let error = await_activity_summary_generation(
-            std::future::pending::<Result<AgentActivitySummary, String>>(),
-            Duration::from_millis(10),
-        )
-        .await
-        .expect_err("pending summary generation should time out");
-
-        assert_eq!(error, "activity summary generation timed out after 10 ms");
-    }
-
-    #[tokio::test]
-    async fn agent_name_generation_timeout_returns_error() {
-        let error = await_agent_name_generation(
-            std::future::pending::<Result<String, String>>(),
-            Duration::from_millis(10),
-        )
-        .await
-        .expect_err("pending agent name generation should time out");
-
-        assert_eq!(error, "agent name generation timed out after 10 ms");
-    }
-
-    #[tokio::test]
-    async fn queued_activity_summary_waits_for_permit_before_pending_state() {
-        let fixture = compact_fixture().await;
-        let (slow_agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "__mock_slow_activity_summary__ keep working")
-                .await;
-        let (queued_agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "normal queued summary").await;
-        let settings = ActivitySummarySettingsSignal {
-            enabled: true,
-            epoch: 11,
-        };
-        let semaphore = Arc::new(Semaphore::new(1));
-        let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel();
-        let mut entries = HashMap::new();
-        entries.insert(
-            slow_agent_id.clone(),
-            ActivitySummarySchedulerEntry {
-                pending_due: Some(Instant::now() - Duration::from_millis(1)),
-                ..Default::default()
-            },
-        );
-
-        start_due_activity_summary_calls(
-            &fixture.host,
-            &mut entries,
-            settings,
-            Arc::clone(&semaphore),
-            task_event_tx.clone(),
-        )
-        .await;
-        let started = tokio::time::timeout(Duration::from_secs(1), task_event_rx.recv())
-            .await
-            .expect("slow summary should acquire the permit")
-            .expect("slow summary start event");
-        let ActivitySummaryTaskEvent::Started(started) = started else {
-            panic!("expected slow summary start event");
-        };
-        assert_eq!(started.agent_id, slow_agent_id);
-        begin_activity_summary_call(&fixture.host, &mut entries, started, settings).await;
-        assert!(matches!(
-            activity_summary_state(&fixture.host, &slow_agent_id).await,
-            AgentActivitySummaryState::Pending { .. }
-        ));
-
-        entries.insert(
-            queued_agent_id.clone(),
-            ActivitySummarySchedulerEntry {
-                pending_due: Some(Instant::now() - Duration::from_millis(1)),
-                ..Default::default()
-            },
-        );
-        start_due_activity_summary_calls(
-            &fixture.host,
-            &mut entries,
-            settings,
-            Arc::clone(&semaphore),
-            task_event_tx,
-        )
-        .await;
-
-        match tokio::time::timeout(Duration::from_millis(200), task_event_rx.recv()).await {
-            Err(_) => {}
-            Ok(Some(event)) => {
-                panic!("queued summary emitted an event before the permit was free: {event:?}");
-            }
-            Ok(None) => panic!("activity summary task event channel closed"),
-        }
-        assert!(
-            !matches!(
-                activity_summary_state(&fixture.host, &queued_agent_id).await,
-                AgentActivitySummaryState::Pending { .. }
-            ),
-            "queued summaries must not render as Pending before generation starts"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_project_removes_code_intel_router() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_root = dir.path().join("project-root");
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        let host = spawn_host_with_mock_backend(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-        )
-        .expect("spawn host");
-
-        host.create_project(ProjectCreatePayload {
-            name: "Code Intel Router".to_owned(),
-            roots: vec![ProjectRootPath(project_root.to_string_lossy().into_owned())],
-        })
-        .await
-        .expect("create project");
-        let project_id = {
-            let state = host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Code Intel Router")
-                .expect("created project")
-                .id
-        };
-
-        host.warm_code_intel_project(project_id.clone(), "test")
-            .await
-            .expect("warm code-intel project");
-        {
-            let state = host.state.lock().await;
-            assert!(
-                state.code_intel_routers.contains_key(&project_id),
-                "warmup should create the per-project router"
-            );
-        }
-
-        host.delete_project(ProjectDeletePayload {
-            id: project_id.clone(),
-        })
-        .await
-        .expect("delete project");
-
-        let state = host.state.lock().await;
-        assert!(
-            !state.code_intel_routers.contains_key(&project_id),
-            "project deletion must drop the code-intel router"
-        );
-    }
-
-    #[tokio::test]
-    async fn restarted_project_stream_recreates_code_intel_router_handle() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_root = dir.path().join("project-root");
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        let host = spawn_host_with_mock_backend(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-        )
-        .expect("spawn host");
-
-        host.create_project(ProjectCreatePayload {
-            name: "Restarted Project Stream".to_owned(),
-            roots: vec![ProjectRootPath(project_root.to_string_lossy().into_owned())],
-        })
-        .await
-        .expect("create project");
-        let project_id = {
-            let state = host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Restarted Project Stream")
-                .expect("created project")
-                .id
-        };
-
-        host.warm_code_intel_project(project_id.clone(), "test")
-            .await
-            .expect("warm code-intel project");
-        let old_handle = {
-            let state = host.state.lock().await;
-            let handle = state
-                .project_streams
-                .get(&project_id)
-                .expect("project stream exists")
-                .handle
-                .clone();
-            assert!(
-                state
-                    .code_intel_routers
-                    .get(&project_id)
-                    .expect("router exists")
-                    .uses_project_handle_for_test(&handle),
-                "router should start with the active project stream handle"
-            );
-            state
-                .project_streams
-                .get(&project_id)
-                .expect("project stream exists")
-                .task
-                .abort();
-            handle
-        };
-
-        for _ in 0..100 {
-            let finished = {
-                let state = host.state.lock().await;
-                state
-                    .project_streams
-                    .get(&project_id)
-                    .expect("project stream exists")
-                    .task
-                    .is_finished()
-            };
-            if finished {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        {
-            let state = host.state.lock().await;
-            assert!(
-                state
-                    .project_streams
-                    .get(&project_id)
-                    .expect("project stream exists")
-                    .task
-                    .is_finished(),
-                "aborted project stream should finish before restart"
-            );
-        }
-
-        host.warm_code_intel_project(project_id.clone(), "test")
-            .await
-            .expect("warm code-intel project after stream restart");
-
-        let state = host.state.lock().await;
-        let new_handle = &state
-            .project_streams
-            .get(&project_id)
-            .expect("project stream restarted")
-            .handle;
-        assert!(
-            !new_handle.same_channel_for_test(&old_handle),
-            "project stream restart should replace the handle"
-        );
-        assert!(
-            state
-                .code_intel_routers
-                .get(&project_id)
-                .expect("router recreated")
-                .uses_project_handle_for_test(new_handle),
-            "router must use the replacement project stream handle"
-        );
-    }
-
-    #[test]
-    fn dynamic_session_schema_unavailable_rejects_explicit_settings() {
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            protocol::SessionSettingValue::String("anthropic/claude-haiku-4.5".to_string()),
-        );
-
-        let failure =
-            session_settings_startup_failure(BackendKind::Hermes, None, &settings, "supplied")
-                .expect("non-empty settings without schema should fail");
-
-        assert_eq!(failure.code, protocol::AgentErrorCode::BackendFailed);
-        assert!(
-            failure
-                .message
-                .contains("session settings schema unavailable"),
-            "unexpected failure message: {}",
-            failure.message
-        );
-    }
-
-    #[test]
-    fn dynamic_session_schema_unavailable_rejects_stored_settings() {
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            protocol::SessionSettingValue::String("anthropic/claude-haiku-4.5".to_string()),
-        );
-
-        let (sanitized, failure) =
-            sanitize_stored_session_settings(BackendKind::Hermes, None, Some(settings));
-
-        assert!(sanitized.is_none());
-        let failure = failure.expect("stored settings without schema should fail");
-        assert_eq!(failure.code, protocol::AgentErrorCode::BackendFailed);
-        assert!(
-            failure
-                .message
-                .contains("session settings schema unavailable"),
-            "unexpected failure message: {}",
-            failure.message
-        );
-    }
-
-    #[test]
-    fn stored_session_settings_invalid_for_schema_are_rejected() {
-        let mut settings = protocol::SessionSettingsValues::default();
-        settings.0.insert(
-            "default_agent".to_string(),
-            protocol::SessionSettingValue::String("swarm".to_string()),
-        );
-        let schema = crate::backend::empty_session_settings_schema(BackendKind::Tycode);
-
-        let (sanitized, failure) =
-            sanitize_stored_session_settings(BackendKind::Tycode, Some(&schema), Some(settings));
-
-        assert!(sanitized.is_none());
-        let failure = failure.expect("invalid stored Tycode settings should fail");
-        assert_eq!(failure.code, protocol::AgentErrorCode::Internal);
-        assert!(
-            failure.message.contains("invalid stored session settings"),
-            "unexpected failure message: {}",
-            failure.message
-        );
-        assert!(
-            failure
-                .message
-                .contains("unknown session setting 'default_agent'"),
-            "unexpected failure message: {}",
-            failure.message
-        );
-    }
-
-    #[test]
-    fn worktree_path_sanitizes_branch_characters() {
-        let parent = ProjectRootPath("/Users/mike/Tyde2".to_owned());
-
-        let simple = compute_worktree_path(&parent, &GitBranchName("feature-login".to_owned()))
-            .expect("compute simple worktree path");
-        assert_eq!(simple.0, "/Users/mike/Tyde2--feature-login");
-
-        let slash = compute_worktree_path(&parent, &GitBranchName("feature/login".to_owned()))
-            .expect("compute slash worktree path");
-        assert_eq!(slash.0, "/Users/mike/Tyde2--feature-login");
-
-        // `%` in particular must never appear in the directory name:
-        // rust-lld cannot write output files under a path containing `%`.
-        let unicode = compute_worktree_path(&parent, &GitBranchName("café%".to_owned()))
-            .expect("compute unicode worktree path");
-        assert_eq!(unicode.0, "/Users/mike/Tyde2--caf--");
-        assert!(!unicode.0.contains('%'));
-    }
-
-    #[tokio::test]
-    async fn workbench_remove_reports_internal_when_parent_record_is_missing() {
-        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp host dir");
-        let host = spawn_host_with_mock_backend(
-            dir.join("sessions.json"),
-            dir.join("projects.json"),
-            dir.join("settings.json"),
-        )
-        .expect("spawn host");
-
-        let workbench = Project {
-            id: ProjectId("workbench-test".to_owned()),
-            name: "feature".to_owned(),
-            sort_order: 0,
-            source: ProjectSource::GitWorkbench {
-                parent_project_id: ProjectId("missing-parent".to_owned()),
-                branch: GitBranchName("feature".to_owned()),
-                roots: vec![WorkbenchRoot {
-                    parent_root: ProjectRootPath("/tmp/parent".to_owned()),
-                    worktree_root: ProjectRootPath("/tmp/parent--feature".to_owned()),
-                }],
-            },
-        };
-
-        let error = host
-            .validate_workbench_remove_roots(&workbench, false)
-            .await
-            .expect_err("missing parent should block removal");
-        assert_eq!(error.code(), protocol::CommandErrorCode::Internal);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    struct TeamFixture {
-        _dir: tempfile::TempDir,
-        host: HostHandle,
-        team: protocol::Team,
-        manager: TeamMember,
-        report: TeamMember,
-        custom_agent_id: CustomAgentId,
-        project_id: ProjectId,
-        project_root: String,
-        agent_team_store_path: PathBuf,
-    }
-
-    struct TeamRaceFixture {
-        temp_dir: tempfile::TempDir,
-        host: HostHandle,
-        team: protocol::Team,
-        custom_agent_id: CustomAgentId,
-        project_id: ProjectId,
-        agent_team_store_path: PathBuf,
-    }
-
-    struct CompactFixture {
-        _dir: tempfile::TempDir,
-        host: HostHandle,
-    }
-
-    async fn team_fixture() -> TeamFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_root = dir.path().join("project-root");
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        let session_path = dir.path().join("sessions.json");
-        let project_path = dir.path().join("projects.json");
-        let settings_path = dir.path().join("settings.json");
-        let agent_team_store_path = dir.path().join("agent_teams.json");
-        let host = spawn_host_with_mock_backend(session_path, project_path, settings_path)
-            .expect("spawn mock host");
-
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backend");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Claude),
-            },
-        })
-        .await
-        .expect("set default backend");
-
-        let custom_agent_id = CustomAgentId(format!("custom-{}", Uuid::new_v4()));
-        host.upsert_custom_agent(CustomAgentUpsertPayload {
-            custom_agent: CustomAgent {
-                id: custom_agent_id.clone(),
-                name: "Team Custom Agent".to_owned(),
-                description: "Handles team work".to_owned(),
-                instructions: None,
-                skill_ids: Vec::new(),
-                mcp_server_ids: Vec::new(),
-                tool_policy: ToolPolicy::Unrestricted,
-            },
-        })
-        .await
-        .expect("upsert custom agent");
-
-        host.create_project(ProjectCreatePayload {
-            name: "Team Project".to_owned(),
-            roots: vec![ProjectRootPath(project_root.to_string_lossy().to_string())],
-        })
-        .await
-        .expect("create project");
-        let project_id = {
-            let state = host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Team Project")
-                .expect("created project")
-                .id
-        };
-
-        host.create_team(TeamCreatePayload {
-            name: "Product Team".to_owned(),
-            manager: TeamMemberCreateSpec {
-                name: "Manager".to_owned(),
-                description: "Coordinates reports".to_owned(),
-                profile: None,
-                custom_agent_id: Some(custom_agent_id.clone()),
-                backend_kind: BackendKind::Claude,
-                cost_hint: None,
-                project_ids: vec![project_id.clone()],
-            },
-        })
-        .await
-        .expect("create team");
-        let (team, manager) = {
-            let snapshot = team_snapshot(&host).await;
-            let team = snapshot
-                .teams
-                .into_iter()
-                .find(|team| team.name == "Product Team")
-                .expect("created team");
-            let manager = snapshot
-                .members
-                .into_iter()
-                .find(|member| member.id == team.manager_member_id)
-                .expect("created manager");
-            (team, manager)
-        };
-
-        host.create_team_member(TeamMemberCreatePayload {
-            team_id: team.id.clone(),
-            member: TeamMemberCreateSpec {
-                name: "Report".to_owned(),
-                description: "Implements delegated work".to_owned(),
-                profile: None,
-                custom_agent_id: Some(custom_agent_id.clone()),
-                backend_kind: BackendKind::Claude,
-                cost_hint: None,
-                project_ids: vec![project_id.clone()],
-            },
-            session_id: None,
-        })
-        .await
-        .expect("create report");
-        let report = team_snapshot(&host)
-            .await
-            .members
-            .into_iter()
-            .find(|member| member.team_id == team.id && member.role == TeamMemberRole::Report)
-            .expect("created report");
-
-        TeamFixture {
-            _dir: dir,
-            host,
-            team,
-            manager,
-            report,
-            custom_agent_id,
-            project_id,
-            project_root: project_root.to_string_lossy().to_string(),
-            agent_team_store_path,
-        }
-    }
-
-    async fn team_race_fixture() -> TeamRaceFixture {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let project_root = temp_dir.path().join("race-project-root");
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        let project_root = project_root.to_string_lossy().to_string();
-        let manager_project_root = temp_dir.path().join("race-manager-project-root");
-        std::fs::create_dir_all(&manager_project_root).expect("create manager project root");
-        let manager_project_root = manager_project_root.to_string_lossy().to_string();
-        let session_path = temp_dir.path().join("sessions.json");
-        let project_path = temp_dir.path().join("projects.json");
-        let settings_path = temp_dir.path().join("settings.json");
-        let agent_team_store_path = temp_dir.path().join("agent_teams.json");
-        let host = spawn_host_with_mock_backend(session_path, project_path, settings_path)
-            .expect("spawn mock host");
-
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backend");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Claude),
-            },
-        })
-        .await
-        .expect("set default backend");
-
-        let manager_custom_agent_id = CustomAgentId(format!("manager-{}", Uuid::new_v4()));
-        host.upsert_custom_agent(CustomAgentUpsertPayload {
-            custom_agent: CustomAgent {
-                id: manager_custom_agent_id.clone(),
-                name: "Race Manager Custom Agent".to_owned(),
-                description: "Owns the team manager".to_owned(),
-                instructions: None,
-                skill_ids: Vec::new(),
-                mcp_server_ids: Vec::new(),
-                tool_policy: ToolPolicy::Unrestricted,
-            },
-        })
-        .await
-        .expect("upsert manager custom agent");
-
-        let custom_agent_id = CustomAgentId(format!("race-{}", Uuid::new_v4()));
-        host.upsert_custom_agent(CustomAgentUpsertPayload {
-            custom_agent: CustomAgent {
-                id: custom_agent_id.clone(),
-                name: "Race Custom Agent".to_owned(),
-                description: "The custom agent raced with member creation".to_owned(),
-                instructions: None,
-                skill_ids: Vec::new(),
-                mcp_server_ids: Vec::new(),
-                tool_policy: ToolPolicy::Unrestricted,
-            },
-        })
-        .await
-        .expect("upsert raced custom agent");
-
-        host.create_project(ProjectCreatePayload {
-            name: "Race Manager Project".to_owned(),
-            roots: vec![ProjectRootPath(manager_project_root)],
-        })
-        .await
-        .expect("create manager project");
-        let manager_project_id = {
-            let state = host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Race Manager Project")
-                .expect("created manager project")
-                .id
-        };
-
-        host.create_project(ProjectCreatePayload {
-            name: "Race Project".to_owned(),
-            roots: vec![ProjectRootPath(project_root.clone())],
-        })
-        .await
-        .expect("create project");
-        let project_id = {
-            let state = host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Race Project")
-                .expect("created project")
-                .id
-        };
-
-        host.create_team(TeamCreatePayload {
-            name: "Race Team".to_owned(),
-            manager: TeamMemberCreateSpec {
-                name: "Race Manager".to_owned(),
-                description: "Coordinates the race test".to_owned(),
-                profile: None,
-                custom_agent_id: Some(manager_custom_agent_id),
-                backend_kind: BackendKind::Claude,
-                cost_hint: None,
-                project_ids: vec![manager_project_id],
-            },
-        })
-        .await
-        .expect("create team");
-        let team = team_snapshot(&host)
-            .await
-            .teams
-            .into_iter()
-            .find(|team| team.name == "Race Team")
-            .expect("created team");
-
-        TeamRaceFixture {
-            temp_dir,
-            host,
-            team,
-            custom_agent_id,
-            project_id,
-            agent_team_store_path,
-        }
-    }
-
-    async fn team_snapshot(host: &HostHandle) -> crate::team_registry::TeamRegistrySnapshot {
-        let registry = { host.state.lock().await.team_registry.clone() };
-        registry.snapshot().await.expect("team snapshot")
-    }
-
-    async fn bind_team_member(host: &HostHandle, member: &TeamMember) -> AgentId {
-        let agent_id = AgentId(Uuid::new_v4().to_string());
-        let session_id = SessionId(format!("session-{}", Uuid::new_v4()));
-        let (registry, refs) = {
-            let state = host.state.lock().await;
-            (
-                state.team_registry.clone(),
-                agent_team_validation_refs(&state, "test_bind_team_member")
-                    .await
-                    .expect("team refs"),
-            )
-        };
-        let events = registry
-            .bind_member_agent(member.id.clone(), agent_id.clone(), Some(session_id), refs)
-            .await
-            .expect("bind member");
-        host.fan_out_team_registry_events(events).await;
-        agent_id
-    }
-
-    fn member_from_snapshot(
-        host_snapshot: crate::team_registry::TeamRegistrySnapshot,
-        id: &TeamMemberId,
-    ) -> TeamMember {
-        host_snapshot
-            .members
-            .into_iter()
-            .find(|member| member.id == *id)
-            .expect("member in snapshot")
-    }
-
-    fn persisted_team_store(path: &Path) -> AgentTeamsStoreFile {
-        let json = std::fs::read_to_string(path).expect("read agent teams store");
-        serde_json::from_str(&json).expect("parse agent teams store")
-    }
-
-    fn assert_no_team_member_references_project(
-        store: &AgentTeamsStoreFile,
-        project_id: &ProjectId,
-    ) {
-        for member in store.members.values() {
-            assert!(
-                !member.project_ids.contains(project_id),
-                "member {} still references deleted project {}",
-                member.id,
-                project_id
-            );
-        }
-    }
-
-    async fn assert_agent_team_store_loads_with_current_refs(host: &HostHandle, path: &Path) {
-        let refs = {
-            let state = host.state.lock().await;
-            agent_team_validation_refs(&state, "test_validate_agent_team_store")
-                .await
-                .expect("team refs")
-        };
-        AgentTeamsStore::load(path.to_path_buf(), &refs).expect("agent teams store validates");
-    }
-
-    fn team_member_create_payload(
-        fixture: &TeamRaceFixture,
-        custom_agent_id: CustomAgentId,
-        project_ids: Vec<ProjectId>,
-    ) -> TeamMemberCreatePayload {
-        TeamMemberCreatePayload {
-            team_id: fixture.team.id.clone(),
-            member: TeamMemberCreateSpec {
-                name: "Race Report".to_owned(),
-                description: "Created while a referenced record is deleting".to_owned(),
-                profile: None,
-                custom_agent_id: Some(custom_agent_id),
-                backend_kind: BackendKind::Claude,
-                cost_hint: None,
-                project_ids,
-            },
-            session_id: None,
-        }
-    }
-
-    fn team_mutation_race_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
-    async fn wait_for_team_member_unbound(host: &HostHandle, member_id: &TeamMemberId) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let snapshot = team_snapshot(host).await;
-            let binding = snapshot
-                .bindings
-                .iter()
-                .find(|binding| binding.member_id == *member_id)
-                .expect("member binding");
-            if binding.current_agent_id.is_none() {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for team member {member_id} to unbind"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_team_member_binding_idle(host: &HostHandle, member_id: &TeamMemberId) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let snapshot = team_snapshot(host).await;
-            let binding = snapshot
-                .bindings
-                .iter()
-                .find(|binding| binding.member_id == *member_id)
-                .expect("member binding");
-            if binding.current_agent_id.is_some() && binding.status == AgentControlStatus::Idle {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for team member {member_id} binding to become idle"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn compact_fixture() -> CompactFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let host = spawn_host_with_mock_backend(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-        )
-        .expect("spawn mock host");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backend");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Claude),
-            },
-        })
-        .await
-        .expect("set default backend");
-        CompactFixture { _dir: dir, host }
-    }
-
-    async fn compact_fixture_with_transcript_io() -> CompactFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let host = spawn_host_with_mock_backend_and_runtime_config(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-            HostRuntimeConfig {
-                skip_real_backend_probe: true,
-                enable_actor_transcript_io: true,
-                ..HostRuntimeConfig::default()
-            },
-        )
-        .expect("spawn mock host with transcript persistence");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backend");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Claude),
-            },
-        })
-        .await
-        .expect("set default backend");
-        CompactFixture { _dir: dir, host }
-    }
-
-    async fn compact_fixture_without_supervisor_worker() -> CompactFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let host = spawn_host_with_mock_backend_and_runtime_config(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-            HostRuntimeConfig {
-                skip_real_backend_probe: true,
-                start_agent_supervisor_worker: false,
-                ..HostRuntimeConfig::default()
-            },
-        )
-        .expect("spawn mock host without supervisor worker");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backend");
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Claude),
-            },
-        })
-        .await
-        .expect("set default backend");
-        CompactFixture { _dir: dir, host }
-    }
-
-    async fn assert_native_context_compaction_route(host: &HostHandle, agent_id: &AgentId) {
-        let capability = host
-            .agent_handle(agent_id)
-            .await
-            .expect("live compaction target")
-            .compaction_capability()
-            .await
-            .expect("compaction capability");
-        assert_eq!(
-            capability.coordinator,
-            crate::backend::BackendCompactionCoordinator::ContextOperation
-        );
-        assert!(matches!(
-            capability.availability,
-            crate::backend::BackendCompactionAvailability::Native {
-                mechanism: crate::backend::BackendCompactionMechanism::JsonRpcRequest
-            }
-        ));
-    }
-
-    fn task_usage_amount(input_tokens: u64, output_tokens: u64) -> TaskTokenUsageAmount {
-        TaskTokenUsageAmount {
-            total_tokens: input_tokens + output_tokens,
-            input_tokens: Some(input_tokens),
-            output_tokens: Some(output_tokens),
-            cached_prompt_tokens: None,
-            cache_creation_input_tokens: None,
-            reasoning_tokens: None,
-        }
-    }
-
-    fn task_usage_start(
-        agent_id: AgentId,
-        parent_agent_id: Option<AgentId>,
-        created_at_ms: u64,
-    ) -> AgentStartPayload {
-        AgentStartPayload {
-            agent_id,
-            name: "Task Usage Agent".to_owned(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Claude,
-            launch_profile_id: None,
-            workspace_roots: Vec::new(),
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id,
-            session_id: None,
-            workflow: None,
-            created_at_ms,
-        }
-    }
-
-    #[test]
-    fn task_token_usage_rollup_preserves_partial_root_self_usage() {
-        let root_id = AgentId("partial-root".to_owned());
-        let snapshots = vec![AgentUsageSnapshot {
-            start: task_usage_start(root_id.clone(), None, 1),
-            usage: TaskTokenUsageScope::Partial {
-                usage: Box::new(task_usage_amount(30, 12)),
-                unavailable_count: 1,
-                reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
-            },
-            model: Some("mock".to_owned()),
-        }];
-        let live_agent_ids = HashSet::from([root_id.clone()]);
-        let agent_sessions = HashMap::new();
-
-        let payloads =
-            task_token_usage_rollups_from_snapshots(snapshots, &live_agent_ids, &agent_sessions);
-
-        assert_eq!(payloads.len(), 1);
-        let payload = &payloads[0];
-        assert_eq!(payload.root_agent_id, root_id);
-        assert_eq!(payload.total.usage.total_tokens, 42);
-        assert_eq!(payload.total.usage.input_tokens, Some(30));
-        assert_eq!(payload.total.usage.output_tokens, Some(12));
-        assert!(matches!(
-            payload.total.status,
-            TaskTokenUsageStatus::Partial {
-                unavailable_count: 1,
-                ref reasons
-            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
-        ));
-        assert!(matches!(
-            payload.self_usage,
-            TaskTokenUsageScope::Partial {
-                ref usage,
-                unavailable_count: 1,
-                ref reasons
-            } if usage.total_tokens == 42
-                && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
-        ));
-        assert_eq!(payload.breakdown.len(), 1);
-        assert!(matches!(
-            payload.breakdown[0].usage,
-            TaskTokenUsageScope::Partial {
-                ref usage,
-                unavailable_count: 1,
-                ref reasons
-            } if usage.total_tokens == 42
-                && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
-        ));
-    }
-
-    #[test]
-    fn task_token_usage_rollup_mixes_registered_and_native_children_once() {
-        let root_id = AgentId("mixed-root".to_owned());
-        let native_id = AgentId("mixed-native".to_owned());
-        let registered_id = AgentId("mixed-registered".to_owned());
-        let mut root_start = task_usage_start(root_id.clone(), None, 1);
-        root_start.origin = AgentOrigin::User;
-        let mut native_start = task_usage_start(native_id.clone(), Some(root_id.clone()), 2);
-        native_start.origin = AgentOrigin::BackendNative;
-        let mut registered_start =
-            task_usage_start(registered_id.clone(), Some(root_id.clone()), 3);
-        registered_start.origin = AgentOrigin::AgentControl;
-        let snapshots = vec![
-            AgentUsageSnapshot {
-                start: root_start,
-                usage: TaskTokenUsageScope::Known {
-                    usage: Box::new(task_usage_amount(70, 30)),
-                },
-                model: Some("claude-root".to_owned()),
-            },
-            AgentUsageSnapshot {
-                start: native_start,
-                usage: TaskTokenUsageScope::Known {
-                    usage: Box::new(TaskTokenUsageAmount::total_only(47)),
-                },
-                model: Some("claude-native".to_owned()),
-            },
-            AgentUsageSnapshot {
-                start: registered_start,
-                usage: TaskTokenUsageScope::Known {
-                    usage: Box::new(task_usage_amount(20, 10)),
-                },
-                model: Some("claude-managed".to_owned()),
-            },
-        ];
-        let live_agent_ids = HashSet::from([root_id.clone()]);
-        let agent_sessions = HashMap::new();
-
-        let payloads = task_token_usage_rollups_from_snapshots(
-            snapshots.clone(),
-            &live_agent_ids,
-            &agent_sessions,
-        );
-
-        assert_eq!(payloads.len(), 1);
-        let payload = &payloads[0];
-        assert_eq!(payload.total.usage.total_tokens, 177);
-        assert_eq!(payload.descendant_usage.usage.total_tokens, 77);
-        assert_eq!(payload.descendant_count, 2);
-        assert_eq!(payload.total.status, TaskTokenUsageStatus::Known);
-        assert_eq!(
-            payload.descendant_usage.status,
-            TaskTokenUsageStatus::Known,
-            "a truthful total-only native child does not make the rollup partial"
-        );
-        assert_eq!(
-            payload
-                .breakdown
-                .iter()
-                .filter(|entry| entry.agent_id == native_id)
-                .count(),
-            1
-        );
-        assert_eq!(
-            payload
-                .breakdown
-                .iter()
-                .filter(|entry| entry.agent_id == registered_id)
-                .count(),
-            1
-        );
-
-        let unavailable_id = AgentId("mixed-unavailable".to_owned());
-        let mut unavailable_start = task_usage_start(unavailable_id, Some(root_id.clone()), 4);
-        unavailable_start.origin = AgentOrigin::AgentControl;
-        let mut incomplete = snapshots;
-        incomplete.push(AgentUsageSnapshot {
-            start: unavailable_start,
-            usage: TaskTokenUsageScope::Unavailable {
-                reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
-            },
-            model: None,
-        });
-
-        let payloads =
-            task_token_usage_rollups_from_snapshots(incomplete, &live_agent_ids, &agent_sessions);
-        let payload = &payloads[0];
-        assert_eq!(payload.total.usage.total_tokens, 177);
-        assert_eq!(payload.descendant_usage.usage.total_tokens, 77);
-        assert_eq!(payload.descendant_count, 3);
-        assert!(matches!(
-            payload.total.status,
-            TaskTokenUsageStatus::Partial {
-                unavailable_count: 1,
-                ref reasons,
-            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
-        ));
-        assert!(matches!(
-            payload.descendant_usage.status,
-            TaskTokenUsageStatus::Partial {
-                unavailable_count: 1,
-                ref reasons,
-            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
-        ));
-    }
-
-    async fn spawn_idle_user_agent(host: &HostHandle, prompt: &str) -> (AgentId, SessionId) {
-        let agent_id = host
-            .spawn_agent(SpawnAgentPayload {
-                name: Some("Compact Me".to_owned()),
-                custom_agent_id: None,
-                parent_agent_id: None,
-                project_id: None,
-                params: SpawnAgentParams::New {
-                    workspace_roots: Vec::new(),
-                    prompt: prompt.to_owned(),
-                    images: None,
-                    backend_kind: BackendKind::Claude,
-                    launch_profile_id: None,
-                    cost_hint: None,
-                    access_mode: Default::default(),
-                    session_settings: None,
-                },
-            })
-            .await
-            .expect("spawn idle user agent");
-        let session_id = host
-            .wait_for_agent_session_id_result(&agent_id)
-            .await
-            .expect("agent session id");
-        wait_for_agent_idle(host, &agent_id).await;
-        if prompt.contains(crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL) {
-            timeout(Duration::from_secs(1), async {
-                loop {
-                    let observation = host
-                        .activity_summary_observation(&agent_id)
-                        .await
-                        .expect("agent observation");
-                    let context = observation
-                        .handle
-                        .read_supervision_context()
-                        .await
-                        .expect("supervision context");
-                    if context.last_user_message.is_some() {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("mock user bubble must reach supervision context");
-        }
-        (agent_id, session_id)
-    }
-
-    #[tokio::test]
-    async fn response_end_fans_out_targeted_assistant_response_count() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("host bootstrap")
-            .expect("host stream remains open");
-        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
-        fixture
-            .host
-            .list_sessions(&host_stream, ListSessionsPayload::default())
-            .await
-            .expect("subscribe to session summary updates");
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::SessionList {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("initial session list");
-
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "count persisted assistant responses").await;
-        let mut saw_new_agent = false;
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                match envelope.kind {
-                    FrameKind::NewAgent => {
-                        let payload: NewAgentPayload =
-                            envelope.parse_payload().expect("NewAgent payload");
-                        saw_new_agent |= payload.agent_id == agent_id;
-                    }
-                    FrameKind::SessionSummaryCountUpdated => {
-                        let payload: SessionSummaryCountUpdatedPayload = envelope
-                            .parse_payload()
-                            .expect("session count update payload");
-                        if payload.session_id == session_id {
-                            assert!(
-                                saw_new_agent,
-                                "session summary update must follow NewAgent publication"
-                            );
-                            assert_eq!(payload.assistant_turn_count, 1);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("initial turn count update");
-        assert!(
-            saw_new_agent,
-            "spawn must publish NewAgent to the subscriber"
-        );
-
-        let (bootstrap_tx, mut bootstrap_rx) = crate::stream::output_channel();
-        let bootstrap_path =
-            StreamPath(format!("/host/session-count-bootstrap-{}", Uuid::new_v4()));
-        let bootstrap_stream = Stream::new(bootstrap_path, bootstrap_tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(bootstrap_stream, AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let second_bootstrap = timeout(Duration::from_secs(1), bootstrap_rx.recv())
-            .await
-            .expect("second host bootstrap")
-            .expect("second host stream remains open");
-        assert_eq!(second_bootstrap.kind, FrameKind::HostBootstrap);
-        while rx.try_recv().is_ok() {}
-        while bootstrap_rx.try_recv().is_ok() {}
-
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        assert!(
-            observation
-                .handle
-                .send_input(AgentInput::SendMessage(SendMessagePayload {
-                    message: format!("second turn {MOCK_SLOW_TURN_SENTINEL}"),
-                    images: None,
-                    origin: Some(MessageOrigin::User),
-                    tool_response: None,
-                }))
-                .await
-        );
-        wait_for_agent_active(&fixture.host, &agent_id).await;
-        wait_for_agent_idle(&fixture.host, &agent_id).await;
-
-        let mut rebuilt_session_lists = 0;
-        let count_update = timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                match envelope.kind {
-                    FrameKind::SessionList => rebuilt_session_lists += 1,
-                    FrameKind::SessionSummaryCountUpdated => {
-                        let payload: SessionSummaryCountUpdatedPayload = envelope
-                            .parse_payload()
-                            .expect("session count update payload");
-                        if payload.session_id == session_id && payload.assistant_turn_count == 2 {
-                            break payload;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("second turn count update");
-
-        assert_eq!(
-            rebuilt_session_lists, 0,
-            "response persistence must not rebuild the full session list"
-        );
-        assert_no_session_summary_count(
-            &mut bootstrap_rx,
-            "bootstrap-only response-count subscriber",
-        )
-        .await;
-        {
-            let state = fixture.host.state.lock().await;
-            let summary = state
-                .host_streams
-                .get(&host_path)
-                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
-                .and_then(|snapshot| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .find(|summary| summary.id == session_id)
-                })
-                .expect("subscriber session summary");
-            assert_eq!(summary.message_count, count_update.assistant_turn_count);
-            assert_eq!(summary.updated_at_ms, count_update.updated_at_ms);
-        }
-        let session_store = { Arc::clone(&fixture.host.state.lock().await.session_store) };
-        let persisted = session_store
-            .lock()
-            .await
-            .get(&session_id)
-            .expect("persisted session");
-        assert_eq!(persisted.message_count, 2);
-        assert!(persisted.updated_at_ms >= count_update.updated_at_ms);
-    }
-
-    #[tokio::test]
-    async fn explicit_session_list_delivery_subscribes_each_host_stream() {
-        let fixture = compact_fixture().await;
-        let (first_tx, mut first_rx) = crate::stream::output_channel();
-        let first_path = StreamPath(format!("/host/session-list-first-{}", Uuid::new_v4()));
-        let first_stream = Stream::new(first_path.clone(), first_tx);
-        let (second_tx, mut second_rx) = crate::stream::output_channel();
-        let second_path = StreamPath(format!("/host/session-list-second-{}", Uuid::new_v4()));
-        let second_stream = Stream::new(second_path.clone(), second_tx);
-        for stream in [first_stream.clone(), second_stream.clone()] {
-            assert!(
-                fixture
-                    .host
-                    .register_host_stream(stream, AgentReplayMode::Lazy)
-                    .await
-                    .is_empty()
-            );
-        }
-        assert_eq!(
-            first_rx.recv().await.expect("first HostBootstrap").kind,
-            FrameKind::HostBootstrap
-        );
-        assert_eq!(
-            second_rx.recv().await.expect("second HostBootstrap").kind,
-            FrameKind::HostBootstrap
-        );
-        while first_rx.try_recv().is_ok() {}
-        while second_rx.try_recv().is_ok() {}
-        {
-            let state = fixture.host.state.lock().await;
-            assert!(
-                [&first_path, &second_path].into_iter().all(|path| {
-                    !state
-                        .host_streams
-                        .get(path)
-                        .expect("bootstrap subscriber")
-                        .session_summary_updates_subscribed
-                }),
-                "HostBootstrap snapshots must not enroll passive streams"
-            );
-        }
-
-        for (stream, receiver) in [
-            (&first_stream, &mut first_rx),
-            (&second_stream, &mut second_rx),
-        ] {
-            fixture
-                .host
-                .list_sessions(stream, ListSessionsPayload::default())
-                .await
-                .expect("explicit session list");
-            loop {
-                if receiver
-                    .recv()
-                    .await
-                    .expect("explicit SessionList recipient")
-                    .kind
-                    == FrameKind::SessionList
-                {
-                    break;
-                }
-            }
-        }
-
-        let (unlisted_tx, mut unlisted_rx) = crate::stream::output_channel();
-        let unlisted_path = StreamPath(format!("/host/session-list-unlisted-{}", Uuid::new_v4()));
-        {
-            let mut state = fixture.host.state.lock().await;
-            state.host_streams.insert(
-                unlisted_path.clone(),
-                HostSubscriber {
-                    stream: Stream::new(unlisted_path.clone(), unlisted_tx),
-                    voice_desktop: None,
-                    bootstrapped: true,
-                    agent_replay: AgentReplayMode::Lazy,
-                    session_list_replay: SessionListReplayMode::Paged {
-                        limit: DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
-                    },
-                    session_list_snapshot: None,
-                    session_summary_updates_subscribed: false,
-                    new_agent_fanouts_in_flight: 0,
-                    held_summary_count_frames: Vec::new(),
-                    known_agent_streams: HashSet::new(),
-                    attached_agent_streams: HashSet::new(),
-                    bootstrapped_agent_streams: HashSet::new(),
-                    pending_bootstrap_new_agents: Vec::new(),
-                    pending_bootstrap_frames: Vec::new(),
-                    last_session_schemas: None,
-                    last_backend_config_schemas: None,
-                    last_backend_config_snapshots: None,
-                    last_backend_native_settings_snapshots: None,
-                    last_backend_capacity: None,
-                    capacity_replay_ready: true,
-                    last_launch_profile_catalog: None,
-                    last_task_token_usages: HashMap::new(),
-                },
-            );
-            assert_eq!(
-                fan_out_session_summary_count_update_inner(
-                    &mut state,
-                    &HostSessionSummaryCountUpdate {
-                        agent_id: AgentId("session-list-producer".to_owned()),
-                        payload: SessionSummaryCountUpdatedPayload {
-                            session_id: SessionId("session-list-session".to_owned()),
-                            assistant_turn_count: 1,
-                            updated_at_ms: 10,
-                        },
-                    },
-                ),
-                SessionSummaryCountDelivery::Delivered
-            );
-        }
-        let first_count =
-            recv_session_summary_count(&mut first_rx, "first explicit subscriber").await;
-        let second_count =
-            recv_session_summary_count(&mut second_rx, "second explicit subscriber").await;
-        assert_eq!(
-            first_count,
-            SessionSummaryCountUpdatedPayload {
-                session_id: SessionId("session-list-session".to_owned()),
-                assistant_turn_count: 1,
-                updated_at_ms: 10,
-            }
-        );
-        assert_eq!(second_count, first_count);
-        assert_no_session_summary_count(&mut unlisted_rx, "unlisted subscriber").await;
-
-        fixture.host.fan_out_session_lists().await;
-        for receiver in [&mut first_rx, &mut second_rx, &mut unlisted_rx] {
-            loop {
-                if receiver.recv().await.expect("SessionList recipient").kind
-                    == FrameKind::SessionList
-                {
-                    break;
-                }
-            }
-        }
-        {
-            let mut state = fixture.host.state.lock().await;
-            assert!(
-                state
-                    .host_streams
-                    .get(&first_path)
-                    .is_some_and(|subscriber| subscriber.session_summary_updates_subscribed)
-                    && state
-                        .host_streams
-                        .get(&second_path)
-                        .is_some_and(|subscriber| subscriber.session_summary_updates_subscribed),
-                "explicit ListSessions recipients must remain subscribed after fanout"
-            );
-            assert!(
-                !state
-                    .host_streams
-                    .get(&unlisted_path)
-                    .expect("unlisted subscriber")
-                    .session_summary_updates_subscribed,
-                "unsolicited SessionList fanout must not enroll a passive stream"
-            );
-            assert_eq!(
-                fan_out_session_summary_count_update_inner(
-                    &mut state,
-                    &HostSessionSummaryCountUpdate {
-                        agent_id: AgentId("session-list-producer".to_owned()),
-                        payload: SessionSummaryCountUpdatedPayload {
-                            session_id: SessionId("session-list-session".to_owned()),
-                            assistant_turn_count: 2,
-                            updated_at_ms: 20,
-                        },
-                    },
-                ),
-                SessionSummaryCountDelivery::Delivered
-            );
-        }
-        let first_count =
-            recv_session_summary_count(&mut first_rx, "first fanout-preserved subscriber").await;
-        let second_count =
-            recv_session_summary_count(&mut second_rx, "second fanout-preserved subscriber").await;
-        assert_eq!(first_count.assistant_turn_count, 2);
-        assert_eq!(first_count.updated_at_ms, 20);
-        assert_eq!(second_count, first_count);
-        assert_no_session_summary_count(&mut unlisted_rx, "fanout-only subscriber").await;
-    }
-
-    #[tokio::test]
-    async fn explicit_session_list_precedes_pending_count_drain() {
-        let fixture = compact_fixture().await;
-        let (_, session_id) =
-            spawn_idle_user_agent(&fixture.host, "persist a response before subscribing").await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("host bootstrap")
-            .expect("host stream remains open");
-        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
-        while rx.try_recv().is_ok() {}
-
-        let (observer_tx, mut observer_rx) = crate::stream::output_channel();
-        let observer_path = StreamPath(format!("/host/session-count-observer-{}", Uuid::new_v4()));
-        let observer_stream = Stream::new(observer_path.clone(), observer_tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(observer_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        assert_eq!(
-            observer_rx
-                .recv()
-                .await
-                .expect("observer HostBootstrap")
-                .kind,
-            FrameKind::HostBootstrap
-        );
-        while observer_rx.try_recv().is_ok() {}
-        fixture
-            .host
-            .list_sessions(&observer_stream, ListSessionsPayload::default())
-            .await
-            .expect("subscribe observer");
-        loop {
-            if observer_rx.recv().await.expect("observer SessionList").kind
-                == FrameKind::SessionList
-            {
-                break;
-            }
-        }
-
-        let pending_agent_id = AgentId("pending-count-during-enrollment".to_owned());
-        let visibility = {
-            let state = fixture.host.state.lock().await;
-            state.agent_visibility.clone()
-        };
-        let pending_visibility = SpawnVisibility::new(pending_agent_id.clone(), visibility);
-        let expected = {
-            let mut state = fixture.host.state.lock().await;
-            let summary = state
-                .host_streams
-                .get(&host_path)
-                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
-                .and_then(|snapshot| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .find(|summary| summary.id == session_id)
-                })
-                .expect("bootstrap snapshot contains persisted session");
-            let update = HostSessionSummaryCountUpdate {
-                agent_id: pending_agent_id.clone(),
-                payload: SessionSummaryCountUpdatedPayload {
-                    session_id: session_id.clone(),
-                    assistant_turn_count: summary.message_count,
-                    updated_at_ms: summary.updated_at_ms,
-                },
-            };
-            assert!(
-                !state
-                    .host_streams
-                    .get(&host_path)
-                    .expect("passive subscriber")
-                    .session_summary_updates_subscribed
-            );
-            assert!(
-                state
-                    .host_streams
-                    .get(&observer_path)
-                    .expect("subscribed observer")
-                    .session_summary_updates_subscribed
-            );
-            fan_out_session_summary_count_update(&mut state, &update);
-            assert_eq!(
-                state
-                    .pending_session_summary_count_updates
-                    .get(&pending_agent_id)
-                    .expect("publication-pending count")
-                    .front()
-                    .expect("queued count")
-                    .payload,
-                update.payload
-            );
-            update.payload
-        };
-        assert_no_session_summary_count(&mut rx, "passive subscriber before enrollment").await;
-        assert_no_session_summary_count(&mut observer_rx, "publication-pending observer").await;
-        assert!(pending_visibility.begin_fanout());
-        assert!(!pending_visibility.finish_new_agent_fanout());
-
-        fixture
-            .host
-            .list_sessions(&host_stream, ListSessionsPayload::default())
-            .await
-            .expect("create subscribed session snapshot");
-
-        let mut saw_session_list = false;
-        let count = timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                match envelope.kind {
-                    FrameKind::SessionList => saw_session_list = true,
-                    FrameKind::SessionSummaryCountUpdated => {
-                        let payload = envelope
-                            .parse_payload::<SessionSummaryCountUpdatedPayload>()
-                            .expect("count payload");
-                        if payload.session_id == session_id {
-                            assert!(
-                                saw_session_list,
-                                "snapshot response must precede its pending count flush"
-                            );
-                            break payload;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("matching pending count flush");
-        assert_eq!(count, expected);
-        assert_eq!(
-            recv_session_summary_count(&mut observer_rx, "existing subscribed observer").await,
-            expected,
-            "the global pending item was deferred for every subscriber, so \
-             enrollment must deliver it once to the existing observer"
-        );
-        assert_no_session_summary_count(&mut observer_rx, "existing observer duplicate").await;
-        assert!(
-            !fixture
-                .host
-                .state
-                .lock()
-                .await
-                .pending_session_summary_count_updates
-                .contains_key(&pending_agent_id),
-            "matching pending count must be consumed when the snapshot is created"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_session_snapshot_delivers_each_count_and_unsubscribe_discards() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("host bootstrap")
-            .expect("host stream remains open");
-        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
-        assert!(
-            bootstrap
-                .parse_payload::<HostBootstrapPayload>()
-                .expect("HostBootstrap payload")
-                .sessions
-                .is_empty()
-        );
-        while rx.try_recv().is_ok() {}
-
-        fixture
-            .host
-            .list_sessions(&host_stream, ListSessionsPayload::default())
-            .await
-            .expect("subscribe with an empty session snapshot");
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind == FrameKind::SessionList {
-                    let payload: SessionListPayload =
-                        envelope.parse_payload().expect("SessionList payload");
-                    assert!(payload.sessions.is_empty());
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("empty SessionList response");
-
-        let agent_id = AgentId("session-scoped-count-producer".to_owned());
-        let session_id = SessionId("new-session-outside-empty-snapshot".to_owned());
-        {
-            let mut state = fixture.host.state.lock().await;
-            for assistant_turn_count in [1, 2] {
-                fan_out_session_summary_count_update(
-                    &mut state,
-                    &HostSessionSummaryCountUpdate {
-                        agent_id: agent_id.clone(),
-                        payload: SessionSummaryCountUpdatedPayload {
-                            session_id: session_id.clone(),
-                            assistant_turn_count,
-                            updated_at_ms: u64::from(assistant_turn_count) * 10,
-                        },
-                    },
-                );
-            }
-            let snapshot = state
-                .host_streams
-                .get(&host_path)
-                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
-                .expect("subscribed session snapshot");
-            assert!(
-                snapshot.sessions.is_empty(),
-                "targeted delivery must not insert a session absent from the snapshot"
-            );
-        }
-
-        let counts = timeout(Duration::from_secs(1), async {
-            let mut counts = Vec::new();
-            while counts.len() < 2 {
-                let envelope = rx.recv().await.expect("host stream remains open");
-                if envelope.kind != FrameKind::SessionSummaryCountUpdated {
-                    continue;
-                }
-                let payload: SessionSummaryCountUpdatedPayload =
-                    envelope.parse_payload().expect("count payload");
-                if payload.session_id == session_id {
-                    counts.push(payload.assistant_turn_count);
-                }
-            }
-            counts
-        })
-        .await
-        .expect("both targeted count updates");
-        assert_eq!(
-            counts,
-            vec![1, 2],
-            "an empty snapshot must receive count one before count two"
-        );
-
-        let pending_agent_id = AgentId("pending-count-before-unsubscribe".to_owned());
-        let visibility = {
-            let state = fixture.host.state.lock().await;
-            state.agent_visibility.clone()
-        };
-        let pending_visibility = SpawnVisibility::new(pending_agent_id.clone(), visibility);
-        {
-            let mut state = fixture.host.state.lock().await;
-            for assistant_turn_count in [3, 4] {
-                fan_out_session_summary_count_update(
-                    &mut state,
-                    &HostSessionSummaryCountUpdate {
-                        agent_id: pending_agent_id.clone(),
-                        payload: SessionSummaryCountUpdatedPayload {
-                            session_id: session_id.clone(),
-                            assistant_turn_count,
-                            updated_at_ms: u64::from(assistant_turn_count) * 10,
-                        },
-                    },
-                );
-            }
-            assert_eq!(
-                state
-                    .pending_session_summary_count_updates
-                    .get(&pending_agent_id)
-                    .expect("deferred count queue")
-                    .iter()
-                    .map(|update| update.payload.assistant_turn_count)
-                    .collect::<Vec<_>>(),
-                vec![3, 4],
-                "deferred response counts must remain lossless and ordered"
-            );
-        }
-        assert!(
-            pending_visibility
-                .agent_visibility
-                .publication_pending(&pending_agent_id)
-        );
-
-        fixture.host.unregister_host_stream(&host_path).await;
-        assert!(
-            fixture
-                .host
-                .state
-                .lock()
-                .await
-                .pending_session_summary_count_updates
-                .is_empty(),
-            "removing the final subscriber must discard undeliverable counts"
-        );
-
-        let mut state = fixture.host.state.lock().await;
-        let outcome = fan_out_session_summary_count_update_inner(
-            &mut state,
-            &HostSessionSummaryCountUpdate {
-                agent_id,
-                payload: SessionSummaryCountUpdatedPayload {
-                    session_id,
-                    assistant_turn_count: 5,
-                    updated_at_ms: 50,
-                },
-            },
-        );
-        assert_eq!(outcome, SessionSummaryCountDelivery::Discarded);
-        assert!(state.pending_session_summary_count_updates.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lazy_host_registration_defers_agent_bootstrap_until_load() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember lazy mobile startup").await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/lazy-agents-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-
-        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("lazy registration should emit HostBootstrap")
-            .expect("output envelope");
-        assert_eq!(envelope.kind, FrameKind::HostBootstrap);
-        let bootstrap: HostBootstrapPayload = envelope.parse_payload().expect("host bootstrap");
-        let agent_stream = bootstrap
-            .agents
-            .iter()
-            .find_map(|agent| (agent.agent_id == agent_id).then_some(agent.instance_stream.clone()))
-            .expect("existing agent advertised in HostBootstrap");
-
-        let agent_replay = tokio::time::timeout(Duration::from_millis(50), async {
-            loop {
-                let envelope = rx.recv().await?;
-                if envelope.stream == agent_stream {
-                    return Some(envelope);
-                }
-            }
-        })
-        .await;
-        assert!(
-            agent_replay.is_err(),
-            "lazy registration must not replay agent transcripts until requested"
-        );
-
-        let load = protocol::Envelope::from_payload(
-            agent_stream.clone(),
-            FrameKind::LoadAgent,
-            0,
-            &protocol::LoadAgentPayload {},
-        )
-        .expect("load agent envelope");
-        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, load)
-            .await
-            .expect("route load_agent");
-
-        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("load_agent should emit AgentBootstrap")
-            .expect("output envelope");
-        assert_eq!(envelope.stream, agent_stream);
-        assert_eq!(envelope.kind, FrameKind::AgentBootstrap);
-        let bootstrap: protocol::AgentBootstrapPayload =
-            envelope.parse_payload().expect("agent bootstrap");
-        assert!(
-            bootstrap
-                .events
-                .iter()
-                .any(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_))),
-            "loaded agent bootstrap should include its AgentStart snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_token_usage_keeps_unresponsive_live_agent_unavailable() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember unavailable live agent").await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/unavailable-agent-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path, tx);
-
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream, AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("registration should emit HostBootstrap")
-            .expect("output envelope");
-        assert_eq!(envelope.kind, FrameKind::HostBootstrap);
-
-        let handle = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_handle(&agent_id)
-                .expect("live registry handle")
-        };
-        assert!(handle.close().await);
-
-        fixture.host.fan_out_task_token_usages().await;
-
-        let payload = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("task token usage should be emitted")
-                .expect("output envelope");
-            if envelope.kind != FrameKind::TaskTokenUsage {
-                continue;
-            }
-            let payload: TaskTokenUsagePayload =
-                envelope.parse_payload().expect("TaskTokenUsage payload");
-            if payload.root_agent_id == agent_id {
-                break payload;
-            }
-        };
-
-        assert_eq!(payload.descendant_count, 0);
-        assert_eq!(payload.breakdown.len(), 1);
-        assert_eq!(payload.breakdown[0].agent_id, agent_id);
-        assert!(matches!(
-            payload.self_usage,
-            TaskTokenUsageScope::Unavailable {
-                reason: TaskTokenUsageUnavailableReason::AgentUnavailable
-            }
-        ));
-        assert_eq!(payload.total.usage.total_tokens, 0);
-        assert_eq!(payload.total.usage.input_tokens, None);
-        assert!(matches!(
-            payload.total.status,
-            TaskTokenUsageStatus::Unavailable {
-                unavailable_count: 1,
-                ref reasons
-            } if reasons == &vec![TaskTokenUsageUnavailableReason::AgentUnavailable]
-        ));
-    }
-
-    #[tokio::test]
-    async fn unchanged_task_token_usage_is_not_resent_after_bootstrap() {
-        let fixture = compact_fixture().await;
-        spawn_idle_user_agent(&fixture.host, "deduplicate token usage").await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/token-usage-dedup-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path, tx);
-
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream, AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let bootstrap = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("registration should emit HostBootstrap")
-            .expect("output envelope");
-        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
-
-        fixture.host.fan_out_task_token_usages().await;
-        let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
-            while let Some(envelope) = rx.recv().await {
-                if envelope.kind == FrameKind::TaskTokenUsage {
-                    return;
-                }
-            }
-        })
-        .await;
-        assert!(
-            duplicate.is_err(),
-            "unchanged bootstrap token usage was emitted again"
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrapping_new_agent_fanout_is_deferred_until_after_bootstrap() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember bootstrap fanout ordering").await;
-        let handle = {
-            let state = fixture.host.state.lock().await;
-            state
-                .registry
-                .agent_handle(&agent_id)
-                .expect("live registry handle")
-        };
-        let start = handle.snapshot();
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/bootstrap-pending-{}", Uuid::new_v4()));
-        let stream = Stream::new(host_path, tx);
-        let mut subscriber = HostSubscriber {
-            stream: stream.clone(),
-            voice_desktop: None,
-            bootstrapped: false,
-            agent_replay: AgentReplayMode::Eager,
-            session_list_replay: SessionListReplayMode::Full,
-            session_list_snapshot: None,
-            session_summary_updates_subscribed: false,
-            new_agent_fanouts_in_flight: 0,
-            held_summary_count_frames: Vec::new(),
-            known_agent_streams: HashSet::new(),
-            attached_agent_streams: HashSet::new(),
-            bootstrapped_agent_streams: HashSet::new(),
-            pending_bootstrap_new_agents: Vec::new(),
-            pending_bootstrap_frames: Vec::new(),
-            last_session_schemas: None,
-            last_backend_config_schemas: None,
-            last_backend_config_snapshots: None,
-            last_backend_native_settings_snapshots: None,
-            last_backend_capacity: None,
-            capacity_replay_ready: false,
-            last_launch_profile_catalog: None,
-            last_task_token_usages: HashMap::new(),
-        };
-
-        assert!(
-            prepare_new_agent_fanout_for_subscriber(
-                &mut subscriber,
-                &start,
-                &handle,
-                AgentActivitySummaryState::default(),
-            )
-            .is_none()
-        );
-        assert_eq!(subscriber.pending_bootstrap_new_agents.len(), 1);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .is_err(),
-            "NewAgent must not be emitted before HostBootstrap"
-        );
-
-        subscriber
-            .stream
-            .send_value(FrameKind::HostBootstrap, serde_json::json!({}))
-            .expect("send bootstrap marker");
-        subscriber.bootstrapped = true;
-        for pending in std::mem::take(&mut subscriber.pending_bootstrap_new_agents) {
-            emit_new_agent_for_stream(
-                &pending.start,
-                &pending.agent_handle,
-                &subscriber.stream,
-                pending.instance_stream,
-                pending.attach_eagerly,
-                pending.activity_summary,
-            )
-            .expect("flush pending NewAgent");
-        }
-
-        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("bootstrap marker should be first")
-            .expect("bootstrap marker envelope");
-        assert_eq!(first.kind, FrameKind::HostBootstrap);
-        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("pending NewAgent should follow bootstrap")
-            .expect("pending NewAgent envelope");
-        assert_eq!(second.kind, FrameKind::NewAgent);
-        let payload: NewAgentPayload = second.parse_payload().expect("NewAgent payload");
-        assert_eq!(payload.agent_id, agent_id);
-    }
-
-    #[tokio::test]
-    async fn forced_backend_config_snapshot_fanout_reemits_unchanged_native_settings() {
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/backend-config-{}", Uuid::new_v4()));
-        let stream = Stream::new(host_path, tx);
-        let mut subscriber = HostSubscriber {
-            stream,
-            voice_desktop: None,
-            bootstrapped: true,
-            agent_replay: AgentReplayMode::Eager,
-            session_list_replay: SessionListReplayMode::Full,
-            session_list_snapshot: None,
-            session_summary_updates_subscribed: false,
-            new_agent_fanouts_in_flight: 0,
-            held_summary_count_frames: Vec::new(),
-            known_agent_streams: HashSet::new(),
-            attached_agent_streams: HashSet::new(),
-            bootstrapped_agent_streams: HashSet::new(),
-            pending_bootstrap_new_agents: Vec::new(),
-            pending_bootstrap_frames: Vec::new(),
-            last_session_schemas: None,
-            last_backend_config_schemas: None,
-            last_backend_config_snapshots: None,
-            last_backend_native_settings_snapshots: None,
-            last_backend_capacity: None,
-            capacity_replay_ready: true,
-            last_launch_profile_catalog: None,
-            last_task_token_usages: HashMap::new(),
-        };
-        let native_settings = vec![BackendNativeSettingsSnapshot {
-            backend_kind: BackendKind::Tycode,
-            status: BackendConfigSnapshotStatus::Ready,
-            settings: Some(serde_json::json!({
-                "active_provider": "default",
-                "model_quality": "high",
-            })),
-            groups: Vec::new(),
-            message: None,
-            advisories: Vec::new(),
-        }];
-
-        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
-            .await
-            .expect("initial backend config snapshot fanout");
-        let first = rx.recv().await.expect("initial snapshot event");
-        assert_eq!(first.kind, FrameKind::BackendConfigSnapshots);
-
-        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
-            .await
-            .expect("unchanged backend config snapshot fanout");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .is_err(),
-            "unchanged snapshots should still be deduped during ordinary refresh"
-        );
-
-        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, true)
-            .await
-            .expect("forced backend config snapshot fanout");
-        let forced = rx.recv().await.expect("forced snapshot event");
-        assert_eq!(forced.kind, FrameKind::BackendConfigSnapshots);
-        let payload: BackendConfigSnapshotsPayload = forced
-            .parse_payload()
-            .expect("forced BackendConfigSnapshots payload");
-        assert_eq!(payload.native_settings, native_settings);
-    }
-
-    #[test]
-    fn backend_setup_refresh_order_is_authoritative() {
-        assert_eq!(
-            BACKEND_SETUP_REFRESH_ORDER,
-            [
-                BackendSetupRefreshStep::Setup,
-                BackendSetupRefreshStep::SessionSchemas,
-                BackendSetupRefreshStep::BackendConfigSnapshots,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn forced_session_schema_fanout_reemits_unchanged_snapshot() {
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/session-schema-{}", Uuid::new_v4()));
-        let stream = Stream::new(host_path, tx);
-        let mut subscriber = HostSubscriber {
-            stream,
-            voice_desktop: None,
-            bootstrapped: true,
-            agent_replay: AgentReplayMode::Eager,
-            session_list_replay: SessionListReplayMode::Full,
-            session_list_snapshot: None,
-            session_summary_updates_subscribed: false,
-            new_agent_fanouts_in_flight: 0,
-            held_summary_count_frames: Vec::new(),
-            known_agent_streams: HashSet::new(),
-            attached_agent_streams: HashSet::new(),
-            bootstrapped_agent_streams: HashSet::new(),
-            pending_bootstrap_new_agents: Vec::new(),
-            pending_bootstrap_frames: Vec::new(),
-            last_session_schemas: None,
-            last_backend_config_schemas: None,
-            last_backend_config_snapshots: None,
-            last_backend_native_settings_snapshots: None,
-            last_backend_capacity: None,
-            capacity_replay_ready: true,
-            last_launch_profile_catalog: None,
-            last_task_token_usages: HashMap::new(),
-        };
-
-        emit_session_schemas_for_subscriber(&[], &mut subscriber, false)
-            .await
-            .expect("initial session schema fanout");
-        let first = rx.recv().await.expect("initial session schema event");
-        assert_eq!(first.kind, FrameKind::SessionSchemas);
-
-        emit_session_schemas_for_subscriber(&[], &mut subscriber, false)
-            .await
-            .expect("unchanged session schema fanout");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .is_err(),
-            "ordinary refresh should still dedupe unchanged session schemas"
-        );
-
-        emit_session_schemas_for_subscriber(&[], &mut subscriber, true)
-            .await
-            .expect("forced session schema fanout");
-        let forced = rx.recv().await.expect("forced session schema event");
-        assert_eq!(forced.kind, FrameKind::SessionSchemas);
-    }
-
-    /// Compile-contract for the session-schema probe helpers: they must stay
-    /// reachable from this crate's own `cfg(test)` build, not just from the
-    /// `test-support` feature the `tests` crate turns on. Never called — it
-    /// exists so that re-narrowing any of the three gates back to
-    /// `#[cfg(feature = "test-support")]` fails `cargo test -p server`, which
-    /// is the configuration AGENTS.md documents for the live backend tests and
-    /// the only one the workspace-wide `./dev.sh check` build cannot observe.
-    /// `host_reload_reprobes_ready_dynamic_session_schemas` below covers two of
-    /// the three; this covers `set_session_schema_unavailable_for_test` too.
-    #[allow(dead_code)]
-    async fn session_schema_probe_helpers_compile_without_test_support(h: &HostHandle) {
-        HostHandle::set_session_schema_ready_for_test(h, BackendKind::Codex).await;
-        HostHandle::set_session_schema_unavailable_for_test(h, BackendKind::Codex, "").await;
-        let _: u64 = HostHandle::session_schema_probe_count_for_test(h).await;
-    }
-
-    #[tokio::test]
-    async fn host_reload_reprobes_ready_dynamic_session_schemas() {
-        let fixture = compact_fixture().await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::EnabledBackends {
-                    enabled_backends: vec![BackendKind::Hermes],
-                },
-            })
-            .await
-            .expect("enable Hermes");
-        fixture
-            .host
-            .set_session_schema_ready_for_test(BackendKind::Hermes)
-            .await;
-        let before = fixture.host.session_schema_probe_count_for_test().await;
-        let (tx, _rx) = crate::stream::output_channel();
-
-        fixture
-            .host
-            .register_host_stream(
-                Stream::new(
-                    StreamPath(format!("/host/hermes-reload-{}", Uuid::new_v4())),
-                    tx,
-                ),
-                AgentReplayMode::Lazy,
-            )
-            .await;
-
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if fixture.host.session_schema_probe_count_for_test().await > before {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("host reload must re-probe an already-ready Hermes profile catalog");
-    }
-
-    async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = host.agent_status_snapshot(agent_id).await
-                && status.started
-                && !status.terminated
-                && !status.is_active()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for agent {agent_id} to become idle"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_authoritative_visible_assistant_transcript(
-        host: &HostHandle,
-        session_id: &SessionId,
-        expected_content: &str,
-    ) -> HashSet<String> {
-        let transcript_store = {
-            let state = host.state.lock().await;
-            state.transcript_store.clone()
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let store = transcript_store.clone();
-                let session_id = session_id.clone();
-                let expected_content = expected_content.to_owned();
-                let visible = tokio::task::spawn_blocking(move || {
-                    if !store.is_authoritative(&session_id) {
-                        return Ok::<Option<HashSet<String>>, String>(None);
-                    }
-                    let records = store.load(&session_id)?;
-                    let has_expected_message = records.iter().any(|record| {
-                        record.visibility == TranscriptVisibility::Visible
-                            && matches!(
-                                &record.event,
-                                ChatEvent::MessageAdded(message)
-                                    if matches!(
-                                        &message.sender,
-                                        MessageSender::Assistant { .. }
-                                    ) && message.content.contains(&expected_content)
-                            )
-                    });
-                    if !has_expected_message {
-                        return Ok(None);
-                    }
-                    Ok(Some(
-                        records
-                            .into_iter()
-                            .filter(|record| record.visibility == TranscriptVisibility::Visible)
-                            .map(|record| record.event_id)
-                            .collect::<HashSet<_>>(),
-                    ))
-                })
-                .await
-                .expect("authoritative transcript read task")
-                .expect("authoritative transcript read");
-                if let Some(visible) = visible {
-                    return visible;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("agent transcript should become authoritative with visible history")
-    }
-
-    async fn wait_for_agent_active(host: &HostHandle, agent_id: &AgentId) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = host.agent_status_snapshot(agent_id).await
-                && status.started
-                && !status.terminated
-                && status.is_active()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for agent {agent_id} to become active"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    fn compact_stream(agent_id: &AgentId) -> (Stream, crate::stream::OutputReceiver) {
-        let (tx, rx) = crate::stream::output_channel();
-        (
-            Stream::new(StreamPath(format!("/agent/{}", agent_id)), tx),
-            rx,
-        )
-    }
-
-    fn drain_validated_events(
-        validator: &mut ProtocolValidator,
-        rx: &mut crate::stream::OutputReceiver,
-        context: &str,
-    ) -> Vec<protocol::Envelope> {
-        let mut envelopes = Vec::new();
-        while let Ok(envelope) = rx.try_recv() {
-            validator
-                .validate_envelope(&envelope)
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "{context}: protocol violation after {} on {}: {err}",
-                        envelope.kind, envelope.stream
-                    )
-                });
-            envelopes.push(envelope);
-        }
-        envelopes
-    }
-
-    fn drain_compact_notifies(
-        rx: &mut crate::stream::OutputReceiver,
-    ) -> Vec<AgentCompactNotifyPayload> {
-        let mut notifies = Vec::new();
-        while let Ok(envelope) = rx.try_recv() {
-            if envelope.kind == FrameKind::AgentCompactNotify {
-                notifies.push(
-                    envelope
-                        .parse_payload::<AgentCompactNotifyPayload>()
-                        .expect("compact notify payload"),
-                );
-            }
-        }
-        notifies
-    }
-
-    #[tokio::test]
-    async fn native_agent_compaction_route_does_not_block_host_commands() {
-        let fixture = compact_fixture().await;
-        let (old_agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember routing responsiveness").await;
-        let handle = fixture
-            .host
-            .agent_handle(&old_agent_id)
-            .await
-            .expect("live compaction target");
-        assert_native_context_compaction_route(&fixture.host, &old_agent_id).await;
-        handle
-            .deliver_message(SendMessagePayload {
-                message: format!("{MOCK_SLOW_TURN_SENTINEL} hold native compaction"),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            })
-            .await
-            .expect("start deterministic active turn");
-        wait_for_agent_active(&fixture.host, &old_agent_id).await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
-        assert!(
-            handle
-                .attach(Stream::new(agent_path.clone(), tx.clone()))
-                .await
-        );
-        let host_path = StreamPath(format!("/host/compact-route-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
-                .await
-                .is_empty()
-        );
-        let compact = protocol::Envelope::from_payload(
-            agent_path,
-            FrameKind::AgentCompact,
-            0,
-            &AgentCompactPayload {
-                summary_prompt: None,
-                max_summary_bytes: None,
-            },
-        )
-        .expect("compact envelope");
-
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact),
-        )
-        .await
-        .expect("agent_compact route should return without waiting for compaction")
-        .expect("route compact");
-
-        let list_sessions = protocol::Envelope::from_payload(
-            host_path.clone(),
-            FrameKind::ListSessions,
-            0,
-            &protocol::ListSessionsPayload::default(),
-        )
-        .expect("list sessions envelope");
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            crate::router::route_client_envelope(
-                &fixture.host,
-                &host_path,
-                &host_stream,
-                list_sessions,
-            ),
-        )
-        .await
-        .expect("list_sessions route should not wait behind compaction")
-        .expect("route list sessions");
-
-        loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("session list should be emitted while compaction is still running")
-                .expect("output envelope");
-            if envelope.kind == FrameKind::SessionList {
-                break;
-            }
-            if envelope.kind == FrameKind::ContextCompactionNotify {
-                let payload: ContextCompactionNotifyPayload =
-                    envelope.parse_payload().expect("context compaction notify");
-                assert!(
-                    !payload.status.is_terminal(),
-                    "deferred native compaction completed before ListSessions was processed"
-                );
-            }
-        }
-
-        loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .expect("background compaction should finish")
-                .expect("output envelope");
-            if envelope.kind != FrameKind::ContextCompactionNotify {
-                continue;
-            }
-            let payload: ContextCompactionNotifyPayload =
-                envelope.parse_payload().expect("context compaction notify");
-            if payload.status.is_terminal() {
-                assert_eq!(payload.status, ContextCompactionStatus::Completed);
-                break;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn native_agent_compaction_route_orders_later_input_after_terminal() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/compact-ordering-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
-                .await
-                .is_empty()
-        );
-
-        let (old_agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember input ordering").await;
-        let handle = fixture
-            .host
-            .agent_handle(&old_agent_id)
-            .await
-            .expect("live compaction target");
-        assert_native_context_compaction_route(&fixture.host, &old_agent_id).await;
-        handle
-            .deliver_message(SendMessagePayload {
-                message: format!("{MOCK_SLOW_TURN_SENTINEL} hold native compaction"),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            })
-            .await
-            .expect("start deterministic active turn");
-        wait_for_agent_active(&fixture.host, &old_agent_id).await;
-        let old_instance_stream = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("new agent should be emitted")
-                .expect("output envelope");
-            if envelope.kind != FrameKind::NewAgent {
-                continue;
-            }
-            let payload: NewAgentPayload = envelope.parse_payload().expect("new agent payload");
-            if payload.agent_id == old_agent_id {
-                break payload.instance_stream;
-            }
-        };
-
-        let compact = protocol::Envelope::from_payload(
-            old_instance_stream.clone(),
-            FrameKind::AgentCompact,
-            0,
-            &AgentCompactPayload {
-                summary_prompt: None,
-                max_summary_bytes: None,
-            },
-        )
-        .expect("compact envelope");
-        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact)
-            .await
-            .expect("route compact");
-
-        let send = protocol::Envelope::from_payload(
-            old_instance_stream,
-            FrameKind::SendMessage,
-            1,
-            &SendMessagePayload {
-                message: "This input must wait behind compaction".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .expect("send envelope");
-        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, send)
-            .await
-            .expect("route send");
-
-        let mut terminal_seen = false;
-        loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .expect("native compaction and queued follow-up should finish")
-                .expect("output envelope");
-            match envelope.kind {
-                FrameKind::ContextCompactionNotify => {
-                    let payload: ContextCompactionNotifyPayload =
-                        envelope.parse_payload().expect("context compaction notify");
-                    if payload.status.is_terminal() {
-                        assert_eq!(payload.status, ContextCompactionStatus::Completed);
-                        terminal_seen = true;
-                    }
-                }
-                FrameKind::ChatEvent => {
-                    let event: ChatEvent = envelope.parse_payload().expect("chat event");
-                    if matches!(
-                        event,
-                        ChatEvent::StreamEnd(ref end)
-                            if end.message.content.contains(
-                                "This input must wait behind compaction"
-                            )
-                    ) {
-                        assert!(
-                            terminal_seen,
-                            "queued input reached the backend before native compaction terminated"
-                        );
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_agent_compaction_route_preserves_transcript_and_replaces_session() {
-        let fixture = compact_fixture_with_transcript_io().await;
-        let prompt =
-            format!("{MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL} legacy transcript remains visible");
-        let (old_agent_id, old_session_id) = spawn_idle_user_agent(&fixture.host, &prompt).await;
-        let capability = fixture
-            .host
-            .agent_handle(&old_agent_id)
-            .await
-            .expect("live legacy compaction target")
-            .compaction_capability()
-            .await
-            .expect("legacy compaction capability");
-        assert_eq!(
-            capability.coordinator,
-            crate::backend::BackendCompactionCoordinator::LegacyReplacement
-        );
-
-        let visible_before = wait_for_authoritative_visible_assistant_transcript(
-            &fixture.host,
-            &old_session_id,
-            "legacy transcript remains visible",
-        )
-        .await;
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_path = StreamPath(format!("/host/legacy-compact-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path.clone(), tx);
-        let deferred_attachments = fixture
-            .host
-            .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
-            .await;
-        let host_bootstrap_envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("eager host bootstrap should arrive")
-            .expect("host output envelope");
-        assert_eq!(host_bootstrap_envelope.stream, host_path);
-        assert_eq!(host_bootstrap_envelope.kind, FrameKind::HostBootstrap);
-        let host_bootstrap: HostBootstrapPayload = host_bootstrap_envelope
-            .parse_payload()
-            .expect("HostBootstrap payload");
-        let old_bootstrap_agent = host_bootstrap
-            .agents
-            .iter()
-            .find(|agent| agent.agent_id == old_agent_id)
-            .expect("live legacy agent advertised in HostBootstrap");
-        assert_eq!(
-            old_bootstrap_agent.session_id.as_ref(),
-            Some(&old_session_id)
-        );
-        let old_instance_stream = old_bootstrap_agent.instance_stream.clone();
-        let old_bootstrap_session = host_bootstrap
-            .sessions
-            .iter()
-            .find(|session| session.id == old_session_id)
-            .expect("legacy session advertised in HostBootstrap");
-        assert!(
-            old_bootstrap_session.resumable,
-            "uncompacted legacy session must initially be resumable"
-        );
-        assert!(old_bootstrap_session.compacted_to_session_id.is_none());
-        assert_eq!(deferred_attachments.len(), 1);
-        let attachment = deferred_attachments
-            .into_iter()
-            .next()
-            .expect("eager legacy agent attachment");
-        assert_eq!(attachment.host_stream, host_path);
-        assert_eq!(attachment.agent_stream, old_instance_stream);
-        assert_eq!(
-            attachment
-                .agent_handle
-                .as_ref()
-                .expect("existing-agent attachment handle")
-                .snapshot()
-                .agent_id,
-            old_agent_id
-        );
-        fixture.host.attach_deferred_agent_stream(attachment).await;
-
-        let old_agent_bootstrap = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("old agent bootstrap should arrive")
-                .expect("host output envelope");
-            assert_ne!(
-                envelope.kind,
-                FrameKind::ContextCompactionNotify,
-                "registration must not fabricate a context compaction operation"
-            );
-            if envelope.stream == old_instance_stream {
-                assert_eq!(envelope.kind, FrameKind::AgentBootstrap);
-                break envelope
-                    .parse_payload::<protocol::AgentBootstrapPayload>()
-                    .expect("old AgentBootstrap payload");
-            }
-            assert_eq!(envelope.stream, host_path);
-            assert!(
-                matches!(
-                    envelope.kind,
-                    FrameKind::BackendConfigSnapshots | FrameKind::SessionSchemas
-                ),
-                "unexpected eager-registration follow-up frame: {}",
-                envelope.kind
-            );
-        };
-        let mut old_start_seen = false;
-        let mut old_capability_seen = false;
-        let mut visible_assistant_seen = false;
-        for event in &old_agent_bootstrap.events {
-            match event {
-                protocol::AgentBootstrapEvent::AgentStart(start) => {
-                    assert_eq!(start.agent_id, old_agent_id);
-                    assert_eq!(start.session_id.as_ref(), Some(&old_session_id));
-                    assert!(!old_start_seen, "old bootstrap repeated AgentStart");
-                    old_start_seen = true;
-                }
-                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability) => {
-                    assert_eq!(capability.agent_id, old_agent_id);
-                    assert_eq!(capability.logical_session_id, old_session_id);
-                    old_capability_seen = true;
-                }
-                protocol::AgentBootstrapEvent::ContextCompaction(compaction) => {
-                    panic!(
-                        "registration replayed unexpected context compaction operation {:?}",
-                        compaction.operation_id
-                    );
-                }
-                protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
-                    if matches!(&message.sender, MessageSender::Assistant { .. })
-                        && message
-                            .content
-                            .contains("legacy transcript remains visible") =>
-                {
-                    visible_assistant_seen = true;
-                }
-                protocol::AgentBootstrapEvent::AgentError(error) => {
-                    panic!(
-                        "live legacy bootstrap contained agent error: {}",
-                        error.message
-                    );
-                }
-                protocol::AgentBootstrapEvent::SessionSettings(_)
-                | protocol::AgentBootstrapEvent::QueuedMessages(_)
-                | protocol::AgentBootstrapEvent::AgentActivityStats(_)
-                | protocol::AgentBootstrapEvent::ChatEvent(_)
-                | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => {}
-            }
-        }
-        assert!(
-            old_start_seen,
-            "old AgentBootstrap must prove the agent is live"
-        );
-        assert!(
-            old_capability_seen,
-            "old AgentBootstrap must expose its compaction capability"
-        );
-        assert!(
-            visible_assistant_seen,
-            "old AgentBootstrap must expose the authoritative visible response"
-        );
-
-        let compact = protocol::Envelope::from_payload(
-            old_instance_stream.clone(),
-            FrameKind::AgentCompact,
-            0,
-            &AgentCompactPayload::default(),
-        )
-        .expect("legacy compact envelope");
-        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact)
-            .await
-            .expect("route legacy compaction");
-
-        let mut started = false;
-        let mut compact_frames = Vec::new();
-        let completed = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .expect("legacy replacement should finish")
-                .expect("legacy compact output");
-            assert_ne!(
-                envelope.kind,
-                FrameKind::ContextCompactionNotify,
-                "LegacyReplacement must stay on the replacement protocol"
-            );
-            let completed = if envelope.kind == FrameKind::AgentCompactNotify {
-                let payload: AgentCompactNotifyPayload =
-                    envelope.parse_payload().expect("legacy compact notify");
-                assert_eq!(envelope.stream, old_instance_stream);
-                match payload.status {
-                    AgentCompactStatus::Started => {
-                        assert!(!started, "legacy replacement admitted more than once");
-                        started = true;
-                        None
-                    }
-                    AgentCompactStatus::Completed => Some(payload),
-                    AgentCompactStatus::Failed => {
-                        panic!("legacy replacement failed: {:?}", payload.message)
-                    }
-                }
-            } else {
-                None
-            };
-            compact_frames.push(envelope);
-            if let Some(payload) = completed {
-                break payload;
-            }
-        };
-        assert!(started, "legacy replacement must report admission");
-        assert_eq!(completed.old_agent_id, old_agent_id);
-        assert_eq!(completed.old_session_id.as_ref(), Some(&old_session_id));
-        let new_agent_id = completed
-            .new_agent_id
-            .clone()
-            .expect("replacement agent id");
-        let new_session_id = completed
-            .new_session_id
-            .clone()
-            .expect("replacement session id");
-        assert_ne!(new_agent_id, old_agent_id);
-        assert_ne!(new_session_id, old_session_id);
-
-        let replacement_agent = compact_frames
-            .iter()
-            .find_map(|envelope| {
-                if envelope.kind != FrameKind::NewAgent {
-                    return None;
-                }
-                let payload = envelope
-                    .parse_payload::<NewAgentPayload>()
-                    .expect("replacement NewAgent payload");
-                (payload.agent_id == new_agent_id).then_some(payload)
-            })
-            .expect("legacy replacement must advertise the new live agent");
-        assert!(
-            replacement_agent.session_id.is_none(),
-            "NewAgent is the pre-startup advertisement; AgentBootstrap owns the bound session"
-        );
-        let compacted_session = compact_frames
-            .iter()
-            .filter(|envelope| envelope.kind == FrameKind::SessionList)
-            .flat_map(|envelope| {
-                envelope
-                    .parse_payload::<SessionListPayload>()
-                    .expect("compaction SessionList payload")
-                    .sessions
-            })
-            .find(|session| {
-                session.id == old_session_id
-                    && session.compacted_to_session_id.as_ref() == Some(&new_session_id)
-            })
-            .expect("replacement must publish the compacted old session");
-        assert!(
-            !compacted_session.resumable,
-            "published compacted session must not remain resumable"
-        );
-        let replacement_bootstrap = compact_frames
-            .iter()
-            .find_map(|envelope| {
-                (envelope.kind == FrameKind::AgentBootstrap
-                    && envelope.stream == replacement_agent.instance_stream)
-                    .then(|| {
-                        envelope
-                            .parse_payload::<protocol::AgentBootstrapPayload>()
-                            .expect("replacement AgentBootstrap payload")
-                    })
-            })
-            .expect("legacy replacement must eagerly bootstrap the new agent");
-        let mut replacement_start_seen = false;
-        for event in &replacement_bootstrap.events {
-            match event {
-                protocol::AgentBootstrapEvent::AgentStart(start) => {
-                    assert_eq!(start.agent_id, new_agent_id);
-                    assert_eq!(start.session_id.as_ref(), Some(&new_session_id));
-                    assert!(
-                        !replacement_start_seen,
-                        "replacement bootstrap repeated AgentStart"
-                    );
-                    replacement_start_seen = true;
-                }
-                protocol::AgentBootstrapEvent::ContextCompaction(compaction) => {
-                    panic!(
-                        "replacement bootstrap carried native compaction operation {:?}",
-                        compaction.operation_id
-                    );
-                }
-                protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker)) => {
-                    panic!(
-                        "replacement bootstrap carried native compaction marker {}",
-                        marker.marker_id.0
-                    );
-                }
-                protocol::AgentBootstrapEvent::AgentError(error) => {
-                    panic!(
-                        "replacement bootstrap contained agent error: {}",
-                        error.message
-                    );
-                }
-                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability) => {
-                    assert_eq!(capability.agent_id, new_agent_id);
-                    assert_eq!(capability.logical_session_id, new_session_id);
-                }
-                protocol::AgentBootstrapEvent::SessionSettings(_)
-                | protocol::AgentBootstrapEvent::QueuedMessages(_)
-                | protocol::AgentBootstrapEvent::AgentActivityStats(_)
-                | protocol::AgentBootstrapEvent::ChatEvent(_)
-                | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => {}
-            }
-        }
-        assert!(
-            replacement_start_seen,
-            "replacement bootstrap must contain its AgentStart"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while fixture.host.agent_handle(&old_agent_id).await.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("old agent should close after the completed notify");
-        assert!(fixture.host.agent_handle(&new_agent_id).await.is_some());
-
-        let (transcript_store, session_store) = {
-            let state = fixture.host.state.lock().await;
-            (
-                state.transcript_store.clone(),
-                Arc::clone(&state.session_store),
-            )
-        };
-        let visible_after = transcript_store
-            .load(&old_session_id)
-            .expect("old transcript after compaction")
-            .into_iter()
-            .filter(|record| record.visibility == TranscriptVisibility::Visible)
-            .map(|record| record.event_id)
-            .collect::<HashSet<_>>();
-        assert!(
-            transcript_store.is_authoritative(&old_session_id),
-            "replacement must preserve transcript authority"
-        );
-        let store = session_store.lock().await;
-        let old_record = store.get(&old_session_id).expect("old session record");
-        let new_record = store
-            .get(&new_session_id)
-            .expect("replacement session record");
-        assert!(
-            visible_before.is_subset(&visible_after),
-            "replacement must not hide or remove the old visible transcript"
-        );
-        assert!(!old_record.resumable);
-        assert_eq!(
-            old_record.compacted_to_session_id.as_ref(),
-            Some(&new_session_id)
-        );
-        assert_eq!(
-            new_record.compacted_from_session_id.as_ref(),
-            Some(&old_session_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_rotates_user_agent() {
-        let fixture = compact_fixture().await;
-        let (old_agent_id, old_session_id) =
-            spawn_idle_user_agent(&fixture.host, "remember this user preference").await;
-        let (stream, mut rx) = compact_stream(&old_agent_id);
-
-        fixture
-            .host
-            .compact_agent(old_agent_id.clone(), AgentCompactPayload::default(), stream)
-            .await
-            .expect("compact agent");
-
-        let notifies = drain_compact_notifies(&mut rx);
-        assert_eq!(
-            notifies.first().map(|notify| notify.status),
-            Some(AgentCompactStatus::Started)
-        );
-        let completed = notifies
-            .iter()
-            .find(|notify| notify.status == AgentCompactStatus::Completed)
-            .expect("completed notify");
-        let new_agent_id = completed
-            .new_agent_id
-            .clone()
-            .expect("new agent id in completed notify");
-        let new_session_id = completed
-            .new_session_id
-            .clone()
-            .expect("new session id in completed notify");
-        assert_ne!(new_agent_id, old_agent_id);
-        assert_ne!(new_session_id, old_session_id);
-        assert!(fixture.host.agent_handle(&old_agent_id).await.is_none());
-        assert!(fixture.host.agent_handle(&new_agent_id).await.is_some());
-
-        let (old_record, new_record) = {
-            let state = fixture.host.state.lock().await;
-            let store = state.session_store.lock().await;
-            (
-                store.get(&old_session_id).expect("old record"),
-                store.get(&new_session_id).expect("new record"),
-            )
-        };
-        assert!(!old_record.resumable);
-        assert_eq!(
-            old_record.compacted_to_session_id.as_ref(),
-            Some(&new_session_id)
-        );
-        assert_eq!(
-            new_record.compacted_from_session_id.as_ref(),
-            Some(&old_session_id)
-        );
-        assert!(
-            old_record
-                .compaction_summary_preview
-                .as_deref()
-                .is_some_and(|preview| preview.contains("mock backend response"))
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_completed_validates_before_old_agent_closed_on_instance_stream() {
-        let fixture = compact_fixture().await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let host_stream = Stream::new(
-            StreamPath(format!("/host/compact-order-{}", Uuid::new_v4())),
-            tx.clone(),
-        );
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream, AgentReplayMode::Eager)
-                .await
-                .is_empty()
-        );
-        let mut validator = ProtocolValidator::new();
-        drain_validated_events(&mut validator, &mut rx, "host registration");
-
-        let (old_agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "remember protocol ordering").await;
-        let spawn_events = drain_validated_events(&mut validator, &mut rx, "old agent spawn");
-        let old_instance_stream = spawn_events
-            .iter()
-            .find_map(|envelope| {
-                if envelope.kind != FrameKind::NewAgent {
-                    return None;
-                }
-                let payload: NewAgentPayload =
-                    envelope.parse_payload().expect("parse old NewAgent");
-                (payload.agent_id == old_agent_id).then_some(payload.instance_stream)
-            })
-            .expect("old agent instance stream");
-        assert!(
-            old_instance_stream
-                .0
-                .starts_with(&format!("/agent/{}/", old_agent_id))
-        );
-
-        let compact_stream = Stream::new(old_instance_stream.clone(), tx);
-        fixture
-            .host
-            .compact_agent(
-                old_agent_id.clone(),
-                AgentCompactPayload::default(),
-                compact_stream,
-            )
-            .await
-            .expect("compact agent");
-
-        let compact_events = drain_validated_events(&mut validator, &mut rx, "agent compaction");
-        let mut completed_index = None;
-        let mut closed_index = None;
-        for (index, envelope) in compact_events.iter().enumerate() {
-            match envelope.kind {
-                FrameKind::AgentCompactNotify if envelope.stream == old_instance_stream => {
-                    let payload: AgentCompactNotifyPayload =
-                        envelope.parse_payload().expect("compact notify");
-                    if payload.status == AgentCompactStatus::Completed {
-                        completed_index = Some(index);
-                    }
-                }
-                FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
-                        envelope.parse_payload().expect("agent closed");
-                    if payload.agent_id == old_agent_id {
-                        closed_index = Some(index);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let completed_index = completed_index.expect("completed compact notify");
-        let closed_index = closed_index.expect("old AgentClosed");
-        assert!(
-            completed_index < closed_index,
-            "Completed notify must arrive before AgentClosed invalidates the old stream"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_rejects_busy_agent() {
-        let fixture = compact_fixture().await;
-        let resolved = ResolvedSpawnConfig {
-            instructions: Some(MOCK_SLOW_TURN_SENTINEL.to_owned()),
-            ..Default::default()
-        };
-        let agent_id = fixture
-            .host
-            .spawn_agent_with_origin_config_and_team(
-                SpawnAgentPayload {
-                    name: Some("Busy Agent".to_owned()),
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::New {
-                        workspace_roots: Vec::new(),
-                        prompt: "slow start".to_owned(),
-                        images: None,
-                        backend_kind: BackendKind::Claude,
-                        launch_profile_id: None,
-                        cost_hint: None,
-                        access_mode: Default::default(),
-                        session_settings: None,
-                    },
-                },
-                AgentOrigin::User,
-                Some(resolved),
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("spawn busy agent");
-        let old_session_id = fixture
-            .host
-            .wait_for_agent_session_id_result(&agent_id)
-            .await
-            .expect("agent session id");
-        wait_for_agent_active(&fixture.host, &agent_id).await;
-        let (stream, mut rx) = compact_stream(&agent_id);
-
-        fixture
-            .host
-            .compact_agent(agent_id.clone(), AgentCompactPayload::default(), stream)
-            .await
-            .expect("compact busy agent");
-
-        let notifies = drain_compact_notifies(&mut rx);
-        let failed = notifies
-            .iter()
-            .find(|notify| notify.status == AgentCompactStatus::Failed)
-            .expect("failed notify");
-        assert!(
-            failed
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("busy"))
-        );
-        assert!(fixture.host.agent_handle(&agent_id).await.is_some());
-        let old_record = {
-            let state = fixture.host.state.lock().await;
-            state
-                .session_store
-                .lock()
-                .await
-                .get(&old_session_id)
-                .expect("old record")
-        };
-        assert!(old_record.resumable);
-        assert!(old_record.compacted_to_session_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_summary_failure_leaves_old_agent() {
-        let fixture = compact_fixture().await;
-        let (old_agent_id, old_session_id) =
-            spawn_idle_user_agent(&fixture.host, "initial prompt").await;
-        let (stream, mut rx) = compact_stream(&old_agent_id);
-
-        fixture
-            .host
-            .compact_agent(
-                old_agent_id.clone(),
-                AgentCompactPayload {
-                    summary_prompt: Some("/compact".to_owned()),
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-            .expect("compact agent");
-
-        let notifies = drain_compact_notifies(&mut rx);
-        let failed = notifies
-            .iter()
-            .find(|notify| notify.status == AgentCompactStatus::Failed)
-            .expect("failed notify");
-        assert!(
-            failed
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("summary was empty"))
-        );
-        assert!(fixture.host.agent_handle(&old_agent_id).await.is_some());
-        let old_record = {
-            let state = fixture.host.state.lock().await;
-            state
-                .session_store
-                .lock()
-                .await
-                .get(&old_session_id)
-                .expect("old record")
-        };
-        assert!(old_record.resumable);
-        assert!(old_record.compacted_to_session_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_replacement_failure_leaves_old_agent() {
-        let fixture = compact_fixture().await;
-        let (old_agent_id, old_session_id) =
-            spawn_idle_user_agent(&fixture.host, "initial prompt").await;
-        let (stream, mut rx) = compact_stream(&old_agent_id);
-
-        fixture
-            .host
-            .compact_agent(
-                old_agent_id.clone(),
-                AgentCompactPayload {
-                    summary_prompt: Some("__mock_fail_spawn__".to_owned()),
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-            .expect("compact agent");
-
-        let notifies = drain_compact_notifies(&mut rx);
-        let failed = notifies
-            .iter()
-            .find(|notify| notify.status == AgentCompactStatus::Failed)
-            .expect("failed notify");
-        assert!(
-            failed
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("replacement agent failed"))
-        );
-        assert!(fixture.host.agent_handle(&old_agent_id).await.is_some());
-        if let Some(new_agent_id) = failed.new_agent_id.as_ref() {
-            assert!(fixture.host.agent_handle(new_agent_id).await.is_none());
-        }
-        let old_record = {
-            let state = fixture.host.state.lock().await;
-            state
-                .session_store
-                .lock()
-                .await
-                .get(&old_session_id)
-                .expect("old record")
-        };
-        assert!(old_record.resumable);
-        assert!(old_record.compacted_to_session_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn agent_compaction_rotates_team_member_session() {
-        let fixture = team_fixture().await;
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-        let outcome = fixture
-            .host
-            .message_team_member(
-                manager_agent_id.clone(),
-                fixture.report.id.clone(),
-                "Please investigate the bug".to_owned(),
-                None,
-            )
-            .await
-            .expect("message report");
-        let old_report_agent_id = outcome.agent_id;
-        let old_report_session_id = fixture
-            .host
-            .wait_for_agent_session_id_result(&old_report_agent_id)
-            .await
-            .expect("report session");
-        wait_for_agent_idle(&fixture.host, &old_report_agent_id).await;
-        let (stream, mut rx) = compact_stream(&old_report_agent_id);
-
-        fixture
-            .host
-            .compact_agent(
-                old_report_agent_id.clone(),
-                AgentCompactPayload::default(),
-                stream,
-            )
-            .await
-            .expect("compact report");
-
-        let notifies = drain_compact_notifies(&mut rx);
-        let completed = notifies
-            .iter()
-            .find(|notify| notify.status == AgentCompactStatus::Completed)
-            .expect("completed notify");
-        let replacement_agent_id = completed
-            .new_agent_id
-            .clone()
-            .expect("replacement agent id");
-        let replacement_session_id = completed
-            .new_session_id
-            .clone()
-            .expect("replacement session id");
-        assert_ne!(replacement_session_id, old_report_session_id);
-
-        let snapshot = team_snapshot(&fixture.host).await;
-        let report = member_from_snapshot(snapshot.clone(), &fixture.report.id);
-        assert_eq!(report.session_id.as_ref(), Some(&replacement_session_id));
-        let binding = snapshot
-            .bindings
-            .iter()
-            .find(|binding| binding.member_id == fixture.report.id)
-            .expect("report binding");
-        assert_eq!(
-            binding.current_agent_id.as_ref(),
-            Some(&replacement_agent_id)
-        );
-
-        assert!(fixture.host.close_agent(&replacement_agent_id).await);
-        wait_for_team_member_unbound(&fixture.host, &fixture.report.id).await;
-        let resumed = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                fixture.report.id.clone(),
-                "Follow up after compaction".to_owned(),
-                None,
-            )
-            .await
-            .expect("message compacted report");
-        let resumed_session_id = fixture
-            .host
-            .wait_for_agent_session_id_result(&resumed.agent_id)
-            .await
-            .expect("resumed report session");
-        assert_eq!(resumed_session_id, replacement_session_id);
-    }
-
-    #[tokio::test]
-    async fn native_team_compaction_defers_busy_member_until_idle() {
-        let fixture = team_fixture().await;
-        let manager = fixture
-            .host
-            .activate_team_member(
-                fixture.manager.id.clone(),
-                Some(format!("{MOCK_SLOW_TURN_SENTINEL} start manager")),
-                None,
-            )
-            .await
-            .expect("activate busy manager");
-        assert_native_context_compaction_route(&fixture.host, &manager.agent_id).await;
-        wait_for_agent_active(&fixture.host, &manager.agent_id).await;
-        let (tx, mut rx) = crate::stream::output_channel();
-        let stream = Stream::new(
-            StreamPath(format!("/host/team-compact-busy-{}", Uuid::new_v4())),
-            tx,
-        );
-
-        fixture
-            .host
-            .compact_team(
-                TeamCompactPayload {
-                    team_id: fixture.team.id.clone(),
-                    summary_prompt: None,
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-            .expect("busy native team compaction should defer");
-        let started = rx.recv().await.expect("team context compaction started");
-        assert_eq!(started.kind, FrameKind::TeamContextCompactionNotify);
-        let started: TeamContextCompactionNotifyPayload = started
-            .parse_payload()
-            .expect("team context compaction started payload");
-        assert_eq!(started.status, TeamContextCompactionStatus::Started);
-
-        let terminal = loop {
-            let envelope = timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .expect("busy team compaction reaches terminal")
-                .expect("team compaction stream remains open");
-            if envelope.kind != FrameKind::TeamContextCompactionNotify {
-                continue;
-            }
-            let payload: TeamContextCompactionNotifyPayload = envelope
-                .parse_payload()
-                .expect("team context compaction terminal payload");
-            if payload.status != TeamContextCompactionStatus::Started {
-                break payload;
-            }
-        };
-        assert_eq!(terminal.status, TeamContextCompactionStatus::Completed);
-        assert_eq!(terminal.members.len(), 1);
-        assert_eq!(terminal.members[0].agent_id, manager.agent_id);
-        assert_eq!(
-            terminal.members[0].status,
-            ContextCompactionStatus::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn native_team_compaction_preserves_live_idle_member_bindings() {
-        let fixture = team_fixture().await;
-        let manager = fixture
-            .host
-            .activate_team_member(
-                fixture.manager.id.clone(),
-                Some("Start the manager".to_owned()),
-                None,
-            )
-            .await
-            .expect("activate manager");
-        wait_for_agent_idle(&fixture.host, &manager.agent_id).await;
-        wait_for_team_member_binding_idle(&fixture.host, &fixture.manager.id).await;
-
-        let report = fixture
-            .host
-            .message_team_member(
-                manager.agent_id.clone(),
-                fixture.report.id.clone(),
-                "Please investigate the bug".to_owned(),
-                None,
-            )
-            .await
-            .expect("message report");
-        wait_for_agent_idle(&fixture.host, &report.agent_id).await;
-        wait_for_team_member_binding_idle(&fixture.host, &fixture.report.id).await;
-        assert_native_context_compaction_route(&fixture.host, &manager.agent_id).await;
-        assert_native_context_compaction_route(&fixture.host, &report.agent_id).await;
-        let old_agent_ids = HashSet::from([manager.agent_id.clone(), report.agent_id.clone()]);
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        let stream = Stream::new(
-            StreamPath(format!("/host/team-compact-{}", Uuid::new_v4())),
-            tx,
-        );
-        fixture
-            .host
-            .compact_team(
-                TeamCompactPayload {
-                    team_id: fixture.team.id.clone(),
-                    summary_prompt: None,
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-            .expect("compact team");
-
-        let started = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("team compaction started notify")
-            .expect("team compaction started envelope");
-        assert_eq!(started.kind, FrameKind::TeamContextCompactionNotify);
-        let started: TeamContextCompactionNotifyPayload = started
-            .parse_payload()
-            .expect("team context compaction started");
-        assert_eq!(started.status, TeamContextCompactionStatus::Started);
-
-        let completed = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .expect("team compaction should finish")
-                .expect("team compact envelope");
-            if envelope.kind != FrameKind::TeamContextCompactionNotify {
-                continue;
-            }
-            let payload: TeamContextCompactionNotifyPayload = envelope
-                .parse_payload()
-                .expect("team context compaction notify");
-            if payload.status != TeamContextCompactionStatus::Started {
-                break payload;
-            }
-        };
-        assert_eq!(completed.status, TeamContextCompactionStatus::Completed);
-        assert_eq!(completed.members.len(), 2);
-        assert!(
-            completed
-                .members
-                .iter()
-                .all(|result| result.status == ContextCompactionStatus::Completed)
-        );
-        assert!(
-            completed
-                .members
-                .iter()
-                .all(|result| old_agent_ids.contains(&result.agent_id))
-        );
-
-        let snapshot = team_snapshot(&fixture.host).await;
-        for member_id in [&fixture.manager.id, &fixture.report.id] {
-            let member = member_from_snapshot(snapshot.clone(), member_id);
-            let session_id = member.session_id.expect("member session after compaction");
-            let binding = snapshot
-                .bindings
-                .iter()
-                .find(|binding| binding.member_id == *member_id)
-                .expect("member binding");
-            let new_agent_id = binding
-                .current_agent_id
-                .as_ref()
-                .expect("member remains live-bound");
-            assert!(old_agent_ids.contains(new_agent_id));
-            let result = completed
-                .members
-                .iter()
-                .find(|result| &result.agent_id == new_agent_id)
-                .expect("completed result for preserved agent");
-            assert_eq!(result.logical_session_id, session_id);
-        }
-    }
-
-    #[tokio::test]
-    async fn team_first_message_records_report_session_id() {
-        let fixture = team_fixture().await;
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-
-        let outcome = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                fixture.report.id.clone(),
-                "Please investigate the bug".to_owned(),
-                None,
-            )
-            .await
-            .expect("message report");
-
-        assert_eq!(outcome.member_id, fixture.report.id);
-        assert!(!outcome.queued);
-
-        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
-        let session_id = report
-            .session_id
-            .clone()
-            .expect("first spawn records session id");
-        let persisted = persisted_team_store(&fixture.agent_team_store_path);
-        let persisted_report = persisted
-            .members
-            .get(&fixture.report.id)
-            .expect("persisted report");
-        assert_eq!(persisted_report.session_id.as_ref(), Some(&session_id));
-
-        let start = fixture
-            .host
-            .list_agents()
-            .await
-            .into_iter()
-            .find(|start| start.agent_id == outcome.agent_id)
-            .expect("spawned report agent");
-        assert_eq!(start.origin, AgentOrigin::TeamMember);
-        assert_eq!(start.team_id.as_ref(), Some(&fixture.team.id));
-        assert_eq!(start.team_member_id.as_ref(), Some(&fixture.report.id));
-    }
-
-    #[tokio::test]
-    async fn team_member_spawn_uses_union_of_project_roots() {
-        let fixture = team_fixture().await;
-        let second_root = fixture._dir.path().join("second-project-root");
-        std::fs::create_dir_all(&second_root).expect("create second root");
-        let second_root = second_root.to_string_lossy().to_string();
-        fixture
-            .host
-            .create_project(ProjectCreatePayload {
-                name: "Second Team Project".to_owned(),
-                roots: vec![ProjectRootPath(second_root.clone())],
-            })
-            .await
-            .expect("create second project");
-        let second_project_id = {
-            let state = fixture.host.state.lock().await;
-            state
-                .project_store
-                .lock()
-                .await
-                .list()
-                .expect("list projects")
-                .into_iter()
-                .find(|project| project.name == "Second Team Project")
-                .expect("created second project")
-                .id
-        };
-        fixture
-            .host
-            .update_team_member(TeamMemberUpdatePayload {
-                id: fixture.report.id.clone(),
-                name: fixture.report.name.clone(),
-                description: fixture.report.description.clone(),
-                profile: fixture.report.profile.clone(),
-                project_ids: vec![fixture.project_id.clone(), second_project_id],
-            })
-            .await
-            .expect("update report projects");
-        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-
-        let outcome = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                report.id.clone(),
-                "Use both projects".to_owned(),
-                None,
-            )
-            .await
-            .expect("message report");
-
-        let start = fixture
-            .host
-            .list_agents()
-            .await
-            .into_iter()
-            .find(|start| start.agent_id == outcome.agent_id)
-            .expect("spawned report agent");
-        assert_eq!(
-            start.workspace_roots,
-            vec![fixture.project_root.clone(), second_root]
-        );
-        assert_eq!(start.project_id.as_ref(), Some(&fixture.project_id));
-    }
-
-    #[tokio::test]
-    async fn team_terminal_agent_unbinds_and_resumes_next_message() {
-        let fixture = team_fixture().await;
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-
-        let first = fixture
-            .host
-            .message_team_member(
-                manager_agent_id.clone(),
-                fixture.report.id.clone(),
-                format!("First task {MOCK_DIE_AFTER_BUSY_SENTINEL}"),
-                None,
-            )
-            .await
-            .expect("first message spawns report");
-        let first_session_id =
-            member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id)
-                .session_id
-                .expect("first session id");
-
-        wait_for_team_member_unbound(&fixture.host, &fixture.report.id).await;
-
-        let second = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                fixture.report.id.clone(),
-                "Follow-up after crash".to_owned(),
-                None,
-            )
-            .await
-            .expect("second message resumes after terminal unbind");
-        assert_ne!(first.agent_id, second.agent_id);
-
-        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
-        assert_eq!(report.session_id.as_ref(), Some(&first_session_id));
-    }
-
-    #[tokio::test]
-    async fn team_subsequent_unbound_message_resumes_session() {
-        let fixture = team_fixture().await;
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-        let first = fixture
-            .host
-            .message_team_member(
-                manager_agent_id.clone(),
-                fixture.report.id.clone(),
-                "First task".to_owned(),
-                None,
-            )
-            .await
-            .expect("first message");
-        let first_session_id =
-            member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id)
-                .session_id
-                .expect("first session id");
-
-        assert!(fixture.host.close_agent(&first.agent_id).await);
-
-        let second = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                fixture.report.id.clone(),
-                "Follow-up task".to_owned(),
-                None,
-            )
-            .await
-            .expect("second message resumes");
-        assert_ne!(first.agent_id, second.agent_id);
-
-        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
-        assert_eq!(report.session_id.as_ref(), Some(&first_session_id));
-    }
-
-    #[tokio::test]
-    async fn team_message_member_rejects_report_caller() {
-        let fixture = team_fixture().await;
-        let report_agent_id = bind_team_member(&fixture.host, &fixture.report).await;
-
-        let err = fixture
-            .host
-            .message_team_member(
-                report_agent_id,
-                fixture.report.id.clone(),
-                "Try to delegate".to_owned(),
-                None,
-            )
-            .await
-            .expect_err("report caller should be rejected");
-        assert!(err.starts_with("authorization:"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn team_resume_failure_marks_binding_failed() {
-        let fixture = team_fixture().await;
-        let report_agent_id = bind_team_member(&fixture.host, &fixture.report).await;
-        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
-        let bad_session_id = report.session_id.clone().expect("bound report session");
-        {
-            let state = fixture.host.state.lock().await;
-            state
-                .session_store
-                .lock()
-                .await
-                .upsert_backend_session(
-                    &BackendSession {
-                        id: bad_session_id.clone(),
-                        backend_kind: BackendKind::Claude,
-                        workspace_roots: vec![fixture.project_root.clone()],
-                        title: Some("Missing mock backend session".to_owned()),
-                        token_count: None,
-                        created_at_ms: Some(1),
-                        updated_at_ms: Some(1),
-                        resumable: true,
-                    },
-                    None,
-                    Some(report.project_ids[0].clone()),
-                    report.custom_agent_id.clone(),
-                    None,
-                )
-                .expect("persist fake session");
-        }
-        {
-            let registry = { fixture.host.state.lock().await.team_registry.clone() };
-            let events = registry
-                .clear_binding_by_agent(report_agent_id)
-                .await
-                .expect("clear report binding");
-            fixture.host.fan_out_team_registry_events(events).await;
-        }
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-
-        let err = fixture
-            .host
-            .message_team_member(
-                manager_agent_id,
-                fixture.report.id.clone(),
-                "Try resume".to_owned(),
-                None,
-            )
-            .await
-            .expect_err("unknown backend session should fail");
-        assert!(
-            err.contains("unknown mock session"),
-            "unexpected error: {err}"
-        );
-
-        let snapshot = team_snapshot(&fixture.host).await;
-        let binding = snapshot
-            .bindings
-            .iter()
-            .find(|binding| binding.member_id == fixture.report.id)
-            .expect("report binding");
-        assert!(binding.current_agent_id.is_none());
-        assert_eq!(binding.status, AgentControlStatus::Failed);
-        let report = member_from_snapshot(snapshot, &fixture.report.id);
-        assert!(report.session_id.is_none());
-        let persisted = persisted_team_store(&fixture.agent_team_store_path);
-        let persisted_report = persisted
-            .members
-            .get(&fixture.report.id)
-            .expect("persisted report");
-        assert!(persisted_report.session_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn team_delete_hard_removes_team_and_members() {
-        let fixture = team_fixture().await;
-
-        fixture
-            .host
-            .delete_team(TeamDeletePayload {
-                id: fixture.team.id.clone(),
-            })
-            .await
-            .expect("delete team");
-        let snapshot = team_snapshot(&fixture.host).await;
-        assert!(snapshot.teams.iter().all(|team| team.id != fixture.team.id));
-        assert!(
-            snapshot
-                .members
-                .iter()
-                .all(|member| member.team_id != fixture.team.id)
-        );
-        assert!(snapshot.bindings.iter().all(|binding| {
-            binding.member_id != fixture.manager.id && binding.member_id != fixture.report.id
-        }));
-        let persisted = persisted_team_store(&fixture.agent_team_store_path);
-        assert!(!persisted.teams.contains_key(&fixture.team.id));
-        assert!(!persisted.members.contains_key(&fixture.manager.id));
-        assert!(!persisted.members.contains_key(&fixture.report.id));
-
-        let err = fixture
-            .host
-            .rename_team(TeamRenamePayload {
-                id: fixture.team.id.clone(),
-                name: "Renamed Team".to_owned(),
-            })
-            .await
-            .expect_err("deleted team rename should fail");
-        assert_eq!(err.kind, crate::error::AppErrorKind::NotFound);
-        assert!(err.message.contains("missing team"));
-    }
-
-    #[tokio::test]
-    async fn concurrent_first_team_messages_spawn_at_most_one_agent() {
-        let fixture = team_fixture().await;
-        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
-        let mut tasks = Vec::new();
-        for index in 0..8 {
-            let host = fixture.host.clone();
-            let caller = manager_agent_id.clone();
-            let member_id = fixture.report.id.clone();
-            tasks.push(tokio::spawn(async move {
-                host.message_team_member(
-                    caller,
-                    member_id,
-                    format!("Concurrent task {index}"),
-                    None,
-                )
-                .await
-            }));
-        }
-
-        let mut success_count = 0;
-        for task in tasks {
-            match task.await.expect("message task should not panic") {
-                Ok(_) => success_count += 1,
-                Err(err) => assert!(
-                    err.starts_with("conflict:"),
-                    "unexpected concurrent message error: {err}"
-                ),
-            }
-        }
-        assert!(success_count >= 1);
-
-        let report_agents = fixture
-            .host
-            .list_agents()
-            .await
-            .into_iter()
-            .filter(|agent| agent.team_member_id.as_ref() == Some(&fixture.report.id))
-            .collect::<Vec<_>>();
-        assert_eq!(report_agents.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn team_delete_rejects_live_bound_member() {
-        let fixture = team_fixture().await;
-        bind_team_member(&fixture.host, &fixture.report).await;
-
-        let err = fixture
-            .host
-            .delete_team_member(TeamMemberDeletePayload {
-                id: fixture.report.id.clone(),
-            })
-            .await
-            .expect_err("live-bound report should not delete");
-        assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
-        assert!(err.message.contains("live-bound"));
-    }
-
-    #[tokio::test]
-    async fn team_references_block_custom_agent_but_project_delete_unassigns_members() {
-        let fixture = team_fixture().await;
-
-        let custom_agent_err = fixture
-            .host
-            .delete_custom_agent(CustomAgentDeletePayload {
-                id: fixture.custom_agent_id.clone(),
-            })
-            .await
-            .expect_err("custom agent reference should block delete");
-        assert_eq!(custom_agent_err.kind, crate::error::AppErrorKind::Conflict);
-        assert!(
-            custom_agent_err
-                .message
-                .contains(r#"custom agent "Team Custom Agent""#)
-        );
-        assert!(custom_agent_err.message.contains(r#"team "Product Team""#));
-        assert!(
-            custom_agent_err
-                .message
-                .contains(r#"team member "Manager""#)
-                || custom_agent_err.message.contains(r#"team member "Report""#)
-        );
-        assert!(!custom_agent_err.message.contains(&fixture.manager.id.0));
-        assert!(!custom_agent_err.message.contains(&fixture.report.id.0));
-
-        fixture
-            .host
-            .delete_project(ProjectDeletePayload {
-                id: fixture.project_id.clone(),
-            })
-            .await
-            .expect("project delete should detach team project refs");
-
-        let snapshot = team_snapshot(&fixture.host).await;
-        let manager = member_from_snapshot(snapshot.clone(), &fixture.manager.id);
-        let report = member_from_snapshot(snapshot, &fixture.report.id);
-        assert!(manager.project_ids.is_empty());
-        assert!(report.project_ids.is_empty());
-
-        let persisted = persisted_team_store(&fixture.agent_team_store_path);
-        assert_no_team_member_references_project(&persisted, &fixture.project_id);
-        assert_agent_team_store_loads_with_current_refs(
-            &fixture.host,
-            &fixture.agent_team_store_path,
-        )
-        .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_member_and_delete_custom_agent_serialize() {
-        let race_test_guard = team_mutation_race_test_lock().lock().await;
-        let fixture = team_race_fixture().await;
-        assert!(fixture.temp_dir.path().exists());
-        let hook = install_team_mutation_after_refs_test_hook(&fixture.host, "team_member_create");
-        let create_host = fixture.host.clone();
-        let create_payload = team_member_create_payload(
-            &fixture,
-            fixture.custom_agent_id.clone(),
-            vec![fixture.project_id.clone()],
-        );
-        let create_task =
-            tokio::spawn(async move { create_host.create_team_member(create_payload).await });
-
-        hook.wait_until_reached().await;
-        let delete_host = fixture.host.clone();
-        let custom_agent_id = fixture.custom_agent_id.clone();
-        let delete_task = tokio::spawn(async move {
-            delete_host
-                .delete_custom_agent(CustomAgentDeletePayload {
-                    id: custom_agent_id,
-                })
-                .await
-        });
-        tokio::task::yield_now().await;
-        hook.resume();
-
-        let create_result = create_task.await.expect("create task should not panic");
-        let delete_result = delete_task.await.expect("delete task should not panic");
-        match (&create_result, &delete_result) {
-            (Ok(()), Err(err)) => {
-                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
-                assert!(err.message.contains(r#"custom agent "Race Custom Agent""#));
-                assert!(err.message.contains(r#"team member "Race Report""#));
-            }
-            (Err(err), Ok(())) => {
-                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
-                assert!(
-                    err.message.contains("references missing custom agent"),
-                    "unexpected create error: {}",
-                    err.message
-                );
-            }
-            (Ok(()), Ok(())) => panic!("create and delete both succeeded"),
-            (Err(create_err), Err(delete_err)) => panic!(
-                "create and delete both failed: create={}, delete={}",
-                create_err, delete_err
-            ),
-        }
-        assert_agent_team_store_loads_with_current_refs(
-            &fixture.host,
-            &fixture.agent_team_store_path,
-        )
-        .await;
-        drop(hook);
-        drop(race_test_guard);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_member_and_delete_project_serialize() {
-        let race_test_guard = team_mutation_race_test_lock().lock().await;
-        let fixture = team_race_fixture().await;
-        assert!(fixture.temp_dir.path().exists());
-        let hook = install_team_mutation_after_refs_test_hook(&fixture.host, "team_member_create");
-        let create_host = fixture.host.clone();
-        let create_payload = team_member_create_payload(
-            &fixture,
-            fixture.custom_agent_id.clone(),
-            vec![fixture.project_id.clone()],
-        );
-        let create_task =
-            tokio::spawn(async move { create_host.create_team_member(create_payload).await });
-
-        hook.wait_until_reached().await;
-        let delete_host = fixture.host.clone();
-        let project_id = fixture.project_id.clone();
-        let delete_task = tokio::spawn(async move {
-            delete_host
-                .delete_project(ProjectDeletePayload { id: project_id })
-                .await
-        });
-        tokio::task::yield_now().await;
-        hook.resume();
-
-        let create_result = create_task.await.expect("create task should not panic");
-        let delete_result = delete_task.await.expect("delete task should not panic");
-        match (&create_result, &delete_result) {
-            (Ok(()), Err(err)) => {
-                panic!("delete should detach project refs instead of failing: {err}");
-            }
-            (Err(err), Ok(())) => {
-                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
-                assert!(
-                    err.message.contains("references missing project"),
-                    "unexpected create error: {}",
-                    err.message
-                );
-            }
-            (Ok(()), Ok(())) => {
-                let snapshot = team_snapshot(&fixture.host).await;
-                let created = snapshot
-                    .members
-                    .iter()
-                    .find(|member| member.name == "Race Report")
-                    .expect("created race report");
-                assert!(
-                    !created.project_ids.contains(&fixture.project_id),
-                    "created member retained deleted project ref"
-                );
-            }
-            (Err(create_err), Err(delete_err)) => panic!(
-                "create and delete both failed: create={}, delete={}",
-                create_err, delete_err
-            ),
-        }
-        let persisted = persisted_team_store(&fixture.agent_team_store_path);
-        assert_no_team_member_references_project(&persisted, &fixture.project_id);
-        assert_agent_team_store_loads_with_current_refs(
-            &fixture.host,
-            &fixture.agent_team_store_path,
-        )
-        .await;
-        drop(hook);
-        drop(race_test_guard);
-    }
-
-    #[tokio::test]
-    async fn ai_reviewer_backend_resolution_uses_host_defaults() {
-        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp host dir");
-        let host = spawn_host_with_store_paths_and_runtime_config(
-            dir.join("sessions.json"),
-            dir.join("projects.json"),
-            dir.join("settings.json"),
-            HostRuntimeConfig::default(),
-        )
-        .expect("spawn host");
-
-        let err = host
-            .resolve_ai_reviewer_backend_kind(None)
-            .await
-            .expect_err("missing host backend should fail");
-        assert!(
-            err.contains("no default_backend or enabled backends"),
-            "unexpected error: {err}"
-        );
-
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
-            },
-        })
-        .await
-        .expect("enable backends");
-        assert_eq!(
-            host.resolve_ai_reviewer_backend_kind(None)
-                .await
-                .expect("first enabled backend"),
-            BackendKind::Claude
-        );
-
-        host.set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(BackendKind::Codex),
-            },
-        })
-        .await
-        .expect("set default backend");
-        assert_eq!(
-            host.resolve_ai_reviewer_backend_kind(None)
-                .await
-                .expect("default backend"),
-            BackendKind::Codex
-        );
-        assert_eq!(
-            host.resolve_ai_reviewer_backend_kind(Some(BackendKind::Antigravity))
-                .await
-                .expect("explicit backend override"),
-            BackendKind::Antigravity
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn ai_reviewer_non_claude_reaches_read_only_spawn_preconditions() {
-        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp host dir");
-        let host = spawn_host_with_store_paths_and_runtime_config(
-            dir.join("sessions.json"),
-            dir.join("projects.json"),
-            dir.join("settings.json"),
-            HostRuntimeConfig::default(),
-        )
-        .expect("spawn host");
-        host.state.lock().await.review_mcp.url.clear();
-
-        let (review_tx, _review_rx) = mpsc::channel(1);
-        let (reply, _response) = oneshot::channel();
-        let project_store = {
-            let state = host.state.lock().await;
-            Arc::clone(&state.project_store)
-        };
-        let project = project_store
-            .lock()
-            .await
-            .create(
-                "Review Project".to_owned(),
-                vec![ProjectRootPath("/tmp/review-root".to_owned())],
-            )
-            .expect("create review project");
-        let review = Review {
-            id: ReviewId("review-test".to_string()),
-            project_id: project.id,
-            origin_agent_id: AgentId("agent-test".to_string()),
-            origin_session_id: SessionId("session-test".to_string()),
-            selection: ReviewDiffSelection::AllUncommitted,
-            status: ReviewStatus::Draft,
-            diffs: vec![ProjectGitDiffPayload {
-                root: ProjectRootPath("/tmp/review-root".to_string()),
-                scope: ProjectDiffScope::Uncommitted,
-                path: None,
-                context_mode: DiffContextMode::Hunks,
-                files: vec![ProjectGitDiffFile {
-                    relative_path: "src/lib.rs".to_owned(),
-                    is_binary: false,
-                    unmerged: false,
-                    hunks: Vec::new(),
-                }],
-            }],
-            comments: Vec::new(),
-            suggestions: Vec::new(),
-            ai_reviewer: ReviewAiReviewerState {
-                status: ReviewAiReviewerStatus::Idle,
-                agent_id: None,
-                error: None,
-            },
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let (_reply, result) = host
-            .spawn_ai_reviewer(crate::review::actor::ReviewAiSpawnRequest {
-                review_id: review.id.clone(),
-                review,
-                backend_kind: Some(BackendKind::Codex),
-                cost_hint: None,
-                instructions: None,
-                review_handle: ReviewHandle { tx: review_tx },
-                reply,
-            })
-            .await;
-
-        let err = result.expect_err("missing MCP should fail before spawning");
-        assert!(
-            err.contains("review feedback MCP server is unavailable"),
-            "unexpected error: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn supervisor_done_deadline_uses_live_delay_and_original_idle_since() {
-        let idle_since = Instant::now();
-        let agent_id = AgentId("supervisor-deadline".to_owned());
-        let mut entries = HashMap::new();
-        entries.insert(
-            agent_id,
-            SupervisorSchedulerEntry {
-                last_activity_counter: 7,
-                phase: SupervisorPhase::DoneAuthorized {
-                    idle_since,
-                    baseline: SupervisionBaseline {
-                        last_user_message: "done".to_owned(),
-                        kicks_since_user_message: 0,
-                        session_id: None,
-                    },
-                    last_gate_evaluation_epoch: None,
-                },
-            },
-        );
-        let mut supervisor = protocol::SupervisorSettings {
-            enabled: true,
-            auto_compact_on_success: true,
-            auto_compact_inactivity_delay_seconds: 600,
-            ..Default::default()
-        };
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal {
-                    settings: supervisor,
-                    epoch: 1,
-                },
-                false,
-            ),
-            idle_since.checked_add(Duration::from_secs(600))
-        );
-        supervisor.auto_compact_inactivity_delay_seconds = 30;
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal {
-                    settings: supervisor,
-                    epoch: 2,
-                },
-                false,
-            ),
-            idle_since.checked_add(Duration::from_secs(30))
-        );
-    }
-
-    fn stall_settings(seconds: u32) -> protocol::SupervisorSettings {
-        protocol::SupervisorSettings {
-            enabled: true,
-            stall_timeout_enabled: true,
-            stall_timeout_seconds: seconds,
-            ..Default::default()
-        }
-    }
-
-    fn active_entries(
-        agent_id: &AgentId,
-        progress_at: Option<Instant>,
-        recheck_after: Option<Instant>,
-    ) -> HashMap<AgentId, SupervisorSchedulerEntry> {
-        HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 3,
-                phase: SupervisorPhase::Active {
-                    progress_at,
-                    recheck_after,
-                },
-            },
-        )])
-    }
-
-    /// The stall clock measures silence, not turn length: it runs from the last
-    /// observed progress, honors a live timeout edit, and never fires while the
-    /// turn is parked on a plan approval or while the timeout is off.
-    #[test]
-    fn supervisor_stall_deadline_tracks_progress_not_turn_start() {
-        let agent_id = AgentId("supervisor-stall".to_owned());
-        let progress_at = Instant::now();
-        let entries = active_entries(&agent_id, Some(progress_at), None);
-        let signal = |settings| SupervisorSettingsSignal { settings, epoch: 1 };
-
-        assert_eq!(
-            supervisor_next_deadline(&entries, signal(stall_settings(1_800)), false),
-            progress_at.checked_add(Duration::from_secs(1_800))
-        );
-        assert_eq!(
-            supervisor_next_deadline(&entries, signal(stall_settings(60)), false),
-            progress_at.checked_add(Duration::from_secs(60)),
-            "a live timeout edit must apply to the turn already being watched"
-        );
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                signal(protocol::SupervisorSettings {
-                    stall_timeout_enabled: false,
-                    ..stall_settings(60)
-                }),
-                false
-            ),
-            None
-        );
-        assert_eq!(
-            supervisor_next_deadline(&entries, signal(stall_settings(1_800)), true),
-            progress_at.checked_add(Duration::from_secs(1_800)),
-            "a verdict call in flight must not hold off a free interrupt"
-        );
-
-        // Waiting on a plan approval pauses the clock outright.
-        let paused = active_entries(&agent_id, None, None);
-        assert_eq!(
-            supervisor_next_deadline(&paused, signal(stall_settings(1)), false),
-            None
-        );
-    }
-
-    /// The actor sees stream deltas the status watch never carries, so its
-    /// "not yet" answer must push the next query out without moving the
-    /// observed progress instant a later settings edit recomputes from.
-    #[test]
-    fn supervisor_stall_recheck_floor_defers_then_clears_on_settings_edit() {
-        let agent_id = AgentId("supervisor-stall-floor".to_owned());
-        let progress_at = Instant::now();
-        let mut entries = active_entries(&agent_id, Some(progress_at), None);
-        let previous = SupervisorSettingsSignal {
-            settings: stall_settings(60),
-            epoch: 1,
-        };
-
-        supervisor_defer_stall_check(&mut entries, &agent_id, previous.settings, progress_at);
-        assert_eq!(
-            supervisor_next_deadline(&entries, previous, false),
-            progress_at.checked_add(Duration::from_secs(60))
-        );
-        supervisor_defer_stall_check(
-            &mut entries,
-            &agent_id,
-            previous.settings,
-            progress_at + Duration::from_secs(90),
-        );
-        assert_eq!(
-            supervisor_next_deadline(&entries, previous, false),
-            progress_at.checked_add(Duration::from_secs(150)),
-            "a deferral must hold off the next query by a full window"
-        );
-
-        let current = SupervisorSettingsSignal {
-            settings: stall_settings(30),
-            epoch: 2,
-        };
-        apply_live_stall_settings(&mut entries, previous, current);
-        assert_eq!(
-            supervisor_next_deadline(&entries, current, false),
-            progress_at.checked_add(Duration::from_secs(30)),
-            "shortening the timeout must not stay blocked behind the old floor"
-        );
-
-        apply_live_stall_settings(&mut entries, current, current);
-        assert_eq!(
-            supervisor_next_deadline(&entries, current, false),
-            progress_at.checked_add(Duration::from_secs(30)),
-            "an unrelated settings edit must leave the live window alone"
-        );
-    }
-
-    /// Restored agents wait for the opt-in rather than being judged on replayed
-    /// history, and enabling it arms exactly those waiting agents.
-    #[test]
-    fn supervisor_restore_gate_defers_until_the_setting_is_enabled() {
-        let deferred = AgentId("restored".to_owned());
-        let awaiting_user = AgentId("awaiting".to_owned());
-        let idle_since = Instant::now();
-        let mut entries = HashMap::from([
-            (
-                deferred.clone(),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: 2,
-                    phase: SupervisorPhase::RestoreDeferred { idle_since },
-                },
-            ),
-            (
-                awaiting_user.clone(),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: 5,
-                    phase: SupervisorPhase::AwaitingUser { idle_since },
-                },
-            ),
-        ]);
-        let off = SupervisorSettingsSignal {
-            settings: protocol::SupervisorSettings {
-                enabled: true,
-                ..Default::default()
-            },
-            epoch: 1,
-        };
-        assert_eq!(supervisor_next_deadline(&entries, off, false), None);
-
-        let on = SupervisorSettingsSignal {
-            settings: protocol::SupervisorSettings {
-                supervise_restored_agents: true,
-                ..off.settings
-            },
-            epoch: 2,
-        };
-        arm_restore_deferred_entries(&mut entries, off, on);
-        assert!(matches!(
-            entries.get(&deferred).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { .. })
-        ));
-        assert!(
-            matches!(
-                entries.get(&awaiting_user).map(|entry| &entry.phase),
-                Some(SupervisorPhase::AwaitingUser { .. })
-            ),
-            "already-judged agents must not be re-judged by the restore opt-in"
-        );
-
-        arm_restore_deferred_entries(&mut entries, on, off);
-        assert!(
-            matches!(
-                entries.get(&deferred).map(|entry| &entry.phase),
-                Some(SupervisorPhase::Debouncing { .. })
-            ),
-            "turning the opt-in back off must not retract an armed agent"
-        );
-    }
-
-    #[test]
-    fn supervisor_failed_gate_is_suppressed_for_only_its_settings_epoch() {
-        let agent_id = AgentId("supervisor-gate".to_owned());
-        let idle_since = Instant::now();
-        let mut entries = HashMap::new();
-        entries.insert(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 9,
-                phase: SupervisorPhase::DoneAuthorized {
-                    idle_since,
-                    baseline: SupervisionBaseline {
-                        last_user_message: "done".to_owned(),
-                        kicks_since_user_message: 0,
-                        session_id: None,
-                    },
-                    last_gate_evaluation_epoch: None,
-                },
-            },
-        );
-        mark_supervisor_gate_evaluated(&mut entries, &agent_id, 4);
-        let supervisor = protocol::SupervisorSettings {
-            enabled: true,
-            auto_compact_on_success: true,
-            auto_compact_inactivity_delay_seconds: 1,
-            ..Default::default()
-        };
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal {
-                    settings: supervisor,
-                    epoch: 4,
-                },
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal {
-                    settings: supervisor,
-                    epoch: 5,
-                },
-                false,
-            ),
-            idle_since.checked_add(Duration::from_secs(1))
-        );
-    }
-
-    #[test]
-    fn supervisor_fresh_idle_observation_starts_a_new_interval() {
-        let now = Instant::now();
-        let idle = crate::agent::registry::AgentStatus {
-            started: true,
-            turn_completed: true,
-            activity_counter: 11,
-            ..Default::default()
-        };
-        let settings = protocol::SupervisorSettings {
-            enabled: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            supervisor_phase_for_fresh_observation(&idle, settings, now),
-            SupervisorPhase::Debouncing { idle_since } if idle_since == now
-        ));
-
-        let active = crate::agent::registry::AgentStatus {
-            is_thinking: true,
-            ..idle.clone()
-        };
-        assert!(matches!(
-            supervisor_phase_for_fresh_observation(&active, settings, now),
-            SupervisorPhase::Active { progress_at, recheck_after }
-                if progress_at == Some(now) && recheck_after.is_none()
-        ));
-
-        // A session restored from history settles into idle exactly like a
-        // finished turn does, so only the restore opt-in separates them.
-        let restored = crate::agent::registry::AgentStatus {
-            restored_without_live_turn: true,
-            ..idle
-        };
-        assert!(matches!(
-            supervisor_phase_for_fresh_observation(&restored, settings, now),
-            SupervisorPhase::RestoreDeferred { idle_since } if idle_since == now
-        ));
-        assert!(matches!(
-            supervisor_phase_for_fresh_observation(
-                &restored,
-                protocol::SupervisorSettings {
-                    supervise_restored_agents: true,
-                    ..settings
-                },
-                now
-            ),
-            SupervisorPhase::Debouncing { idle_since } if idle_since == now
-        ));
-    }
-
-    #[test]
-    fn supervisor_kick_is_active_before_backend_typing_starts() {
-        let now = Instant::now();
-        let mut status = crate::agent::registry::AgentStatus {
-            started: true,
-            turn_completed: true,
-            activity_counter: 21,
-            ..Default::default()
-        };
-
-        mark_supervisor_kick_pending(&mut status);
-        status.activity_counter += 1;
-
-        assert!(status.is_active());
-        assert!(matches!(
-            supervisor_phase_for_fresh_observation(
-                &status,
-                protocol::SupervisorSettings {
-                    enabled: true,
-                    ..Default::default()
-                },
-                now
-            ),
-            SupervisorPhase::Active { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn settings_commit_during_verdict_await_rearms_without_kick() {
-        let fixture = compact_fixture().await;
-        let (agent_id, session_id) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "stale verdict settings race {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let context = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let cached_settings = fixture.host.supervisor_settings_signal().await;
-        let idle_since = Instant::now();
-        let baseline = SupervisionBaseline {
-            last_user_message: context.last_user_message.expect("last user message"),
-            kicks_since_user_message: context.kicks_since_user_message,
-            session_id: Some(session_id),
-        };
-        let activity_counter = observation.status.activity_counter;
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    verdict_settings: VerdictSettingsFingerprint::from(cached_settings.settings),
-                },
-            },
-        )]);
-
-        let (entered, release) = install_supervisor_verdict_post_sample_test_gate(agent_id.clone());
-        let host = fixture.host.clone();
-        let result_agent_id = agent_id.clone();
-        let result_baseline = baseline.clone();
-        let acceptance = tokio::spawn(async move {
-            accept_supervision_verdict_result(
-                &host,
-                &mut entries,
-                cached_settings,
-                SupervisorVerdictTaskResult {
-                    agent_id: result_agent_id,
-                    activity_counter,
-                    baseline: result_baseline,
-                    attempts_started: 1,
-                    verdict_settings: VerdictSettingsFingerprint::from(cached_settings.settings),
-                    result: Ok(crate::agent::supervisor::SupervisionVerdict::Continue {
-                        message: "stale kick must not be sent".to_owned(),
-                    }),
-                },
-                Instant::now(),
-            )
-            .await;
-            entries
-        });
-        entered
-            .await
-            .expect("verdict handler sampled the original settings epoch");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 2 },
-            })
-            .await
-            .expect("commit settings during post-sample await window");
-        assert_ne!(
-            fixture.host.supervisor_settings_signal().await.epoch,
-            cached_settings.epoch
-        );
-        release.send(()).expect("release verdict handler");
-        let mut entries = acceptance.await.expect("verdict acceptance task");
-
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::RetryPending {
-                idle_since: preserved,
-                attempts_started: 1,
-                last_failure_kind: SupervisionRetryReason::SettingsChanged,
-                ..
-            }) if *preserved == idle_since
-        ));
-        let live_settings = fixture.host.supervisor_settings_signal().await;
-        let context_after_stale_result = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context after stale result");
-        assert_eq!(
-            context_after_stale_result.kicks_since_user_message,
-            baseline.kicks_since_user_message
-        );
-        apply_live_retry_settings(
-            &agent_id,
-            entries.get_mut(&agent_id).expect("scheduler entry"),
-            live_settings.settings,
-        );
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::RetryPending { .. })
-        ));
-        entries.get_mut(&agent_id).expect("scheduler entry").phase =
-            SupervisorPhase::VerdictInFlight {
-                idle_since,
-                baseline: baseline.clone(),
-                attempts_started: 2,
-                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
-            };
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            live_settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline: baseline.clone(),
-                attempts_started: 2,
-                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
-                result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
-            },
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::DoneAuthorized {
-                idle_since: preserved,
-                ..
-            }) if *preserved == idle_since
-        ));
-
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            live_settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline,
-                attempts_started: 2,
-                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
-                result: Ok(crate::agent::supervisor::SupervisionVerdict::AwaitingUser),
-            },
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::DoneAuthorized { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn deadline_launch_reads_live_epoch_without_rearm_churn() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "live deadline epoch {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let settings_rx = fixture.host.supervisor_settings_receiver().await;
-        let stale_settings = *settings_rx.borrow();
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 2 },
-            })
-            .await
-            .expect("commit settings before deadline decision");
-        let live_settings = fixture.host.supervisor_settings_signal().await;
-        assert_ne!(live_settings.epoch, stale_settings.epoch);
-
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let idle_since = Instant::now()
-            .checked_sub(SUPERVISION_DEBOUNCE)
-            .expect("past-due debounce instant");
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: observation.status.activity_counter,
-                phase: SupervisorPhase::Debouncing { idle_since },
-            },
-        )]);
-        let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
-        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-        let semaphore = Arc::new(Semaphore::new(1));
-        let mut verdict_task_state = SupervisorVerdictTaskState::default();
-
-        launch_supervision_verdict(
-            &fixture.host,
-            &mut entries,
-            agent_id.clone(),
-            stale_settings,
-            &verdict_tx,
-            &semaphore,
-            &mut verdict_task_state,
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { idle_since: preserved })
-                if *preserved == idle_since
-        ));
-
-        process_supervisor_deadlines_from_signal(
-            &fixture.host,
-            &mut entries,
-            &settings_rx,
-            &verdict_tx,
-            &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
-        )
-        .await;
-
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::VerdictInFlight {
-                verdict_settings,
-                idle_since: preserved,
-                ..
-            }) if *verdict_settings == VerdictSettingsFingerprint::from(live_settings.settings)
-                && *preserved == idle_since
-        ));
-
-        apply_supervisor_settings_change(
-            &fixture.host,
-            &mut entries,
-            stale_settings,
-            live_settings,
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::VerdictInFlight {
-                verdict_settings,
-                ..
-            }) if *verdict_settings == VerdictSettingsFingerprint::from(live_settings.settings)
-        ));
-    }
-
-    #[tokio::test]
-    async fn disable_then_enable_observes_idle_agent_with_fresh_interval() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "restart interval").await;
-        let old_idle_since = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .expect("old instant");
-        let baseline = SupervisionBaseline {
-            last_user_message: "restart interval".to_owned(),
-            kicks_since_user_message: 0,
-            session_id: None,
-        };
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 1,
-                phase: SupervisorPhase::RetryPending {
-                    idle_since: old_idle_since,
-                    baseline,
-                    attempts_started: 1,
-                    due_at: Instant::now().checked_add(Duration::from_secs(30)).unwrap(),
-                    last_failure_kind: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    verdict_settings: VerdictSettingsFingerprint::from(
-                        protocol::SupervisorSettings::default(),
-                    ),
-                },
-            },
-        )]);
-        let enabled = protocol::SupervisorSettings {
-            enabled: true,
-            ..Default::default()
-        };
-        let mut disabled = enabled;
-        disabled.enabled = false;
-
-        apply_supervisor_settings_change(
-            &fixture.host,
-            &mut entries,
-            SupervisorSettingsSignal {
-                settings: enabled,
-                epoch: 1,
-            },
-            SupervisorSettingsSignal {
-                settings: disabled,
-                epoch: 2,
-            },
-        )
-        .await;
-        assert!(entries.is_empty());
-
-        let reenabled_at = Instant::now();
-        apply_supervisor_settings_change(
-            &fixture.host,
-            &mut entries,
-            SupervisorSettingsSignal {
-                settings: disabled,
-                epoch: 2,
-            },
-            SupervisorSettingsSignal {
-                settings: enabled,
-                epoch: 3,
-            },
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { idle_since })
-                if *idle_since >= reenabled_at && *idle_since != old_idle_since
-        ));
-    }
-
-    #[tokio::test]
-    async fn activity_cancels_pending_retry_and_resets_generation() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "retry activity reset").await;
-        let status = fixture
-            .host
-            .agent_status_snapshot(&agent_id)
-            .await
-            .expect("agent status");
-        let idle_since = Instant::now();
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: status.activity_counter,
-                phase: SupervisorPhase::RetryPending {
-                    idle_since,
-                    baseline: SupervisionBaseline {
-                        last_user_message: "retry activity reset".to_owned(),
-                        kicks_since_user_message: 0,
-                        session_id: None,
-                    },
-                    attempts_started: 1,
-                    due_at: idle_since.checked_add(Duration::from_secs(30)).unwrap(),
-                    last_failure_kind: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    verdict_settings: VerdictSettingsFingerprint::from(
-                        protocol::SupervisorSettings::default(),
-                    ),
-                },
-            },
-        )]);
-        let status_handle = fixture
-            .host
-            .agent_status_handle(&agent_id)
-            .await
-            .expect("agent status handle");
-        status_handle
-            .update(|status| {
-                status.activity_counter = status.activity_counter.saturating_add(1);
-                status.is_thinking = true;
-                status.turn_completed = false;
-            })
-            .await;
-        observe_supervised_agents(
-            &fixture.host,
-            &mut entries,
-            protocol::SupervisorSettings {
-                enabled: true,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let entry = entries.get(&agent_id).expect("scheduler entry");
-        assert_ne!(entry.last_activity_counter, status.activity_counter);
-        assert!(matches!(entry.phase, SupervisorPhase::Active { .. }));
-    }
-
-    #[tokio::test]
-    async fn failed_verdict_retries_then_continue_delivers_one_kick() {
-        let fixture = compact_fixture().await;
-        let (agent_id, session_id) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "retry then recover {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let context = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context");
-        let idle_since = Instant::now();
-        let baseline = SupervisionBaseline {
-            last_user_message: context.last_user_message.expect("last user message"),
-            kicks_since_user_message: context.kicks_since_user_message,
-            session_id: Some(session_id),
-        };
-        let activity_counter = observation.status.activity_counter;
-        let fingerprint = VerdictSettingsFingerprint::from(settings.settings);
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                },
-            },
-        )]);
-
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline: baseline.clone(),
-                attempts_started: 1,
-                verdict_settings: fingerprint,
-                result: Err(crate::agent::supervisor::SupervisionFailure {
-                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    message: "temporary outage".to_owned(),
-                }),
-            },
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::RetryPending {
-                attempts_started: 1,
-                ..
-            })
-        ));
-
-        entries.get_mut(&agent_id).expect("scheduler entry").phase =
-            SupervisorPhase::VerdictInFlight {
-                idle_since,
-                baseline: baseline.clone(),
-                attempts_started: 2,
-                verdict_settings: fingerprint,
-            };
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline,
-                attempts_started: 2,
-                verdict_settings: fingerprint,
-                result: Ok(crate::agent::supervisor::SupervisionVerdict::Continue {
-                    message: "continue after recovery".to_owned(),
-                }),
-            },
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active { .. })
-        ));
-        let mut kicks = 0;
-        for _ in 0..100 {
-            kicks = observation
-                .handle
-                .read_supervision_context()
-                .await
-                .expect("supervision context after recovery")
-                .kicks_since_user_message;
-            if kicks == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(kicks, 1);
-    }
-
-    #[tokio::test]
-    async fn failure_exhaustion_appends_once_and_only_then_becomes_dormant() {
-        let fixture = compact_fixture().await;
-        let (agent_id, session_id) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "terminal supervisor failure {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 0 },
-            })
-            .await
-            .expect("set immediate exhaustion cap");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let context = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context");
-        let baseline = SupervisionBaseline {
-            last_user_message: context.last_user_message.expect("last user message"),
-            kicks_since_user_message: context.kicks_since_user_message,
-            session_id: Some(session_id),
-        };
-        let activity_counter = observation.status.activity_counter;
-        let idle_since = Instant::now();
-        let fingerprint = VerdictSettingsFingerprint::from(settings.settings);
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                },
-            },
-        )]);
-
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline,
-                attempts_started: 1,
-                verdict_settings: fingerprint,
-                result: Err(crate::agent::supervisor::SupervisionFailure {
-                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    message: "private backend detail".to_owned(),
-                }),
-            },
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Dormant { .. })
-        ));
-
-        exhaust_supervision_by_failure(
-            &fixture.host,
-            &mut entries,
-            &agent_id,
-            activity_counter,
-            idle_since,
-            1,
-            settings,
-        )
-        .await;
-        let history = observation
-            .handle
-            .fetch_session_history(None, 100)
-            .await
-            .expect("actor history");
-        let warnings = history
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::MessageAdded(message)
-                    if matches!(message.sender, MessageSender::Warning)
-                        && message.content.starts_with("Supervisor could not verify") =>
-                {
-                    Some(message.content.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(
-            warnings[0],
-            "Supervisor could not verify whether this task was complete after 1 attempt and has stopped retrying. Send a follow-up message if you want the agent to continue."
-        );
-        assert!(!warnings[0].contains("private backend detail"));
-        assert!(!warnings[0].contains("BackendStream"));
-    }
-
-    #[tokio::test]
-    async fn non_retryable_supervisor_backend_failure_stops_without_warning() {
-        let fixture = compact_fixture().await;
-        let (agent_id, session_id) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "non-retryable supervisor failure {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 5 },
-            })
-            .await
-            .expect("set retry cap");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let context = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context");
-        let baseline = SupervisionBaseline {
-            last_user_message: context.last_user_message.expect("last user message"),
-            kicks_since_user_message: context.kicks_since_user_message,
-            session_id: Some(session_id),
-        };
-        let activity_counter = observation.status.activity_counter;
-        let idle_since = Instant::now();
-        let fingerprint = VerdictSettingsFingerprint::from(settings.settings);
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                },
-            },
-        )]);
-
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                baseline,
-                attempts_started: 1,
-                verdict_settings: fingerprint,
-                result: Err(crate::agent::supervisor::SupervisionFailure {
-                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendTerminal,
-                    message: "No allowed providers are available for the selected model."
-                        .to_owned(),
-                }),
-            },
-            Instant::now(),
-        )
-        .await;
-
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Dormant { .. })
-        ));
-        let history = observation
-            .handle
-            .fetch_session_history(None, 100)
-            .await
-            .expect("actor history");
-        assert!(history.events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::MessageAdded(message)
-                if matches!(message.sender, MessageSender::Warning)
-                    && message.content.starts_with("Supervisor could not verify")
-        )));
-    }
-
-    #[tokio::test]
-    async fn settings_change_at_warning_gate_rejects_stale_append_and_preserves_backoff() {
-        let fixture = compact_fixture().await;
-        let (agent_id, session_id) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "warning settings race {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 0 },
-            })
-            .await
-            .expect("set initial retry cap");
-        let expected_settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let context = observation
-            .handle
-            .read_supervision_context()
-            .await
-            .expect("supervision context");
-        let baseline = SupervisionBaseline {
-            last_user_message: context.last_user_message.expect("last user message"),
-            kicks_since_user_message: context.kicks_since_user_message,
-            session_id: Some(session_id),
-        };
-        let activity_counter = observation.status.activity_counter;
-        let idle_since = Instant::now();
-        let failed_at = Instant::now();
-        let fingerprint = VerdictSettingsFingerprint::from(expected_settings.settings);
-        let entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                },
-            },
-        )]);
-        let (entered, release) =
-            crate::agent::install_append_supervisor_warning_test_gate(agent_id.clone());
-        let host = fixture.host.clone();
-        let result_agent_id = agent_id.clone();
-        let acceptance = tokio::spawn(async move {
-            let mut entries = entries;
-            accept_supervision_verdict_result(
-                &host,
-                &mut entries,
-                expected_settings,
-                SupervisorVerdictTaskResult {
-                    agent_id: result_agent_id,
-                    activity_counter,
-                    baseline,
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                    result: Err(crate::agent::supervisor::SupervisionFailure {
-                        kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                        message: "settings race failure".to_owned(),
-                    }),
-                },
-                failed_at,
-            )
-            .await;
-            entries
-        });
-
-        entered
-            .await
-            .expect("warning command reached final settings gate");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 1 },
-            })
-            .await
-            .expect("raise retry cap at warning gate");
-        let raised_settings = fixture.host.supervisor_settings_signal().await;
-        release.send(()).expect("release warning settings gate");
-        let entries = acceptance.await.expect("verdict acceptance task");
-        let expected_due = failed_at
-            .checked_add(SUPERVISION_RETRY_DELAYS[0])
-            .expect("first retry due");
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::RetryPending {
-                attempts_started: 1,
-                due_at,
-                verdict_settings,
-                ..
-            }) if *due_at == expected_due
-                && *verdict_settings == VerdictSettingsFingerprint::from(raised_settings.settings)
-        ));
-        let history = observation
-            .handle
-            .fetch_session_history(None, 100)
-            .await
-            .expect("actor history after settings race");
-        assert!(!history.events.iter().any(|event| matches!(
-            event,
-            ChatEvent::MessageAdded(message)
-                if matches!(message.sender, MessageSender::Warning)
-                    && message.content.starts_with("Supervisor could not verify")
-        )));
-    }
-
-    #[tokio::test]
-    async fn failure_backed_live_cap_reduction_warns_but_settings_only_does_not() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "live retry cap reduction").await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 5 },
-            })
-            .await
-            .expect("set raised retry cap");
-        let previous = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let activity_counter = observation.status.activity_counter;
-        let idle_since = Instant::now();
-        let baseline = SupervisionBaseline {
-            last_user_message: "live retry cap reduction".to_owned(),
-            kicks_since_user_message: 0,
-            session_id: observation.start.session_id.clone(),
-        };
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::RetryPending {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 2,
-                    due_at: idle_since.checked_add(Duration::from_secs(60)).unwrap(),
-                    last_failure_kind: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::Timeout,
-                    ),
-                    verdict_settings: VerdictSettingsFingerprint::from(previous.settings),
-                },
-            },
-        )]);
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 1 },
-            })
-            .await
-            .expect("lower retry cap");
-        let current = fixture.host.supervisor_settings_signal().await;
-        apply_supervisor_settings_change(&fixture.host, &mut entries, previous, current).await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Dormant { .. })
-        ));
-        let history = observation
-            .handle
-            .fetch_session_history(None, 100)
-            .await
-            .expect("actor history");
-        assert!(history.events.iter().any(|event| matches!(
-            event,
-            ChatEvent::MessageAdded(message)
-                if matches!(message.sender, MessageSender::Warning)
-                    && message.content.contains("after 2 attempts")
-        )));
-
-        let settings_only_id = AgentId("settings-only-exhaustion".to_owned());
-        entries.insert(
-            settings_only_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: activity_counter,
-                phase: SupervisorPhase::RetryPending {
-                    idle_since,
-                    baseline,
-                    attempts_started: 2,
-                    due_at: idle_since,
-                    last_failure_kind: SupervisionRetryReason::SettingsChanged,
-                    verdict_settings: VerdictSettingsFingerprint::from(previous.settings),
-                },
-            },
-        );
-        assert!(matches!(
-            apply_live_retry_settings(
-                &settings_only_id,
-                entries
-                    .get_mut(&settings_only_id)
-                    .expect("settings-only entry"),
-                current.settings,
-            ),
-            LiveRetrySettingsResult::SettingsExhausted {
-                attempts_started: 2,
-                ..
-            }
-        ));
-    }
-
-    async fn accept_next_supervisor_task_event(
-        host: &HostHandle,
-        entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
-        settings: SupervisorSettingsSignal,
-        verdict_task_state: &mut SupervisorVerdictTaskState,
-        verdict_rx: &mut mpsc::UnboundedReceiver<SupervisorVerdictTaskEvent>,
-        result_dequeued_at: Instant,
-    ) {
-        let event = verdict_rx.recv().await.expect("supervisor task result");
-        assert!(
-            verdict_task_state.finish(event.task_id),
-            "result must clear the actual scheduler-owned task"
-        );
-        accept_supervision_verdict_result(
-            host,
-            entries,
-            settings,
-            event.result,
-            result_dequeued_at,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn aborted_verdict_task_releases_permit_and_reports_completion() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&semaphore)
-            .try_acquire_owned()
-            .expect("test permit");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut task_state = SupervisorVerdictTaskState::default();
-        let task_id = task_state.reserve().expect("reserve task");
-        let completion = SupervisorVerdictTaskCompletion {
-            task_id,
-            tx,
-            permit: Some(permit),
-            aborted: Some(SupervisorVerdictTaskResult {
-                agent_id: AgentId("aborted-verdict".to_owned()),
-                activity_counter: 1,
-                baseline: SupervisionBaseline {
-                    last_user_message: "request".to_owned(),
-                    kicks_since_user_message: 0,
-                    session_id: None,
-                },
-                attempts_started: 1,
-                verdict_settings: VerdictSettingsFingerprint::from(
-                    protocol::SupervisorSettings::default(),
-                ),
-                result: Err(crate::agent::supervisor::SupervisionFailure {
-                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    message: "task aborted".to_owned(),
-                }),
-            }),
-        };
-        let task = tokio::spawn(async move {
-            let _completion = completion;
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
-        task.abort();
-        let _ = task.await;
-        let event = rx.recv().await.expect("abort completion event");
-        assert_eq!(semaphore.available_permits(), 1);
-        assert!(task_state.finish(event.task_id));
-        assert!(!task_state.is_active());
-        assert!(matches!(
-            event.result.result,
-            Err(crate::agent::supervisor::SupervisionFailure {
-                kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn production_retry_scheduler_starts_exact_bounded_calls_at_due_deadlines() {
-        for (retry_attempts, expected_calls) in [(0, 1_u8), (1, 2), (5, 6)] {
-            let fixture = compact_fixture_without_supervisor_worker().await;
-            fixture
-                .host
-                .set_setting(SetSettingPayload {
-                    setting: HostSettingValue::SupervisorRetryAttempts {
-                        count: retry_attempts,
-                    },
-                })
-                .await
-                .expect("set retry budget");
-            let (agent_id, _) = spawn_idle_user_agent(
-                &fixture.host,
-                &format!(
-                    "{} {}",
-                    crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-                    crate::agent::supervisor::MOCK_SUPERVISOR_ERROR,
-                ),
-            )
-            .await;
-            fixture
-                .host
-                .set_setting(SetSettingPayload {
-                    setting: HostSettingValue::SupervisorEnabled { enabled: true },
-                })
-                .await
-                .expect("enable supervisor");
-            let settings = fixture.host.supervisor_settings_signal().await;
-            let observation = fixture
-                .host
-                .activity_summary_observation(&agent_id)
-                .await
-                .expect("idle observation");
-            let launch_at = Instant::now();
-            let mut entries = HashMap::from([(
-                agent_id.clone(),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: observation.status.activity_counter,
-                    phase: SupervisorPhase::Debouncing {
-                        idle_since: launch_at.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
-                    },
-                },
-            )]);
-            let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
-            let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-            let semaphore = Arc::new(Semaphore::new(1));
-            let mut verdict_task_state = SupervisorVerdictTaskState::default();
-            let (mut starts, releases) =
-                install_supervisor_verdict_call_test_gate(agent_id.clone());
-
-            for expected_attempt in 1..=expected_calls {
-                let due_at = match entries.get(&agent_id).map(|entry| &entry.phase) {
-                    Some(SupervisorPhase::Debouncing { .. }) => launch_at,
-                    Some(SupervisorPhase::RetryPending { due_at, .. }) => *due_at,
-                    _ => panic!("attempt {expected_attempt} must have a due phase"),
-                };
-                if expected_attempt > 1 {
-                    process_supervisor_deadlines_at(
-                        &fixture.host,
-                        &mut entries,
-                        settings,
-                        &verdict_tx,
-                        &compaction_tx,
-                        SupervisorVerdictExecution {
-                            semaphore: &semaphore,
-                            task_state: &mut verdict_task_state,
-                        },
-                        due_at.checked_sub(Duration::from_nanos(1)).unwrap(),
-                    )
-                    .await;
-                    assert!(!verdict_task_state.is_active());
-                    assert!(starts.try_recv().is_err(), "retry started before due");
-                }
-                process_supervisor_deadlines_at(
-                    &fixture.host,
-                    &mut entries,
-                    settings,
-                    &verdict_tx,
-                    &compaction_tx,
-                    SupervisorVerdictExecution {
-                        semaphore: &semaphore,
-                        task_state: &mut verdict_task_state,
-                    },
-                    due_at,
-                )
-                .await;
-                let start = starts.recv().await.expect("recorded verdict call start");
-                assert_eq!(start.agent_id, agent_id);
-                assert_eq!(start.activity_counter, observation.status.activity_counter);
-                assert_eq!(start.attempts_started, expected_attempt);
-                assert_eq!(start.cost_hint, Some(protocol::SpawnCostHint::Low));
-                assert!(verdict_task_state.is_active());
-                releases.send(()).expect("release verdict call");
-                let result_at = due_at.checked_add(Duration::from_secs(1)).unwrap();
-                accept_next_supervisor_task_event(
-                    &fixture.host,
-                    &mut entries,
-                    settings,
-                    &mut verdict_task_state,
-                    &mut verdict_rx,
-                    result_at,
-                )
-                .await;
-                if expected_attempt < expected_calls {
-                    let expected_due = result_at
-                        .checked_add(SUPERVISION_RETRY_DELAYS[usize::from(expected_attempt - 1)])
-                        .unwrap();
-                    assert!(matches!(
-                        entries.get(&agent_id).map(|entry| &entry.phase),
-                        Some(SupervisorPhase::RetryPending { due_at, .. })
-                            if *due_at == expected_due
-                    ));
-                }
-            }
-
-            assert!(matches!(
-                entries.get(&agent_id).map(|entry| &entry.phase),
-                Some(SupervisorPhase::Dormant { .. })
-            ));
-            assert_eq!(
-                supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
-                None
-            );
-            assert!(starts.try_recv().is_err());
-            let history = observation
-                .handle
-                .fetch_session_history(None, 100)
-                .await
-                .expect("supervisor exhaustion history");
-            let expected_attempt_label = if expected_calls == 1 {
-                "attempt"
-            } else {
-                "attempts"
-            };
-            let expected_copy = format!(
-                "Supervisor could not verify whether this task was complete after {expected_calls} {expected_attempt_label} and has stopped retrying. Send a follow-up message if you want the agent to continue."
-            );
-            assert_eq!(
-                history
-                    .events
-                    .iter()
-                    .filter(|event| matches!(
-                        event,
-                        ChatEvent::MessageAdded(message)
-                            if matches!(message.sender, MessageSender::Warning)
-                                && message.content == expected_copy
-                    ))
-                    .count(),
-                1
-            );
-            remove_supervisor_verdict_call_test_gate(&agent_id);
-        }
-    }
-
-    #[tokio::test]
-    async fn production_scheduler_occupancy_survives_activity_and_disable_phase_resets() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        let (agent_id, _) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "occupancy {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("idle observation");
-        let now = Instant::now();
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: observation.status.activity_counter,
-                phase: SupervisorPhase::Debouncing {
-                    idle_since: now.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
-                },
-            },
-        )]);
-        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
-        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-        let semaphore = Arc::new(Semaphore::new(1));
-        let mut verdict_task_state = SupervisorVerdictTaskState::default();
-        let (mut starts, releases) = install_supervisor_verdict_call_test_gate(agent_id.clone());
-
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            now,
-        )
-        .await;
-        let first_start = starts.recv().await.expect("first held verdict call");
-        assert_eq!(first_start.attempts_started, 1);
-
-        assert!(
-            observation
-                .handle
-                .send_input(AgentInput::SendMessage(SendMessagePayload {
-                    message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
-                    images: None,
-                    origin: Some(MessageOrigin::User),
-                    tool_response: None,
-                }))
-                .await
-        );
-        wait_for_agent_active(&fixture.host, &agent_id).await;
-        observe_supervised_agents(&fixture.host, &mut entries, settings.settings).await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active { .. })
-        ));
-        assert!(verdict_task_state.is_active());
-        assert!(starts.try_recv().is_err());
-        wait_for_agent_idle(&fixture.host, &agent_id).await;
-        observe_supervised_agents(&fixture.host, &mut entries, settings.settings).await;
-        let fresh_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
-            Some(SupervisorPhase::Debouncing { idle_since }) => {
-                idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
-            }
-            _ => panic!("new activity generation must debounce"),
-        };
-        for _ in 0..100 {
-            assert_eq!(
-                supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
-                None
-            );
-            process_supervisor_deadlines_at(
-                &fixture.host,
-                &mut entries,
-                settings,
-                &verdict_tx,
-                &compaction_tx,
-                SupervisorVerdictExecution {
-                    semaphore: &semaphore,
-                    task_state: &mut verdict_task_state,
-                },
-                fresh_due,
-            )
-            .await;
-        }
-        assert!(starts.try_recv().is_err());
-
-        releases.send(()).expect("release stale activity call");
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            fresh_due,
-        )
-        .await;
-        let second_start = starts.recv().await.expect("fresh activity call");
-        assert_ne!(second_start.activity_counter, first_start.activity_counter);
-
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: false },
-            })
-            .await
-            .expect("disable supervisor while call is held");
-        let disabled = fixture.host.supervisor_settings_signal().await;
-        apply_supervisor_settings_change(&fixture.host, &mut entries, settings, disabled).await;
-        assert!(entries.is_empty());
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("re-enable supervisor while old call is held");
-        let reenabled = fixture.host.supervisor_settings_signal().await;
-        apply_supervisor_settings_change(&fixture.host, &mut entries, disabled, reenabled).await;
-        let reenabled_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
-            Some(SupervisorPhase::Debouncing { idle_since }) => {
-                idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
-            }
-            _ => panic!("re-enabled idle generation must debounce"),
-        };
-        assert_eq!(
-            supervisor_next_deadline(&entries, reenabled, verdict_task_state.is_active()),
-            None
-        );
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            reenabled,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            reenabled_due,
-        )
-        .await;
-        assert!(starts.try_recv().is_err());
-
-        releases.send(()).expect("release pre-disable call");
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            reenabled,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            reenabled,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            reenabled_due,
-        )
-        .await;
-        let third_start = starts.recv().await.expect("post-enable call");
-        assert_eq!(third_start.activity_counter, second_start.activity_counter);
-        releases.send(()).expect("release post-enable call");
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            reenabled,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        remove_supervisor_verdict_call_test_gate(&agent_id);
-    }
-
-    #[tokio::test]
-    async fn actor_verdict_start_rejects_activity_ordered_before_authorization() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        let (agent_id, _) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "actor ordering {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("idle observation");
-
-        assert!(
-            observation
-                .handle
-                .send_input(AgentInput::SendMessage(SendMessagePayload {
-                    message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
-                    images: None,
-                    origin: Some(MessageOrigin::User),
-                    tool_response: None,
-                }))
-                .await
-        );
-        let result = observation
-            .handle
-            .begin_supervisor_verdict_if_inactive(
-                observation.status.activity_counter,
-                VerdictSettingsFingerprint::from(settings.settings),
-                fixture.host.supervisor_settings_receiver().await,
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            SupervisorVerdictStart::Rejected {
-                reason: crate::agent::SupervisorVerdictStartRejection::ActivityChanged,
-                live_settings,
-            } if live_settings == settings
-        ));
-        assert!(
-            fixture
-                .host
-                .agent_status_snapshot(&agent_id)
-                .await
-                .expect("active status")
-                .activity_counter
-                > observation.status.activity_counter
-        );
-        assert_eq!(
-            observation.handle.interrupt().await,
-            InterruptOutcome::Interrupted
-        );
-    }
-
-    #[tokio::test]
-    async fn production_scheduler_actor_gate_rejects_stale_settings() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorRetryAttempts { count: 0 },
-            })
-            .await
-            .expect("set one-call budget");
-        let (agent_id, _) = spawn_idle_user_agent(
-            &fixture.host,
-            &format!(
-                "{} {}",
-                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-                crate::agent::supervisor::MOCK_SUPERVISOR_CONTINUE,
-            ),
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let stale_settings = fixture.host.supervisor_settings_signal().await;
-        assert_eq!(stale_settings.settings.retry_attempts, 0);
-        assert_eq!(
-            stale_settings.settings.cost_tier,
-            protocol::SupervisorCostTier::Low
-        );
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("idle observation");
-        let now = Instant::now();
-        let entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: observation.status.activity_counter,
-                phase: SupervisorPhase::Debouncing {
-                    idle_since: now.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
-                },
-            },
-        )]);
-        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
-        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-        let semaphore = Arc::new(Semaphore::new(1));
-        let (pre_start_entered, pre_start_release) =
-            crate::agent::install_begin_supervisor_verdict_test_gate(agent_id.clone());
-        let (mut starts, releases) = install_supervisor_verdict_call_test_gate(agent_id.clone());
-
-        let host = fixture.host.clone();
-        let task_verdict_tx = verdict_tx.clone();
-        let task_compaction_tx = compaction_tx.clone();
-        let task_semaphore = Arc::clone(&semaphore);
-        let launch = tokio::spawn(async move {
-            let mut entries = entries;
-            let mut verdict_task_state = SupervisorVerdictTaskState::default();
-            process_supervisor_deadlines_at(
-                &host,
-                &mut entries,
-                stale_settings,
-                &task_verdict_tx,
-                &task_compaction_tx,
-                SupervisorVerdictExecution {
-                    semaphore: &task_semaphore,
-                    task_state: &mut verdict_task_state,
-                },
-                now,
-            )
-            .await;
-            (entries, verdict_task_state)
-        });
-        pre_start_entered
-            .await
-            .expect("actor reached verdict settings boundary");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorCostTier {
-                    tier: protocol::SupervisorCostTier::High,
-                },
-            })
-            .await
-            .expect("change verdict settings before actor authorization");
-        let live_settings = fixture.host.supervisor_settings_signal().await;
-        pre_start_release.send(()).expect("release pre-start gate");
-        let (mut entries, mut verdict_task_state) = launch.await.expect("deadline task");
-
-        assert!(!verdict_task_state.is_active());
-        assert!(starts.try_recv().is_err(), "stale Low call must be free");
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { .. })
-        ));
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            live_settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            now,
-        )
-        .await;
-        let start = starts.recv().await.expect("live High call start");
-        assert_eq!(start.attempts_started, 1);
-        assert_eq!(start.cost_hint, Some(protocol::SpawnCostHint::High));
-        releases.send(()).expect("release live call");
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            live_settings,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active { .. })
-        ));
-        let mut kicks = 0;
-        for _ in 0..100 {
-            kicks = observation
-                .handle
-                .read_supervision_context()
-                .await
-                .expect("context after live kick")
-                .kicks_since_user_message;
-            if kicks == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(kicks, 1);
-        remove_supervisor_verdict_call_test_gate(&agent_id);
-    }
-
-    #[tokio::test]
-    async fn production_scheduler_serializes_due_agents_through_one_task_owner() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        let prompt = format!(
-            "{} {}",
-            crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
-            crate::agent::supervisor::MOCK_SUPERVISOR_ERROR,
-        );
-        let (first_agent, _) = spawn_idle_user_agent(&fixture.host, &prompt).await;
-        let (second_agent, _) = spawn_idle_user_agent(&fixture.host, &prompt).await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        let settings = fixture.host.supervisor_settings_signal().await;
-        let first_observation = fixture
-            .host
-            .activity_summary_observation(&first_agent)
-            .await
-            .expect("first idle observation");
-        let second_observation = fixture
-            .host
-            .activity_summary_observation(&second_agent)
-            .await
-            .expect("second idle observation");
-        let now = Instant::now();
-        let idle_since = now.checked_sub(SUPERVISION_DEBOUNCE).unwrap();
-        let mut entries = HashMap::from([
-            (
-                first_agent.clone(),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: first_observation.status.activity_counter,
-                    phase: SupervisorPhase::Debouncing { idle_since },
-                },
-            ),
-            (
-                second_agent.clone(),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: second_observation.status.activity_counter,
-                    phase: SupervisorPhase::Debouncing { idle_since },
-                },
-            ),
-        ]);
-        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
-        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-        let semaphore = Arc::new(Semaphore::new(1));
-        let mut verdict_task_state = SupervisorVerdictTaskState::default();
-        let (mut first_starts, first_releases) =
-            install_supervisor_verdict_call_test_gate(first_agent.clone());
-        let (mut second_starts, second_releases) =
-            install_supervisor_verdict_call_test_gate(second_agent.clone());
-
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            now,
-        )
-        .await;
-        let first_owner = tokio::select! {
-            start = first_starts.recv() => {
-                assert_eq!(start.expect("first call start").agent_id, first_agent);
-                1_u8
-            }
-            start = second_starts.recv() => {
-                assert_eq!(start.expect("second call start").agent_id, second_agent);
-                2_u8
-            }
-        };
-        assert!(verdict_task_state.is_active());
-        assert_eq!(
-            supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
-            None
-        );
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            now,
-        )
-        .await;
-        if first_owner == 1 {
-            assert!(second_starts.try_recv().is_err());
-            first_releases.send(()).expect("release first owner");
-        } else {
-            assert!(first_starts.try_recv().is_err());
-            second_releases.send(()).expect("release second owner");
-        }
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        process_supervisor_deadlines_at(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &verdict_tx,
-            &compaction_tx,
-            SupervisorVerdictExecution {
-                semaphore: &semaphore,
-                task_state: &mut verdict_task_state,
-            },
-            now,
-        )
-        .await;
-        if first_owner == 1 {
-            assert_eq!(
-                second_starts
-                    .recv()
-                    .await
-                    .expect("second serialized call")
-                    .agent_id,
-                second_agent
-            );
-            second_releases.send(()).expect("release second call");
-        } else {
-            assert_eq!(
-                first_starts
-                    .recv()
-                    .await
-                    .expect("first serialized call")
-                    .agent_id,
-                first_agent
-            );
-            first_releases.send(()).expect("release first call");
-        }
-        accept_next_supervisor_task_event(
-            &fixture.host,
-            &mut entries,
-            settings,
-            &mut verdict_task_state,
-            &mut verdict_rx,
-            Instant::now(),
-        )
-        .await;
-        remove_supervisor_verdict_call_test_gate(&first_agent);
-        remove_supervisor_verdict_call_test_gate(&second_agent);
-    }
-
-    async fn assert_settings_edit_rejects_actor_pending_compaction(
-        fixture: &CompactFixture,
-        agent_id: &AgentId,
-        setting: HostSettingValue,
-    ) {
-        assert_native_context_compaction_route(&fixture.host, agent_id).await;
-        let status = fixture
-            .host
-            .agent_status_snapshot(agent_id)
-            .await
-            .expect("agent status");
-        let signal = fixture.host.supervisor_settings_signal().await;
-        let (entered, release) =
-            crate::agent::install_compact_if_inactive_test_gate(agent_id.clone());
-        let host = fixture.host.clone();
-        let compact_agent_id = agent_id.clone();
-        let compact = tokio::spawn(async move {
-            let (stream, _rx) = compact_stream(&compact_agent_id);
-            host.compact_agent_if_inactive_in_background(
-                compact_agent_id,
-                status.activity_counter,
-                signal.epoch,
-                AgentCompactPayload {
-                    summary_prompt: None,
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-        });
-
-        entered
-            .await
-            .expect("conditional compact reached actor gate");
-        fixture
-            .host
-            .set_setting(SetSettingPayload { setting })
-            .await
-            .expect("commit supervisor setting while actor gate is held");
-        release.send(()).expect("release actor gate");
-
-        assert!(
-            !compact
-                .await
-                .expect("conditional compact task")
-                .expect("conditional compact request")
-        );
-    }
-
-    #[tokio::test]
-    async fn actor_gate_rejects_each_stale_supervisor_setting_kind() {
-        let fixture = compact_fixture().await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("enable supervisor");
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
-            })
-            .await
-            .expect("enable auto-compaction");
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "actor settings race").await;
-
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorEnabled { enabled: false },
-        )
-        .await;
-        fixture
-            .host
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorEnabled { enabled: true },
-            })
-            .await
-            .expect("restore supervisor");
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: false },
-        )
-        .await;
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 900 },
-        )
-        .await;
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 900_000 },
-        )
-        .await;
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
-        )
-        .await;
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 120 },
-        )
-        .await;
-        assert_settings_edit_rejects_actor_pending_compaction(
-            &fixture,
-            &agent_id,
-            HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn actor_gate_linearizes_activity_before_conditional_compaction() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "activity wins race").await;
-        assert_native_context_compaction_route(&fixture.host, &agent_id).await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let expected_counter = observation.status.activity_counter;
-        assert!(
-            observation
-                .handle
-                .send_input(AgentInput::SendMessage(SendMessagePayload {
-                    message: "new user activity".to_owned(),
-                    images: None,
-                    origin: Some(MessageOrigin::User),
-                    tool_response: None,
-                }))
-                .await
-        );
-        let signal = fixture.host.supervisor_settings_signal().await;
-        let (stream, _rx) = compact_stream(&agent_id);
-
-        let accepted = fixture
-            .host
-            .compact_agent_if_inactive_in_background(
-                agent_id,
-                expected_counter,
-                signal.epoch,
-                AgentCompactPayload {
-                    summary_prompt: None,
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-            .expect("conditional compact request");
-
-        assert!(!accepted);
-    }
-
-    #[tokio::test]
-    async fn actor_gate_accepts_compaction_that_linearizes_first() {
-        let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "compaction wins race").await;
-        assert_native_context_compaction_route(&fixture.host, &agent_id).await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
-        let expected_counter = observation.status.activity_counter;
-        let agent_handle = observation.handle;
-        let signal = fixture.host.supervisor_settings_signal().await;
-        let (entered, release) =
-            crate::agent::install_compact_if_inactive_test_gate(agent_id.clone());
-        let host = fixture.host.clone();
-        let compact_agent_id = agent_id.clone();
-        let compact = tokio::spawn(async move {
-            let (stream, _rx) = compact_stream(&compact_agent_id);
-            host.compact_agent_if_inactive_in_background(
-                compact_agent_id,
-                expected_counter,
-                signal.epoch,
-                AgentCompactPayload {
-                    summary_prompt: None,
-                    max_summary_bytes: None,
-                },
-                stream,
-            )
-            .await
-        });
-        entered
-            .await
-            .expect("conditional compact reached actor gate");
-        release.send(()).expect("release actor gate");
-        assert!(
-            compact
-                .await
-                .expect("conditional compact task")
-                .expect("conditional compact request")
-        );
-
-        assert!(
-            agent_handle
-                .send_input(AgentInput::SendMessage(SendMessagePayload {
-                    message: "activity after compaction acceptance".to_owned(),
-                    images: None,
-                    origin: Some(MessageOrigin::User),
-                    tool_response: None,
-                }))
-                .await
-        );
-    }
-
-    #[test]
-    fn supervisor_retry_limit_changes_preserve_or_exhaust_pending_retry() {
-        let idle_since = Instant::now();
-        let due_at = idle_since.checked_add(Duration::from_secs(30)).unwrap();
-        let baseline = SupervisionBaseline {
-            last_user_message: "request".to_owned(),
-            kicks_since_user_message: 0,
-            session_id: None,
-        };
-        let mut pending = SupervisorSchedulerEntry {
-            last_activity_counter: 4,
-            phase: SupervisorPhase::RetryPending {
-                idle_since,
-                baseline: baseline.clone(),
-                attempts_started: 1,
-                due_at,
-                last_failure_kind: SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ),
-                verdict_settings: VerdictSettingsFingerprint::from(
-                    protocol::SupervisorSettings::default(),
-                ),
-            },
-        };
-        let raised = protocol::SupervisorSettings {
-            retry_attempts: 5,
-            cost_tier: protocol::SupervisorCostTier::High,
-            ..Default::default()
-        };
-        apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, raised);
-        assert!(matches!(
-            pending.phase,
-            SupervisorPhase::RetryPending {
-                due_at: preserved_due,
-                attempts_started: 1,
-                verdict_settings,
-                ..
-            } if preserved_due == due_at
-                && verdict_settings == VerdictSettingsFingerprint::from(raised)
-        ));
-
-        let mut lowered = raised;
-        lowered.retry_attempts = 0;
-        assert!(matches!(
-            apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, lowered),
-            LiveRetrySettingsResult::FailureExhausted {
-                attempts_started: 1,
-                ..
-            }
-        ));
-        assert!(matches!(
-            pending.phase,
-            SupervisorPhase::FailureExhausted { .. }
-        ));
-    }
-
-    #[test]
-    fn supervisor_retry_backoff_and_caps_are_exact_and_finite() {
-        let agent_id = AgentId("retry-backoff".to_owned());
-        let idle_since = Instant::now();
-        let baseline = SupervisionBaseline {
-            last_user_message: "retry".to_owned(),
-            kicks_since_user_message: 0,
-            session_id: None,
-        };
-        let mut settings = protocol::SupervisorSettings {
-            enabled: true,
-            retry_attempts: 5,
-            ..Default::default()
-        };
-        assert_eq!(settings.retry_attempts.saturating_add(1), 6);
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 1,
-                phase: SupervisorPhase::Dormant { idle_since },
-            },
-        )]);
-
-        for attempts_started in 1..=5 {
-            let scheduled_at = idle_since
-                .checked_add(Duration::from_secs(u64::from(attempts_started)))
-                .unwrap();
-            assert_eq!(
-                schedule_supervision_retry_at(
-                    &mut entries,
-                    &agent_id,
-                    SupervisionRetryRequest {
-                        idle_since,
-                        baseline: baseline.clone(),
-                        attempts_started,
-                        settings,
-                        reason: SupervisionRetryReason::Failure(
-                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                        ),
-                        message: Some("outage".to_owned()),
-                        scheduled_at,
-                    },
-                ),
-                SupervisionRetrySchedule::Pending
-            );
-            let expected_due = scheduled_at
-                .checked_add(SUPERVISION_RETRY_DELAYS[usize::from(attempts_started - 1)])
-                .unwrap();
-            assert!(matches!(
-                entries.get(&agent_id).map(|entry| &entry.phase),
-                Some(SupervisorPhase::RetryPending {
-                    due_at,
-                    attempts_started: actual,
-                    ..
-                }) if *due_at == expected_due && *actual == attempts_started
-            ));
-            for _ in 0..100 {
-                assert_eq!(
-                    supervisor_next_deadline(
-                        &entries,
-                        SupervisorSettingsSignal { settings, epoch: 1 },
-                        false,
-                    ),
-                    Some(expected_due),
-                    "polling before a retry transition must not move its deadline"
-                );
-            }
-        }
-
-        assert_eq!(
-            schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                SupervisionRetryRequest {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 6,
-                    settings,
-                    reason: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    message: Some("outage".to_owned()),
-                    scheduled_at: Instant::now(),
-                },
-            ),
-            SupervisionRetrySchedule::Exhausted
-        );
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::FailureExhausted { .. })
-        ));
-        for _ in 0..100 {
-            assert_eq!(
-                supervisor_next_deadline(
-                    &entries,
-                    SupervisorSettingsSignal { settings, epoch: 1 },
-                    false,
-                ),
-                None,
-                "failure-exhausted warning gating must never create an immediate deadline"
-            );
-        }
-
-        settings.retry_attempts = 1;
-        assert_eq!(settings.retry_attempts.saturating_add(1), 2);
-        assert_eq!(
-            schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                SupervisionRetryRequest {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 1,
-                    settings,
-                    reason: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    message: None,
-                    scheduled_at: idle_since,
-                },
-            ),
-            SupervisionRetrySchedule::Pending
-        );
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::RetryPending {
-                attempts_started: 1,
-                due_at,
-                ..
-            }) if *due_at == idle_since.checked_add(Duration::from_secs(30)).unwrap()
-        ));
-        assert_eq!(
-            schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                SupervisionRetryRequest {
-                    idle_since,
-                    baseline: baseline.clone(),
-                    attempts_started: 2,
-                    settings,
-                    reason: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    message: None,
-                    scheduled_at: idle_since,
-                },
-            ),
-            SupervisionRetrySchedule::Exhausted
-        );
-        assert!(matches!(
-            entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::FailureExhausted {
-                retry_due_at: Some(_),
-                ..
-            })
-        ));
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal { settings, epoch: 1 },
-                false,
-            ),
-            None
-        );
-
-        settings.retry_attempts = 0;
-        assert_eq!(settings.retry_attempts.saturating_add(1), 1);
-        assert_eq!(
-            schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                SupervisionRetryRequest {
-                    idle_since,
-                    baseline,
-                    attempts_started: 1,
-                    settings,
-                    reason: SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
-                    ),
-                    message: None,
-                    scheduled_at: Instant::now(),
-                },
-            ),
-            SupervisionRetrySchedule::Exhausted
-        );
-    }
-
-    #[test]
-    fn supervisor_retry_deadlines_serialize_and_each_agent_stops_at_default_cap() {
-        let now = Instant::now();
-        let settings = protocol::SupervisorSettings {
-            enabled: true,
-            ..Default::default()
-        };
-        assert_eq!(settings.retry_attempts.saturating_add(1), 2);
-        let fingerprint = VerdictSettingsFingerprint::from(settings);
-        let baseline = || SupervisionBaseline {
-            last_user_message: "retry".to_owned(),
-            kicks_since_user_message: 0,
-            session_id: None,
-        };
-        let mut entries = HashMap::new();
-        for index in 0..3 {
-            entries.insert(
-                AgentId(format!("retry-agent-{index}")),
-                SupervisorSchedulerEntry {
-                    last_activity_counter: 1,
-                    phase: SupervisorPhase::RetryPending {
-                        idle_since: now,
-                        baseline: baseline(),
-                        attempts_started: 1,
-                        due_at: now,
-                        last_failure_kind: SupervisionRetryReason::Failure(
-                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                        ),
-                        verdict_settings: fingerprint,
-                    },
-                },
-            );
-        }
-        let active_id = AgentId("active-verdict".to_owned());
-        entries.insert(
-            active_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 1,
-                phase: SupervisorPhase::VerdictInFlight {
-                    idle_since: now,
-                    baseline: baseline(),
-                    attempts_started: 1,
-                    verdict_settings: fingerprint,
-                },
-            },
-        );
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal { settings, epoch: 1 },
-                true,
-            ),
-            None,
-            "one in-flight call must suppress all due retry launches"
-        );
-        entries.remove(&active_id);
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal { settings, epoch: 1 },
-                false,
-            ),
-            Some(now)
-        );
-
-        let ids = entries.keys().cloned().collect::<Vec<_>>();
-        for agent_id in ids {
-            assert_eq!(
-                schedule_supervision_retry_at(
-                    &mut entries,
-                    &agent_id,
-                    SupervisionRetryRequest {
-                        idle_since: now,
-                        baseline: baseline(),
-                        attempts_started: 2,
-                        settings,
-                        reason: SupervisionRetryReason::Failure(
-                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                        ),
-                        message: Some("outage".to_owned()),
-                        scheduled_at: now,
-                    },
-                ),
-                SupervisionRetrySchedule::Exhausted
-            );
-        }
-    }
-
-    #[test]
-    fn backend_compaction_mutation_and_method_conversions_are_exhaustive() {
-        assert_eq!(
-            CompactionMutation::from(crate::backend::BackendCompactionMutationState::NotObserved),
-            CompactionMutation::NotObserved
-        );
-        assert_eq!(
-            CompactionMutation::from(crate::backend::BackendCompactionMutationState::Completed),
-            CompactionMutation::Completed
-        );
-        assert_eq!(
-            CompactionMutation::from(
-                crate::backend::BackendCompactionMutationState::MayHaveMutated
-            ),
-            CompactionMutation::MayHaveMutated
-        );
-        assert_eq!(
-            CompactionMethod::from(
-                crate::backend::BackendCompactionMechanism::InterceptedTextCommand
-            ),
-            CompactionMethod::NativeTextCommand
-        );
-        assert_eq!(
-            CompactionMethod::from(crate::backend::BackendCompactionMechanism::JsonRpcRequest),
-            CompactionMethod::NativeRpc
-        );
-    }
-
-    #[test]
-    fn capability_conversion_includes_policy_and_transcript_authority() {
-        let policy = CompactionRoutingPolicy::default();
-        let guarded = crate::backend::BackendCompactionCapability::context_unavailable(
-            crate::backend::BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
-        );
-        assert!(matches!(
-            requested_compaction_availability(&guarded, &policy, false),
-            RequestedCompactionAvailability::Unavailable { .. }
-        ));
-        let unavailable = crate::backend::BackendCompactionCapability::context_unavailable(
-            crate::backend::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-        );
-        assert_eq!(
-            requested_compaction_availability(&unavailable, &policy, true),
-            RequestedCompactionAvailability::Available {
-                route: RequestedCompactionRoute::InlineFallbackOnly,
-            }
-        );
-        for trigger in [
-            CompactionTrigger::UserRequested,
-            CompactionTrigger::TeamRequested,
-            CompactionTrigger::SupervisorRequested,
-        ] {
-            assert_eq!(
-                requested_context_compaction_route(&unavailable, trigger, true),
-                Ok(RequestedCompactionRoute::InlineFallbackOnly)
-            );
-        }
-        assert!(
-            requested_context_compaction_route(
-                &unavailable,
-                CompactionTrigger::UserRequested,
-                false,
-            )
-            .is_err()
-        );
-
-        let unknown = crate::backend::BackendCompactionCapability::unknown(
-            crate::backend::BackendCompactionUnknownReason::CapabilityProbeFailed(
-                "development probe failed".to_owned(),
-            ),
-            Some("development".to_owned()),
-            crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
-        );
-        for trigger in [
-            CompactionTrigger::UserRequested,
-            CompactionTrigger::TeamRequested,
-            CompactionTrigger::SupervisorRequested,
-        ] {
-            assert!(
-                requested_context_compaction_route(&unknown, trigger, true).is_err(),
-                "{trigger:?} must fail closed on a genuinely unknown protocol"
-            );
-        }
-
-        let automatic = crate::backend::BackendCompactionCapability {
-            coordinator: crate::backend::BackendCompactionCoordinator::ContextOperation,
-            availability: crate::backend::BackendCompactionAvailability::AutomaticOnly {
-                reason: crate::backend::BackendCompactionUnavailableReason::ManualTriggerAbsent,
-            },
-            provider_version: None,
-            protocol_version: None,
-            evidence: crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
-        };
-        assert_eq!(
-            requested_context_compaction_route(&automatic, CompactionTrigger::UserRequested, true,),
-            Ok(RequestedCompactionRoute::InlineFallbackOnly)
-        );
-        assert!(
-            requested_context_compaction_route(
-                &automatic,
-                CompactionTrigger::SupervisorRequested,
-                true,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn threshold_zero_remains_blocked_until_a_real_user_message() {
-        assert!(supervisor_auto_compaction_eligible(Some(1), 0));
-        let record: crate::store::session::SessionRecord =
-            serde_json::from_value(serde_json::json!({
-                "id": "session",
-                "backend_kind": "claude",
-                "workspace_roots": [],
-                "created_at_ms": 1,
-                "updated_at_ms": 1
-            }))
-            .expect("session record");
-        let mut context = crate::agent::supervisor::SupervisionContextSnapshot::default();
-        context.auto_compaction_blocked_until_real_user = true;
-        context.supervision_verdict_dormant_until_real_user = true;
-        context.compaction_user_message_count = Some(1);
-        context.user_message_count = 1;
-        assert!(!supervision_record_allows_action(
-            Some(&record),
-            &context,
-            SupervisionAction::AutoCompaction,
-        ));
-        assert!(!supervision_record_allows_action(
-            Some(&record),
-            &context,
-            SupervisionAction::Verdict,
-        ));
-        let mut released = context;
-        released.auto_compaction_blocked_until_real_user = false;
-        released.supervision_verdict_dormant_until_real_user = false;
-        released.user_message_count = 2;
-        assert!(supervision_record_allows_action(
-            Some(&record),
-            &released,
-            SupervisionAction::AutoCompaction,
-        ));
-        assert!(supervision_record_allows_action(
-            Some(&record),
-            &released,
-            SupervisionAction::Verdict,
-        ));
-    }
-
-    #[test]
-    fn finished_compaction_remains_dormant_without_a_deadline() {
-        let agent_id = AgentId("post-compaction-dormant".to_owned());
-        let idle_since = Instant::now();
-        let mut entries = HashMap::from([(
-            agent_id.clone(),
-            SupervisorSchedulerEntry {
-                last_activity_counter: 9,
-                phase: SupervisorPhase::Compacting,
-            },
-        )]);
-
-        assert!(finish_supervisor_compaction(
-            &mut entries,
-            &agent_id,
-            9,
-            3,
-            idle_since,
-        ));
-        assert!(matches!(
-            &entries.get(&agent_id).expect("scheduler entry").phase,
-            SupervisorPhase::PostCompactionDormant {
-                idle_since: stored_idle,
-                user_message_count: 3,
-            } if *stored_idle == idle_since
-        ));
-        let enabled = protocol::SupervisorSettings {
-            enabled: true,
-            auto_compact_on_success: true,
-            auto_compact_min_context_tokens: 0,
-            ..Default::default()
-        };
-        assert_eq!(
-            supervisor_next_deadline(
-                &entries,
-                SupervisorSettingsSignal {
-                    settings: enabled,
-                    epoch: 1,
-                },
-                false,
-            ),
-            None,
-            "Finished must not schedule another verdict or zero-threshold compaction"
-        );
-        assert!(
-            !finish_supervisor_compaction(&mut entries, &agent_id, 10, 3, Instant::now(),),
-            "a duplicate or stale Finished event must not re-arm the entry"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_compaction_guard_holds_without_mark_compacted_at_both_sites() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "typed dormancy fixture").await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("live observation");
-        let session_store = { fixture.host.state.lock().await.session_store.clone() };
-        session_store
-            .lock()
-            .await
-            .put_compaction_operation(
-                &session_id,
-                crate::store::session::CompactionOperationRecord {
-                    operation_id: protocol::CompactionOperationId(
-                        "typed-dormancy-operation".to_owned(),
-                    ),
-                    logical_session_id: session_id.clone(),
-                    trigger: CompactionTrigger::SupervisorRequested,
-                    state: crate::store::session::StoredCompactionState::Completed,
-                    method: Some(CompactionMethod::NativeRpc),
-                    accepted: true,
-                    mutation: CompactionMutation::Completed,
-                    binding_generation_before: 0,
-                    binding_generation_after: None,
-                    transcript_high_water: 1,
-                    metrics: CompactionMetrics::default(),
-                    message: None,
-                    started_at_ms: 1,
-                    finished_at_ms: Some(2),
-                },
-            )
-            .expect("persist typed compaction fixture");
-        let record = session_store
-            .lock()
-            .await
-            .get(&session_id)
-            .expect("typed session record");
-        assert!(
-            record.compacted_from_session_id.is_none() && record.compacted_to_session_id.is_none(),
-            "context-operation dormancy must not rely on legacy lineage"
-        );
-        let mut dormant = crate::agent::supervisor::SupervisionContextSnapshot::default();
-        dormant.auto_compaction_blocked_until_real_user = true;
-        dormant.supervision_verdict_dormant_until_real_user = true;
-        dormant.compaction_user_message_count = Some(1);
-        dormant.user_message_count = 1;
-        assert!(!supervision_verdict_launch_allows_action(
-            Some(&record),
-            &dormant,
-        ));
-        assert!(
-            !supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &dormant,
-                SupervisionAction::Verdict,
-            )
-            .await
-        );
-        assert!(
-            !supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &dormant,
-                SupervisionAction::AutoCompaction,
-            )
-            .await
-        );
-
-        let mut released = dormant;
-        released.auto_compaction_blocked_until_real_user = false;
-        released.supervision_verdict_dormant_until_real_user = false;
-        released.user_message_count = 2;
-        assert!(supervision_verdict_launch_allows_action(
-            Some(&record),
-            &released,
-        ));
-        assert!(
-            supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &released,
-                SupervisionAction::Verdict,
-            )
-            .await
-        );
-        assert!(
-            supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &released,
-                SupervisionAction::AutoCompaction,
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_lineage_guard_remains_compatible_at_both_sites() {
-        let fixture = compact_fixture_without_supervisor_worker().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "legacy dormancy fixture").await;
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("live observation");
-        let session_store = { fixture.host.state.lock().await.session_store.clone() };
-        session_store
-            .lock()
-            .await
-            .update(&session_id, |record| {
-                record.compacted_from_session_id = Some(SessionId("legacy-parent".to_owned()));
-                record.compaction_operations.clear();
-            })
-            .expect("persist legacy lineage fixture");
-        let record = session_store
-            .lock()
-            .await
-            .get(&session_id)
-            .expect("legacy session record");
-        let mut dormant = crate::agent::supervisor::SupervisionContextSnapshot::default();
-        dormant.user_message_count = 1;
-        assert!(!supervision_verdict_launch_allows_action(
-            Some(&record),
-            &dormant,
-        ));
-        assert!(
-            !supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &dormant,
-                SupervisionAction::Verdict,
-            )
-            .await
-        );
-        assert!(
-            !supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &dormant,
-                SupervisionAction::AutoCompaction,
-            )
-            .await
-        );
-
-        let mut released = dormant;
-        released.user_message_count = 2;
-        assert!(supervision_verdict_launch_allows_action(
-            Some(&record),
-            &released,
-        ));
-        assert!(
-            supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &released,
-                SupervisionAction::Verdict,
-            )
-            .await
-        );
-        assert!(
-            supervision_session_allows_action(
-                &fixture.host,
-                &observation,
-                &released,
-                SupervisionAction::AutoCompaction,
-            )
-            .await
-        );
-    }
-
-    #[test]
-    fn compaction_barrier_deadline_extends_long_stall_timeout() {
-        assert_eq!(compaction_barrier_timeout(None), Duration::from_secs(600));
-        assert_eq!(
-            compaction_barrier_timeout(Some(Duration::from_secs(900))),
-            Duration::from_secs(930)
-        );
-    }
-
-    fn acp_profile_config(id: &str, command: &str) -> protocol::HostLaunchProfileConfig {
-        protocol::HostLaunchProfileConfig {
-            id: LaunchProfileId(id.to_owned()),
-            label: id.to_owned(),
-            description: None,
-            backend_kind: BackendKind::Acp,
-            session_settings: protocol::SessionSettingsValues::default(),
-            acp: Some(protocol::AcpAgentSpec {
-                command: command.to_owned(),
-                args: Vec::new(),
-                cwd: None,
-                env: Default::default(),
-                adapter: protocol::AcpAdapterId::Stock,
-            }),
-        }
-    }
-
-    #[test]
-    fn configured_acp_profiles_always_include_the_builtin_kiro_agent() {
-        let mut settings = crate::store::settings::empty_settings_for_test();
-        settings.launch_profiles = vec![
-            acp_profile_config("acp:my-agent", "/usr/local/bin/my-agent"),
-            // A non-ACP profile must not be probed as an ACP agent.
-            protocol::HostLaunchProfileConfig {
-                backend_kind: BackendKind::Claude,
-                acp: None,
-                ..acp_profile_config("claude:custom", "")
-            },
-        ];
-
-        let ids = configured_acp_profile_ids(&settings);
-        let agents = configured_acp_setup_agents(&settings);
-
-        assert_eq!(
-            ids,
-            vec![
-                LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
-                LaunchProfileId("acp:my-agent".to_owned()),
-            ],
-            "probing must cover the built-in agent plus every configured ACP agent, and nothing else"
-        );
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].label, "Kiro (ACP)");
-        assert_eq!(agents[0].command, "");
-        assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
-        assert_eq!(agents[1].label, "acp:my-agent");
-        assert_eq!(agents[1].command, "/usr/local/bin/my-agent");
-        assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
-    }
-
-    #[test]
-    fn acp_schemas_are_per_agent_and_do_not_leak_across_profiles() {
-        // The schema comes from probing the agent's own model list, so two
-        // configured agents must not share one. A regression here would show a
-        // user their Kiro models while they are configuring a different agent.
-        let kiro = LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned());
-        let other = LaunchProfileId("acp:my-agent".to_owned());
-        let mut schemas = HashMap::new();
-        schemas.insert(
-            kiro.clone(),
-            AcpSessionSchemaState::Ready(crate::backend::empty_session_settings_schema(
-                BackendKind::Acp,
-            )),
-        );
-
-        assert!(
-            matches!(
-                acp_schema_state(&schemas, Some(&kiro)),
-                AcpSessionSchemaState::Ready(_)
-            ),
-            "the probed agent resolves to its own schema"
-        );
-        assert!(
-            matches!(
-                acp_schema_state(&schemas, Some(&other)),
-                AcpSessionSchemaState::Pending
-            ),
-            "an unprobed agent must read as Pending, never inherit another agent's schema"
-        );
-        assert!(
-            matches!(
-                acp_schema_state(&schemas, None),
-                AcpSessionSchemaState::Ready(_)
-            ),
-            "kind-scoped surfaces with no profile fall back to the built-in agent"
-        );
-    }
 }

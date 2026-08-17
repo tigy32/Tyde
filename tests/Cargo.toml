@@ -5,6 +5,7 @@ edition.workspace = true
 [dependencies]
 client = { path = "../client" }
 protocol = { path = "../protocol" }
+settings-model = { path = "../settings-model" }
 mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
 server = { path = "../server", features = ["test-support"] }
 tyde-dev-driver = { path = "../dev-driver" }

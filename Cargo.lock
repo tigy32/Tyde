@@ -966,6 +966,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "backends"
+version = "0.0.0"
+
+[[package]]
 name = "base16"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2520,6 +2524,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "settings-model",
  "similar",
  "syntect",
  "two-face",
@@ -4405,6 +4410,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "settings-model",
  "sha2 0.11.0",
  "tokio",
  "uuid",
@@ -6961,12 +6967,16 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "server",
+ "settings-model",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "tyde-agent-adapter",
+ "tyde-dev-driver",
  "url",
  "uuid",
 ]
@@ -7046,6 +7056,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
 dependencies = [
  "stable_deref_trait",
+]
+
+[[package]]
+name = "settings-model"
+version = "0.0.0"
+dependencies = [
+ "hmac 0.12.1",
+ "protocol",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -7918,6 +7940,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server",
+ "settings-model",
  "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
@@ -8465,6 +8488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server",
+ "settings-model",
  "tempfile",
  "tokio",
  "tracing",

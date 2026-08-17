@@ -2,7 +2,7 @@
 //!
 //! The document travels as the opaque `settings` value inside
 //! [`crate::BackendNativeSettingsSnapshot`] (server → client) and
-//! [`crate::HostSettingValue::BackendNativeSettings`] (client → server). Both
+//! `BackendNativeSettingsWritePayload` (client → server). Both
 //! sides deserialize it into these types; the wire frames stay generic.
 //!
 //! Server snapshots describe every discovered Hermes profile (the default

@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "protocol",
+    "settings-model",
+    "backends",
     "agent-adapter",
     "server",
     "client",

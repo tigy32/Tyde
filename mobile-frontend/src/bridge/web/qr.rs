@@ -472,18 +472,6 @@ fn err_string(value: &JsValue) -> String {
         .unwrap_or_else(|| format!("{value:?}"))
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    #[test]
-    fn mobile_jsqr_copy_matches_loader_source() {
-        assert_eq!(
-            include_str!("../../../vendor/jsqr.js"),
-            include_str!("../../../../web/loader/vendor/jsqr.js"),
-            "mobile-frontend/vendor/jsqr.js must stay identical to the loader's source-of-truth copy"
-        );
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;

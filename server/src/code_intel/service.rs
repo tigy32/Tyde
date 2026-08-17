@@ -19,10 +19,10 @@ use protocol::{
     CodeIntelErrorPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelHoverResultPayload, CodeIntelNavigatePayload, CodeIntelNavigateResultPayload,
     CodeIntelProviderStatus, CodeIntelReferencesCompletePayload, CodeIntelResourceMode,
-    CodeIntelSetVisibleRangePayload, CodeIntelSettings, CodeIntelState, CodeIntelStatusPayload,
-    CodeIntelStatusScope, CodeIntelSubscribeFilePayload, FrameKind, ProjectFileVersion,
-    ProjectPath, ProjectRootPath,
+    CodeIntelSetVisibleRangePayload, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
+    CodeIntelSubscribeFilePayload, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
 };
+use settings_model::CodeIntelSettings;
 use tokio::sync::mpsc;
 
 use super::lsp_provider::LspProvider;
@@ -486,11 +486,6 @@ impl CodeIntelRouter {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn uses_project_handle_for_test(&self, handle: &ProjectStreamHandle) -> bool {
-        self.project_handle.same_channel_for_test(handle)
-    }
-
     fn service_for(&mut self, root: &ProjectRootPath) -> &CodeIntelServiceHandle {
         let project_handle = self.project_handle.clone();
         let resource_mode = self.resource_mode;
@@ -596,88 +591,5 @@ impl CodeIntelRouter {
 impl Drop for CodeIntelRouter {
     fn drop(&mut self) {
         self.shutdown_all();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn root(path: &str) -> ProjectRootPath {
-        ProjectRootPath(path.to_owned())
-    }
-
-    fn service_handle() -> (
-        CodeIntelServiceHandle,
-        mpsc::UnboundedReceiver<CodeIntelCommand>,
-    ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (CodeIntelServiceHandle { tx }, rx)
-    }
-
-    fn router_with_services(
-        services: HashMap<ProjectRootPath, CodeIntelServiceHandle>,
-    ) -> CodeIntelRouter {
-        CodeIntelRouter {
-            services,
-            project_handle: ProjectStreamHandle::disconnected_for_test(),
-            resource_mode: CodeIntelResourceMode::Full,
-            code_intel_settings: CodeIntelSettings::default(),
-        }
-    }
-
-    #[test]
-    fn retain_roots_shuts_down_retired_services_before_settings_fanout() {
-        let live_root = root("/repo/live");
-        let retired_root = root("/repo/retired");
-        let (live_handle, mut live_rx) = service_handle();
-        let (retired_handle, mut retired_rx) = service_handle();
-        let mut services = HashMap::new();
-        services.insert(live_root.clone(), live_handle);
-        services.insert(retired_root.clone(), retired_handle);
-        let mut router = router_with_services(services);
-
-        router.retain_roots(std::slice::from_ref(&live_root));
-
-        assert!(router.services.contains_key(&live_root));
-        assert!(!router.services.contains_key(&retired_root));
-        assert!(matches!(
-            retired_rx.try_recv(),
-            Ok(CodeIntelCommand::Shutdown)
-        ));
-        assert!(live_rx.try_recv().is_err());
-
-        router.update_settings(CodeIntelSettings::default());
-
-        assert!(matches!(
-            live_rx.try_recv(),
-            Ok(CodeIntelCommand::UpdateSettings { .. })
-        ));
-        assert!(
-            retired_rx.try_recv().is_err(),
-            "retired services must not receive settings fanout"
-        );
-    }
-
-    #[test]
-    fn shutdown_all_drains_services_and_sends_shutdown() {
-        let (first_handle, mut first_rx) = service_handle();
-        let (second_handle, mut second_rx) = service_handle();
-        let mut services = HashMap::new();
-        services.insert(root("/repo/a"), first_handle);
-        services.insert(root("/repo/b"), second_handle);
-        let mut router = router_with_services(services);
-
-        router.shutdown_all();
-
-        assert!(router.services.is_empty());
-        assert!(matches!(
-            first_rx.try_recv(),
-            Ok(CodeIntelCommand::Shutdown)
-        ));
-        assert!(matches!(
-            second_rx.try_recv(),
-            Ok(CodeIntelCommand::Shutdown)
-        ));
     }
 }

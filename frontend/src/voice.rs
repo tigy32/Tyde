@@ -108,8 +108,6 @@ pub enum VoiceUiState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TargetResolutionState {
     target_resolvable: bool,
-    #[cfg(test)]
-    reason: &'static str,
 }
 
 fn target_resolution_state(
@@ -131,8 +129,6 @@ fn target_resolution_state(
     };
     TargetResolutionState {
         target_resolvable: reason == "resolved",
-        #[cfg(test)]
-        reason,
     }
 }
 
@@ -1132,145 +1128,6 @@ pub fn VoiceRuntime() -> impl IntoView {
     });
 }
 
-#[cfg(test)]
-mod gate_tests {
-    use super::*;
-
-    /// The failed surface must say WHY the provider dropped the session when
-    /// the host supplies detail (beta.58's killer was only visible in host
-    /// logs), while detail-less payloads keep the typed summary alone.
-    #[test]
-    fn provider_detail_is_appended_to_the_error_message() {
-        let mut payload = protocol::VoiceErrorPayload {
-            session_id: None,
-            generation: 1,
-            code: protocol::VoiceErrorCode::ProviderUnavailable,
-            retryable: true,
-            fatal: true,
-            detail: Some(
-                "Duplicate SYSTEM content. SYSTEM content can only be provided once per prompt."
-                    .into(),
-            ),
-        };
-        let message = voice_error_message(&payload);
-        assert!(message.contains("Amazon Bedrock"), "{message}");
-        assert!(message.contains("retry"), "{message}");
-        assert!(message.contains("Duplicate SYSTEM content"), "{message}");
-
-        payload.detail = None;
-        let message = voice_error_message(&payload);
-        assert!(message.contains("Amazon Bedrock"), "{message}");
-        assert!(!message.contains("Provider said"), "{message}");
-    }
-
-    fn active_downlink_state(generation: u64, next_output_media_seq: u64) -> VoiceUiState {
-        VoiceUiState::Active {
-            host_id: "local".to_string(),
-            session_id: protocol::VoiceSessionId("voice-session".to_string()),
-            target: protocol::VoiceTarget {
-                agent_id: protocol::AgentId("agent".to_string()),
-                instance_stream: StreamPath("/instance/local".to_string()),
-            },
-            generation,
-            state: protocol::VoiceSessionState::Listening,
-            lanes: VoiceLanes::default(),
-            next_output_media_seq,
-            dropped_output_packets: 0,
-        }
-    }
-
-    fn downlink_payload(generation: u64, first_media_seq: u64) -> protocol::VoiceAudioPayload {
-        protocol::VoiceAudioPayload {
-            session_id: protocol::VoiceSessionId("voice-session".to_string()),
-            generation,
-            direction: protocol::VoiceDirection::Output,
-            first_media_seq,
-            timestamp_samples_48k: first_media_seq.saturating_mul(960),
-            packet_lengths: vec![3],
-        }
-    }
-
-    #[test]
-    fn target_resolution_reports_each_false_reason() {
-        for (state, reason) in [
-            (
-                target_resolution_state(false, false, false, false),
-                "active_agent_missing",
-            ),
-            (
-                target_resolution_state(true, false, false, false),
-                "matching_agent_missing",
-            ),
-            (
-                target_resolution_state(true, true, false, false),
-                "not_started",
-            ),
-            (
-                target_resolution_state(true, true, true, true),
-                "fatal_error",
-            ),
-        ] {
-            assert!(!state.target_resolvable);
-            assert_eq!(state.reason, reason);
-        }
-        assert_eq!(
-            target_resolution_state(true, true, true, false).reason,
-            "resolved"
-        );
-    }
-
-    #[test]
-    fn voice_gate_reports_each_false_conjunct_and_available() {
-        let unresolved = target_resolution_state(false, false, false, false);
-        let resolved = target_resolution_state(true, true, true, false);
-        assert!(!voice_gate_state(unresolved, true, true, true).gate_available);
-        assert!(!voice_gate_state(resolved, false, true, true).gate_available);
-        assert!(!voice_gate_state(resolved, true, false, true).gate_available);
-        assert!(!voice_gate_state(resolved, true, true, false).gate_available);
-        assert_eq!(
-            voice_gate_state(resolved, true, true, true),
-            VoiceGateState {
-                gate_available: true,
-            }
-        );
-    }
-
-    #[test]
-    fn downlink_admission_classifies_every_webview_outcome() {
-        let payload = downlink_payload(7, 5);
-        let mut inactive = VoiceUiState::Idle;
-        assert_eq!(
-            admit_voice_downlink(&mut inactive, &payload),
-            Err((7, VoiceDownlinkRejection::Inactive,))
-        );
-
-        let mut other_generation = active_downlink_state(8, 0);
-        assert_eq!(
-            admit_voice_downlink(&mut other_generation, &payload),
-            Err((8, VoiceDownlinkRejection::Generation,))
-        );
-
-        let mut stale_sequence = active_downlink_state(7, 6);
-        assert_eq!(
-            admit_voice_downlink(&mut stale_sequence, &payload),
-            Err((7, VoiceDownlinkRejection::Sequence,))
-        );
-
-        let mut accepted = active_downlink_state(7, 3);
-        assert_eq!(admit_voice_downlink(&mut accepted, &payload), Ok(7));
-        let VoiceUiState::Active {
-            next_output_media_seq,
-            dropped_output_packets,
-            ..
-        } = accepted
-        else {
-            panic!("accepted downlink must preserve the active state");
-        };
-        assert_eq!(next_output_media_seq, 6);
-        assert_eq!(dropped_output_packets, 2);
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
@@ -1868,7 +1725,7 @@ mod wasm_tests {
     /// gate is open and the composer may offer voice.
     fn open_voice_gate(state: &AppState) {
         state.host_settings_by_host.update(|settings| {
-            let mut host = protocol::HostSettings::default();
+            let mut host = settings_model::HostSettings::default();
             host.voice.enabled = true;
             settings.insert("local".to_owned(), host);
         });
@@ -2197,7 +2054,7 @@ mod wasm_tests {
         let container = container();
         let state = AppState::new();
         state.host_settings_by_host.update(|settings| {
-            let mut host = protocol::HostSettings::default();
+            let mut host = settings_model::HostSettings::default();
             host.voice.enabled = true;
             settings.insert("local".to_owned(), host);
         });

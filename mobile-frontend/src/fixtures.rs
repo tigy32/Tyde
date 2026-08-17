@@ -3,8 +3,9 @@ use std::cell::Cell;
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, ChatMessage, ChatMessageId, CustomAgent, CustomAgentId,
-    HostSettings, MessageSender, SessionId, StreamPath, ToolPolicy,
+    MessageSender, SessionId, StreamPath, ToolPolicy,
 };
+use settings_model::HostSettings;
 use wasm_bindgen::JsValue;
 
 use crate::bridge::{Accepted, LocalSubmissionId};

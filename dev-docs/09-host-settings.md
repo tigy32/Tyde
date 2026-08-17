@@ -28,9 +28,9 @@ That violated the design rules:
 - State flows through events, not hidden caches.
 - Everything must use protocol types end-to-end.
 
-The fix is a typed host settings model in `protocol`, persisted and owned by
-`tyde-server`, replayed on connect, and updated through typed host-stream
-events.
+The fix is a typed host settings model in `settings-model`, persisted and owned
+by `tyde-server`, replayed on connect, and updated through compare-and-swap
+host-stream operations.
 
 ---
 
@@ -59,7 +59,8 @@ Out of scope for this slice:
 
 ## Protocol Model
 
-Host settings are strongly typed in `protocol/src/types.rs`.
+Host settings are strongly typed in `settings-model/src/lib.rs`; protocol owns
+only the generic transport payloads.
 
 ### Types
 
@@ -76,31 +77,14 @@ introduced here.
 
 ### Input Events
 
-These are sent on the connection's `/host/<uuid>` stream:
+Clients update settings on `/host/<uuid>` with `FrameKind::SettingsWrite`.
+Each `SettingOp::Replace` or `SettingOp::Remove` carries an RFC 6901 path and a
+mandatory value, version-token, or absent compare-and-swap expectation. A
+write is atomic: overlapping operations or any failed expectation reject the
+whole batch.
 
-```rust
-FrameKind::DumpSettings
-FrameKind::SetSetting
-```
-
-Payloads:
-
-```rust
-pub struct DumpSettingsPayload {}
-
-pub struct SetSettingPayload {
-    pub setting: HostSettingValue,
-}
-
-pub enum HostSettingValue {
-    EnabledBackends { enabled_backends: Vec<BackendKind> },
-    DefaultBackend { default_backend: Option<BackendKind> },
-    VoiceEnabled { enabled: bool },
-    VoiceAwsProfile { profile: Option<String> },
-    VoiceAwsRegion { region: Option<String> },
-    VoiceNovaModel { model: String },
-}
-```
+Profile create/delete and similar backend lifecycle operations use
+`FrameKind::InvokeSettingsAction`, not document writes.
 
 ### Output Event
 
@@ -113,48 +97,38 @@ FrameKind::HostSettings
 Payload:
 
 ```rust
-pub struct HostSettingsPayload {
+pub struct HostSettingsPayload<HostSettings> {
     pub settings: HostSettings,
+    pub etag: String,
+    pub configured_secrets: Vec<ConfiguredSecret>,
 }
 ```
 
-There is exactly one settings snapshot event shape. Initial state and updates
-use the same event model.
+`HostBootstrap` supplies initial state; `HostSettings` is the authoritative
+live-update shape.
 
 ---
 
 ## Semantics
 
-### `dump_settings`
+### Bootstrap and snapshots
 
-Client asks the host to emit the current settings snapshot on the same host
-stream.
+`HostBootstrap` carries the initial redacted settings document, its etag, the
+build-static JSON Schema, and revision tokens for configured write-only paths.
+An applied write fans out `HostSettings` with the new full redacted snapshot,
+etag, and configured-secret tokens.
 
-This is not a request/response abstraction layered outside the protocol. It is
-just an input event that causes the server to emit the current state as a normal
-output event.
+### `settings_write`
 
-### `set_setting`
+Under one settings-apply lock, the host checks path knowledge, secret rules,
+overlap, and every CAS expectation; applies the batch to a candidate document;
+deserializes and validates the typed model; commits the host store; propagates
+backend effects; and publishes the snapshot. The requester alone receives a
+correlated `SettingsWriteResult`. Semantic rejection is a typed result, not a
+`CommandError`.
 
-Client sends a typed mutation request for one setting domain.
-
-The host:
-
-1. loads current settings
-2. applies the typed update
-3. validates invariants
-4. persists the updated snapshot
-5. emits `host_settings` with the latest full snapshot to all subscribers
-
-The client does not optimistically mutate backend settings locally. It waits for
-the resulting `host_settings` event.
-
-### `host_settings`
-
-This is the source of truth for the frontend. The latest event fully replaces
-previous frontend state.
-
----
+The client does not optimistically replace server-owned settings. It waits for
+the authoritative fanout.
 
 ## Invariants
 
@@ -235,22 +209,15 @@ No special-case frontend refresh logic is required beyond normal event handling.
 
 ## Frontend Data Flow
 
-The frontend stores:
-
-```rust
-pub host_settings: RwSignal<Option<HostSettings>>
-```
-
-That signal is populated only from `FrameKind::HostSettings`.
+The frontend stores host-keyed settings, schemas, and configured-secret tokens.
+They are seeded by `HostBootstrap`; settings and secret tokens are replaced by
+each `HostSettings` fanout.
 
 ### Settings Overlay
 
-When the settings overlay opens, the frontend sends `dump_settings` on the host
-stream. The Backends tab renders from `host_settings` and sends typed
-`set_setting` events for:
-
-- toggling backend enablement
-- selecting the default backend
+The settings overlay renders complex editors from the typed model and primitive
+rows from the server-published schema. Edits emit path-scoped `SettingsWrite`
+operations against the selected host.
 
 ### Runtime Behavior
 
@@ -267,10 +234,10 @@ state, not isolated frontend preferences.
 Tycode settings are backend-owned rather than part of persisted
 `HostSettings`. The server publishes typed `BackendNativeSettingsSnapshot`
 events; the frontend renders them and never reads TOML, inspects files, parses
-error text to infer recovery, or maintains a parallel settings model. Saves,
-notice acknowledgement, and managed-copy reset are typed `HostSettingValue`
-events intercepted by the host and are never persisted in the ordinary host
-settings store.
+error text to infer recovery, or maintains a parallel settings model. Saves use
+`BackendNativeSettingsWrite`; profile lifecycle commands use
+`InvokeSettingsAction`. They are never persisted in the ordinary host settings
+store.
 
 Upstream added `GetSettingsSchema` in 0.9.3-pre.1. Tyde adopts grouped native
 settings at its exact stable 0.10.0 pin and renders the returned top-level
@@ -489,26 +456,20 @@ and QA do not validate this final corrective behavior.
 
 This design follows the philosophy document directly:
 
-- One source of truth: `HostSettings` lives in `protocol`.
+- One source of truth: `HostSettings` lives in `settings-model`.
 - Server owns behavior: persistence, validation, and fanout all happen in
   `tyde-server`.
 - UI only renders state: the frontend does not own backend settings anymore.
-- Initial state and live updates share one event shape: `host_settings`.
-- No parallel mirror types: the same protocol types are used across protocol,
-  server, and frontend.
+- Bootstrap supplies initial state; `host_settings` supplies authoritative
+  updates.
+- The protocol transports generic JSON operations while server and clients share
+  the typed settings model.
 
 ---
 
 ## Next Steps
 
-Natural extensions of this design:
-
-- add more typed host settings fields to `HostSettings`
-- add more `HostSettingValue` variants for partial typed updates
-- wire host settings into more runtime decisions beyond new-chat
-- expand the Backends tab with dependency/install state once that domain exists
-- introduce host registry and selected-host state above this layer without
-  changing the per-host settings model
-
-The important constraint is unchanged: new settings must be added as typed
-protocol fields/events and remain server-owned.
+Natural extensions add typed fields to `HostSettings`, expose primitive rows
+through its schema annotations, and keep complex editors in Rust. No new wire
+enum is needed for ordinary fields. Settings remain server-owned, and schema
+validation on the client is advisory; the server is authoritative.

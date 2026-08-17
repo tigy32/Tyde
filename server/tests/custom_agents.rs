@@ -3,144 +3,46 @@ mod fixture;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
-    CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload,
-    ProjectRootPath, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, Steering, SteeringDeletePayload, SteeringId, SteeringNotifyPayload,
-    SteeringScope, SteeringUpsertPayload, ToolPolicy,
+    AgentErrorPayload, AgentStartPayload, BackendKind, CommandErrorCode, CommandErrorPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig, McpServerDeletePayload,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, Skill, SkillId,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, Steering,
+    SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload,
+    ToolPolicy,
 };
 use serde_json::to_string_pretty;
-use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-
-fn pending_agent_events() -> &'static Mutex<HashMap<protocol::StreamPath, VecDeque<Envelope>>> {
-    static PENDING: OnceLock<Mutex<HashMap<protocol::StreamPath, VecDeque<Envelope>>>> =
-        OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn pop_pending_agent_event(stream: &protocol::StreamPath, kind: FrameKind) -> Option<Envelope> {
-    let mut pending = pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned");
-    let queue = pending.get_mut(stream)?;
-    let index = queue.iter().position(|env| env.kind == kind)?;
-    let env = queue.remove(index);
-    if queue.is_empty() {
-        pending.remove(stream);
-    }
-    env
-}
-
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if env.kind == FrameKind::AgentBootstrap {
-            let payload: AgentBootstrapPayload =
-                env.parse_payload().expect("parse AgentBootstrapPayload");
-            let mut events = payload
-                .events
-                .into_iter()
-                .filter_map(|event| bootstrap_event_envelope(&env.stream, env.seq, event));
-            if let Some(first) = events.next() {
-                let mut rest = events.collect::<VecDeque<_>>();
-                if !rest.is_empty() {
-                    pending_agent_events()
-                        .lock()
-                        .expect("pending agent event mutex poisoned")
-                        .entry(env.stream.clone())
-                        .or_default()
-                        .append(&mut rest);
-                }
-                return first;
-            }
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionList
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::AgentActivityStats
-                | FrameKind::SessionSummaryCountUpdated
-                | FrameKind::ProjectBootstrap
-                | FrameKind::ProjectGitStatus
-                | FrameKind::ProjectFileList
-                | FrameKind::CodeIntelOverview
-                | FrameKind::ProjectEvent
-                | FrameKind::ContextCompactionNotify
-                | FrameKind::ContextCompactionCapability
-        ) {
+        let env = fixture::next_frame_unpacking_agent_bootstrap_on(client, context).await;
+        if fixture::is_routine_control_plane_frame(&env)
+            || matches!(
+                env.kind,
+                FrameKind::HostSettings
+                    | FrameKind::BackendCapacity
+                    | FrameKind::TeamPresetCatalogNotify
+                    | FrameKind::SessionList
+                    | FrameKind::TaskTokenUsage
+                    | FrameKind::WorkflowNotify
+                    | FrameKind::AgentsViewPreferencesNotify
+                    | FrameKind::AgentActivityStats
+                    | FrameKind::SessionSummaryCountUpdated
+                    | FrameKind::ProjectBootstrap
+                    | FrameKind::ProjectGitStatus
+                    | FrameKind::ProjectFileList
+                    | FrameKind::CodeIntelOverview
+                    | FrameKind::ProjectEvent
+                    | FrameKind::ContextCompactionNotify
+                    | FrameKind::ContextCompactionCapability
+            )
+        {
             continue;
         }
         return env;
-    }
-}
-
-fn bootstrap_event_envelope(
-    stream: &protocol::StreamPath,
-    seq: u64,
-    event: AgentBootstrapEvent,
-) -> Option<Envelope> {
-    match event {
-        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentStart,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentError,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::SessionSettings(_)
-        | AgentBootstrapEvent::QueuedMessages(_)
-        | AgentBootstrapEvent::AgentActivityStats(_)
-        | AgentBootstrapEvent::ContextCompaction(_)
-        | AgentBootstrapEvent::ContextCompactionCapability(_)
-        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
-    }
-    .map(|result| result.expect("serialize AgentBootstrap event"))
-}
-
-async fn raw_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
     }
 }
 
@@ -151,7 +53,7 @@ fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
 }
 
 fn collect_builtin_team_custom_agents_from_bootstrap(
-    bootstrap: &protocol::HostBootstrapPayload,
+    bootstrap: &settings_model::HostBootstrapPayload,
 ) -> HashMap<CustomAgentId, CustomAgent> {
     let expected = builtin_team_custom_agent_ids();
     bootstrap
@@ -160,28 +62,6 @@ fn collect_builtin_team_custom_agents_from_bootstrap(
         .filter(|agent| expected.contains(agent.id.0.as_str()))
         .map(|agent| (agent.id.clone(), agent.clone()))
         .collect()
-}
-
-async fn expect_custom_agent_upsert_raw(
-    client: &mut client::Connection,
-    id: &CustomAgentId,
-    context: &str,
-) -> CustomAgent {
-    loop {
-        let env = raw_next_event(client, context).await;
-        if env.kind != FrameKind::CustomAgentNotify {
-            continue;
-        }
-        match env
-            .parse_payload::<CustomAgentNotifyPayload>()
-            .expect("parse CustomAgentNotifyPayload")
-        {
-            CustomAgentNotifyPayload::Upsert { custom_agent } if &custom_agent.id == id => {
-                return custom_agent;
-            }
-            CustomAgentNotifyPayload::Upsert { .. } | CustomAgentNotifyPayload::Delete { .. } => {}
-        }
-    }
 }
 
 async fn expect_command_error(
@@ -201,7 +81,9 @@ async fn expect_agent_error_containing(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+        if let Some(env) = fixture::pop_pending_frame_matching_on(client, |env| {
+            env.stream == *stream && env.kind == FrameKind::AgentError
+        }) {
             let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
             if payload.message.contains(expected) {
                 return payload;
@@ -222,43 +104,26 @@ async fn expect_session_list(
     client: &mut client::Connection,
     context: &str,
 ) -> protocol::SessionListPayload {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::AgentActivityStats
-                | FrameKind::TaskTokenUsage
-                | FrameKind::ProjectBootstrap
-                | FrameKind::ProjectGitStatus
-                | FrameKind::ProjectFileList
-                | FrameKind::CodeIntelOverview
-                | FrameKind::ProjectEvent
-        ) {
-            continue;
-        }
-        assert_eq!(env.kind, FrameKind::SessionList);
-        return env
-            .parse_payload()
-            .expect("failed to parse SessionListPayload");
-    }
+    let allowed_noise = fixture::routine_control_plane_noise_plus(&[
+        FrameKind::HostSettings,
+        FrameKind::BackendCapacity,
+        FrameKind::TeamPresetCatalogNotify,
+        FrameKind::WorkflowNotify,
+        FrameKind::AgentsViewPreferencesNotify,
+        FrameKind::AgentActivityStats,
+        FrameKind::TaskTokenUsage,
+        FrameKind::ProjectBootstrap,
+        FrameKind::ProjectGitStatus,
+        FrameKind::ProjectFileList,
+        FrameKind::CodeIntelOverview,
+        FrameKind::ProjectEvent,
+    ]);
+    fixture::next_frame_matching_strict_on(client, context, &allowed_noise, |env| {
+        env.kind == FrameKind::SessionList
+    })
+    .await
+    .parse_payload()
+    .expect("failed to parse SessionListPayload")
 }
 
 async fn expect_turn_text(client: &mut client::Connection, context: &str) -> String {
@@ -278,47 +143,6 @@ async fn expect_turn_text(client: &mut client::Connection, context: &str) -> Str
     let env = expect_next_event(client, &format!("{context}: TypingStatusChanged(false)")).await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     text
-}
-
-async fn wait_for_session_list(
-    client: &mut client::Connection,
-    context: &str,
-) -> protocol::SessionListPayload {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::AgentActivityStats
-                | FrameKind::TaskTokenUsage
-                | FrameKind::ProjectBootstrap
-                | FrameKind::ProjectGitStatus
-                | FrameKind::ProjectFileList
-                | FrameKind::CodeIntelOverview
-        ) {
-            continue;
-        }
-        if env.kind == FrameKind::SessionList {
-            return env.parse_payload().expect("parse SessionListPayload");
-        }
-    }
 }
 
 fn write_skill(store_dir: &Path, skill: &Skill, body: &str) {
@@ -413,7 +237,7 @@ fn sample_custom_agent(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let mut fixture = Fixture::new().await;
     let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
@@ -479,13 +303,32 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         })
         .await
         .expect("custom_agent_upsert built-in override failed");
-    let notified = expect_custom_agent_upsert_raw(
-        &mut fixture.client,
-        &orchestrator_id,
-        "edited built-in upsert",
-    )
-    .await;
-    assert_eq!(notified, edited);
+    let mut notified = None;
+    fixture
+        .next_frame_matching("edited built-in upsert", |env| {
+            if env.kind != FrameKind::CustomAgentNotify {
+                return false;
+            }
+            match env
+                .parse_payload::<CustomAgentNotifyPayload>()
+                .expect("parse CustomAgentNotifyPayload")
+            {
+                CustomAgentNotifyPayload::Upsert { custom_agent }
+                    if custom_agent.id == orchestrator_id =>
+                {
+                    notified = Some(custom_agent);
+                    true
+                }
+                CustomAgentNotifyPayload::Upsert { .. }
+                | CustomAgentNotifyPayload::Delete { .. } => false,
+            }
+        })
+        .await;
+    assert_eq!(
+        notified.expect("edited built-in upsert payload"),
+        edited,
+        "the built-in override must be notified verbatim"
+    );
 
     let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
@@ -496,7 +339,7 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn host_customization_upsert_delete_round_trip_and_notify() {
     let mut fixture = Fixture::new().await;
     let mcp_server = sample_mcp_server("docs", "docs-server");
@@ -655,7 +498,7 @@ async fn host_customization_upsert_delete_round_trip_and_notify() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn invalid_custom_agent_upsert_with_blank_description_keeps_connection_alive() {
     let mut fixture = Fixture::new().await;
     let custom_agent = CustomAgent {
@@ -694,7 +537,7 @@ async fn invalid_custom_agent_upsert_with_blank_description_keeps_connection_ali
     assert!(list.sessions.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deleting_referenced_mcp_server_keeps_connection_alive() {
     let mut fixture = Fixture::new().await;
     let mcp_server = sample_mcp_server("docs", "docs-server");
@@ -751,7 +594,7 @@ async fn deleting_referenced_mcp_server_keeps_connection_alive() {
     assert!(list.sessions.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn replay_order_replays_customization_before_agents() {
     let mut fixture = Fixture::new().await;
     ensure_dir("/tmp/custom-project");
@@ -851,7 +694,7 @@ async fn replay_order_replays_customization_before_agents() {
     assert_eq!(env.kind, FrameKind::AgentStart);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawn_with_custom_agent_resolves_expected_configuration() {
     let mut fixture = Fixture::new().await;
     ensure_dir("/tmp/spawn-project");
@@ -973,7 +816,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
     assert!(text.contains("[steering: project steering body\\n\\nhost steering body]"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     let mut fixture = Fixture::new().await;
     let mcp_server = sample_mcp_server("docs", "docs-server");
@@ -1045,7 +888,7 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     assert!(!text.contains("Check the visible UI state before reporting completion."));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn generated_name_isolates_configured_http_mcp_from_setup() {
     let mut fixture = Fixture::new().await;
     let mcp_server = sample_http_mcp_server(
@@ -1097,7 +940,7 @@ async fn generated_name_isolates_configured_http_mcp_from_setup() {
     assert!(text.contains("method-not-allowed(http)"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tool_policy_rejection_for_non_claude_backends() {
     let mut fixture = Fixture::new().await;
     let cases = vec![
@@ -1189,7 +1032,7 @@ async fn tool_policy_rejection_for_non_claude_backends() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn resume_re_resolves_deleted_custom_agent_with_warning() {
     let mut fixture = Fixture::new().await;
     let custom_agent = sample_custom_agent(
@@ -1239,7 +1082,11 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
         .list_sessions(protocol::ListSessionsPayload::default())
         .await
         .expect("list_sessions failed");
-    let session_list = wait_for_session_list(&mut fixture.client, "SessionList").await;
+    let session_list: protocol::SessionListPayload = fixture
+        .next_frame_matching("SessionList", |env| env.kind == FrameKind::SessionList)
+        .await
+        .parse_payload()
+        .expect("parse SessionListPayload");
     let session = session_list
         .sessions
         .first()
@@ -1301,7 +1148,7 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
     assert!(resumed_turn.contains("mock backend response to: after resume"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_mcp_name_returns_upsert_error() {
     let mut fixture = Fixture::new().await;
     let reserved_server = sample_mcp_server("debug-alias", "tyde-debug");
@@ -1323,7 +1170,7 @@ async fn reserved_mcp_name_returns_upsert_error() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn steering_ordering_combines_host_and_project_by_title() {
     let mut fixture = Fixture::new().await;
     ensure_dir("/tmp/ordering-project");

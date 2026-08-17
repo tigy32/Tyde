@@ -153,12 +153,11 @@ This is simpler than the old external-driver design because the server already
 has direct access to all agent state. No protocol connection bootstrapping, no
 snapshot derivation from events, no external process coordination.
 
-### `protocol`
+### `settings-model` and `protocol`
 
-`protocol` owns:
+`settings-model` owns `HostSettings.tyde_agent_control_mcp_enabled`; `protocol`
+owns the generic `SettingsWrite` transport used to update it.
 
-- `HostSettings.tyde_agent_control_mcp_enabled`
-- `HostSettingValue::TydeAgentControlMcpEnabled`
 
 ### `frontend/tauri-shell`
 
@@ -190,10 +189,14 @@ Default: **`true`**.
 Agent control is a core host capability. Agents should be able to orchestrate
 other agents by default. Users can disable it if they want to restrict that.
 
-The setting is toggled via `SetSetting` with a new `HostSettingValue` variant:
+The setting is toggled with a compare-and-swap `SettingsWrite` operation:
 
 ```rust
-TydeAgentControlMcpEnabled { enabled: bool }
+SettingOp::Replace {
+    path: "/tyde_agent_control_mcp_enabled".into(),
+    value: enabled.into(),
+    expected,
+}
 ```
 
 ---

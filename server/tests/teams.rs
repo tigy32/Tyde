@@ -1,23 +1,21 @@
 mod fixture;
 
-use std::time::Duration;
-
-use fixture::Fixture;
+use fixture::{Fixture, expect_settings_write_applied, expect_settings_write_result};
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentId, BackendKind,
     CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, HostSettingValue,
-    NewAgentPayload, Project, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload,
-    ProjectRootPath, SessionSettingValue, SessionSettingsPayload, SetSettingPayload, SpawnCostHint,
-    StreamPath, Team, TeamCreatePayload, TeamDeletePayload, TeamDraft,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftId,
-    TeamDraftMember, TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope,
-    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
-    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberPresetProfile, TeamMemberRole, TeamMemberState, TeamNotifyPayload,
-    TeamPersonalityPresetId, TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId,
-    TeamSetManagerPayload, TeamTemplateId, ToolPolicy, write_envelope,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, NewAgentPayload,
+    Project, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload, ProjectRootPath,
+    SessionSettingValue, SessionSettingsPayload, SpawnCostHint, StreamPath, Team,
+    TeamCreatePayload, TeamDeletePayload, TeamDraft, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftId, TeamDraftMember,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
+    TeamId, TeamMember, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberBindingPayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberPresetProfile,
+    TeamMemberRole, TeamMemberState, TeamNotifyPayload, TeamPersonalityPresetId,
+    TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId, TeamSetManagerPayload,
+    TeamTemplateId, ToolPolicy, write_envelope,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -70,87 +68,11 @@ for line in sys.stdin:
     binary
 }
 
-async fn next_env(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(10), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
-    }
-}
-
-async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = next_env(client, context).await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if env.kind == FrameKind::AgentBootstrap {
-            let payload: AgentBootstrapPayload =
-                env.parse_payload().expect("parse AgentBootstrapPayload");
-            if let Some(env) = payload.events.into_iter().find_map(|event| match event {
-                AgentBootstrapEvent::AgentStart(payload) => Some(
-                    Envelope::from_payload(
-                        env.stream.clone(),
-                        FrameKind::AgentStart,
-                        env.seq,
-                        &payload,
-                    )
-                    .expect("serialize AgentStart"),
-                ),
-                AgentBootstrapEvent::AgentError(payload) => Some(
-                    Envelope::from_payload(
-                        env.stream.clone(),
-                        FrameKind::AgentError,
-                        env.seq,
-                        &payload,
-                    )
-                    .expect("serialize AgentError"),
-                ),
-                AgentBootstrapEvent::ChatEvent(payload) => Some(
-                    Envelope::from_payload(
-                        env.stream.clone(),
-                        FrameKind::ChatEvent,
-                        env.seq,
-                        &payload,
-                    )
-                    .expect("serialize ChatEvent"),
-                ),
-                _ => None,
-            }) {
-                return env;
-            }
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::SessionList
-                | FrameKind::ProjectBootstrap
-                | FrameKind::ProjectFileList
-                | FrameKind::ProjectGitStatus
-                | FrameKind::CodeIntelOverview
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::AgentActivityStats
-        ) {
-            continue;
-        }
-        return env;
-    }
-}
-
 async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: &str) -> Envelope {
-    loop {
-        let env = expect_next_event(client, context).await;
-        if env.kind == kind {
-            return env;
-        }
-    }
+    fixture::next_frame_matching_on(client, context, |env| {
+        env.kind == kind && !fixture::is_builtin_team_custom_agent_notify(env)
+    })
+    .await
 }
 
 async fn expect_command_error(
@@ -285,21 +207,32 @@ async fn expect_session_settings_on_stream(
     stream: &StreamPath,
     context: &str,
 ) -> SessionSettingsPayload {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::AgentBootstrap && &env.stream == stream {
-            let payload: AgentBootstrapPayload =
-                env.parse_payload().expect("parse AgentBootstrapPayload");
-            for event in payload.events {
-                if let AgentBootstrapEvent::SessionSettings(payload) = event {
-                    return payload;
-                }
+    let mut found = None;
+    fixture::next_frame_matching_on(client, context, |env| {
+        if &env.stream != stream {
+            return false;
+        }
+        match env.kind {
+            FrameKind::SessionSettings => {
+                found = Some(env.parse_payload().expect("parse SessionSettingsPayload"));
+                true
             }
+            FrameKind::AgentBootstrap => {
+                let payload: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrapPayload");
+                for event in payload.events {
+                    if let AgentBootstrapEvent::SessionSettings(payload) = event {
+                        found = Some(payload);
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
-        if env.kind == FrameKind::SessionSettings && &env.stream == stream {
-            return env.parse_payload().expect("parse SessionSettingsPayload");
-        }
-    }
+    })
+    .await;
+    found.expect("matched session settings snapshot")
 }
 
 async fn expect_bound_team_member(
@@ -420,14 +353,26 @@ async fn upsert_custom_agent(client: &mut client::Connection, id: &str) -> Custo
 }
 
 async fn create_project(client: &mut client::Connection, name: &str) -> Project {
-    client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
-            },
-        })
+    let write_id = client
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude, BackendKind::Codex],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("set enabled backends failed");
+    let result = expect_settings_write_result(client, &write_id, "set enabled backends").await;
+    if !result.applied {
+        let retry_id = client
+            .replace_setting(
+                "/enabled_backends",
+                vec![BackendKind::Claude, BackendKind::Codex],
+                vec![BackendKind::Claude, BackendKind::Codex],
+            )
+            .await
+            .expect("retry enabled backends setting");
+        expect_settings_write_applied(client, &retry_id, "retry set enabled backends").await;
+    }
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
@@ -609,7 +554,7 @@ async fn send_raw_host_value(client: &mut client::Connection, kind: FrameKind, p
         .expect("write raw host envelope");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_creation_round_trip_and_replay_order() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "round-trip-agent").await;
@@ -660,7 +605,7 @@ async fn team_creation_round_trip_and_replay_order() {
     assert!(bootstrap.team_member_bindings.contains(&binding));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_preset_catalog_replays_before_team_state() {
     let fixture = Fixture::new().await;
     let catalog = &fixture.bootstrap.team_preset_catalog;
@@ -691,7 +636,7 @@ async fn team_preset_catalog_replays_before_team_state() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_draft_template_shuffle_and_commit_is_atomic() {
     let mut fixture = Fixture::new().await;
     let project = create_project(&mut fixture.client, "draft-commit-project").await;
@@ -859,7 +804,7 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_draft_commit_validation_keeps_draft_without_half_created_team() {
     let mut fixture = Fixture::new().await;
 
@@ -906,7 +851,7 @@ async fn team_draft_commit_validation_keeps_draft_without_half_created_team() {
     assert_eq!(replayed_draft.name, "Invalid Draft");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_draft_personality_update_preserves_edited_fields() {
     let mut fixture = Fixture::new().await;
 
@@ -978,7 +923,7 @@ async fn team_draft_personality_update_preserves_edited_fields() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn invalid_team_draft_mutation_preserves_draft_for_replay() {
     let mut fixture = Fixture::new().await;
 
@@ -1027,7 +972,7 @@ async fn invalid_team_draft_mutation_preserves_draft_for_replay() {
     assert_eq!(replayed_draft, draft);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_member_create_rejects_unknown_custom_agent() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "missing-custom-valid").await;
@@ -1059,6 +1004,9 @@ async fn team_member_create_rejects_unknown_custom_agent() {
     );
 }
 
+// Real time: this test runs the fake Codex model-probe program as a real
+// subprocess; paused time auto-advances past deadlines while waiting on
+// external process I/O.
 #[tokio::test]
 async fn team_create_allows_default_agent_with_backend_and_cost() {
     let probe_dir = tempfile::tempdir().expect("Codex probe tempdir");
@@ -1069,13 +1017,12 @@ async fn team_create_allows_default_agent_with_backend_and_cost() {
     })
     .await;
     let project = create_project(&mut fixture.client, "default-agent-project").await;
-    fixture
+    let write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::ComplexityTiersEnabled { enabled: true },
-        })
+        .replace_setting("/complexity_tiers_enabled", true, false)
         .await
         .expect("set complexity tiers failed");
+    expect_settings_write_applied(&mut fixture.client, &write_id, "set complexity tiers").await;
     let mut manager_spec = member_spec_with_profile(
         "manager",
         None,
@@ -1153,6 +1100,9 @@ async fn team_create_allows_default_agent_with_backend_and_cost() {
     );
 }
 
+// Real time: this test calls the agent-control MCP server over real loopback
+// HTTP (rmcp StreamableHttpClientTransport); paused time auto-advances past
+// deadlines while waiting on real socket I/O.
 #[tokio::test]
 async fn team_describe_includes_default_agent_member() {
     let mut fixture = Fixture::new().await;
@@ -1271,7 +1221,7 @@ async fn team_describe_includes_default_agent_member() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_member_create_rejects_missing_project() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "missing-project-agent").await;
@@ -1308,7 +1258,7 @@ async fn team_member_create_rejects_missing_project() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_member_create_allows_unassigned_project_ids() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "empty-projects-agent").await;
@@ -1357,7 +1307,7 @@ async fn team_member_create_allows_unassigned_project_ids() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_create_rejects_missing_inline_manager_payload() {
     let mut fixture = Fixture::new().await;
 
@@ -1379,7 +1329,7 @@ async fn team_create_rejects_missing_inline_manager_payload() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_set_manager_rejects_current_manager() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "current-manager-agent").await;
@@ -1411,7 +1361,7 @@ async fn team_set_manager_rejects_current_manager() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_set_manager_rejects_missing_target() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "missing-target-agent").await;
@@ -1437,7 +1387,7 @@ async fn team_set_manager_rejects_missing_target() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_set_manager_rejects_member_from_different_team() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "different-team-agent").await;
@@ -1484,7 +1434,7 @@ async fn team_set_manager_rejects_member_from_different_team() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_member_delete_rejects_active_manager() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "delete-manager-agent").await;
@@ -1508,7 +1458,7 @@ async fn team_member_delete_rejects_active_manager() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_delete_hard_removes_team_and_members() {
     let mut fixture = Fixture::new().await;
     let (_, _, team, manager, report) = create_team_with_report(&mut fixture, "hard-delete").await;
@@ -1565,7 +1515,7 @@ async fn team_delete_hard_removes_team_and_members() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn custom_agent_delete_rejects_active_team_member_reference() {
     let mut fixture = Fixture::new().await;
     let (custom_agent, _, _, _, _) = create_team_with_report(&mut fixture, "custom-delete").await;
@@ -1589,7 +1539,7 @@ async fn custom_agent_delete_rejects_active_team_member_reference() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn custom_agent_delete_succeeds_after_team_member_delete() {
     let mut fixture = Fixture::new().await;
     let (_manager_agent, report_agent, report) =
@@ -1629,7 +1579,7 @@ async fn custom_agent_delete_succeeds_after_team_member_delete() {
     let _fresh = fixture.connect_fresh_host().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn project_delete_unassigns_team_members_that_only_reference_it() {
     let mut fixture = Fixture::new().await;
     let (_, project, _, manager, report) =
@@ -1693,7 +1643,7 @@ async fn project_delete_unassigns_team_members_that_only_reference_it() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn project_delete_prunes_team_member_project_refs() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "project-delete-prune").await;
@@ -1771,7 +1721,7 @@ async fn project_delete_prunes_team_member_project_refs() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn manager_replacement_swaps_roles_atomically() {
     let mut fixture = Fixture::new().await;
     let (_, _, team, manager, report) = create_team_with_report(&mut fixture, "manager-swap").await;
@@ -1813,7 +1763,7 @@ async fn manager_replacement_swaps_roles_atomically() {
     assert_eq!(binding.member_id, deleted.id);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn replay_order_pins_dependencies_before_teams() {
     let mut fixture = Fixture::new().await;
     let (custom_agent, project, team, manager, report) =
@@ -1863,7 +1813,7 @@ async fn expect_team_member_shuffle_suggestion(
         .expect("parse TeamMemberShuffleSuggestionNotify")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_member_shuffle_emits_server_owned_suggestion() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "shuffle-team-agent").await;
@@ -1919,7 +1869,7 @@ async fn team_member_shuffle_emits_server_owned_suggestion() {
     assert_eq!(err.operation, "team_member_shuffle");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn team_draft_replace_member_preserves_server_owned_profile() {
     let mut fixture = Fixture::new().await;
 
@@ -1980,7 +1930,7 @@ async fn team_draft_replace_member_preserves_server_owned_profile() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn custom_agent_delete_rejected_for_builtin_role_preset_default() {
     let mut fixture = Fixture::new().await;
     assert!(

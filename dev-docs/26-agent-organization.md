@@ -1129,7 +1129,7 @@ Wasm/component tests:
 - Additive bootstrap/snapshot fields must use `#[serde(default)]`, even with a
   protocol bump, because tests and staged implementation frequently construct
   partial payloads.
-- Do not reuse `SetSetting` / `HostSettings` for Agents view preferences,
+- Do not reuse host `SettingsWrite` / `HostSettings` for Agents view preferences,
   Smart Views, tags, or pins. This is client-global Agents-view state, not host
   runtime settings.
 - Do not send Smart View, tag, or pin mutations over agent streams. They are

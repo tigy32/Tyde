@@ -1,18 +1,20 @@
+use settings_model::HostBootstrapPayload;
 use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
     BackendAccessMode, BackendKind, CommandErrorCode, CommandErrorPayload, FrameKind,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseStartPayload, HostLaunchProfileConfig,
-    HostSettingValue, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, LaunchProfileKind, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
-    ReviewSummaryScope, SessionId, SessionListPageStatus, SessionListPayload,
-    SessionSchemasPayload, SessionSettingValue, SessionSettingsValues, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
+    HostBrowseInitial, HostBrowseStartPayload, LaunchProfileCatalog, LaunchProfileCatalogPayload,
+    LaunchProfileEntry, LaunchProfileId, LaunchProfileKind, NewAgentPayload,
+    ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope, SessionId, SessionListPageStatus,
+    SessionListPayload, SessionSchemasPayload, SessionSettingValue, SessionSettingsValues,
+    SettingsWriteResultPayload, SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload,
+    TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
 use server::store::session::SessionStore;
+use settings_model::HostLaunchProfileConfig;
 
 async fn connect_raw(host: server::HostHandle) -> client::Connection {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
@@ -212,21 +214,25 @@ fn write_host_settings_with_launch_profiles(
     default_backend: Option<BackendKind>,
     launch_profiles: Vec<HostLaunchProfileConfig>,
 ) {
-    let settings = protocol::HostSettings {
+    let settings = settings_model::HostSettings {
         enabled_backends: backends.to_vec(),
         default_backend,
         enable_mobile_connections: false,
         mobile_broker_url: None,
+        mobile_broker_auth: Default::default(),
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
-        tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+        tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         supervisor: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
-        launch_profiles,
+        launch_profiles: launch_profiles
+            .into_iter()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect(),
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
     };
@@ -917,23 +923,34 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
         "model".to_owned(),
         SessionSettingValue::String("haiku".to_owned()),
     );
+    let profile = HostLaunchProfileConfig {
+        id: LaunchProfileId("claude:haiku".to_owned()),
+        label: "Claude Haiku".to_owned(),
+        description: Some("Launch Claude with Haiku.".to_owned()),
+        backend_kind: BackendKind::Claude,
+        session_settings: profile_settings,
+        acp: None,
+    };
     write_host_settings_with_launch_profiles(
         &settings_path,
         &[BackendKind::Claude, BackendKind::Codex],
         Some(BackendKind::Claude),
-        vec![HostLaunchProfileConfig {
-            id: LaunchProfileId("claude:haiku".to_owned()),
-            label: "Claude Haiku".to_owned(),
-            description: Some("Launch Claude with Haiku.".to_owned()),
-            backend_kind: BackendKind::Claude,
-            session_settings: profile_settings,
-            acp: None,
-        }],
+        vec![profile.clone()],
     );
+    let mut legacy: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&settings_path).expect("read keyed settings fixture"),
+    )
+    .expect("parse keyed settings fixture");
+    legacy["settings"]["launch_profiles"] = serde_json::json!([profile]);
+    std::fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&legacy).expect("serialize legacy launch profile array"),
+    )
+    .expect("write legacy launch profile array");
     let host = server::spawn_host_with_mock_backend(
         dir.path().join("sessions.json"),
         dir.path().join("projects.json"),
-        settings_path,
+        settings_path.clone(),
     )
     .expect("spawn host");
     let mut client = connect_raw(host).await;
@@ -965,6 +982,39 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
         launch_profile_entry(&bootstrap.launch_profile_catalog, "claude:haiku").kind(),
         LaunchProfileKind::Custom
     );
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).expect("read migrated settings"))
+            .expect("parse migrated settings");
+    assert!(
+        migrated["settings"]["launch_profiles"]
+            .as_object()
+            .is_some_and(|profiles| profiles.contains_key("claude:haiku")),
+        "legacy launch profile arrays must migrate to keyed resources: {migrated:?}"
+    );
+
+    let duplicate_dir = tempfile::tempdir().expect("duplicate tempdir");
+    let duplicate_path = duplicate_dir.path().join("settings.json");
+    let profile = migrated["settings"]["launch_profiles"]["claude:haiku"].clone();
+    let mut duplicate = migrated;
+    duplicate["settings"]["launch_profiles"] =
+        serde_json::Value::Array(vec![profile.clone(), profile]);
+    std::fs::write(
+        &duplicate_path,
+        serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate legacy profiles"),
+    )
+    .expect("write duplicate legacy profiles");
+    let error = match server::spawn_host_with_mock_backend(
+        duplicate_dir.path().join("sessions.json"),
+        duplicate_dir.path().join("projects.json"),
+        duplicate_path,
+    ) {
+        Ok(_) => panic!("duplicate legacy launch profile ids must fail host startup"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("duplicate launch profile id claude:haiku"),
+        "migration failure must identify the duplicate resource: {error}"
+    );
 }
 
 #[tokio::test]
@@ -984,11 +1034,11 @@ async fn enabled_backend_change_emits_deduped_launch_profile_catalog() {
     assert_eq!(bootstrap_env.kind, FrameKind::HostBootstrap);
 
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude, BackendKind::Codex],
+            vec![BackendKind::Claude],
+        )
         .await
         .expect("set enabled backends");
 
@@ -1215,37 +1265,39 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
         "reasoning_effort".to_owned(),
         SessionSettingValue::String("max".to_owned()),
     );
-    client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendTiers {
-                backend: BackendKind::Codex,
-                config: protocol::BackendTierConfig {
-                    low: invalid_low,
-                    high: SessionSettingsValues::default(),
-                },
-            },
-        })
+    let invalid_config = settings_model::BackendTierConfig {
+        low: invalid_low,
+        high: SessionSettingsValues::default(),
+    };
+    let write_id = client
+        .replace_setting(
+            "/backend_tier_configs/codex",
+            &invalid_config,
+            serde_json::Value::Null,
+        )
         .await
         .expect("write invalid Codex tier config");
     let tier_error = next_kind(
         &mut client,
-        FrameKind::CommandError,
-        "invalid Codex tier CommandError",
+        FrameKind::SettingsWriteResult,
+        "invalid Codex tier SettingsWriteResult",
     )
     .await
-    .parse_payload::<CommandErrorPayload>()
-    .expect("parse invalid Codex tier CommandError");
-    assert_eq!(tier_error.code, CommandErrorCode::InvalidInput);
-    assert!(tier_error.message.contains("invalid Low tier"));
-    assert!(tier_error.message.contains("reasoning_effort"));
-    assert!(tier_error.message.contains("max"));
+    .parse_payload::<SettingsWriteResultPayload>()
+    .expect("parse invalid Codex tier SettingsWriteResult");
+    assert_eq!(tier_error.write_id, write_id);
+    assert!(!tier_error.applied);
+    let tier_message = &tier_error.field_errors[0].message;
+    assert!(tier_message.contains("invalid Low tier"));
+    assert!(tier_message.contains("reasoning_effort"));
+    assert!(tier_message.contains("max"));
 
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Codex],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Codex],
+            vec![BackendKind::Codex],
+        )
         .await
         .expect("refresh Codex session schema");
 
@@ -1313,11 +1365,11 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
     ));
 
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Codex],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Codex],
+            vec![BackendKind::Codex],
+        )
         .await
         .expect("refresh failing Codex session schema");
 
@@ -1380,11 +1432,11 @@ async fn changed_session_schemas_still_emit_live_after_host_bootstrap() {
     );
 
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude, BackendKind::Codex],
+            vec![BackendKind::Claude],
+        )
         .await
         .expect("set enabled backends");
 
@@ -1419,7 +1471,7 @@ async fn claude_xhigh_tier_round_trips_and_invalid_effort_preserves_state() {
         "effort".to_owned(),
         SessionSettingValue::String("xhigh".to_owned()),
     );
-    let expected_config = protocol::BackendTierConfig {
+    let expected_config = settings_model::BackendTierConfig {
         low: SessionSettingsValues::default(),
         high: xhigh.clone(),
     };
@@ -1434,13 +1486,12 @@ async fn claude_xhigh_tier_round_trips_and_invalid_effort_preserves_state() {
         let mut client = connect_raw(host).await;
         let _ = next_env(&mut client, "initial host bootstrap").await;
 
-        client
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::BackendTiers {
-                    backend: BackendKind::Claude,
-                    config: expected_config.clone(),
-                },
-            })
+        let saved_write_id = client
+            .replace_setting(
+                "/backend_tier_configs/claude",
+                &expected_config,
+                serde_json::Value::Null,
+            )
             .await
             .expect("save Claude xhigh tier");
         let saved = next_kind(
@@ -1449,7 +1500,7 @@ async fn claude_xhigh_tier_round_trips_and_invalid_effort_preserves_state() {
             "Claude xhigh HostSettings",
         )
         .await
-        .parse_payload::<protocol::HostSettingsPayload>()
+        .parse_payload::<settings_model::HostSettingsPayload>()
         .expect("parse Claude xhigh HostSettings");
         assert_eq!(
             saved
@@ -1465,35 +1516,46 @@ async fn claude_xhigh_tier_round_trips_and_invalid_effort_preserves_state() {
                 .get("effort"),
             Some(&SessionSettingValue::String("xhigh".to_owned()))
         );
+        let saved_result = next_kind(
+            &mut client,
+            FrameKind::SettingsWriteResult,
+            "Claude xhigh SettingsWriteResult",
+        )
+        .await
+        .parse_payload::<SettingsWriteResultPayload>()
+        .expect("parse Claude xhigh SettingsWriteResult");
+        assert_eq!(saved_result.write_id, saved_write_id);
+        assert!(saved_result.applied, "{:?}", saved_result.field_errors);
 
         let mut ultra = SessionSettingsValues::default();
         ultra.0.insert(
             "effort".to_owned(),
             SessionSettingValue::String("ultra".to_owned()),
         );
-        client
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::BackendTiers {
-                    backend: BackendKind::Claude,
-                    config: protocol::BackendTierConfig {
-                        low: SessionSettingsValues::default(),
-                        high: ultra,
-                    },
-                },
-            })
+        let invalid_config = settings_model::BackendTierConfig {
+            low: SessionSettingsValues::default(),
+            high: ultra,
+        };
+        let write_id = client
+            .replace_setting(
+                "/backend_tier_configs/claude",
+                &invalid_config,
+                &expected_config,
+            )
             .await
             .expect("send invalid Claude tier");
         let error = next_kind(
             &mut client,
-            FrameKind::CommandError,
-            "invalid Claude effort CommandError",
+            FrameKind::SettingsWriteResult,
+            "invalid Claude effort SettingsWriteResult",
         )
         .await
-        .parse_payload::<CommandErrorPayload>()
-        .expect("parse invalid Claude effort CommandError");
-        assert_eq!(error.code, CommandErrorCode::InvalidInput);
-        assert!(error.message.contains("effort"));
-        assert!(error.message.contains("ultra"));
+        .parse_payload::<SettingsWriteResultPayload>()
+        .expect("parse invalid Claude effort SettingsWriteResult");
+        assert_eq!(error.write_id, write_id);
+        assert!(!error.applied);
+        assert!(error.field_errors[0].message.contains("effort"));
+        assert!(error.field_errors[0].message.contains("ultra"));
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         loop {

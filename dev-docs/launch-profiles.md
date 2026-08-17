@@ -43,8 +43,8 @@ Every enabled backend gets a default profile:
 
 Only enabled backends appear in the catalog.
 
-Most additional named profiles come from explicit host settings
-(`HostSettings.launch_profiles` / `HostSettingValue::LaunchProfiles`). They
+Most additional named profiles come from the keyed
+`HostSettings.launch_profiles` map. They
 are server-owned, typed presets over `SessionSettingsValues`, and the server
 validates them against the backend session schema before marking them ready.
 If their backend is disabled they do not appear; if their settings are invalid

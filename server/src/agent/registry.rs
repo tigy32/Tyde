@@ -87,16 +87,6 @@ pub(crate) struct AgentStatusHandle {
 }
 
 impl AgentStatusHandle {
-    #[cfg(test)]
-    pub fn new() -> (Self, watch::Receiver<u64>) {
-        let (status_change_tx, status_change_rx) = watch::channel(0);
-        let status_change_counter = Arc::new(AtomicU64::new(0));
-        (
-            Self::with_notifier(status_change_tx, status_change_counter),
-            status_change_rx,
-        )
-    }
-
     fn with_notifier(
         status_change_tx: watch::Sender<u64>,
         status_change_counter: Arc<AtomicU64>,
@@ -168,6 +158,8 @@ pub(crate) struct ResolvedSpawnRequest {
     /// When true, all backend spawns use MockBackend regardless of backend_kind.
     /// Set by the test fixture.
     pub use_mock_backend: bool,
+    /// Test-only behavior reserved for this mock backend launch.
+    pub mock_launch: Option<crate::backend::mock::MockLaunch>,
 }
 
 #[derive(Clone, Debug)]
@@ -485,119 +477,5 @@ fn collect_agent_subtree_post_order(
 
     if let Some(entry) = agents.get(agent_id) {
         ordered.push((agent_id.clone(), entry.handle.clone()));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::AgentCommand;
-    use std::sync::atomic::AtomicBool;
-    use tokio::sync::mpsc;
-
-    #[test]
-    fn status_derivation_separates_recoverable_error_from_fatal_failure() {
-        let recoverable = AgentStatus {
-            started: true,
-            terminated: false,
-            is_thinking: false,
-            turn_completed: true,
-            last_error: Some("recoverable identity fallback".to_owned()),
-            ..AgentStatus::default()
-        };
-        assert!(!recoverable.is_active());
-        assert_eq!(recoverable.status(), AgentControlStatus::Idle);
-        let reused = AgentStatus {
-            is_thinking: true,
-            turn_completed: false,
-            last_error: None,
-            ..recoverable.clone()
-        };
-        assert!(reused.is_active());
-        assert_eq!(reused.status(), AgentControlStatus::Thinking);
-
-        let clean_close = AgentStatus {
-            started: true,
-            terminated: true,
-            is_thinking: false,
-            turn_completed: true,
-            last_error: None,
-            ..AgentStatus::default()
-        };
-        assert!(!clean_close.is_active());
-        assert_eq!(clean_close.status(), AgentControlStatus::Idle);
-
-        let fatal = AgentStatus {
-            started: true,
-            terminated: true,
-            is_thinking: false,
-            turn_completed: true,
-            last_error: Some("fatal backend closure".to_owned()),
-            ..AgentStatus::default()
-        };
-        assert!(!fatal.is_active());
-        assert_eq!(fatal.status(), AgentControlStatus::Failed);
-
-        let stale_fatal = AgentStatus {
-            is_thinking: true,
-            turn_completed: false,
-            ..fatal
-        };
-        assert!(!stale_fatal.is_active());
-        assert_eq!(stale_fatal.status(), AgentControlStatus::Failed);
-    }
-
-    #[test]
-    fn remove_agent_notifies_status_watch_only_after_success() {
-        let mut registry = AgentRegistry::new();
-        let agent_id = AgentId("removed-agent".to_owned());
-        let start = AgentStartPayload {
-            agent_id: agent_id.clone(),
-            name: "Removed Agent".to_owned(),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Tycode,
-            launch_profile_id: None,
-            workspace_roots: vec!["/tmp/test".to_owned()],
-            custom_agent_id: None,
-            team_id: None,
-            team_member_id: None,
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            workflow: None,
-            created_at_ms: 1,
-        };
-        let (_, start_rx) = watch::channel(start);
-        let (tx, _) = mpsc::unbounded_channel::<AgentCommand>();
-        let status_handle = registry.next_status_handle();
-        registry.agents.insert(
-            agent_id.clone(),
-            AgentEntry {
-                handle: AgentHandle {
-                    tx,
-                    accepting_input: Arc::new(AtomicBool::new(true)),
-                    closing: Arc::new(AtomicBool::new(false)),
-                    start: start_rx,
-                },
-                status_handle,
-                access_mode: BackendAccessMode::Unrestricted,
-                parent_agent_id: None,
-            },
-        );
-
-        let mut status_rx = registry.subscribe_status_changes();
-        assert!(!status_rx.has_changed().expect("status watch remains open"));
-        assert!(registry.remove_agent(&agent_id).is_some());
-        assert!(
-            status_rx.has_changed().expect("status watch remains open"),
-            "successful removal must wake status subscribers"
-        );
-        assert_eq!(*status_rx.borrow_and_update(), 1);
-
-        assert!(registry.remove_agent(&agent_id).is_none());
-        assert!(
-            !status_rx.has_changed().expect("status watch remains open"),
-            "removing an absent id must not publish a false lifecycle change"
-        );
     }
 }

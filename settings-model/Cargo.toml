@@ -1,0 +1,11 @@
+[package]
+name = "settings-model"
+edition.workspace = true
+
+[dependencies]
+hmac = "0.12"
+protocol = { path = "../protocol", default-features = false }
+schemars = "1.2.1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

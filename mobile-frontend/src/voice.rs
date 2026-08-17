@@ -899,7 +899,7 @@ mod wasm_tests {
                 protocol::VoiceCapabilitiesPayload::for_connection(true, false),
             );
         });
-        let mut settings = protocol::HostSettings::default();
+        let mut settings = settings_model::HostSettings::default();
         settings.voice.enabled = true;
         state.host_settings_by_host.update(|map| {
             map.insert(host.clone(), settings);
@@ -962,7 +962,7 @@ mod wasm_tests {
                 protocol::VoiceCapabilitiesPayload::for_connection(true, false),
             );
         });
-        let mut settings = protocol::HostSettings::default();
+        let mut settings = settings_model::HostSettings::default();
         settings.voice.enabled = true;
         state.host_settings_by_host.update(|map| {
             map.insert(host.clone(), settings);

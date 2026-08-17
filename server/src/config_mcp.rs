@@ -14,9 +14,9 @@ use std::net::SocketAddr;
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
     BackendKind, CodeIntelProviderId, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentUpsertPayload, HostExecutablePath, HostSettingValue, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, McpTransportConfig,
-    SetSettingPayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
+    CustomAgentUpsertPayload, McpServerConfig, McpServerDeletePayload, McpServerId,
+    McpServerUpsertPayload, McpTransportConfig, SettingExpectation, SettingOp, SettingsWriteId,
+    SettingsWritePayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -37,6 +37,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use settings_model::HostExecutablePath;
 use uuid::Uuid;
 
 use crate::backend::setup;
@@ -116,35 +117,64 @@ enum SettingInput {
     },
 }
 
-impl From<SettingInput> for HostSettingValue {
-    fn from(value: SettingInput) -> Self {
-        match value {
-            SettingInput::EnabledBackends { enabled_backends } => Self::EnabledBackends {
-                enabled_backends: enabled_backends.into_iter().map(Into::into).collect(),
+impl SettingInput {
+    fn into_op(self, current: &settings_model::HostSettings) -> Result<SettingOp, String> {
+        let doc = serde_json::to_value(current).map_err(|error| error.to_string())?;
+        let (path, value) = match self {
+            Self::EnabledBackends { enabled_backends } => (
+                "/enabled_backends".to_owned(),
+                Some(json!(
+                    enabled_backends
+                        .into_iter()
+                        .map(BackendKind::from)
+                        .collect::<Vec<_>>()
+                )),
+            ),
+            Self::DefaultBackend { default_backend } => (
+                "/default_backend".to_owned(),
+                Some(json!(default_backend.map(BackendKind::from))),
+            ),
+            Self::ComplexityTiersEnabled { enabled } => {
+                ("/complexity_tiers_enabled".to_owned(), Some(json!(enabled)))
+            }
+            Self::TydeDebugMcpEnabled { enabled } => {
+                ("/tyde_debug_mcp_enabled".to_owned(), Some(json!(enabled)))
+            }
+            Self::TydeAgentControlMcpEnabled { enabled } => (
+                "/tyde_agent_control_mcp_enabled".to_owned(),
+                Some(json!(enabled)),
+            ),
+            Self::TydeAgentControlMaxDepth { depth } => (
+                "/tyde_agent_control_max_depth".to_owned(),
+                Some(json!(depth)),
+            ),
+            Self::EnableMobileConnections { enabled } => (
+                "/enable_mobile_connections".to_owned(),
+                Some(json!(enabled)),
+            ),
+            Self::CodeIntelLanguageServerPath { provider, path } => (
+                format!(
+                    "/code_intel/language_server_paths/{}",
+                    settings_model::escape_pointer_token(&CodeIntelProviderId(provider).0)
+                ),
+                path.map(HostExecutablePath).map(|path| json!(path)),
+            ),
+        };
+        let tokens = protocol::parse_json_pointer(&path)
+            .ok_or_else(|| format!("invalid generated settings path {path}"))?;
+        let expected = SettingExpectation::Value {
+            value: settings_model::pointer_get(&doc, &tokens)
+                .cloned()
+                .unwrap_or(Value::Null),
+        };
+        Ok(match value {
+            Some(value) => SettingOp::Replace {
+                path,
+                value,
+                expected,
             },
-            SettingInput::DefaultBackend { default_backend } => Self::DefaultBackend {
-                default_backend: default_backend.map(Into::into),
-            },
-            SettingInput::ComplexityTiersEnabled { enabled } => {
-                Self::ComplexityTiersEnabled { enabled }
-            }
-            SettingInput::TydeDebugMcpEnabled { enabled } => Self::TydeDebugMcpEnabled { enabled },
-            SettingInput::TydeAgentControlMcpEnabled { enabled } => {
-                Self::TydeAgentControlMcpEnabled { enabled }
-            }
-            SettingInput::TydeAgentControlMaxDepth { depth } => {
-                Self::TydeAgentControlMaxDepth { depth }
-            }
-            SettingInput::EnableMobileConnections { enabled } => {
-                Self::EnableMobileConnections { enabled }
-            }
-            SettingInput::CodeIntelLanguageServerPath { provider, path } => {
-                Self::CodeIntelLanguageServerPath {
-                    provider: CodeIntelProviderId(provider),
-                    path: path.map(HostExecutablePath),
-                }
-            }
-        }
+            None => SettingOp::Remove { path, expected },
+        })
     }
 }
 
@@ -154,7 +184,7 @@ struct EmptyToolInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SetSettingToolInput {
+struct SettingsWriteToolInput {
     setting: SettingInput,
 }
 
@@ -279,7 +309,9 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
-fn backend_status_acp_agents(settings: &protocol::HostSettings) -> Vec<setup::ConfiguredAcpAgent> {
+fn backend_status_acp_agents(
+    settings: &settings_model::HostSettings,
+) -> Vec<setup::ConfiguredAcpAgent> {
     crate::host::configured_acp_setup_agents(settings)
 }
 
@@ -304,7 +336,7 @@ async fn backend_status_with<ReadSettings, ReadFuture, CollectSetup, CollectFutu
 ) -> Result<Vec<Value>, String>
 where
     ReadSettings: FnOnce() -> ReadFuture,
-    ReadFuture: Future<Output = Result<protocol::HostSettings, String>>,
+    ReadFuture: Future<Output = Result<settings_model::HostSettings, String>>,
     CollectSetup: FnOnce(Vec<setup::ConfiguredAcpAgent>) -> CollectFuture,
     CollectFuture: Future<Output = protocol::BackendSetupPayload>,
 {
@@ -332,20 +364,36 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_set_setting(
         &self,
-        Parameters(input): Parameters<SetSettingToolInput>,
+        Parameters(input): Parameters<SettingsWriteToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let result = self
-            .host
-            .set_setting(SetSettingPayload {
-                setting: input.setting.into(),
-            })
-            .await;
+        let result = async {
+            let current = self.host.read_settings().await?;
+            let op = input.setting.into_op(&current)?;
+            let result = self
+                .host
+                .settings_write_for_internal_caller(SettingsWritePayload {
+                    write_id: SettingsWriteId(format!("config-mcp-{}", Uuid::new_v4())),
+                    ops: vec![op],
+                })
+                .await
+                .map_err(|error| error.message)?;
+            if !result.applied {
+                return Err(result
+                    .field_errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; "));
+            }
+            Ok(())
+        }
+        .await;
         match result {
             Ok(()) => match self.host.read_settings().await {
                 Ok(settings) => ok_json(settings),
                 Err(err) => Ok(err_text(err)),
             },
-            Err(err) => Ok(err_text(err.message)),
+            Err(err) => Ok(err_text(err)),
         }
     }
 
@@ -702,152 +750,4 @@ pub fn start_server(
     Ok(ConfigMcpHandle {
         url: format!("http://{local_addr}/mcp"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn acp_profile(id: &str, label: &str, command: &str) -> protocol::HostLaunchProfileConfig {
-        protocol::HostLaunchProfileConfig {
-            id: protocol::LaunchProfileId(id.to_owned()),
-            label: label.to_owned(),
-            description: None,
-            backend_kind: BackendKind::Acp,
-            session_settings: protocol::SessionSettingsValues::default(),
-            acp: Some(protocol::AcpAgentSpec {
-                command: command.to_owned(),
-                args: Vec::new(),
-                cwd: None,
-                env: Default::default(),
-                adapter: protocol::AcpAdapterId::Stock,
-            }),
-        }
-    }
-
-    #[test]
-    fn tool_list_includes_skill_and_mcp_mutations() {
-        let dir = tempfile::tempdir().expect("create temp host dir");
-        let host = crate::host::spawn_host_with_mock_backend(
-            dir.path().join("sessions.json"),
-            dir.path().join("projects.json"),
-            dir.path().join("settings.json"),
-        )
-        .expect("spawn mock host");
-        let server = TydeConfigMcpServer::new(host);
-        let tool_names = server
-            .tool_router
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<std::collections::HashSet<_>>();
-
-        for name in [
-            "tyde_config_refresh_skills",
-            "tyde_config_upsert_skill",
-            "tyde_config_delete_skill",
-            "tyde_config_upsert_mcp_server",
-            "tyde_config_delete_mcp_server",
-        ] {
-            assert!(tool_names.contains(name), "missing config MCP tool {name}");
-        }
-    }
-
-    #[test]
-    fn backend_status_derives_configured_acp_agents_from_settings() {
-        let mut settings = crate::store::settings::empty_settings_for_test();
-        settings.launch_profiles = vec![
-            acp_profile("acp:qa", "QA Stock", "/opt/qa-stock"),
-            protocol::HostLaunchProfileConfig {
-                backend_kind: BackendKind::Claude,
-                acp: None,
-                ..acp_profile("claude:custom", "Claude Custom", "")
-            },
-        ];
-
-        let agents = backend_status_acp_agents(&settings);
-
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].label, "Kiro (ACP)");
-        assert_eq!(agents[0].command, "");
-        assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
-        assert_eq!(agents[1].label, "QA Stock");
-        assert_eq!(agents[1].command, "/opt/qa-stock");
-        assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
-    }
-
-    #[test]
-    fn backend_status_response_shape_remains_stable() {
-        let payload = protocol::BackendSetupPayload {
-            backends: vec![protocol::BackendSetupInfo {
-                backend_kind: BackendKind::Acp,
-                status: protocol::BackendSetupStatus::Installed,
-                installed_version: Some("qa-acp 1.0".to_owned()),
-                docs_url: "https://example.test/acp".to_owned(),
-                install_command: None,
-                diagnostic: Some(protocol::BackendSetupDiagnostic {
-                    code: protocol::BackendSetupDiagnosticCode::CommandFailed,
-                    message: "another profile failed".to_owned(),
-                }),
-                sign_in_command: None,
-            }],
-        };
-
-        assert_eq!(
-            backend_status_response(&payload),
-            vec![json!({
-                "backend_kind": "acp",
-                "status": "installed",
-                "installed_version": "qa-acp 1.0",
-                "docs_url": "https://example.test/acp",
-            })],
-            "the configured-agent fix must not expand the MCP response contract"
-        );
-    }
-
-    #[tokio::test]
-    async fn backend_status_handler_seam_passes_configured_agents() {
-        let mut settings = crate::store::settings::empty_settings_for_test();
-        settings.launch_profiles = vec![acp_profile("acp:qa", "QA Stock", "/opt/qa-stock")];
-
-        let response = backend_status_with(
-            || std::future::ready(Ok(settings)),
-            |agents| {
-                assert_eq!(agents.len(), 2, "configured agents must not become &[]");
-                assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
-                assert_eq!(agents[1].label, "QA Stock");
-                assert_eq!(agents[1].command, "/opt/qa-stock");
-                assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
-                std::future::ready(protocol::BackendSetupPayload {
-                    backends: Vec::new(),
-                })
-            },
-        )
-        .await
-        .expect("backend status");
-
-        assert!(response.is_empty());
-    }
-
-    #[tokio::test]
-    async fn backend_status_handler_seam_stops_on_settings_failure() {
-        let collector_called = std::cell::Cell::new(false);
-
-        let result = backend_status_with(
-            || std::future::ready(Err("settings unavailable".to_owned())),
-            |_| {
-                collector_called.set(true);
-                std::future::ready(protocol::BackendSetupPayload {
-                    backends: Vec::new(),
-                })
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err("settings unavailable".to_owned()));
-        assert!(
-            !collector_called.get(),
-            "setup collection must not run after settings read failure"
-        );
-    }
 }

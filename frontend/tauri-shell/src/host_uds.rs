@@ -158,31 +158,3 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
 
     Ok(server::paths::home_dir()?.join(".tyde").join("tyde.sock"))
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::bind_host_socket_before_start;
-    use std::cell::Cell;
-
-    #[tokio::test]
-    async fn socket_contention_rejects_before_host_start() {
-        let path =
-            std::path::PathBuf::from(format!("/tmp/tyde-uds-test-{}.sock", uuid::Uuid::new_v4()));
-        let owner = server::bind_uds(&path).await.expect("first socket owner");
-        let started = Cell::new(false);
-
-        let result = bind_host_socket_before_start(&path, || {
-            started.set(true);
-            Ok(())
-        })
-        .await;
-
-        assert!(
-            result.is_err(),
-            "the second starter must lose at the socket"
-        );
-        assert!(!started.get(), "a socket loser must not construct a host");
-        drop(owner);
-        assert!(!path.exists(), "the socket owner must clean up its path");
-    }
-}

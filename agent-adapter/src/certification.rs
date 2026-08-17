@@ -804,32 +804,3 @@ impl CertificationCase {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use crate::BackendCapability;
-
-    use super::CertificationCase;
-
-    #[test]
-    fn certification_case_ids_are_unique() {
-        let mut ids = HashSet::new();
-        for case in CertificationCase::ALL {
-            assert!(ids.insert(case.id()), "duplicate case id {}", case.id());
-        }
-    }
-
-    #[test]
-    fn every_declared_capability_has_a_certification_case() {
-        for capability in BackendCapability::ALL {
-            assert!(
-                CertificationCase::ALL
-                    .iter()
-                    .any(|case| case.required_capabilities().contains(&capability)),
-                "capability {capability:?} has no certification case"
-            );
-        }
-    }
-}

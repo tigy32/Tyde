@@ -1,99 +1,76 @@
 mod fixture;
 
+use settings_model::HostSettingsPayload;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{Fixture, expect_settings_write_applied};
 use protocol::BackendKind;
 use protocol::{
     CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelLanguageId,
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelProviderId,
     CodeIntelProviderStatus, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
-    CodeIntelSubscribeFilePayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue,
-    HostSettingsPayload, Project, ProjectCreatePayload, ProjectFileVersion, ProjectId,
-    ProjectNotifyPayload, ProjectPath, ProjectRootPath, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, write_envelope,
+    CodeIntelSubscribeFilePayload, Envelope, FrameKind, Project, ProjectCreatePayload,
+    ProjectFileVersion, ProjectId, ProjectNotifyPayload, ProjectPath, ProjectRootPath,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
 };
+use settings_model::HostExecutablePath;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionList
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::ProjectEvent
-        ) {
-            continue;
-        }
-        return env;
-    }
+fn is_control_plane_noise(env: &Envelope) -> bool {
+    matches!(
+        env.kind,
+        FrameKind::HostSettings
+            | FrameKind::BackendCapacity
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::TaskTokenUsage
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::ProjectEvent
+    )
+}
+
+/// Noise that does not hide reordered project lifecycle frames.
+fn project_wait_allowed_noise() -> Vec<FrameKind> {
+    fixture::routine_control_plane_noise_plus(&[
+        FrameKind::HostSettings,
+        FrameKind::BackendCapacity,
+        FrameKind::TeamPresetCatalogNotify,
+        FrameKind::SessionList,
+        FrameKind::TaskTokenUsage,
+        FrameKind::WorkflowNotify,
+        FrameKind::AgentsViewPreferencesNotify,
+        FrameKind::ProjectEvent,
+        FrameKind::ProjectFileList,
+        FrameKind::ProjectGitStatus,
+        FrameKind::CodeIntelOverview,
+    ])
 }
 
 async fn expect_project_notify(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectNotifyPayload {
-    loop {
-        let env = expect_next_event(client, context).await;
-        if env.kind == FrameKind::ProjectNotify {
-            return env
-                .parse_payload()
-                .expect("failed to parse ProjectNotifyPayload");
-        }
-        if matches!(
-            env.kind,
-            FrameKind::ProjectFileList
-                | FrameKind::ProjectGitStatus
-                | FrameKind::CodeIntelOverview
-                | FrameKind::TaskTokenUsage
-        ) {
-            continue;
-        }
-        assert_eq!(env.kind, FrameKind::ProjectNotify);
-    }
+    let allowed_noise = project_wait_allowed_noise();
+    fixture::next_frame_matching_strict_on(client, context, &allowed_noise, |env| {
+        env.kind == FrameKind::ProjectNotify
+    })
+    .await
+    .parse_payload()
+    .expect("failed to parse ProjectNotifyPayload")
 }
 
 async fn expect_project_bootstrap(client: &mut client::Connection, context: &str) {
-    loop {
-        let env = expect_next_event(client, context).await;
-        if env.kind == FrameKind::ProjectBootstrap {
-            return;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::ProjectFileList
-                | FrameKind::ProjectGitStatus
-                | FrameKind::CodeIntelOverview
-                | FrameKind::TaskTokenUsage
-        ) {
-            continue;
-        }
-        assert_eq!(env.kind, FrameKind::ProjectBootstrap);
-    }
+    let allowed_noise = project_wait_allowed_noise();
+    fixture::next_frame_matching_strict_on(client, context, &allowed_noise, |env| {
+        env.kind == FrameKind::ProjectBootstrap
+    })
+    .await;
 }
 
 async fn drain_initial_project_state_pushes(client: &mut client::Connection, context: &str) {
@@ -103,26 +80,13 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
             Ok(Ok(None)) => return,
             Ok(Err(err)) => panic!("next_event failed while draining {context}: {err:?}"),
             Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
+                if is_control_plane_noise(&env)
                     || matches!(
                         env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionList
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::ProjectEvent
-                            | FrameKind::ProjectBootstrap
+                        FrameKind::ProjectBootstrap
                             | FrameKind::ProjectFileList
                             | FrameKind::ProjectGitStatus
                             | FrameKind::CodeIntelOverview
-                            | FrameKind::TaskTokenUsage
                     ) =>
             {
                 continue;
@@ -194,47 +158,39 @@ async fn next_raw_event(client: &mut client::Connection, context: &str) -> Envel
 }
 
 async fn set_rust_analyzer_path(client: &mut client::Connection, path: Option<HostExecutablePath>) {
-    send_rust_analyzer_path_setting(client, path.clone()).await;
+    let write_id = send_rust_analyzer_path_setting(client, path.clone(), None).await;
     let provider = CodeIntelProviderId("rust-analyzer".to_owned());
 
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before rust-analyzer path HostSettings"),
-            Ok(Err(err)) => panic!("next_event failed before HostSettings: {err:?}"),
-            Err(_) => panic!("timed out waiting for rust-analyzer path HostSettings"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if env.kind != FrameKind::HostSettings {
-            continue;
-        }
-        let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
-        assert_eq!(
-            payload
-                .settings
-                .code_intel
-                .language_server_paths
-                .get(&provider)
-                .cloned(),
-            path
-        );
-        return;
-    }
+    let env = fixture::next_frame_matching_on(client, "rust-analyzer path HostSettings", |env| {
+        env.kind == FrameKind::HostSettings
+    })
+    .await;
+    let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
+    assert_eq!(
+        payload
+            .settings
+            .code_intel
+            .language_server_paths
+            .get(&provider)
+            .cloned(),
+        path
+    );
+    expect_settings_write_applied(client, &write_id, "rust-analyzer path write").await;
 }
 
 async fn send_rust_analyzer_path_setting(
     client: &mut client::Connection,
     path: Option<HostExecutablePath>,
-) {
-    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+    expected: Option<HostExecutablePath>,
+) -> protocol::SettingsWriteId {
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::CodeIntelLanguageServerPath { provider, path },
-        })
+        .replace_setting(
+            "/code_intel/language_server_paths/rust-analyzer",
+            path,
+            expected,
+        )
         .await
-        .expect("set rust-analyzer path setting");
+        .expect("set rust-analyzer path setting")
 }
 
 async fn wait_for_code_intel_unavailable(
@@ -249,7 +205,7 @@ async fn wait_for_code_intel_unavailable(
             "timed out waiting for code-intel unavailable/error frames"
         );
         let env = next_raw_event(client, "code-intel error").await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
+        if fixture::is_routine_control_plane_frame(&env) {
             continue;
         }
         match env.kind {
@@ -276,11 +232,6 @@ async fn wait_for_code_intel_unavailable(
             | FrameKind::AgentActivityStats
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionSettings
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList => {}
             other => panic!("unexpected frame while waiting for code-intel error: {other}"),
@@ -308,7 +259,7 @@ async fn wait_for_code_intel_unavailable_with_overview(
             "timed out waiting for code-intel unavailable/error/overview frames"
         );
         let env = next_raw_event(client, "code-intel unavailable overview").await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
+        if fixture::is_routine_control_plane_frame(&env) {
             continue;
         }
         match env.kind {
@@ -350,11 +301,6 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::AgentActivityStats
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionSettings
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
             | FrameKind::WorkflowNotify
@@ -396,7 +342,7 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             "timed out waiting for code-intel warm unavailable overview"
         );
         let env = next_raw_event(client, "code-intel warm overview").await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
+        if fixture::is_routine_control_plane_frame(&env) {
             continue;
         }
         match env.kind {
@@ -431,11 +377,6 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             | FrameKind::AgentActivityStats
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionSettings
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
             | FrameKind::WorkflowNotify
@@ -452,55 +393,54 @@ async fn wait_for_code_intel_status_matching(
     context: &str,
     mut predicate: impl FnMut(&CodeIntelStatusPayload) -> bool,
 ) -> CodeIntelStatusPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for code-intel status matching {context}"
-        );
-        let env = next_raw_event(client, context).await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
+    let allowed_noise = fixture::routine_control_plane_noise_plus(&[
+        FrameKind::CodeIntelStatus,
+        FrameKind::VoiceCapabilities,
+        FrameKind::ProjectFileList,
+        FrameKind::ProjectGitStatus,
+        FrameKind::CodeIntelOverview,
+        FrameKind::ProjectEvent,
+        FrameKind::HostSettings,
+        FrameKind::TeamPresetCatalogNotify,
+        FrameKind::SessionList,
+        FrameKind::TaskTokenUsage,
+        FrameKind::WorkflowNotify,
+        FrameKind::AgentsViewPreferencesNotify,
+        FrameKind::CodeIntelError,
+        FrameKind::SettingsWriteResult,
+    ]);
+    let host_stream = client
+        .outgoing_seq
+        .keys()
+        .find(|stream| stream.0.starts_with("/host/"))
+        .expect("connected host stream")
+        .clone();
+    let mut found = None;
+    // Raw (voice-visible) read: this waiter asserts on VoiceCapabilities,
+    // which `client.next_event()` filters out.
+    fixture::next_raw_frame_matching_strict_on(client, context, &allowed_noise, |env| {
         match env.kind {
             FrameKind::CodeIntelStatus => {
                 let payload: CodeIntelStatusPayload =
                     env.parse_payload().expect("parse CodeIntelStatusPayload");
                 if predicate(&payload) {
-                    return payload;
+                    found = Some(payload);
+                    return true;
                 }
             }
             FrameKind::VoiceCapabilities => {
                 let capabilities: protocol::VoiceCapabilitiesPayload = env
                     .parse_payload()
                     .expect("parse VoiceCapabilities while waiting for code-intel status");
-                let host_stream = client
-                    .outgoing_seq
-                    .keys()
-                    .find(|stream| stream.0.starts_with("/host/"))
-                    .expect("connected host stream");
-                assert_eq!(&env.stream, host_stream);
+                assert_eq!(env.stream, host_stream);
                 assert!(capabilities.valid());
             }
-            FrameKind::ProjectFileList
-            | FrameKind::ProjectGitStatus
-            | FrameKind::CodeIntelOverview
-            | FrameKind::ProjectEvent
-            | FrameKind::HostSettings
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionSettings
-            | FrameKind::TeamPresetCatalogNotify
-            | FrameKind::SessionList
-            | FrameKind::TaskTokenUsage
-            | FrameKind::WorkflowNotify
-            | FrameKind::AgentsViewPreferencesNotify
-            | FrameKind::CodeIntelError => {}
-            other => panic!("unexpected frame while waiting for code-intel status: {other}"),
+            _ => {}
         }
-    }
+        false
+    })
+    .await;
+    found.expect("matched code-intel status")
 }
 
 async fn wait_for_code_intel_overview_matching(
@@ -508,43 +448,38 @@ async fn wait_for_code_intel_overview_matching(
     context: &str,
     mut predicate: impl FnMut(&CodeIntelOverviewPayload) -> bool,
 ) -> CodeIntelOverviewPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for code-intel overview matching {context}"
-        );
-        let env = next_raw_event(client, context).await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
+    let allowed_noise = fixture::routine_control_plane_noise_plus(&[
+        FrameKind::CodeIntelOverview,
+        FrameKind::ProjectFileList,
+        FrameKind::ProjectGitStatus,
+        FrameKind::ProjectEvent,
+        FrameKind::HostSettings,
+        FrameKind::TeamPresetCatalogNotify,
+        FrameKind::SessionList,
+        FrameKind::TaskTokenUsage,
+        FrameKind::WorkflowNotify,
+        FrameKind::AgentsViewPreferencesNotify,
+        FrameKind::CodeIntelStatus,
+        FrameKind::CodeIntelError,
+    ]);
+    let mut found = None;
+    // Raw read to keep the baseline's frame visibility: a voice frame here is
+    // unexpected and must still fail the wait.
+    fixture::next_raw_frame_matching_strict_on(client, context, &allowed_noise, |env| {
+        if env.kind != FrameKind::CodeIntelOverview {
+            return false;
         }
-        match env.kind {
-            FrameKind::CodeIntelOverview => {
-                let payload: CodeIntelOverviewPayload =
-                    env.parse_payload().expect("parse CodeIntelOverviewPayload");
-                if predicate(&payload) {
-                    return payload;
-                }
-            }
-            FrameKind::ProjectFileList
-            | FrameKind::ProjectGitStatus
-            | FrameKind::ProjectEvent
-            | FrameKind::HostSettings
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionSettings
-            | FrameKind::TeamPresetCatalogNotify
-            | FrameKind::SessionList
-            | FrameKind::TaskTokenUsage
-            | FrameKind::WorkflowNotify
-            | FrameKind::AgentsViewPreferencesNotify
-            | FrameKind::CodeIntelStatus
-            | FrameKind::CodeIntelError => {}
-            other => panic!("unexpected frame while waiting for code-intel overview: {other}"),
+        let payload: CodeIntelOverviewPayload =
+            env.parse_payload().expect("parse CodeIntelOverviewPayload");
+        if predicate(&payload) {
+            found = Some(payload);
+            true
+        } else {
+            false
         }
-    }
+    })
+    .await;
+    found.expect("matched code-intel overview")
 }
 
 async fn assert_no_code_intel_warm_events(client: &mut client::Connection, context: &str) {
@@ -559,7 +494,7 @@ async fn assert_no_code_intel_warm_events(client: &mut client::Connection, conte
                     .incoming_seq
                     .validate(&env.stream, env.seq, env.kind)
                     .expect("incoming sequence must be valid");
-                if fixture::is_builtin_team_custom_agent_notify(&env) {
+                if fixture::is_routine_control_plane_frame(&env) {
                     continue;
                 }
                 match env.kind {
@@ -590,7 +525,7 @@ async fn assert_no_direct_code_intel_warm_frames(client: &mut client::Connection
                     .incoming_seq
                     .validate(&env.stream, env.seq, env.kind)
                     .expect("incoming sequence must be valid");
-                if fixture::is_builtin_team_custom_agent_notify(&env) {
+                if fixture::is_routine_control_plane_frame(&env) {
                     continue;
                 }
                 match env.kind {
@@ -1163,6 +1098,7 @@ while True:
         Some(HostExecutablePath(
             valid_path.to_string_lossy().into_owned(),
         )),
+        Some(HostExecutablePath(missing_path_text.clone())),
     )
     .await;
 

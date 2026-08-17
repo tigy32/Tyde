@@ -1,5 +1,7 @@
+#[path = "../../server/tests/fixture.rs"]
 mod fixture;
 
+use settings_model::HostBootstrapPayload;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -27,15 +29,14 @@ use protocol::{
     BackendSetupPayload, BackendSetupStatus, CancelQueuedMessagePayload, CapacityBucketId,
     CapacityFreshness, CapacityMeasure, CapacityReset, CapacityScope, CapacityWindow, ChatEvent,
     ChatMessage, ChatMessageId, CommandErrorCode, CommandErrorPayload, DeleteSessionPayload,
-    EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload, FrameKind,
-    HostBootstrapPayload, HostSettingValue, ImageData, ListSessionsPayload,
-    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProjectCreatePayload,
-    ProjectNotifyPayload, ProjectRootPath, ProtocolValidator, QueuedMessageId,
-    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
+    EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload, FrameKind, ImageData,
+    ListSessionsPayload, MessageMetadataUpdateData, MessageSender, NewAgentPayload,
+    ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, ProtocolValidator,
+    QueuedMessageId, QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
     SendQueuedMessageNowPayload, SessionHistoryPayload, SessionId, SessionListPayload,
     SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsValues, SessionSummary, SetSessionSettingsPayload, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TeamCompactPayload,
+    SessionSettingsValues, SessionSummary, SetSessionSettingsPayload, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath, TeamCompactPayload,
     TeamContextCompactionNotifyPayload, TeamContextCompactionStatus, TeamCreatePayload,
     TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
     TeamMemberCreateSpec, TeamMemberNotifyPayload, TeamNotifyPayload, TokenUsage, TokenUsageScope,
@@ -758,17 +759,25 @@ async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
 
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig::default()).await;
 
-    fixture
+    let write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::TydeDebugMcpEnabled { enabled: true },
-        })
+        .replace_setting("/tyde_debug_mcp_enabled", true, false)
         .await
         .expect("set_setting failed");
     loop {
         let env =
             expect_fixture_event(&mut fixture.client, "host settings after set_setting").await;
         if env.kind == FrameKind::HostSettings {
+            break;
+        }
+    }
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "debug MCP settings result").await;
+        if env.kind == FrameKind::SettingsWriteResult
+            && env
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .is_ok_and(|result| result.write_id == write_id && result.applied)
+        {
             break;
         }
     }
@@ -1328,10 +1337,6 @@ impl ValidatedConnection {
         payload: DeleteSessionPayload,
     ) -> Result<(), protocol::FrameError> {
         self.inner.delete_session(payload).await
-    }
-
-    async fn set_setting(&mut self, setting: HostSettingValue) -> Result<(), protocol::FrameError> {
-        self.inner.set_setting(SetSettingPayload { setting }).await
     }
 
     async fn backend_settings_refresh(
@@ -47372,14 +47377,15 @@ async fn assert_background_work_is_not_supervisor_stalled(backend_kind: BackendK
                 _ => {}
             }
             if foreground_ended && !settings_armed {
-                for setting in [
-                    HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1 },
-                    HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
-                    HostSettingValue::SupervisorEnabled { enabled: true },
+                for (path, value, expected) in [
+                    ("/supervisor/stall_timeout_seconds", serde_json::json!(1), serde_json::json!(1_800)),
+                    ("/supervisor/stall_timeout_enabled", serde_json::json!(true), serde_json::json!(false)),
+                    ("/supervisor/enabled", serde_json::json!(true), serde_json::json!(false)),
                 ] {
                     fixture
                         .client
-                        .set_setting(setting)
+                        .inner
+                        .replace_setting(path, value, expected)
                         .await
                         .expect("enable supervisor stall timeout");
                 }

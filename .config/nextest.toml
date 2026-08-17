@@ -17,38 +17,17 @@ command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspa
 # to avoid dyld paging stalls. The wrapper keys clones by logical test target,
 # removes superseded identities, and safely recovers locks left by dead copiers.
 
-# Several backend tests stand up a *fake* CLI/app-server (a real subprocess:
-# `python3`, a shell script, etc.) and serialize themselves with an in-process
-# mutex — CODEX_FAKE_APP_SERVER_SERIAL, FAKE_CLAUDE_ENV_LOCK,
-# ANTIGRAVITY_MCP_CONFIG_MUTEX. Those mutexes work under `cargo test`, where
-# every test shares one process, but nextest runs each test in its own process
-# so the mutexes no longer apply. Run concurrently, these subprocess-heavy
-# tests both clobber the process-global state the mutex protected and starve
-# each other's request timeouts (Codex's is 45s, Claude's is 2s), so they
-# flake. Pinning them to a single thread restores the one-at-a-time behavior
-# the in-process mutexes were providing.
-[test-groups]
-serial-backend-fakes = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/) | test(/backend::acp::backend::tests::authenticated_kiro_startup_allows_session_load_replay/)'
-test-group = 'serial-backend-fakes'
-
 # These tests intentionally exercise real CLI probes at tight process timeout
 # boundaries. Reserve the runner while they probe so unrelated process-heavy
 # tests cannot consume the deadline of healthy fake executables. The Tycode
 # integration flows also isolate process-global HOME/PATH while spawning their
 # fake subprocess, so both profiles reserve the runner with the same filter.
 [[profile.default.overrides]]
-filter = '(binary_id(tests::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/)) | test(/backend::setup::tests::version_probe_bounds_descendant_pipe_drain/)'
+filter = '(binary_id(server::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/))'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
-filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/) | test(/backend::acp::backend::tests::authenticated_kiro_startup_allows_session_load_replay/)'
-test-group = 'serial-backend-fakes'
-
-[[profile.ci.overrides]]
-filter = '(binary_id(tests::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/)) | test(/backend::setup::tests::version_probe_bounds_descendant_pipe_drain/)'
+filter = '(binary_id(server::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/))'
 threads-required = "num-test-threads"
 
 [profile.default]

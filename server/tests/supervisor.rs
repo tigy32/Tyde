@@ -1,38 +1,26 @@
-//! Integration coverage for the agent supervisor: the hidden background
-//! verdict that kicks stalled agents and optionally auto-compacts finished
-//! ones. Runs entirely on the mock backend — the mock supervision verdict is
-//! Continue when an error is in context, AwaitingUser for its explicit
-//! sentinel, and Done for its explicit sentinel or legacy default.
+//! End-to-end coverage for supervisor verdicts, kicks, stall handling, and
+//! automatic compaction.
 
 mod fixture;
 
 use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, BackendKind, ChatEvent,
-    CommandErrorPayload, CompactionMethod, CompactionTrigger, ContextCompactionCapabilityPayload,
+    CompactionMethod, CompactionTrigger, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, Envelope, FetchSessionHistoryPayload,
-    FrameKind, HostSettingErrorTarget, HostSettingValue, HostSettingsPayload, ListSessionsPayload,
-    MessageSender, NewAgentPayload, RequestedCompactionAvailability, RequestedCompactionRoute,
-    SUPERVISOR_MESSAGE_PREFIX, SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    FrameKind, ListSessionsPayload, MessageSender, NewAgentPayload,
+    RequestedCompactionAvailability, RequestedCompactionRoute, SUPERVISOR_MESSAGE_PREFIX,
+    SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload, SettingsWriteResultPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
+use server::backend::mock::{MockScript, MockTurn};
+use settings_model::HostSettingsPayload;
 use std::time::Duration;
 
-const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
-/// Holds a turn open until something interrupts it — a backend that has stopped
-/// producing anything, which is exactly what the stall timeout exists for.
-const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
-/// Opts the mock backend into emitting `MessageSender::User` transcript
-/// bubbles like real backends do — the supervisor's context reader consumes
-/// them, so supervised sessions must run with bubbles on.
-const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
-const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
 const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__";
 const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
-const MOCK_ACTIVE_IDLE_CYCLE: &str = "__mock_active_idle_cycle__";
-const MOCK_CODEX_INTERNAL_ERROR_TAIL: &str = "__mock_codex_internal_error_tail__";
 
 /// The supervisor debounces 3s after an idle transition before reading
 /// context, so supervisor-driven frames need a longer wait than ordinary
@@ -234,19 +222,45 @@ fn native_capability_matches(
         )
 }
 
-async fn apply_supervisor_setting(fixture: &mut Fixture, setting: HostSettingValue) {
+async fn apply_supervisor_setting<V: serde::Serialize, E: serde::Serialize>(
+    fixture: &mut Fixture,
+    path: &str,
+    value: V,
+    expected: E,
+) {
     fixture
         .client
-        .set_setting(SetSettingPayload { setting })
+        .replace_setting(path, value, expected)
         .await
-        .expect("send SetSetting");
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "HostSettings after supervisor SetSetting",
-        |env| env.kind == FrameKind::HostSettings,
-    )
-    .await;
+        .expect("send SettingsWrite");
+    fixture
+        .next_frame_matching("HostSettings after supervisor SettingsWrite", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await;
+}
+
+async fn expect_supervisor_setting_rejection<V: serde::Serialize, E: serde::Serialize>(
+    fixture: &mut Fixture,
+    path: &str,
+    value: V,
+    expected: E,
+) -> SettingsWriteResultPayload {
+    let write_id = fixture
+        .client
+        .replace_setting(path, value, expected)
+        .await
+        .expect("send invalid SettingsWrite");
+    fixture
+        .next_frame_matching("rejected supervisor SettingsWrite", |env| {
+            env.kind == FrameKind::SettingsWriteResult
+                && env
+                    .parse_payload::<SettingsWriteResultPayload>()
+                    .is_ok_and(|result| result.write_id == write_id)
+        })
+        .await
+        .parse_payload()
+        .expect("parse SettingsWriteResult")
 }
 
 async fn spawn_supervised_agent(
@@ -263,11 +277,21 @@ async fn spawn_supervised_agent_with_verdict(
     report_context: bool,
     verdict_sentinel: &str,
 ) -> NewAgentPayload {
-    let context_sentinel = if report_context {
-        MOCK_CONTEXT_250K_SENTINEL
+    let prompt = format!("hello {verdict_sentinel}");
+    let response = format!("mock backend response to: {prompt}");
+    let turn = if report_context {
+        MockTurn::text_with_context_250k(response)
     } else {
-        ""
+        MockTurn::text(response)
     };
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            name,
+            MockScript::one(turn)
+                .with_user_bubbles()
+                .with_unbounded_echo(),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -277,9 +301,7 @@ async fn spawn_supervised_agent_with_verdict(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: format!(
-                    "hello {MOCK_USER_BUBBLES_SENTINEL} {context_sentinel} {verdict_sentinel}"
-                ),
+                prompt,
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -291,75 +313,71 @@ async fn spawn_supervised_agent_with_verdict(
         .await
         .expect("spawn_agent failed");
 
-    let env = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "NewAgent",
-        |env| env.kind == FrameKind::NewAgent,
-    )
-    .await;
+    let env = fixture
+        .next_frame_matching("NewAgent", |env| env.kind == FrameKind::NewAgent)
+        .await;
     let mut new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
     let agent_stream = new_agent.instance_stream.clone();
 
     let mut saw_native_capability = false;
     let mut saw_initial_response = false;
     let mut logical_session_id = None;
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "initial mock turn and native compaction capability",
-        |env| {
-            if env.stream != agent_stream {
-                return false;
-            }
-            match env.kind {
-                FrameKind::AgentBootstrap => {
-                    let bootstrap: AgentBootstrapPayload =
-                        env.parse_payload().expect("parse AgentBootstrap");
-                    for event in bootstrap.events {
-                        match event {
-                            AgentBootstrapEvent::ContextCompactionCapability(payload) => {
-                                if native_capability_matches(&payload, &new_agent) {
-                                    saw_native_capability = true;
-                                    logical_session_id = Some(payload.logical_session_id);
+    fixture
+        .next_frame_matching(
+            "initial mock turn and native compaction capability",
+            |env| {
+                if env.stream != agent_stream {
+                    return false;
+                }
+                match env.kind {
+                    FrameKind::AgentBootstrap => {
+                        let bootstrap: AgentBootstrapPayload =
+                            env.parse_payload().expect("parse AgentBootstrap");
+                        for event in bootstrap.events {
+                            match event {
+                                AgentBootstrapEvent::ContextCompactionCapability(payload) => {
+                                    if native_capability_matches(&payload, &new_agent) {
+                                        saw_native_capability = true;
+                                        logical_session_id = Some(payload.logical_session_id);
+                                    }
                                 }
+                                AgentBootstrapEvent::ChatEvent(event) => {
+                                    saw_initial_response |= assistant_message_contains(
+                                        &event,
+                                        "mock backend response to: hello",
+                                    );
+                                }
+                                AgentBootstrapEvent::AgentStart(_)
+                                | AgentBootstrapEvent::AgentError(_)
+                                | AgentBootstrapEvent::SessionSettings(_)
+                                | AgentBootstrapEvent::QueuedMessages(_)
+                                | AgentBootstrapEvent::AgentActivityStats(_)
+                                | AgentBootstrapEvent::ContextCompaction(_)
+                                | AgentBootstrapEvent::HasPriorHistory { .. } => {}
                             }
-                            AgentBootstrapEvent::ChatEvent(event) => {
-                                saw_initial_response |= assistant_message_contains(
-                                    &event,
-                                    "mock backend response to: hello",
-                                );
-                            }
-                            AgentBootstrapEvent::AgentStart(_)
-                            | AgentBootstrapEvent::AgentError(_)
-                            | AgentBootstrapEvent::SessionSettings(_)
-                            | AgentBootstrapEvent::QueuedMessages(_)
-                            | AgentBootstrapEvent::AgentActivityStats(_)
-                            | AgentBootstrapEvent::ContextCompaction(_)
-                            | AgentBootstrapEvent::HasPriorHistory { .. } => {}
                         }
                     }
-                }
-                FrameKind::ContextCompactionCapability => {
-                    let payload: ContextCompactionCapabilityPayload = env
-                        .parse_payload()
-                        .expect("parse ContextCompactionCapability");
-                    if native_capability_matches(&payload, &new_agent) {
-                        saw_native_capability = true;
-                        logical_session_id = Some(payload.logical_session_id);
+                    FrameKind::ContextCompactionCapability => {
+                        let payload: ContextCompactionCapabilityPayload = env
+                            .parse_payload()
+                            .expect("parse ContextCompactionCapability");
+                        if native_capability_matches(&payload, &new_agent) {
+                            saw_native_capability = true;
+                            logical_session_id = Some(payload.logical_session_id);
+                        }
                     }
+                    FrameKind::ChatEvent => {
+                        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                        saw_initial_response |=
+                            assistant_message_contains(&event, "mock backend response to: hello");
+                    }
+                    _ => {}
                 }
-                FrameKind::ChatEvent => {
-                    let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-                    saw_initial_response |=
-                        assistant_message_contains(&event, "mock backend response to: hello");
-                }
-                _ => {}
-            }
-            saw_native_capability && saw_initial_response
-        },
-    )
-    .await;
+                saw_native_capability && saw_initial_response
+            },
+        )
+        .await;
+    drop(reservation);
     new_agent.session_id = logical_session_id;
     new_agent
 }
@@ -370,26 +388,26 @@ async fn auto_compaction_fixture(threshold: u64) -> Fixture {
 
 async fn auto_compaction_fixture_with_delay(threshold: u64, delay_seconds: u32) -> Fixture {
     let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
+        "/supervisor/auto_compact_on_success",
+        true,
+        false,
     )
     .await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+        "/supervisor/auto_compact_inactivity_delay_seconds",
+        delay_seconds,
+        300_u32,
     )
     .await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds {
-            seconds: delay_seconds,
-        },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: threshold },
+        "/supervisor/auto_compact_min_context_tokens",
+        threshold,
+        200_000_u64,
     )
     .await;
     fixture
@@ -397,18 +415,9 @@ async fn auto_compaction_fixture_with_delay(threshold: u64, delay_seconds: u32) 
 
 #[tokio::test]
 async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorRetryAttempts { count: 0 },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/retry_attempts", 0, 1_u32).await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
 
     let other = spawn_supervised_agent(&mut fixture, "unaffected-supervisor-agent", false).await;
     let affected = spawn_supervised_agent_with_verdict(
@@ -448,15 +457,13 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         )
         .await
         .expect("fetch affected actor history");
-    let history = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "affected actor history",
-        |env| env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream,
-    )
-    .await
-    .parse_payload::<protocol::SessionHistoryPayload>()
-    .expect("parse affected actor history");
+    let history = fixture
+        .next_frame_matching("affected actor history", |env| {
+            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
+        })
+        .await
+        .parse_payload::<protocol::SessionHistoryPayload>()
+        .expect("parse affected actor history");
     assert_eq!(
         history
             .events
@@ -488,13 +495,11 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         .await
         .expect("send new failing supervision generation");
     let affected_stream = affected.instance_stream.clone();
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "new generation assistant turn",
-        |env| is_assistant_message_containing(env, &affected_stream, "new generation"),
-    )
-    .await;
+    fixture
+        .next_frame_matching("new generation assistant turn", |env| {
+            is_assistant_message_containing(env, &affected_stream, "new generation")
+        })
+        .await;
     let second = wait_for_envelope(
         &mut fixture.client,
         SUPERVISION_WAIT,
@@ -519,15 +524,13 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         )
         .await
         .expect("fetch both warning generations");
-    let history = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "history for both warning generations",
-        |env| env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream,
-    )
-    .await
-    .parse_payload::<protocol::SessionHistoryPayload>()
-    .expect("parse history for both warning generations");
+    let history = fixture
+        .next_frame_matching("history for both warning generations", |env| {
+            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
+        })
+        .await
+        .parse_payload::<protocol::SessionHistoryPayload>()
+        .expect("parse history for both warning generations");
     assert_eq!(
         history
             .events
@@ -552,18 +555,9 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
 
 #[tokio::test]
 async fn transient_supervisor_failure_and_closed_agent_remain_silent() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorRetryAttempts { count: 1 },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/retry_attempts", 1, 1_u32).await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
     let transient = spawn_supervised_agent_with_verdict(
         &mut fixture,
         "transient-supervisor-failure",
@@ -584,13 +578,11 @@ async fn transient_supervisor_failure_and_closed_agent_remain_silent() {
         .close_agent(&transient.instance_stream)
         .await
         .expect("close agent with pending retry");
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "closed supervised agent",
-        |env| env.kind == FrameKind::AgentClosed,
-    )
-    .await;
+    fixture
+        .next_frame_matching("closed supervised agent", |env| {
+            env.kind == FrameKind::AgentClosed
+        })
+        .await;
     assert_no_envelope(
         &mut fixture.client,
         QUIET_WAIT,
@@ -606,29 +598,25 @@ async fn transient_supervisor_failure_and_closed_agent_remain_silent() {
 /// starts a real follow-up turn — and the kick budget must stop the loop.
 #[tokio::test]
 async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorMaxKicksPerTask { count: 1 },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/max_kicks_per_task", 1, 3_u32).await;
 
-    let agent_stream = spawn_supervised_agent(&mut fixture, "supervised-error-agent", false)
+    let agent = spawn_supervised_agent(&mut fixture, "supervised-error-agent", false).await;
+    let agent_stream = agent.instance_stream.clone();
+    fixture
+        .mock_by_id(&agent.agent_id)
         .await
-        .instance_stream;
-
+        .enqueue(MockTurn::error_card(
+            "mock backend emitted error without idle",
+        ))
+        .await;
     fixture
         .client
-        .send_message(&agent_stream, MOCK_ERROR_WITHOUT_IDLE_SENTINEL.to_owned())
+        .send_message(&agent_stream, "trigger backend error".to_owned())
         .await
-        .expect("send error sentinel failed");
+        .expect("send backend error trigger failed");
 
     // The supervisor sees the error, kicks the agent, and the kick runs a
     // real turn (the mock echoes the kick text back).
@@ -669,16 +657,19 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
 
 #[tokio::test]
 async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorMaxKicksPerTask { count: 1 },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/max_kicks_per_task", 1, 3_u32).await;
     fixture
         .host_for_test()
         .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "codex-error-tail",
+            MockScript::one(MockTurn::codex_internal_error_tail())
+                .with_user_bubbles()
+                .with_unbounded_echo(),
+        )
         .await;
     fixture
         .client
@@ -689,9 +680,7 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: format!(
-                    "recover {MOCK_USER_BUBBLES_SENTINEL} {MOCK_CODEX_INTERNAL_ERROR_TAIL}"
-                ),
+                prompt: "recover".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Codex,
                 launch_profile_id: None,
@@ -702,15 +691,13 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
         })
         .await
         .expect("spawn Codex-shaped mock agent");
-    let new_agent = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "Codex-shaped NewAgent",
-        |env| env.kind == FrameKind::NewAgent,
-    )
-    .await
-    .parse_payload::<NewAgentPayload>()
-    .expect("parse NewAgent");
+    let new_agent = fixture
+        .next_frame_matching("Codex-shaped NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("parse NewAgent");
     let stream = new_agent.instance_stream.clone();
 
     for (label, predicate) in [
@@ -722,11 +709,8 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
         ("recoverable error", 5),
     ] {
         let stream = stream.clone();
-        wait_for_envelope(
-            &mut fixture.client,
-            Duration::from_secs(5),
-            label,
-            move |env| {
+        fixture
+            .next_frame_matching(label, move |env| {
                 assert_ne!(env.kind, FrameKind::AgentClosed, "tail must remain live");
                 if env.kind == FrameKind::AgentError {
                     let error: protocol::AgentErrorPayload =
@@ -748,30 +732,24 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
                     }
                     _ => false,
                 }
-            },
-        )
-        .await;
+            })
+            .await;
     }
+    drop(reservation);
 
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorEnabled { enabled: true },
-        })
+        .replace_setting("/supervisor/enabled", true, false)
         .await
         .expect("enable supervisor after idle error tail");
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "same-host enabled HostSettings",
-        |env| {
+    fixture
+        .next_frame_matching("same-host enabled HostSettings", |env| {
             env.kind == FrameKind::HostSettings
                 && env
                     .parse_payload::<HostSettingsPayload>()
                     .is_ok_and(|payload| payload.settings.supervisor.enabled)
-        },
-    )
-    .await;
+        })
+        .await;
 
     let kick_stream = stream.clone();
     wait_for_envelope(
@@ -806,7 +784,6 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
 
 #[tokio::test]
 async fn supervisor_auto_compaction_skips_unavailable_context_at_zero_threshold() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(0).await;
 
     spawn_supervised_agent(&mut fixture, "supervised-unavailable-agent", false).await;
@@ -821,22 +798,26 @@ async fn supervisor_auto_compaction_skips_unavailable_context_at_zero_threshold(
 
 #[tokio::test]
 async fn supervisor_and_auto_compact_gates_fail_independently() {
-    fixture::init_tracing();
-
     let mut supervisor_off = Fixture::new().await;
     apply_supervisor_setting(
         &mut supervisor_off,
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+        "/supervisor/auto_compact_on_success",
+        true,
+        false,
     )
     .await;
     apply_supervisor_setting(
         &mut supervisor_off,
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
+        "/supervisor/auto_compact_inactivity_delay_seconds",
+        1,
+        300_u32,
     )
     .await;
     apply_supervisor_setting(
         &mut supervisor_off,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+        "/supervisor/auto_compact_min_context_tokens",
+        200_000,
+        200_000_u64,
     )
     .await;
     spawn_supervised_agent(&mut supervisor_off, "supervisor-off-agent", true).await;
@@ -849,19 +830,19 @@ async fn supervisor_and_auto_compact_gates_fail_independently() {
     .await;
 
     let mut auto_compact_off = Fixture::new().await;
+    apply_supervisor_setting(&mut auto_compact_off, "/supervisor/enabled", true, false).await;
     apply_supervisor_setting(
         &mut auto_compact_off,
-        HostSettingValue::SupervisorEnabled { enabled: true },
+        "/supervisor/auto_compact_inactivity_delay_seconds",
+        1,
+        300_u32,
     )
     .await;
     apply_supervisor_setting(
         &mut auto_compact_off,
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut auto_compact_off,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+        "/supervisor/auto_compact_min_context_tokens",
+        200_000,
+        200_000_u64,
     )
     .await;
     spawn_supervised_agent(&mut auto_compact_off, "auto-compact-off-agent", true).await;
@@ -876,7 +857,6 @@ async fn supervisor_and_auto_compact_gates_fail_independently() {
 
 #[tokio::test]
 async fn supervisor_auto_compaction_skips_context_below_threshold() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(300_000).await;
 
     spawn_supervised_agent(&mut fixture, "supervised-below-agent", true).await;
@@ -891,7 +871,6 @@ async fn supervisor_auto_compaction_skips_context_below_threshold() {
 
 #[tokio::test]
 async fn supervisor_auto_compaction_skips_context_equal_to_threshold() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(250_000).await;
 
     spawn_supervised_agent(&mut fixture, "supervised-equal-agent", true).await;
@@ -906,7 +885,6 @@ async fn supervisor_auto_compaction_skips_context_equal_to_threshold() {
 
 #[tokio::test]
 async fn supervisor_auto_compaction_runs_above_threshold_once() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(200_000).await;
 
     let original = spawn_supervised_agent(&mut fixture, "supervised-done-agent", true).await;
@@ -935,29 +913,34 @@ async fn supervisor_auto_compaction_runs_above_threshold_once() {
 
 #[tokio::test]
 async fn accepted_user_activity_invalidates_the_old_compaction_interval() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture_with_delay(200_000, 6).await;
     let original = spawn_supervised_agent(&mut fixture, "supervised-race-agent", true).await;
 
     tokio::time::sleep(Duration::from_secs(4)).await;
     fixture
+        .mock_by_id(&original.agent_id)
+        .await
+        .enqueue(
+            MockTurn::text_with_context_250k(format!(
+                "mock backend response to: continue {MOCK_SUPERVISOR_DONE}"
+            ))
+            .with_active_idle_cycle(),
+        )
+        .await;
+    fixture
         .client
         .send_message(
             &original.instance_stream,
-            format!(
-                "continue {MOCK_USER_BUBBLES_SENTINEL} {MOCK_CONTEXT_250K_SENTINEL} {MOCK_SUPERVISOR_DONE} {MOCK_ACTIVE_IDLE_CYCLE}"
-            ),
+            format!("continue {MOCK_SUPERVISOR_DONE}"),
         )
         .await
         .expect("send activity before the old expiry");
     let stream = original.instance_stream.clone();
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "assistant response after intervening activity",
-        |env| is_assistant_message_containing(env, &stream, "mock backend response to: continue"),
-    )
-    .await;
+    fixture
+        .next_frame_matching("assistant response after intervening activity", |env| {
+            is_assistant_message_containing(env, &stream, "mock backend response to: continue")
+        })
+        .await;
 
     assert_no_envelope(
         &mut fixture.client,
@@ -979,21 +962,20 @@ async fn accepted_user_activity_invalidates_the_old_compaction_interval() {
 
 #[tokio::test]
 async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
+        "/supervisor/auto_compact_inactivity_delay_seconds",
+        1,
+        300_u32,
     )
     .await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 300_000 },
+        "/supervisor/auto_compact_min_context_tokens",
+        300_000,
+        200_000_u64,
     )
     .await;
     let agent = spawn_supervised_agent(&mut fixture, "live-settings-agent", true).await;
@@ -1001,7 +983,9 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
 
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+        "/supervisor/auto_compact_on_success",
+        true,
+        false,
     )
     .await;
     assert_no_envelope(
@@ -1013,7 +997,9 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
     .await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+        "/supervisor/auto_compact_min_context_tokens",
+        200_000,
+        300_000_u64,
     )
     .await;
     // The failing run honored the live 300,000-token threshold and timed out
@@ -1029,7 +1015,6 @@ async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
 
 #[tokio::test]
 async fn terminated_agent_cannot_compact_during_the_delay() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture_with_delay(200_000, 6).await;
     let agent = spawn_supervised_agent(&mut fixture, "terminated-delay-agent", true).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1049,7 +1034,6 @@ async fn terminated_agent_cannot_compact_during_the_delay() {
 
 #[tokio::test]
 async fn supervisor_awaiting_user_neither_kicks_nor_compacts() {
-    fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(200_000).await;
     let mut streams = Vec::new();
     for (name, waiting_case) in [
@@ -1080,43 +1064,48 @@ async fn supervisor_awaiting_user_neither_kicks_nor_compacts() {
     .await;
 }
 
-/// Settings sanity over the wire: every supervisor knob committed through
-/// SetSetting must round-trip into the fanned-out HostSettings payload.
 #[tokio::test]
 async fn supervisor_settings_round_trip_over_the_wire() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
-    for setting in [
-        HostSettingValue::SupervisorEnabled { enabled: true },
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 19 },
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 225_000 },
-        HostSettingValue::SupervisorMaxKicksPerTask { count: 7 },
-        HostSettingValue::SupervisorRetryAttempts { count: 2 },
-    ] {
-        apply_supervisor_setting(&mut fixture, setting).await;
-    }
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
+    apply_supervisor_setting(
+        &mut fixture,
+        "/supervisor/auto_compact_on_success",
+        true,
+        false,
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        "/supervisor/auto_compact_inactivity_delay_seconds",
+        19_u32,
+        300_u32,
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        "/supervisor/auto_compact_min_context_tokens",
+        225_000_u64,
+        200_000_u64,
+    )
+    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/max_kicks_per_task", 7_u32, 3_u32).await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/retry_attempts", 2_u32, 1_u32).await;
 
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorRetryAttempts { count: 3 },
-        })
+        .replace_setting("/supervisor/retry_attempts", 3_u32, 2_u32)
         .await
-        .expect("send final SetSetting");
-    let env = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "final HostSettings fan-out",
-        |env| {
+        .expect("send final SettingsWrite");
+    let env = fixture
+        .next_frame_matching("final HostSettings fan-out", |env| {
             env.kind == FrameKind::HostSettings
                 && env
                     .parse_payload::<HostSettingsPayload>()
                     .is_ok_and(|payload| payload.settings.supervisor.retry_attempts == 3)
-        },
-    )
-    .await;
+        })
+        .await;
     let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
     assert!(payload.settings.supervisor.enabled);
     assert!(payload.settings.supervisor.auto_compact_on_success);
@@ -1136,55 +1125,36 @@ async fn supervisor_settings_round_trip_over_the_wire() {
 }
 
 #[tokio::test]
-async fn invalid_supervisor_delay_returns_typed_setting_target() {
-    fixture::init_tracing();
+async fn invalid_supervisor_delay_returns_pointer_error() {
     let mut fixture = Fixture::new().await;
     for seconds in [0_u32, 86_401] {
-        fixture
-            .client
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
-            })
-            .await
-            .expect("send invalid delay setting");
-        let envelope = wait_for_envelope(
-            &mut fixture.client,
-            Duration::from_secs(5),
-            "typed invalid inactivity delay error",
-            |envelope| envelope.kind == FrameKind::CommandError,
+        let result = expect_supervisor_setting_rejection(
+            &mut fixture,
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            seconds,
+            300_u32,
         )
         .await;
-        let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
+        assert!(!result.applied);
         assert_eq!(
-            error.setting_target,
-            Some(HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds)
+            result.field_errors[0].pointer,
+            "/supervisor/auto_compact_inactivity_delay_seconds"
         );
     }
 }
 
 #[tokio::test]
-async fn invalid_supervisor_retry_limit_returns_typed_setting_target() {
-    fixture::init_tracing();
+async fn invalid_supervisor_retry_limit_returns_pointer_error() {
     let mut fixture = Fixture::new().await;
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorRetryAttempts { count: 6 },
-        })
-        .await
-        .expect("send invalid retry setting");
-    let envelope = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "typed invalid retry-attempt error",
-        |envelope| envelope.kind == FrameKind::CommandError,
+    let result = expect_supervisor_setting_rejection(
+        &mut fixture,
+        "/supervisor/retry_attempts",
+        6_u32,
+        1_u32,
     )
     .await;
-    let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
-    assert_eq!(
-        error.setting_target,
-        Some(HostSettingErrorTarget::SupervisorRetryAttempts)
-    );
+    assert!(!result.applied);
+    assert_eq!(result.field_errors[0].pointer, "/supervisor/retry_attempts");
 }
 
 /// Reopening a saved session replays its transcript, which reaches the
@@ -1193,10 +1163,19 @@ async fn invalid_supervisor_retry_limit_returns_typed_setting_target() {
 /// very agents that were waiting on it.
 #[tokio::test]
 async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
     let source_name = "restore-supervision-source";
-    let prompt = format!("hello {MOCK_USER_BUBBLES_SENTINEL} {MOCK_SUPERVISOR_CONTINUE}");
+    let prompt = format!("hello {MOCK_SUPERVISOR_CONTINUE}");
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            source_name,
+            MockScript::one(MockTurn::text(format!(
+                "mock backend response to: {prompt}"
+            )))
+            .with_user_bubbles()
+            .with_unbounded_echo(),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1217,38 +1196,33 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
         })
         .await
         .expect("spawn restore source");
-    let source: NewAgentPayload = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "restore source NewAgent",
-        |env| env.kind == FrameKind::NewAgent,
-    )
-    .await
-    .parse_payload()
-    .expect("parse restore source NewAgent");
+    let source: NewAgentPayload = fixture
+        .next_frame_matching("restore source NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("parse restore source NewAgent");
     let source_stream = source.instance_stream.clone();
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "restore source turn",
-        |env| is_assistant_message_containing(env, &source_stream, "mock backend response to:"),
-    )
-    .await;
+    fixture
+        .next_frame_matching("restore source turn", |env| {
+            is_assistant_message_containing(env, &source_stream, "mock backend response to:")
+        })
+        .await;
+    drop(reservation);
 
     fixture
         .client
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list sessions for restore");
-    let sessions: SessionListPayload = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "restore SessionList",
-        |env| env.kind == FrameKind::SessionList,
-    )
-    .await
-    .parse_payload()
-    .expect("parse restore SessionList");
+    let sessions: SessionListPayload = fixture
+        .next_frame_matching("restore SessionList", |env| {
+            env.kind == FrameKind::SessionList
+        })
+        .await
+        .parse_payload()
+        .expect("parse restore SessionList");
     let session_id = sessions
         .sessions
         .iter()
@@ -1262,20 +1236,20 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
         .close_agent(&source.instance_stream)
         .await
         .expect("close restore source");
-    wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "restore source AgentClosed",
-        |env| env.kind == FrameKind::AgentClosed,
-    )
-    .await;
+    fixture
+        .next_frame_matching("restore source AgentClosed", |env| {
+            env.kind == FrameKind::AgentClosed
+        })
+        .await;
 
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "restored-agent",
+            MockScript::new().with_user_bubbles().with_unbounded_echo(),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1290,15 +1264,11 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
         })
         .await
         .expect("resume the saved session");
-    let restored: NewAgentPayload = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "restored NewAgent",
-        |env| env.kind == FrameKind::NewAgent,
-    )
-    .await
-    .parse_payload()
-    .expect("parse restored NewAgent");
+    let restored: NewAgentPayload = fixture
+        .next_frame_matching("restored NewAgent", |env| env.kind == FrameKind::NewAgent)
+        .await
+        .parse_payload()
+        .expect("parse restored NewAgent");
     let restored_stream = restored.instance_stream.clone();
     // Replayed history is recorded without being broadcast as live events; the
     // client is attached once the replay has settled, so its bootstrap is what
@@ -1313,6 +1283,7 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
     .await
     .parse_payload()
     .expect("parse restored AgentBootstrap");
+    drop(reservation);
     assert!(
         bootstrap.events.iter().any(|event| matches!(
             event,
@@ -1334,7 +1305,9 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
 
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
+        "/supervisor/supervise_restored_agents",
+        true,
+        false,
     )
     .await;
     let kick = wait_for_envelope(
@@ -1352,24 +1325,33 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
 /// a user cancel would have suppressed supervision instead.
 #[tokio::test]
 async fn stalled_turn_is_interrupted_then_judged_once() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1 },
+        "/supervisor/stall_timeout_seconds",
+        1,
+        1_800_u32,
     )
     .await;
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
+        "/supervisor/stall_timeout_enabled",
+        true,
+        false,
     )
     .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "stalled-agent",
+            MockScript::one(MockTurn::held_text(
+                "mock backend held response to: stall forever",
+            ))
+            .with_user_bubbles()
+            .with_unbounded_echo(),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1379,9 +1361,7 @@ async fn stalled_turn_is_interrupted_then_judged_once() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: format!(
-                    "stall forever {MOCK_USER_BUBBLES_SENTINEL} {MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL}"
-                ),
+                prompt: "stall forever".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -1392,15 +1372,11 @@ async fn stalled_turn_is_interrupted_then_judged_once() {
         })
         .await
         .expect("spawn a stalling agent");
-    let agent: NewAgentPayload = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "stalled NewAgent",
-        |env| env.kind == FrameKind::NewAgent,
-    )
-    .await
-    .parse_payload()
-    .expect("parse stalled NewAgent");
+    let agent: NewAgentPayload = fixture
+        .next_frame_matching("stalled NewAgent", |env| env.kind == FrameKind::NewAgent)
+        .await
+        .parse_payload()
+        .expect("parse stalled NewAgent");
     let agent_stream = agent.instance_stream.clone();
 
     let notice = wait_for_envelope(
@@ -1410,6 +1386,7 @@ async fn stalled_turn_is_interrupted_then_judged_once() {
         |env| stall_interrupt_notice(env, &agent_stream).is_some(),
     )
     .await;
+    drop(reservation);
     let notice_copy =
         stall_interrupt_notice(&notice, &agent_stream).expect("stall interrupt notice payload");
     assert!(
@@ -1446,52 +1423,42 @@ async fn stalled_turn_is_interrupted_then_judged_once() {
 }
 
 #[tokio::test]
-async fn invalid_supervisor_stall_timeout_returns_typed_setting_target() {
-    fixture::init_tracing();
+async fn invalid_supervisor_stall_timeout_returns_pointer_error() {
     let mut fixture = Fixture::new().await;
     for seconds in [0_u32, 86_401] {
-        fixture
-            .client
-            .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorStallTimeoutSeconds { seconds },
-            })
-            .await
-            .expect("send invalid stall timeout setting");
-        let envelope = wait_for_envelope(
-            &mut fixture.client,
-            Duration::from_secs(5),
-            "typed invalid stall timeout error",
-            |envelope| envelope.kind == FrameKind::CommandError,
+        let result = expect_supervisor_setting_rejection(
+            &mut fixture,
+            "/supervisor/stall_timeout_seconds",
+            seconds,
+            1_800_u32,
         )
         .await;
-        let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
+        assert!(!result.applied);
         assert_eq!(
-            error.setting_target,
-            Some(HostSettingErrorTarget::SupervisorStallTimeoutSeconds)
+            result.field_errors[0].pointer,
+            "/supervisor/stall_timeout_seconds"
         );
     }
 
     apply_supervisor_setting(
         &mut fixture,
-        HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 900 },
+        "/supervisor/stall_timeout_seconds",
+        900,
+        1_800_u32,
     )
     .await;
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
-        })
+        .replace_setting("/supervisor/supervise_restored_agents", true, false)
         .await
         .expect("send restore opt-in");
-    let payload: HostSettingsPayload = wait_for_envelope(
-        &mut fixture.client,
-        Duration::from_secs(5),
-        "HostSettings after the restore opt-in",
-        |env| env.kind == FrameKind::HostSettings,
-    )
-    .await
-    .parse_payload()
-    .expect("parse HostSettings");
+    let payload: HostSettingsPayload = fixture
+        .next_frame_matching("HostSettings after the restore opt-in", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await
+        .parse_payload()
+        .expect("parse HostSettings");
     assert_eq!(payload.settings.supervisor.stall_timeout_seconds, 900);
     assert!(payload.settings.supervisor.supervise_restored_agents);
     assert!(

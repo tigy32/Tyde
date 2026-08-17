@@ -5,15 +5,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendSettingsRefreshPayload,
-    CancelQueuedMessagePayload, CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload,
-    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
-    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendNativeSettingsWritePayload,
+    BackendSettingsRefreshPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
     FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
-    HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
-    McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
+    HostBrowseStartPayload, InterruptPayload, InvokeSettingsActionPayload, ListSessionsPayload,
+    LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
     ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
@@ -24,7 +25,7 @@ use protocol::{
     ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentGroupsPayload, SetAgentNamePayload, SetAgentPinsPayload,
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
+    SetSessionSettingsPayload, SettingsWritePayload, SkillRefreshPayload, SpawnAgentParams,
     SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
     TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
     TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
@@ -50,9 +51,38 @@ pub(crate) async fn route_client_envelope(
 ) -> AppResult<()> {
     if envelope.stream == *connection_host_stream {
         match envelope.kind {
-            FrameKind::SetSetting => {
-                let payload: SetSettingPayload = parse_payload(&envelope, "set_setting")?;
-                host.set_setting(payload).await?;
+            FrameKind::SettingsWrite => {
+                let payload: SettingsWritePayload = parse_payload(&envelope, "settings_write")?;
+                ensure_non_empty("settings_write", "write_id", payload.write_id.0.as_str())?;
+                host.settings_write(payload, host_output_stream).await?;
+            }
+            FrameKind::BackendNativeSettingsWrite => {
+                let payload: BackendNativeSettingsWritePayload =
+                    parse_payload(&envelope, "backend_native_settings_write")?;
+                ensure_non_empty(
+                    "backend_native_settings_write",
+                    "write_id",
+                    payload.write_id.0.as_str(),
+                )?;
+                host.backend_native_settings_write(payload, host_output_stream)
+                    .await?;
+            }
+            FrameKind::InvokeSettingsAction => {
+                let payload: InvokeSettingsActionPayload =
+                    parse_payload(&envelope, "invoke_settings_action")?;
+                ensure_non_empty(
+                    "invoke_settings_action",
+                    "write_id",
+                    payload.write_id.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "invoke_settings_action",
+                    "resource",
+                    payload.resource.as_str(),
+                )?;
+                ensure_non_empty("invoke_settings_action", "action", payload.action.as_str())?;
+                host.invoke_settings_action(payload, host_output_stream)
+                    .await?;
             }
             FrameKind::SetAgentsViewPreferences => {
                 let payload: SetAgentsViewPreferencesPayload =

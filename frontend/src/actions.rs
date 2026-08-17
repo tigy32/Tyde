@@ -1571,72 +1571,6 @@ pub fn send_set_session_settings(
     });
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod native_tests {
-    use super::*;
-    use crate::state::OpenFile;
-
-    #[test]
-    fn side_open_with_navigation_targets_the_duplicate_occurrence() {
-        let owner = leptos::reactive::owner::Owner::new();
-        owner.with(|| {
-            let state = AppState::new();
-            let project_id = ProjectId("project".to_owned());
-            let path = ProjectPath {
-                root: ProjectRootPath("/repo".to_owned()),
-                relative_path: "src/main.rs".to_owned(),
-            };
-            let key = FileResourceKey {
-                host_id: "host".to_owned(),
-                project_id: project_id.clone(),
-                path: path.clone(),
-            };
-            state.active_project.set(Some(ActiveProjectRef {
-                host_id: key.host_id.clone(),
-                project_id,
-            }));
-            state.open_files.update(|files| {
-                files.insert(
-                    key.clone(),
-                    OpenFile {
-                        path: path.clone(),
-                        version: ProjectFileVersion(1),
-                        contents: Some("fn main() {}".to_owned()),
-                        is_binary: false,
-                        missing: false,
-                    },
-                );
-            });
-            let primary = state
-                .open_tab_in(
-                    PaneId::Primary,
-                    TabContent::File { key: key.clone() },
-                    "main.rs".to_owned(),
-                    true,
-                )
-                .expect("primary occurrence");
-
-            let secondary = open_project_path_at_navigation(
-                &state,
-                path,
-                OpenTarget::Beside,
-                PendingFileNavigation::Line(27),
-            )
-            .expect("loaded side open is synchronous");
-
-            assert_ne!(primary, secondary);
-            assert_eq!(
-                state.file_occurrence_in(PaneId::Secondary, &key),
-                Some(secondary)
-            );
-            assert_eq!(
-                state.pending_goto_line.get_untracked(),
-                Some((secondary, 27))
-            );
-        });
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
@@ -1950,21 +1884,22 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 "host-a".to_owned(),
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },

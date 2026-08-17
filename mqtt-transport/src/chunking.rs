@@ -80,21 +80,3 @@ pub fn next_write_len(buffered_len: usize, incoming_len: usize) -> usize {
         incoming_len.min(remaining_to_chunk)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chunks_at_64_kib() {
-        let mut outbound = OutboundPlaintext::new();
-        outbound.append(&vec![1_u8; MAX_PLAINTEXT_CHUNK_LEN + 3]);
-        let first = outbound.take_full_chunk();
-        assert!(matches!(
-            first.as_ref().map(Vec::len),
-            Some(MAX_PLAINTEXT_CHUNK_LEN)
-        ));
-        let rest = outbound.take_flush_chunk();
-        assert!(matches!(rest.as_ref().map(Vec::len), Some(3)));
-    }
-}

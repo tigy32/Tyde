@@ -275,28 +275,3 @@ fn find_matching_executable_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> 
         candidate.is_file().then_some(candidate)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn extract_probe_value_finds_payload_amidst_noise() {
-        let input = format!(
-            "welcome\nsome plugin output\n{begin}/opt/homebrew/bin/claude{end}\ntrailing\n",
-            begin = PROBE_SENTINEL_BEGIN,
-            end = PROBE_SENTINEL_END,
-        );
-        assert_eq!(
-            extract_probe_value(&input),
-            Some("/opt/homebrew/bin/claude")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn extract_probe_value_returns_none_without_sentinels() {
-        assert_eq!(extract_probe_value("just some random output\n"), None);
-    }
-}

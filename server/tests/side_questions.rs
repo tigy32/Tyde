@@ -1,199 +1,37 @@
 mod fixture;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId,
-    AgentOrigin, BackendAccessMode, BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload,
-    Envelope, FrameError, FrameKind, HostBootstrapPayload, NewAgentPayload, SessionId,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentOrigin, BackendAccessMode, BackendKind,
+    ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, NewAgentPayload,
+    SessionId, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use server::backend::BackendSession;
+use server::backend::mock::MockTurn;
 use server::store::session::{SessionRecord, SessionStore};
-
-async fn connect_host(host: server::HostHandle) -> (client::Connection, HostBootstrapPayload) {
-    let (client_stream, server_stream) = tokio::io::duplex(8192);
-    let server_config = server::ServerConfig::current();
-    let client_config = client::ClientConfig::current();
-
-    tokio::spawn(async move {
-        let conn = server::accept(&server_config, server_stream)
-            .await
-            .expect("server handshake failed");
-        if let Err(err) = server::run_connection(conn, host).await {
-            eprintln!("server connection loop failed: {err:?}");
-        }
-    });
-
-    let mut client = client::connect(&client_config, client_stream)
-        .await
-        .expect("client handshake failed");
-    let env = next_raw_event(&mut client, "host bootstrap")
-        .await
-        .expect("host bootstrap read failed")
-        .expect("connection closed before host bootstrap");
-    assert_eq!(env.kind, FrameKind::HostBootstrap);
-    let bootstrap = env.parse_payload().expect("parse HostBootstrapPayload");
-    (client, bootstrap)
-}
-
-async fn next_raw_event(
-    client: &mut client::Connection,
-    context: &str,
-) -> Result<Option<Envelope>, FrameError> {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(result) => result,
-        Err(_) => panic!("timed out waiting for {context}"),
-    }
-}
 
 async fn expect_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
-        let pending_key = client as *mut client::Connection as usize;
-        if let Some(env) = pop_pending_agent_event(pending_key) {
-            if fixture::is_builtin_team_custom_agent_notify(&env) || is_noise(&env) {
-                continue;
-            }
-            return env;
-        }
-        let env = next_raw_event(client, context)
-            .await
-            .unwrap_or_else(|err| panic!("next_event failed before {context}: {err:?}"))
-            .unwrap_or_else(|| panic!("connection closed before {context}"));
-        if fixture::is_builtin_team_custom_agent_notify(&env) || is_noise(&env) {
-            continue;
-        }
-        if env.kind == FrameKind::AgentBootstrap {
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            if let Some(first) = record_agent_bootstrap_events(pending_key, &env.stream, bootstrap)
-            {
-                return first;
-            }
+        let env = fixture::next_logical_frame_on(client, context).await;
+        if is_noise(&env) {
             continue;
         }
         return env;
     }
 }
 
-type PendingAgentEvents = HashMap<usize, HashMap<StreamPath, VecDeque<Envelope>>>;
-
-fn pending_agent_events() -> &'static Mutex<PendingAgentEvents> {
-    static PENDING: OnceLock<Mutex<PendingAgentEvents>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn record_agent_bootstrap_events(
-    pending_key: usize,
-    stream: &StreamPath,
-    bootstrap: AgentBootstrapPayload,
-) -> Option<Envelope> {
-    let mut events = bootstrap
-        .events
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
-    let first = events.next();
-    let mut rest = events.collect::<VecDeque<_>>();
-    if !rest.is_empty() {
-        push_pending_agent_events(pending_key, stream, &mut rest);
-    }
-    first
-}
-
-fn push_pending_agent_events(
-    pending_key: usize,
-    stream: &StreamPath,
-    events: &mut VecDeque<Envelope>,
-) {
-    pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned")
-        .entry(pending_key)
-        .or_default()
-        .entry(stream.clone())
-        .or_default()
-        .append(events);
-}
-
-fn pop_pending_agent_event(pending_key: usize) -> Option<Envelope> {
-    let mut pending = pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned");
-    let streams = pending.get_mut(&pending_key)?;
-    let stream = streams.keys().next().cloned()?;
-    let queue = streams
-        .get_mut(&stream)
-        .expect("pending stream key disappeared while popping");
-    let env = queue.pop_front();
-    if queue.is_empty() {
-        streams.remove(&stream);
-    }
-    if streams.is_empty() {
-        pending.remove(&pending_key);
-    }
-    env
-}
-
 fn is_noise(env: &Envelope) -> bool {
-    matches!(
-        env.kind,
-        FrameKind::SessionSettings
-            | FrameKind::QueuedMessages
-            | FrameKind::SessionList
-            | FrameKind::SessionSchemas
-            | FrameKind::LaunchProfileCatalogNotify
-            | FrameKind::BackendSetup
-            | FrameKind::TeamPresetCatalogNotify
-            | FrameKind::TaskTokenUsage
-            | FrameKind::HostSettings
-    )
-}
-
-fn agent_bootstrap_event_envelope(
-    stream: &StreamPath,
-    seq: u64,
-    event: AgentBootstrapEvent,
-) -> Option<Envelope> {
-    match event {
-        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentStart,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentError,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::SessionSettings(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::SessionSettings,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::QueuedMessages(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::QueuedMessages,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::AgentActivityStats(_)
-        | AgentBootstrapEvent::ContextCompaction(_)
-        | AgentBootstrapEvent::ContextCompactionCapability(_)
-        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
-    }
-    .map(|result| result.expect("serialize synthetic bootstrap event"))
+    fixture::is_routine_control_plane_frame(env)
+        || matches!(
+            env.kind,
+            FrameKind::SessionList
+                | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::TaskTokenUsage
+                | FrameKind::HostSettings
+        )
 }
 
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
@@ -211,11 +49,10 @@ async fn expect_new_agent_with_diagnostics(
     context: &str,
 ) -> NewAgentPayload {
     let deadline = Instant::now() + Duration::from_secs(5);
-    let pending_key = client as *mut client::Connection as usize;
     let mut observed = Vec::new();
     let mut deferred = HashMap::<StreamPath, VecDeque<Envelope>>::new();
     loop {
-        let env = if let Some(env) = pop_pending_agent_event(pending_key) {
+        let env = if let Some(env) = fixture::pop_pending_frame_on(client) {
             env
         } else {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -254,23 +91,21 @@ async fn expect_new_agent_with_diagnostics(
             observed.last().expect("just pushed diagnostic frame")
         );
         if env.kind == FrameKind::NewAgent {
-            for (stream, mut events) in deferred {
-                push_pending_agent_events(pending_key, &stream, &mut events);
+            for (_, events) in deferred {
+                fixture::push_pending_frames_on(client, events);
             }
             return env.parse_payload().expect("parse NewAgentPayload");
         }
         if env.kind == FrameKind::AgentBootstrap {
             let stream = env.stream.clone();
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            let bootstrap_event_count = bootstrap.events.len();
-            for (index, event) in bootstrap.events.into_iter().enumerate() {
-                if let Some(event) = agent_bootstrap_event_envelope(&stream, index as u64, event) {
-                    observed.push(format!(
-                        "bootstrap kind={:?} stream={} seq={} payload={}",
-                        event.kind, event.stream, event.seq, event.payload
-                    ));
-                    deferred.entry(stream.clone()).or_default().push_back(event);
-                }
+            let events = fixture::agent_bootstrap_frames(&env);
+            let bootstrap_event_count = events.len();
+            for event in events {
+                observed.push(format!(
+                    "bootstrap kind={:?} stream={} seq={} payload={}",
+                    event.kind, event.stream, event.seq, event.payload
+                ));
+                deferred.entry(stream.clone()).or_default().push_back(event);
             }
             eprintln!(
                 "diagnostic stale-parent AgentBootstrap unpacked: stream={} events={bootstrap_event_count}",
@@ -290,13 +125,12 @@ async fn expect_agent_start(
     stream: &StreamPath,
     context: &str,
 ) -> protocol::AgentStartPayload {
-    let pending_key = client as *mut client::Connection as usize;
     let mut deferred = VecDeque::new();
     loop {
         let env = expect_event(client, context).await;
         if env.stream == *stream && env.kind == FrameKind::AgentStart {
             if !deferred.is_empty() {
-                push_pending_agent_events(pending_key, stream, &mut deferred);
+                fixture::push_pending_frames_on(client, deferred);
             }
             return env.parse_payload().expect("parse AgentStartPayload");
         }
@@ -323,12 +157,10 @@ async fn expect_command_error(
     client: &mut client::Connection,
     context: &str,
 ) -> CommandErrorPayload {
-    loop {
-        let env = expect_event(client, context).await;
-        if env.kind == FrameKind::CommandError {
-            return env.parse_payload().expect("parse CommandErrorPayload");
-        }
-    }
+    fixture::next_frame_matching_on(client, context, |env| env.kind == FrameKind::CommandError)
+        .await
+        .parse_payload()
+        .expect("parse CommandErrorPayload")
 }
 
 async fn collect_turn_delta_text(
@@ -382,9 +214,8 @@ async fn wait_for_session_count(store_dir: &std::path::Path, count: usize) -> Ve
 #[tokio::test]
 async fn mock_fork_creates_interactive_side_question_with_lineage() {
     let mut fixture = Fixture::new().await;
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
+    let (parent, parent_start) = fixture
+        .spawn_with(SpawnAgentPayload {
             name: Some("Parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -400,24 +231,16 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
                 session_settings: None,
             },
         })
-        .await
-        .expect("spawn parent");
+        .await;
 
-    let parent = expect_new_agent(&mut fixture.client, "parent NewAgent").await;
-    assert_eq!(parent.origin, AgentOrigin::User);
-    let parent_start = expect_agent_start(
-        &mut fixture.client,
-        &parent.instance_stream,
-        "parent AgentStart",
-    )
-    .await;
+    assert_eq!(parent.new_agent.origin, AgentOrigin::User);
     assert_eq!(parent_start.origin, AgentOrigin::User);
     let parent_start_session_id = parent_start
         .session_id
         .clone()
         .expect("parent AgentStart should include live session_id");
     let parent_initial =
-        collect_turn_delta_text(&mut fixture.client, &parent.instance_stream, "parent turn").await;
+        collect_turn_delta_text(&mut fixture.client, &parent.stream, "parent turn").await;
     assert!(parent_initial.contains("mock backend response to: parent prompt"));
 
     let sessions = wait_for_session_count(fixture.store_dir(), 1).await;
@@ -427,7 +250,7 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
     let bootstrapped_parent = second_bootstrap
         .agents
         .iter()
-        .find(|agent| agent.agent_id == parent.agent_id)
+        .find(|agent| agent.agent_id == parent.new_agent.agent_id)
         .expect("parent NewAgent in second host bootstrap");
     assert_eq!(
         bootstrapped_parent.session_id.as_ref(),
@@ -435,12 +258,11 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
         "HostBootstrap NewAgent should retain the live session_id"
     );
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
+    let (child, child_start) = fixture
+        .spawn_with(SpawnAgentPayload {
             name: Some("BTW".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(parent.agent_id.clone()),
+            parent_agent_id: Some(parent.new_agent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: parent_session_id.clone(),
@@ -449,31 +271,29 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
                 access_mode: None,
             },
         })
-        .await
-        .expect("spawn side question");
+        .await;
 
-    let child = expect_new_agent(&mut fixture.client, "child NewAgent").await;
-    assert_eq!(child.origin, AgentOrigin::SideQuestion);
-    assert_eq!(child.parent_agent_id, Some(parent.agent_id.clone()));
-    let child_start = expect_agent_start(
-        &mut fixture.client,
-        &child.instance_stream,
-        "child AgentStart",
-    )
-    .await;
+    assert_eq!(child.new_agent.origin, AgentOrigin::SideQuestion);
+    assert_eq!(
+        child.new_agent.parent_agent_id,
+        Some(parent.new_agent.agent_id.clone())
+    );
     assert_eq!(child_start.origin, AgentOrigin::SideQuestion);
-    assert_eq!(child_start.parent_agent_id, Some(parent.agent_id.clone()));
+    assert_eq!(
+        child_start.parent_agent_id,
+        Some(parent.new_agent.agent_id.clone())
+    );
     let child_start_session_id = child_start
         .session_id
         .clone()
         .expect("child AgentStart should include forked session_id");
     assert_ne!(child_start_session_id, parent_session_id);
     let mut child_initial =
-        collect_turn_delta_text(&mut fixture.client, &child.instance_stream, "child turn").await;
+        collect_turn_delta_text(&mut fixture.client, &child.stream, "child turn").await;
     if !child_initial.contains("mock backend response to: child prompt") {
         child_initial = collect_turn_delta_text(
             &mut fixture.client,
-            &child.instance_stream,
+            &child.stream,
             "child live turn after fork history",
         )
         .await;
@@ -497,39 +317,35 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
     assert_eq!(child_session.backend_kind, BackendKind::Claude);
 
     fixture
-        .client
-        .send_message(
-            &child.instance_stream,
-            "__mock_history__ child follow-up".to_owned(),
-        )
+        .mock(&child)
         .await
-        .expect("send child follow-up");
-    let child_history = collect_turn_delta_text(
-        &mut fixture.client,
-        &child.instance_stream,
-        "child history turn",
-    )
-    .await;
-    assert!(child_history.contains("parent prompt"));
-    assert!(child_history.contains("child prompt"));
-    assert!(child_history.contains("__mock_history__ child follow-up"));
-
+        .enqueue(MockTurn::history_join())
+        .await;
     fixture
         .client
-        .send_message(
-            &parent.instance_stream,
-            "__mock_history__ parent follow-up".to_owned(),
-        )
+        .send_message(&child.stream, "child follow-up".to_owned())
+        .await
+        .expect("send child follow-up");
+    let child_history =
+        collect_turn_delta_text(&mut fixture.client, &child.stream, "child history turn").await;
+    assert!(child_history.contains("parent prompt"));
+    assert!(child_history.contains("child prompt"));
+    assert!(child_history.contains("child follow-up"));
+
+    fixture
+        .mock(&parent)
+        .await
+        .enqueue(MockTurn::history_join())
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "parent follow-up".to_owned())
         .await
         .expect("send parent follow-up");
-    let parent_history = collect_turn_delta_text(
-        &mut fixture.client,
-        &parent.instance_stream,
-        "parent history turn",
-    )
-    .await;
+    let parent_history =
+        collect_turn_delta_text(&mut fixture.client, &parent.stream, "parent history turn").await;
     assert!(parent_history.contains("parent prompt"));
-    assert!(parent_history.contains("__mock_history__ parent follow-up"));
+    assert!(parent_history.contains("parent follow-up"));
     assert!(
         !parent_history.contains("child prompt"),
         "parent history was mutated by child fork: {parent_history}"
@@ -585,9 +401,8 @@ async fn server_rejects_fork_without_parent_or_source_session() {
 async fn stale_fork_source_session_fails_as_agent_error() {
     let mut fixture = Fixture::new().await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
+    let (child, _child_start) = fixture
+        .spawn_with(SpawnAgentPayload {
             name: Some("Stale BTW".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(AgentId("missing-parent-agent".to_owned())),
@@ -599,23 +414,10 @@ async fn stale_fork_source_session_fails_as_agent_error() {
                 access_mode: None,
             },
         })
-        .await
-        .expect("send stale fork spawn");
+        .await;
 
-    let child = expect_new_agent(&mut fixture.client, "stale fork NewAgent").await;
-    assert_eq!(child.origin, AgentOrigin::SideQuestion);
-    let _ = expect_agent_start(
-        &mut fixture.client,
-        &child.instance_stream,
-        "stale fork start",
-    )
-    .await;
-    let error = expect_agent_error(
-        &mut fixture.client,
-        &child.instance_stream,
-        "stale fork error",
-    )
-    .await;
+    assert_eq!(child.new_agent.origin, AgentOrigin::SideQuestion);
+    let error = expect_agent_error(&mut fixture.client, &child.stream, "stale fork error").await;
     assert_eq!(error.code, AgentErrorCode::Internal);
     assert!(error.message.contains("cannot fork missing session"));
 }
@@ -650,7 +452,7 @@ async fn fork_rejects_orphan_parent_even_when_source_session_exists() {
 
     let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
         .expect("spawn host");
-    let (mut client, _bootstrap) = connect_host(host).await;
+    let (mut client, _bootstrap) = fixture::connect_host(host).await;
 
     client
         .spawn_agent(SpawnAgentPayload {
@@ -708,7 +510,7 @@ async fn stale_parent_fork_fails_without_touching_source_session() {
 
     let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
         .expect("spawn real-backend host");
-    let (mut client, _bootstrap) = connect_host(host.clone()).await;
+    let (mut client, _bootstrap) = fixture::connect_host(host.clone()).await;
 
     client
         .spawn_agent(SpawnAgentPayload {

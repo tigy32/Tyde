@@ -1,37 +1,29 @@
 mod fixture;
 
+use settings_model::HostSettingsPayload;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
     AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorPayload,
-    DiffContextMode, Envelope, FrameKind, HostSettingValue, HostSettingsPayload, MessageOrigin,
-    MessageSender, NewAgentPayload, Project, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review, ReviewActionPayload,
-    ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload,
-    ReviewCommentId, ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide,
-    ReviewErrorCode, ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
-    ReviewSubmitTarget, ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState,
-    ReviewSummaryScope, SessionId, SessionListPayload, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
+    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
+    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
+    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
+    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
+    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget,
+    ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, ReviewSummaryScope,
+    SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
 use serde_json::json;
-
-async fn next_env(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(10), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
-    }
-}
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
 async fn next_env_before(
     client: &mut client::Connection,
@@ -48,34 +40,42 @@ async fn next_env_before(
     }
 }
 
+fn project_stream(project: &Project) -> String {
+    format!("/project/{}", project.id.0)
+}
+
 async fn expect_project(client: &mut client::Connection, context: &str) -> Project {
-    loop {
-        let env = next_env(client, context).await;
+    let mut project = None;
+    next_frame_matching_on(client, context, |env| {
         if env.kind != FrameKind::ProjectNotify || !env.stream.0.starts_with("/host/") {
-            continue;
+            return false;
         }
         match env
             .parse_payload::<ProjectNotifyPayload>()
             .expect("project notify")
         {
-            ProjectNotifyPayload::Upsert { project } => return project,
-            ProjectNotifyPayload::Delete { .. } => continue,
+            ProjectNotifyPayload::Upsert { project: upserted } => {
+                project = Some(upserted);
+                true
+            }
+            ProjectNotifyPayload::Delete { .. } => false,
         }
-    }
+    })
+    .await;
+    project.expect("matched project upsert")
 }
 
 async fn expect_project_bootstrap(
     client: &mut client::Connection,
     project: &Project,
 ) -> ProjectBootstrapPayload {
-    loop {
-        let env = next_env(client, "project bootstrap").await;
-        if env.kind == FrameKind::ProjectBootstrap
-            && env.stream.0 == format!("/project/{}", project.id.0)
-        {
-            return env.parse_payload().expect("project bootstrap payload");
-        }
-    }
+    let stream = project_stream(project);
+    next_frame_matching_on(client, "project bootstrap", |env| {
+        env.kind == FrameKind::ProjectBootstrap && env.stream.0 == stream
+    })
+    .await
+    .parse_payload()
+    .expect("project bootstrap payload")
 }
 
 async fn expect_existing_review_create_echo(
@@ -83,10 +83,10 @@ async fn expect_existing_review_create_echo(
     project: &Project,
     review_id: &ReviewId,
 ) {
+    let stream = project_stream(project);
     let mut saw_bootstrap = false;
     let mut saw_list_changed = false;
-    while !saw_bootstrap || !saw_list_changed {
-        let env = next_env(client, "existing review_create echo").await;
+    next_frame_matching_on(client, "existing review_create echo", |env| {
         match env.kind {
             FrameKind::ReviewBootstrap => {
                 let bootstrap: ReviewBootstrapPayload =
@@ -95,23 +95,20 @@ async fn expect_existing_review_create_echo(
                     saw_bootstrap = true;
                 }
             }
-            FrameKind::ProjectEvent if env.stream.0 == format!("/project/{}", project.id.0) => {
-                match env
+            FrameKind::ProjectEvent if env.stream.0 == stream => {
+                if let ProjectEventPayload::ReviewListChanged { reviews } = env
                     .parse_payload::<ProjectEventPayload>()
                     .expect("project event payload")
+                    && reviews.iter().any(|summary| summary.id == *review_id)
                 {
-                    ProjectEventPayload::ReviewListChanged { reviews }
-                        if reviews.iter().any(|summary| summary.id == *review_id) =>
-                    {
-                        saw_list_changed = true;
-                    }
-                    ProjectEventPayload::ReviewListChanged { .. } => {}
-                    ProjectEventPayload::FilesChanged { .. } => {}
+                    saw_list_changed = true;
                 }
             }
             _ => {}
         }
-    }
+        saw_bootstrap && saw_list_changed
+    })
+    .await;
 }
 
 async fn expect_review_summary_update(
@@ -120,39 +117,51 @@ async fn expect_review_summary_update(
     review_id: &ReviewId,
     context: &str,
 ) -> protocol::ReviewSummary {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::ProjectEvent
-            && env.stream.0 == format!("/project/{}", project.id.0)
-        {
-            let ProjectEventPayload::ReviewListChanged { reviews } =
-                env.parse_payload().expect("project event payload")
-            else {
-                continue;
-            };
-            if let Some(summary) = reviews.into_iter().find(|summary| summary.id == *review_id) {
-                return summary;
-            }
+    let stream = project_stream(project);
+    let mut found = None;
+    next_frame_matching_on(client, context, |env| {
+        if env.kind != FrameKind::ProjectEvent || env.stream.0 != stream {
+            return false;
         }
-    }
+        let ProjectEventPayload::ReviewListChanged { reviews } =
+            env.parse_payload().expect("project event payload")
+        else {
+            return false;
+        };
+        match reviews.into_iter().find(|summary| summary.id == *review_id) {
+            Some(summary) => {
+                found = Some(summary);
+                true
+            }
+            None => false,
+        }
+    })
+    .await;
+    found.expect("matched review summary")
 }
 
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::NewAgent {
-            return env.parse_payload().expect("new agent payload");
-        }
-    }
+    next_frame_matching_on(client, context, |env| env.kind == FrameKind::NewAgent)
+        .await
+        .parse_payload()
+        .expect("new agent payload")
 }
 
 async fn expect_review_event(client: &mut client::Connection, context: &str) -> ReviewEventPayload {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::ReviewEvent {
-            return env.parse_payload().expect("review event payload");
-        }
-    }
+    next_frame_matching_on(client, context, |env| env.kind == FrameKind::ReviewEvent)
+        .await
+        .parse_payload()
+        .expect("review event payload")
+}
+
+async fn expect_review_bootstrap(client: &mut client::Connection, context: &str) -> Review {
+    next_frame_matching_on(client, context, |env| {
+        env.kind == FrameKind::ReviewBootstrap
+    })
+    .await
+    .parse_payload::<ReviewBootstrapPayload>()
+    .expect("review bootstrap payload")
+    .review
 }
 
 async fn expect_review_delta(client: &mut client::Connection, context: &str) -> ReviewEventPayload {
@@ -275,32 +284,30 @@ async fn expect_host_settings(
     client: &mut client::Connection,
     context: &str,
 ) -> HostSettingsPayload {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::HostSettings {
-            return env.parse_payload().expect("host settings payload");
-        }
-    }
+    next_frame_matching_on(client, context, |env| env.kind == FrameKind::HostSettings)
+        .await
+        .parse_payload()
+        .expect("host settings payload")
 }
 
 async fn set_default_backend(client: &mut client::Connection, backend_kind: BackendKind) {
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![backend_kind],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![backend_kind],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("enable backend");
     let settings = expect_host_settings(client, "enabled backend host settings").await;
     assert!(settings.settings.enabled_backends.contains(&backend_kind));
 
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::DefaultBackend {
-                default_backend: Some(backend_kind),
-            },
-        })
+        .replace_setting(
+            "/default_backend",
+            Some(backend_kind),
+            Option::<BackendKind>::None,
+        )
         .await
         .expect("set default backend");
     let settings = expect_host_settings(client, "default backend host settings").await;
@@ -316,18 +323,17 @@ async fn subscribe_review_with_payload(
         .review_subscribe(review_id, payload)
         .await
         .expect("review subscribe");
-    loop {
-        let env = next_env(client, "review subscribe bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            return bootstrap.review;
-        }
+    next_frame_matching_on(client, "review subscribe bootstrap", |env| {
         if env.kind == FrameKind::CommandError {
             let error: CommandErrorPayload = env.parse_payload().expect("command error payload");
             panic!("review subscribe command error: {error:?}");
         }
-    }
+        env.kind == FrameKind::ReviewBootstrap
+    })
+    .await
+    .parse_payload::<ReviewBootstrapPayload>()
+    .expect("review bootstrap payload")
+    .review
 }
 
 async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId) -> Review {
@@ -621,14 +627,7 @@ async fn create_review(
         )
         .await
         .expect("review create");
-    loop {
-        let env = next_env(client, "review bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            return bootstrap.review;
-        }
-    }
+    expect_review_bootstrap(client, "review bootstrap").await
 }
 
 async fn create_review_for_root(
@@ -649,14 +648,7 @@ async fn create_review_for_root(
         )
         .await
         .expect("review create");
-    loop {
-        let env = next_env(client, "review bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            return bootstrap.review;
-        }
-    }
+    expect_review_bootstrap(client, "review bootstrap").await
 }
 
 fn submit_to(agent: &NewAgentPayload) -> ReviewActionPayload {
@@ -736,12 +728,10 @@ async fn call_propose_review_comment_tool(
 
 async fn close_agent_and_wait(client: &mut client::Connection, stream: &protocol::StreamPath) {
     client.close_agent(stream).await.expect("close agent");
-    loop {
-        let env = next_env(client, "agent closed").await;
-        if env.kind == FrameKind::AgentClosed {
-            break;
-        }
-    }
+    next_frame_matching_on(client, "agent closed", |env| {
+        env.kind == FrameKind::AgentClosed
+    })
+    .await;
 }
 
 fn tyde_review_json(markdown: &str) -> &str {
@@ -758,6 +748,17 @@ fn tyde_review_json(markdown: &str) -> &str {
 #[tokio::test]
 async fn project_bootstrap_exposes_one_active_workspace_review() {
     let fixture = Fixture::new().await;
+    // Keep the reviewer running while its bootstrap state is inspected.
+    let reviewer_gate = MockGateHandle::new();
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::gated_text(
+                "mock review of both roots",
+                &reviewer_gate,
+            )),
+        )
+        .await;
     let mut client = fixture.client;
     set_default_backend(&mut client, BackendKind::Claude).await;
     let root = tempfile::tempdir().expect("temp root");
@@ -812,7 +813,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
             ReviewActionPayload::StartAiReview {
                 backend_kind: None,
                 cost_hint: None,
-                instructions: Some("__mock_slow__ Check both roots.".to_owned()),
+                instructions: Some("Check both roots.".to_owned()),
             },
         )
         .await
@@ -820,8 +821,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
 
     let mut new_agent = None;
     let mut running = None;
-    while new_agent.is_none() || running.is_none() {
-        let env = next_env(&mut client, "workspace AI reviewer start").await;
+    next_frame_matching_on(&mut client, "workspace AI reviewer start", |env| {
         match env.kind {
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
@@ -852,10 +852,13 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
             },
             _ => {}
         }
-    }
+        new_agent.is_some() && running.is_some()
+    })
+    .await;
     let new_agent = new_agent.expect("new AI Review agent");
     let running = running.expect("running AI reviewer state");
     assert_eq!(running.agent_id, Some(new_agent.agent_id.clone()));
+    drop(reviewer_gate);
     close_agent_and_wait(&mut client, &new_agent.instance_stream).await;
 }
 
@@ -903,16 +906,17 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
         .await
         .expect("start AI review on clean workspace");
 
-    let mut saw_error = false;
-    while !saw_error {
-        let env = next_env(&mut client, "clean workspace StartAiReview").await;
-        match env.kind {
+    next_frame_matching_on(
+        &mut client,
+        "clean workspace StartAiReview",
+        |env| match env.kind {
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
                 assert_ne!(
                     payload.name, "AI Review",
                     "clean StartAiReview must not spawn an AI Review agent"
                 );
+                false
             }
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event payload") {
                 ReviewEventPayload::Error { error } => {
@@ -926,7 +930,7 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
                         "unexpected clean StartAiReview error: {}",
                         error.message
                     );
-                    saw_error = true;
+                    true
                 }
                 ReviewEventPayload::AiReviewerChanged { state }
                     if state.status == ReviewAiReviewerStatus::Running =>
@@ -935,12 +939,14 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
                 }
                 ReviewEventPayload::Cleared { review: cleared } => {
                     assert_ne!(cleared.ai_reviewer.status, ReviewAiReviewerStatus::Running);
+                    false
                 }
-                _ => {}
+                _ => false,
             },
-            _ => {}
-        }
-    }
+            _ => false,
+        },
+    )
+    .await;
     assert_no_ai_review_spawned(&mut client, "clean StartAiReview").await;
 
     let snapshot = subscribe_review(&mut client, &review.id).await;
@@ -1020,6 +1026,17 @@ async fn create_review_add_update_delete_and_submit_live() {
 #[tokio::test]
 async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
     let fixture = Fixture::new().await;
+    // Keep the submit target busy so the review bundle must queue.
+    let origin_gate = MockGateHandle::new();
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: start review target",
+                &origin_gate,
+            )),
+        )
+        .await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
     let repo_a = root.path().join("review-root-a");
@@ -1043,13 +1060,8 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
     let review = subscribe_review(&mut client, &review_id).await;
     let location_a = new_line_location_for_root(&review, &project_roots(&project)[0]);
     let location_b = new_line_location_for_root(&review, &project_roots(&project)[1]);
-    let (agent, _session_id) = spawn_project_agent_with_prompt(
-        &mut client,
-        &project,
-        "start review target __mock_slow__",
-        false,
-    )
-    .await;
+    let (agent, _session_id) =
+        spawn_project_agent_with_prompt(&mut client, &project, "start review target", false).await;
 
     for (location, body) in [
         (location_a.clone(), "Root A review comment."),
@@ -1099,8 +1111,7 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
 
     let mut cleared_count = 0;
     let mut queued_review_message = None;
-    while cleared_count == 0 || queued_review_message.is_none() {
-        let env = next_env(&mut client, "workspace review submit").await;
+    next_frame_matching_on(&mut client, "workspace review submit", |env| {
         match env.kind {
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
                 ReviewEventPayload::Cleared { review: cleared } => {
@@ -1130,7 +1141,9 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
             }
             _ => {}
         }
-    }
+        cleared_count > 0 && queued_review_message.is_some()
+    })
+    .await;
     assert_eq!(cleared_count, 1);
     let queued_review_message = queued_review_message.expect("queued review message");
     let bundle: serde_json::Value = serde_json::from_str(tyde_review_json(&queued_review_message))
@@ -1440,14 +1453,7 @@ async fn create_review_does_not_require_origin_agent() {
         .await
         .expect("review create without origin");
 
-    let review = loop {
-        let env = next_env(&mut client, "origin-free review bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            break bootstrap.review;
-        }
-    };
+    let review = expect_review_bootstrap(&mut client, "origin-free review bootstrap").await;
     assert_eq!(review.project_id, project.id);
     assert!(matches!(review.status, ReviewStatus::Draft));
     assert_eq!(review.diffs.len(), 1);
@@ -1482,14 +1488,7 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
         .await
         .expect("review create with untracked binary");
 
-    let review = loop {
-        let env = next_env(&mut client, "binary review bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            break bootstrap.review;
-        }
-    };
+    let review = expect_review_bootstrap(&mut client, "binary review bootstrap").await;
     let diff = review.diffs.first().expect("binary review diff");
     let binary_file = diff
         .files
@@ -1580,8 +1579,7 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
 
     let mut saw_cleared = false;
     let mut delivered_message = None;
-    while !saw_cleared || delivered_message.is_none() {
-        let env = next_env(&mut client, "rendered review delivery").await;
+    next_frame_matching_on(&mut client, "rendered review delivery", |env| {
         match env.kind {
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
                 ReviewEventPayload::Cleared { review: cleared } => {
@@ -1607,7 +1605,9 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
             }
             _ => {}
         }
-    }
+        saw_cleared && delivered_message.is_some()
+    })
+    .await;
 
     let delivered_message = delivered_message.expect("review message should be delivered");
     assert!(delivered_message.contains("The user finished a review with 1 comments."));
@@ -1764,15 +1764,19 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     let review = create_review(&mut client, &project, &agent).await;
     let location = new_line_location(&review);
 
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::held_text("mock reviewer holding until interrupt")),
+        )
+        .await;
     client
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
                 backend_kind: None,
                 cost_hint: None,
-                instructions: Some(
-                    "__mock_hold_until_interrupt__ Look for changed return values.".to_owned(),
-                ),
+                instructions: Some("Look for changed return values.".to_owned()),
             },
         )
         .await
@@ -1780,9 +1784,7 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
 
     let mut reviewer_agent_id = None;
     let mut reviewer_stream = None;
-    let mut suggestion = None;
-    while suggestion.is_none() || reviewer_stream.is_none() {
-        let env = next_env(&mut client, "AI reviewer proposal").await;
+    next_frame_matching_on(&mut client, "AI reviewer start", |env| {
         match env.kind {
             FrameKind::NewAgent => {
                 let new_agent: NewAgentPayload = env.parse_payload().expect("new AI reviewer");
@@ -1804,32 +1806,50 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
                     if state.status == ReviewAiReviewerStatus::Running
                         && reviewer_agent_id.is_none() =>
                 {
-                    let agent_id = state.agent_id.expect("running AI reviewer agent id");
-                    let tool_result = call_propose_review_comment_tool(
-                        &fixture,
-                        &agent_id,
-                        &review.id,
-                        location.clone(),
-                    )
-                    .await;
-                    assert_eq!(
-                        tool_result["status"], "success",
-                        "unexpected tool result: {tool_result}"
-                    );
-                    reviewer_agent_id = Some(agent_id);
-                }
-                ReviewEventPayload::SuggestionUpsert {
-                    suggestion: proposed,
-                } if reviewer_agent_id.is_some() => {
-                    suggestion = Some(proposed);
+                    reviewer_agent_id = Some(state.agent_id.expect("running AI reviewer agent id"));
                 }
                 _ => {}
             },
             _ => {}
         }
-    }
+        reviewer_agent_id.is_some() && reviewer_stream.is_some()
+    })
+    .await;
     let reviewer_agent_id = reviewer_agent_id.expect("reviewer agent id");
     let reviewer_stream = reviewer_stream.expect("reviewer stream");
+
+    let tool_result = call_propose_review_comment_tool(
+        &fixture,
+        &reviewer_agent_id,
+        &review.id,
+        location.clone(),
+    )
+    .await;
+    assert_eq!(
+        tool_result["status"], "success",
+        "unexpected tool result: {tool_result}"
+    );
+
+    let mut suggestion = None;
+    next_frame_matching_on(&mut client, "AI reviewer proposal", |env| {
+        if env.kind != FrameKind::ReviewEvent {
+            return false;
+        }
+        match env.parse_payload().expect("review event") {
+            ReviewEventPayload::Snapshot { review } => panic!(
+                "review mutation emitted unexpected Snapshot for review {} while waiting for the AI proposal",
+                review.id.0
+            ),
+            ReviewEventPayload::SuggestionUpsert {
+                suggestion: proposed,
+            } => {
+                suggestion = Some(proposed);
+                true
+            }
+            _ => false,
+        }
+    })
+    .await;
     let suggestion = suggestion.expect("AI suggestion upsert");
     assert_eq!(suggestion.reviewer_agent_id, reviewer_agent_id);
     assert_eq!(suggestion.body, "AI found a review issue.");
@@ -2073,14 +2093,7 @@ async fn second_review_create_attaches_to_existing_singleton() {
         )
         .await
         .expect("send second review create");
-    let second = loop {
-        let env = next_env(&mut client, "second review_create bootstrap").await;
-        if env.kind == FrameKind::ReviewBootstrap {
-            let bootstrap: ReviewBootstrapPayload =
-                env.parse_payload().expect("review bootstrap payload");
-            break bootstrap.review;
-        }
-    };
+    let second = expect_review_bootstrap(&mut client, "second review_create bootstrap").await;
     assert_eq!(second.id, first.id);
     assert!(matches!(second.status, ReviewStatus::Draft));
 
@@ -2140,6 +2153,18 @@ async fn fallback_review_create_for_existing_draft_echoes_review_list() {
 #[tokio::test]
 async fn queued_review_bundle_clears_after_successful_enqueue() {
     let fixture = Fixture::new().await;
+    // Origin agent busy window scripted with a test gate (see the workspace
+    // counts test): the submitted bundle must queue on a provably busy agent.
+    let origin_gate = MockGateHandle::new();
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: start review origin",
+                &origin_gate,
+            )),
+        )
+        .await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("review-root");
@@ -2147,13 +2172,8 @@ async fn queued_review_bundle_clears_after_successful_enqueue() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, _session_id) = spawn_project_agent_with_prompt(
-        &mut client,
-        &project,
-        "start review origin __mock_slow__",
-        false,
-    )
-    .await;
+    let (agent, _session_id) =
+        spawn_project_agent_with_prompt(&mut client, &project, "start review origin", false).await;
     let review = create_review(&mut client, &project, &agent).await;
     let _comment_id = add_comment(&mut client, &review, "Queued delivery comment.").await;
 
@@ -2164,8 +2184,7 @@ async fn queued_review_bundle_clears_after_successful_enqueue() {
 
     let mut saw_cleared = false;
     let mut saw_queued_origin = false;
-    while !saw_cleared || !saw_queued_origin {
-        let env = next_env(&mut client, "queued review bundle").await;
+    next_frame_matching_on(&mut client, "queued review bundle", |env| {
         match env.kind {
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
                 ReviewEventPayload::Cleared { review: cleared } => {
@@ -2189,7 +2208,9 @@ async fn queued_review_bundle_clears_after_successful_enqueue() {
             }
             _ => {}
         }
-    }
+        saw_cleared && saw_queued_origin
+    })
+    .await;
 }
 
 #[tokio::test]

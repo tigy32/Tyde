@@ -15,27 +15,12 @@ use uuid::Uuid;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = match timeout(EVENT_TIMEOUT, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-
-        if matches!(
+fn is_ambient_broadcast(env: &Envelope) -> bool {
+    fixture::is_routine_control_plane_frame(env)
+        || matches!(
             env.kind,
             FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
                 | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
@@ -45,50 +30,26 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::ProjectFileList
                 | FrameKind::ProjectGitStatus
                 | FrameKind::CodeIntelOverview
-        ) {
+        )
+}
+
+async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
+    loop {
+        let env = match timeout(EVENT_TIMEOUT, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if is_ambient_broadcast(&env) {
             continue;
         }
-
         return env;
     }
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    loop {
-        match timeout(duration, client.next_event()).await {
-            Err(_) => return,
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionList
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::ProjectBootstrap
-                            | FrameKind::ProjectEvent
-                            | FrameKind::ProjectFileList
-                            | FrameKind::ProjectGitStatus
-                            | FrameKind::CodeIntelOverview
-                    ) =>
-            {
-                continue;
-            }
-            Ok(Ok(Some(env))) => panic!(
-                "unexpected event before {context}: kind={} stream={}",
-                env.kind, env.stream
-            ),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
+    fixture::assert_no_interesting_frame_on(client, duration, context, is_ambient_broadcast).await;
 }
 
 async fn create_project(

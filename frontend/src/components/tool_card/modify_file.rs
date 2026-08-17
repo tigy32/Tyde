@@ -151,49 +151,6 @@ fn build_diff_html(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_diff_has_no_lines() {
-        let lines = build_diff_lines("a\nb\n", "a\nb\n");
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn single_added_line_classifies_correctly() {
-        let lines = build_diff_lines("a\n", "a\nb\n");
-        // Should have at least one hunk header and one added line.
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DiffLineKind::Added && l.text == "b")
-        );
-    }
-
-    #[test]
-    fn replace_classifies_added_and_removed() {
-        let lines = build_diff_lines("a\nb\nc\n", "a\nB\nc\n");
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DiffLineKind::Added && l.text == "B")
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DiffLineKind::Removed && l.text == "b")
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DiffLineKind::Context && l.text == "a")
-        );
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;

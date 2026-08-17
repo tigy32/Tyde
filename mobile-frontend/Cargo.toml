@@ -8,6 +8,7 @@ ui-fixtures = []
 
 [dependencies]
 protocol = { path = "../protocol" }
+settings-model = { path = "../settings-model" }
 host-config = { path = "../host-config" }
 mobile-shell-types = { path = "../mobile-shell-types" }
 # Direct-to-wasm MQTT transport for the browser (PWA) backend. The native

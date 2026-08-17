@@ -8,14 +8,14 @@ use protocol::{
 use tokio::io::BufReader;
 use uuid::Uuid;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn handshake_happy_path() {
     let fixture = Fixture::new().await;
 
     assert_eq!(fixture.client.outgoing_seq.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn handshake_rejects_incompatible_protocol() {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();
@@ -46,7 +46,7 @@ async fn handshake_rejects_incompatible_protocol() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn incompatible_protocol_reject_includes_configured_release_version() {
     server::set_host_release_version("0.8.19-beta.16");
     let (client_stream, server_stream) = tokio::io::duplex(8192);
@@ -78,7 +78,7 @@ async fn incompatible_protocol_reject_includes_configured_release_version() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn handshake_rejects_wrong_first_frame_kind() {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();
@@ -121,7 +121,7 @@ async fn handshake_rejects_wrong_first_frame_kind() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn handshake_rejects_invalid_stream_path() {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();

@@ -1,18 +1,19 @@
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::{collections::BTreeMap, mem};
 
-use protocol::{
-    ACP_BACKEND, BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings,
-    HostLaunchProfileConfig, HostSettingValue, HostSettings, LEGACY_KIRO_BACKEND, LaunchProfileId,
+use protocol::{ACP_BACKEND, BackendKind, BrokerUrl, LEGACY_KIRO_BACKEND, LaunchProfileId};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use settings_model::{
+    CodeIntelSettings, HostLaunchProfileConfig, HostSettings,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
     SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
     SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, TYDE_AGENT_CONTROL_MAX_DEPTH_MAX,
     TYDE_AGENT_CONTROL_MAX_DEPTH_MIN,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 const CANONICAL_BACKENDS: [BackendKind; 6] = [
     BackendKind::Tycode,
@@ -52,9 +53,21 @@ struct StoreFile {
     settings: HostSettings,
 }
 
+/// The random per-host key secret version tokens are derived with. Never
+/// printed: a leaked key would let an attacker verify guessed secret values
+/// against published tokens.
+struct SecretTokenKey([u8; 32]);
+
+impl std::fmt::Debug for SecretTokenKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretTokenKey(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct HostSettingsStore {
     path: PathBuf,
+    secret_key: std::sync::OnceLock<SecretTokenKey>,
 }
 
 impl HostSettingsStore {
@@ -68,8 +81,59 @@ impl HostSettingsStore {
         // it.
         Self::migrate_legacy_kiro_settings(&path)?;
         Self::migrate_legacy_gemini_settings(&path)?;
+        Self::migrate_launch_profiles_to_map(&path)?;
         let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            secret_key: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The persistent random key secret version tokens are keyed with.
+    /// Created lazily beside the settings store on first use (no secret
+    /// settings exist → the file is never created), stable across restarts
+    /// so tokens survive them without spurious conflicts.
+    pub fn secret_token_key(&self) -> Result<[u8; 32], String> {
+        if let Some(key) = self.secret_key.get() {
+            return Ok(key.0);
+        }
+        let key_path = self
+            .path
+            .parent()
+            .ok_or_else(|| format!("Settings store path has no parent: {}", self.path.display()))?
+            .join("settings.secret-token.key");
+        let key = match std::fs::read_to_string(&key_path) {
+            Ok(contents) => parse_secret_token_key(contents.trim())
+                .ok_or_else(|| format!("Corrupt secret token key file {}", key_path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut fresh = [0_u8; 32];
+                fresh[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                fresh[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                let encoded: String = fresh.iter().map(|byte| format!("{byte:02x}")).collect();
+                std::fs::create_dir_all(key_path.parent().expect("key path has a parent"))
+                    .map_err(|err| format!("Failed to create settings directory: {err}"))?;
+                let tmp_path = key_path.with_extension("key.tmp");
+                std::fs::write(&tmp_path, &encoded)
+                    .map_err(|err| format!("Failed to write secret token key: {err}"))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|err| format!("Failed to restrict secret token key: {err}"))?;
+                }
+                std::fs::rename(&tmp_path, &key_path)
+                    .map_err(|err| format!("Failed to install secret token key: {err}"))?;
+                fresh
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read secret token key {}: {err}",
+                    key_path.display()
+                ));
+            }
+        };
+        let _ = self.secret_key.set(SecretTokenKey(key));
+        Ok(self.secret_key.get().expect("secret key just set").0)
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -119,9 +183,11 @@ impl HostSettingsStore {
         Ok(true)
     }
 
-    pub fn apply(&self, setting: HostSettingValue) -> Result<HostSettings, String> {
-        let mut settings = Self::read_from_disk(&self.path)?;
-        apply_setting(&mut settings, setting)?;
+    /// Replaces the whole settings document (the generic `SettingsWrite`
+    /// path). The candidate runs through the same validation/normalization
+    /// as a load, so an invalid document is rejected with nothing written.
+    pub fn replace(&self, settings: HostSettings) -> Result<HostSettings, String> {
+        let settings = validate_settings(settings)?;
         Self::save(&self.path, &settings)?;
         Ok(settings)
     }
@@ -314,11 +380,13 @@ impl HostSettingsStore {
             }
         }
 
-        if let Some(profiles) = settings
-            .get_mut("launch_profiles")
-            .and_then(Value::as_array_mut)
-        {
-            for profile in profiles.iter_mut() {
+        if let Some(profiles) = settings.get_mut("launch_profiles") {
+            let profiles: Vec<&mut Value> = match profiles {
+                Value::Array(profiles) => profiles.iter_mut().collect(),
+                Value::Object(profiles) => profiles.values_mut().collect(),
+                _ => Vec::new(),
+            };
+            for profile in profiles {
                 let Some(profile) = profile.as_object_mut() else {
                     continue;
                 };
@@ -344,6 +412,55 @@ impl HostSettingsStore {
             Self::save_raw(path, &value)?;
         }
         Ok(())
+    }
+
+    fn migrate_launch_profiles_to_map(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read settings store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse settings store {}: {err}", path.display()))?;
+        let Some(profiles) = value
+            .get_mut("settings")
+            .and_then(Value::as_object_mut)
+            .and_then(|settings| settings.get_mut("launch_profiles"))
+        else {
+            return Ok(());
+        };
+        let Value::Array(entries) = profiles else {
+            return Ok(());
+        };
+
+        let entries = mem::take(entries);
+        let mut keyed = serde_json::Map::new();
+        for (index, profile) in entries.into_iter().enumerate() {
+            let id = profile
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Failed to migrate settings store {}: launch_profiles[{index}] has no valid id",
+                        path.display()
+                    )
+                })?
+                .to_owned();
+            if keyed.insert(id.clone(), profile).is_some() {
+                return Err(format!(
+                    "Failed to migrate settings store {}: duplicate launch profile id {id}",
+                    path.display()
+                ));
+            }
+        }
+        *profiles = Value::Object(keyed);
+        Self::save_raw(path, &value)
     }
 
     /// Write a settings document verbatim, without validating it as typed
@@ -430,212 +547,6 @@ impl HostSettingsStore {
     }
 }
 
-fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Result<(), String> {
-    match setting {
-        HostSettingValue::EnabledBackends { enabled_backends } => {
-            settings.enabled_backends = normalize_backend_list(enabled_backends);
-            if settings
-                .default_backend
-                .is_some_and(|kind| !settings.enabled_backends.contains(&kind))
-            {
-                settings.default_backend = None;
-            }
-        }
-        HostSettingValue::DefaultBackend { default_backend } => {
-            if default_backend.is_some_and(|kind| !settings.enabled_backends.contains(&kind)) {
-                return Err(format!(
-                    "default_backend {:?} must be present in enabled_backends",
-                    default_backend
-                ));
-            }
-            settings.default_backend = default_backend;
-        }
-        HostSettingValue::EnableMobileConnections { enabled } => {
-            settings.enable_mobile_connections = enabled;
-        }
-        HostSettingValue::MobileBrokerUrl { broker_url } => {
-            validate_mobile_broker_url_for_write(broker_url.as_ref())?;
-            settings.mobile_broker_url = broker_url;
-        }
-        HostSettingValue::TydeDebugMcpEnabled { enabled } => {
-            settings.tyde_debug_mcp_enabled = enabled;
-        }
-        HostSettingValue::TydeAgentControlMcpEnabled { enabled } => {
-            settings.tyde_agent_control_mcp_enabled = enabled;
-        }
-        HostSettingValue::TydeAgentControlMaxDepth { depth } => {
-            if !(TYDE_AGENT_CONTROL_MAX_DEPTH_MIN..=TYDE_AGENT_CONTROL_MAX_DEPTH_MAX)
-                .contains(&depth)
-            {
-                return Err(format!(
-                    "Tyde sub-agent depth must be between {} and {}",
-                    TYDE_AGENT_CONTROL_MAX_DEPTH_MIN, TYDE_AGENT_CONTROL_MAX_DEPTH_MAX,
-                ));
-            }
-            settings.tyde_agent_control_max_depth = depth;
-        }
-        HostSettingValue::ComplexityTiersEnabled { enabled } => {
-            settings.complexity_tiers_enabled = enabled;
-            // Seed editable per-backend configs from the built-in defaults so
-            // the settings UI always shows the actual Low/High behavior.
-            if enabled {
-                for kind in CANONICAL_BACKENDS {
-                    if kind == BackendKind::Codex {
-                        continue;
-                    }
-                    settings
-                        .backend_tier_configs
-                        .entry(kind)
-                        .or_insert_with(|| crate::backend::builtin_tier_config(kind));
-                }
-            }
-        }
-        HostSettingValue::BackendTiers { backend, config } => {
-            settings.backend_tier_configs.insert(backend, config);
-        }
-        HostSettingValue::BackendConfig { backend, values } => {
-            let previous = settings.backend_config.get(&backend);
-            let merged = crate::backend::merge_backend_config_update(backend, previous, &values)?;
-            if merged.0.is_empty() {
-                settings.backend_config.remove(&backend);
-            } else {
-                settings.backend_config.insert(backend, merged);
-            }
-        }
-        HostSettingValue::BackendNativeSettings { backend, .. } => {
-            return Err(format!(
-                "{backend:?} native settings are owned by the backend and are not stored in Tyde host settings"
-            ));
-        }
-        HostSettingValue::LaunchProfiles { profiles } => {
-            settings.launch_profiles = validate_launch_profile_configs(profiles)?;
-        }
-        HostSettingValue::HermesDisabledProviders { profile, providers } => {
-            let profile = profile.trim();
-            if profile.is_empty() {
-                return Err("hermes disabled providers need a profile name".to_owned());
-            }
-            let mut slugs: Vec<String> = Vec::new();
-            for slug in providers {
-                let slug = slug.trim().to_owned();
-                if slug.is_empty() || slugs.contains(&slug) {
-                    continue;
-                }
-                slugs.push(slug);
-            }
-            slugs.sort();
-            // An empty list is "nothing disabled", so drop the key entirely
-            // rather than persisting an empty vec that reads as configuration.
-            if slugs.is_empty() {
-                settings.hermes_disabled_providers.remove(profile);
-            } else {
-                settings
-                    .hermes_disabled_providers
-                    .insert(profile.to_owned(), slugs);
-            }
-        }
-        HostSettingValue::VoiceEnabled { enabled } => settings.voice.enabled = enabled,
-        HostSettingValue::VoiceAwsProfile { profile } => {
-            settings.voice.aws_profile = normalize_optional_voice_setting(profile, "AWS profile")?;
-        }
-        HostSettingValue::VoiceAwsRegion { region } => {
-            settings.voice.aws_region = normalize_optional_voice_setting(region, "AWS region")?;
-        }
-        HostSettingValue::VoiceNovaModel { model } => {
-            settings.voice.nova_model = validate_voice_model(&model)?.to_owned();
-        }
-        HostSettingValue::VoiceEndpointingSensitivity { sensitivity } => {
-            settings.voice.endpointing_sensitivity = sensitivity;
-        }
-        HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
-            BackgroundAgentFeature::AutoGenerateAgentNames => {
-                settings.background_agent_features.auto_generate_agent_names = enabled;
-            }
-            BackgroundAgentFeature::AgentActivitySummaries => {
-                settings.background_agent_features.agent_activity_summaries = enabled;
-            }
-        },
-        HostSettingValue::SupervisorEnabled { enabled } => {
-            settings.supervisor.enabled = enabled;
-        }
-        HostSettingValue::SupervisorSuperviseRestoredAgents { enabled } => {
-            settings.supervisor.supervise_restored_agents = enabled;
-        }
-        HostSettingValue::SupervisorStallTimeoutEnabled { enabled } => {
-            settings.supervisor.stall_timeout_enabled = enabled;
-        }
-        HostSettingValue::SupervisorStallTimeoutSeconds { seconds } => {
-            if !(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN..=SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX)
-                .contains(&seconds)
-            {
-                return Err(format!(
-                    "supervisor stall timeout must be between {} and {} seconds",
-                    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
-                ));
-            }
-            settings.supervisor.stall_timeout_seconds = seconds;
-        }
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled } => {
-            settings.supervisor.auto_compact_on_success = enabled;
-        }
-        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds } => {
-            if !(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
-                ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
-                .contains(&seconds)
-            {
-                return Err(format!(
-                    "supervisor auto-compact inactivity delay must be between {} and {} seconds",
-                    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
-                    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
-                ));
-            }
-            settings.supervisor.auto_compact_inactivity_delay_seconds = seconds;
-        }
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens } => {
-            settings.supervisor.auto_compact_min_context_tokens = tokens;
-        }
-        HostSettingValue::SupervisorMaxKicksPerTask { count } => {
-            if count == 0 {
-                return Err(
-                    "supervisor max kicks per task must be at least 1; disable the supervisor instead of setting it to 0"
-                        .to_owned(),
-                );
-            }
-            settings.supervisor.max_kicks_per_task = count;
-        }
-        HostSettingValue::SupervisorRetryAttempts { count } => {
-            if count > SUPERVISOR_RETRY_ATTEMPTS_MAX {
-                return Err(format!(
-                    "supervisor retry attempts must be between {} and {}",
-                    SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
-                ));
-            }
-            settings.supervisor.retry_attempts = count;
-        }
-        HostSettingValue::SupervisorCostTier { tier } => {
-            settings.supervisor.cost_tier = tier;
-        }
-        HostSettingValue::CodeIntelLanguageServerPath { provider, path } => match path {
-            Some(path) => {
-                if path.0.trim().is_empty() {
-                    return Err(format!(
-                        "code-intel language server path for {provider} must not be empty"
-                    ));
-                }
-                settings
-                    .code_intel
-                    .language_server_paths
-                    .insert(provider, path);
-            }
-            None => {
-                settings.code_intel.language_server_paths.remove(&provider);
-            }
-        },
-    }
-
-    Ok(())
-}
-
 /// Removes backend kinds this build doesn't know from everywhere they can
 /// appear in a raw settings file, returning a description of each skipped
 /// entry. Works on the raw JSON rather than `BackendKind` so a fake
@@ -690,33 +601,33 @@ fn strip_unknown_backend_kinds(value: &mut serde_json::Value) -> Vec<String> {
             known
         });
     }
-    if let Some(profiles) = settings
-        .get_mut("launch_profiles")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        profiles.retain(|profile| {
-            let Some(backend) = profile.get("backend_kind") else {
-                return true;
-            };
-            let known = is_known_backend_kind(backend);
-            if !known {
-                skipped.push(format!("launch_profiles backend_kind {backend}"));
+    if let Some(profiles) = settings.get_mut("launch_profiles") {
+        match profiles {
+            Value::Array(profiles) => {
+                profiles.retain(|profile| launch_profile_backend_is_known(profile, &mut skipped))
             }
-            known
-        });
+            Value::Object(profiles) => {
+                profiles.retain(|_, profile| launch_profile_backend_is_known(profile, &mut skipped))
+            }
+            _ => {}
+        }
     }
     skipped
 }
 
-fn is_known_backend_kind(value: &serde_json::Value) -> bool {
-    serde_json::from_value::<BackendKind>(value.clone()).is_ok()
+fn launch_profile_backend_is_known(profile: &Value, skipped: &mut Vec<String>) -> bool {
+    let Some(backend) = profile.get("backend_kind") else {
+        return true;
+    };
+    let known = is_known_backend_kind(backend);
+    if !known {
+        skipped.push(format!("launch_profiles backend_kind {backend}"));
+    }
+    known
 }
 
-/// A settings value with every field at its unset default, for tests that need
-/// to build one field without spelling out the rest.
-#[cfg(test)]
-pub(crate) fn empty_settings_for_test() -> HostSettings {
-    empty_settings()
+fn is_known_backend_kind(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<BackendKind>(value.clone()).is_ok()
 }
 
 fn empty_settings() -> HostSettings {
@@ -725,16 +636,17 @@ fn empty_settings() -> HostSettings {
         default_backend: None,
         enable_mobile_connections: false,
         mobile_broker_url: None,
+        mobile_broker_auth: Default::default(),
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
-        tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+        tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         supervisor: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
-        launch_profiles: Vec::new(),
+        launch_profiles: BTreeMap::new(),
         hermes_disabled_providers: std::collections::HashMap::new(),
         voice: Default::default(),
     }
@@ -855,6 +767,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         default_backend: settings.default_backend,
         enable_mobile_connections: settings.enable_mobile_connections,
         mobile_broker_url: settings.mobile_broker_url,
+        mobile_broker_auth: settings.mobile_broker_auth,
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
         tyde_agent_control_max_depth: settings.tyde_agent_control_max_depth,
@@ -904,11 +817,16 @@ fn validate_code_intel_settings(settings: CodeIntelSettings) -> Result<CodeIntel
 }
 
 fn validate_launch_profile_configs(
-    profiles: Vec<HostLaunchProfileConfig>,
-) -> Result<Vec<HostLaunchProfileConfig>, String> {
-    let mut seen = std::collections::HashSet::<LaunchProfileId>::new();
-    let mut validated = Vec::with_capacity(profiles.len());
-    for profile in profiles {
+    profiles: BTreeMap<LaunchProfileId, HostLaunchProfileConfig>,
+) -> Result<BTreeMap<LaunchProfileId, HostLaunchProfileConfig>, String> {
+    let mut validated = BTreeMap::new();
+    for (id, profile) in profiles {
+        if id != profile.id {
+            return Err(format!(
+                "launch profile map key {id} does not match embedded id {}",
+                profile.id
+            ));
+        }
         if profile.id.0.trim().is_empty() {
             return Err("launch profile id must not be empty".to_owned());
         }
@@ -942,9 +860,6 @@ fn validate_launch_profile_configs(
                 profile.id
             ));
         }
-        if !seen.insert(profile.id.clone()) {
-            return Err(format!("duplicate launch profile id {}", profile.id));
-        }
         // An ACP profile is nothing without a command to run, and an agent spec
         // on a non-ACP profile would be silently ignored. Reject both rather
         // than persisting a profile that can't launch or that lies about what
@@ -977,7 +892,7 @@ fn validate_launch_profile_configs(
             }
             _ => {}
         }
-        validated.push(profile);
+        validated.insert(id, profile);
     }
     Ok(validated)
 }
@@ -991,6 +906,17 @@ fn backend_slug(backend_kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "antigravity",
         BackendKind::Hermes => "hermes",
     }
+}
+
+fn parse_secret_token_key(encoded: &str) -> Option<[u8; 32]> {
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut key = [0_u8; 32];
+    for (index, chunk) in encoded.as_bytes().chunks(2).enumerate() {
+        key[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(key)
 }
 
 pub(crate) fn validate_mobile_broker_url_for_write(
@@ -1039,715 +965,9 @@ fn is_loopback_url(parsed: &url::Url) -> bool {
     }
 }
 
-fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
+pub(crate) fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
     CANONICAL_BACKENDS
         .into_iter()
         .filter(|kind| backends.contains(kind))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use protocol::SessionSettingValue;
-
-    use super::*;
-
-    #[test]
-    fn seeds_installed_backends_on_fresh_install_with_preferred_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
-
-        // Codex + Claude installed; Claude is preferred as the default.
-        let seeded = store
-            .seed_installed_backends_if_fresh(&[BackendKind::Codex, BackendKind::Claude])
-            .expect("seed");
-        assert!(seeded);
-        assert!(path.exists(), "seeding persists a settings file");
-
-        let settings = store.get().expect("get settings");
-        // Normalized to canonical order.
-        assert_eq!(
-            settings.enabled_backends,
-            vec![BackendKind::Claude, BackendKind::Codex]
-        );
-        assert_eq!(settings.default_backend, Some(BackendKind::Claude));
-    }
-
-    /// Hermes has no provider enable/disable flag, so Tyde owns this list. It
-    /// is scoped per profile, and clearing it must remove the key rather than
-    /// persist an empty vec — an empty list would read as "this profile has a
-    /// disable list" while disabling nothing.
-    #[test]
-    fn hermes_disabled_providers_are_per_profile_and_clear_to_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
-
-        store
-            .apply(HostSettingValue::HermesDisabledProviders {
-                profile: "default".to_owned(),
-                // Duplicates and padding are normalized, not persisted as-is.
-                providers: vec![
-                    " copilot ".to_owned(),
-                    "copilot".to_owned(),
-                    String::new(),
-                    "bedrock".to_owned(),
-                ],
-            })
-            .expect("disable providers");
-        store
-            .apply(HostSettingValue::HermesDisabledProviders {
-                profile: "work".to_owned(),
-                providers: vec!["openrouter".to_owned()],
-            })
-            .expect("disable providers for another profile");
-
-        let settings = store.get().expect("get settings");
-        assert_eq!(
-            settings.hermes_disabled_providers.get("default"),
-            Some(&vec!["bedrock".to_owned(), "copilot".to_owned()])
-        );
-        // Editing one profile must not disturb another's list.
-        assert_eq!(
-            settings.hermes_disabled_providers.get("work"),
-            Some(&vec!["openrouter".to_owned()])
-        );
-
-        store
-            .apply(HostSettingValue::HermesDisabledProviders {
-                profile: "default".to_owned(),
-                providers: Vec::new(),
-            })
-            .expect("re-enable everything");
-        let settings = store.get().expect("get settings");
-        assert!(
-            !settings.hermes_disabled_providers.contains_key("default"),
-            "clearing the list must drop the key, not store an empty one"
-        );
-        assert_eq!(
-            settings.hermes_disabled_providers.get("work"),
-            Some(&vec!["openrouter".to_owned()]),
-            "clearing one profile must leave the others alone"
-        );
-
-        // The list has to survive a reload — it is what keeps a provider out
-        // of the model picker across restarts.
-        let reloaded = HostSettingsStore::load(path).expect("reload store");
-        assert_eq!(
-            reloaded
-                .get()
-                .expect("get settings")
-                .hermes_disabled_providers
-                .get("work"),
-            Some(&vec!["openrouter".to_owned()])
-        );
-    }
-
-    #[test]
-    fn seeding_is_noop_once_a_settings_file_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        // A user who deliberately turned every backend off.
-        let store = HostSettingsStore::load(path).expect("load empty store");
-        store
-            .apply(HostSettingValue::EnabledBackends {
-                enabled_backends: vec![],
-            })
-            .expect("disable all backends");
-
-        let seeded = store
-            .seed_installed_backends_if_fresh(&[BackendKind::Claude])
-            .expect("seed");
-        assert!(!seeded, "must not re-enable backends once configured");
-        assert!(store.get().expect("get").enabled_backends.is_empty());
-    }
-
-    #[test]
-    fn seeding_is_noop_when_nothing_is_installed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
-
-        let seeded = store.seed_installed_backends_if_fresh(&[]).expect("seed");
-        assert!(!seeded);
-        assert!(
-            !path.exists(),
-            "no file is written so a later launch can seed once a CLI is installed"
-        );
-    }
-
-    #[test]
-    fn mobile_broker_url_write_accepts_only_loopback_dev_brokers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
-
-        let public = BrokerUrl::new("mqtts://broker.example.test:8883").expect("broker URL");
-        let err = store
-            .apply(HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(public),
-            })
-            .expect_err("public custom broker must be rejected at write time");
-        assert!(err.contains("dev/test-only"), "unexpected error: {err}");
-        assert!(!path.exists(), "rejected setting must not be persisted");
-
-        let default_public =
-            BrokerUrl::new(protocol::DEFAULT_MOBILE_MQTT_BROKER_URL).expect("broker URL");
-        let err = store
-            .apply(HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(default_public),
-            })
-            .expect_err("default public broker must be rejected at write time");
-        assert!(
-            err.contains("public default mobile broker"),
-            "unexpected error: {err}"
-        );
-
-        let public_ipv6 = BrokerUrl::new("mqtts://[2001:db8::1]:8883").expect("broker URL");
-        let err = store
-            .apply(HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(public_ipv6),
-            })
-            .expect_err("non-loopback IPv6 broker must be rejected at write time");
-        assert!(err.contains("dev/test-only"), "unexpected error: {err}");
-
-        let ipv6_loopback = BrokerUrl::new("mqtts://[::1]:8883").expect("broker URL");
-        let settings = store
-            .apply(HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(ipv6_loopback.clone()),
-            })
-            .expect("IPv6 loopback dev broker remains allowed");
-        assert_eq!(settings.mobile_broker_url, Some(ipv6_loopback));
-
-        let loopback = BrokerUrl::new("mqtts://127.0.0.1:8883").expect("broker URL");
-        let settings = store
-            .apply(HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(loopback.clone()),
-            })
-            .expect("loopback dev broker remains allowed");
-        assert_eq!(settings.mobile_broker_url, Some(loopback));
-    }
-
-    #[test]
-    fn legacy_public_mobile_broker_url_still_loads_for_repair_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":[],"default_backend":null,"mobile_broker_url":"mqtts://broker.example.test:8883"}}"#,
-        )
-        .expect("write legacy public broker setting");
-
-        let store = HostSettingsStore::load(path).expect("legacy public broker setting loads");
-        let settings = store.get().expect("get settings");
-        assert_eq!(
-            settings.mobile_broker_url.as_ref().map(BrokerUrl::as_str),
-            Some("mqtts://broker.example.test:8883")
-        );
-    }
-
-    #[test]
-    fn old_store_files_without_tier_fields_load_with_tiers_off() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude"],"default_backend":"claude","enable_mobile_connections":false,"mobile_broker_url":null,"tyde_debug_mcp_enabled":false,"tyde_agent_control_mcp_enabled":true}}"#,
-        )
-        .expect("write legacy store file");
-
-        let store = HostSettingsStore::load(path).expect("load legacy store");
-        let settings = store.get().expect("get settings");
-        assert!(!settings.complexity_tiers_enabled);
-        assert_eq!(settings.tyde_agent_control_max_depth, 3);
-        assert!(settings.backend_tier_configs.is_empty());
-    }
-
-    #[test]
-    fn old_store_files_default_background_agent_features_safely() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude"],"default_backend":"claude"}}"#,
-        )
-        .expect("write legacy store file");
-
-        let store = HostSettingsStore::load(path).expect("load legacy store");
-        let settings = store.get().expect("get settings");
-        assert!(settings.background_agent_features.auto_generate_agent_names);
-        assert!(!settings.background_agent_features.agent_activity_summaries);
-    }
-
-    #[test]
-    fn background_agent_feature_settings_apply_independently() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            HostSettingsStore::load(dir.path().join("settings.json")).expect("load empty store");
-
-        let settings = store
-            .apply(HostSettingValue::BackgroundAgentFeatureEnabled {
-                feature: BackgroundAgentFeature::AgentActivitySummaries,
-                enabled: true,
-            })
-            .expect("enable activity summaries");
-        assert!(settings.background_agent_features.agent_activity_summaries);
-        assert!(settings.background_agent_features.auto_generate_agent_names);
-
-        let settings = store
-            .apply(HostSettingValue::BackgroundAgentFeatureEnabled {
-                feature: BackgroundAgentFeature::AutoGenerateAgentNames,
-                enabled: false,
-            })
-            .expect("disable generated names");
-        assert!(settings.background_agent_features.agent_activity_summaries);
-        assert!(!settings.background_agent_features.auto_generate_agent_names);
-    }
-
-    #[test]
-    fn unknown_backend_in_enabled_backends_is_skipped() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude","future_backend","codex"],"default_backend":"claude"}}"#,
-        )
-        .expect("write store file");
-
-        let store = HostSettingsStore::load(path).expect("load store with unknown backend");
-        let settings = store.get().expect("get settings");
-        assert_eq!(
-            settings.enabled_backends,
-            vec![BackendKind::Claude, BackendKind::Codex]
-        );
-        assert_eq!(settings.default_backend, Some(BackendKind::Claude));
-    }
-
-    #[test]
-    fn unknown_backend_tier_config_key_is_skipped() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude"],"complexity_tiers_enabled":true,"backend_tier_configs":{"claude":{"low":{"model":{"string":"haiku"}},"high":{}},"future_backend":{"low":{"model":{"string":"Future Low"}},"high":{}}}}}"#,
-        )
-        .expect("write store file");
-
-        let store = HostSettingsStore::load(path).expect("load store with unknown tier key");
-        let settings = store.get().expect("get settings");
-        assert!(settings.complexity_tiers_enabled);
-        assert_eq!(settings.backend_tier_configs.len(), 1);
-        let claude = settings
-            .backend_tier_configs
-            .get(&BackendKind::Claude)
-            .expect("claude tier config kept");
-        assert_eq!(
-            claude.low.0.get("model"),
-            Some(&SessionSettingValue::String("haiku".to_string()))
-        );
-    }
-
-    #[test]
-    fn unknown_default_backend_falls_back_to_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude","future_backend"],"default_backend":"future_backend"}}"#,
-        )
-        .expect("write store file");
-
-        let store = HostSettingsStore::load(path).expect("load store with unknown default");
-        let settings = store.get().expect("get settings");
-        assert_eq!(settings.enabled_backends, vec![BackendKind::Claude]);
-        assert_eq!(settings.default_backend, None);
-    }
-
-    #[test]
-    fn fully_known_settings_file_round_trips_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"settings":{"enabled_backends":["claude","codex"],"default_backend":"codex","enable_mobile_connections":true,"mobile_broker_url":null,"tyde_debug_mcp_enabled":true,"tyde_agent_control_mcp_enabled":true,"tyde_agent_control_max_depth":3,"complexity_tiers_enabled":true,"backend_tier_configs":{"codex":{"low":{"reasoning_effort":{"string":"low"}},"high":{"reasoning_effort":{"string":"xhigh"}}}}}}"#,
-        )
-        .expect("write store file");
-
-        let store = HostSettingsStore::load(path).expect("load fully-known store");
-        let before = store.get().expect("get settings");
-        assert_eq!(
-            before.enabled_backends,
-            vec![BackendKind::Claude, BackendKind::Codex]
-        );
-        assert_eq!(before.default_backend, Some(BackendKind::Codex));
-        assert!(before.enable_mobile_connections);
-        assert!(before.tyde_debug_mcp_enabled);
-        assert!(before.complexity_tiers_enabled);
-        assert_eq!(
-            before
-                .backend_tier_configs
-                .get(&BackendKind::Codex)
-                .expect("codex tier config")
-                .high
-                .0
-                .get("reasoning_effort"),
-            Some(&SessionSettingValue::String("xhigh".to_string()))
-        );
-
-        // A write cycle must not drop any known entries.
-        let after = store
-            .apply(HostSettingValue::TydeDebugMcpEnabled { enabled: true })
-            .expect("apply no-op setting");
-        assert_eq!(after, before);
-        assert_eq!(store.get().expect("re-read settings"), before);
-    }
-
-    #[test]
-    fn validates_and_persists_agent_control_max_depth() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            HostSettingsStore::load(dir.path().join("settings.json")).expect("load settings store");
-
-        let updated = store
-            .apply(HostSettingValue::TydeAgentControlMaxDepth { depth: 4 })
-            .expect("save valid depth");
-        assert_eq!(updated.tyde_agent_control_max_depth, 4);
-
-        let error = store
-            .apply(HostSettingValue::TydeAgentControlMaxDepth { depth: 0 })
-            .expect_err("reject depth zero");
-        assert!(
-            error.contains("between 1 and 10"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(
-            store
-                .get()
-                .expect("re-read settings")
-                .tyde_agent_control_max_depth,
-            4,
-            "a rejected depth must not mutate the stored setting"
-        );
-    }
-
-    #[test]
-    fn migrates_gemini_settings_to_antigravity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{
-  "settings": {
-    "enabled_backends": ["gemini", "claude", "gemini"],
-    "default_backend": "gemini",
-    "complexity_tiers_enabled": true,
-    "backend_tier_configs": {
-      "gemini": {
-        "low": {"model": {"string": "legacy-low"}},
-        "high": {"model": {"string": "legacy-high"}}
-      }
-    }
-  }
-}"#,
-        )
-        .expect("write legacy settings");
-
-        let store = HostSettingsStore::load(path.clone()).expect("load migrated settings");
-        let settings = store.get().expect("get migrated settings");
-        assert_eq!(
-            settings.enabled_backends,
-            vec![BackendKind::Claude, BackendKind::Antigravity]
-        );
-        assert_eq!(settings.default_backend, Some(BackendKind::Antigravity));
-        assert!(
-            !settings
-                .backend_tier_configs
-                .contains_key(&BackendKind::Claude)
-        );
-        assert!(
-            !std::fs::read_to_string(&path)
-                .expect("read migrated file")
-                .contains("gemini")
-        );
-        let antigravity = settings
-            .backend_tier_configs
-            .get(&BackendKind::Antigravity)
-            .expect("antigravity tier config seeded");
-        assert_eq!(
-            antigravity.low.0.get("model"),
-            Some(&SessionSettingValue::String(
-                "Gemini 3.5 Flash (Low)".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn migrates_kiro_settings_to_acp() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{
-  "settings": {
-    "enabled_backends": ["kiro", "claude"],
-    "default_backend": "kiro",
-    "complexity_tiers_enabled": true,
-    "backend_tier_configs": {
-      "kiro": {
-        "low": {"model": {"string": "kiro-low"}}
-      }
-    },
-    "launch_profiles": [
-      {
-        "id": "my-kiro",
-        "label": "My Kiro",
-        "backend_kind": "kiro",
-        "session_settings": {}
-      }
-    ]
-  }
-}"#,
-        )
-        .expect("write legacy settings");
-
-        let store = HostSettingsStore::load(path.clone()).expect("load migrated settings");
-        let settings = store.get().expect("get migrated settings");
-
-        assert!(
-            settings.enabled_backends.contains(&BackendKind::Acp),
-            "kiro must become acp in enabled_backends, got {:?}",
-            settings.enabled_backends
-        );
-        assert_eq!(settings.default_backend, Some(BackendKind::Acp));
-        let tiers = settings
-            .backend_tier_configs
-            .get(&BackendKind::Acp)
-            .expect("tier config keyed by the old kind must be re-keyed, not dropped");
-        assert_eq!(
-            tiers.low.0.get("model"),
-            Some(&SessionSettingValue::String("kiro-low".to_string())),
-            "the migrated tier config must keep its values"
-        );
-
-        let profile = settings
-            .launch_profiles
-            .iter()
-            .find(|profile| profile.id == LaunchProfileId("my-kiro".to_owned()))
-            .expect("user launch profile survived migration");
-        assert_eq!(profile.backend_kind, BackendKind::Acp);
-        let spec = profile
-            .acp
-            .as_ref()
-            .expect("migrated profile gains an agent spec so it still validates");
-        assert_eq!(spec.adapter, protocol::AcpAdapterId::Kiro);
-
-        // Assert on the backend *kind* specifically rather than the substring
-        // "kiro", which legitimately survives as the adapter id
-        // (`"adapter": "kiro"`) and inside the profile id `my-kiro`.
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read migrated file"))
-                .expect("migrated file is valid json");
-        let persisted = &raw["settings"];
-        assert!(
-            !persisted["enabled_backends"]
-                .as_array()
-                .expect("enabled_backends array")
-                .iter()
-                .any(|kind| kind == LEGACY_KIRO_BACKEND),
-            "enabled_backends still names the retired kind: {persisted}"
-        );
-        assert_ne!(persisted["default_backend"], LEGACY_KIRO_BACKEND);
-        assert!(
-            persisted["backend_tier_configs"]
-                .get(LEGACY_KIRO_BACKEND)
-                .is_none(),
-            "tier configs are still keyed by the retired kind"
-        );
-        for profile in persisted["launch_profiles"]
-            .as_array()
-            .expect("launch_profiles array")
-        {
-            assert_ne!(
-                profile["backend_kind"], LEGACY_KIRO_BACKEND,
-                "launch profile still targets the retired kind"
-            );
-        }
-    }
-
-    #[test]
-    fn kiro_migration_does_not_clobber_an_existing_acp_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{
-  "settings": {
-    "enabled_backends": ["kiro", "acp"],
-    "complexity_tiers_enabled": true,
-    "backend_tier_configs": {
-      "kiro": {"low": {"model": {"string": "legacy"}}},
-      "acp": {"low": {"model": {"string": "current"}}}
-    }
-  }
-}"#,
-        )
-        .expect("write settings");
-
-        let store = HostSettingsStore::load(path).expect("load migrated settings");
-        let settings = store.get().expect("get migrated settings");
-
-        assert_eq!(
-            settings
-                .enabled_backends
-                .iter()
-                .filter(|kind| **kind == BackendKind::Acp)
-                .count(),
-            1,
-            "collapsing kiro into acp must not leave a duplicate entry"
-        );
-        let tiers = settings
-            .backend_tier_configs
-            .get(&BackendKind::Acp)
-            .expect("acp tier config present");
-        assert_eq!(
-            tiers.low.0.get("model"),
-            Some(&SessionSettingValue::String("current".to_string())),
-            "a config written by a newer build must win over the legacy kiro one"
-        );
-    }
-
-    #[test]
-    fn stock_acp_launch_profile_requires_a_command() {
-        let err = validate_launch_profile_configs(vec![HostLaunchProfileConfig {
-            id: LaunchProfileId("custom".to_owned()),
-            label: "Custom".to_owned(),
-            description: None,
-            backend_kind: BackendKind::Acp,
-            session_settings: Default::default(),
-            acp: Some(protocol::AcpAgentSpec {
-                command: "   ".to_owned(),
-                args: Vec::new(),
-                cwd: None,
-                env: Default::default(),
-                adapter: protocol::AcpAdapterId::Stock,
-            }),
-        }])
-        .expect_err("blank command must be rejected");
-        assert!(err.contains("command"), "got: {err}");
-    }
-
-    #[test]
-    fn agent_spec_on_a_non_acp_profile_is_rejected() {
-        let err = validate_launch_profile_configs(vec![HostLaunchProfileConfig {
-            id: LaunchProfileId("weird".to_owned()),
-            label: "Weird".to_owned(),
-            description: None,
-            backend_kind: BackendKind::Claude,
-            session_settings: Default::default(),
-            acp: Some(protocol::AcpAgentSpec {
-                command: "claude".to_owned(),
-                args: Vec::new(),
-                cwd: None,
-                env: Default::default(),
-                adapter: protocol::AcpAdapterId::Stock,
-            }),
-        }])
-        .expect_err("agent spec on a non-ACP profile must be rejected");
-        assert!(err.contains("ACP agent"), "got: {err}");
-    }
-
-    #[test]
-    fn enabling_complexity_tiers_seeds_builtin_configs_and_round_trips() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            HostSettingsStore::load(dir.path().join("settings.json")).expect("load empty store");
-
-        let settings = store
-            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: true })
-            .expect("enable tiers");
-        assert!(settings.complexity_tiers_enabled);
-        let claude = settings
-            .backend_tier_configs
-            .get(&BackendKind::Claude)
-            .expect("claude config seeded");
-        assert_eq!(
-            claude.low.0.get("model"),
-            Some(&SessionSettingValue::String("haiku".to_string()))
-        );
-        assert_eq!(
-            claude.high.0.get("model"),
-            Some(&SessionSettingValue::String("opus".to_string()))
-        );
-        assert_eq!(
-            claude.high.0.get("effort"),
-            Some(&SessionSettingValue::String("max".to_string()))
-        );
-        assert!(
-            !settings
-                .backend_tier_configs
-                .contains_key(&BackendKind::Codex),
-            "Codex built-in tiers must resolve from live model metadata"
-        );
-
-        // User edits survive a disable/enable cycle (no re-seeding over them).
-        let mut edited = claude.clone();
-        edited.high.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String("fable".to_string()),
-        );
-        store
-            .apply(HostSettingValue::BackendTiers {
-                backend: BackendKind::Claude,
-                config: edited.clone(),
-            })
-            .expect("store edited config");
-        store
-            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: false })
-            .expect("disable tiers");
-        let settings = store
-            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: true })
-            .expect("re-enable tiers");
-        assert_eq!(
-            settings.backend_tier_configs.get(&BackendKind::Claude),
-            Some(&edited)
-        );
-    }
-
-    #[test]
-    fn voice_settings_validate_exact_model_without_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = HostSettingsStore::load(dir.path().join("settings.json")).unwrap();
-        let settings = store
-            .apply(HostSettingValue::VoiceNovaModel {
-                model: "amazon.nova-2-sonic-v1:0".into(),
-            })
-            .unwrap();
-        assert_eq!(settings.voice.nova_model, "amazon.nova-2-sonic-v1:0");
-        assert!(
-            store
-                .apply(HostSettingValue::VoiceNovaModel {
-                    model: "amazon.unknown".into()
-                })
-                .is_err()
-        );
-        assert_eq!(
-            store.get().unwrap().voice.nova_model,
-            "amazon.nova-2-sonic-v1:0"
-        );
-
-        assert_eq!(
-            store.get().unwrap().voice.endpointing_sensitivity,
-            protocol::VoiceEndpointingSensitivity::Low
-        );
-        let settings = store
-            .apply(HostSettingValue::VoiceEndpointingSensitivity {
-                sensitivity: protocol::VoiceEndpointingSensitivity::High,
-            })
-            .unwrap();
-        assert_eq!(
-            settings.voice.endpointing_sensitivity,
-            protocol::VoiceEndpointingSensitivity::High
-        );
-    }
 }

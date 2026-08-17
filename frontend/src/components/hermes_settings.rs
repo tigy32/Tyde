@@ -11,9 +11,8 @@
 //! Two save flows, kept deliberately separate:
 //!
 //! - **Config edits** accumulate locally in per-profile drafts and are sent
-//!   only when the user presses Save (whole-document replace via
-//!   `HostSettingValue::BackendNativeSettings`). Dirty state is the difference
-//!   between the drafts and the live snapshot document.
+//!   only when the user presses Save. Dirty state is the difference between
+//!   the drafts and the live snapshot document.
 //! - **Credential actions** (save API key / disconnect) save immediately. A
 //!   credential save carries the ORIGINAL snapshot config sections plus the
 //!   queued action — never the local draft — so pressing "Save key" cannot
@@ -24,7 +23,7 @@
 //! save is recorded `Pending` against the pre-save snapshot document, the
 //! server force-publishes a fresh snapshot after every native save (which
 //! clears the gate in the `BackendConfigSnapshots` dispatch handler), and a
-//! typed `SetSetting` error flips the state to `Failed` with the server's
+//! typed `SettingsWrite` error flips the state to `Failed` with the server's
 //! message. API keys travel only inside the wire payload; they are never
 //! logged, never stored in a signal, and never rendered back into the DOM.
 //!
@@ -45,8 +44,8 @@ use protocol::hermes_config::{
     HermesProfileSettings, HermesProviderState,
 };
 use protocol::{
-    BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot, FrameKind,
-    HostSettingValue, SetSettingPayload,
+    BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
+    BackendNativeSettingsWritePayload, FrameKind,
 };
 use serde_json::Value;
 
@@ -208,7 +207,8 @@ fn HermesSettingsBody(host_id: String) -> impl IntoView {
             .cloned();
         let saving = matches!(
             &save_state,
-            Some(NativeSettingsSaveState::Pending { base }) if Some(base) == snap.settings.as_ref()
+            Some(NativeSettingsSaveState::Pending { base, .. })
+                if Some(base) == snap.settings.as_ref()
         );
         let save_error = match save_state {
             Some(NativeSettingsSaveState::Failed { message }) => Some(message),
@@ -329,23 +329,32 @@ fn send_hermes_save(state: &AppState, host_id: &str, base: Value, doc: &HermesNa
         return;
     };
 
+    let write_id = super::settings_panel::next_settings_write_id();
     state.native_settings_save_state.update(|states| {
         states.entry(host_id.to_owned()).or_default().insert(
             BackendKind::Hermes,
-            NativeSettingsSaveState::Pending { base },
+            NativeSettingsSaveState::Pending {
+                base,
+                write_id: write_id.clone(),
+            },
         );
     });
 
     let state = state.clone();
     let host_id = host_id.to_owned();
     spawn_local(async move {
-        let payload = SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Hermes,
-                settings: value,
-            },
+        let payload = BackendNativeSettingsWritePayload {
+            write_id,
+            backend: BackendKind::Hermes,
+            settings: value,
         };
-        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SetSetting, &payload).await
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::BackendNativeSettingsWrite,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send Hermes BackendNativeSettings: {error}");
             mark_save_failed(
@@ -428,31 +437,15 @@ fn refresh_hermes_settings(state: &AppState, host_id: &str) {
 /// is a Tyde host setting, not Hermes configuration: Hermes has no provider
 /// enable/disable flag, so hiding one can only ever be Tyde's own decision.
 fn set_disabled_providers(state: &AppState, host_id: &str, profile: &str, providers: Vec<String>) {
-    let Some(host_stream) = state.host_stream_untracked(host_id) else {
+    if state.host_stream_untracked(host_id).is_none() {
         mark_save_failed(
             state,
             host_id,
             "Cannot update providers: the selected host is not connected.",
         );
         return;
-    };
-    let state = state.clone();
-    let host_id = host_id.to_owned();
-    let profile = profile.to_owned();
-    spawn_local(async move {
-        let payload = SetSettingPayload {
-            setting: HostSettingValue::HermesDisabledProviders { profile, providers },
-        };
-        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SetSetting, &payload).await
-        {
-            log::error!("failed to send Hermes disabled providers: {error}");
-            mark_save_failed(
-                &state,
-                &host_id,
-                "Failed to update providers. Check the connection and try again.",
-            );
-        }
-    });
+    }
+    super::settings_panel::send_hermes_disabled_providers(state, profile, providers);
 }
 
 /// The provider slugs Tyde must not offer for `profile` on this host.
@@ -3289,21 +3282,22 @@ mod wasm_tests {
             let state = AppState::new();
             install_doc(&state, doc.clone());
             if !disabled.is_empty() {
-                let settings = protocol::HostSettings {
+                let settings = settings_model::HostSettings {
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: None,
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     voice: Default::default(),
                     hermes_disabled_providers: HashMap::from([(
                         HERMES_DEFAULT_PROFILE.to_owned(),

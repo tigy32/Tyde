@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 protocol = { path = "../protocol", default-features = false }
+settings-model = { path = "../settings-model" }
 devtools-protocol = { path = "../devtools-protocol", default-features = false }
 host-config = { path = "../host-config" }
 leptos = { version = "0.8.17", features = ["csr"] }

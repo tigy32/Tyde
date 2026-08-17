@@ -8,13 +8,21 @@ use protocol::{
     Envelope, FrameKind, NewAgentPayload, QueuedMessagesPayload, SpawnAgentParams,
     SpawnAgentPayload, StreamPath,
 };
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
-async fn raw_next(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+async fn observe_frames_for(
+    client: &mut client::Connection,
+    duration: Duration,
+    mut check: impl FnMut(&Envelope),
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), client.next_event()).await {
+            Ok(Ok(Some(env))) => check(&env),
+            Ok(Ok(None)) => panic!("connection closed unexpectedly"),
+            Ok(Err(err)) => panic!("next_event failed: {err:?}"),
+            Err(_) => {}
+        }
     }
 }
 
@@ -44,64 +52,79 @@ async fn spawn_agent(
         .await
         .expect("spawn_agent failed");
 
-    let new_agent = loop {
-        let env = raw_next(client, "NewAgent").await;
+    let mut new_agent = None;
+    fixture::next_frame_matching_on(client, "NewAgent", |env| {
         if env.kind != FrameKind::NewAgent {
-            continue;
+            return false;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
         if payload.name == name {
-            break payload;
+            new_agent = Some(payload);
+            true
+        } else {
+            false
         }
-    };
+    })
+    .await;
+    let new_agent = new_agent.expect("matched NewAgent");
 
-    let start = loop {
-        let env = raw_next(client, "AgentStart").await;
+    let mut start: Option<AgentStartPayload> = None;
+    fixture::next_frame_matching_on(client, "AgentStart", |env| {
         if env.stream != new_agent.instance_stream {
-            continue;
+            return false;
         }
         match env.kind {
-            FrameKind::AgentStart => break env.parse_payload().expect("parse AgentStartPayload"),
+            FrameKind::AgentStart => {
+                start = Some(env.parse_payload().expect("parse AgentStartPayload"));
+                true
+            }
             FrameKind::AgentBootstrap => {
                 let bootstrap: AgentBootstrapPayload =
                     env.parse_payload().expect("parse AgentBootstrapPayload");
-                if let Some(start) = bootstrap.events.into_iter().find_map(|event| match event {
-                    AgentBootstrapEvent::AgentStart(start) => Some(start),
+                match bootstrap.events.into_iter().find_map(|event| match event {
+                    AgentBootstrapEvent::AgentStart(payload) => Some(payload),
                     _ => None,
                 }) {
-                    break start;
+                    Some(bootstrapped) => {
+                        start = Some(bootstrapped);
+                        true
+                    }
+                    None => false,
                 }
             }
-            _ => {}
+            _ => false,
         }
-    };
+    })
+    .await;
+    let start = start.expect("matched AgentStart");
 
     (new_agent, start)
 }
 
 async fn wait_for_typing_true(client: &mut client::Connection, stream: &StreamPath) {
-    loop {
-        let env = raw_next(client, "TypingStatusChanged(true)").await;
-        if env.kind == FrameKind::AgentBootstrap && env.stream == *stream {
-            let bootstrap: AgentBootstrapPayload =
-                env.parse_payload().expect("parse AgentBootstrapPayload");
-            if bootstrap.events.into_iter().any(|event| {
-                matches!(
-                    event,
-                    AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
-                )
-            }) {
-                return;
+    fixture::next_frame_matching_on(client, "TypingStatusChanged(true)", |env| {
+        if env.stream != *stream {
+            return false;
+        }
+        match env.kind {
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrapPayload");
+                bootstrap.events.into_iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
+                    )
+                })
             }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                matches!(event, ChatEvent::TypingStatusChanged(true))
+            }
+            _ => false,
         }
-        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if matches!(event, ChatEvent::TypingStatusChanged(true)) {
-            return;
-        }
-    }
+    })
+    .await;
 }
 
 fn assert_no_nonempty_parent_queue(env: &Envelope, parent_stream: &StreamPath) {
@@ -137,31 +160,33 @@ async fn expect_completed_turn_without_parent_queue(
     let mut saw_expected_text = false;
     let mut saw_stream_end = false;
 
-    loop {
-        let env = raw_next(client, "child completed turn").await;
-        assert_no_nonempty_parent_queue(&env, parent_stream);
+    fixture::next_frame_matching_on(client, "child completed turn", |env| {
+        assert_no_nonempty_parent_queue(env, parent_stream);
         if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
+            return false;
         }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
             ChatEvent::StreamDelta(delta) => {
                 saw_expected_text |= delta.text.contains(expected_text);
+                false
             }
             ChatEvent::StreamEnd(data) => {
                 saw_expected_text |= data.message.content.contains(expected_text);
                 saw_stream_end = true;
+                false
             }
             ChatEvent::TypingStatusChanged(false) if saw_stream_end => {
                 assert!(
                     saw_expected_text,
                     "expected child turn on {stream} to contain {expected_text:?}"
                 );
-                return;
+                true
             }
-            _ => {}
+            _ => false,
         }
-    }
+    })
+    .await;
 }
 
 async fn expect_cancelled_turn_without_parent_queue(
@@ -172,11 +197,10 @@ async fn expect_cancelled_turn_without_parent_queue(
 ) {
     let mut saw_cancel = false;
 
-    loop {
-        let env = raw_next(client, "child cancelled turn").await;
-        assert_no_nonempty_parent_queue(&env, parent_stream);
+    fixture::next_frame_matching_on(client, "child cancelled turn", |env| {
+        assert_no_nonempty_parent_queue(env, parent_stream);
         if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
+            return false;
         }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
@@ -187,11 +211,13 @@ async fn expect_cancelled_turn_without_parent_queue(
                     data.message
                 );
                 saw_cancel = true;
+                false
             }
-            ChatEvent::TypingStatusChanged(false) if saw_cancel => return,
-            _ => {}
+            ChatEvent::TypingStatusChanged(false) if saw_cancel => true,
+            _ => false,
         }
-    }
+    })
+    .await;
 }
 
 async fn assert_no_parent_reentry(
@@ -199,21 +225,14 @@ async fn assert_no_parent_reentry(
     parent_stream: &StreamPath,
     duration: Duration,
 ) {
-    let deadline = tokio::time::Instant::now() + duration;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(100), client.next_event()).await {
-            Ok(Ok(Some(env))) => {
-                assert_no_nonempty_parent_queue(&env, parent_stream);
-                assert!(
-                    !(env.kind == FrameKind::ChatEvent && env.stream == *parent_stream),
-                    "child completion must not re-enter the parent turn, got {env:?}"
-                );
-            }
-            Ok(Ok(None)) => panic!("connection closed unexpectedly"),
-            Ok(Err(err)) => panic!("next_event failed: {err:?}"),
-            Err(_) => {}
-        }
-    }
+    observe_frames_for(client, duration, |env| {
+        assert_no_nonempty_parent_queue(env, parent_stream);
+        assert!(
+            !(env.kind == FrameKind::ChatEvent && env.stream == *parent_stream),
+            "child completion must not re-enter the parent turn, got {env:?}"
+        );
+    })
+    .await;
 }
 
 fn mock_turn_text(prompt: &str) -> String {
@@ -224,16 +243,21 @@ fn mock_turn_text(prompt: &str) -> String {
 
 #[tokio::test]
 async fn child_completion_does_not_enqueue_on_parent_queue() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
-    let (parent_new, _) = spawn_agent(
-        &mut fixture.client,
-        "parent-busy",
-        "__mock_slow__ parent busy",
-        None,
-    )
-    .await;
+    let parent_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-busy",
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: parent busy",
+                &parent_gate,
+            )),
+        )
+        .await;
+    let (parent_new, _) =
+        spawn_agent(&mut fixture.client, "parent-busy", "parent busy", None).await;
+    drop(reservation);
     wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
 
     let (child_new, _) = spawn_agent(
@@ -255,30 +279,49 @@ async fn child_completion_does_not_enqueue_on_parent_queue() {
 
 #[tokio::test]
 async fn child_cancellation_does_not_enqueue_on_parent_queue() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
+    let parent_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-cancel-busy",
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: parent busy",
+                &parent_gate,
+            )),
+        )
+        .await;
     let (parent_new, _) = spawn_agent(
         &mut fixture.client,
         "parent-cancel-busy",
-        "__mock_slow__ parent busy",
+        "parent busy",
         None,
     )
     .await;
+    drop(reservation);
     wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
 
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "child-cancelled",
+            MockScript::one(MockTurn::cancelled(
+                "mock backend cancelled: child cancelled",
+            )),
+        )
+        .await;
     let (child_new, _) = spawn_agent(
         &mut fixture.client,
         "child-cancelled",
-        "__mock_cancel__ child cancelled",
+        "child cancelled",
         Some(parent_new.agent_id.clone()),
     )
     .await;
+    drop(child_reservation);
 
     expect_cancelled_turn_without_parent_queue(
         &mut fixture.client,
         &child_new.instance_stream,
-        "mock backend cancelled: __mock_cancel__ child cancelled",
+        "mock backend cancelled: child cancelled",
         &parent_new.instance_stream,
     )
     .await;
@@ -286,32 +329,69 @@ async fn child_cancellation_does_not_enqueue_on_parent_queue() {
 
 #[tokio::test]
 async fn backend_native_child_does_not_enqueue_completion_notice() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
-    let (parent_new, _) = spawn_agent(
+    // The backend-native child spawns and completes MID-TURN — after the
+    // parent's stream end but before the gate and the trailing idle — so the
+    // whole child lifecycle happens while the parent is provably busy. Gate
+    // entry is causally after the child effect ran, and the gate is released
+    // only after the observation window, so every parent-queue assertion
+    // below runs against a parent that is still mid-turn while its native
+    // child has actually completed.
+    let parent_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-native",
+            MockScript::one(MockTurn::gated_text_with_busy_native_child(
+                "mock backend response to: parent busy",
+                "mock-native-child",
+                "child completed",
+                &parent_gate,
+            )),
+        )
+        .await;
+    let (parent_new, _) =
+        spawn_agent(&mut fixture.client, "parent-native", "parent busy", None).await;
+    drop(reservation);
+    wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
+    parent_gate.wait_until_entered().await;
+
+    // Positive child-lifecycle evidence during the busy window: the native
+    // child agent appears and runs its full completed turn, with the parent
+    // queue asserted empty on every frame consumed along the way.
+    let mut native_child = None;
+    fixture::next_frame_matching_on(&mut fixture.client, "native child NewAgent", |env| {
+        assert_no_nonempty_parent_queue(env, &parent_new.instance_stream);
+        if env.kind != FrameKind::NewAgent {
+            return false;
+        }
+        let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
+        if payload.name == "mock-native-child" {
+            native_child = Some(payload);
+            true
+        } else {
+            false
+        }
+    })
+    .await;
+    let native_child = native_child.expect("matched native child NewAgent");
+    expect_completed_turn_without_parent_queue(
         &mut fixture.client,
-        "parent-native",
-        "__mock_slow__ __mock_spawn_native_child__ parent busy",
-        None,
+        &native_child.instance_stream,
+        "mock native child response to: child completed",
+        &parent_new.instance_stream,
     )
     .await;
-    wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), fixture.client.next_event()).await {
-            Ok(Ok(Some(env))) => assert_no_nonempty_parent_queue(&env, &parent_new.instance_stream),
-            Ok(Ok(None)) => panic!("connection closed unexpectedly"),
-            Ok(Err(err)) => panic!("next_event failed: {err:?}"),
-            Err(_) => {}
-        }
-    }
+    observe_frames_for(&mut fixture.client, Duration::from_secs(3), |env| {
+        assert_no_nonempty_parent_queue(env, &parent_new.instance_stream);
+    })
+    .await;
+    drop(parent_gate);
 }
 
 #[tokio::test]
 async fn idle_parent_does_not_reenter_turn_for_child_completion() {
-    fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
     let (parent_new, _) =

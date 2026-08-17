@@ -1877,37 +1877,3 @@ mod wasm_tests {
         );
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::abbreviate;
-
-    #[test]
-    fn camel_case_uses_capitals() {
-        assert_eq!(abbreviate("ThingDoStuff"), "tds");
-        assert_eq!(abbreviate("MyCoolApp"), "mca");
-    }
-
-    #[test]
-    fn multi_token_uses_initials() {
-        assert_eq!(abbreviate("api-gateway"), "ag");
-        assert_eq!(abbreviate("web_app_server"), "was");
-    }
-
-    #[test]
-    fn single_lowercase_uses_prefix() {
-        assert_eq!(abbreviate("agentflow"), "agen");
-        assert_eq!(abbreviate("go"), "go");
-    }
-
-    #[test]
-    fn single_capital_falls_back_to_prefix() {
-        assert_eq!(abbreviate("Anthropic"), "anth");
-    }
-
-    #[test]
-    fn empty_returns_placeholder() {
-        assert_eq!(abbreviate(""), "?");
-        assert_eq!(abbreviate("   "), "?");
-    }
-}

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -31,234 +31,6 @@ pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
-}
-
-#[cfg(test)]
-mod compaction_contract_tests {
-    use super::*;
-
-    fn metrics() -> CompactionMetrics {
-        CompactionMetrics {
-            before_tokens: Some(100),
-            after_tokens: Some(20),
-            before_messages: Some(10),
-            after_messages: Some(3),
-            messages_summarized: Some(7),
-            cumulative_dropped_tokens: Some(80),
-            duration_ms: Some(12),
-            precomputed: Some(false),
-        }
-    }
-
-    #[test]
-    fn context_compaction_notify_round_trips_all_terminal_failure_fields() {
-        let payload = ContextCompactionNotifyPayload {
-            operation_id: CompactionOperationId("operation".to_owned()),
-            agent_id: AgentId("agent".to_owned()),
-            logical_session_id: SessionId("session".to_owned()),
-            backend_kind: BackendKind::Claude,
-            trigger: CompactionTrigger::UserRequested,
-            method: Some(CompactionMethod::NativeTextCommand),
-            status: ContextCompactionStatus::Failed {
-                accepted: true,
-                mutation: CompactionMutation::MayHaveMutated,
-            },
-            provider_version: Some("1.0.0".to_owned()),
-            metrics: metrics(),
-            message: Some("provider closed".to_owned()),
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize notify");
-        let decoded: ContextCompactionNotifyPayload =
-            serde_json::from_value(encoded).expect("deserialize notify");
-        assert_eq!(decoded, payload);
-        assert!(decoded.status.is_terminal());
-    }
-
-    #[test]
-    fn team_context_compaction_result_round_trips_member_session_identity() {
-        let payload = TeamContextCompactionNotifyPayload {
-            team_operation_id: CompactionOperationId("team-operation".to_owned()),
-            team_id: TeamId("team".to_owned()),
-            status: TeamContextCompactionStatus::Completed,
-            members: vec![TeamMemberContextCompactionResult {
-                agent_id: AgentId("agent".to_owned()),
-                logical_session_id: SessionId("session-after-reseat".to_owned()),
-                operation_id: CompactionOperationId("member-operation".to_owned()),
-                method: Some(CompactionMethod::InlineFallback),
-                status: ContextCompactionStatus::Completed,
-                mutation: CompactionMutation::Completed,
-                message: None,
-            }],
-            message: None,
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize team notify");
-        let decoded: TeamContextCompactionNotifyPayload =
-            serde_json::from_value(encoded).expect("deserialize team notify");
-
-        assert_eq!(decoded, payload);
-        assert_eq!(
-            decoded.members[0].logical_session_id.0,
-            "session-after-reseat"
-        );
-    }
-
-    #[test]
-    fn team_context_compaction_result_requires_member_session_identity() {
-        let missing_session = serde_json::json!({
-            "team_operation_id": "team-operation",
-            "team_id": "team",
-            "status": "failed",
-            "members": [{
-                "agent_id": "agent",
-                "operation_id": "member-operation",
-                "status": {
-                    "kind": "failed",
-                    "accepted": false,
-                    "mutation": "not_observed"
-                },
-                "mutation": "not_observed"
-            }]
-        });
-
-        let error = serde_json::from_value::<TeamContextCompactionNotifyPayload>(missing_session)
-            .expect_err("member logical_session_id is a required wire field");
-        assert!(error.to_string().contains("logical_session_id"));
-    }
-
-    #[test]
-    fn timeline_marker_round_trips_without_becoming_a_message() {
-        let marker = ContextCompactionTimelineEvent {
-            marker_id: CompactionObservationId("marker".to_owned()),
-            operation_id: Some(CompactionOperationId("operation".to_owned())),
-            trigger: CompactionTrigger::SupervisorRequested,
-            method: CompactionMethod::NativeRpc,
-            backend_kind: BackendKind::Codex,
-            provider_session_id: Some(SessionId("provider".to_owned())),
-            status: ContextCompactionTimelineStatus::Completed,
-            mutation: CompactionMutation::Completed,
-            metrics: metrics(),
-            message: None,
-            timestamp: 42,
-        };
-        let event = ChatEvent::ContextCompaction(marker.clone());
-        let decoded: ChatEvent =
-            serde_json::from_value(serde_json::to_value(&event).expect("serialize marker"))
-                .expect("deserialize marker");
-        assert!(matches!(
-            decoded,
-            ChatEvent::ContextCompaction(decoded_marker)
-                if decoded_marker == marker
-        ));
-    }
-
-    #[test]
-    fn history_response_echoes_request_identity_and_cursor() {
-        let payload = SessionHistoryPayload {
-            agent_id: AgentId("agent".to_owned()),
-            request_id: HistoryPageRequestId("request".to_owned()),
-            request_before_seq: Some(19),
-            events: Vec::new(),
-            has_more_before: false,
-            oldest_seq: None,
-        };
-        let decoded: SessionHistoryPayload =
-            serde_json::from_value(serde_json::to_value(&payload).expect("serialize history"))
-                .expect("deserialize history");
-        assert_eq!(decoded.request_id, payload.request_id);
-        assert_eq!(decoded.request_before_seq, Some(19));
-    }
-}
-
-#[cfg(test)]
-mod supervisor_inactivity_delay_tests {
-    use super::*;
-
-    #[test]
-    fn defaults_and_round_trips_as_three_hundred_seconds() {
-        assert_eq!(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, 1);
-        assert_eq!(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX, 86_400);
-        let settings = SupervisorSettings::default();
-        assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
-        assert_eq!(settings.retry_attempts, 1);
-        assert_eq!(SUPERVISOR_RETRY_ATTEMPTS_MIN, 0);
-        assert_eq!(SUPERVISOR_RETRY_ATTEMPTS_MAX, 5);
-        let encoded = serde_json::to_value(settings).expect("serialize supervisor settings");
-        let decoded: SupervisorSettings =
-            serde_json::from_value(encoded).expect("deserialize supervisor settings");
-        assert_eq!(decoded.auto_compact_inactivity_delay_seconds, 300);
-    }
-
-    #[test]
-    fn legacy_supervisor_object_defaults_delay() {
-        let settings: SupervisorSettings = serde_json::from_value(serde_json::json!({
-            "enabled": true,
-            "auto_compact_on_success": true,
-            "auto_compact_min_context_tokens": 200000,
-            "max_kicks_per_task": 3,
-            "retry_attempts": 1,
-            "cost_tier": "low"
-        }))
-        .expect("deserialize legacy supervisor settings");
-        assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
-    }
-
-    /// Both new controls are destructive or paid, so a supervisor that was
-    /// already enabled before they existed must decode with them off, and the
-    /// stall delay must round-trip its 30-minute default.
-    #[test]
-    fn restore_and_stall_controls_default_off_for_legacy_settings() {
-        assert_eq!(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, 1);
-        assert_eq!(SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX, 86_400);
-        let defaults = SupervisorSettings::default();
-        assert!(!defaults.supervise_restored_agents);
-        assert!(!defaults.stall_timeout_enabled);
-        assert_eq!(defaults.stall_timeout_seconds, 1_800);
-
-        let legacy: SupervisorSettings = serde_json::from_value(serde_json::json!({
-            "enabled": true,
-            "auto_compact_on_success": true,
-            "auto_compact_inactivity_delay_seconds": 300,
-            "auto_compact_min_context_tokens": 200000,
-            "max_kicks_per_task": 3,
-            "retry_attempts": 1,
-            "cost_tier": "low"
-        }))
-        .expect("deserialize supervisor settings saved before the stall timeout existed");
-        assert!(legacy.enabled);
-        assert!(!legacy.supervise_restored_agents);
-        assert!(!legacy.stall_timeout_enabled);
-        assert_eq!(legacy.stall_timeout_seconds, 1_800);
-
-        let round_tripped: SupervisorSettings = serde_json::from_value(
-            serde_json::to_value(SupervisorSettings {
-                supervise_restored_agents: true,
-                stall_timeout_enabled: true,
-                stall_timeout_seconds: 600,
-                ..SupervisorSettings::default()
-            })
-            .expect("serialize supervisor settings"),
-        )
-        .expect("deserialize supervisor settings");
-        assert!(round_tripped.supervise_restored_agents);
-        assert!(round_tripped.stall_timeout_enabled);
-        assert_eq!(round_tripped.stall_timeout_seconds, 600);
-    }
-
-    #[test]
-    fn new_supervisor_settings_report_distinct_error_targets() {
-        assert_eq!(
-            HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true }.error_target(),
-            HostSettingErrorTarget::SupervisorSuperviseRestoredAgents
-        );
-        assert_eq!(
-            HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true }.error_target(),
-            HostSettingErrorTarget::SupervisorStallTimeoutEnabled
-        );
-        assert_eq!(
-            HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1_800 }.error_target(),
-            HostSettingErrorTarget::SupervisorStallTimeoutSeconds
-        );
-    }
 }
 
 impl fmt::Display for Version {
@@ -324,7 +96,7 @@ impl fmt::Display for ProtocolTypeError {
 
 impl std::error::Error for ProtocolTypeError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct BrokerUrl(String);
 
@@ -923,7 +695,9 @@ pub struct AcpAgentSpec {
     pub adapter: AcpAdapterId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct LaunchProfileId(pub String);
 
@@ -1001,23 +775,6 @@ impl LaunchProfileEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchProfileCatalogPayload {
     pub catalog: LaunchProfileCatalog,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostLaunchProfileConfig {
-    pub id: LaunchProfileId,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub backend_kind: BackendKind,
-    #[serde(default)]
-    pub session_settings: SessionSettingsValues,
-    /// Required when `backend_kind` is [`BackendKind::Acp`], rejected
-    /// otherwise. Validated in the settings store rather than the type system
-    /// so an invalid persisted profile surfaces a named error instead of
-    /// failing to deserialize the whole settings file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acp: Option<AcpAgentSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
@@ -1272,7 +1029,9 @@ pub enum FrameKind {
     Reject,
 
     // Input events (client -> server)
-    SetSetting,
+    SettingsWrite,
+    BackendNativeSettingsWrite,
+    InvokeSettingsAction,
     SetAgentsViewPreferences,
     SetAgentsSmartViews,
     SetAgentTags,
@@ -1374,6 +1133,7 @@ pub enum FrameKind {
     BrowseBootstrap,
     TerminalBootstrap,
     HostSettings,
+    SettingsWriteResult,
     AgentsViewPreferencesNotify,
     BackendSetup,
     NewAgent,
@@ -1460,7 +1220,10 @@ impl fmt::Display for FrameKind {
             Self::Hello => f.write_str("hello"),
             Self::Welcome => f.write_str("welcome"),
             Self::Reject => f.write_str("reject"),
-            Self::SetSetting => f.write_str("set_setting"),
+            Self::SettingsWrite => f.write_str("settings_write"),
+            Self::BackendNativeSettingsWrite => f.write_str("backend_native_settings_write"),
+            Self::InvokeSettingsAction => f.write_str("invoke_settings_action"),
+            Self::SettingsWriteResult => f.write_str("settings_write_result"),
             Self::SetAgentsViewPreferences => f.write_str("set_agents_view_preferences"),
             Self::SetAgentsSmartViews => f.write_str("set_agents_smart_views"),
             Self::SetAgentTags => f.write_str("set_agent_tags"),
@@ -1951,8 +1714,25 @@ pub struct CancelWorkflowPayload {
 pub struct WorkflowRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostBootstrapPayload {
-    pub settings: HostSettings,
+pub struct HostBootstrapPayload<S = Value> {
+    pub settings: S,
+    /// Content-derived tag of the client-visible (secret-redacted) settings
+    /// document in `settings`. Same derivation as
+    /// [`HostSettingsPayload::etag`].
+    #[serde(default)]
+    pub settings_etag: String,
+    /// Build-static JSON Schema (schemars, draft 2020-12) describing the
+    /// host settings document. Delivered only here, never per-write.
+    #[serde(default)]
+    pub settings_schema: Value,
+    /// Currently-configured write-only (secret) settings values with their
+    /// server-issued revision tokens. Secret values themselves are omitted
+    /// from every outbound settings document; this side channel is how
+    /// clients render "configured" and mint `Version` expectations without
+    /// ever seeing the value. Also republished on every `HostSettings`
+    /// fanout.
+    #[serde(default)]
+    pub configured_secrets: Vec<ConfiguredSecret>,
     pub mobile_access: MobileAccessStatePayload,
     pub backend_setup: BackendSetupPayload,
     pub session_schemas: Vec<SessionSchemaEntry>,
@@ -2514,282 +2294,6 @@ pub struct TerminalBootstrapPayload {
     pub start: TerminalStartPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostSettings {
-    #[serde(default)]
-    pub enabled_backends: Vec<BackendKind>,
-    #[serde(default)]
-    pub default_backend: Option<BackendKind>,
-    #[serde(default)]
-    pub enable_mobile_connections: bool,
-    #[serde(default)]
-    pub mobile_broker_url: Option<BrokerUrl>,
-    #[serde(default)]
-    pub tyde_debug_mcp_enabled: bool,
-    #[serde(default = "default_agent_control_mcp_enabled")]
-    pub tyde_agent_control_mcp_enabled: bool,
-    #[serde(default = "default_agent_control_max_depth")]
-    pub tyde_agent_control_max_depth: u8,
-    /// When false (default), spawn cost hints are ignored: every spawn uses
-    /// the backend's own default model/effort and the hint is hidden from
-    /// spawn UIs and the agent-control MCP tool schema.
-    #[serde(default)]
-    pub complexity_tiers_enabled: bool,
-    /// Per-backend overrides for what the Low/High complexity tiers mean.
-    /// Backends without an entry fall back to built-in defaults.
-    #[serde(default)]
-    pub backend_tier_configs: HashMap<BackendKind, BackendTierConfig>,
-    #[serde(default = "default_background_agent_features")]
-    pub background_agent_features: BackgroundAgentFeaturesSettings,
-    #[serde(default)]
-    pub supervisor: SupervisorSettings,
-    #[serde(default)]
-    pub code_intel: CodeIntelSettings,
-    /// Per-backend deep configuration (e.g. Hermes default model/provider).
-    /// Host-level and persistent, distinct from lightweight per-session
-    /// settings. Keys/values are described by each backend's
-    /// [`BackendConfigSchema`]. Backends without an entry use their defaults.
-    #[serde(default)]
-    pub backend_config: HashMap<BackendKind, BackendConfigValues>,
-    /// Explicit server-owned Launch Profiles. These are host-level presets
-    /// over backend session settings; they are never inferred from model names.
-    #[serde(default)]
-    pub launch_profiles: Vec<HostLaunchProfileConfig>,
-    /// Provider slugs Tyde must not offer for a given Hermes profile, keyed by
-    /// profile name. Tyde-owned because Hermes itself has no provider
-    /// enable/disable flag: it reports every provider it can find credentials
-    /// for, and auto-harvested ones (GitHub Copilot via the `gh` CLI login)
-    /// come back after a disconnect. Entries here are filtered out of Tyde's
-    /// Hermes model options; they do not touch Hermes's own configuration, so
-    /// a `hermes` session started outside Tyde still sees the provider.
-    #[serde(default)]
-    pub hermes_disabled_providers: HashMap<String, Vec<String>>,
-    #[serde(default)]
-    pub voice: VoiceSettings,
-}
-
-impl Default for HostSettings {
-    fn default() -> Self {
-        Self {
-            enabled_backends: Vec::new(),
-            default_backend: None,
-            enable_mobile_connections: false,
-            mobile_broker_url: None,
-            tyde_debug_mcp_enabled: false,
-            tyde_agent_control_mcp_enabled: true,
-            tyde_agent_control_max_depth: default_agent_control_max_depth(),
-            complexity_tiers_enabled: false,
-            backend_tier_configs: HashMap::new(),
-            background_agent_features: default_background_agent_features(),
-            supervisor: SupervisorSettings::default(),
-            code_intel: CodeIntelSettings::default(),
-            backend_config: HashMap::new(),
-            launch_profiles: Vec::new(),
-            hermes_disabled_providers: HashMap::new(),
-            voice: VoiceSettings::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoiceSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws_profile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws_region: Option<String>,
-    #[serde(default = "default_voice_nova_model")]
-    pub nova_model: String,
-    #[serde(default)]
-    pub endpointing_sensitivity: VoiceEndpointingSensitivity,
-    #[serde(default)]
-    pub availability: VoiceAvailability,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceEndpointingSensitivity {
-    High,
-    Medium,
-    #[default]
-    Low,
-}
-
-impl VoiceEndpointingSensitivity {
-    pub fn nova_value(self) -> &'static str {
-        match self {
-            Self::High => "HIGH",
-            Self::Medium => "MEDIUM",
-            Self::Low => "LOW",
-        }
-    }
-}
-
-fn default_voice_nova_model() -> String {
-    "amazon.nova-2-sonic-v1:0".into()
-}
-
-impl Default for VoiceSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            aws_profile: None,
-            aws_region: None,
-            nova_model: default_voice_nova_model(),
-            endpointing_sensitivity: VoiceEndpointingSensitivity::default(),
-            availability: VoiceAvailability::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeIntelSettings {
-    #[serde(default)]
-    pub language_server_paths: HashMap<CodeIntelProviderId, HostExecutablePath>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostExecutablePath(pub String);
-
-impl fmt::Display for HostExecutablePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackgroundAgentFeaturesSettings {
-    #[serde(default = "default_auto_generate_agent_names_enabled")]
-    pub auto_generate_agent_names: bool,
-    #[serde(default)]
-    pub agent_activity_summaries: bool,
-}
-
-/// Agent supervisor: when an agent goes idle, a hidden one-shot model call
-/// reviews the last user request, the task list, and the agent's final
-/// message, then either accepts the turn as finished or sends a follow-up
-/// message to kick the agent back to work. Costs money per idle transition,
-/// so everything defaults off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SupervisorSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Judge an agent whose session was restored from history as soon as its
-    /// replayed transcript settles into idle. Off by default: reopening a saved
-    /// session is not new work, so the supervisor waits for that agent's first
-    /// live turn instead of spending a verdict — and possibly a kick — on a
-    /// conversation the user only wanted to look at.
-    #[serde(default)]
-    pub supervise_restored_agents: bool,
-    /// Interrupt a turn that has gone [`Self::stall_timeout_seconds`] without
-    /// observable progress and let the supervisor decide how to make progress.
-    /// Off by default; cancelling a running turn is destructive.
-    #[serde(default)]
-    pub stall_timeout_enabled: bool,
-    /// Whole seconds without any observable turn progress before a stalled turn
-    /// is interrupted. Progress is any backend event on the turn, so a slow but
-    /// working agent never trips this. Only read when
-    /// [`Self::stall_timeout_enabled`] is set.
-    #[serde(default = "default_supervisor_stall_timeout_seconds")]
-    pub stall_timeout_seconds: u32,
-    /// When the supervisor judges the task complete, automatically compact
-    /// (rotate-and-summarize) the agent so reusing it later starts from a
-    /// small warm context instead of resuming a huge cold session.
-    #[serde(default)]
-    pub auto_compact_on_success: bool,
-    /// Whole seconds of uninterrupted inactivity required before a successful
-    /// supervision verdict may start automatic compaction.
-    #[serde(default = "default_supervisor_auto_compact_inactivity_delay_seconds")]
-    pub auto_compact_inactivity_delay_seconds: u32,
-    /// Minimum latest-assistant context size required before a successful
-    /// supervision verdict may trigger automatic compaction.
-    #[serde(default = "default_supervisor_auto_compact_min_context_tokens")]
-    pub auto_compact_min_context_tokens: u64,
-    /// Maximum consecutive supervisor kicks without an intervening real user
-    /// message. Prevents a supervisor/agent ping-pong loop.
-    #[serde(default = "default_supervisor_max_kicks_per_task")]
-    pub max_kicks_per_task: u8,
-    /// Extra delayed paid attempts when a supervision call errors or returns
-    /// output that does not parse to a verdict. 1 means two total calls.
-    #[serde(default = "default_supervisor_retry_attempts")]
-    pub retry_attempts: u8,
-    /// Which model tier the supervision verdict runs on. `Low` is the cheap
-    /// tier (like agent naming); `Default` uses the backend's own default
-    /// model; `High` is the most capable configuration.
-    #[serde(default)]
-    pub cost_tier: SupervisorCostTier,
-}
-
-/// Model tier for supervision verdict calls, mapped to a [`SpawnCostHint`]
-/// at spawn time (`Default` maps to no hint).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SupervisorCostTier {
-    #[default]
-    Low,
-    Default,
-    High,
-}
-
-impl SupervisorCostTier {
-    pub fn as_cost_hint(self) -> Option<SpawnCostHint> {
-        match self {
-            Self::Low => Some(SpawnCostHint::Low),
-            Self::Default => None,
-            Self::High => Some(SpawnCostHint::High),
-        }
-    }
-}
-
-pub fn default_supervisor_max_kicks_per_task() -> u8 {
-    3
-}
-
-pub fn default_supervisor_retry_attempts() -> u8 {
-    1
-}
-
-pub const SUPERVISOR_RETRY_ATTEMPTS_MIN: u8 = 0;
-pub const SUPERVISOR_RETRY_ATTEMPTS_MAX: u8 = 5;
-
-pub fn default_supervisor_auto_compact_min_context_tokens() -> u64 {
-    200_000
-}
-
-pub const SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN: u32 = 1;
-pub const SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX: u32 = 86_400;
-
-pub fn default_supervisor_auto_compact_inactivity_delay_seconds() -> u32 {
-    300
-}
-
-pub const SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN: u32 = 1;
-pub const SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX: u32 = 86_400;
-
-pub fn default_supervisor_stall_timeout_seconds() -> u32 {
-    1_800
-}
-
-impl Default for SupervisorSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            supervise_restored_agents: false,
-            stall_timeout_enabled: false,
-            stall_timeout_seconds: default_supervisor_stall_timeout_seconds(),
-            auto_compact_on_success: false,
-            auto_compact_inactivity_delay_seconds:
-                default_supervisor_auto_compact_inactivity_delay_seconds(),
-            auto_compact_min_context_tokens: default_supervisor_auto_compact_min_context_tokens(),
-            max_kicks_per_task: default_supervisor_max_kicks_per_task(),
-            retry_attempts: default_supervisor_retry_attempts(),
-            cost_tier: SupervisorCostTier::default(),
-        }
-    }
-}
-
 /// Prefix every supervisor-authored kick message carries. It keeps supervisor
 /// turns visibly labeled in the transcript and lets the server count
 /// consecutive supervisor kicks straight from the event log, with no
@@ -2804,274 +2308,218 @@ pub const SUPERVISOR_MESSAGE_PREFIX: &str = "[Tyde Supervisor] ";
 pub const SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX: &str =
     "[Tyde Supervisor] Interrupted this turn after no progress for";
 
-/// Per-backend mapping from spawn complexity tiers to session-settings
-/// overrides (e.g. `model`, `effort`). An empty map means "no override" —
-/// the spawn runs on the backend's own defaults.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendTierConfig {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSettingsPayload<S = Value> {
+    pub settings: S,
+    /// Content-derived tag of the client-visible settings state: the
+    /// secret-redacted document plus the configured-secret tokens, so a
+    /// secret-only change still advances the etag. Stateless with respect to
+    /// server memory (the secret-token key persists beside the store), so
+    /// restarts mint no spurious mismatches. Clients clear pending drafts
+    /// only when a broadcast snapshot's etag equals the `current_etag` of
+    /// their own [`SettingsWriteResultPayload`].
     #[serde(default)]
-    pub low: SessionSettingsValues,
+    pub etag: String,
+    /// Current configured write-only (secret) values and their revision
+    /// tokens. Published on every settings snapshot (bootstrap and fanout)
+    /// so clients can render configured-status and mint valid `Version`
+    /// expectations without ever seeing a secret value.
     #[serde(default)]
-    pub high: SessionSettingsValues,
+    pub configured_secrets: Vec<ConfiguredSecret>,
 }
 
-fn default_agent_control_mcp_enabled() -> bool {
-    true
-}
+/// Client-minted id correlating a [`FrameKind::SettingsWrite`] command with
+/// its requester-scoped [`FrameKind::SettingsWriteResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SettingsWriteId(pub String);
 
-pub const TYDE_AGENT_CONTROL_MAX_DEPTH_MIN: u8 = 1;
-pub const TYDE_AGENT_CONTROL_MAX_DEPTH_MAX: u8 = 10;
-
-pub fn default_agent_control_max_depth() -> u8 {
-    3
-}
-
-pub fn default_auto_generate_agent_names_enabled() -> bool {
-    true
-}
-
-pub fn default_background_agent_features() -> BackgroundAgentFeaturesSettings {
-    BackgroundAgentFeaturesSettings {
-        auto_generate_agent_names: true,
-        agent_activity_summaries: false,
+impl fmt::Display for SettingsWriteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl Default for BackgroundAgentFeaturesSettings {
-    fn default() -> Self {
-        default_background_agent_features()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundAgentFeature {
-    AutoGenerateAgentNames,
-    AgentActivitySummaries,
+/// Client -> Server: apply a batch of path operations to the host settings
+/// document, all-or-nothing. Every operation carries a mandatory
+/// compare-and-swap precondition ([`SettingExpectation`]), so a stale client
+/// gets a visible `Conflict` instead of silently clobbering a concurrent
+/// edit. The server answers with a requester-scoped
+/// [`SettingsWriteResultPayload`]; an applied write additionally fans out the
+/// new document to every subscriber as [`FrameKind::HostSettings`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsWritePayload {
+    pub write_id: SettingsWriteId,
+    pub ops: Vec<SettingOp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetSettingPayload {
-    pub setting: HostSettingValue,
+pub struct BackendNativeSettingsWritePayload {
+    pub write_id: SettingsWriteId,
+    pub backend: BackendKind,
+    pub settings: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvokeSettingsActionPayload {
+    pub write_id: SettingsWriteId,
+    pub backend: BackendKind,
+    pub resource: String,
+    pub action: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// Maximum operations one [`SettingsWritePayload`] may carry.
+pub const SETTINGS_WRITE_MAX_OPS: usize = 64;
+
+/// One path operation inside a [`SettingsWritePayload`]. Paths are RFC 6901
+/// JSON pointers into the host settings document. `Remove` is explicit and
+/// distinct from `Replace` with `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HostSettingValue {
-    EnabledBackends {
-        enabled_backends: Vec<BackendKind>,
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SettingOp {
+    Replace {
+        path: String,
+        value: Value,
+        expected: SettingExpectation,
     },
-    DefaultBackend {
-        default_backend: Option<BackendKind>,
-    },
-    EnableMobileConnections {
-        enabled: bool,
-    },
-    MobileBrokerUrl {
-        broker_url: Option<BrokerUrl>,
-    },
-    TydeDebugMcpEnabled {
-        enabled: bool,
-    },
-    TydeAgentControlMcpEnabled {
-        enabled: bool,
-    },
-    TydeAgentControlMaxDepth {
-        depth: u8,
-    },
-    ComplexityTiersEnabled {
-        enabled: bool,
-    },
-    BackendTiers {
-        backend: BackendKind,
-        config: BackendTierConfig,
-    },
-    BackgroundAgentFeatureEnabled {
-        feature: BackgroundAgentFeature,
-        enabled: bool,
-    },
-    SupervisorEnabled {
-        enabled: bool,
-    },
-    SupervisorSuperviseRestoredAgents {
-        enabled: bool,
-    },
-    SupervisorStallTimeoutEnabled {
-        enabled: bool,
-    },
-    SupervisorStallTimeoutSeconds {
-        seconds: u32,
-    },
-    SupervisorAutoCompactOnSuccess {
-        enabled: bool,
-    },
-    SupervisorAutoCompactInactivityDelaySeconds {
-        seconds: u32,
-    },
-    SupervisorAutoCompactMinContextTokens {
-        tokens: u64,
-    },
-    SupervisorMaxKicksPerTask {
-        count: u8,
-    },
-    SupervisorRetryAttempts {
-        count: u8,
-    },
-    SupervisorCostTier {
-        tier: SupervisorCostTier,
-    },
-    CodeIntelLanguageServerPath {
-        provider: CodeIntelProviderId,
-        path: Option<HostExecutablePath>,
-    },
-    /// Merge a deep-configuration update for one backend. Keys present with
-    /// non-null values are validated against the backend's schema and saved.
-    /// Keys present as `Null` are explicitly cleared. Missing keys are
-    /// preserved, so editing one field cannot overwrite sibling config. An
-    /// empty `values` map explicitly clears the backend's whole configuration.
-    BackendConfig {
-        backend: BackendKind,
-        values: BackendConfigValues,
-    },
-    /// Replace a backend-native settings document through the backend's own
-    /// settings protocol. Tyde does not persist this payload in host settings.
-    BackendNativeSettings {
-        backend: BackendKind,
-        settings: Value,
-    },
-    /// Replace all explicit server-owned Launch Profiles.
-    LaunchProfiles {
-        profiles: Vec<HostLaunchProfileConfig>,
-    },
-    /// Replace the provider slugs Tyde must not offer for one Hermes profile.
-    /// Scoped to a single profile so two clients editing different profiles
-    /// cannot clobber each other's list.
-    HermesDisabledProviders {
-        profile: String,
-        providers: Vec<String>,
-    },
-    VoiceEnabled {
-        enabled: bool,
-    },
-    VoiceAwsProfile {
-        profile: Option<String>,
-    },
-    VoiceAwsRegion {
-        region: Option<String>,
-    },
-    VoiceNovaModel {
-        model: String,
-    },
-    VoiceEndpointingSensitivity {
-        sensitivity: VoiceEndpointingSensitivity,
+    Remove {
+        path: String,
+        expected: SettingExpectation,
     },
 }
 
-impl HostSettingValue {
-    /// Returns the value-free target clients use to correlate a failed setting
-    /// command with its pending save.
-    pub fn error_target(&self) -> HostSettingErrorTarget {
+impl SettingOp {
+    pub fn path(&self) -> &str {
         match self {
-            Self::EnabledBackends { .. } => HostSettingErrorTarget::EnabledBackends,
-            Self::DefaultBackend { .. } => HostSettingErrorTarget::DefaultBackend,
-            Self::EnableMobileConnections { .. } => HostSettingErrorTarget::EnableMobileConnections,
-            Self::MobileBrokerUrl { .. } => HostSettingErrorTarget::MobileBrokerUrl,
-            Self::TydeDebugMcpEnabled { .. } => HostSettingErrorTarget::TydeDebugMcpEnabled,
-            Self::TydeAgentControlMcpEnabled { .. } => {
-                HostSettingErrorTarget::TydeAgentControlMcpEnabled
-            }
-            Self::TydeAgentControlMaxDepth { .. } => {
-                HostSettingErrorTarget::TydeAgentControlMaxDepth
-            }
-            Self::ComplexityTiersEnabled { .. } => HostSettingErrorTarget::ComplexityTiersEnabled,
-            Self::BackendTiers { .. } => HostSettingErrorTarget::BackendTiers,
-            Self::BackgroundAgentFeatureEnabled { .. } => {
-                HostSettingErrorTarget::BackgroundAgentFeatureEnabled
-            }
-            Self::SupervisorEnabled { .. } => HostSettingErrorTarget::SupervisorEnabled,
-            Self::SupervisorSuperviseRestoredAgents { .. } => {
-                HostSettingErrorTarget::SupervisorSuperviseRestoredAgents
-            }
-            Self::SupervisorStallTimeoutEnabled { .. } => {
-                HostSettingErrorTarget::SupervisorStallTimeoutEnabled
-            }
-            Self::SupervisorStallTimeoutSeconds { .. } => {
-                HostSettingErrorTarget::SupervisorStallTimeoutSeconds
-            }
-            Self::SupervisorAutoCompactOnSuccess { .. } => {
-                HostSettingErrorTarget::SupervisorAutoCompactOnSuccess
-            }
-            Self::SupervisorAutoCompactInactivityDelaySeconds { .. } => {
-                HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds
-            }
-            Self::SupervisorAutoCompactMinContextTokens { .. } => {
-                HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
-            }
-            Self::SupervisorMaxKicksPerTask { .. } => {
-                HostSettingErrorTarget::SupervisorMaxKicksPerTask
-            }
-            Self::SupervisorRetryAttempts { .. } => HostSettingErrorTarget::SupervisorRetryAttempts,
-            Self::SupervisorCostTier { .. } => HostSettingErrorTarget::SupervisorCostTier,
-            Self::CodeIntelLanguageServerPath { .. } => {
-                HostSettingErrorTarget::CodeIntelLanguageServerPath
-            }
-            Self::BackendConfig { .. } => HostSettingErrorTarget::BackendConfig,
-            Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
-            Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
-            Self::HermesDisabledProviders { .. } => HostSettingErrorTarget::HermesDisabledProviders,
-            Self::VoiceEnabled { .. } => HostSettingErrorTarget::VoiceEnabled,
-            Self::VoiceAwsProfile { .. } => HostSettingErrorTarget::VoiceAwsProfile,
-            Self::VoiceAwsRegion { .. } => HostSettingErrorTarget::VoiceAwsRegion,
-            Self::VoiceNovaModel { .. } => HostSettingErrorTarget::VoiceNovaModel,
-            Self::VoiceEndpointingSensitivity { .. } => {
-                HostSettingErrorTarget::VoiceEndpointingSensitivity
-            }
+            Self::Replace { path, .. } | Self::Remove { path, .. } => path,
+        }
+    }
+
+    pub fn expected(&self) -> &SettingExpectation {
+        match self {
+            Self::Replace { expected, .. } | Self::Remove { expected, .. } => expected,
         }
     }
 }
 
-/// Identifies the setting affected by a [`FrameKind::SetSetting`] command
-/// error without echoing a submitted value, credential, path, or stale token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostSettingErrorTarget {
-    /// The command payload was not a valid typed host-setting value.
-    Malformed,
-    EnabledBackends,
-    DefaultBackend,
-    EnableMobileConnections,
-    MobileBrokerUrl,
-    TydeDebugMcpEnabled,
-    TydeAgentControlMcpEnabled,
-    TydeAgentControlMaxDepth,
-    ComplexityTiersEnabled,
-    BackendTiers,
-    BackgroundAgentFeatureEnabled,
-    SupervisorEnabled,
-    SupervisorSuperviseRestoredAgents,
-    SupervisorStallTimeoutEnabled,
-    SupervisorStallTimeoutSeconds,
-    SupervisorAutoCompactOnSuccess,
-    SupervisorAutoCompactInactivityDelaySeconds,
-    SupervisorAutoCompactMinContextTokens,
-    SupervisorMaxKicksPerTask,
-    SupervisorRetryAttempts,
-    SupervisorCostTier,
-    CodeIntelLanguageServerPath,
-    BackendConfig,
-    BackendNativeSettings,
-    LaunchProfiles,
-    HermesDisabledProviders,
-    VoiceEnabled,
-    VoiceAwsProfile,
-    VoiceAwsRegion,
-    VoiceNovaModel,
-    VoiceEndpointingSensitivity,
+/// Mandatory per-path compare-and-swap precondition on a [`SettingOp`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SettingExpectation {
+    /// The full expected current value at the path. `null` matches both an
+    /// explicit null and an absent member. Rejected for secret-bearing paths
+    /// (their values are never on the wire); use `Version`/`Absent` there.
+    Value { value: Value },
+    /// Value-free version token. For ordinary paths this is the content hash
+    /// of the client-visible subtree (self-computable via
+    /// `settings_model::version_token`). For secret-bearing paths it is the
+    /// SERVER-ISSUED per-path revision token published in
+    /// [`ConfiguredSecret::token`] — keyed over the true value, so it
+    /// changes whenever the secret changes and is never derivable from a
+    /// guessed value. Accepted on any path.
+    Version { token: String },
+    /// "Nothing is configured here": the current value must be absent or
+    /// null. The value-free way to guard a first write to a secret path
+    /// (which never appears in `configured_secrets` while unset).
+    Absent,
 }
 
+/// One currently-configured write-only (secret) settings value: its RFC 6901
+/// pointer and the server-issued, value-free revision token clients echo as
+/// a [`SettingExpectation::Version`] when replacing or removing it. Secrets
+/// that are not configured are not listed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostSettingsPayload {
-    pub settings: HostSettings,
+pub struct ConfiguredSecret {
+    pub pointer: String,
+    pub token: String,
+}
+
+/// Server -> Client, delivered only to the connection that issued the
+/// [`FrameKind::SettingsWrite`]. `applied` reflects the host settings store:
+/// `false` means nothing was applied anywhere; `true` means the store
+/// committed and fanned out, though `field_errors` may still carry
+/// post-commit backend-propagation diagnostics ([`SettingsErrorCode::BackendRejected`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsWriteResultPayload {
+    pub write_id: SettingsWriteId,
+    pub applied: bool,
+    /// The etag of the current client-visible settings document after this
+    /// result: the new document's etag when applied, the unchanged current
+    /// document's etag when rejected. Equals the `etag` of the
+    /// [`HostSettingsPayload`] fanout an applied write produces.
+    pub current_etag: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<SettingsFieldError>,
+}
+
+/// One pointer-addressed failure inside a [`SettingsWriteResultPayload`].
+/// Value-free: pointers and messages name fields, bounds, and enum kinds,
+/// never submitted values or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsFieldError {
+    /// RFC 6901 pointer into the settings document; `""` is document-wide.
+    pub pointer: String,
+    pub code: SettingsErrorCode,
+    pub message: String,
+}
+
+/// Closed set of settings-write failure categories. Deliberately an enum,
+/// not open strings: clients branch on these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsErrorCode {
+    /// A compare-and-swap precondition failed: the current value at the
+    /// pointer is not what the client expected (concurrent edit).
+    Conflict,
+    /// The submitted value is malformed, out of range, or violates a
+    /// cross-field invariant.
+    Invalid,
+    /// The pointer names no path the settings schema knows.
+    UnknownPath,
+    /// The operation would replace an ancestor of a secret-bearing value, or
+    /// carried a value expectation for a secret-bearing path.
+    SecretSubtree,
+    /// An environment-dependent check could not be satisfied (e.g. a live
+    /// backend schema needed for validation is unavailable).
+    Unavailable,
+    /// The store committed but propagating the change to a backend failed.
+    BackendRejected,
+    /// Two operations in the write target overlapping paths, or an operation
+    /// targets a path another operation's write would implicitly normalize.
+    OverlapRejected,
+}
+
+/// Parses an RFC 6901 JSON pointer into its unescaped reference tokens.
+/// Returns `None` for syntactically invalid pointers (missing leading `/`,
+/// dangling `~` escape). The empty pointer (`""`, the whole document) parses
+/// to an empty token list.
+pub fn parse_json_pointer(pointer: &str) -> Option<Vec<String>> {
+    if pointer.is_empty() {
+        return Some(Vec::new());
+    }
+    if !pointer.starts_with('/') {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    for raw in pointer[1..].split('/') {
+        let mut token = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '~' {
+                match chars.next() {
+                    Some('0') => token.push('~'),
+                    Some('1') => token.push('/'),
+                    _ => return None,
+                }
+            } else {
+                token.push(ch);
+            }
+        }
+        tokens.push(token);
+    }
+    Some(tokens)
 }
 
 /// Deep, host-level configuration schema for one backend. Rendered in the
@@ -3148,7 +2596,7 @@ pub enum BackendConfigFieldType {
 /// Current deep-configuration values for one backend.
 /// Keys match `BackendConfigField.key`. Values reuse the session-setting value
 /// enum (`String`/`Bool`/`Integer`/`Null`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BackendConfigValues(pub HashMap<String, SessionSettingValue>);
 
 /// Server → Client on host stream. Carries the host/build's deep-config schema
@@ -5836,7 +5284,7 @@ impl fmt::Display for CodeIntelLanguageId {
 
 /// Open provider identifier on the wire — NOT a closed enum (e.g.
 /// "rust-analyzer", "pyright"). Rendered as an opaque label by the frontend.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct CodeIntelProviderId(pub String);
 
@@ -7217,7 +6665,7 @@ pub struct VoiceStopPayload {
     pub stats: VoiceFlowStats,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceUnavailableReason {
     NotEnabled,
@@ -7229,7 +6677,7 @@ pub enum VoiceUnavailableReason {
     ClientMediaUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VoiceAvailability {
     Available,
@@ -7291,11 +6739,6 @@ pub enum CommandErrorCode {
 pub struct CommandErrorPayload {
     pub stream: StreamPath,
     pub request_kind: FrameKind,
-    /// Present only for [`FrameKind::SetSetting`] errors. The target is
-    /// intentionally value-free so command errors cannot expose submitted
-    /// settings, credentials, paths, or projection tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setting_target: Option<HostSettingErrorTarget>,
     pub operation: String,
     pub code: CommandErrorCode,
     pub message: String,
@@ -7711,40 +7154,6 @@ pub struct ToolUseData {
     /// `content.chars()` and JavaScript with `Array.from(content)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_offset: Option<u32>,
-}
-
-#[cfg(test)]
-mod tool_use_data_serde_tests {
-    use super::*;
-
-    #[test]
-    fn content_offset_round_trips_and_legacy_payloads_default_to_none() {
-        let positioned = ToolUseData {
-            id: "tool-1".to_owned(),
-            name: "terminal".to_owned(),
-            arguments: serde_json::json!({ "command": "pwd" }),
-            content_offset: Some(4),
-        };
-        let encoded = serde_json::to_value(&positioned).expect("serialize positioned tool call");
-        assert_eq!(encoded["content_offset"], 4);
-        let decoded: ToolUseData =
-            serde_json::from_value(encoded).expect("deserialize positioned tool call");
-        assert_eq!(decoded.content_offset, Some(4));
-
-        let legacy: ToolUseData = serde_json::from_value(serde_json::json!({
-            "id": "tool-2",
-            "name": "terminal",
-            "arguments": null
-        }))
-        .expect("legacy tool call remains decodable");
-        assert_eq!(legacy.content_offset, None);
-        assert!(
-            serde_json::to_value(legacy)
-                .expect("serialize unpositioned tool call")
-                .get("content_offset")
-                .is_none()
-        );
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8516,1883 +7925,5 @@ impl SeqValidator {
         }
         self.expected.insert(stream.clone(), expected + 1);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod token_usage_serde_tests {
-    use super::*;
-
-    #[test]
-    fn chat_message_token_usage_round_trips_all_scopes() {
-        let request = TokenUsage {
-            input_tokens: 1,
-            output_tokens: 2,
-            total_tokens: 3,
-            cached_prompt_tokens: Some(4),
-            cache_creation_input_tokens: Some(5),
-            reasoning_tokens: Some(6),
-        };
-        let turn = TokenUsage {
-            input_tokens: 10,
-            output_tokens: 20,
-            total_tokens: 30,
-            cached_prompt_tokens: Some(40),
-            cache_creation_input_tokens: Some(50),
-            reasoning_tokens: Some(60),
-        };
-        let cumulative = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 200,
-            total_tokens: 300,
-            cached_prompt_tokens: Some(400),
-            cache_creation_input_tokens: Some(500),
-            reasoning_tokens: Some(600),
-        };
-
-        let usage = MessageTokenUsage::request_and_turn_known(request.clone(), turn.clone())
-            .with_cumulative(cumulative.clone());
-        let json = serde_json::to_value(&usage).expect("serialize");
-        assert_eq!(json["request"]["kind"], serde_json::json!("known"));
-        assert_eq!(
-            json["request"]["usage"]["total_tokens"],
-            serde_json::json!(3)
-        );
-        assert_eq!(json["turn"]["usage"]["total_tokens"], serde_json::json!(30));
-        assert_eq!(
-            json["cumulative"]["usage"]["total_tokens"],
-            serde_json::json!(300)
-        );
-
-        let round_trip: MessageTokenUsage =
-            serde_json::from_value(json).expect("deserialize message token usage");
-        assert_eq!(round_trip, usage);
-        assert_eq!(round_trip.request.known_usage(), Some(&request));
-        assert_eq!(round_trip.turn.known_usage(), Some(&turn));
-        assert_eq!(round_trip.cumulative.known_usage(), Some(&cumulative));
-    }
-
-    #[test]
-    fn token_usage_unavailable_reason_round_trips_provider_scope_ambiguous() {
-        let usage = MessageTokenUsage {
-            request: TokenUsageScope::Unavailable {
-                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
-            },
-            turn: TokenUsageScope::Unavailable {
-                reason: TokenUsageUnavailableReason::BackendDidNotReport,
-            },
-            cumulative: TokenUsageScope::Unavailable {
-                reason: TokenUsageUnavailableReason::BackendDidNotReport,
-            },
-        };
-
-        let json = serde_json::to_value(&usage).expect("serialize");
-        assert_eq!(
-            json["request"]["reason"],
-            serde_json::json!("provider_scope_ambiguous")
-        );
-        assert_eq!(
-            serde_json::from_value::<MessageTokenUsage>(json).expect("deserialize"),
-            usage
-        );
-    }
-}
-
-#[cfg(test)]
-mod command_error_serde_tests {
-    use super::*;
-
-    #[test]
-    fn set_setting_error_targets_round_trip_without_echoing_setting_values() {
-        let legacy = serde_json::json!({
-            "stream": "/host/settings",
-            "request_kind": "set_setting",
-            "operation": "set_setting",
-            "code": "conflict",
-            "message": "setting changed",
-            "fatal": false,
-        });
-        let legacy_payload: CommandErrorPayload =
-            serde_json::from_value(legacy).expect("deserialize legacy command error");
-        assert_eq!(legacy_payload.setting_target, None);
-        let legacy_encoded =
-            serde_json::to_value(&legacy_payload).expect("serialize legacy command error");
-        assert!(legacy_encoded.get("setting_target").is_none());
-
-        // The error target must never echo the submitted value: a native
-        // settings save can carry credentials in its opaque settings document.
-        let setting = HostSettingValue::BackendNativeSettings {
-            backend: BackendKind::Tycode,
-            settings: serde_json::json!({"api_key": "native-save-secret"}),
-        };
-        let payload = CommandErrorPayload {
-            stream: StreamPath("/host/settings".to_owned()),
-            request_kind: FrameKind::SetSetting,
-            setting_target: Some(setting.error_target()),
-            operation: "set_setting".to_owned(),
-            code: CommandErrorCode::Conflict,
-            message: "settings changed".to_owned(),
-            fatal: false,
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize typed command error");
-        assert_eq!(
-            encoded["setting_target"],
-            serde_json::json!("backend_native_settings")
-        );
-        let encoded_text = encoded.to_string();
-        assert!(!encoded_text.contains("native-save-secret"));
-
-        let decoded: CommandErrorPayload =
-            serde_json::from_value(encoded).expect("deserialize typed command error");
-        assert_eq!(
-            decoded.setting_target,
-            Some(HostSettingErrorTarget::BackendNativeSettings)
-        );
-    }
-
-    #[test]
-    fn host_setting_error_targets_distinguish_native_legacy_and_host_saves() {
-        assert_eq!(
-            HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: serde_json::json!({"api_key": "native-secret"}),
-            }
-            .error_target(),
-            HostSettingErrorTarget::BackendNativeSettings
-        );
-        assert_eq!(
-            HostSettingValue::BackendConfig {
-                backend: BackendKind::Tycode,
-                values: BackendConfigValues::default(),
-            }
-            .error_target(),
-            HostSettingErrorTarget::BackendConfig
-        );
-        assert_eq!(
-            HostSettingValue::EnableMobileConnections { enabled: true }.error_target(),
-            HostSettingErrorTarget::EnableMobileConnections
-        );
-        assert_eq!(
-            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 }
-                .error_target(),
-            HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
-        );
-        assert_eq!(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 300 }
-                .error_target(),
-            HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds
-        );
-    }
-
-    #[test]
-    fn tool_completion_normalization_failure_is_typed_and_backward_compatible() {
-        let completion = ToolExecutionCompletedData {
-            tool_call_id: "tool-normalization".to_owned(),
-            tool_name: "tyde_send_agent_message".to_owned(),
-            tool_result: ToolExecutionResult::TydeSendAgentMessage,
-            success: false,
-            error: Some("request could not be normalized".to_owned()),
-            normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
-        };
-        let encoded = serde_json::to_value(&completion).expect("serialize marked completion");
-        assert_eq!(
-            encoded["normalization_failure"],
-            serde_json::json!("canonical_request")
-        );
-        let decoded: ToolExecutionCompletedData =
-            serde_json::from_value(encoded).expect("deserialize marked completion");
-        assert_eq!(
-            decoded.normalization_failure,
-            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
-        );
-
-        let legacy = ToolExecutionCompletedData {
-            tool_call_id: "tool-unrelated-error".to_owned(),
-            tool_name: "run_command".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "command failed".to_owned(),
-                detailed_message: "exit status 1".to_owned(),
-            },
-            success: false,
-            error: Some("exit status 1".to_owned()),
-            normalization_failure: None,
-        };
-        let legacy_encoded =
-            serde_json::to_value(&legacy).expect("serialize unrelated completion error");
-        assert!(legacy_encoded.get("normalization_failure").is_none());
-        let legacy_decoded: ToolExecutionCompletedData =
-            serde_json::from_value(legacy_encoded).expect("deserialize legacy completion");
-        assert_eq!(legacy_decoded.normalization_failure, None);
-    }
-}
-
-#[cfg(test)]
-mod search_serde_tests {
-    use super::*;
-
-    fn round_trip<T>(value: &T) -> T
-    where
-        T: Serialize + DeserializeOwned,
-    {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
-    }
-
-    #[test]
-    fn protocol_version_is_forty_six() {
-        assert_eq!(PROTOCOL_VERSION, 47);
-    }
-
-    #[test]
-    fn project_git_unmerged_state_round_trips_and_defaults() {
-        let legacy: ProjectGitDiffFile = serde_json::from_value(serde_json::json!({
-            "relative_path": "src/lib.rs",
-            "is_binary": false,
-            "hunks": []
-        }))
-        .expect("deserialize legacy project diff file");
-        assert!(!legacy.unmerged);
-
-        let unmerged = ProjectGitDiffFile {
-            relative_path: "src/lib.rs".to_owned(),
-            is_binary: false,
-            unmerged: true,
-            hunks: Vec::new(),
-        };
-        let encoded =
-            serde_json::to_value(&unmerged).expect("serialize unmerged project diff file");
-        assert_eq!(encoded["unmerged"], true);
-        assert_eq!(
-            serde_json::from_value::<ProjectGitDiffFile>(encoded)
-                .expect("deserialize unmerged project diff file"),
-            unmerged
-        );
-        assert_eq!(
-            serde_json::to_value(ProjectGitChangeKind::Unmerged)
-                .expect("serialize unmerged project change kind"),
-            serde_json::json!("unmerged")
-        );
-        assert_eq!(
-            serde_json::from_value::<ProjectGitChangeKind>(serde_json::json!("unmerged"))
-                .expect("deserialize unmerged project change kind"),
-            ProjectGitChangeKind::Unmerged
-        );
-    }
-
-    #[test]
-    fn session_summary_count_update_retains_existing_typed_wire_name() {
-        let payload = SessionSummaryCountUpdatedPayload {
-            session_id: SessionId("session-1".to_owned()),
-            assistant_turn_count: 3,
-            updated_at_ms: 1_700_000_000_000,
-        };
-
-        let encoded =
-            serde_json::to_value(&payload).expect("serialize SessionSummaryCountUpdatedPayload");
-        assert_eq!(encoded["session_id"], "session-1");
-        assert_eq!(encoded["assistant_turn_count"], 3);
-        assert_eq!(encoded["updated_at_ms"], 1_700_000_000_000_u64);
-        assert!(encoded.get("message_count").is_none());
-        assert!(encoded.get("assistant_response_count").is_none());
-        assert_eq!(
-            FrameKind::SessionSummaryCountUpdated.to_string(),
-            "session_summary_count_updated"
-        );
-        assert_eq!(
-            serde_json::from_value::<SessionSummaryCountUpdatedPayload>(encoded)
-                .expect("deserialize SessionSummaryCountUpdatedPayload"),
-            payload
-        );
-    }
-
-    #[test]
-    fn session_list_scope_round_trips_and_defaults_to_all() {
-        let payload = ListSessionsPayload {
-            scope: Some(SessionListScope::RootSessions),
-            cursor: None,
-            limit: Some(20),
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize ListSessionsPayload");
-        assert_eq!(encoded["scope"], serde_json::json!("root_sessions"));
-        let decoded: ListSessionsPayload =
-            serde_json::from_value(encoded).expect("deserialize ListSessionsPayload");
-        assert_eq!(decoded.scope, Some(SessionListScope::RootSessions));
-
-        let legacy_page = serde_json::json!({
-            "cursor": { "generation": 1, "offset": 0 },
-            "limit": 64,
-            "total_count": 0,
-            "status": { "kind": "complete" },
-        });
-        let page: SessionListPageInfo =
-            serde_json::from_value(legacy_page).expect("deserialize SessionListPageInfo");
-        assert_eq!(page.scope, SessionListScope::AllSessions);
-        // A numeric limit is a bounded page and stays one. `Option<u32>`
-        // decodes the present number on its own; `#[serde(default)]` is what
-        // the omitted key below needs.
-        assert_eq!(page.limit, Some(64));
-    }
-
-    /// A page's `limit` is a *response descriptor*: `None` says the server
-    /// applied no bound. Encoding that as `total_count` is what made the host
-    /// advertise `4014` and then reject the client that echoed it back.
-    ///
-    /// The omitted-key and omitted-on-serialize cases are the ones that make
-    /// this a breaking wire change: a pre-42 client's `u32` field cannot
-    /// decode a missing `limit`, which is why `PROTOCOL_VERSION` moves with it.
-    #[test]
-    fn session_list_page_limit_encodes_unbounded_as_an_absent_field() {
-        let unbounded = serde_json::json!({
-            "cursor": { "generation": 1, "offset": 0 },
-            "total_count": 4014,
-            "status": { "kind": "complete" },
-        });
-        let page: SessionListPageInfo =
-            serde_json::from_value(unbounded).expect("deserialize unbounded SessionListPageInfo");
-        assert_eq!(page.limit, None);
-        assert_eq!(page.total_count, 4014);
-
-        let encoded = serde_json::to_value(page).expect("serialize unbounded page");
-        assert!(
-            encoded.get("limit").is_none(),
-            "an unbounded page must omit the key rather than emit a count"
-        );
-
-        let bounded = SessionListPageInfo {
-            limit: Some(64),
-            ..Default::default()
-        };
-        let encoded = serde_json::to_value(bounded).expect("serialize bounded page");
-        assert_eq!(
-            encoded["limit"],
-            serde_json::json!(64),
-            "a bounded page keeps the pre-42 numeric wire shape"
-        );
-    }
-
-    #[test]
-    fn managed_broker_credentials_round_trip_without_debug_secret_leak() {
-        let mut headers = BTreeMap::new();
-        headers.insert(
-            "x-amz-customauthorizer-name".to_owned(),
-            "tycode-mobile-v1".to_owned(),
-        );
-        headers.insert("tycode-grant".to_owned(), "signed-grant-token".to_owned());
-        let credentials = ManagedBrokerCredentials {
-            grant_id: ManagedBrokerGrantId::new("grant_01J").expect("grant id"),
-            client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J")
-                .expect("client id"),
-            connect: ManagedBrokerConnectAuth {
-                username: Some("tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
-                password: Some("signed-grant-token".to_owned()),
-                websocket_url: Some(
-                    BrokerUrl::new(
-                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-token"
-                    )
-                    .expect("websocket url"),
-                ),
-                headers,
-            },
-            scope: ManagedBrokerCredentialScope {
-                namespace: ManagedBrokerTopicNamespace::new("tyde/prod/pair_01J")
-                    .expect("namespace"),
-                role: ManagedBrokerRole::Host,
-                publish: vec!["tyde/prod/pair_01J/rooms/+/host-to-client".to_owned()],
-                subscribe: vec!["tyde/prod/pair_01J/rooms/+/client-to-host".to_owned()],
-            },
-            issued_at_ms: 1_760_000_000_000,
-            expires_at_ms: 1_760_000_900_000,
-        };
-
-        let json = serde_json::to_value(&credentials).expect("serialize credentials");
-        assert_eq!(json["grant_id"], "grant_01J");
-        assert_eq!(json["scope"]["role"], "host");
-        assert_eq!(
-            json["connect"]["headers"]["x-amz-customauthorizer-name"],
-            "tycode-mobile-v1"
-        );
-        assert_eq!(
-            json["connect"]["headers"]["tycode-grant"],
-            "signed-grant-token"
-        );
-        assert_eq!(
-            json["connect"]["websocket_url"],
-            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-token"
-        );
-        assert_eq!(
-            serde_json::from_value::<ManagedBrokerCredentials>(json)
-                .expect("deserialize credentials"),
-            credentials
-        );
-
-        let debug = format!("{:?}", credentials.connect);
-        assert!(
-            !debug.contains("signed-grant-token"),
-            "debug output leaked managed broker grant: {debug}"
-        );
-        assert!(
-            !debug.contains("a1234567890-ats.iot.us-west-2.amazonaws.com"),
-            "debug output leaked managed broker websocket URL: {debug}"
-        );
-        assert!(
-            !debug.contains("tycode-grant") && !debug.contains("x-amz-customauthorizer-name"),
-            "debug output leaked managed broker grant/header details: {debug}"
-        );
-    }
-
-    #[test]
-    fn mobile_managed_access_states_are_protocol_typed() {
-        let repair = MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::RepairRequired {
-                code: MobileAccessErrorCode::RepairRequired,
-                message: "Legacy public broker pairing must be repaired".to_owned(),
-            },
-            pairing: MobilePairingState::RepairRequired {
-                code: MobileAccessErrorCode::RepairRequired,
-                message: "Legacy public broker pairing must be repaired".to_owned(),
-            },
-            paired_devices: vec![MobileDeviceSummary {
-                device_id: MobileDeviceId("dev_01J".to_owned()),
-                label: "Mike's iPhone".to_owned(),
-                key_fingerprint: "sha256:abc".to_owned(),
-                created_at_ms: 1,
-                last_seen_at_ms: None,
-                state: MobileDeviceState::RepairRequired,
-            }],
-        };
-
-        let json = serde_json::to_value(&repair).expect("serialize mobile access state");
-        assert_eq!(json["broker_status"]["kind"], "repair_required");
-        assert_eq!(json["pairing"]["kind"], "repair_required");
-        assert_eq!(json["paired_devices"][0]["state"], "repair_required");
-        assert_eq!(
-            serde_json::from_value::<MobileAccessStatePayload>(json)
-                .expect("deserialize mobile access state"),
-            repair
-        );
-    }
-
-    #[test]
-    fn mobile_service_auth_state_carries_paywall_outside_host_state() {
-        let auth = MobileServiceAuthStatePayload {
-            state: MobileServiceAuthState::PassRequired {
-                message: "A Tyggs Pass is required".to_owned(),
-                paywall_url: "https://tyggs.com/pass".to_owned(),
-            },
-        };
-
-        let json = serde_json::to_value(&auth).expect("serialize mobile service auth");
-        assert_eq!(json["state"]["kind"], "pass_required");
-        assert_eq!(json["state"]["paywall_url"], "https://tyggs.com/pass");
-        assert_eq!(
-            serde_json::from_value::<MobileServiceAuthStatePayload>(json)
-                .expect("deserialize mobile service auth"),
-            auth
-        );
-    }
-
-    #[test]
-    fn managed_semantic_newtypes_reject_empty_deserialization() {
-        assert!(serde_json::from_value::<ManagedBrokerRegion>(serde_json::json!("")).is_err());
-        assert!(
-            serde_json::from_value::<ManagedBrokerAuthorizerName>(serde_json::json!("")).is_err()
-        );
-        assert!(serde_json::from_value::<ManagedBrokerGrantId>(serde_json::json!("")).is_err());
-        assert!(serde_json::from_value::<ManagedBrokerClientId>(serde_json::json!("")).is_err());
-        assert!(
-            serde_json::from_value::<ManagedBrokerTopicNamespace>(serde_json::json!("")).is_err()
-        );
-        assert!(serde_json::from_value::<MobilePairingOfferId>(serde_json::json!("")).is_err());
-    }
-
-    #[test]
-    fn orchestration_event_round_trips_tycode_shape() {
-        let event = ChatEvent::Orchestration(OrchestrationEvent {
-            agent_id: OrchestrationId("boot-1-7".to_owned()),
-            agent_type: OrchestrationAgentType("swarm".to_owned()),
-            payload: OrchestrationPayload::WorkerCompleted {
-                fanout_id: OrchestrationId("boot-1-8".to_owned()),
-                worker_id: OrchestrationId("boot-1-9".to_owned()),
-                label: "src/a.rs".to_owned(),
-                status: OrchestrationOutcomeStatus::Succeeded,
-                summary: "done".to_owned(),
-            },
-        });
-
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["kind"], "Orchestration");
-        assert_eq!(json["data"]["agent_id"], "boot-1-7");
-        assert_eq!(json["data"]["agent_type"], "swarm");
-        assert_eq!(json["data"]["payload"]["kind"], "WorkerCompleted");
-        assert_eq!(json["data"]["payload"]["status"], "Succeeded");
-
-        let decoded: ChatEvent = serde_json::from_value(json).expect("deserialize");
-        let ChatEvent::Orchestration(decoded) = decoded else {
-            panic!("expected Orchestration event");
-        };
-        assert_eq!(decoded.agent_id.0, "boot-1-7");
-        assert_eq!(decoded.agent_type.0, "swarm");
-        assert!(matches!(
-            decoded.payload,
-            OrchestrationPayload::WorkerCompleted { .. }
-        ));
-    }
-
-    #[test]
-    fn background_agent_settings_defaults_are_safe() {
-        let settings: HostSettings = serde_json::from_str("{}").expect("deserialize settings");
-        assert!(settings.background_agent_features.auto_generate_agent_names);
-        assert!(!settings.background_agent_features.agent_activity_summaries);
-        assert!(settings.code_intel.language_server_paths.is_empty());
-    }
-
-    #[test]
-    fn tycode_native_settings_snapshot_round_trips_typed_advisories() {
-        let snapshot = BackendNativeSettingsSnapshot {
-            backend_kind: BackendKind::Tycode,
-            status: BackendConfigSnapshotStatus::Ready,
-            settings: Some(serde_json::json!({"active_provider": "anthropic"})),
-            groups: Vec::new(),
-            message: None,
-            advisories: vec![
-                BackendNativeSettingsAdvisory::NoProviderConfigured {
-                    message: "Configure a provider to continue.".to_owned(),
-                },
-                BackendNativeSettingsAdvisory::BackendReported {
-                    message: "Tycode reported a recoverable settings diagnostic.".to_owned(),
-                },
-            ],
-        };
-
-        let json = serde_json::to_value(&snapshot).expect("serialize native settings snapshot");
-        assert_eq!(json["advisories"][0]["kind"], "no_provider_configured");
-        assert_eq!(json["advisories"][1]["kind"], "backend_reported");
-        assert_eq!(round_trip(&snapshot), snapshot);
-    }
-
-    #[test]
-    fn native_settings_snapshot_defaults_optional_fields_for_legacy_hosts() {
-        let legacy = serde_json::json!({
-            "backend_kind": "tycode",
-            "status": "ready",
-            "settings": {"active_provider": "anthropic"},
-            "groups": [],
-        });
-        let snapshot: BackendNativeSettingsSnapshot =
-            serde_json::from_value(legacy).expect("deserialize legacy native settings snapshot");
-        assert!(snapshot.advisories.is_empty());
-
-        let encoded = serde_json::to_value(snapshot).expect("serialize legacy-compatible snapshot");
-        assert!(encoded.get("advisories").is_none());
-    }
-
-    #[test]
-    fn tycode_profiles_doc_round_trips_actions_and_base_settings() {
-        use crate::tycode_config::{
-            TYCODE_NATIVE_SETTINGS_VERSION, TycodeNativeSettingsDoc, TycodeProfileAction,
-            TycodeProfileSettings,
-        };
-
-        let doc = TycodeNativeSettingsDoc {
-            version: TYCODE_NATIVE_SETTINGS_VERSION,
-            profiles: vec![
-                TycodeProfileSettings {
-                    name: "default".to_owned(),
-                    settings_path: "/Users/alice/.tycode/settings.toml".to_owned(),
-                    settings: serde_json::json!({"model_quality": "high"}),
-                    base_settings: None,
-                },
-                TycodeProfileSettings {
-                    name: "work".to_owned(),
-                    settings_path: "/Users/alice/.tycode/profiles/work.toml".to_owned(),
-                    settings: serde_json::json!({"model_quality": "low"}),
-                    base_settings: Some(serde_json::json!({"model_quality": "high"})),
-                },
-            ],
-            actions: vec![
-                TycodeProfileAction::CreateProfile {
-                    name: "work".to_owned(),
-                    copy_from: None,
-                },
-                TycodeProfileAction::DeleteProfile {
-                    name: "scratch".to_owned(),
-                },
-            ],
-        };
-
-        let json = serde_json::to_value(&doc).expect("serialize Tycode profiles doc");
-        assert_eq!(json["profiles"][0]["name"], "default");
-        assert!(json["profiles"][0].get("base_settings").is_none());
-        assert_eq!(json["actions"][0]["kind"], "create_profile");
-        assert_eq!(json["actions"][1]["kind"], "delete_profile");
-        let decoded: TycodeNativeSettingsDoc =
-            serde_json::from_value(json).expect("deserialize Tycode profiles doc");
-        assert_eq!(decoded, doc);
-
-        // A server snapshot has no actions and omits the key entirely.
-        let bare = TycodeNativeSettingsDoc {
-            version: TYCODE_NATIVE_SETTINGS_VERSION,
-            profiles: Vec::new(),
-            actions: Vec::new(),
-        };
-        let bare_json = serde_json::to_value(&bare).expect("serialize bare doc");
-        assert!(bare_json.get("actions").is_none());
-    }
-
-    #[test]
-    fn activity_summary_state_round_trips() {
-        let state = AgentActivitySummaryState::Fresh {
-            summary: AgentActivitySummary {
-                text: "Editing the backend scheduler.".to_owned(),
-                generated_at_ms: 42,
-                source_from_seq: Some(1),
-                source_through_seq: Some(9),
-            },
-        };
-        assert_eq!(round_trip(&state), state);
-
-        let payload = AgentActivitySummaryPayload {
-            agent_id: AgentId("agent-1".to_owned()),
-            state: AgentActivitySummaryState::Stale {
-                summary: AgentActivitySummary {
-                    text: "Editing the backend scheduler.".to_owned(),
-                    generated_at_ms: 42,
-                    source_from_seq: Some(1),
-                    source_through_seq: Some(9),
-                },
-                reason: AgentActivitySummaryStaleReason::NewActivity,
-            },
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn activity_stats_payload_and_bootstrap_round_trip() {
-        assert_eq!(
-            FrameKind::AgentActivityStats.to_string(),
-            "agent_activity_stats"
-        );
-        let stats = AgentActivityStats {
-            last_output_line: Some("Done".to_owned()),
-            tool_calls: 2,
-            token_usage: TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
-                cached_prompt_tokens: Some(3),
-                cache_creation_input_tokens: Some(1),
-                reasoning_tokens: Some(2),
-            },
-            token_usage_total_only: Some(15),
-            current_context_usage: Some(CurrentContextUsage::Known {
-                input_tokens: 14,
-                context_window: 200_000,
-            }),
-            estimated_context_breakdown: Some(ContextBreakdown {
-                system_prompt_bytes: 10,
-                tool_io_bytes: 20,
-                conversation_history_bytes: 30,
-                reasoning_bytes: 40,
-                context_injection_bytes: 50,
-                input_tokens: 14,
-                context_window: 200_000,
-            }),
-            source_through_seq: Some(42),
-        };
-        let payload = AgentActivityStatsPayload {
-            agent_id: AgentId("agent-1".to_owned()),
-            stats,
-        };
-        assert_eq!(round_trip(&payload), payload);
-
-        let bootstrap = AgentBootstrapPayload {
-            events: vec![AgentBootstrapEvent::AgentActivityStats(payload.clone())],
-            latest_output: AgentControlOutput::Empty,
-            turn_active: false,
-        };
-        assert!(matches!(
-            round_trip(&bootstrap).events.as_slice(),
-            [AgentBootstrapEvent::AgentActivityStats(round_tripped)] if round_tripped == &payload
-        ));
-    }
-
-    #[test]
-    fn task_token_usage_payload_round_trips() {
-        assert_eq!(FrameKind::TaskTokenUsage.to_string(), "task_token_usage");
-        let usage = TaskTokenUsageAmount {
-            total_tokens: 42,
-            input_tokens: Some(30),
-            output_tokens: Some(12),
-            cached_prompt_tokens: Some(5),
-            cache_creation_input_tokens: None,
-            reasoning_tokens: Some(3),
-        };
-        let payload = TaskTokenUsagePayload {
-            root_agent_id: AgentId("root".to_owned()),
-            root_session_id: Some(SessionId("root-session".to_owned())),
-            total: TaskTokenUsageAggregate {
-                usage: usage.clone(),
-                status: TaskTokenUsageStatus::Partial {
-                    unavailable_count: 1,
-                    reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
-                },
-            },
-            self_usage: TaskTokenUsageScope::Known {
-                usage: Box::new(usage.clone()),
-            },
-            descendant_usage: TaskTokenUsageAggregate {
-                usage: TaskTokenUsageAmount::total_only(10),
-                status: TaskTokenUsageStatus::Known,
-            },
-            descendant_count: 2,
-            breakdown: vec![TaskTokenUsageEntry {
-                agent_id: AgentId("root".to_owned()),
-                session_id: Some(SessionId("root-session".to_owned())),
-                parent_agent_id: None,
-                parent_session_id: None,
-                name: "Root".to_owned(),
-                origin: AgentOrigin::User,
-                backend_kind: BackendKind::Claude,
-                model: Some("mock".to_owned()),
-                depth: 0,
-                tree_index: 0,
-                usage: TaskTokenUsageScope::Unavailable {
-                    reason: TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous,
-                },
-            }],
-        };
-
-        assert_eq!(round_trip(&payload), payload);
-        let partial_scope = TaskTokenUsageScope::Partial {
-            usage: Box::new(usage.clone()),
-            unavailable_count: 2,
-            reasons: vec![
-                TaskTokenUsageUnavailableReason::BackendDidNotReport,
-                TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous,
-            ],
-        };
-        assert_eq!(round_trip(&partial_scope), partial_scope);
-        assert_eq!(partial_scope.known_usage(), None);
-        assert_eq!(partial_scope.reported_usage(), Some(&usage));
-        let mut entry_without_agent_id =
-            serde_json::to_value(&payload.breakdown[0]).expect("serialize entry");
-        entry_without_agent_id
-            .as_object_mut()
-            .expect("entry object")
-            .remove("agent_id");
-        assert!(
-            serde_json::from_value::<TaskTokenUsageEntry>(entry_without_agent_id).is_err(),
-            "TaskTokenUsageEntry.agent_id is required for agent breakdown rows"
-        );
-        let bootstrap = HostBootstrapPayload {
-            settings: HostSettings {
-                enabled_backends: Vec::new(),
-                default_backend: None,
-                enable_mobile_connections: false,
-                mobile_broker_url: None,
-                tyde_debug_mcp_enabled: false,
-                tyde_agent_control_mcp_enabled: true,
-                tyde_agent_control_max_depth: default_agent_control_max_depth(),
-                complexity_tiers_enabled: false,
-                backend_tier_configs: HashMap::new(),
-                background_agent_features: BackgroundAgentFeaturesSettings::default(),
-                supervisor: SupervisorSettings::default(),
-                code_intel: CodeIntelSettings::default(),
-                backend_config: HashMap::new(),
-                launch_profiles: Vec::new(),
-                hermes_disabled_providers: Default::default(),
-                voice: Default::default(),
-            },
-            mobile_access: MobileAccessStatePayload {
-                broker_status: MobileBrokerStatus::Disabled,
-                pairing: MobilePairingState::Idle,
-                paired_devices: Vec::new(),
-            },
-            backend_setup: BackendSetupPayload {
-                backends: Vec::new(),
-            },
-            session_schemas: Vec::new(),
-            backend_config_schemas: Vec::new(),
-            backend_config_snapshots: Vec::new(),
-            launch_profile_catalog: LaunchProfileCatalog::default(),
-            sessions: Vec::new(),
-            session_list: Default::default(),
-            projects: Vec::new(),
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            steering: Vec::new(),
-            custom_agents: Vec::new(),
-            team_preset_catalog: TeamPresetCatalog {
-                role_presets: Vec::new(),
-                personality_traits: Vec::new(),
-                personality_presets: Vec::new(),
-                team_templates: Vec::new(),
-            },
-            team_drafts: Vec::new(),
-            teams: Vec::new(),
-            team_members: Vec::new(),
-            team_member_bindings: Vec::new(),
-            agents: Vec::new(),
-            task_token_usages: vec![payload.clone()],
-            workflow_summaries: Vec::new(),
-            workflow_diagnostics: Vec::new(),
-            workflow_runs: Vec::new(),
-            workflow_locations: Vec::new(),
-            agents_view_preferences: None,
-        };
-        assert_eq!(round_trip(&bootstrap).task_token_usages, vec![payload]);
-    }
-
-    #[test]
-    fn sidebar_preferences_default_and_update_round_trip() {
-        let snapshot: AgentsViewPreferencesSnapshot =
-            serde_json::from_str(r#"{"preferences":{"filters":{}}}"#)
-                .expect("deserialize snapshot");
-        assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
-
-        let update = AgentsViewPreferencesUpdate::SetSidebarPreferences {
-            sidebar: AgentsSidebarPreferences {
-                hide_inactive: true,
-                hide_sub_agents: true,
-                project_visibility: AgentsSidebarProjectVisibility::CurrentProjectOnly,
-            },
-        };
-        let json = serde_json::to_value(&update).expect("serialize update");
-        assert_eq!(json["kind"], "set_sidebar_preferences");
-        assert_eq!(
-            json["sidebar"]["project_visibility"],
-            "current_project_only"
-        );
-        assert_eq!(round_trip(&update), update);
-    }
-
-    #[test]
-    fn search_frame_kinds_display_snake_case() {
-        assert_eq!(FrameKind::SetAgentGroups.to_string(), "set_agent_groups");
-        assert_eq!(FrameKind::ProjectSearch.to_string(), "project_search");
-        assert_eq!(
-            FrameKind::ProjectSearchCancel.to_string(),
-            "project_search_cancel"
-        );
-        assert_eq!(FrameKind::ProjectAccessed.to_string(), "project_accessed");
-        assert_eq!(
-            FrameKind::ProjectSearchResults.to_string(),
-            "project_search_results"
-        );
-        assert_eq!(
-            FrameKind::ProjectSearchComplete.to_string(),
-            "project_search_complete"
-        );
-    }
-
-    #[test]
-    fn project_search_payload_round_trip() {
-        let payload = ProjectSearchPayload {
-            search_id: 7,
-            query: "needle".to_owned(),
-            case_sensitive: true,
-            whole_word: true,
-            use_regex: false,
-            include_ignored: true,
-            roots: vec![
-                ProjectRootPath("/a".to_owned()),
-                ProjectRootPath("/b".to_owned()),
-            ],
-            path_prefix: Some("src/".to_owned()),
-            max_results: Some(500),
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn project_search_payload_defaults_deserialize() {
-        // Minimal payload: only the required fields. Booleans/roots default.
-        let payload: ProjectSearchPayload =
-            serde_json::from_str(r#"{"search_id":1,"query":"x"}"#).expect("deserialize");
-        assert_eq!(payload.search_id, 1);
-        assert_eq!(payload.query, "x");
-        assert!(!payload.case_sensitive);
-        assert!(!payload.whole_word);
-        assert!(!payload.use_regex);
-        assert!(!payload.include_ignored);
-        assert!(payload.roots.is_empty());
-        assert_eq!(payload.path_prefix, None);
-        assert_eq!(payload.max_results, None);
-    }
-
-    #[test]
-    fn project_search_results_payload_round_trip() {
-        let payload = ProjectSearchResultsPayload {
-            search_id: 3,
-            file: ProjectSearchFileResult {
-                path: ProjectPath {
-                    root: ProjectRootPath("/repo".to_owned()),
-                    relative_path: "src/main.rs".to_owned(),
-                },
-                matches: vec![
-                    ProjectSearchMatch {
-                        line_number: 12,
-                        line_text: "let café = needle;".to_owned(),
-                        ranges: vec![(11, 17)],
-                    },
-                    ProjectSearchMatch {
-                        line_number: 40,
-                        line_text: "another needle here".to_owned(),
-                        ranges: vec![(8, 14)],
-                    },
-                ],
-                truncated: true,
-            },
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn project_search_complete_round_trip() {
-        let payload = ProjectSearchCompletePayload {
-            search_id: 9,
-            total_files: 4,
-            total_matches: 17,
-            truncated: false,
-            cancelled: true,
-            error: Some("boom".to_owned()),
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn project_search_cancel_round_trip() {
-        let payload = ProjectSearchCancelPayload { search_id: 42 };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn project_accessed_payload_round_trip_empty_payload() {
-        let payload = ProjectAccessedPayload {};
-        let json = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(json, serde_json::json!({}));
-        assert_eq!(round_trip(&payload), payload);
-        let kind_json = serde_json::to_string(&FrameKind::ProjectAccessed).expect("serialize");
-        assert_eq!(kind_json, "\"project_accessed\"");
-        assert_eq!(
-            serde_json::from_str::<FrameKind>(&kind_json).expect("deserialize"),
-            FrameKind::ProjectAccessed
-        );
-    }
-
-    #[test]
-    fn project_file_contents_carries_version() {
-        let payload = ProjectFileContentsPayload {
-            path: ProjectPath {
-                root: ProjectRootPath("/repo".to_owned()),
-                relative_path: "src/main.rs".to_owned(),
-            },
-            version: ProjectFileVersion(7),
-            contents: Some("fn main() {}".to_owned()),
-            is_binary: false,
-            missing: false,
-        };
-        let json = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(json["version"], serde_json::json!(7));
-    }
-}
-
-#[cfg(test)]
-mod code_intel_serde_tests {
-    use super::*;
-
-    fn round_trip<T>(value: &T) -> T
-    where
-        T: Serialize + DeserializeOwned,
-    {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
-    }
-
-    fn sample_path() -> ProjectPath {
-        ProjectPath {
-            root: ProjectRootPath("/repo".to_owned()),
-            relative_path: "src/lib.rs".to_owned(),
-        }
-    }
-
-    fn sample_location() -> CodeIntelLocation {
-        CodeIntelLocation {
-            path: sample_path(),
-            range: ByteRange { start: 4, end: 9 },
-        }
-    }
-
-    #[test]
-    fn code_intel_frame_kinds_display_snake_case() {
-        assert_eq!(
-            FrameKind::CodeIntelSubscribeFile.to_string(),
-            "code_intel_subscribe_file"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelUnsubscribeFile.to_string(),
-            "code_intel_unsubscribe_file"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelSetVisibleRange.to_string(),
-            "code_intel_set_visible_range"
-        );
-        assert_eq!(FrameKind::CodeIntelHover.to_string(), "code_intel_hover");
-        assert_eq!(
-            FrameKind::CodeIntelNavigate.to_string(),
-            "code_intel_navigate"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelFindReferences.to_string(),
-            "code_intel_find_references"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelCancelReferences.to_string(),
-            "code_intel_cancel_references"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelOverview.to_string(),
-            "code_intel_overview"
-        );
-        assert_eq!(FrameKind::CodeIntelStatus.to_string(), "code_intel_status");
-        assert_eq!(
-            FrameKind::CodeIntelFileModel.to_string(),
-            "code_intel_file_model"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelDiagnostics.to_string(),
-            "code_intel_diagnostics"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelHoverResult.to_string(),
-            "code_intel_hover_result"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelNavigateResult.to_string(),
-            "code_intel_navigate_result"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelReferencesResults.to_string(),
-            "code_intel_references_results"
-        );
-        assert_eq!(
-            FrameKind::CodeIntelReferencesComplete.to_string(),
-            "code_intel_references_complete"
-        );
-        assert_eq!(FrameKind::CodeIntelError.to_string(), "code_intel_error");
-    }
-
-    #[test]
-    fn subscribe_unsubscribe_round_trip() {
-        let subscribe = CodeIntelSubscribeFilePayload {
-            path: sample_path(),
-        };
-        assert_eq!(round_trip(&subscribe), subscribe);
-        let unsubscribe = CodeIntelUnsubscribeFilePayload {
-            path: sample_path(),
-        };
-        assert_eq!(round_trip(&unsubscribe), unsubscribe);
-    }
-
-    #[test]
-    fn set_visible_range_round_trip() {
-        let payload = CodeIntelSetVisibleRangePayload {
-            path: sample_path(),
-            version: ProjectFileVersion(3),
-            range: ByteRange { start: 0, end: 120 },
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn hover_and_navigate_round_trip() {
-        let hover = CodeIntelHoverPayload {
-            hover_id: 1,
-            path: sample_path(),
-            version: ProjectFileVersion(2),
-            offset: 42,
-        };
-        assert_eq!(round_trip(&hover), hover);
-        let navigate = CodeIntelNavigatePayload {
-            navigate_id: 9,
-            path: sample_path(),
-            version: ProjectFileVersion(2),
-            offset: 42,
-        };
-        assert_eq!(round_trip(&navigate), navigate);
-    }
-
-    #[test]
-    fn find_and_cancel_references_round_trip() {
-        let find = CodeIntelFindReferencesPayload {
-            references_id: 5,
-            path: sample_path(),
-            version: ProjectFileVersion(4),
-            offset: 17,
-            include_declaration: true,
-        };
-        assert_eq!(round_trip(&find), find);
-        let cancel = CodeIntelCancelReferencesPayload { references_id: 5 };
-        assert_eq!(round_trip(&cancel), cancel);
-    }
-
-    #[test]
-    fn overview_payload_round_trips_provider_state() {
-        let payload = CodeIntelOverviewPayload {
-            roots: vec![
-                CodeIntelRootOverview {
-                    root: ProjectRootPath("/repo-a".to_owned()),
-                    providers: vec![CodeIntelProviderStatus {
-                        provider: CodeIntelProviderId("rust-analyzer".to_owned()),
-                        language: CodeIntelLanguageId("rust".to_owned()),
-                        state: CodeIntelState::Indexing,
-                        resource_mode: CodeIntelResourceMode::Full,
-                        work_done: Some(40),
-                        total_work: Some(100),
-                        message: Some("indexing".to_owned()),
-                        error_count: 3,
-                        warning_count: 1,
-                    }],
-                },
-                CodeIntelRootOverview {
-                    root: ProjectRootPath("/repo-b".to_owned()),
-                    providers: Vec::new(),
-                },
-            ],
-            summary: CodeIntelOverviewSummary {
-                headline: CodeIntelOverviewHeadline::Indexing,
-                ready: 0,
-                indexing: 1,
-                starting: 0,
-                unavailable: 0,
-                failed: 0,
-                message: Some("Indexing code intelligence".to_owned()),
-                error_count: 3,
-                warning_count: 1,
-            },
-        };
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn overview_headline_round_trips_not_started() {
-        let payload = CodeIntelOverviewPayload {
-            roots: vec![CodeIntelRootOverview {
-                root: ProjectRootPath("/repo".to_owned()),
-                providers: Vec::new(),
-            }],
-            summary: CodeIntelOverviewSummary {
-                headline: CodeIntelOverviewHeadline::NotStarted,
-                ready: 0,
-                indexing: 0,
-                starting: 0,
-                unavailable: 0,
-                failed: 0,
-                message: Some("No language server running — open a file to index".to_owned()),
-                error_count: 0,
-                warning_count: 0,
-            },
-        };
-
-        let json = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(json["summary"]["headline"], "not_started");
-        assert_eq!(round_trip(&payload), payload);
-    }
-
-    #[test]
-    fn status_payload_round_trips_every_scope_and_state() {
-        let scopes = [
-            CodeIntelStatusScope::Project,
-            CodeIntelStatusScope::Provider {
-                root: ProjectRootPath("/repo".to_owned()),
-            },
-            CodeIntelStatusScope::File {
-                path: sample_path(),
-                version: ProjectFileVersion(8),
-            },
-        ];
-        let states = [
-            CodeIntelState::Unsupported,
-            CodeIntelState::Unavailable,
-            CodeIntelState::Starting,
-            CodeIntelState::Indexing,
-            CodeIntelState::Ready,
-            CodeIntelState::Failed,
-        ];
-        let modes = [
-            CodeIntelResourceMode::Full,
-            CodeIntelResourceMode::Limited,
-            CodeIntelResourceMode::Unavailable,
-        ];
-        for scope in &scopes {
-            for state in &states {
-                for mode in &modes {
-                    let payload = CodeIntelStatusPayload {
-                        scope: scope.clone(),
-                        state: *state,
-                        resource_mode: *mode,
-                        work_done: Some(3),
-                        total_work: Some(10),
-                        message: Some("indexing".to_owned()),
-                    };
-                    assert_eq!(round_trip(&payload), payload);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn file_model_round_trip_all_variants() {
-        for model_range in [
-            CodeIntelModelRange::FullFile,
-            CodeIntelModelRange::ByteRange {
-                range: ByteRange { start: 1, end: 2 },
-            },
-        ] {
-            for completeness in [
-                CodeIntelCompleteness::Complete,
-                CodeIntelCompleteness::Partial,
-            ] {
-                let payload = CodeIntelFileModelPayload {
-                    path: sample_path(),
-                    version: ProjectFileVersion(6),
-                    provider: CodeIntelProviderId("rust-analyzer".to_owned()),
-                    language: CodeIntelLanguageId("rust".to_owned()),
-                    model_range: model_range.clone(),
-                    completeness,
-                    occurrences: vec![
-                        CodeIntelOccurrence {
-                            range: ByteRange { start: 4, end: 9 },
-                            role: CodeIntelRole::Definition,
-                            display: "foo".to_owned(),
-                            definition: vec![sample_location()],
-                        },
-                        CodeIntelOccurrence {
-                            range: ByteRange { start: 20, end: 23 },
-                            role: CodeIntelRole::Reference,
-                            display: "bar".to_owned(),
-                            definition: vec![],
-                        },
-                    ],
-                };
-                assert_eq!(round_trip(&payload), payload);
-            }
-        }
-    }
-
-    #[test]
-    fn diagnostics_round_trip_all_severities() {
-        for severity in [
-            CodeIntelSeverity::Error,
-            CodeIntelSeverity::Warning,
-            CodeIntelSeverity::Information,
-            CodeIntelSeverity::Hint,
-        ] {
-            let payload = CodeIntelDiagnosticsPayload {
-                path: sample_path(),
-                version: ProjectFileVersion(2),
-                diagnostics: vec![CodeIntelDiagnostic {
-                    range: ByteRange { start: 0, end: 5 },
-                    severity,
-                    message: "mismatched types".to_owned(),
-                    source: Some("rustc".to_owned()),
-                }],
-            };
-            assert_eq!(round_trip(&payload), payload);
-        }
-    }
-
-    #[test]
-    fn navigate_and_hover_results_round_trip() {
-        let navigate = CodeIntelNavigateResultPayload {
-            navigate_id: 9,
-            path: sample_path(),
-            version: ProjectFileVersion(2),
-            targets: vec![sample_location()],
-            external_targets: 1,
-        };
-        assert_eq!(round_trip(&navigate), navigate);
-        let hover = CodeIntelHoverResultPayload {
-            hover_id: 1,
-            path: sample_path(),
-            version: ProjectFileVersion(2),
-            contents: Some("`fn foo()`".to_owned()),
-            range: Some(ByteRange { start: 4, end: 9 }),
-        };
-        assert_eq!(round_trip(&hover), hover);
-    }
-
-    #[test]
-    fn references_results_and_complete_round_trip() {
-        let results = CodeIntelReferencesResultsPayload {
-            references_id: 5,
-            file: CodeIntelReferencesFileResult {
-                path: sample_path(),
-                lines: vec![CodeIntelReferenceLine {
-                    line_number: 12,
-                    line_text: "    foo();".to_owned(),
-                    ranges: vec![ByteRange { start: 4, end: 7 }],
-                }],
-                truncated: false,
-            },
-        };
-        assert_eq!(round_trip(&results), results);
-        let complete = CodeIntelReferencesCompletePayload {
-            references_id: 5,
-            total_files: 2,
-            total_references: 7,
-            truncated: false,
-            cancelled: false,
-            error: None,
-        };
-        assert_eq!(round_trip(&complete), complete);
-    }
-
-    #[test]
-    fn error_round_trip_all_codes_and_contexts() {
-        let codes = [
-            CodeIntelErrorCode::ProviderUnavailable,
-            CodeIntelErrorCode::ProviderCrashed,
-            CodeIntelErrorCode::UnsupportedLanguage,
-            CodeIntelErrorCode::StaleVersion,
-            CodeIntelErrorCode::Timeout,
-            CodeIntelErrorCode::ProtocolError,
-            CodeIntelErrorCode::Internal,
-        ];
-        let contexts = [
-            CodeIntelErrorContext::Subscribe {
-                path: sample_path(),
-            },
-            CodeIntelErrorContext::Hover {
-                hover_id: 1,
-                path: sample_path(),
-            },
-            CodeIntelErrorContext::Navigate {
-                navigate_id: 2,
-                path: sample_path(),
-            },
-            CodeIntelErrorContext::FindReferences {
-                references_id: 3,
-                path: sample_path(),
-            },
-            CodeIntelErrorContext::Provider {
-                language: CodeIntelLanguageId("rust".to_owned()),
-            },
-        ];
-        for code in &codes {
-            for context in &contexts {
-                let payload = CodeIntelErrorPayload {
-                    code: *code,
-                    message: "boom".to_owned(),
-                    hint: Some("rustup component add rust-analyzer".to_owned()),
-                    exit_status: Some("exit status: 1".to_owned()),
-                    stderr: Some("language server stderr".to_owned()),
-                    context: context.clone(),
-                    fatal: true,
-                };
-                assert_eq!(round_trip(&payload), payload);
-            }
-        }
-    }
-
-    #[test]
-    fn occurrence_definition_defaults_to_empty() {
-        let occurrence: CodeIntelOccurrence = serde_json::from_str(
-            r#"{"range":{"start":0,"end":3},"role":"reference","display":"x"}"#,
-        )
-        .expect("deserialize");
-        assert!(occurrence.definition.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod tool_progress_serde_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn agent_control_progress_round_trip() {
-        let payload = ToolProgressData {
-            tool_call_id: "toolu_await".to_owned(),
-            tool_name: "tyde_await_agents".to_owned(),
-            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
-                progress_kind: AgentControlProgressKind::Await,
-                agents: vec![AgentControlAgentRef {
-                    agent_id: AgentId("agent-123".to_owned()),
-                    name: Some("Worker".to_owned()),
-                }],
-                status: AgentControlProgressStatus::Running,
-            }),
-        };
-
-        let encoded = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(
-            encoded,
-            json!({
-                "tool_call_id": "toolu_await",
-                "tool_name": "tyde_await_agents",
-                "update": {
-                    "kind": "agent_control",
-                    "progress_kind": "await",
-                    "agents": [{
-                        "agent_id": "agent-123",
-                        "name": "Worker"
-                    }],
-                    "status": "running"
-                }
-            })
-        );
-
-        let decoded: ToolProgressData = serde_json::from_value(encoded).expect("deserialize");
-        let ToolProgressUpdate::AgentControl(progress) = decoded.update else {
-            panic!("expected AgentControl progress");
-        };
-        assert_eq!(progress.progress_kind, AgentControlProgressKind::Await);
-        assert_eq!(progress.agents.len(), 1);
-        assert_eq!(progress.agents[0].agent_id, AgentId("agent-123".to_owned()));
-        assert_eq!(progress.agents[0].name.as_deref(), Some("Worker"));
-    }
-}
-
-/// Wire contract for the typed Tyde orchestration tool calls. These variants are
-/// what let the UI render a sent message as Markdown and an await verdict as a
-/// status list instead of dumping the MCP envelope as raw JSON, so their shape is
-/// pinned here rather than left to whichever backend normalizes them.
-#[cfg(test)]
-mod tyde_orchestration_tool_serde_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn send_agent_message_request_round_trips() {
-        let request = ToolRequest {
-            tool_call_id: "toolu_send".to_owned(),
-            tool_name: "tyde_send_agent_message".to_owned(),
-            tool_type: ToolRequestType::TydeSendAgentMessage {
-                agent_id: AgentId("agent-123".to_owned()),
-                message: "**Fix the rerun**\n\n- start with `mock.rs`".to_owned(),
-            },
-        };
-
-        let encoded = serde_json::to_value(&request).expect("serialize");
-        assert_eq!(
-            encoded,
-            json!({
-                "tool_call_id": "toolu_send",
-                "tool_name": "tyde_send_agent_message",
-                "tool_type": {
-                    "kind": "TydeSendAgentMessage",
-                    "agent_id": "agent-123",
-                    "message": "**Fix the rerun**\n\n- start with `mock.rs`"
-                }
-            })
-        );
-
-        let decoded: ToolRequest = serde_json::from_value(encoded).expect("deserialize");
-        let ToolRequestType::TydeSendAgentMessage { agent_id, message } = decoded.tool_type else {
-            panic!("expected TydeSendAgentMessage request");
-        };
-        assert_eq!(agent_id, AgentId("agent-123".to_owned()));
-        // The Markdown source survives verbatim — newlines stay newlines, not
-        // the escaped `\n` the raw-JSON panel used to show.
-        assert_eq!(message, "**Fix the rerun**\n\n- start with `mock.rs`");
-    }
-
-    /// The send tool's real result is `{"ok": true}` — a pure ack. The typed
-    /// completion is a unit variant so there is nothing to render but status.
-    #[test]
-    fn send_agent_message_result_round_trips_as_bare_ack() {
-        let result = ToolExecutionResult::TydeSendAgentMessage;
-        let encoded = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(encoded, json!({ "kind": "TydeSendAgentMessage" }));
-
-        let decoded: ToolExecutionResult = serde_json::from_value(encoded).expect("deserialize");
-        assert_eq!(decoded, ToolExecutionResult::TydeSendAgentMessage);
-    }
-
-    #[test]
-    fn await_agents_request_round_trips() {
-        let request = ToolRequest {
-            tool_call_id: "toolu_await".to_owned(),
-            tool_name: "tyde_await_agents".to_owned(),
-            tool_type: ToolRequestType::TydeAwaitAgents {
-                agent_ids: vec![AgentId("agent-1".to_owned()), AgentId("agent-2".to_owned())],
-            },
-        };
-
-        let encoded = serde_json::to_value(&request).expect("serialize");
-        assert_eq!(
-            encoded,
-            json!({
-                "tool_call_id": "toolu_await",
-                "tool_name": "tyde_await_agents",
-                "tool_type": {
-                    "kind": "TydeAwaitAgents",
-                    "agent_ids": ["agent-1", "agent-2"]
-                }
-            })
-        );
-
-        let decoded: ToolRequest = serde_json::from_value(encoded).expect("deserialize");
-        let ToolRequestType::TydeAwaitAgents { agent_ids } = decoded.tool_type else {
-            panic!("expected TydeAwaitAgents request");
-        };
-        assert_eq!(
-            agent_ids,
-            vec![AgentId("agent-1".to_owned()), AgentId("agent-2".to_owned())]
-        );
-    }
-
-    /// Mirrors the MCP tool's `AwaitAgentsResult` exactly: `ready` /
-    /// `still_thinking`, each carrying `{agent_id, status}` and nothing else.
-    #[test]
-    fn await_agents_result_round_trips() {
-        let result = ToolExecutionResult::TydeAwaitAgents {
-            ready: vec![TydeAgentWaitStatus {
-                agent_id: AgentId("agent-1".to_owned()),
-                status: AgentControlStatus::Idle,
-            }],
-            still_thinking: vec![TydeAgentWaitStatus {
-                agent_id: AgentId("agent-2".to_owned()),
-                status: AgentControlStatus::Thinking,
-            }],
-        };
-
-        let encoded = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(
-            encoded,
-            json!({
-                "kind": "TydeAwaitAgents",
-                "ready": [{ "agent_id": "agent-1", "status": "idle" }],
-                "still_thinking": [{ "agent_id": "agent-2", "status": "thinking" }]
-            })
-        );
-
-        let decoded: ToolExecutionResult = serde_json::from_value(encoded).expect("deserialize");
-        assert_eq!(decoded, result);
-    }
-
-    /// A failed watched agent surfaces as `failed` in `ready` — the wait is over
-    /// for it. The status enum, not a string, is what crosses the wire.
-    #[test]
-    fn await_agents_result_carries_failed_status() {
-        let json = json!({
-            "kind": "TydeAwaitAgents",
-            "ready": [{ "agent_id": "agent-9", "status": "failed" }],
-            "still_thinking": []
-        });
-        let decoded: ToolExecutionResult = serde_json::from_value(json).expect("deserialize");
-        let ToolExecutionResult::TydeAwaitAgents {
-            ready,
-            still_thinking,
-        } = decoded
-        else {
-            panic!("expected TydeAwaitAgents result");
-        };
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].status, AgentControlStatus::Failed);
-        assert!(still_thinking.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod release_version_back_compat_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn welcome_payload_deserializes_without_release_version() {
-        // Legacy hosts emit no `release_version`; it must default to None.
-        let legacy = json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "tyde_version": { "major": 0, "minor": 8, "patch": 14 },
-        });
-        let payload: WelcomePayload = serde_json::from_value(legacy).expect("deserialize legacy");
-        assert_eq!(payload.release_version, None);
-    }
-
-    #[test]
-    fn reject_payload_deserializes_without_release_version() {
-        let legacy = json!({
-            "code": "incompatible_protocol",
-            "message": "nope",
-            "server_protocol_version": PROTOCOL_VERSION,
-            "server_tyde_version": { "major": 0, "minor": 8, "patch": 14 },
-        });
-        let payload: RejectPayload = serde_json::from_value(legacy).expect("deserialize legacy");
-        assert_eq!(payload.release_version, None);
-    }
-
-    #[test]
-    fn welcome_payload_round_trips_some_release_version_and_omits_none() {
-        let version = TydeReleaseVersion::parse("0.8.19-beta.2").expect("valid version");
-        let payload = WelcomePayload {
-            protocol_version: PROTOCOL_VERSION,
-            tyde_version: TYDE_VERSION,
-            release_version: Some(version.clone()),
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(encoded["release_version"], json!("0.8.19-beta.2"));
-        let decoded: WelcomePayload = serde_json::from_value(encoded).expect("round-trip");
-        assert_eq!(decoded.release_version, Some(version));
-
-        // `skip_serializing_if = "Option::is_none"` must omit the field entirely.
-        let none = WelcomePayload {
-            protocol_version: PROTOCOL_VERSION,
-            tyde_version: TYDE_VERSION,
-            release_version: None,
-        };
-        let encoded_none = serde_json::to_value(&none).expect("serialize none");
-        assert!(encoded_none.get("release_version").is_none());
-    }
-
-    #[test]
-    fn reject_payload_round_trips_some_release_version_and_omits_none() {
-        let version = TydeReleaseVersion::parse("0.8.20-beta.1").expect("valid version");
-        let payload = RejectPayload {
-            code: RejectCode::IncompatibleProtocol,
-            message: "drift".to_owned(),
-            server_protocol_version: PROTOCOL_VERSION,
-            server_tyde_version: TYDE_VERSION,
-            release_version: Some(version.clone()),
-        };
-        let encoded = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(encoded["release_version"], json!("0.8.20-beta.1"));
-        let decoded: RejectPayload = serde_json::from_value(encoded).expect("round-trip");
-        assert_eq!(decoded.release_version, Some(version));
-
-        let none = RejectPayload {
-            code: RejectCode::IncompatibleProtocol,
-            message: "drift".to_owned(),
-            server_protocol_version: PROTOCOL_VERSION,
-            server_tyde_version: TYDE_VERSION,
-            release_version: None,
-        };
-        let encoded_none = serde_json::to_value(&none).expect("serialize none");
-        assert!(encoded_none.get("release_version").is_none());
-    }
-}
-
-#[cfg(test)]
-mod agent_control_output_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn latest_output_result_round_trips_typed_variants() {
-        let cases = [
-            AgentControlReadResult {
-                agent_id: AgentId("agent-1".to_owned()),
-                output: AgentControlOutput::Empty,
-            },
-            AgentControlReadResult {
-                agent_id: AgentId("agent-1".to_owned()),
-                output: AgentControlOutput::Message {
-                    text: "visible answer".to_owned(),
-                },
-            },
-            AgentControlReadResult {
-                agent_id: AgentId("agent-1".to_owned()),
-                output: AgentControlOutput::Error {
-                    error: AgentErrorPayload {
-                        agent_id: AgentId("agent-1".to_owned()),
-                        code: AgentErrorCode::Internal,
-                        message: "backend failed".to_owned(),
-                        fatal: true,
-                    },
-                },
-            },
-        ];
-
-        for expected in cases {
-            let encoded = serde_json::to_value(&expected).expect("serialize read result");
-            let decoded: AgentControlReadResult =
-                serde_json::from_value(encoded).expect("deserialize read result");
-            assert_eq!(decoded, expected);
-        }
-    }
-
-    #[test]
-    fn message_output_contains_only_visible_text() {
-        let result = AgentControlReadResult {
-            agent_id: AgentId("agent-1".to_owned()),
-            output: AgentControlOutput::Message {
-                text: "visible answer".to_owned(),
-            },
-        };
-
-        assert_eq!(
-            serde_json::to_value(result).expect("serialize read result"),
-            json!({
-                "agent_id": "agent-1",
-                "output": {
-                    "kind": "message",
-                    "text": "visible answer"
-                }
-            })
-        );
-    }
-
-    fn assistant_message(content: &str) -> ChatMessage {
-        ChatMessage {
-            message_id: None,
-            timestamp: 1,
-            sender: MessageSender::Assistant {
-                agent: "worker".to_owned(),
-            },
-            content: content.to_owned(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            model_info: None,
-            token_usage: None,
-            context_breakdown: None,
-            images: None,
-        }
-    }
-
-    #[test]
-    fn latest_output_state_observes_records_in_source_order_without_lookback() {
-        let stream = StreamPath("/agent/agent-1".to_owned());
-        let message = Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            1,
-            &ChatEvent::MessageAdded(assistant_message("visible")),
-        )
-        .expect("message envelope");
-        let empty = Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            2,
-            &ChatEvent::MessageAdded(assistant_message("")),
-        )
-        .expect("empty envelope");
-        let unrelated = Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            3,
-            &ChatEvent::TypingStatusChanged(false),
-        )
-        .expect("typing envelope");
-        let error = AgentErrorPayload {
-            agent_id: AgentId("agent-1".to_owned()),
-            code: AgentErrorCode::BackendFailed,
-            message: "failed".to_owned(),
-            fatal: true,
-        };
-        let error_envelope = Envelope::from_payload(stream, FrameKind::AgentError, 4, &error)
-            .expect("error envelope");
-
-        let mut state = AgentControlLatestOutput::default();
-        state
-            .observe_event_log(&[message, empty, unrelated, error_envelope])
-            .expect("project source-ordered output");
-        assert_eq!(state.output(), &AgentControlOutput::Error { error });
-    }
-
-    #[test]
-    fn debug_result_and_byte_cap_share_one_serialized_shape() {
-        let event = Envelope::from_payload(
-            StreamPath("/agent/agent-1".to_owned()),
-            FrameKind::ChatEvent,
-            7,
-            &ChatEvent::MessageAdded(assistant_message("visible")),
-        )
-        .expect("message envelope");
-        let capped = cap_agent_control_events(vec![event], 1024 * 1024, Some(6))
-            .expect("typed envelope sizing");
-        let result = AgentControlReadDebugResult {
-            agent_id: AgentId("agent-1".to_owned()),
-            events: capped.events,
-            next_after_seq: capped.next_after_seq,
-            max_bytes: 1024 * 1024,
-            omitted_events: capped.omitted_events,
-            omitted_event_bytes: capped.omitted_event_bytes,
-        };
-        let decoded: AgentControlReadDebugResult =
-            serde_json::from_value(serde_json::to_value(&result).expect("serialize debug result"))
-                .expect("deserialize debug result");
-        assert_eq!(decoded, result);
-    }
-
-    #[test]
-    fn bootstrap_requires_explicit_latest_output() {
-        let error = serde_json::from_value::<AgentBootstrapPayload>(json!({ "events": [] }))
-            .expect_err("bootstrap without latest_output must be rejected");
-        assert!(error.to_string().contains("latest_output"));
-    }
-
-    #[test]
-    fn bootstrap_requires_explicit_turn_active() {
-        let error = serde_json::from_value::<AgentBootstrapPayload>(json!({
-            "events": [],
-            "latest_output": { "kind": "empty" }
-        }))
-        .expect_err("bootstrap without turn_active must be rejected");
-        assert!(error.to_string().contains("turn_active"));
-    }
-}
-
-#[cfg(test)]
-mod stream_identity_tests {
-    use super::*;
-
-    #[test]
-    fn stream_identity_violation_round_trips_as_a_value_free_tag() {
-        let violation = StreamIdentityViolation::ForeignActiveMessageId;
-        let encoded = serde_json::to_value(violation).expect("serialize stream identity violation");
-        assert_eq!(encoded, serde_json::json!("foreign_active_message_id"));
-        let decoded: StreamIdentityViolation =
-            serde_json::from_value(encoded).expect("deserialize stream identity violation");
-        assert_eq!(decoded, violation);
-    }
-
-    #[test]
-    fn legacy_stream_wire_frame_decodes_but_cannot_enter_runtime_without_an_identity() {
-        let start: StreamStartData = serde_json::from_value(serde_json::json!({
-            "agent": "assistant",
-            "model": null,
-        }))
-        .expect("legacy frame remains decodable");
-        assert_eq!(
-            start.required_message_id(),
-            Err(StreamIdentityViolation::MissingMessageId)
-        );
-    }
-
-    #[test]
-    fn server_generated_identity_is_deterministic_and_origin_tagged() {
-        let origin =
-            serde_json::to_value(ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem)
-                .expect("serialize origin");
-        assert_eq!(origin, serde_json::json!("idless_provider_response_item"));
-        let identity = ServerGeneratedChatMessageIdentity {
-            origin: ServerGeneratedChatMessageIdOrigin::LegacyReplay,
-            stream_epoch: 7,
-            item_ordinal: 3,
-        };
-        assert_eq!(
-            identity.message_id(),
-            ChatMessageId("server-generated:legacy_replay:7:3".to_owned())
-        );
-        let round_trip: ServerGeneratedChatMessageIdentity = serde_json::from_value(
-            serde_json::to_value(&identity).expect("serialize identity contract"),
-        )
-        .expect("deserialize identity contract");
-        assert_eq!(round_trip, identity);
-    }
-}
-
-#[cfg(test)]
-mod workbench_remove_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_payload_defaults_to_safe_removal() {
-        let payload: WorkbenchRemovePayload =
-            serde_json::from_value(serde_json::json!({ "id": "workbench-1" }))
-                .expect("legacy workbench removal payload");
-        assert_eq!(payload.id.0, "workbench-1");
-        assert!(!payload.force);
     }
 }

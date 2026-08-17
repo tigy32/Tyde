@@ -37,34 +37,15 @@ pub(crate) struct TranscriptRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptStore {
     root: PathBuf,
-    #[cfg(test)]
-    actor_io_enabled: bool,
 }
 
 impl TranscriptStore {
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            #[cfg(test)]
-            actor_io_enabled: false,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_actor_io_enabled(mut self, enabled: bool) -> Self {
-        self.actor_io_enabled = enabled;
-        self
+        Self { root }
     }
 
     pub(crate) fn actor_io_enabled(&self) -> bool {
-        #[cfg(not(test))]
-        {
-            true
-        }
-        #[cfg(test)]
-        {
-            self.actor_io_enabled || std::env::var_os("TYDE_TRANSCRIPT_STORE_DIR").is_some()
-        }
+        true
     }
 
     pub(crate) fn default_root() -> Result<PathBuf, String> {
@@ -168,23 +149,6 @@ impl TranscriptStore {
         Ok(records)
     }
 
-    #[cfg(test)]
-    fn window_before(
-        &self,
-        session_id: &SessionId,
-        before_sequence: Option<u64>,
-        limit: usize,
-    ) -> Result<(Vec<TranscriptRecord>, bool), String> {
-        let records = self.load(session_id)?;
-        let eligible = records
-            .into_iter()
-            .filter(|record| before_sequence.is_none_or(|before| record.sequence < before))
-            .collect::<Vec<_>>();
-        let start = eligible.len().saturating_sub(limit);
-        let has_more = start > 0;
-        Ok((eligible.into_iter().skip(start).collect(), has_more))
-    }
-
     fn ensure_root(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.root).map_err(|error| {
             format!(
@@ -214,102 +178,4 @@ fn safe_id(id: &str) -> String {
             }
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use protocol::{
-        BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation,
-        CompactionObservationId, CompactionTrigger, ContextCompactionTimelineEvent,
-        ContextCompactionTimelineStatus,
-    };
-    use uuid::Uuid;
-
-    use super::*;
-
-    fn store() -> TranscriptStore {
-        TranscriptStore::new(
-            std::env::temp_dir().join(format!("tyde-transcript-test-{}", Uuid::new_v4())),
-        )
-    }
-
-    fn marker(session_id: &SessionId, sequence: u64) -> TranscriptRecord {
-        TranscriptRecord {
-            logical_session_id: session_id.clone(),
-            sequence,
-            event_id: format!("event-{sequence}"),
-            visibility: TranscriptVisibility::TimelineMarker,
-            provider_identity: None,
-            event: ChatEvent::ContextCompaction(ContextCompactionTimelineEvent {
-                marker_id: CompactionObservationId(format!("marker-{sequence}")),
-                operation_id: None,
-                trigger: CompactionTrigger::BackendAutomatic,
-                method: CompactionMethod::BackendAutomatic,
-                backend_kind: BackendKind::Claude,
-                provider_session_id: None,
-                status: ContextCompactionTimelineStatus::Completed,
-                mutation: CompactionMutation::Completed,
-                metrics: CompactionMetrics::default(),
-                message: None,
-                timestamp: sequence,
-            }),
-            timestamp_ms: sequence,
-        }
-    }
-
-    #[test]
-    fn append_load_and_window_preserve_marker_order() {
-        let store = store();
-        let session_id = SessionId("session".to_owned());
-        store.append(&marker(&session_id, 1)).expect("append one");
-        store.append(&marker(&session_id, 2)).expect("append two");
-        let (window, has_more) = store
-            .window_before(&session_id, None, 1)
-            .expect("read window");
-        assert!(has_more);
-        assert_eq!(window[0].sequence, 2);
-    }
-
-    #[test]
-    fn provider_import_is_idempotent() {
-        let store = store();
-        let session_id = SessionId("session".to_owned());
-        let mut record = marker(&session_id, 1);
-        record.provider_identity = Some(ProviderEventIdentity {
-            backend: "claude".to_owned(),
-            provider_session_id: "provider".to_owned(),
-            event_id: "boundary".to_owned(),
-        });
-        assert!(
-            store
-                .append_import_if_missing(&record)
-                .expect("first import")
-        );
-        let mut duplicate = record.clone();
-        duplicate.event_id = "different-local-id".to_owned();
-        assert!(
-            !store
-                .append_import_if_missing(&duplicate)
-                .expect("duplicate import")
-        );
-    }
-
-    #[test]
-    fn authority_is_explicit() {
-        let store = store();
-        let session_id = SessionId("session".to_owned());
-        assert!(!store.is_authoritative(&session_id));
-        store
-            .mark_authoritative(&session_id)
-            .expect("mark authoritative");
-        assert!(store.is_authoritative(&session_id));
-    }
-
-    #[test]
-    fn safe_id_never_creates_subdirectories() {
-        assert_eq!(safe_id("../session/name"), "___session_name");
-        assert!(!Path::new(&safe_id("../session/name")).is_absolute());
-    }
 }

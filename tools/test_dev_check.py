@@ -1160,17 +1160,13 @@ class NativeBuildToolsContractTests(unittest.TestCase):
             "out_dir().join(build_support::BUNDLED_LINK_DIRECTORY)", build_script
         )
 
-        workspace_test = (
-            REPO_ROOT / "tests/tests/webrtc_build_support.rs"
-        ).read_text(encoding="utf-8")
+        # The repo-side unit-test runner for the vendored build support
+        # (tests/tests/webrtc_build_support.rs) was deleted with the rest of
+        # the in-process unit tests per the AGENTS.md "Writing tests" policy;
+        # see dev-docs/deleted-test-coverage.md.
         tests_manifest = (REPO_ROOT / "tests/Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('"tests",', workspace)
         self.assertNotIn("autotests = false", tests_manifest)
-        self.assertIn(
-            '../../vendor/webrtc-audio-processing-sys/build_support.rs',
-            workspace_test,
-        )
-        self.assertIn("#[cfg(test)]\nmod tests", build_support)
 
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp) / "cached tools;$(touch injection)"
@@ -2617,7 +2613,7 @@ class TestingBehaviorContractTests(unittest.TestCase):
                 )
 
     def test_fixture_tracing_defaults_to_warn_without_hiding_rust_log(self) -> None:
-        source = (REPO_ROOT / "tests" / "tests" / "fixture.rs").read_text(
+        source = (REPO_ROOT / "server" / "tests" / "fixture.rs").read_text(
             encoding="utf-8"
         )
         self.assertIn(
@@ -2628,7 +2624,7 @@ class TestingBehaviorContractTests(unittest.TestCase):
         self.assertNotIn("EnvFilter::from_default_env()", source)
 
     def test_workbench_watcher_exception_is_exact_and_test_local(self) -> None:
-        source = (REPO_ROOT / "tests" / "tests" / "workbenches.rs").read_text(
+        source = (REPO_ROOT / "server" / "tests" / "workbenches.rs").read_text(
             encoding="utf-8"
         )
         helper = source.split("async fn expect_project_notify", 1)[1].split(

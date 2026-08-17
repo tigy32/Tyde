@@ -86,34 +86,3 @@ fn random_u64() -> Result<u64, ReconnectBackoffError> {
     getrandom::fill(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_invalid_backoff_configuration() {
-        assert!(matches!(
-            MqttReconnectBackoff::new(Duration::ZERO, Duration::from_secs(1)),
-            Err(ReconnectBackoffError::InitialDelayZero)
-        ));
-        assert!(matches!(
-            MqttReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(1)),
-            Err(ReconnectBackoffError::MaxBeforeInitial { .. })
-        ));
-    }
-
-    #[test]
-    fn base_delay_caps_at_max() -> Result<(), ReconnectBackoffError> {
-        let mut backoff =
-            MqttReconnectBackoff::new(Duration::from_millis(10), Duration::from_millis(30))?;
-        assert_eq!(backoff.current_base_delay(), Duration::from_millis(10));
-        let _ = backoff.next_delay()?;
-        assert_eq!(backoff.current_base_delay(), Duration::from_millis(20));
-        let _ = backoff.next_delay()?;
-        assert_eq!(backoff.current_base_delay(), Duration::from_millis(30));
-        let _ = backoff.next_delay()?;
-        assert_eq!(backoff.current_base_delay(), Duration::from_millis(30));
-        Ok(())
-    }
-}

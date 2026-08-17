@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command_group::AsyncCommandGroup;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use protocol::tycode_config::{
-    TYCODE_NATIVE_SETTINGS_VERSION, TycodeNativeSettingsDoc, TycodeProfileAction,
-    TycodeProfileSettings,
+    TYCODE_NATIVE_SETTINGS_VERSION, TycodeNativeSettingsDoc, TycodeProfileSettings,
 };
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
@@ -1364,7 +1364,7 @@ async fn probe_native_settings_snapshot() -> Result<BackendNativeSettingsSnapsho
     let mut doc = TycodeNativeSettingsDoc {
         version: TYCODE_NATIVE_SETTINGS_VERSION,
         profiles: Vec::new(),
-        actions: Vec::new(),
+        tombstones: Vec::new(),
     };
     let mut groups = Vec::new();
     let mut advisories = Vec::new();
@@ -1444,6 +1444,12 @@ async fn probe_profile_settings(
 /// that profile's real settings file. A save based on a stale snapshot is
 /// refused, never merged or last-writer-wins.
 pub(crate) async fn persist_native_settings(settings: Value) -> Result<(), String> {
+    if settings.get("actions").is_some() {
+        return Err(
+            "Tycode profile lifecycle actions must use InvokeSettingsAction, not a settings write"
+                .to_owned(),
+        );
+    }
     let doc: TycodeNativeSettingsDoc = serde_json::from_value(settings)
         .map_err(|err| format!("invalid Tycode settings document: {err}"))?;
     if doc.version != TYCODE_NATIVE_SETTINGS_VERSION {
@@ -1455,25 +1461,10 @@ pub(crate) async fn persist_native_settings(settings: Value) -> Result<(), Strin
     let home = tycode_home_dir()?;
     ensure_tycode_home_dir(&home)?;
 
-    // Saves are serialized so two clients cannot interleave their
-    // check-then-write sequences and silently overwrite each other.
-    static TYCODE_PERSIST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _persist_guard = TYCODE_PERSIST_LOCK.lock().await;
-
-    // Profile file operations first, so a profile created here can be edited
-    // and saved by the same document.
-    for action in &doc.actions {
-        match action {
-            TycodeProfileAction::CreateProfile { name, copy_from } => {
-                tycode_config::create_profile_in(&home, name, copy_from.as_deref())?;
-            }
-            TycodeProfileAction::DeleteProfile { name } => {
-                tycode_config::delete_profile_in(&home, name)?;
-            }
-        }
-    }
-
     for profile_settings in &doc.profiles {
+        let _profile_guard = tycode_profile_persist_lock(&profile_settings.name)
+            .lock_owned()
+            .await;
         let profile = tycode_config::resolve_profile_ref_in(&home, Some(&profile_settings.name))?;
         let current = probe_profile_settings(TycodeCommandPurpose::NativeSettingsPersist, &profile)
             .await?
@@ -1509,6 +1500,72 @@ pub(crate) async fn persist_native_settings(settings: Value) -> Result<(), Strin
     Ok(())
 }
 
+fn tycode_profile_persist_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("Tycode profile lock registry poisoned");
+    Arc::clone(
+        locks
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+#[derive(Deserialize)]
+struct CreateProfileArguments {
+    name: String,
+    #[serde(default)]
+    copy_from: Option<String>,
+}
+
+pub(crate) async fn invoke_settings_action(
+    resource: &str,
+    action: &str,
+    arguments: Value,
+) -> Result<Vec<String>, String> {
+    let home = tycode_home_dir()?;
+    ensure_tycode_home_dir(&home)?;
+    match (resource, action) {
+        ("profiles", "create") => {
+            let arguments: CreateProfileArguments = serde_json::from_value(arguments)
+                .map_err(|error| format!("invalid Tycode create-profile arguments: {error}"))?;
+            let mut names = vec![arguments.name.clone()];
+            if let Some(copy_from) = &arguments.copy_from {
+                names.push(copy_from.clone());
+            }
+            names.sort();
+            names.dedup();
+            let mut guards = Vec::with_capacity(names.len());
+            for name in names {
+                guards.push(tycode_profile_persist_lock(&name).lock_owned().await);
+            }
+            tycode_config::create_profile_in(
+                &home,
+                &arguments.name,
+                arguments.copy_from.as_deref(),
+            )?;
+            drop(guards);
+            Ok(Vec::new())
+        }
+        (resource, "delete") if resource.starts_with("profiles/") => {
+            let name = resource.trim_start_matches("profiles/");
+            if name.is_empty() || name.contains('/') {
+                return Err(format!("invalid Tycode profile resource {resource:?}"));
+            }
+            let _guard = tycode_profile_persist_lock(name).lock_owned().await;
+            tycode_config::delete_profile_in(&home, name)?;
+            Ok(vec![resource.to_owned()])
+        }
+        _ => Err(format!(
+            "Tycode settings resource {resource:?} does not support action {action:?}"
+        )),
+    }
+}
+
 /// Run one `SaveSettings { persist: true }` conversation against the
 /// profile's real settings file; the Tycode subprocess validates the payload
 /// and owns the write.
@@ -1521,9 +1578,27 @@ async fn save_profile_settings(
     }
     let purpose = TycodeCommandPurpose::NativeSettingsPersist;
     let command = tycode_settings_command(purpose, &profile.settings_path).await?;
-    run_tycode_settings_operation(command, purpose, TycodeSettingsOperation::Save(settings))
-        .await
-        .map(|_| ())
+    let saved = run_tycode_settings_operation(
+        command,
+        purpose,
+        TycodeSettingsOperation::Save(settings.clone()),
+    )
+    .await?
+    .snapshot
+    .settings
+    .ok_or_else(|| {
+        format!(
+            "Tycode settings schema omitted post-save settings for profile '{}'",
+            profile.name
+        )
+    })?;
+    if saved != settings {
+        return Err(format!(
+            "Tycode profile '{}' did not retain the settings it accepted",
+            profile.name
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Result<(), String> {
@@ -1532,6 +1607,9 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
     }
     let home = tycode_home_dir()?;
     let profile = tycode_config::resolve_profile_ref_in(&home, None)?;
+    let _profile_guard = tycode_profile_persist_lock(&profile.name)
+        .lock_owned()
+        .await;
     let probed = probe_profile_settings(TycodeCommandPurpose::LegacyConfigProbe, &profile).await?;
     let settings = probed
         .snapshot

@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, HostSettingErrorTarget,
-    ProtocolFrame, SetSettingPayload, encode_frame,
+    EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, ProtocolFrame, encode_frame,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
@@ -690,7 +689,6 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
 
                 let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
-                let setting_target = set_setting_error_target(&envelope);
                 if origin == ConnectionOrigin::Mobile
                     && is_terminal_control_command(request_kind)
                 {
@@ -702,7 +700,6 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         &host_output_stream,
                         request_stream,
                         request_kind,
-                        setting_target,
                         &error,
                     );
                     first_request.notify_one();
@@ -717,7 +714,6 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         &host_output_stream,
                         request_stream,
                         request_kind,
-                        setting_target,
                         &error,
                     );
 
@@ -766,7 +762,6 @@ pub(crate) fn emit_command_error(
     host_output_stream: &Stream,
     request_stream: protocol::StreamPath,
     request_kind: FrameKind,
-    setting_target: Option<HostSettingErrorTarget>,
     error: &AppError,
 ) {
     if let Some(source) = error.source.as_ref() {
@@ -792,7 +787,7 @@ pub(crate) fn emit_command_error(
         );
     }
 
-    let payload = command_error_payload(request_stream, request_kind, setting_target, error);
+    let payload = error.to_payload(request_stream, request_kind);
     let payload = match serde_json::to_value(&payload) {
         Ok(value) => value,
         Err(err) => {
@@ -801,353 +796,4 @@ pub(crate) fn emit_command_error(
         }
     };
     let _ = host_output_stream.send_value(FrameKind::CommandError, payload);
-}
-
-fn command_error_payload(
-    request_stream: protocol::StreamPath,
-    request_kind: FrameKind,
-    setting_target: Option<HostSettingErrorTarget>,
-    error: &AppError,
-) -> protocol::CommandErrorPayload {
-    let mut payload = error.to_payload(request_stream, request_kind);
-    if request_kind == FrameKind::SetSetting {
-        payload.setting_target = Some(setting_target.unwrap_or(HostSettingErrorTarget::Malformed));
-    }
-    payload
-}
-
-fn set_setting_error_target(envelope: &Envelope) -> Option<HostSettingErrorTarget> {
-    if envelope.kind != FrameKind::SetSetting {
-        return None;
-    }
-
-    Some(
-        envelope
-            .parse_payload::<SetSettingPayload>()
-            .map_or(HostSettingErrorTarget::Malformed, |payload| {
-                payload.setting.error_target()
-            }),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stale_audio_is_sequence_admitted_before_lifecycle_drop() {
-        let root = protocol::StreamPath("/voice".into());
-        let old_session = protocol::VoiceSessionId("old-session".into());
-        let old_stream = protocol::StreamPath(format!("/voice/{}", old_session.0));
-        let start = |generation, seq| {
-            Envelope::from_payload(
-                root.clone(),
-                FrameKind::VoiceStart,
-                seq,
-                &protocol::VoiceStartPayload {
-                    generation,
-                    target: protocol::VoiceTarget {
-                        agent_id: protocol::AgentId("agent-a".into()),
-                        instance_stream: protocol::StreamPath("/agent/agent-a/instance-a".into()),
-                    },
-                    formats: vec![protocol::VoiceFormatPair {
-                        uplink: protocol::VoiceAudioFormat::opus(48_000),
-                        downlink: protocol::VoiceAudioFormat::opus(24_000),
-                    }],
-                },
-            )
-            .unwrap()
-        };
-        let mut ingress = VoiceIngressState::default();
-        ingress.observe_validated(&start(1, 0));
-        let stop = Envelope::from_payload(
-            old_stream.clone(),
-            FrameKind::VoiceStop,
-            3,
-            &protocol::VoiceStopPayload {
-                session_id: old_session.clone(),
-                generation: 1,
-                reason: protocol::VoiceStopReason::UserExited,
-                stats: Default::default(),
-            },
-        )
-        .unwrap();
-        ingress.observe_validated(&stop);
-        ingress.observe_validated(&start(2, 1));
-
-        let stale = ProtocolFrame {
-            envelope: Envelope::from_payload(
-                old_stream.clone(),
-                FrameKind::VoiceAudio,
-                4,
-                &protocol::VoiceAudioPayload {
-                    session_id: old_session.clone(),
-                    generation: 1,
-                    direction: protocol::VoiceDirection::Input,
-                    first_media_seq: 1,
-                    timestamp_samples_48k: 960,
-                    packet_lengths: vec![1],
-                },
-            )
-            .unwrap(),
-            binary: vec![1],
-        };
-        let mut sequence = protocol::SeqValidator::new();
-        for seq in 0..4 {
-            sequence
-                .validate(&old_stream, seq, FrameKind::VoiceStop)
-                .unwrap();
-        }
-        sequence
-            .validate(
-                &stale.envelope.stream,
-                stale.envelope.seq,
-                stale.envelope.kind,
-            )
-            .unwrap();
-        assert!(ingress.should_ignore_stale_audio(&stale.envelope, &stale.binary));
-        assert!(!ingress.should_ignore_stale_audio(&stale.envelope, &[]));
-        let foreign = ProtocolFrame {
-            envelope: Envelope::from_payload(
-                protocol::StreamPath("/voice/foreign".into()),
-                FrameKind::VoiceAudio,
-                4,
-                &protocol::VoiceAudioPayload {
-                    session_id: protocol::VoiceSessionId("foreign".into()),
-                    generation: 1,
-                    direction: protocol::VoiceDirection::Input,
-                    first_media_seq: 1,
-                    timestamp_samples_48k: 960,
-                    packet_lengths: vec![1],
-                },
-            )
-            .unwrap(),
-            binary: vec![1],
-        };
-        assert!(!ingress.should_ignore_stale_audio(&foreign.envelope, &foreign.binary));
-
-        let late_end = Envelope::from_payload(
-            old_stream.clone(),
-            FrameKind::VoiceInputEnd,
-            5,
-            &protocol::VoiceSessionPayload {
-                session_id: old_session.clone(),
-                generation: 1,
-            },
-        )
-        .unwrap();
-        assert!(!ingress.should_ignore_stale_audio(&late_end, &[]));
-        sequence
-            .validate(&old_stream, 5, FrameKind::VoiceInputEnd)
-            .expect("stale non-audio remains contiguous after admitted stale audio");
-        ingress.observe_validated(&late_end);
-        assert_eq!(ingress.stale_session, Some((1, old_session)));
-    }
-
-    #[tokio::test]
-    async fn writer_interleaves_fragments_without_sequence_holes() {
-        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-        let bulk_stream = protocol::StreamPath("/project/bulk".into());
-        let voice_stream = protocol::StreamPath("/voice/session".into());
-        let initial =
-            std::collections::HashMap::from([(bulk_stream.clone(), 0), (voice_stream.clone(), 0)]);
-        let queue = OutputQueue::default();
-        let stream = Stream::new(protocol::StreamPath("/host/test".into()), queue.clone());
-        let writer_queue = queue.clone();
-        let writer = tokio::spawn(async move {
-            writer_loop(server_io, writer_queue, initial, CancellationToken::new()).await
-        });
-        stream
-            .with_path(bulk_stream.clone())
-            .send_binary(
-                FrameKind::ProjectFileContents,
-                serde_json::json!({"contents": "x".repeat(2 * 1024 * 1024)}),
-                Vec::new(),
-            )
-            .unwrap();
-        while queue.records_written() == 0 {
-            tokio::task::yield_now().await;
-        }
-        let audio = protocol::VoiceAudioPayload {
-            session_id: protocol::VoiceSessionId("session".into()),
-            generation: 1,
-            direction: protocol::VoiceDirection::Output,
-            first_media_seq: 0,
-            timestamp_samples_48k: 0,
-            packet_lengths: vec![1],
-        };
-        stream
-            .with_path(voice_stream.clone())
-            .send_binary(
-                FrameKind::VoiceAudio,
-                serde_json::to_value(audio).unwrap(),
-                vec![1],
-            )
-            .unwrap();
-        stream
-            .with_path(voice_stream.clone())
-            .send_value(FrameKind::VoiceStop, serde_json::json!({}))
-            .unwrap();
-        stream
-            .with_path(bulk_stream.clone())
-            .send_value(FrameKind::HeartbeatAck, serde_json::json!({}))
-            .unwrap();
-
-        let mut reader = FrameReader::new(tokio::io::BufReader::new(client_io));
-        let mut kinds = Vec::new();
-        let mut sequences = Vec::new();
-        while kinds.len() < 4 {
-            let frame = reader.read_frame().await.unwrap().unwrap();
-            sequences.push((frame.envelope.stream.clone(), frame.envelope.seq));
-            kinds.push(frame.envelope.kind);
-        }
-        assert_eq!(
-            kinds,
-            vec![
-                FrameKind::VoiceStop,
-                FrameKind::VoiceAudio,
-                FrameKind::ProjectFileContents,
-                FrameKind::HeartbeatAck,
-            ]
-        );
-        assert_eq!(
-            sequences,
-            vec![
-                (voice_stream.clone(), 0),
-                (voice_stream, 1),
-                (bulk_stream.clone(), 0),
-                (bulk_stream, 1),
-            ]
-        );
-        queue.close();
-        writer.await.unwrap().unwrap();
-    }
-
-    #[test]
-    fn mobile_terminal_blocklist_covers_all_terminal_control_frames() {
-        for kind in [
-            FrameKind::TerminalCreate,
-            FrameKind::TerminalSend,
-            FrameKind::TerminalResize,
-            FrameKind::TerminalClose,
-        ] {
-            assert!(
-                is_terminal_control_command(kind),
-                "{kind} must be blocked from mobile connections"
-            );
-        }
-
-        assert!(!is_terminal_control_command(FrameKind::SendMessage));
-        assert!(!is_terminal_control_command(FrameKind::HostBrowseStart));
-    }
-
-    #[test]
-    fn only_mobile_connections_have_a_peer_liveness_deadline() {
-        assert!(has_peer_liveness_deadline(ConnectionOrigin::Mobile));
-        assert!(!has_peer_liveness_deadline(ConnectionOrigin::Desktop));
-        assert!(MOBILE_CLIENT_LIVENESS_TIMEOUT > std::time::Duration::from_secs(10));
-    }
-
-    #[test]
-    fn peer_broken_pipe_is_a_clean_disconnect_but_other_io_errors_survive() {
-        assert!(
-            normalize_peer_disconnect(Err(FrameError::Io(std::io::Error::from(
-                std::io::ErrorKind::BrokenPipe,
-            ))))
-            .is_ok()
-        );
-        let result = normalize_peer_disconnect(Err(FrameError::Io(std::io::Error::from(
-            std::io::ErrorKind::ConnectionAborted,
-        ))));
-        assert!(matches!(
-            result,
-            Err(FrameError::Io(error))
-                if error.kind() == std::io::ErrorKind::ConnectionAborted
-        ));
-    }
-
-    #[test]
-    fn set_setting_command_errors_have_value_free_typed_targets() {
-        let cases = [
-            (
-                protocol::HostSettingValue::BackendNativeSettings {
-                    backend: protocol::BackendKind::Tycode,
-                    settings: serde_json::json!({"api_key": "native-secret"}),
-                },
-                HostSettingErrorTarget::BackendNativeSettings,
-            ),
-            (
-                protocol::HostSettingValue::BackendConfig {
-                    backend: protocol::BackendKind::Tycode,
-                    values: protocol::BackendConfigValues::default(),
-                },
-                HostSettingErrorTarget::BackendConfig,
-            ),
-            (
-                protocol::HostSettingValue::EnableMobileConnections { enabled: true },
-                HostSettingErrorTarget::EnableMobileConnections,
-            ),
-        ];
-
-        for (setting, expected_target) in cases {
-            let envelope = Envelope::from_payload(
-                protocol::StreamPath("/host/error-target".to_owned()),
-                FrameKind::SetSetting,
-                1,
-                &protocol::SetSettingPayload { setting },
-            )
-            .expect("encode typed setting command");
-            let payload = command_error_payload(
-                envelope.stream.clone(),
-                envelope.kind,
-                set_setting_error_target(&envelope),
-                &AppError::invalid("set_setting", "setting save failed"),
-            );
-            assert_eq!(payload.setting_target, Some(expected_target));
-            let encoded = serde_json::to_value(&payload).expect("serialize setting error");
-            assert_eq!(
-                encoded["setting_target"],
-                serde_json::to_value(expected_target).expect("serialize setting target")
-            );
-            let encoded = encoded.to_string();
-            assert!(!encoded.contains("native-secret"));
-        }
-    }
-
-    #[test]
-    fn malformed_set_setting_errors_are_typed_and_other_errors_remain_compatible() {
-        let malformed = Envelope {
-            stream: protocol::StreamPath("/host/error-target".to_owned()),
-            kind: FrameKind::SetSetting,
-            seq: 1,
-            payload: serde_json::json!({
-                "setting": {
-                    "kind": "unknown_setting_kind",
-                    "secret_token": {"unexpected": "raw-token"},
-                },
-            }),
-        };
-        let malformed_error = command_error_payload(
-            malformed.stream.clone(),
-            malformed.kind,
-            set_setting_error_target(&malformed),
-            &AppError::invalid("set_setting", "invalid setting payload"),
-        );
-        assert_eq!(
-            malformed_error.setting_target,
-            Some(HostSettingErrorTarget::Malformed)
-        );
-        let encoded = serde_json::to_string(&malformed_error).expect("serialize malformed error");
-        assert!(!encoded.contains("raw-token"));
-
-        let other_error = command_error_payload(
-            protocol::StreamPath("/host/error-target".to_owned()),
-            FrameKind::SpawnAgent,
-            None,
-            &AppError::invalid("spawn_agent", "invalid agent"),
-        );
-        assert_eq!(other_error.setting_target, None);
-        let encoded = serde_json::to_value(&other_error).expect("serialize other command error");
-        assert!(encoded.get("setting_target").is_none());
-    }
 }

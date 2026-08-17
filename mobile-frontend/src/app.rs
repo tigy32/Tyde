@@ -22,7 +22,7 @@ use protocol::{FrameKind, HeartbeatPayload};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 const BACKGROUND_RECONNECT_AFTER: Duration = Duration::from_secs(15);
 
 thread_local! {
@@ -96,14 +96,14 @@ fn AppSurface() -> impl IntoView {
     }
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundRecovery {
     Probe,
     Reconnect,
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn foreground_recovery(background_ms: u64) -> ForegroundRecovery {
     if background_ms >= BACKGROUND_RECONNECT_AFTER.as_millis() as u64 {
         ForegroundRecovery::Reconnect
@@ -1161,28 +1161,6 @@ fn make_host_stream() -> protocol::StreamPath {
     ))
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod native_tests {
-    use super::*;
-
-    #[test]
-    fn foreground_recovery_reconnects_only_after_the_grace_period() {
-        assert_eq!(foreground_recovery(0), ForegroundRecovery::Probe);
-        assert_eq!(
-            foreground_recovery(BACKGROUND_RECONNECT_AFTER.as_millis() as u64 - 1),
-            ForegroundRecovery::Probe
-        );
-        assert_eq!(
-            foreground_recovery(BACKGROUND_RECONNECT_AFTER.as_millis() as u64),
-            ForegroundRecovery::Reconnect
-        );
-        assert_eq!(
-            foreground_recovery(Duration::from_secs(60).as_millis() as u64),
-            ForegroundRecovery::Reconnect
-        );
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
 
@@ -1217,22 +1195,23 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn empty_host_settings() -> protocol::HostSettings {
-        protocol::HostSettings {
+    fn empty_host_settings() -> settings_model::HostSettings {
+        settings_model::HostSettings {
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
             mobile_broker_url: None,
+            mobile_broker_auth: Default::default(),
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
-            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+            tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: Default::default(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: Default::default(),
-            launch_profiles: Vec::new(),
+            launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
         }

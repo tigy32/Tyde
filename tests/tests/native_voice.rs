@@ -7,8 +7,7 @@ use mqtt_transport::{
     BrokerAuth, BrokerEndpoint, MqttConnectConfig, ParticipantRole, PreSharedKey, RoomId,
 };
 use protocol::{
-    Envelope, FrameKind, FrameReader, HostSettingValue, SetSettingPayload, StreamPath,
-    VoiceAudioPayload, VoiceDirection, VoiceSessionId,
+    Envelope, FrameKind, FrameReader, StreamPath, VoiceAudioPayload, VoiceDirection, VoiceSessionId,
 };
 
 async fn next_kind(client: &mut client::Connection, kind: FrameKind) -> protocol::ProtocolFrame {
@@ -68,7 +67,7 @@ async fn refreshed_voice_capability(
                 .expect("open connection");
             match frame.envelope.kind {
                 FrameKind::HostSettings => {
-                    let payload: protocol::HostSettingsPayload =
+                    let payload: settings_model::HostSettingsPayload =
                         frame.envelope.parse_payload().unwrap();
                     settings_received = payload.settings.voice.enabled
                         && payload.settings.voice.aws_region.as_deref() == Some("us-east-1");
@@ -135,17 +134,15 @@ async fn voice_settings_refresh_capabilities_for_every_live_connection() {
     assert!(observer_initial.browser_capture);
 
     writer
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::VoiceAwsRegion {
-                region: Some("us-east-1".into()),
-            },
-        })
+        .replace_setting(
+            "/voice/aws_region",
+            Some("us-east-1"),
+            Option::<String>::None,
+        )
         .await
         .unwrap();
     writer
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::VoiceEnabled { enabled: true },
-        })
+        .replace_setting("/voice/enabled", true, false)
         .await
         .unwrap();
 
@@ -194,17 +191,15 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
         .unwrap();
     let _ = next_kind(&mut client, FrameKind::HostBootstrap).await;
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::VoiceAwsRegion {
-                region: Some("us-east-1".into()),
-            },
-        })
+        .replace_setting(
+            "/voice/aws_region",
+            Some("us-east-1"),
+            Option::<String>::None,
+        )
         .await
         .unwrap();
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::VoiceEnabled { enabled: true },
-        })
+        .replace_setting("/voice/enabled", true, false)
         .await
         .unwrap();
     for _ in 0..2 {

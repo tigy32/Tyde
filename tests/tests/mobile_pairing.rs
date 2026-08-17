@@ -1,3 +1,4 @@
+use settings_model::HostBootstrapPayload;
 use std::time::Duration;
 
 mod support;
@@ -8,13 +9,12 @@ use mqtt_transport::{
 };
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, BackendKind, BrokerUrl, ChatEvent,
-    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostSettingValue, ListSessionsPayload, LoadAgentPayload, MobileAccessErrorCode,
-    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload,
-    MobilePairingStartPayload, MobilePairingState, NewAgentPayload, ProjectCreatePayload,
-    ProjectRootPath, SendMessagePayload, SessionId, SessionListPageStatus, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget,
-    write_envelope,
+    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, ListSessionsPayload,
+    LoadAgentPayload, MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus,
+    MobileDeviceState, MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState,
+    NewAgentPayload, ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SessionId,
+    SessionListPageStatus, SettingsWriteId, SettingsWriteResultPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -146,6 +146,23 @@ async fn wait_for_command_error(
     }
 }
 
+async fn wait_for_settings_write_result(
+    client: &mut client::Connection,
+    write_id: &SettingsWriteId,
+    context: &str,
+) -> SettingsWriteResultPayload {
+    loop {
+        let env = next_event(client, context).await;
+        if env.kind == FrameKind::SettingsWriteResult {
+            let result: SettingsWriteResultPayload =
+                env.parse_payload().expect("parse SettingsWriteResult");
+            if result.write_id == *write_id {
+                return result;
+            }
+        }
+    }
+}
+
 async fn wait_for_chat_stream_end(client: &mut client::Connection, context: &str) -> ChatEvent {
     loop {
         let env = next_event(client, context).await;
@@ -174,18 +191,14 @@ async fn expect_initial_replay(client: &mut client::Connection) -> MobileAccessS
 
 async fn set_mobile_broker_url(client: &mut client::Connection, broker_url: Option<BrokerUrl>) {
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::MobileBrokerUrl { broker_url },
-        })
+        .replace_setting("/mobile_broker_url", broker_url, Option::<BrokerUrl>::None)
         .await
         .expect("set mobile broker URL");
 }
 
 async fn set_mobile_enabled(client: &mut client::Connection, enabled: bool) {
     client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnableMobileConnections { enabled },
-        })
+        .replace_setting("/enable_mobile_connections", enabled, !enabled)
         .await
         .expect("set enable_mobile_connections");
 }
@@ -582,19 +595,19 @@ async fn plaintext_public_mqtt_url_is_rejected_at_settings_write() {
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
 
-    desktop
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::MobileBrokerUrl {
-                broker_url: Some(
-                    BrokerUrl::new("mqtt://broker.example.test:1883").expect("broker URL"),
-                ),
-            },
-        })
+    let write_id = desktop
+        .replace_setting(
+            "/mobile_broker_url",
+            Some(BrokerUrl::new("mqtt://broker.example.test:1883").expect("broker URL")),
+            Option::<BrokerUrl>::None,
+        )
         .await
         .expect("send invalid broker setting");
-    let error = wait_for_command_error(&mut desktop, "invalid mobile broker setting").await;
-    assert_eq!(error.code, CommandErrorCode::InvalidInput);
-    assert!(error.message.contains("insecure"));
+    let error =
+        wait_for_settings_write_result(&mut desktop, &write_id, "invalid mobile broker setting")
+            .await;
+    assert!(!error.applied);
+    assert!(error.field_errors[0].message.contains("insecure"));
 }
 
 #[tokio::test]

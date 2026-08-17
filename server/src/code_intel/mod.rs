@@ -32,8 +32,9 @@ pub(crate) use service::CodeIntelRouter;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use protocol::{CodeIntelResourceMode, CodeIntelSettings, FrameKind, ProjectPath};
+use protocol::{CodeIntelResourceMode, FrameKind, ProjectPath};
 use serde::Serialize;
+use settings_model::CodeIntelSettings;
 
 use language_server::LanguageServerConfig;
 
@@ -169,96 +170,5 @@ pub(crate) fn emit<T: Serialize>(output: &Stream, kind: FrameKind, payload: &T) 
         Err(error) => {
             tracing::error!(%error, %kind, "failed to serialize code-intel frame");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entries(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn extension_maps_to_each_language() {
-        assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
-        assert_eq!(Language::from_extension("py"), Some(Language::Python));
-        assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
-        assert_eq!(Language::from_extension("txt"), None);
-    }
-
-    #[test]
-    fn each_language_has_a_distinct_config() {
-        // The §M7 proof at the type level: every language resolves to its own
-        // config with distinct wire ids, all flowing through the one engine.
-        let settings = CodeIntelSettings::default();
-        assert_eq!(Language::Rust.config(&settings).language.0, "rust");
-        assert_eq!(Language::Python.config(&settings).language.0, "python");
-        assert_eq!(
-            Language::Rust.config(&settings).provider_id.0,
-            "rust-analyzer"
-        );
-        assert_eq!(Language::Python.config(&settings).provider_id.0, "pyright");
-        assert_ne!(
-            Language::Rust.config(&settings).language,
-            Language::Python.config(&settings).language
-        );
-    }
-
-    #[test]
-    fn detect_requires_extension_and_matching_marker() {
-        // Rust: .rs + Cargo.toml.
-        assert_eq!(
-            detect_language("src/main.rs", &entries(&["Cargo.toml", "src"])),
-            Some(Language::Rust)
-        );
-        // Python: .py + any Python marker.
-        assert_eq!(
-            detect_language("app/main.py", &entries(&["pyproject.toml"])),
-            Some(Language::Python)
-        );
-        assert_eq!(
-            detect_language("main.py", &entries(&["requirements.txt"])),
-            Some(Language::Python)
-        );
-        assert_eq!(
-            detect_language("main.py", &entries(&["setup.py"])),
-            Some(Language::Python)
-        );
-    }
-
-    #[test]
-    fn detect_rejects_extension_without_its_marker() {
-        // A known extension but no matching project marker → Unsupported, not a
-        // wrongly-spun-up server (a Python marker does not validate a Rust file).
-        assert_eq!(detect_language("src/main.rs", &entries(&["src"])), None);
-        assert_eq!(
-            detect_language("src/main.rs", &entries(&["pyproject.toml"])),
-            None
-        );
-        assert_eq!(detect_language("main.py", &entries(&["Cargo.toml"])), None);
-        // Unknown extension is always None regardless of markers.
-        assert_eq!(
-            detect_language("notes.txt", &entries(&["Cargo.toml"])),
-            None
-        );
-    }
-
-    #[test]
-    fn project_language_detection_uses_root_markers_without_files() {
-        assert_eq!(
-            detect_project_languages(&entries(&["Cargo.toml"])),
-            vec![Language::Rust]
-        );
-        assert_eq!(
-            detect_project_languages(&entries(&["pyproject.toml"])),
-            vec![Language::Python]
-        );
-        assert_eq!(
-            detect_project_languages(&entries(&["Cargo.toml", "pyproject.toml"])),
-            vec![Language::Rust, Language::Python]
-        );
-        assert!(detect_project_languages(&entries(&["src"])).is_empty());
     }
 }

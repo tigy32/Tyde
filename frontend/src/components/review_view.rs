@@ -2843,21 +2843,22 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 "h1".to_owned(),
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![BackendKind::Codex],
                     default_backend: Some(BackendKind::Codex),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: false,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },
@@ -3273,21 +3274,22 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 "h1".to_owned(),
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: enabled,
                     default_backend: default,
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: false,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },

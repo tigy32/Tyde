@@ -180,22 +180,6 @@ pub fn alert(message: impl Into<String>) {
     ALERT.with(|alert| alert.set(message));
 }
 
-/// The polite live region's current text.
-///
-/// Exists so tests can assert on what assistive technology would actually be
-/// told — including that a replay path said *nothing* — rather than inferring
-/// it from which code path ran.
-#[cfg(test)]
-pub(crate) fn current_announcement() -> String {
-    ANNOUNCEMENT.with(|announcement| announcement.get_untracked())
-}
-
-/// The assertive live region's current text.
-#[cfg(test)]
-pub(crate) fn current_alert() -> String {
-    ALERT.with(|alert| alert.get_untracked())
-}
-
 /// Drop everything that only meant something while a workspace was on screen.
 /// Called when the center zone unmounts.
 fn forget_rendered_workspace() {

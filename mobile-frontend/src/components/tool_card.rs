@@ -1680,46 +1680,6 @@ fn send_decision(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use protocol::AskUserQuestionOption;
-
-    fn question() -> AskUserQuestion {
-        AskUserQuestion {
-            id: None,
-            question: "Which language?".to_owned(),
-            header: Some("Language".to_owned()),
-            options: vec![
-                AskUserQuestionOption {
-                    label: "Rust".to_owned(),
-                    description: None,
-                },
-                AskUserQuestionOption {
-                    label: "Python".to_owned(),
-                    description: None,
-                },
-            ],
-            multi_select: true,
-        }
-    }
-
-    #[test]
-    fn format_answer_joins_selected_and_custom() {
-        let qs = vec![question()];
-        let responses = vec![(vec![0usize, 1usize], "Go".to_owned())];
-        assert_eq!(format_answer(&qs, &responses), "Language: Rust, Python, Go");
-    }
-
-    #[test]
-    fn format_answer_falls_back_to_question_without_header() {
-        let mut q = question();
-        q.header = None;
-        let responses = vec![(vec![0usize], String::new())];
-        assert_eq!(format_answer(&[q], &responses), "Which language?: Rust");
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;

@@ -26,7 +26,7 @@ mod link_wasm;
 // Pure codec/ack helpers for the wasm backend; compiled into the wasm build and
 // into native test builds (where mqttbytes is a dev-dependency) so they can be
 // unit-tested natively.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 mod wasm_codec;
 
 #[cfg(not(target_arch = "wasm32"))]

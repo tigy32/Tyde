@@ -469,7 +469,7 @@ Defaults:
 - `auto_generate_agent_names: true` to preserve existing behavior.
 - `agent_activity_summaries: false` because it creates periodic paid calls.
 
-Add a strongly typed setting update:
+The stored model remains strongly typed:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,20 +479,18 @@ pub enum BackgroundAgentFeature {
     AgentActivitySummaries,
 }
 
-HostSettingValue::BackgroundAgentFeatureEnabled {
-    feature: BackgroundAgentFeature,
-    enabled: bool,
-}
 ```
 
-This keeps the protocol strongly typed rather than string-keyed.
+Clients update either field with a compare-and-swap `SettingsWrite` operation
+at `/background_agent_features/<field>`. The server validates the resulting
+document against `HostSettings` before committing it.
 
 ### 5.2 Store and propagation
 
 Mirror the existing settings pattern:
 
-- Add serde defaults in `protocol/src/types.rs`, alongside the current
-  `HostSettings` defaults (`protocol/src/types.rs:1530-1551`).
+- Add serde defaults in `settings-model/src/lib.rs`, alongside the current
+  `HostSettings` defaults.
 - Add defaults in `empty_settings` (`server/src/store/settings.rs:384-394`).
 - Extend `apply_setting` to mutate only the requested background feature
   (`server/src/store/settings.rs:276-330`).
@@ -530,7 +528,7 @@ Required protocol changes:
 
 1. Add `BackgroundAgentFeaturesSettings` and `BackgroundAgentFeature`.
 2. Add `HostSettings.background_agent_features`.
-3. Add `HostSettingValue::BackgroundAgentFeatureEnabled`.
+3. Expose the fields through the host settings schema and `SettingsWrite`.
 4. Add `AgentActivitySummary`, `AgentActivitySummaryState`,
    `AgentActivitySummaryStaleReason`, and `AgentActivitySummaryPayload`.
 5. Add output `FrameKind::AgentActivitySummary` with display string
@@ -733,8 +731,9 @@ Recommended tests:
    `PROTOCOL_VERSION` assertion.
 2. **Settings default and toggle.** With `Fixture::new`, assert the bootstrap
    settings default to generated names enabled and activity summaries disabled.
-   Send `SetSetting` for `AgentActivitySummaries`; assert a `HostSettings` event
-   reflects the change.
+   Send `SettingsWrite` for
+   `/background_agent_features/agent_activity_summaries`; assert a
+   `HostSettings` event reflects the change.
 3. **Disabled means no calls.** Spawn and drive a mock agent with summaries off;
    assert no `AgentActivitySummary` event appears in the observed event window.
 4. **Enabled emits pending/fresh.** Enable summaries, spawn a mock agent, drive a

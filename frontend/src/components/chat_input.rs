@@ -2474,7 +2474,7 @@ mod wasm_tests {
 
     fn open_voice_gate(state: &AppState) {
         state.host_settings_by_host.update(|settings| {
-            let mut host = protocol::HostSettings::default();
+            let mut host = settings_model::HostSettings::default();
             host.voice.enabled = true;
             settings.insert(HOST.to_owned(), host);
         });

@@ -8,130 +8,30 @@ use protocol::{
     SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
     StreamPath,
 };
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use server::backend::mock::{MockScript, MockTurn};
 use std::time::Duration;
-
-const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
-const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
-const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
-
-static PENDING_BOOTSTRAP_EVENTS: OnceLock<Mutex<HashMap<StreamPath, VecDeque<Envelope>>>> =
-    OnceLock::new();
-
-fn pending_bootstrap_events() -> &'static Mutex<HashMap<StreamPath, VecDeque<Envelope>>> {
-    PENDING_BOOTSTRAP_EVENTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn client_key(client: &client::Connection) -> StreamPath {
-    let mut host_streams = client
-        .outgoing_seq
-        .keys()
-        .filter(|stream| stream.0.starts_with("/host/"));
-    let host_stream = host_streams
-        .next()
-        .cloned()
-        .expect("missing host stream for test connection");
-    assert!(
-        host_streams.next().is_none(),
-        "test connection has multiple host streams"
-    );
-    host_stream
-}
-
-fn pop_pending_bootstrap_event(client: &mut client::Connection) -> Option<Envelope> {
-    let key = client_key(client);
-    let mut pending = pending_bootstrap_events()
-        .lock()
-        .expect("pending bootstrap event lock poisoned");
-    let queue = pending.get_mut(&key)?;
-    let event = queue.pop_front();
-    if queue.is_empty() {
-        pending.remove(&key);
-    }
-    event
-}
-
-fn push_bootstrap_events(
-    client: &mut client::Connection,
-    events: impl IntoIterator<Item = Envelope>,
-) {
-    let mut events = events.into_iter().collect::<VecDeque<_>>();
-    if events.is_empty() {
-        return;
-    }
-    let key = client_key(client);
-    let mut pending = pending_bootstrap_events()
-        .lock()
-        .expect("pending bootstrap event lock poisoned");
-    pending.entry(key).or_default().append(&mut events);
-}
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
-        if let Some(env) = pop_pending_bootstrap_event(client) {
-            return env;
-        }
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
+        let env = fixture::next_logical_frame_on(client, context).await;
+        if fixture::is_routine_control_plane_frame(&env)
+            || matches!(
+                env.kind,
+                FrameKind::HostSettings
+                    | FrameKind::BackendCapacity
+                    | FrameKind::TeamPresetCatalogNotify
+                    | FrameKind::SessionList
+                    | FrameKind::SessionSummaryCountUpdated
+                    | FrameKind::TaskTokenUsage
+                    | FrameKind::WorkflowNotify
+                    | FrameKind::AgentsViewPreferencesNotify
+                    | FrameKind::AgentActivityStats
+                    | FrameKind::ContextCompactionNotify
+                    | FrameKind::ContextCompactionCapability
+            )
+        {
             continue;
         }
-        if env.kind == FrameKind::AgentBootstrap {
-            let payload: AgentBootstrapPayload =
-                env.parse_payload().expect("parse AgentBootstrapPayload");
-            let events = payload.events.into_iter().filter_map(|event| match event {
-                AgentBootstrapEvent::AgentStart(payload) => Some(
-                    Envelope::from_payload(
-                        env.stream.clone(),
-                        FrameKind::AgentStart,
-                        env.seq,
-                        &payload,
-                    )
-                    .expect("serialize AgentStart"),
-                ),
-                AgentBootstrapEvent::ChatEvent(payload) => Some(
-                    Envelope::from_payload(
-                        env.stream.clone(),
-                        FrameKind::ChatEvent,
-                        env.seq,
-                        &payload,
-                    )
-                    .expect("serialize ChatEvent"),
-                ),
-                _ => None,
-            });
-            push_bootstrap_events(client, events);
-            continue;
-        }
-        // A completed response on any visible agent may update the host while
-        // these callers await the next lifecycle or chat frame.
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionList
-                | FrameKind::SessionSummaryCountUpdated
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::AgentActivityStats
-                | FrameKind::ContextCompactionNotify
-                | FrameKind::ContextCompactionCapability
-        ) {
-            continue;
-        }
-
         return env;
     }
 }
@@ -142,31 +42,20 @@ async fn expect_raw_event_on_stream(
     kind: FrameKind,
     context: &str,
 ) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
+    fixture::next_frame_matching_on(client, context, |env| {
+        if fixture::is_routine_control_plane_frame(env) {
+            return false;
         }
         if env.stream != *stream {
-            continue;
+            return false;
         }
         if env.kind == kind {
-            return env;
+            return true;
         }
         if matches!(
             env.kind,
             FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
                 | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
@@ -174,13 +63,14 @@ async fn expect_raw_event_on_stream(
                 | FrameKind::ContextCompactionNotify
                 | FrameKind::ContextCompactionCapability
         ) {
-            continue;
+            return false;
         }
         panic!(
             "wait for {kind} on {stream} during {context} received unexpected event: kind={} stream={}",
             env.kind, env.stream
         );
-    }
+    })
+    .await
 }
 
 async fn expect_chat_event_on_stream(
@@ -390,30 +280,17 @@ async fn wait_for_session_list(
     client: &mut client::Connection,
     context: &str,
 ) -> SessionListPayload {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
+    let env = fixture::next_frame_matching_on(client, context, |env| {
+        if fixture::is_routine_control_plane_frame(env) {
+            return false;
         }
         if env.kind == FrameKind::AgentBootstrap {
-            continue;
+            return false;
         }
-        // This helper waits for the requested SessionList, not for the
-        // absence of unrelated targeted host notifications.
         if matches!(
             env.kind,
             FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
                 | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
@@ -424,18 +301,19 @@ async fn wait_for_session_list(
                 | FrameKind::TaskTokenUsage
                 | FrameKind::ChatEvent
         ) {
-            continue;
+            return false;
         }
         if env.kind == FrameKind::SessionList {
-            return env
-                .parse_payload()
-                .expect("failed to parse SessionListPayload");
+            return true;
         }
         panic!(
             "wait_for_session_list({context}) received unexpected event: kind={} stream={}",
             env.kind, env.stream
         );
-    }
+    })
+    .await;
+    env.parse_payload()
+        .expect("failed to parse SessionListPayload")
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
@@ -473,37 +351,19 @@ async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    loop {
-        match tokio::time::timeout(duration, client.next_event()).await {
-            Err(_) => return,
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionList
-                            | FrameKind::TaskTokenUsage
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentsViewPreferencesNotify
-                    ) =>
-            {
-                continue;
-            }
-            Ok(Ok(Some(env))) => panic!(
-                "unexpected event before {context}: kind={} stream={}",
-                env.kind, env.stream
-            ),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
+    fixture::assert_no_interesting_frame_on(client, duration, context, |env| {
+        matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::BackendCapacity
+                | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::SessionList
+                | FrameKind::TaskTokenUsage
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
+        )
+    })
+    .await;
 }
 
 async fn expect_no_chat_event_on_stream(
@@ -1080,7 +940,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/resume-close-before-barrier".to_owned()],
-                prompt: MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL.to_owned(),
+                prompt: "close before barrier seed".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -1100,7 +960,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
     .await;
     expect_turn(
         &mut fixture.client,
-        "mock backend response to: __mock_close_resume_before_barrier__",
+        "mock backend response to: close before barrier seed",
     )
     .await;
 
@@ -1121,6 +981,9 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
         .id
         .clone();
 
+    let close_reservation = fixture
+        .reserve_next_mock_resume_closing_before_barrier("resume-close-before-barrier")
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1137,6 +1000,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
         .expect("resume close-before-barrier agent failed");
 
     let env = expect_next_event(&mut fixture.client, "close-before-barrier resumed NewAgent").await;
+    drop(close_reservation);
     let resumed: NewAgentPayload = env
         .parse_payload()
         .expect("parse close-before-barrier resumed NewAgent");
@@ -1312,6 +1176,12 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
     )
     .await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "active-history-child",
+            MockScript::one(MockTurn::held_text("child active held open")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1321,7 +1191,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/active-history-child".to_owned()],
-                prompt: format!("{MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL} child active"),
+                prompt: "child active".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -1352,12 +1222,18 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
             break;
         }
     }
+    drop(reservation);
 
+    fixture
+        .mock_by_id(&parent.agent_id)
+        .await
+        .enqueue(MockTurn::agent_control_await(vec![child.agent_id.clone()]))
+        .await;
     fixture
         .client
         .send_message(
             &parent.instance_stream,
-            format!("{MOCK_AGENT_CONTROL_AWAIT_SENTINEL} {}", child.agent_id.0),
+            format!("await child {}", child.agent_id.0),
         )
         .await
         .expect("send parent await prompt failed");

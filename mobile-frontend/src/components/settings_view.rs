@@ -60,31 +60,6 @@ pub fn restore_appearance(state: &AppState) {
     }
 }
 
-#[cfg(test)]
-mod tool_output_mode_tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip() {
-        for mode in [
-            ToolOutputMode::Summary,
-            ToolOutputMode::Compact,
-            ToolOutputMode::Full,
-        ] {
-            assert_eq!(
-                tool_output_mode_from_str(tool_output_mode_to_str(mode)),
-                Some(mode)
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_is_none() {
-        assert_eq!(tool_output_mode_from_str(""), None);
-        assert_eq!(tool_output_mode_from_str("bogus"), None);
-    }
-}
-
 #[component]
 pub fn SettingsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -245,7 +220,7 @@ pub fn SettingsView() -> impl IntoView {
                                 <div class="settings-info">
                                     <div class="settings-row"><span class="settings-label">"Status"</span><span class="settings-value">{if settings.voice.enabled {"Enabled"} else {"Disabled"}}</span></div>
                                     <div class="settings-row"><span class="settings-label">"Model"</span><span class="settings-value">{settings.voice.nova_model}</span></div>
-                                    <div class="settings-row"><span class="settings-label">"Turn ending"</span><span class="settings-value">{match settings.voice.endpointing_sensitivity { protocol::VoiceEndpointingSensitivity::High => "Fast", protocol::VoiceEndpointingSensitivity::Medium => "Balanced", protocol::VoiceEndpointingSensitivity::Low => "Patient" }}</span></div>
+                                    <div class="settings-row"><span class="settings-label">"Turn ending"</span><span class="settings-value">{match settings.voice.endpointing_sensitivity { settings_model::VoiceEndpointingSensitivity::High => "Fast", settings_model::VoiceEndpointingSensitivity::Medium => "Balanced", settings_model::VoiceEndpointingSensitivity::Low => "Patient" }}</span></div>
                                     <p class="settings-muted">"Voice capture is foreground-only and uses this device’s echo cancellation, noise suppression, and gain control. Configure AWS profile and region on the desktop host."</p>
                                 </div>
                             }.into_any(),

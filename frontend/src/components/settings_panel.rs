@@ -13,19 +13,17 @@ use protocol::{
     AcpAdapterId, AcpAgentSpec, BackendConfigField, BackendConfigFieldType,
     BackendConfigPersistenceMode, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
     BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsGroupKind,
-    BackendNativeSettingsSnapshot, BackendSetupAction, BackendSetupInfo, BackendSetupStatus,
-    BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId,
-    DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig, HostSettingValue,
-    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
-    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
-    MobilePairingState, ProjectId, RunBackendSetupPayload,
-    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
-    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
-    SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
-    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SessionSchemaEntry, SessionSettingField,
+    BackendNativeSettingsSnapshot, BackendNativeSettingsWritePayload, BackendSetupAction,
+    BackendSetupInfo, BackendSetupStatus, BrokerUrl, CodeIntelProviderId, CustomAgent,
+    CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileId,
+    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
+    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
+    ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering,
+    SteeringId, SteeringScope, ToolPolicy,
 };
+use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -321,149 +319,6 @@ fn tool_output_mode_from_str(s: &str) -> Option<ToolOutputMode> {
 pub fn persist_tool_output_mode(mode: ToolOutputMode) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(STORAGE_TOOL_OUTPUT_MODE, tool_output_mode_to_str(mode));
-    }
-}
-
-#[cfg(test)]
-mod diff_pref_tests {
-    use super::*;
-
-    #[test]
-    fn diff_view_mode_roundtrip() {
-        for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
-            let s = diff_view_mode_to_str(mode);
-            assert_eq!(diff_view_mode_from_str(s), Some(mode));
-        }
-    }
-
-    #[test]
-    fn diff_context_mode_roundtrip() {
-        for mode in [DiffContextMode::Hunks, DiffContextMode::FullFile] {
-            let s = diff_context_mode_to_str(mode);
-            assert_eq!(diff_context_mode_from_str(s), Some(mode));
-        }
-    }
-
-    #[test]
-    fn diff_view_mode_unknown_is_none() {
-        assert_eq!(diff_view_mode_from_str(""), None);
-        assert_eq!(diff_view_mode_from_str("bogus"), None);
-    }
-
-    #[test]
-    fn diff_context_mode_unknown_is_none() {
-        assert_eq!(diff_context_mode_from_str(""), None);
-        assert_eq!(diff_context_mode_from_str("bogus"), None);
-    }
-
-    #[test]
-    fn tool_output_mode_roundtrip() {
-        for mode in [
-            ToolOutputMode::Summary,
-            ToolOutputMode::Compact,
-            ToolOutputMode::Full,
-        ] {
-            let s = tool_output_mode_to_str(mode);
-            assert_eq!(tool_output_mode_from_str(s), Some(mode));
-        }
-    }
-
-    #[test]
-    fn tool_output_mode_unknown_is_none() {
-        assert_eq!(tool_output_mode_from_str(""), None);
-        assert_eq!(tool_output_mode_from_str("bogus"), None);
-    }
-
-    // ---- broker URL validator ----
-    //
-    // These tests mirror the rules the server enforces for the dev-override
-    // `mobile_broker_url` (`server::mobile_access::dev_broker_endpoint` over
-    // `mqtt-transport::validate_broker_url`): secure scheme, no embedded
-    // credentials/fragments, and a loopback-only host. The server remains the
-    // authoritative validator; this mirror surfaces the same rejection inline.
-
-    #[test]
-    fn broker_url_validator_accepts_empty() {
-        // Empty input = "use managed access", not an error.
-        assert!(validate_broker_url_input("").is_ok());
-        assert!(validate_broker_url_input("   ").is_ok());
-    }
-
-    #[test]
-    fn broker_url_validator_accepts_loopback_hosts() {
-        // Loopback dev overrides are the only accepted custom brokers.
-        assert!(validate_broker_url_input("mqtts://localhost:8883").is_ok());
-        assert!(validate_broker_url_input("wss://127.0.0.1:8083/mqtt").is_ok());
-        assert!(validate_broker_url_input("wss://localhost/relay").is_ok());
-        // IPv6 loopback literal.
-        assert!(validate_broker_url_input("mqtts://[::1]:8883").is_ok());
-        // Case-insensitive on scheme and on the `localhost` host.
-        assert!(validate_broker_url_input("MQTTS://LOCALHOST:8883").is_ok());
-    }
-
-    #[test]
-    fn broker_url_validator_rejects_non_loopback_custom_broker() {
-        // A valid-scheme, valid-shape URL at a non-loopback host must be
-        // rejected inline — the server fails closed for it.
-        for bad in [
-            "mqtts://broker.example.test:8883",
-            "wss://broker.emqx.io:8084/mqtt",
-            "wss://192.168.1.10:8083/mqtt",
-            "mqtts://10.0.0.5:8883",
-        ] {
-            let err = validate_broker_url_input(bad)
-                .expect_err(&format!("expected non-loopback {bad:?} to be rejected"));
-            assert!(
-                err.contains("loopback"),
-                "error for {bad:?} must explain the loopback rule: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn broker_url_validator_rejects_insecure_schemes() {
-        for bad in [
-            "mqtt://broker.example",
-            "ws://broker.example",
-            "tcp://x.test",
-        ] {
-            let err = validate_broker_url_input(bad)
-                .expect_err(&format!("expected {bad:?} to be rejected"));
-            assert!(
-                err.contains("Insecure") || err.contains("insecure"),
-                "error for {bad:?} should mention insecure scheme: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn broker_url_validator_rejects_unknown_or_missing_scheme() {
-        // Wrong scheme.
-        assert!(validate_broker_url_input("http://broker.example").is_err());
-        // No scheme separator at all.
-        assert!(validate_broker_url_input("broker.example:8883").is_err());
-        // Empty after scheme.
-        assert!(validate_broker_url_input("mqtts://").is_err());
-    }
-
-    #[test]
-    fn broker_url_validator_rejects_embedded_credentials() {
-        let err = validate_broker_url_input("mqtts://user:pass@broker.example")
-            .expect_err("URL with @ must be rejected");
-        assert!(
-            err.contains("credentials"),
-            "error must mention credentials: {err}"
-        );
-    }
-
-    #[test]
-    fn broker_url_validator_rejects_fragments() {
-        let err = validate_broker_url_input("mqtts://broker.example#frag")
-            .expect_err("URL with fragment must be rejected");
-        assert!(
-            err.contains("fragment"),
-            "error must mention fragments: {err}"
-        );
     }
 }
 
@@ -2213,13 +2068,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
         } else {
             Some(HostExecutablePath(trimmed.to_owned()))
         };
-        send_host_setting(
-            state,
-            HostSettingValue::CodeIntelLanguageServerPath {
-                provider: rust_analyzer_provider_id(),
-                path,
-            },
-        );
+        send_code_intel_path(state, rust_analyzer_provider_id(), path);
     };
 
     let on_commit = move |ev: web_sys::Event| {
@@ -2245,13 +2094,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
         commit_path(&state_for_keydown, &input.value());
     };
     let on_clear = move |_: web_sys::MouseEvent| {
-        send_host_setting(
-            &state_for_clear,
-            HostSettingValue::CodeIntelLanguageServerPath {
-                provider: rust_analyzer_provider_id(),
-                path: None,
-            },
-        );
+        send_code_intel_path(&state_for_clear, rust_analyzer_provider_id(), None);
     };
 
     view! {
@@ -2295,8 +2138,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
 /// short piece of text *about* an agent: its name, and what it is up to. Both
 /// spend money because each runs an extra model call, so the copy is explicit
 /// about cost and activity summaries default off. Values are reflected from
-/// `HostSettings.background_agent_features` and each change is sent as a typed
-/// `BackgroundAgentFeatureEnabled` setting.
+/// `HostSettings.background_agent_features`.
 ///
 /// These used to live on the old "General" tab. They are grouped here because
 /// they answer one question — "may Tyde spend a little money to label things
@@ -2332,12 +2174,10 @@ fn AiSummariesTab() -> impl IntoView {
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
+            send_host_replace(
                 &state,
-                HostSettingValue::BackgroundAgentFeatureEnabled {
-                    feature: BackgroundAgentFeature::AutoGenerateAgentNames,
-                    enabled: input.checked(),
-                },
+                "/background_agent_features/auto_generate_agent_names",
+                input.checked(),
             );
         }
     };
@@ -2347,12 +2187,10 @@ fn AiSummariesTab() -> impl IntoView {
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
+            send_host_replace(
                 &state,
-                HostSettingValue::BackgroundAgentFeatureEnabled {
-                    feature: BackgroundAgentFeature::AgentActivitySummaries,
-                    enabled: input.checked(),
-                },
+                "/background_agent_features/agent_activity_summaries",
+                input.checked(),
             );
         }
     };
@@ -2415,466 +2253,17 @@ fn AiSummariesTab() -> impl IntoView {
 #[component]
 fn SupervisorTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let supervisor = {
-        let state = state.clone();
-        move || {
-            state
-                .selected_host_settings()
-                .map(|settings| settings.supervisor)
-        }
-    };
-    let known = {
-        let supervisor = supervisor.clone();
-        move || supervisor().is_some()
-    };
-    let enabled = {
-        let supervisor = supervisor.clone();
-        move || supervisor().is_some_and(|supervisor| supervisor.enabled)
-    };
-    // Reading through one derived accessor keeps every field below on the same
-    // host snapshot, and keeps the tab's view type small: the wasm test build
-    // ran out of memory when each field carried its own closure types.
-    let field = |supervisor: &dyn Fn() -> Option<protocol::SupervisorSettings>,
-                 read: fn(&protocol::SupervisorSettings) -> String| {
-        supervisor().as_ref().map(read).unwrap_or_default()
-    };
-    let commit = {
-        let state = state.clone();
-        move |setting: HostSettingValue| send_host_setting(&state, setting)
-    };
-
-    let enabled_toggle = {
-        let known = known.clone();
-        let enabled = enabled.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive(enabled),
-            Signal::derive(move || !known()),
-            Callback::new(move |checked: bool| {
-                commit(HostSettingValue::SupervisorEnabled { enabled: checked })
-            }),
-        )
-    };
-    let restored_toggle = {
-        let supervisor = supervisor.clone();
-        let enabled = enabled.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive(move || {
-                supervisor().is_some_and(|supervisor| supervisor.supervise_restored_agents)
-            }),
-            Signal::derive(move || !enabled()),
-            Callback::new(move |checked: bool| {
-                commit(HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: checked })
-            }),
-        )
-    };
-    let stall_toggle = {
-        let supervisor = supervisor.clone();
-        let enabled = enabled.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive(move || {
-                supervisor().is_some_and(|supervisor| supervisor.stall_timeout_enabled)
-            }),
-            Signal::derive(move || !enabled()),
-            Callback::new(move |checked: bool| {
-                commit(HostSettingValue::SupervisorStallTimeoutEnabled { enabled: checked })
-            }),
-        )
-    };
-    let stall_seconds = {
-        let supervisor = supervisor.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || field(&supervisor, |s| s.stall_timeout_seconds.to_string())
-            }),
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || {
-                    supervisor().is_none_or(|supervisor| {
-                        !supervisor.enabled || !supervisor.stall_timeout_enabled
-                    })
-                }
-            }),
-            Callback::new(move |raw: String| {
-                if let Ok(seconds) = raw.trim().parse::<u32>()
-                    && (SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN..=SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX)
-                        .contains(&seconds)
-                {
-                    commit(HostSettingValue::SupervisorStallTimeoutSeconds { seconds });
-                }
-            }),
-        )
-    };
-    let compact_toggle = {
-        let supervisor = supervisor.clone();
-        let enabled = enabled.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive(move || {
-                supervisor().is_some_and(|supervisor| supervisor.auto_compact_on_success)
-            }),
-            Signal::derive(move || !enabled()),
-            Callback::new(move |checked: bool| {
-                commit(HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: checked })
-            }),
-        )
-    };
-    let compact_delay = {
-        let supervisor = supervisor.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || {
-                    field(&supervisor, |s| {
-                        s.auto_compact_inactivity_delay_seconds.to_string()
-                    })
-                }
-            }),
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || {
-                    supervisor().is_none_or(|supervisor| {
-                        !supervisor.enabled || !supervisor.auto_compact_on_success
-                    })
-                }
-            }),
-            Callback::new(move |raw: String| {
-                if let Ok(seconds) = raw.trim().parse::<u32>()
-                    && (SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
-                        ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
-                        .contains(&seconds)
-                {
-                    commit(
-                        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
-                    );
-                }
-            }),
-        )
-    };
-    let compact_min = {
-        let supervisor = supervisor.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || {
-                    field(&supervisor, |s| {
-                        s.auto_compact_min_context_tokens.to_string()
-                    })
-                }
-            }),
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || {
-                    supervisor().is_none_or(|supervisor| {
-                        !supervisor.enabled || !supervisor.auto_compact_on_success
-                    })
-                }
-            }),
-            Callback::new(move |raw: String| {
-                if let Ok(tokens) = raw.trim().parse::<u64>() {
-                    commit(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens });
-                }
-            }),
-        )
-    };
-    let kicks = {
-        let supervisor = supervisor.clone();
-        let known = known.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || field(&supervisor, |s| s.max_kicks_per_task.to_string())
-            }),
-            Signal::derive(move || !known()),
-            Callback::new(move |raw: String| {
-                if let Ok(count) = raw.trim().parse::<u8>()
-                    && count >= 1
-                {
-                    commit(HostSettingValue::SupervisorMaxKicksPerTask { count });
-                }
-            }),
-        )
-    };
-    let retries = {
-        let supervisor = supervisor.clone();
-        let known = known.clone();
-        let commit = commit.clone();
-        (
-            Signal::derive({
-                let supervisor = supervisor.clone();
-                move || field(&supervisor, |s| s.retry_attempts.to_string())
-            }),
-            Signal::derive(move || !known()),
-            Callback::new(move |raw: String| {
-                if let Ok(count) = raw.trim().parse::<u8>()
-                    && count <= SUPERVISOR_RETRY_ATTEMPTS_MAX
-                {
-                    commit(HostSettingValue::SupervisorRetryAttempts { count });
-                }
-            }),
-        )
-    };
-
-    let tier_value = {
-        let supervisor = supervisor.clone();
-        move || {
-            match supervisor()
-                .map(|supervisor| supervisor.cost_tier)
-                .unwrap_or_default()
-            {
-                protocol::SupervisorCostTier::Low => "low",
-                protocol::SupervisorCostTier::Default => "default",
-                protocol::SupervisorCostTier::High => "high",
-            }
-            .to_owned()
-        }
-    };
-    let tier_disabled = {
-        let known = known.clone();
-        move || !known()
-    };
-    let tier_on_change = {
-        let commit = commit.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let select: web_sys::HtmlSelectElement = target.unchecked_into();
-            let tier = match select.value().as_str() {
-                "low" => protocol::SupervisorCostTier::Low,
-                "default" => protocol::SupervisorCostTier::Default,
-                "high" => protocol::SupervisorCostTier::High,
-                other => {
-                    log::warn!("unknown supervisor cost tier option: {other:?}");
-                    return;
-                }
-            };
-            commit(HostSettingValue::SupervisorCostTier { tier });
-        }
-    };
+    let fields_state = state.clone();
 
     view! {
         <h2 class="settings-panel-title">"Supervisor"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "The supervisor is a second model that watches your agents. Every time an agent goes idle it reads the last thing you asked for, the task list, and the agent's closing message, then decides one of three things: the work is genuinely done, the agent is waiting on you, or the agent quit early and should be told to keep going. If it decides the last one, it sends the agent a follow-up message on your behalf."
+            "When an agent goes idle, the supervisor can run a hidden model call that reviews the request, task list, and final response, then either accept the result or send the agent a follow-up. It is off by default because both verdicts and follow-up turns cost money."
         </p>
 
-        <p class="settings-description settings-panel-intro">
-            "That means the supervisor spends money in two ways: the verdict call itself, once per idle transition, and any follow-up turns it triggers. It is off by default for exactly that reason. The kick limit below is the safety rail that stops a supervisor and an agent from pushing each other in circles on a task that cannot be finished."
-        </p>
-
-        <SettingsToggleField
-            label="Enable agent supervisor"
-            description="When an agent goes idle, a background model call checks whether it actually finished the last request. If the agent stopped on an error or quit mid-task, the supervisor sends it a follow-up message to keep it working. This runs an extra model call per idle transition and costs money. Off by default."
-            checked=enabled_toggle.0
-            disabled=enabled_toggle.1
-            on_toggle=enabled_toggle.2
-        />
-
-        <SettingsToggleField
-            label="Supervise restored agents"
-            description="Reopening a saved session replays its transcript, which looks exactly like an agent that just went idle. Off by default, the supervisor leaves that history alone and waits for the agent's first live turn. Turn this on to have it judge — and possibly follow up on — sessions as soon as they are restored."
-            checked=restored_toggle.0
-            disabled=restored_toggle.1
-            on_toggle=restored_toggle.2
-        />
-
-        <SettingsToggleField
-            label="Interrupt stalled turns"
-            description="Cancel a running turn that has produced nothing at all for the stall timeout below, then let the supervisor decide how to make progress. Any output — text, a tool call, a status change — resets the timer, so a slow agent that is still working is never cut off. This cancels real work, so it is off by default, and it only fires while a supervisor follow-up is still available under the kick limit."
-            checked=stall_toggle.0
-            disabled=stall_toggle.1
-            on_toggle=stall_toggle.2
-        />
-
-        <SupervisorNumberField
-            label="Stall timeout"
-            description="How long a turn may produce nothing before it is interrupted. Default 1800 seconds (30 minutes); 900 is 15 minutes and 3600 is an hour."
-            aria_label="Supervisor stall timeout seconds"
-            min=f64::from(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN)
-            max=Some(f64::from(SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX))
-            step="60"
-            unit=Some("seconds")
-            value=stall_seconds.0
-            disabled=stall_seconds.1
-            on_change=stall_seconds.2
-        />
-
-        <SettingsToggleField
-            label="Auto-compact on success"
-            description="After the supervisor confirms the requested work is truly complete, automatically compact only after the inactivity delay has elapsed and the latest completed assistant turn reports a known current context strictly above the configured minimum."
-            checked=compact_toggle.0
-            disabled=compact_toggle.1
-            on_toggle=compact_toggle.2
-        />
-
-        <SupervisorNumberField
-            label="Auto-compact inactivity delay"
-            description="Default 300 seconds (5 minutes); agent activity restarts the timer. Compaction starts only after true completion, this full quiet period, and a known current context strictly above the configured minimum."
-            aria_label="Supervisor auto-compact inactivity delay seconds"
-            min=f64::from(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN)
-            max=Some(f64::from(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX))
-            step="1"
-            unit=Some("seconds")
-            value=compact_delay.0
-            disabled=compact_delay.1
-            on_change=compact_delay.2
-        />
-
-        <SupervisorNumberField
-            label="Auto-compact minimum context"
-            description="Automatically compact only when the latest completed assistant turn reports a context larger than this many tokens. The default is 200,000. Set 0 for no positive minimum; automatic compaction still waits for reported current-context data and skips the turn when that data is unavailable."
-            aria_label="Supervisor auto-compact minimum context tokens"
-            min=0.0
-            max=None
-            step="1000"
-            unit=Some("tokens")
-            value=compact_min.0
-            disabled=compact_min.1
-            on_change=compact_min.2
-        />
-
-        <div class="settings-field">
-            <label class="settings-label">"Verdict model tier"</label>
-            <p class="settings-description">
-                "Which model tier judges whether a task is finished. Low uses the cheap tier (like agent naming); Backend default uses the backend's normal model; High uses the most capable configuration. Raise this if the supervisor's verdicts are unreliable."
-            </p>
-            <select
-                class="settings-select"
-                prop:value=tier_value
-                disabled=tier_disabled
-                aria-label="Supervisor verdict model tier"
-                on:change=tier_on_change
-            >
-                <option value="low">"Low (cheap)"</option>
-                <option value="default">"Backend default"</option>
-                <option value="high">"High (most capable)"</option>
-            </select>
-        </div>
-
-        <SupervisorNumberField
-            label="Kick limit"
-            description="Maximum consecutive supervisor follow-ups without a new message from you. Prevents the supervisor and the agent from looping forever on a task that cannot finish."
-            aria_label="Supervisor kick limit"
-            min=1.0
-            max=Some(20.0)
-            step="1"
-            unit=None
-            value=kicks.0
-            disabled=kicks.1
-            on_change=kicks.2
-        />
-
-        <SupervisorNumberField
-            label="Extra delayed attempts"
-            description="Extra delayed attempts after a supervisor verdict call fails or returns an invalid verdict. Each attempt is a fresh paid model call with automatic backoff. 0 disables extra attempts; maximum 5. The default 1 means two total calls."
-            aria_label="Supervisor extra delayed attempts"
-            min=f64::from(SUPERVISOR_RETRY_ATTEMPTS_MIN)
-            max=Some(f64::from(SUPERVISOR_RETRY_ATTEMPTS_MAX))
-            step="1"
-            unit=None
-            value=retries.0
-            disabled=retries.1
-            on_change=retries.2
-        />
-    }
-}
-
-/// One labelled toggle with explanatory sub-text. Shared by the Supervisor,
-/// Subagents, and Debug tabs: every caller funnels through this and
-/// [`SupervisorNumberField`] with erased signal/callback props, so each tab
-/// compiles to a couple of field view types instead of one per field. That
-/// matters here — the settings panel's wasm test module mounts every one of
-/// these in a single browser instance, and each distinct nested view type costs
-/// module size against that ceiling.
-#[component]
-fn SettingsToggleField(
-    label: &'static str,
-    description: &'static str,
-    checked: Signal<bool>,
-    disabled: Signal<bool>,
-    on_toggle: Callback<bool>,
-) -> impl IntoView {
-    let on_change = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let input: web_sys::HtmlInputElement = target.unchecked_into();
-        on_toggle.run(input.checked());
-    };
-    view! {
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">{label}</label>
-                    <p class="settings-description">{description}</p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=move || checked.get()
-                        disabled=move || disabled.get()
-                        on:change=on_change
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
-    }
-}
-
-/// One labelled supervisor number input, with an optional visible unit.
-#[component]
-fn SupervisorNumberField(
-    label: &'static str,
-    description: &'static str,
-    aria_label: &'static str,
-    min: f64,
-    /// `None` renders no `max`, which the token minimum needs: the setting is a
-    /// `u64` and must not be capped by an attribute the field never had.
-    max: Option<f64>,
-    step: &'static str,
-    unit: Option<&'static str>,
-    value: Signal<String>,
-    disabled: Signal<bool>,
-    on_change: Callback<String>,
-) -> impl IntoView {
-    let on_input_change = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let input: web_sys::HtmlInputElement = target.unchecked_into();
-        on_change.run(input.value());
-    };
-    let input = view! {
-        <input
-            class="settings-input settings-supervisor-number-input"
-            type="number"
-            min=min
-            max=max
-            step=step
-            prop:value=move || value.get()
-            disabled=move || disabled.get()
-            aria-label=aria_label
-            on:change=on_input_change
-        />
-    };
-    view! {
-        <div class="settings-field">
-            <label class="settings-label">{label}</label>
-            <p class="settings-description">{description}</p>
-            {match unit {
-                Some(unit) => view! {
-                    <div class="settings-form-row" style="align-items: center;">
-                        {input}
-                        <span class="settings-supervisor-number-unit">{unit}</span>
-                    </div>
-                }
-                    .into_any(),
-                None => input.into_any(),
-            }}
+        <div class="settings-schema-fields">
+            {move || host_schema_section(&fields_state, "supervisor")}
         </div>
     }
 }
@@ -2931,9 +2320,10 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
                                     };
                                     Some(kind)
                                 };
-                                send_host_setting(
+                                send_host_replace(
                                     &state_for_change,
-                                    HostSettingValue::DefaultBackend { default_backend },
+                                    "/default_backend",
+                                    default_backend,
                                 );
                             }
                         >
@@ -3114,7 +2504,7 @@ impl LaunchProfileForm {
 
 /// Explicit server-owned Launch Profiles: named backend + session-settings
 /// presets (e.g. `hermes:claude`) that show up as ready entries in the New Chat
-/// menu. Persisted through `HostSettingValue::LaunchProfiles`.
+/// menu.
 #[component]
 fn LaunchProfilesSection() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -3125,7 +2515,7 @@ fn LaunchProfilesSection() -> impl IntoView {
     let rows = Memo::new(move |_| {
         state_for_rows
             .selected_host_settings()
-            .map(|settings| settings.launch_profiles)
+            .map(|settings| settings.launch_profiles.into_values().collect::<Vec<_>>())
             .unwrap_or_default()
     });
 
@@ -3141,17 +2531,12 @@ fn LaunchProfilesSection() -> impl IntoView {
             return;
         };
         pending_delete_for_confirm.set(None);
-        let Some(settings) = state_for_confirm_delete.selected_host_settings_untracked() else {
-            return;
-        };
-        let profiles = settings
-            .launch_profiles
-            .into_iter()
-            .filter(|p| p.id != id)
-            .collect();
-        send_host_setting(
+        send_host_remove(
             &state_for_confirm_delete,
-            HostSettingValue::LaunchProfiles { profiles },
+            format!(
+                "/launch_profiles/{}",
+                settings_model::escape_pointer_token(&id.0)
+            ),
         );
     });
 
@@ -3339,23 +2724,19 @@ fn LaunchProfileEditor(
             error_sig_for_save.set(Some("No host selected.".to_string()));
             return;
         };
-        let mut profiles = settings.launch_profiles;
-        if is_new && profiles.iter().any(|p| p.id == config.id) {
+        if is_new && settings.launch_profiles.contains_key(&config.id) {
             error_sig_for_save.set(Some(format!(
                 "A launch profile with id \"{}\" already exists.",
                 config.id.0
             )));
             return;
         }
-        match profiles.iter_mut().find(|p| p.id == config.id) {
-            Some(existing) => *existing = config,
-            None => profiles.push(config),
-        }
         error_sig_for_save.set(None);
-        send_host_setting(
-            &state_for_save,
-            HostSettingValue::LaunchProfiles { profiles },
+        let path = format!(
+            "/launch_profiles/{}",
+            settings_model::escape_pointer_token(&config.id.0)
         );
+        send_host_replace(&state_for_save, path, config);
         editor_signal_for_save.set(None);
     };
 
@@ -3530,144 +2911,26 @@ fn LaunchProfileEditor(
     }
 }
 
-/// "Task complexity tiers" — master toggle plus, when enabled, the
-/// per-backend Low/High tier mappings. The rows are generated from each
-/// backend's session settings schema, so they show exactly the fields
-/// (model, effort, ...) that backend supports.
-/// Sub-agents: whether an agent may start and drive other agents, and what
-/// configuration those children get.
-///
-/// The master toggle is the host-scoped `tyde_agent_control_mcp_enabled`
-/// setting. Turning it on is what injects the `tyde-agent-control` and
-/// `tyde-agent-await` MCP servers into newly created chats — that pair of
-/// servers *is* Tyde's sub-agent mechanism, so this switch decides whether
-/// agents can delegate at all. It is labelled for what it does rather than for
-/// the servers it happens to install.
-///
-/// Complexity tiers sit on the same page because they answer the immediate
-/// follow-up question: given that an agent can spawn a child, what does the
-/// child run as. They are deliberately *not* gated behind the master toggle —
-/// tiers also apply to agents you spawn yourself from the UI, so hiding them
-/// when agent-initiated spawning is off would hide a setting that is still
-/// live.
 #[component]
 fn SubagentsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_checked = state.clone();
-    let state_for_disabled = state.clone();
-    let state_for_toggle = state.clone();
-
-    let checked = Signal::derive(move || {
-        state_for_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.tyde_agent_control_mcp_enabled)
-    });
-    let disabled = Signal::derive(move || state_for_disabled.selected_host_settings().is_none());
-    let on_toggle = Callback::new(move |enabled: bool| {
-        send_host_setting(
-            &state_for_toggle,
-            HostSettingValue::TydeAgentControlMcpEnabled { enabled },
-        );
-    });
-    let state_for_depth = state.clone();
-    let depth = Signal::derive(move || {
-        state_for_depth
-            .selected_host_settings()
-            .map(|settings| settings.tyde_agent_control_max_depth.to_string())
-            .unwrap_or_default()
-    });
-    let state_for_depth_disabled = state.clone();
-    let depth_disabled =
-        Signal::derive(move || state_for_depth_disabled.selected_host_settings().is_none());
-    let on_depth_change = Callback::new(move |value: String| {
-        if let Ok(depth) = value.parse::<u8>() {
-            send_host_setting(&state, HostSettingValue::TydeAgentControlMaxDepth { depth });
-        }
-    });
+    let fields_state = state.clone();
+    let rows_state = state.clone();
 
     view! {
         <h2 class="settings-panel-title">"Subagents"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "A sub-agent is an agent started by another agent rather than by you. Given a large job, an agent can split it up — one child per file to migrate, per subsystem to review, per approach to try — run them in parallel, wait for their results, and use them to finish its own work. You see them in the agent tree as children of the agent that spawned them, and you can open and message any of them directly."
+            "A sub-agent is an agent started by another agent. Agents can split broad work into parallel children, wait for their results, and use them to finish the parent task. More children can finish broad work faster, but each one adds model usage."
         </p>
 
-        <p class="settings-description settings-panel-intro">
-            "This is the biggest single lever on what a request costs. A parent that spawns eight children is running nine agents' worth of model calls. It is also what makes broad work finish in one pass instead of ten. The settings below control whether delegation is allowed at all, and how expensively each child runs."
-        </p>
-
-        <SettingsToggleField
-            label="Tyde sub-agents"
-            description="Allow agents to spawn, message, and await other agents. New chats are started with Tyde's agent-control tools, which let an agent create a child agent, send it follow-up messages, read what it produced, and block until it finishes. Turning this off does not affect agents you create yourself from the UI, and it does not touch a backend's own built-in sub-agent feature — it only removes Tyde's cross-agent orchestration tools from the chats started after the change. On by default."
-            checked=checked
-            disabled=disabled
-            on_toggle=on_toggle
-        />
-
-        <SupervisorNumberField
-            label="Maximum agent depth"
-            description="Count the main task as level 1. Agents at the maximum level are started without Tyde agent-control or await tools, and the server rejects attempts to create another level. The default of 3 allows the main task, its children, and their children."
-            aria_label="Maximum agent depth"
-            min=protocol::TYDE_AGENT_CONTROL_MAX_DEPTH_MIN as f64
-            max=Some(protocol::TYDE_AGENT_CONTROL_MAX_DEPTH_MAX as f64)
-            step="1"
-            unit=Some("levels")
-            value=depth
-            disabled=depth_disabled
-            on_change=on_depth_change
-        />
+        <div class="settings-schema-fields">
+            {move || host_schema_section(&fields_state, "subagents")}
+        </div>
 
         <h3 class="settings-section-title">"How sub-agents are configured"</h3>
-
-        <ComplexityTiersSection />
-    }
-}
-
-#[component]
-fn ComplexityTiersSection() -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let state_for_checked = state.clone();
-    let state_for_disabled = state.clone();
-    let state_for_toggle = state.clone();
-    let state_for_rows = state.clone();
-
-    let checked = move || {
-        state_for_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.complexity_tiers_enabled)
-    };
-    let disabled = move || state_for_disabled.selected_host_settings().is_none();
-    let on_toggle = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let input: web_sys::HtmlInputElement = target.unchecked_into();
-        send_host_setting(
-            &state_for_toggle,
-            HostSettingValue::ComplexityTiersEnabled {
-                enabled: input.checked(),
-            },
-        );
-    };
-
-    view! {
         <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Task complexity tiers"</label>
-                    <p class="settings-description">
-                        "Let a sub-agent be started at a cheaper, faster configuration for trivial work (low) or the most capable one for genuinely hard work (high), instead of every child running the same setup as its parent. Spawn dialogs offer the choice to you, and agents may request a tier for the children they start — a parent that knows it is delegating a mechanical rename can ask for the cheap tier and save real money. When off, every spawn uses the backend's own defaults and neither you nor an agent is offered the choice."
-                    </p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=checked
-                        disabled=disabled
-                        on:change=on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-            {move || complexity_tier_rows(&state_for_rows)}
+            {move || complexity_tier_rows(&rows_state)}
         </div>
     }
 }
@@ -3814,12 +3077,14 @@ fn update_tier_setting(
             .insert(key.to_owned(), SessionSettingValue::String(value));
     }
     clear_invalid_dependent_select_values(fields, tier_values);
-    send_host_setting(
+    let backend = wire_key(kind).expect("backend kind serializes as a string");
+    send_host_replace(
         state,
-        HostSettingValue::BackendTiers {
-            backend: kind,
-            config,
-        },
+        format!(
+            "/backend_tier_configs/{}",
+            settings_model::escape_pointer_token(&backend)
+        ),
+        config,
     );
 }
 
@@ -4016,9 +3281,10 @@ fn backend_page_body(
                                 *candidate == kind || enabled_now.contains(candidate)
                             })
                             .collect::<Vec<_>>();
-                        send_host_setting(
+                        send_host_replace(
                             &state_for_enable,
-                            HostSettingValue::EnabledBackends { enabled_backends },
+                            "/enabled_backends",
+                            enabled_backends,
                         );
                     }
                 >
@@ -4387,11 +3653,6 @@ fn commit_text_value(state: &AppState, kind: BackendKind, key: &str, value: Stri
     update_backend_config(state, kind, key, update);
 }
 
-/// Persist a single backend-config field change. Only the edited key is sent;
-/// the server merges it into the stored config and preserves every sibling key
-/// (see `HostSettingValue::BackendConfig`). Clearing a field sends an explicit
-/// `SessionSettingValue::Null` for that key — never omission — so the server can
-/// tell "clear this one field" apart from "leave it untouched".
 fn update_backend_config(
     state: &AppState,
     kind: BackendKind,
@@ -4402,85 +3663,19 @@ fn update_backend_config(
     values
         .0
         .insert(key.to_owned(), value.unwrap_or(SessionSettingValue::Null));
-    send_host_setting(
-        state,
-        HostSettingValue::BackendConfig {
-            backend: kind,
-            values,
-        },
-    );
+    send_backend_config(state, kind, values);
 }
 
 // ---- Backend-native, JSON-schema-driven settings (e.g. Tycode) ----
 
-/// Secret-like key markers. Native settings groups carry raw JSON schema, which
-/// is not guaranteed to flag secrets in a typed way, so mask defensively by key
-/// name and by the JSON-schema hints a backend might set.
-const NATIVE_SECRET_MARKERS: [&str; 6] = [
-    "api_key",
-    "apikey",
-    "password",
-    "secret",
-    "token",
-    "access_key",
-];
-
-/// Placeholder shown in place of any redacted secret value in JSON views.
-const SECRET_REDACTION: &str = "••••••••";
-
-/// Whether a key *name* alone marks a secret. Used for recursive redaction of
-/// nested JSON where no per-key schema is available.
-fn is_secret_key_name(key: &str) -> bool {
-    let lowered = key.to_lowercase();
-    NATIVE_SECRET_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
-}
-
-/// Whether a native settings property is a secret whose value must be masked and
-/// never rendered. Considers the key name plus JSON-schema secret hints.
-fn is_secret_native_key(key: &str, prop_schema: &Value) -> bool {
-    is_secret_key_name(key)
-        || prop_schema.get("format").and_then(Value::as_str) == Some("password")
-        || prop_schema.get("writeOnly").and_then(Value::as_bool) == Some(true)
-}
-
-/// Whether `value` contains any secret-like key at any depth.
-fn contains_secret(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, child)| is_secret_key_name(key) || contains_secret(child)),
-        Value::Array(items) => items.iter().any(contains_secret),
-        _ => false,
-    }
-}
-
-/// A copy of `value` with every secret-like key's value replaced by a redaction
-/// marker, recursively. Never exposes a stored secret in a rendered JSON view.
-fn redact_secrets(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, child)| {
-                    let redacted = if is_secret_key_name(key) {
-                        Value::String(SECRET_REDACTION.to_owned())
-                    } else {
-                        redact_secrets(child)
-                    };
-                    (key.clone(), redacted)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
-        other => other.clone(),
-    }
+fn schema_marks_secret(prop_schema: &Value) -> bool {
+    settings_model::secret_relation(prop_schema, &[]).at_or_inside_secret
 }
 
 /// The primitive JSON-schema type for a property, unwrapping nullable type
 /// arrays like `["string", "null"]` to the first non-null type so nullable
 /// fields still render a typed control instead of falling through to raw JSON.
-fn native_primitive_type(prop_schema: &Value) -> Option<String> {
+fn schema_primitive_type(prop_schema: &Value) -> Option<String> {
     match prop_schema.get("type") {
         Some(Value::String(single)) => Some(single.clone()),
         Some(Value::Array(types)) => types
@@ -4490,6 +3685,155 @@ fn native_primitive_type(prop_schema: &Value) -> Option<String> {
             .map(str::to_owned),
         _ => None,
     }
+}
+
+fn expanded_schema_node(root: &Value, node: &Value) -> Value {
+    let Some(reference) = node.get("$ref").and_then(Value::as_str) else {
+        return node.clone();
+    };
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return node.clone();
+    };
+    let Some(tokens) = settings_model::parse_json_pointer(pointer) else {
+        return node.clone();
+    };
+    let Some(mut expanded) = settings_model::pointer_get(root, &tokens).cloned() else {
+        return node.clone();
+    };
+    if let (Some(expanded), Some(overrides)) = (expanded.as_object_mut(), node.as_object()) {
+        for (key, value) in overrides {
+            if key != "$ref" {
+                expanded.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    expanded
+}
+
+fn collect_host_schema_fields(
+    root: &Value,
+    node: &Value,
+    pointer: &str,
+    section: &str,
+    depth: usize,
+    fields: &mut Vec<(u64, String, Value)>,
+) {
+    if depth > 16 {
+        return;
+    }
+    let expanded = expanded_schema_node(root, node);
+    if expanded.get("x-tyde-section").and_then(Value::as_str) == Some(section) {
+        fields.push((
+            expanded
+                .get("x-tyde-order")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+            pointer.to_owned(),
+            expanded,
+        ));
+        return;
+    }
+    let Some(properties) = expanded.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, property) in properties {
+        let escaped = settings_model::escape_pointer_token(key);
+        let child_pointer = if pointer.is_empty() {
+            format!("/{escaped}")
+        } else {
+            format!("{pointer}/{escaped}")
+        };
+        collect_host_schema_fields(root, property, &child_pointer, section, depth + 1, fields);
+    }
+}
+
+fn host_schema_field_disabled(pointer: &str, settings: &Value) -> bool {
+    let supervisor_enabled = settings
+        .pointer("/supervisor/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match pointer {
+        "/supervisor/enabled" => false,
+        "/supervisor/stall_timeout_seconds" => {
+            !supervisor_enabled
+                || !settings
+                    .pointer("/supervisor/stall_timeout_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        "/supervisor/auto_compact_inactivity_delay_seconds"
+        | "/supervisor/auto_compact_min_context_tokens" => {
+            !supervisor_enabled
+                || !settings
+                    .pointer("/supervisor/auto_compact_on_success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        pointer if pointer.starts_with("/supervisor/") => !supervisor_enabled,
+        _ => false,
+    }
+}
+
+fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&str>) -> AnyView {
+    let Some(schema) = state.selected_host_settings_schema() else {
+        return view! {
+            <p class="settings-description settings-schema-unavailable">
+                "Unavailable: this host did not publish a settings schema."
+            </p>
+        }
+        .into_any();
+    };
+    let Some(settings) = state
+        .selected_host_settings()
+        .and_then(|settings| serde_json::to_value(settings).ok())
+    else {
+        return view! {
+            <p class="settings-description settings-schema-unavailable">
+                "Unavailable: the current host settings have not loaded."
+            </p>
+        }
+        .into_any();
+    };
+    let mut fields = Vec::new();
+    collect_host_schema_fields(&schema, &schema, "", section, 0, &mut fields);
+    if let Some(prefix) = pointer_prefix {
+        fields.retain(|(_, pointer, _)| pointer.starts_with(prefix));
+    }
+    fields.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if fields.is_empty() {
+        return view! {
+            <p class="settings-description settings-schema-unavailable">
+                "Unavailable: this host schema does not expose settings for this section."
+            </p>
+        }
+        .into_any();
+    }
+    fields
+        .into_iter()
+        .map(|(_, pointer, property_schema)| {
+            let current = settings_model::parse_json_pointer(&pointer)
+                .and_then(|tokens| settings_model::pointer_get(&settings, &tokens));
+            schema_settings_field(
+                SchemaEditTarget::Host {
+                    state: state.clone(),
+                    pointer: pointer.clone(),
+                },
+                &property_schema,
+                current,
+                host_schema_field_disabled(&pointer, &settings),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_view()
+        .into_any()
+}
+
+fn host_schema_section(state: &AppState, section: &str) -> AnyView {
+    host_schema_fields(state, section, None)
+}
+
+fn host_schema_section_prefix(state: &AppState, section: &str, pointer_prefix: &str) -> AnyView {
+    host_schema_fields(state, section, Some(pointer_prefix))
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -4515,7 +3859,7 @@ fn native_save_indicator(
         .get(&host_id)
         .and_then(|m| m.get(&kind))
     {
-        Some(NativeSettingsSaveState::Pending { base }) => (base == settings, None),
+        Some(NativeSettingsSaveState::Pending { base, .. }) => (base == settings, None),
         Some(NativeSettingsSaveState::Failed { message }) => (false, Some(message.clone())),
         None => (false, None),
     }
@@ -4567,10 +3911,7 @@ fn set_native_value(root: &mut Value, path: &[String], key: &str, value: Value) 
         .insert(key.to_owned(), value);
 }
 
-/// Apply one native-settings edit and send the whole updated document to the
-/// server via `HostSettingValue::BackendNativeSettings`. The backend replaces its
-/// native settings document wholesale (Tycode `SaveSettings { persist: true }`),
-/// so the full object is sent rather than a partial patch.
+/// Apply one native-settings edit and send the updated document to the server.
 ///
 /// With `profile: Some(name)` the document is Tycode's profiles document: the
 /// edit lands inside that profile's `settings` and the unedited settings are
@@ -4593,9 +3934,9 @@ fn commit_native_setting(
         ));
         return;
     };
-    let mut root = base.clone();
-    match profile {
+    let root = match profile {
         None => {
+            let mut root = base.clone();
             set_native_value(&mut root, path, key, value);
             // No-op: the edit didn't change the document. Don't send or lock —
             // a save that leaves the document unchanged is pointless, and
@@ -4603,17 +3944,19 @@ fn commit_native_setting(
             if root == base {
                 return;
             }
+            root
         }
         Some(name) => {
-            let Some(entry) = root
-                .get_mut("profiles")
-                .and_then(Value::as_array_mut)
+            let Some(mut entry) = base
+                .get("profiles")
+                .and_then(Value::as_array)
                 .and_then(|profiles| {
                     profiles
-                        .iter_mut()
+                        .iter()
                         .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
                 })
-                .and_then(Value::as_object_mut)
+                .cloned()
+                .and_then(|entry| entry.as_object().cloned())
             else {
                 log::error!(
                     "cannot edit {kind:?} settings: profile '{name}' is not in the current document"
@@ -4637,8 +3980,12 @@ fn commit_native_setting(
             }
             entry.insert("settings".to_owned(), edited);
             entry.insert("base_settings".to_owned(), original);
+            serde_json::json!({
+                "version": base.get("version").cloned().unwrap_or(Value::Null),
+                "profiles": [Value::Object(entry)],
+            })
         }
-    }
+    };
     send_native_settings_document(state, kind, base, root);
 }
 
@@ -4669,29 +4016,38 @@ fn send_native_settings_document(state: &AppState, kind: BackendKind, base: Valu
         .get(&host_id)
         .and_then(|m| m.get(&kind))
         .is_some_and(
-            |save| matches!(save, NativeSettingsSaveState::Pending { base: b } if *b == base),
+            |save| matches!(save, NativeSettingsSaveState::Pending { base: b, .. } if *b == base),
         );
     if already_pending {
         return;
     }
 
+    let write_id = next_settings_write_id();
     state.native_settings_save_state.update(|states| {
-        states
-            .entry(host_id.clone())
-            .or_default()
-            .insert(kind, NativeSettingsSaveState::Pending { base });
+        states.entry(host_id.clone()).or_default().insert(
+            kind,
+            NativeSettingsSaveState::Pending {
+                base,
+                write_id: write_id.clone(),
+            },
+        );
     });
 
     let state = state.clone();
     let host_for_error = host_id.clone();
     spawn_local(async move {
-        let payload = SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: kind,
-                settings: root,
-            },
+        let payload = BackendNativeSettingsWritePayload {
+            write_id,
+            backend: kind,
+            settings: root,
         };
-        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SetSetting, &payload).await
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::BackendNativeSettingsWrite,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send BackendNativeSettings for {kind:?}: {error}");
             state.native_settings_save_state.update(|states| {
@@ -4707,10 +4063,12 @@ fn send_native_settings_document(state: &AppState, kind: BackendKind, base: Valu
     });
 }
 
-/// Send Tycode profile file operations (create/delete) as a profiles-document
-/// save carrying `actions`; per-profile settings are echoed unchanged so the
-/// server skips them.
-fn send_tycode_profile_actions(state: &AppState, actions: Value) {
+fn send_tycode_profile_action(
+    state: &AppState,
+    resource: String,
+    action: &'static str,
+    arguments: Value,
+) {
     let kind = BackendKind::Tycode;
     let Some(base) = native_settings_root(state, kind) else {
         log::error!("cannot modify Tycode profiles: no current settings document");
@@ -4719,16 +4077,52 @@ fn send_tycode_profile_actions(state: &AppState, actions: Value) {
         );
         return;
     };
-    let mut root = base.clone();
-    let Some(object) = root.as_object_mut() else {
-        log::error!("cannot modify Tycode profiles: settings document is not an object");
+    let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         crate::components::header::report_user_error(
-            "Tyde cannot change Tycode profiles because the settings file has an invalid structure.",
+            "Tyde cannot change Tycode profiles because the selected host is not connected.",
         );
         return;
     };
-    object.insert("actions".to_owned(), actions);
-    send_native_settings_document(state, kind, base, root);
+    let write_id = next_settings_write_id();
+    state.native_settings_save_state.update(|states| {
+        states.entry(host_id.clone()).or_default().insert(
+            kind,
+            NativeSettingsSaveState::Pending {
+                base,
+                write_id: write_id.clone(),
+            },
+        );
+    });
+    let state = state.clone();
+    let host_for_error = host_id.clone();
+    spawn_local(async move {
+        let payload = InvokeSettingsActionPayload {
+            write_id,
+            backend: kind,
+            resource,
+            action: action.to_owned(),
+            arguments,
+        };
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::InvokeSettingsAction,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send Tycode settings action: {error}");
+            state.native_settings_save_state.update(|states| {
+                states.entry(host_for_error).or_default().insert(
+                    kind,
+                    NativeSettingsSaveState::Failed {
+                        message: "Failed to change the Tycode profile. Check the connection and try again."
+                            .to_owned(),
+                    },
+                );
+            });
+        }
+    });
 }
 
 /// One typed, server-classified advisory.
@@ -5161,9 +4555,11 @@ fn tycode_profiles_form(
                             {
                                 return;
                             }
-                            send_tycode_profile_actions(
+                            send_tycode_profile_action(
                                 &state,
-                                serde_json::json!([{ "kind": "delete_profile", "name": profile }]),
+                                format!("profiles/{profile}"),
+                                "delete",
+                                Value::Object(Map::new()),
                             );
                         });
                     };
@@ -5227,13 +4623,14 @@ fn tycode_profile_create_control(
         if new_name.is_empty() {
             return;
         }
-        send_tycode_profile_actions(
+        send_tycode_profile_action(
             &state,
-            serde_json::json!([{
-                "kind": "create_profile",
+            "profiles".to_owned(),
+            "create",
+            serde_json::json!({
                 "name": new_name,
                 "copy_from": effective_profile.get_untracked(),
-            }]),
+            }),
         );
         open.set(false);
         name.set(String::new());
@@ -5318,11 +4715,13 @@ fn native_settings_group_content(
             let fields = properties
                 .iter()
                 .map(|(key, prop_schema)| {
-                    native_settings_field(
-                        state,
-                        scope,
-                        &group.settings_path,
-                        key,
+                    schema_settings_field(
+                        SchemaEditTarget::Native {
+                            state: state.clone(),
+                            scope: scope.clone(),
+                            path: group.settings_path.clone(),
+                            key: key.clone(),
+                        },
                         prop_schema,
                         obj.get(key),
                         disabled,
@@ -5335,24 +4734,12 @@ fn native_settings_group_content(
             }
             .into_any()
         }
-        None => {
-            // No property map — don't drop the group. Render its whole value as a
-            // read-only JSON view with secrets recursively redacted so nothing is
-            // silently hidden and no secret leaks. An absent (or explicit-null)
-            // path is stated explicitly rather than shown as a bare `null`.
-            match group_value.filter(|value| !value.is_null()) {
-                None => view! {
-                    <p class="settings-native-unset-note">
-                        "These settings are not present in the current document."
-                    </p>
-                }
-                .into_any(),
-                Some(value) => {
-                    let json = pretty_json(&redact_secrets(value));
-                    view! { <pre class="settings-native-json-readonly">{json}</pre> }.into_any()
-                }
-            }
+        None => view! {
+            <p class="settings-native-unset-note">
+                "Unavailable: this settings schema does not expose editable fields."
+            </p>
         }
+        .into_any(),
     };
 
     view! {
@@ -5386,19 +4773,104 @@ fn native_settings_group(
     .into_any()
 }
 
-/// One editable native settings field, generated from a JSON-schema property.
-/// Renders a typed control for primitives/enums, masks secret keys, and falls
-/// back to a visible JSON editor for object/array/unknown shapes so no field is
-/// dropped.
-fn native_settings_field(
-    state: &AppState,
-    scope: &NativeEditScope,
-    path: &[String],
-    key: &str,
+#[derive(Clone)]
+enum SchemaEditTarget {
+    Host {
+        state: AppState,
+        pointer: String,
+    },
+    Native {
+        state: AppState,
+        scope: NativeEditScope,
+        path: Vec<String>,
+        key: String,
+    },
+}
+
+impl SchemaEditTarget {
+    fn key(&self) -> &str {
+        match self {
+            Self::Host { pointer, .. } => pointer.rsplit('/').next().unwrap_or(pointer),
+            Self::Native { key, .. } => key,
+        }
+    }
+
+    fn commit(&self, value: Value) {
+        match self {
+            Self::Host { state, pointer } => {
+                send_host_schema_replace(state, pointer.clone(), value)
+            }
+            Self::Native {
+                state,
+                scope,
+                path,
+                key,
+            } => commit_native_setting(
+                state,
+                scope.kind,
+                scope.profile.as_deref(),
+                path,
+                key,
+                value,
+            ),
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        matches!(self, Self::Host { .. })
+    }
+
+    fn configured_secret(&self) -> bool {
+        let Self::Host { state, pointer } = self else {
+            return false;
+        };
+        state
+            .selected_host_configured_secrets_untracked()
+            .iter()
+            .any(|secret| secret.pointer == *pointer)
+    }
+}
+
+fn schema_field_aria_label(target: &SchemaEditTarget, label: &str) -> String {
+    let SchemaEditTarget::Host { pointer, .. } = target else {
+        return label.to_owned();
+    };
+    match pointer.as_str() {
+        "/tyde_agent_control_max_depth" => "Maximum agent depth".to_owned(),
+        "/supervisor/stall_timeout_seconds" => "Supervisor stall timeout seconds".to_owned(),
+        "/supervisor/auto_compact_inactivity_delay_seconds" => {
+            "Supervisor auto-compact inactivity delay seconds".to_owned()
+        }
+        "/supervisor/auto_compact_min_context_tokens" => {
+            "Supervisor auto-compact minimum context tokens".to_owned()
+        }
+        "/supervisor/max_kicks_per_task" => "Supervisor kick limit".to_owned(),
+        "/supervisor/retry_attempts" => "Supervisor extra delayed attempts".to_owned(),
+        "/supervisor/cost_tier" => "Supervisor verdict model tier".to_owned(),
+        _ => label.to_owned(),
+    }
+}
+
+fn schema_field_unit(target: &SchemaEditTarget) -> Option<&'static str> {
+    let SchemaEditTarget::Host { pointer, .. } = target else {
+        return None;
+    };
+    match pointer.as_str() {
+        "/tyde_agent_control_max_depth" => Some("levels"),
+        "/supervisor/stall_timeout_seconds"
+        | "/supervisor/auto_compact_inactivity_delay_seconds" => Some("seconds"),
+        "/supervisor/auto_compact_min_context_tokens" => Some("tokens"),
+        _ => None,
+    }
+}
+
+fn schema_settings_field(
+    target: SchemaEditTarget,
     prop_schema: &Value,
     current: Option<&Value>,
     disabled: bool,
 ) -> AnyView {
+    let key = target.key();
     let label = prop_schema
         .get("title")
         .and_then(Value::as_str)
@@ -5408,10 +4880,8 @@ fn native_settings_field(
         .get("description")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let secret = is_secret_native_key(key, prop_schema);
-    // Nullable type arrays (e.g. `["string", "null"]`) still resolve to a typed
-    // control rather than falling through to raw JSON editing.
-    let schema_type = native_primitive_type(prop_schema);
+    let secret = schema_marks_secret(prop_schema);
+    let schema_type = schema_primitive_type(prop_schema);
     let schema_type = schema_type.as_deref();
     let enum_values: Vec<String> = prop_schema
         .get("enum")
@@ -5423,20 +4893,13 @@ fn native_settings_field(
         })
         .unwrap_or_default();
 
-    // A field is "configured" only when the server actually holds a value for
-    // it. An absent key and an explicit JSON `null` are both unset — surfaced
-    // explicitly so a blank/unchecked control is never mistaken for a real
-    // current value. Controls stay editable either way so the user can set one.
     let present = current.is_some_and(|value| !value.is_null());
-
-    let path = path.to_vec();
-    let key = key.to_owned();
-    let scope = scope.clone();
 
     let control = if secret {
         let has_value = current
             .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty());
+            .is_some_and(|s| !s.is_empty())
+            || target.configured_secret();
         let placeholder = if has_value {
             "•••••••• (stored — type to replace)".to_owned()
         } else if present {
@@ -5444,20 +4907,13 @@ fn native_settings_field(
         } else {
             "Not set".to_owned()
         };
-        let state = state.clone();
+        let target = target.clone();
         let on_change = move |ev: web_sys::Event| {
-            if disabled {
+            if disabled && !target.is_host() {
                 return;
             }
             let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-            commit_native_setting(
-                &state,
-                scope.kind,
-                scope.profile.as_deref(),
-                &path,
-                &key,
-                Value::String(el.value()),
-            );
+            target.commit(Value::String(el.value()));
         };
         view! {
             <input
@@ -5479,26 +4935,21 @@ fn native_settings_field(
             .iter()
             .map(|value| view! { <option value=value.clone()>{value.clone()}</option> })
             .collect::<Vec<_>>();
-        let state = state.clone();
+        let target = target.clone();
+        let aria_label = schema_field_aria_label(&target, &label);
         let on_change = move |ev: web_sys::Event| {
-            if disabled {
+            if disabled && !target.is_host() {
                 return;
             }
             let el: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
-            commit_native_setting(
-                &state,
-                scope.kind,
-                scope.profile.as_deref(),
-                &path,
-                &key,
-                Value::String(el.value()),
-            );
+            target.commit(Value::String(el.value()));
         };
         view! {
             <select
                 class="settings-select"
                 prop:value=current
                 disabled=disabled
+                aria-label=aria_label
                 on:change=on_change
             >
                 {(!present).then(|| view! { <option value="">"Not set"</option> })}
@@ -5510,20 +4961,13 @@ fn native_settings_field(
         match schema_type {
             Some("boolean") => {
                 let current = current.and_then(Value::as_bool).unwrap_or(false);
-                let state = state.clone();
+                let target = target.clone();
                 let on_change = move |ev: web_sys::Event| {
-                    if disabled {
+                    if disabled && !target.is_host() {
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    commit_native_setting(
-                        &state,
-                        scope.kind,
-                        scope.profile.as_deref(),
-                        &path,
-                        &key,
-                        Value::Bool(el.checked()),
-                    );
+                    target.commit(Value::Bool(el.checked()));
                 };
                 view! {
                     <label class="settings-toggle">
@@ -5540,67 +4984,84 @@ fn native_settings_field(
             }
             Some("integer") => {
                 let current = current.and_then(Value::as_i64);
-                let state = state.clone();
+                let target = target.clone();
+                let minimum = prop_schema.get("minimum").and_then(Value::as_f64);
+                let maximum = prop_schema.get("maximum").and_then(Value::as_f64);
+                let step = prop_schema
+                    .get("multipleOf")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                let aria_label = schema_field_aria_label(&target, &label);
+                let unit = schema_field_unit(&target);
                 let on_change = move |ev: web_sys::Event| {
-                    if disabled {
+                    if disabled && !target.is_host() {
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    if let Ok(parsed) = el.value().parse::<i64>() {
-                        commit_native_setting(
-                            &state,
-                            scope.kind,
-                            scope.profile.as_deref(),
-                            &path,
-                            &key,
-                            Value::from(parsed),
-                        );
+                    if let Ok(parsed) = el.value().parse::<i64>()
+                        && minimum.is_none_or(|min| parsed as f64 >= min)
+                        && maximum.is_none_or(|max| parsed as f64 <= max)
+                    {
+                        target.commit(Value::from(parsed));
                     }
                 };
                 view! {
-                    <input
-                        type="number"
-                        step="1"
-                        class="settings-input settings-native-input"
-                        prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
-                        placeholder=(!present).then(|| "Not set".to_owned())
-                        autocomplete="off"
-                        disabled=disabled
-                        on:change=on_change
-                    />
+                    <div class="settings-schema-number-row">
+                        <input
+                            type="number"
+                            min=minimum
+                            max=maximum
+                            step=step
+                            class="settings-input settings-native-input settings-supervisor-number-input"
+                            prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
+                            placeholder=(!present).then(|| "Not set".to_owned())
+                            autocomplete="off"
+                            disabled=disabled
+                            aria-label=aria_label
+                            on:change=on_change
+                        />
+                        {unit.map(|unit| view! {
+                            <span class="settings-supervisor-number-unit">{unit}</span>
+                        })}
+                    </div>
                 }
                 .into_any()
             }
             Some("number") => {
                 let current = current.and_then(Value::as_f64);
-                let state = state.clone();
+                let target = target.clone();
+                let minimum = prop_schema.get("minimum").and_then(Value::as_f64);
+                let maximum = prop_schema.get("maximum").and_then(Value::as_f64);
+                let step = prop_schema
+                    .get("multipleOf")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                let aria_label = schema_field_aria_label(&target, &label);
                 let on_change = move |ev: web_sys::Event| {
-                    if disabled {
+                    if disabled && !target.is_host() {
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
                     if let Ok(parsed) = el.value().parse::<f64>()
+                        && minimum.is_none_or(|min| parsed >= min)
+                        && maximum.is_none_or(|max| parsed <= max)
                         && let Some(number) = serde_json::Number::from_f64(parsed)
                     {
-                        commit_native_setting(
-                            &state,
-                            scope.kind,
-                            scope.profile.as_deref(),
-                            &path,
-                            &key,
-                            Value::Number(number),
-                        );
+                        target.commit(Value::Number(number));
                     }
                 };
                 view! {
                     <input
                         type="number"
-                        step="any"
+                        min=minimum
+                        max=maximum
+                        step=step
                         class="settings-input settings-native-input"
                         prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
                         placeholder=(!present).then(|| "Not set".to_owned())
                         autocomplete="off"
                         disabled=disabled
+                        aria-label=aria_label
                         on:change=on_change
                     />
                 }
@@ -5611,20 +5072,13 @@ fn native_settings_field(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let state = state.clone();
+                let target = target.clone();
                 let on_change = move |ev: web_sys::Event| {
-                    if disabled {
+                    if disabled && !target.is_host() {
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    commit_native_setting(
-                        &state,
-                        scope.kind,
-                        scope.profile.as_deref(),
-                        &path,
-                        &key,
-                        Value::String(el.value()),
-                    );
+                    target.commit(Value::String(el.value()));
                 };
                 view! {
                     <input
@@ -5640,7 +5094,15 @@ fn native_settings_field(
                 }
                 .into_any()
             }
-            _ => native_json_field_control(state, scope, path, key, current, disabled),
+            Some("object" | "array") if !target.is_host() => {
+                schema_json_field_control(target.clone(), prop_schema, current, disabled)
+            }
+            _ => view! {
+                <p class="settings-native-unset-note">
+                    "Unavailable: this setting has no supported schema shape."
+                </p>
+            }
+            .into_any(),
         }
     };
 
@@ -5648,15 +5110,33 @@ fn native_settings_field(
     let unset_caption =
         (!present).then(|| view! { <span class="settings-native-unset">"Unset"</span> });
 
-    view! {
-        <div class="settings-native-field">
-            <span class="settings-tier-select-label">{label}</span>
-            {control}
-            {unset_caption}
-            {description.map(|text| view! { <p class="settings-description">{text}</p> })}
-        </div>
+    if schema_type == Some("boolean") {
+        view! {
+            <div class="settings-native-field settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">{label}</label>
+                        {description.map(|text| view! {
+                            <p class="settings-description">{text}</p>
+                        })}
+                    </div>
+                    {control}
+                </div>
+                {unset_caption}
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="settings-native-field settings-field">
+                <label class="settings-label">{label}</label>
+                {description.map(|text| view! { <p class="settings-description">{text}</p> })}
+                {control}
+                {unset_caption}
+            </div>
+        }
+        .into_any()
     }
-    .into_any()
 }
 
 /// Conservative editor/view for object/array/unknown native settings.
@@ -5670,23 +5150,21 @@ fn native_settings_field(
 ///   parse error inline rather than silently discarding the edit.
 ///
 /// The editor is also disabled while a native save is in flight.
-fn native_json_field_control(
-    state: &AppState,
-    scope: NativeEditScope,
-    path: Vec<String>,
-    key: String,
+fn schema_json_field_control(
+    target: SchemaEditTarget,
+    prop_schema: &Value,
     current: Option<&Value>,
     disabled: bool,
 ) -> AnyView {
-    if let Some(value) = current
-        && contains_secret(value)
-    {
-        let json = pretty_json(&redact_secrets(value));
+    if settings_model::secret_relation(prop_schema, &[]).strict_ancestor_of_secret {
+        let mut redacted = current.cloned().unwrap_or(Value::Null);
+        settings_model::redact_write_only(prop_schema, &mut redacted);
+        let json = pretty_json(&redacted);
         return view! {
             <div class="settings-native-json">
                 <pre class="settings-native-json-readonly">{json}</pre>
                 <p class="settings-native-json-note">
-                    "Contains secret values and can't be edited here — change it through the backend directly so the stored secret isn't overwritten."
+                    "Contains write-only values and can't be edited as raw JSON."
                 </p>
             </div>
         }
@@ -5702,9 +5180,8 @@ fn native_json_field_control(
         .map(pretty_json)
         .unwrap_or_default();
     let error = RwSignal::new(Option::<String>::None);
-    let state = state.clone();
     let on_change = move |ev: web_sys::Event| {
-        if disabled {
+        if disabled && !target.is_host() {
             return;
         }
         let el: web_sys::HtmlTextAreaElement = ev.target().unwrap().unchecked_into();
@@ -5716,14 +5193,7 @@ fn native_json_field_control(
         match serde_json::from_str::<Value>(&raw) {
             Ok(parsed) => {
                 error.set(None);
-                commit_native_setting(
-                    &state,
-                    scope.kind,
-                    scope.profile.as_deref(),
-                    &path,
-                    &key,
-                    parsed,
-                );
+                target.commit(parsed);
             }
             Err(err) => error.set(Some(format!("Invalid JSON: {err}"))),
         }
@@ -5748,24 +5218,9 @@ fn native_json_field_control(
     .into_any()
 }
 
-/// Diagnostic tooling for working on Tyde itself. The agent-control toggle that
-/// used to sit here now leads the Subagents tab, where it reads as the feature
-/// switch it actually is rather than as a debug knob.
 #[component]
 fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_checked = state.clone();
-    let state_for_disabled = state.clone();
-
-    let checked = Signal::derive(move || {
-        state_for_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.tyde_debug_mcp_enabled)
-    });
-    let disabled = Signal::derive(move || state_for_disabled.selected_host_settings().is_none());
-    let on_toggle = Callback::new(move |enabled: bool| {
-        send_host_setting(&state, HostSettingValue::TydeDebugMcpEnabled { enabled });
-    });
 
     view! {
         <h2 class="settings-panel-title">"Debug"</h2>
@@ -5774,13 +5229,9 @@ fn DebugTab() -> impl IntoView {
             "Tools for developing Tyde itself. These are aimed at people working on the app, not at people using it to write code — everything here is off by default and safe to leave alone."
         </p>
 
-        <SettingsToggleField
-            label="Tyde Debug MCP"
-            description="Start new chats with the Tyde debug MCP server attached, giving agents tools to inspect and drive Tyde's own frontend: read the rendered DOM, evaluate JavaScript in the running window, take non-visual state snapshots, and launch a child dev instance. This is how an agent can test a UI change it just made. It also means an agent can execute arbitrary JavaScript inside your Tyde window, so leave it off unless you are working on Tyde's interface. Off by default; existing chats are unaffected until they are restarted."
-            checked=checked
-            disabled=disabled
-            on_toggle=on_toggle
-        />
+        <div class="settings-schema-fields">
+            {move || host_schema_section(&state, "general")}
+        </div>
     }
 }
 
@@ -5837,26 +5288,26 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
                 <label class="settings-toggle"><input type="checkbox"
                     prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
                     disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
-                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_setting(&state_for_voice_enabled_commit,HostSettingValue::VoiceEnabled{enabled:input.checked()}); }
+                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
                 /><span class="settings-toggle-slider"></span></label>
             </div>
             <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
             <p class="settings-description">"Which named profile from the host's AWS credentials file to use for Bedrock. Leave empty to use the profile named \"default\". The profile is read on the host, so it has to exist there — not on the device you are reading this on."</p>
             <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
                 prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
-                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_profile_commit,HostSettingValue::VoiceAwsProfile{profile:(!value.is_empty()).then_some(value)}); }
+                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
             />
             <label class="settings-label" for="voice-aws-region">"AWS region"</label>
             <p class="settings-description">"The AWS region to call Bedrock in. Nova Sonic is not offered in every region, and picking a region far from the host adds audible delay to a conversation, so prefer the nearest region that carries the model. Leave empty to use us-east-1."</p>
             <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
                 prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
-                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_setting(&state_for_voice_region_commit,HostSettingValue::VoiceAwsRegion{region:(!value.is_empty()).then_some(value)}); }
+                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
             />
             <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
             <p class="settings-description">"Which Nova Sonic version handles speech. Nova 2 Sonic is the current model and the right choice unless your account or region only carries the older one. If the selected model is unavailable, voice fails with that error rather than switching models behind your back."</p>
             <select id="voice-nova-model" class="settings-select"
                 prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
-                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_setting(&state_for_voice_model_commit,HostSettingValue::VoiceNovaModel{model:input.value()}); }
+                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_voice_model_commit,"/voice/nova_model",input.value()); }
             ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
             <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
             <p class="settings-description">"How long Nova 2 Sonic waits through a pause before deciding that you finished speaking. Patient minimizes interruptions; Fast responds sooner. New and existing configurations default to Patient."</p>
@@ -5865,11 +5316,11 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
                 on:change=move |ev| {
                     let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
                     let sensitivity=match input.value().as_str() {
-                        "HIGH" => protocol::VoiceEndpointingSensitivity::High,
-                        "MEDIUM" => protocol::VoiceEndpointingSensitivity::Medium,
-                        _ => protocol::VoiceEndpointingSensitivity::Low,
+                        "HIGH" => settings_model::VoiceEndpointingSensitivity::High,
+                        "MEDIUM" => settings_model::VoiceEndpointingSensitivity::Medium,
+                        _ => settings_model::VoiceEndpointingSensitivity::Low,
                     };
-                    send_host_setting(&state_for_voice_endpointing_commit,HostSettingValue::VoiceEndpointingSensitivity{sensitivity});
+                    send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
                 }
             ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
         </div>
@@ -5902,6 +5353,7 @@ fn MobileTab() -> impl IntoView {
     let state_for_broker_commit = state.clone();
     let state_for_broker_keydown = state.clone();
     let state_for_broker_reset = state.clone();
+    let state_for_broker_credentials = state.clone();
     let state_for_pairing_lookup = state.clone();
     let state_for_offer_lookup = state.clone();
     let state_for_start_pending = state.clone();
@@ -5933,12 +5385,7 @@ fn MobileTab() -> impl IntoView {
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
-                &state,
-                HostSettingValue::EnableMobileConnections {
-                    enabled: input.checked(),
-                },
-            );
+            send_host_replace(&state, "/enable_mobile_connections", input.checked());
         }
     };
 
@@ -5966,10 +5413,7 @@ fn MobileTab() -> impl IntoView {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             broker_error.set(None);
-            send_host_setting(
-                state,
-                HostSettingValue::MobileBrokerUrl { broker_url: None },
-            );
+            send_host_replace(state, "/mobile_broker_url", Option::<BrokerUrl>::None);
             return;
         }
         if let Err(message) = validate_broker_url_input(trimmed) {
@@ -5979,12 +5423,7 @@ fn MobileTab() -> impl IntoView {
         match BrokerUrl::new(trimmed.to_owned()) {
             Ok(url) => {
                 broker_error.set(None);
-                send_host_setting(
-                    state,
-                    HostSettingValue::MobileBrokerUrl {
-                        broker_url: Some(url),
-                    },
-                );
+                send_host_replace(state, "/mobile_broker_url", Some(url));
             }
             Err(error) => {
                 log::error!("invalid broker URL {trimmed:?}: {error}");
@@ -6022,9 +5461,10 @@ fn MobileTab() -> impl IntoView {
     };
     let on_broker_reset = move |_: web_sys::MouseEvent| {
         broker_error.set(None);
-        send_host_setting(
+        send_host_replace(
             &state_for_broker_reset,
-            HostSettingValue::MobileBrokerUrl { broker_url: None },
+            "/mobile_broker_url",
+            Option::<BrokerUrl>::None,
         );
     };
 
@@ -6377,6 +5817,21 @@ fn MobileTab() -> impl IntoView {
             })}
         </div>
 
+        {move || {
+            state_for_broker_credentials
+                .selected_host_settings()
+                .is_some_and(|settings| settings.mobile_broker_url.is_some())
+                .then(|| view! {
+                    <div class="settings-mobile-broker-credentials">
+                        {host_schema_section_prefix(
+                            &state_for_broker_credentials,
+                            "mobile",
+                            "/mobile_broker_auth/",
+                        )}
+                    </div>
+                })
+        }}
+
         <div class="settings-mobile-warning" role="note">
             <p class="settings-mobile-warning-heading">
                 "Managed access — encrypted contents, visible metadata"
@@ -6443,10 +5898,7 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                 })
                 .collect::<Vec<_>>();
 
-            send_host_setting(
-                &state,
-                HostSettingValue::EnabledBackends { enabled_backends },
-            );
+            send_host_replace(&state, "/enabled_backends", enabled_backends);
         }
     };
 
@@ -6638,27 +6090,226 @@ fn backend_setup_status_class(info: Option<&BackendSetupInfo>) -> &'static str {
     }
 }
 
-fn send_host_setting(state: &AppState, setting: HostSettingValue) {
+fn setting_expectation(doc: &Value, path: &str) -> Result<SettingExpectation, String> {
+    let tokens = protocol::parse_json_pointer(path)
+        .ok_or_else(|| format!("invalid settings pointer {path}"))?;
+    Ok(SettingExpectation::Value {
+        value: settings_model::pointer_get(doc, &tokens)
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn replace_setting_op(doc: &Value, path: String, value: Value) -> Result<SettingOp, String> {
+    Ok(SettingOp::Replace {
+        expected: setting_expectation(doc, &path)?,
+        path,
+        value,
+    })
+}
+
+fn remove_setting_op(doc: &Value, path: String) -> Result<SettingOp, String> {
+    Ok(SettingOp::Remove {
+        expected: setting_expectation(doc, &path)?,
+        path,
+    })
+}
+
+fn wire_key(value: impl serde::Serialize) -> Result<String, String> {
+    serde_json::to_value(value)
+        .map_err(|error| error.to_string())?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "settings map key did not serialize as a string".to_owned())
+}
+
+pub(super) fn next_settings_write_id() -> SettingsWriteId {
+    thread_local! {
+        static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    NEXT_ID.with(|next| {
+        let id = next.get();
+        next.set(id.wrapping_add(1));
+        SettingsWriteId(format!("frontend-{id}"))
+    })
+}
+
+fn send_host_change(
+    state: &AppState,
+    prepare: impl FnOnce(&Value) -> Result<Vec<SettingOp>, String>,
+) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
-        log::error!("send_host_setting called without a selected host stream");
+        log::error!("settings write requested without a selected host stream");
         crate::components::header::report_user_error(
             "Tyde cannot save this setting because the selected host is not connected.",
         );
         return;
     };
+    let Some(settings) = state.selected_host_settings_untracked() else {
+        crate::components::header::report_user_error(
+            "Tyde cannot save this setting because its current value is unavailable.",
+        );
+        return;
+    };
+    let doc = match serde_json::to_value(settings) {
+        Ok(doc) => doc,
+        Err(error) => {
+            log::error!("failed to serialize current settings: {error}");
+            crate::components::header::report_user_error(
+                "Tyde could not prepare this settings change.",
+            );
+            return;
+        }
+    };
+    let ops = match prepare(&doc) {
+        Ok(ops) => ops,
+        Err(error) => {
+            log::error!("failed to prepare settings write: {error}");
+            crate::components::header::report_user_error(
+                "Tyde could not prepare this settings change.",
+            );
+            return;
+        }
+    };
+    let payload = SettingsWritePayload {
+        write_id: next_settings_write_id(),
+        ops,
+    };
 
     spawn_local(async move {
-        if let Err(error) = send_frame(
-            &host_id,
-            host_stream,
-            FrameKind::SetSetting,
-            &SetSettingPayload { setting },
-        )
-        .await
+        if let Err(error) =
+            send_frame(&host_id, host_stream, FrameKind::SettingsWrite, &payload).await
         {
-            log::error!("failed to send SetSetting: {error}");
+            log::error!("failed to send SettingsWrite: {error}");
         }
     });
+}
+
+fn send_host_schema_replace(state: &AppState, path: String, value: Value) {
+    let secret_path = state
+        .selected_host_settings_schema()
+        .and_then(|schema| {
+            settings_model::parse_json_pointer(&path)
+                .map(|tokens| settings_model::secret_relation(&schema, &tokens).at_or_inside_secret)
+        })
+        .unwrap_or(false);
+    let secret_token = state
+        .selected_host_configured_secrets_untracked()
+        .into_iter()
+        .find(|secret| secret.pointer == path)
+        .map(|secret| secret.token);
+    send_host_change(state, move |doc| {
+        let expected = match secret_token {
+            Some(token) => SettingExpectation::Version { token },
+            None if secret_path => SettingExpectation::Absent,
+            None => setting_expectation(doc, &path)?,
+        };
+        Ok(vec![SettingOp::Replace {
+            path,
+            expected,
+            value,
+        }])
+    });
+}
+
+pub(super) fn send_host_replace(
+    state: &AppState,
+    path: impl Into<String>,
+    value: impl serde::Serialize,
+) {
+    let path = path.into();
+    let value = match serde_json::to_value(value) {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("failed to serialize settings value: {error}");
+            crate::components::header::report_user_error(
+                "Tyde could not prepare this settings change.",
+            );
+            return;
+        }
+    };
+    send_host_change(state, move |doc| {
+        replace_setting_op(doc, path, value).map(|op| vec![op])
+    });
+}
+
+pub(super) fn send_host_remove(state: &AppState, path: impl Into<String>) {
+    let path = path.into();
+    send_host_change(state, move |doc| {
+        remove_setting_op(doc, path).map(|op| vec![op])
+    });
+}
+
+fn send_code_intel_path(
+    state: &AppState,
+    provider: CodeIntelProviderId,
+    path: Option<HostExecutablePath>,
+) {
+    let pointer = format!(
+        "/code_intel/language_server_paths/{}",
+        settings_model::escape_pointer_token(&provider.0)
+    );
+    match path {
+        Some(path) => send_host_replace(state, pointer, path),
+        None => send_host_remove(state, pointer),
+    }
+}
+
+fn send_backend_config(state: &AppState, backend: BackendKind, mut values: BackendConfigValues) {
+    send_host_change(state, move |doc| {
+        let backend = settings_model::escape_pointer_token(&wire_key(backend)?);
+        let backend_path = format!("/backend_config/{backend}");
+        if values.0.is_empty() {
+            return remove_setting_op(doc, backend_path).map(|op| vec![op]);
+        }
+        let backend_tokens = protocol::parse_json_pointer(&backend_path)
+            .expect("constructed backend settings pointer");
+        if settings_model::pointer_get(doc, &backend_tokens).is_none() {
+            values
+                .0
+                .retain(|_, value| !matches!(value, SessionSettingValue::Null));
+            if values.0.is_empty() {
+                return remove_setting_op(doc, backend_path).map(|op| vec![op]);
+            }
+            let value = serde_json::to_value(values).map_err(|error| error.to_string())?;
+            return replace_setting_op(doc, backend_path, value).map(|op| vec![op]);
+        }
+        values
+            .0
+            .into_iter()
+            .map(|(key, value)| {
+                let path = format!(
+                    "/backend_config/{backend}/{}",
+                    settings_model::escape_pointer_token(&key)
+                );
+                if matches!(value, SessionSettingValue::Null) {
+                    remove_setting_op(doc, path)
+                } else {
+                    replace_setting_op(
+                        doc,
+                        path,
+                        serde_json::to_value(value).map_err(|error| error.to_string())?,
+                    )
+                }
+            })
+            .collect()
+    });
+}
+
+pub(super) fn send_hermes_disabled_providers(
+    state: &AppState,
+    profile: &str,
+    providers: Vec<String>,
+) {
+    let path = format!(
+        "/hermes_disabled_providers/{}",
+        settings_model::escape_pointer_token(profile.trim())
+    );
+    if providers.is_empty() {
+        send_host_remove(state, path);
+    } else {
+        send_host_replace(state, path, providers);
+    }
 }
 
 fn all_backends() -> [BackendKind; 6] {
@@ -8426,7 +8077,7 @@ mod wasm_tests {
     // Only the tests construct command-error payloads, so this stays out of the
     // production import list — where it would be an unused import on any target that
     // compiles the crate without the wasm test module.
-    use protocol::{CommandErrorCode, HostSettingErrorTarget, SelectOption};
+    use protocol::SelectOption;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
@@ -8619,25 +8270,35 @@ mod wasm_tests {
         state.connection_statuses.update(|m| {
             m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
         });
+        state.host_settings_schema_by_host.update(|schemas| {
+            schemas.insert(
+                host_id.clone(),
+                settings_model::host_settings_schema().clone(),
+            );
+        });
+        state.configured_secrets_by_host.update(|secrets| {
+            secrets.insert(host_id.clone(), Vec::new());
+        });
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id,
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: enabled,
                     mobile_broker_url: broker_url
                         .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },
@@ -8735,6 +8396,60 @@ mod wasm_tests {
             "mqtts://mybroker.example/relay",
             "broker URL input must reflect the host override exactly"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_broker_secret_uses_published_revision_tokens() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_mobile_host_settings(&state, Some("wss://127.0.0.1:8083/mqtt"), true);
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let password: web_sys::HtmlInputElement = container
+            .query_selector(".settings-mobile-broker-credentials input[type='password']")
+            .unwrap()
+            .expect("write-only broker password field")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&password, "first-secret");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let first = recorded_settings_write_ops(&calls)
+            .into_iter()
+            .find(|op| op["path"] == "/mobile_broker_auth/password")
+            .expect("first secret write");
+        assert_eq!(first["expected"]["kind"], "absent");
+
+        state.configured_secrets_by_host.update(|secrets| {
+            secrets.insert(
+                "host-mobile".to_owned(),
+                vec![protocol::ConfiguredSecret {
+                    pointer: "/mobile_broker_auth/password".to_owned(),
+                    token: "server-secret-revision".to_owned(),
+                }],
+            );
+        });
+        set_and_change(&password, "replacement-secret");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let replacement = recorded_settings_write_ops(&calls)
+            .into_iter()
+            .rev()
+            .find(|op| op["path"] == "/mobile_broker_auth/password")
+            .expect("replacement secret write");
+        assert_eq!(replacement["expected"]["kind"], "version");
+        assert_eq!(replacement["expected"]["token"], "server-secret-revision");
     }
 
     /// The Mobile tab copy must reflect **managed** tycode.dev / AWS IoT
@@ -8884,15 +8599,11 @@ mod wasm_tests {
         calls.dyn_into::<js_sys::Array>().expect("array")
     }
 
-    /// Find every SetSetting frame recorded against the send-stub and
-    /// return the parsed `setting` JSON for each. Narrowed to
-    /// SetSetting so we can ignore handshake/other invokes.
-    fn recorded_set_setting_payloads(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+    fn recorded_settings_write_ops(calls: &js_sys::Array) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         for entry in calls.iter() {
-            let arr = match entry.dyn_into::<js_sys::Array>() {
-                Ok(arr) => arr,
-                Err(_) => continue,
+            let Ok(arr) = entry.dyn_into::<js_sys::Array>() else {
+                continue;
             };
             if arr.get(0).as_string().as_deref() != Some("send_host_line") {
                 continue;
@@ -8900,29 +8611,43 @@ mod wasm_tests {
             let Some(args_json) = arr.get(1).as_string() else {
                 continue;
             };
-            let args: serde_json::Value = match serde_json::from_str(&args_json) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let Some(line) = args.get("line").and_then(|v| v.as_str()) else {
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_json) else {
                 continue;
             };
-            let envelope: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Some(line) = args.get("line").and_then(Value::as_str) else {
+                continue;
             };
-            if envelope.get("kind").and_then(|v| v.as_str()) != Some("set_setting") {
+            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if envelope.get("kind").and_then(Value::as_str) != Some("settings_write") {
                 continue;
             }
-            if let Some(setting) = envelope
-                .get("payload")
-                .and_then(|p| p.get("setting"))
-                .cloned()
-            {
-                out.push(setting);
-            }
+            let payload = envelope.get("payload").expect("settings_write payload");
+            assert!(
+                payload
+                    .get("write_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty()),
+                "settings_write must carry a correlation id: {payload:?}"
+            );
+            out.extend(
+                payload
+                    .get("ops")
+                    .and_then(Value::as_array)
+                    .expect("settings_write ops")
+                    .iter()
+                    .cloned(),
+            );
         }
         out
+    }
+
+    fn replacement_value<'a>(op: &'a Value, path: &str) -> Option<&'a Value> {
+        (op.get("op").and_then(Value::as_str) == Some("replace")
+            && op.get("path").and_then(Value::as_str) == Some(path))
+        .then(|| op.get("value"))
+        .flatten()
     }
 
     /// Dispatch a synthetic DOM event on `input` from JS. `web_sys` in
@@ -8935,7 +8660,7 @@ mod wasm_tests {
         // document, so a second dispatch in the same test (or a panel leaked
         // by an earlier panicked test — wasm panics skip destructors) would
         // silently re-fire a previous target instead of `input`. Observed as
-        // one input's SetSetting frame recorded twice while the intended
+        // one input's SettingsWrite frame recorded twice while the intended
         // target never fired.
         static DISPATCH_SEQ: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
@@ -8970,7 +8695,7 @@ mod wasm_tests {
         dispatch_event_from_js(input, "keydown", Some("Enter"));
     }
 
-    /// Pressing Enter on a valid **loopback** override commits a `SetSetting`
+    /// Pressing Enter on a valid **loopback** override commits a `SettingsWrite`
     /// frame whose payload is `MobileBrokerUrl { broker_url: Some(...) }`.
     /// Load-bearing assertion that the typed-URL commit path actually reaches
     /// the wire for the only broker kind the server accepts.
@@ -8996,15 +8721,15 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let mobile = settings
             .iter()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("mobile_broker_url"))
-            .expect("Enter on a valid loopback broker URL must emit a MobileBrokerUrl frame");
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/mobile_broker_url"))
+            .expect("Enter on a valid loopback broker URL must emit a settings write");
         let broker_url = mobile
-            .get("broker_url")
-            .and_then(|v| v.as_str())
-            .expect("MobileBrokerUrl payload must carry the URL on commit");
+            .get("value")
+            .and_then(Value::as_str)
+            .expect("the replacement must carry the URL");
         assert_eq!(broker_url, "mqtts://127.0.0.1:8883");
     }
 
@@ -9047,26 +8772,16 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let mobile = settings
             .iter()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("mobile_broker_url"))
-            .expect("Use default must emit a MobileBrokerUrl SetSetting frame");
-        // `broker_url: None` is encoded as `Option::None`, which serde
-        // serialises as absent OR explicit null depending on payload
-        // attributes. Accept either to keep the test resilient.
-        let broker_url = mobile.get("broker_url");
-        match broker_url {
-            None => {}
-            Some(value) if value.is_null() => {}
-            Some(value) => {
-                panic!("Use default must clear the override (broker_url: None); got {value:?}")
-            }
-        }
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/mobile_broker_url"))
+            .expect("Use managed must emit a settings write");
+        assert!(mobile.get("value").is_some_and(Value::is_null));
     }
 
     /// Toggling the "Enable mobile connections" checkbox commits a
-    /// `SetSetting` frame whose payload is
+    /// `SettingsWrite` frame whose payload is
     /// `EnableMobileConnections { enabled }`. Without this assertion
     /// the toggle could silently become a no-op and nothing would
     /// notice.
@@ -9098,20 +8813,20 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let enable = settings
             .iter()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enable_mobile_connections"))
-            .expect("Toggling Enable must emit an EnableMobileConnections SetSetting frame");
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/enable_mobile_connections"))
+            .expect("Toggling Enable must emit a settings write");
         assert_eq!(
-            enable.get("enabled").and_then(|v| v.as_bool()),
+            enable.get("value").and_then(Value::as_bool),
             Some(true),
-            "EnableMobileConnections payload must carry enabled=true after toggle on"
+            "the replacement must carry true"
         );
         assert!(
-            !settings.iter().any(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str()) == Some("voice_enabled")
-            }),
+            !settings
+                .iter()
+                .any(|op| op.get("path").and_then(Value::as_str) == Some("/voice/enabled")),
             "the mobile toggle must not commit the neighboring voice setting: {settings:?}"
         );
     }
@@ -9142,17 +8857,15 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let voice = settings
             .iter()
-            .find(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str()) == Some("voice_enabled")
-            })
-            .expect("the native voice toggle must emit a VoiceEnabled SetSetting frame");
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/voice/enabled"))
+            .expect("the native voice toggle must emit a settings write");
         assert_eq!(
-            voice.get("enabled").and_then(|value| value.as_bool()),
+            voice.get("value").and_then(Value::as_bool),
             Some(true),
-            "VoiceEnabled must carry enabled=true after toggle on"
+            "the replacement must carry true"
         );
         assert_eq!(
             settings.len(),
@@ -9191,18 +8904,15 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let endpointing = settings
             .iter()
-            .find(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str())
-                    == Some("voice_endpointing_sensitivity")
+            .find(|op| {
+                op.get("path").and_then(Value::as_str) == Some("/voice/endpointing_sensitivity")
             })
-            .expect("changing endpointing sensitivity must emit its typed setting");
+            .expect("changing endpointing sensitivity must emit its settings write");
         assert_eq!(
-            endpointing
-                .get("sensitivity")
-                .and_then(|value| value.as_str()),
+            endpointing.get("value").and_then(Value::as_str),
             Some("high")
         );
     }
@@ -9232,7 +8942,7 @@ mod wasm_tests {
     }
 
     /// Pressing Enter on an insecure-scheme URL must (a) NOT emit any
-    /// SetSetting frame for the broker URL and (b) render an inline
+    /// SettingsWrite frame for the broker URL and (b) render an inline
     /// error message that mentions the scheme problem. This is the
     /// silent-failure regression guard the prior review called out.
     #[wasm_bindgen_test]
@@ -9257,8 +8967,8 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        // No MobileBrokerUrl SetSetting frame should have been sent.
-        let settings = recorded_set_setting_payloads(&calls);
+        // No MobileBrokerUrl SettingsWrite frame should have been sent.
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
             settings
                 .iter()
@@ -9318,7 +9028,7 @@ mod wasm_tests {
         }
 
         // (a) Nothing is committed to the wire.
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
             settings
                 .iter()
@@ -9986,7 +9696,16 @@ mod wasm_tests {
         state.connection_statuses.update(|m| {
             m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
         });
-        let mut code_intel = protocol::CodeIntelSettings::default();
+        state.host_settings_schema_by_host.update(|schemas| {
+            schemas.insert(
+                host_id.clone(),
+                settings_model::host_settings_schema().clone(),
+            );
+        });
+        state.configured_secrets_by_host.update(|secrets| {
+            secrets.insert(host_id.clone(), Vec::new());
+        });
+        let mut code_intel = settings_model::CodeIntelSettings::default();
         if let Some(path) = rust_analyzer_path {
             code_intel.language_server_paths.insert(
                 CodeIntelProviderId("rust-analyzer".to_owned()),
@@ -9997,24 +9716,25 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id,
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: protocol::BackgroundAgentFeaturesSettings {
+                    background_agent_features: settings_model::BackgroundAgentFeaturesSettings {
                         auto_generate_agent_names,
                         agent_activity_summaries,
                     },
-                    supervisor: protocol::SupervisorSettings::default(),
+                    supervisor: settings_model::SupervisorSettings::default(),
                     code_intel,
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },
@@ -10048,7 +9768,7 @@ mod wasm_tests {
         panic!("no settings-toggle-row containing {label:?}; saw {observed:?}");
     }
 
-    /// Toggling "Agent activity summaries" on must commit a `SetSetting`
+    /// Toggling "Agent activity summaries" on must commit a `SettingsWrite`
     /// frame whose payload is
     /// `BackgroundAgentFeatureEnabled { feature: AgentActivitySummaries,
     /// enabled: true }`. This is the load-bearing wire assertion for the
@@ -10080,24 +9800,22 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let frame = settings
             .iter()
-            .find(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("background_agent_feature_enabled")
-                    && s.get("feature").and_then(|f| f.as_str()) == Some("agent_activity_summaries")
+            .find(|op| {
+                replacement_value(op, "/background_agent_features/agent_activity_summaries")
+                    .is_some()
             })
-            .expect(
-                "toggling activity summaries must emit a BackgroundAgentFeatureEnabled SetSetting",
-            );
+            .expect("toggling activity summaries must emit a settings write");
         assert_eq!(
-            frame.get("enabled").and_then(|v| v.as_bool()),
+            frame.get("value").and_then(Value::as_bool),
             Some(true),
             "the committed frame must carry enabled=true: {frame:?}"
         );
     }
 
-    /// Toggling "Enable agent supervisor" on must commit a `SetSetting`
+    /// Toggling "Enable agent supervisor" on must commit a `SettingsWrite`
     /// frame whose payload is `SupervisorEnabled { enabled: true }`. Like the
     /// activity-summaries assertion, this is the load-bearing wire check for
     /// a paid opt-in feature.
@@ -10127,13 +9845,13 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let frame = settings
             .iter()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_enabled"))
-            .expect("toggling the supervisor must emit a SupervisorEnabled SetSetting");
+            .find(|op| replacement_value(op, "/supervisor/enabled").is_some())
+            .expect("toggling the supervisor must emit a settings write");
         assert_eq!(
-            frame.get("enabled").and_then(|v| v.as_bool()),
+            frame.get("value").and_then(Value::as_bool),
             Some(true),
             "the committed frame must carry enabled=true: {frame:?}"
         );
@@ -10144,13 +9862,14 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_auto_compact_on_success")
-                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
-            }),
-            "toggling auto-compact must emit a SupervisorAutoCompactOnSuccess SetSetting: {settings:?}"
+            settings.iter().any(
+                |op| replacement_value(op, "/supervisor/auto_compact_on_success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            ),
+            "toggling auto-compact must emit a SupervisorAutoCompactOnSuccess SettingsWrite: {settings:?}"
         );
 
         // The restore opt-in and stall interrupts each authorize something the
@@ -10174,21 +9893,72 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str())
-                    == Some("supervisor_supervise_restored_agents")
-                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
-            }),
+            settings.iter().any(|op| replacement_value(
+                op,
+                "/supervisor/supervise_restored_agents"
+            )
+            .and_then(Value::as_bool)
+                == Some(true)),
             "the restore opt-in must commit its own typed setting: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_stall_timeout_enabled")
-                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
-            }),
+            settings.iter().any(
+                |op| replacement_value(op, "/supervisor/stall_timeout_enabled")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            ),
             "enabling stall interrupts must commit its own typed setting: {settings:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn debug_primitive_row_is_driven_by_bootstrap_schema() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, None);
+        let mut schema = settings_model::host_settings_schema().clone();
+        schema
+            .pointer_mut("/properties/tyde_debug_mcp_enabled/title")
+            .expect("debug title in host schema")
+            .clone_from(&Value::String("Schema supplied debug switch".to_owned()));
+        state.host_settings_schema_by_host.update(|schemas| {
+            schemas.insert("host-general".to_owned(), schema);
+        });
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Debug");
+        next_tick().await;
+
+        let toggle = toggle_for_label(&container, "Schema supplied debug switch");
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(recorded_settings_write_ops(&calls).iter().any(|op| {
+            replacement_value(op, "/tyde_debug_mcp_enabled").and_then(Value::as_bool) == Some(true)
+        }));
+
+        state.host_settings_schema_by_host.update(|schemas| {
+            schemas.remove("host-general");
+        });
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("Unavailable: this host did not publish a settings schema."));
+        assert!(
+            container
+                .query_selector(".settings-schema-fields input")
+                .unwrap()
+                .is_none(),
+            "a missing schema must not fall back to an inferred editor"
         );
     }
 
@@ -10322,76 +10092,81 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str())
-                    == Some("supervisor_auto_compact_inactivity_delay_seconds")
-                    && s.get("seconds").and_then(|v| v.as_u64()) == Some(15)
-            }),
+            settings.iter().any(|op| replacement_value(
+                op,
+                "/supervisor/auto_compact_inactivity_delay_seconds"
+            )
+            .and_then(Value::as_u64)
+                == Some(15)),
             "editing the delay must emit the exact typed setting: {settings:?}"
         );
         assert_eq!(
             settings
                 .iter()
-                .filter(|s| {
-                    s.get("kind").and_then(|k| k.as_str())
-                        == Some("supervisor_auto_compact_inactivity_delay_seconds")
+                .filter(|op| {
+                    replacement_value(op, "/supervisor/auto_compact_inactivity_delay_seconds")
+                        .is_some()
                 })
                 .count(),
             1,
             "unparsable and out-of-range delay values must emit nothing: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str())
-                    == Some("supervisor_auto_compact_min_context_tokens")
-                    && s.get("tokens").and_then(|v| v.as_u64()) == Some(240_000)
-            }),
+            settings.iter().any(|op| replacement_value(
+                op,
+                "/supervisor/auto_compact_min_context_tokens"
+            )
+            .and_then(Value::as_u64)
+                == Some(240_000)),
             "editing the auto-compact minimum must emit a typed nonzero setting: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str())
-                    == Some("supervisor_auto_compact_min_context_tokens")
-                    && s.get("tokens").and_then(|v| v.as_u64()) == Some(0)
-            }),
+            settings.iter().any(|op| replacement_value(
+                op,
+                "/supervisor/auto_compact_min_context_tokens"
+            )
+            .and_then(Value::as_u64)
+                == Some(0)),
             "zero must be committed as an explicit auto-compact minimum: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_max_kicks_per_task")
-                    && s.get("count").and_then(|v| v.as_u64()) == Some(5)
-            }),
+            settings
+                .iter()
+                .any(|op| replacement_value(op, "/supervisor/max_kicks_per_task")
+                    .and_then(Value::as_u64)
+                    == Some(5)),
             "editing the kick limit must emit SupervisorMaxKicksPerTask count=5: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_retry_attempts")
-                    && s.get("count").and_then(|v| v.as_u64()) == Some(2)
-            }),
+            settings
+                .iter()
+                .any(|op| replacement_value(op, "/supervisor/retry_attempts")
+                    .and_then(Value::as_u64)
+                    == Some(2)),
             "editing retry attempts must emit SupervisorRetryAttempts count=2: {settings:?}"
         );
         assert!(
-            settings.iter().all(|s| {
-                s.get("kind").and_then(|k| k.as_str()) != Some("supervisor_retry_attempts")
-                    || s.get("count").and_then(|v| v.as_u64()) != Some(6)
+            settings.iter().all(|op| {
+                replacement_value(op, "/supervisor/retry_attempts").and_then(Value::as_u64)
+                    != Some(6)
             }),
             "out-of-range delayed attempts must emit nothing: {settings:?}"
         );
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_stall_timeout_seconds")
-                    && s.get("seconds").and_then(|v| v.as_u64()) == Some(600)
-            }),
+            settings.iter().any(
+                |op| replacement_value(op, "/supervisor/stall_timeout_seconds")
+                    .and_then(Value::as_u64)
+                    == Some(600)
+            ),
             "editing the stall window must commit the exact typed seconds: {settings:?}"
         );
         assert_eq!(
             settings
                 .iter()
-                .filter(|s| {
-                    s.get("kind").and_then(|k| k.as_str())
-                        == Some("supervisor_stall_timeout_seconds")
+                .filter(|op| {
+                    replacement_value(op, "/supervisor/stall_timeout_seconds").is_some()
                 })
                 .count(),
             1,
@@ -10414,12 +10189,14 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         assert!(
-            settings.iter().any(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_cost_tier")
-                    && s.get("tier").and_then(|v| v.as_str()) == Some("high")
-            }),
+            settings
+                .iter()
+                .any(
+                    |op| replacement_value(op, "/supervisor/cost_tier").and_then(Value::as_str)
+                        == Some("high")
+                ),
             "picking High must emit SupervisorCostTier tier=high: {settings:?}"
         );
     }
@@ -10596,17 +10373,17 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let set_frame = settings
             .iter()
-            .find(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("code_intel_language_server_path")
-                    && s.get("provider").and_then(|p| p.as_str()) == Some("rust-analyzer")
-                    && s.get("path").and_then(|p| p.as_str()) == Some("/opt/bin/rust-analyzer")
+            .find(|op| {
+                replacement_value(op, "/code_intel/language_server_paths/rust-analyzer")
+                    .and_then(Value::as_str)
+                    == Some("/opt/bin/rust-analyzer")
             })
-            .expect("Enter must emit CodeIntelLanguageServerPath with the typed path");
+            .expect("Enter must emit the rust-analyzer path replacement");
         assert_eq!(
-            set_frame.get("path").and_then(|p| p.as_str()),
+            set_frame.get("value").and_then(Value::as_str),
             Some("/opt/bin/rust-analyzer")
         );
 
@@ -10616,41 +10393,39 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let clear_frame = settings
             .iter()
             .rev()
-            .find(|s| {
-                s.get("kind").and_then(|k| k.as_str()) == Some("code_intel_language_server_path")
-                    && s.get("provider").and_then(|p| p.as_str()) == Some("rust-analyzer")
+            .find(|op| {
+                op.get("op").and_then(Value::as_str) == Some("remove")
+                    && op.get("path").and_then(Value::as_str)
+                        == Some("/code_intel/language_server_paths/rust-analyzer")
             })
-            .expect("Clear must emit CodeIntelLanguageServerPath for rust-analyzer");
-        match clear_frame.get("path") {
-            None => {}
-            Some(value) if value.is_null() => {}
-            Some(value) => panic!("Clear must send path=None/null; got {value:?}"),
-        }
+            .expect("Clear must remove the rust-analyzer path");
+        assert!(clear_frame.get("value").is_none());
     }
 
     fn host_settings_with_hermes_config(
         backend_config: std::collections::HashMap<BackendKind, BackendConfigValues>,
         enabled_backends: Vec<BackendKind>,
-    ) -> protocol::HostSettings {
-        protocol::HostSettings {
+    ) -> settings_model::HostSettings {
+        settings_model::HostSettings {
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             enable_mobile_connections: false,
             mobile_broker_url: None,
+            mobile_broker_auth: Default::default(),
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
-            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+            tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config,
-            launch_profiles: Vec::new(),
+            launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
         }
@@ -10939,12 +10714,30 @@ mod wasm_tests {
         let _ = input.remove_attribute("id");
     }
 
-    /// Most recent `backend_config` SetSetting `setting` payload, if any.
+    /// Most recent `backend_config` SettingsWrite `setting` payload, if any.
     fn last_backend_config(calls: &js_sys::Array) -> Option<serde_json::Value> {
-        recorded_set_setting_payloads(calls)
-            .into_iter()
-            .rev()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("backend_config"))
+        for op in recorded_settings_write_ops(calls).into_iter().rev() {
+            let path = op.get("path").and_then(Value::as_str)?;
+            let Some(rest) = path.strip_prefix("/backend_config/") else {
+                continue;
+            };
+            let mut parts = rest.split('/');
+            let backend = parts.next()?;
+            let values = if let Some(key) = parts.next() {
+                let value = if op.get("op").and_then(Value::as_str) == Some("remove") {
+                    Value::String("null".to_owned())
+                } else {
+                    op.get("value").cloned().unwrap_or(Value::Null)
+                };
+                let mut values = serde_json::Map::new();
+                values.insert(key.to_owned(), value);
+                Value::Object(values)
+            } else {
+                op.get("value").cloned().unwrap_or(Value::Null)
+            };
+            return Some(serde_json::json!({ "backend": backend, "values": values }));
+        }
+        None
     }
 
     /// Editing one backend-config field sends a partial update carrying only
@@ -11231,27 +11024,21 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let frame = settings
             .iter()
-            .find(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str())
-                    == Some("tyde_agent_control_mcp_enabled")
-            })
-            .expect("the sub-agents toggle must commit TydeAgentControlMcpEnabled");
+            .find(|op| replacement_value(op, "/tyde_agent_control_mcp_enabled").is_some())
+            .expect("the sub-agents toggle must commit its settings path");
         assert_eq!(
-            frame.get("enabled").and_then(|value| value.as_bool()),
+            frame.get("value").and_then(Value::as_bool),
             Some(false),
             "turning sub-agents off must carry enabled=false: {frame:?}"
         );
         let depth_frame = settings
             .iter()
-            .find(|setting| {
-                setting.get("kind").and_then(|kind| kind.as_str())
-                    == Some("tyde_agent_control_max_depth")
-            })
-            .expect("the depth input must commit TydeAgentControlMaxDepth");
-        assert_eq!(depth_frame.get("depth").and_then(Value::as_u64), Some(4));
+            .find(|op| replacement_value(op, "/tyde_agent_control_max_depth").is_some())
+            .expect("the depth input must commit its settings path");
+        assert_eq!(depth_frame.get("value").and_then(Value::as_u64), Some(4));
     }
 
     /// The sidebar has a dedicated Backends group: a stable Overview entry, a
@@ -11449,7 +11236,7 @@ mod wasm_tests {
     /// `enabled_backends`), renders an explicit disabled state with its schema
     /// fields visible but locked — some backends persist config edits to the
     /// native backend immediately, so an edit while disabled would fail — and
-    /// offers an enable action that commits an `EnabledBackends` SetSetting
+    /// offers an enable action that commits an `EnabledBackends` SettingsWrite
     /// preserving already-enabled backends.
     #[wasm_bindgen_test]
     async fn backend_page_disabled_backend_shows_enable_action() {
@@ -11512,15 +11299,15 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let settings = recorded_set_setting_payloads(&calls);
+        let settings = recorded_settings_write_ops(&calls);
         let enabled = settings
             .iter()
             .rev()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enabled_backends"))
-            .expect("Enable backend must emit an EnabledBackends SetSetting frame");
+            .find(|op| replacement_value(op, "/enabled_backends").is_some())
+            .expect("Enable backend must replace enabled_backends");
         let list: Vec<&str> = enabled
-            .get("enabled_backends")
-            .and_then(|v| v.as_array())
+            .get("value")
+            .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         assert!(
@@ -11558,21 +11345,22 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id.clone(),
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
+                    launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },
@@ -11662,10 +11450,10 @@ mod wasm_tests {
             next_tick().await;
         }
         assert!(
-            recorded_set_setting_payloads(&calls)
+            recorded_settings_write_ops(&calls)
                 .iter()
-                .any(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enabled_backends")),
-            "the enable action must emit an EnabledBackends SetSetting frame"
+                .any(|op| replacement_value(op, "/enabled_backends").is_some()),
+            "the enable action must replace enabled_backends"
         );
 
         // Server confirms the backend enabled and installed → controls unlock.
@@ -12205,21 +11993,25 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id.clone(),
-                protocol::HostSettings {
+                settings_model::HostSettings {
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
-                    launch_profiles: profiles,
+                    launch_profiles: profiles
+                        .into_iter()
+                        .map(|profile| (profile.id.clone(), profile))
+                        .collect(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                 },
@@ -12270,17 +12062,14 @@ mod wasm_tests {
         let _ = input.remove_attribute("id");
     }
 
-    /// Return the parsed `profiles` array of the most recent LaunchProfiles
-    /// SetSetting frame, or `None` if none was emitted.
-    fn last_launch_profiles(calls: &js_sys::Array) -> Option<Vec<serde_json::Value>> {
-        recorded_set_setting_payloads(calls)
+    fn last_launch_profile_op(calls: &js_sys::Array) -> Option<serde_json::Value> {
+        recorded_settings_write_ops(calls)
             .into_iter()
             .rev()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("launch_profiles"))
-            .and_then(|s| {
-                s.get("profiles")
-                    .and_then(|p| p.as_array())
-                    .map(|a| a.to_vec())
+            .find(|op| {
+                op.get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.starts_with("/launch_profiles/"))
             })
     }
 
@@ -12314,10 +12103,10 @@ mod wasm_tests {
         );
     }
 
-    /// Adding a profile emits a `LaunchProfiles` SetSetting carrying the new
+    /// Adding a profile emits a `LaunchProfiles` SettingsWrite carrying the new
     /// entry alongside any existing ones.
     #[wasm_bindgen_test]
-    async fn launch_profiles_add_emits_set_setting() {
+    async fn launch_profiles_add_emits_settings_write() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -12349,19 +12138,22 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let profiles =
-            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
-        assert_eq!(profiles.len(), 1, "one profile persisted: {profiles:?}");
+        let op = last_launch_profile_op(&calls).expect("a launch-profile op must be emitted");
         assert_eq!(
-            profiles[0].get("id").and_then(|v| v.as_str()),
+            op.get("path").and_then(Value::as_str),
+            Some("/launch_profiles/hermes:grok")
+        );
+        let profile = op.get("value").expect("replacement profile");
+        assert_eq!(
+            profile.get("id").and_then(|v| v.as_str()),
             Some("hermes:grok")
         );
         assert_eq!(
-            profiles[0].get("label").and_then(|v| v.as_str()),
+            profile.get("label").and_then(|v| v.as_str()),
             Some("Hermes · Grok")
         );
         assert_eq!(
-            profiles[0].get("backend_kind").and_then(|v| v.as_str()),
+            profile.get("backend_kind").and_then(|v| v.as_str()),
             Some("hermes"),
             "backend kind must be carried typed"
         );
@@ -12406,25 +12198,28 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let profiles =
-            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
-        assert_eq!(profiles.len(), 1, "still one profile: {profiles:?}");
-        let model = profiles[0]
-            .get("session_settings")
+        let op = last_launch_profile_op(&calls).expect("a launch-profile op must be emitted");
+        assert_eq!(
+            op.get("path").and_then(Value::as_str),
+            Some("/launch_profiles/hermes:claude")
+        );
+        let model = op
+            .get("value")
+            .and_then(|value| value.get("session_settings"))
             .and_then(|s| s.get("model"))
             .and_then(|m| m.get("string"))
             .and_then(|v| v.as_str());
         assert_eq!(
             model,
             Some("opus"),
-            "typed session settings must be persisted on the profile: {profiles:?}"
+            "typed session settings must be persisted on the profile: {op:?}"
         );
     }
 
     /// Removing a profile confirms then emits a `LaunchProfiles` frame with the
     /// remaining profiles only.
     #[wasm_bindgen_test]
-    async fn launch_profiles_remove_emits_set_setting() {
+    async fn launch_profiles_remove_emits_settings_write() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -12459,17 +12254,16 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let profiles =
-            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
-        let ids: Vec<&str> = profiles
-            .iter()
-            .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
-            .collect();
-        assert_eq!(profiles.len(), 1, "one profile must remain: {profiles:?}");
+        let op = last_launch_profile_op(&calls).expect("a launch-profile op must be emitted");
         assert_eq!(
-            ids,
-            vec!["hermes:codex"],
-            "the other profile must be removed"
+            op.get("op").and_then(Value::as_str),
+            Some("remove"),
+            "delete must be an explicit remove: {op:?}"
+        );
+        assert_eq!(
+            op.get("path").and_then(Value::as_str),
+            Some("/launch_profiles/hermes:claude"),
+            "only the selected profile resource must be removed"
         );
     }
 
@@ -12510,7 +12304,7 @@ mod wasm_tests {
         }
 
         assert!(
-            last_launch_profiles(&calls).is_none(),
+            last_launch_profile_op(&calls).is_none(),
             "a reserved id must not reach the wire"
         );
         let error_text = container
@@ -12674,7 +12468,7 @@ mod wasm_tests {
                     description: None,
                     schema: serde_json::json!({
                         "properties": {
-                            "api_key": { "type": "string", "title": "API Key" },
+                            "api_key": { "type": "string", "title": "API Key", "format": "password", "writeOnly": true },
                             "model": { "type": "string", "title": "Model" }
                         }
                     }),
@@ -12716,35 +12510,31 @@ mod wasm_tests {
     /// The host id `install_tycode_native_host` installs on, and selects.
     const TYCODE_HOST: &str = "host-tyc-native";
 
-    /// A typed `CommandError`, dispatched through the real dispatcher exactly as the
-    /// server sends one.
-    ///
-    /// `seq` must start at 0 for each host and advance by one: `prime_host_for_tests`
-    /// forgets the host's counters, and the inbound validator **drops** any envelope
-    /// whose seq is not the one it expects (and marks the connection desynced), so an
-    /// off-by-one here silently delivers nothing.
-    fn dispatch_command_error(
+    fn dispatch_settings_result(
         state: &AppState,
         host_id: &str,
         seq: u64,
-        request_kind: FrameKind,
-        setting_target: Option<HostSettingErrorTarget>,
-        code: CommandErrorCode,
+        write_id: &str,
+        applied: bool,
         message: &str,
     ) {
         let stream = protocol::StreamPath(format!("/host/{host_id}"));
         let envelope = protocol::Envelope::from_payload(
-            stream.clone(),
-            FrameKind::CommandError,
+            stream,
+            FrameKind::SettingsWriteResult,
             seq,
-            &protocol::CommandErrorPayload {
-                stream,
-                request_kind,
-                setting_target,
-                operation: "set_setting".to_owned(),
-                code,
-                message: message.to_owned(),
-                fatal: false,
+            &protocol::SettingsWriteResultPayload {
+                write_id: SettingsWriteId(write_id.to_owned()),
+                applied,
+                current_etag: "etag".to_owned(),
+                field_errors: (!applied)
+                    .then(|| protocol::SettingsFieldError {
+                        pointer: "".to_owned(),
+                        code: protocol::SettingsErrorCode::BackendRejected,
+                        message: message.to_owned(),
+                    })
+                    .into_iter()
+                    .collect(),
             },
         )
         .expect("envelope serialize");
@@ -12763,7 +12553,7 @@ mod wasm_tests {
 
     /// Mark a native save in flight, exactly as the settings page does when it sends
     /// one: `base` is the settings document the save was applied to.
-    fn mark_native_save_pending(state: &AppState, host_id: &str) {
+    fn mark_native_save_pending(state: &AppState, host_id: &str) -> SettingsWriteId {
         let base = state
             .backend_native_settings
             .get_untracked()
@@ -12771,12 +12561,17 @@ mod wasm_tests {
             .and_then(|by_kind| by_kind.get(&BackendKind::Tycode))
             .and_then(|snapshot| snapshot.settings.clone())
             .expect("the host must have an installed snapshot to save against");
+        let write_id = SettingsWriteId("native-test".to_owned());
         state.native_settings_save_state.update(|states| {
             states.entry(host_id.to_owned()).or_default().insert(
                 BackendKind::Tycode,
-                NativeSettingsSaveState::Pending { base },
+                NativeSettingsSaveState::Pending {
+                    base,
+                    write_id: write_id.clone(),
+                },
             );
         });
+        write_id
     }
 
     fn confirm_dialog(container: &HtmlElement) -> Option<HtmlElement> {
@@ -12976,12 +12771,38 @@ mod wasm_tests {
         })
     }
 
-    /// Most recent `backend_native_settings` SetSetting payload, if any.
     fn last_native_settings(calls: &js_sys::Array) -> Option<serde_json::Value> {
-        recorded_set_setting_payloads(calls)
-            .into_iter()
-            .rev()
-            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("backend_native_settings"))
+        calls.iter().rev().find_map(|entry| {
+            let arr = entry.dyn_into::<js_sys::Array>().ok()?;
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                return None;
+            }
+            let args: Value = serde_json::from_str(&arr.get(1).as_string()?).ok()?;
+            let envelope: Value = serde_json::from_str(args.get("line")?.as_str()?).ok()?;
+            (envelope.get("kind")?.as_str()? == "backend_native_settings_write")
+                .then(|| {
+                    let payload = envelope.get("payload")?;
+                    Some(serde_json::json!({
+                        "backend": payload.get("backend")?.clone(),
+                        "settings": payload.get("settings")?.clone(),
+                    }))
+                })
+                .flatten()
+        })
+    }
+
+    fn last_settings_action(calls: &js_sys::Array) -> Option<serde_json::Value> {
+        calls.iter().rev().find_map(|entry| {
+            let arr = entry.dyn_into::<js_sys::Array>().ok()?;
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                return None;
+            }
+            let args: Value = serde_json::from_str(&arr.get(1).as_string()?).ok()?;
+            let envelope: Value = serde_json::from_str(args.get("line")?.as_str()?).ok()?;
+            (envelope.get("kind")?.as_str()? == "invoke_settings_action")
+                .then(|| envelope.get("payload").cloned())
+                .flatten()
+        })
     }
 
     /// When Tycode's native settings probe fails, the Tycode page appears in
@@ -13288,36 +13109,74 @@ mod wasm_tests {
         let settings = setting.get("settings").expect("the full profiles document");
         assert_eq!(
             settings
-                .pointer("/profiles/1/settings/providers/anthropic/model")
+                .pointer("/profiles/0/settings/providers/anthropic/model")
                 .and_then(|v| v.as_str()),
             Some("opus"),
             "the edit must land in the selected profile: {settings:?}"
         );
         assert_eq!(
             settings
-                .pointer("/profiles/1/base_settings/providers/anthropic/model")
+                .pointer("/profiles/0/base_settings/providers/anthropic/model")
                 .and_then(|v| v.as_str()),
             Some("haiku"),
             "the selected profile's unedited settings must ride along as \
              base_settings: {settings:?}"
         );
-        assert_eq!(
-            settings
-                .pointer("/profiles/0/settings/providers/anthropic/model")
-                .and_then(|v| v.as_str()),
-            Some("claude"),
-            "the unselected profile must be echoed unchanged: {settings:?}"
-        );
         assert!(
-            settings.pointer("/profiles/0/base_settings").is_none(),
-            "an untouched profile must not claim an edit basis: {settings:?}"
+            settings
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(|profiles| profiles.len() == 1),
+            "a profile edit must send only its disjoint resource: {settings:?}"
         );
     }
 
-    /// A group whose schema has no typed `properties` map must not be silently
-    /// dropped: its whole value renders in a visible read-only JSON view.
     #[wasm_bindgen_test]
-    async fn tycode_native_settings_render_untyped_group_as_json() {
+    async fn tycode_profile_create_uses_first_class_settings_action() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "+ New profile")
+            .expect("new Tycode profile button")
+            .click();
+        next_tick().await;
+        let input: HtmlInputElement = container
+            .query_selector(".settings-native-profile-name")
+            .unwrap()
+            .expect("profile name input")
+            .dyn_into()
+            .unwrap();
+        set_input_value(&input, "review");
+        find_button_by_text(&container, "Create")
+            .expect("create Tycode profile button")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let action = last_settings_action(&calls).expect("InvokeSettingsAction frame");
+        assert_eq!(action["backend"], "tycode");
+        assert_eq!(action["resource"], "profiles");
+        assert_eq!(action["action"], "create");
+        assert_eq!(action["arguments"]["name"], "review");
+        assert_eq!(action["arguments"]["copy_from"], "default");
+        assert!(
+            last_native_settings(&calls).is_none(),
+            "profile lifecycle must not be smuggled through a settings document"
+        );
+    }
+
+    /// A group without typed properties stays visible but never exposes an
+    /// unprovable value through a raw JSON editor.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_marks_untyped_group_unavailable() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -13347,14 +13206,14 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let pre = container
-            .query_selector(".settings-native-json-readonly")
-            .unwrap()
-            .expect("an untyped group must render as a visible JSON view, not vanish");
-        let json = pre.text_content().unwrap_or_default();
+        let text = container.text_content().unwrap_or_default();
         assert!(
-            json.contains("nested") && json.contains('1'),
-            "the group's current value must be shown, not dropped: {json:?}"
+            text.contains("Unavailable: this settings schema does not expose editable fields."),
+            "the untyped group must remain visible with an explicit state: {text:?}"
+        );
+        assert!(
+            !text.contains("nested"),
+            "values outside an authoritative schema must not be exposed: {text:?}"
         );
     }
 
@@ -13436,7 +13295,16 @@ mod wasm_tests {
                         settings_path: Vec::new(),
                         description: None,
                         schema: serde_json::json!({
-                            "properties": { "auth": { "type": "object", "title": "Auth" } }
+                            "properties": {
+                                "auth": {
+                                    "type": "object",
+                                    "title": "Auth",
+                                    "properties": {
+                                        "token": {"type": "string", "writeOnly": true, "format": "password"},
+                                        "scope": {"type": "string"}
+                                    }
+                                }
+                            }
                         }),
                     }],
                     message: None,
@@ -13459,8 +13327,8 @@ mod wasm_tests {
             .expect("secret-bearing object must render as a read-only JSON view");
         let json = pre.text_content().unwrap_or_default();
         assert!(
-            json.contains("scope") && json.contains(SECRET_REDACTION),
-            "non-secret keys stay visible while the secret is redacted: {json:?}"
+            json.contains("scope") && !json.contains("token"),
+            "non-secret keys stay visible while the secret is omitted: {json:?}"
         );
         // No editable textarea for secret-bearing JSON — editing would clobber it.
         assert!(
@@ -13509,14 +13377,11 @@ mod wasm_tests {
             !html.contains("sk-leak"),
             "an opaque group's nested secret must never reach the DOM: {html:?}"
         );
-        let pre = container
-            .query_selector(".settings-native-json-readonly")
-            .unwrap()
-            .expect("opaque group must still render its value, redacted");
-        let json = pre.text_content().unwrap_or_default();
         assert!(
-            json.contains("model") && json.contains(SECRET_REDACTION),
-            "the redacted view keeps non-secret keys: {json:?}"
+            container
+                .text_content()
+                .is_some_and(|text| text.contains("Unavailable")),
+            "an opaque provider schema must fail closed instead of exposing raw JSON"
         );
     }
 
@@ -14005,7 +13870,7 @@ mod wasm_tests {
             focused_label()
         );
         assert!(
-            last_launch_profiles(&calls).is_none(),
+            last_launch_profile_op(&calls).is_none(),
             "Escape must cancel the delete, never persist it"
         );
 
@@ -14022,25 +13887,16 @@ mod wasm_tests {
         );
     }
 
-    /// Only a typed native-settings target may fail a pending native save.
-    ///
-    /// It closes the bug where `fail_native_settings_pending_on_error` matched on
-    /// `request_kind == SetSetting` alone: *any* failed host setting arriving while a
-    /// save was in flight would have failed that save and printed the other command's
-    /// error on the settings page — against a save the server never even refused,
-    /// unlocking controls on a false report.
-    ///
-    /// Every negative runs first and the real rejection last, so a pipeline that was
-    /// simply broken end to end could not let the negatives pass.
     #[wasm_bindgen_test]
-    async fn only_a_typed_native_settings_target_fails_the_pending_save() {
+    async fn only_the_matching_settings_result_fails_the_pending_save() {
         const HOST_B: &str = "host-tyc-other";
+        const REJECTION: &str = "Tycode SaveSettings rejected: provider unavailable";
         let container = make_container();
         let state = AppState::new();
         crate::dispatch::prime_host_for_tests(&state, TYCODE_HOST);
         crate::dispatch::prime_host_for_tests(&state, HOST_B);
         install_tycode_native_host(&state, tycode_ready_snapshot());
-        mark_native_save_pending(&state, TYCODE_HOST);
+        let write_id = mark_native_save_pending(&state, TYCODE_HOST);
 
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -14053,90 +13909,16 @@ mod wasm_tests {
                 .query_selector(".settings-native-saving")
                 .unwrap()
                 .is_some(),
-            "the page must start in the in-flight saving state, or this proves nothing"
+            "the page must start in the in-flight saving state"
         );
 
-        // Everything that is *not* this save's answer. Each must leave it in flight.
-        let not_our_answer: [(&str, FrameKind, Option<HostSettingErrorTarget>, &str); 5] = [
-            (
-                "a legacy backend-config setting",
-                FrameKind::SetSetting,
-                Some(HostSettingErrorTarget::BackendConfig),
-                "backend config rejected: unknown key",
-            ),
-            (
-                "an ordinary host setting",
-                FrameKind::SetSetting,
-                Some(HostSettingErrorTarget::LaunchProfiles),
-                "launch profile id is reserved",
-            ),
-            (
-                "a malformed SetSetting payload, which denotes no setting at all",
-                FrameKind::SetSetting,
-                Some(HostSettingErrorTarget::Malformed),
-                "host setting payload was not valid",
-            ),
-            (
-                "an older host that sends no target, so cannot correlate at all",
-                FrameKind::SetSetting,
-                None,
-                "set_setting failed for some reason we cannot attribute",
-            ),
-            (
-                "a command that is not a SetSetting",
-                FrameKind::ListSessions,
-                None,
-                "list_sessions failed",
-            ),
-        ];
-
-        let mut seq = 0;
-        for (what, request_kind, setting_target, message) in not_our_answer {
-            dispatch_command_error(
-                &state,
-                TYCODE_HOST,
-                seq,
-                request_kind,
-                setting_target,
-                CommandErrorCode::Internal,
-                message,
-            );
-            seq += 1;
-            for _ in 0..3 {
-                next_tick().await;
-            }
-            assert!(
-                matches!(
-                    native_save_state(&state, TYCODE_HOST),
-                    Some(NativeSettingsSaveState::Pending { .. })
-                ),
-                "{what} must leave the in-flight save waiting for its own answer, not \
-                 fail it: {:?}",
-                native_save_state(&state, TYCODE_HOST)
-            );
-            assert!(
-                container
-                    .query_selector(".settings-native-saving")
-                    .unwrap()
-                    .is_some(),
-                "{what} must not unlock the controls of a save the server never refused"
-            );
-            let page = container.text_content().unwrap_or_default();
-            assert!(
-                !page.contains(message),
-                "{what} must not put its message on the settings page: {page:?}"
-            );
-        }
-
-        // A real native-save rejection \u{2014} for a *different host*. Not this save's.
-        dispatch_command_error(
+        dispatch_settings_result(
             &state,
-            HOST_B,
+            TYCODE_HOST,
             0,
-            FrameKind::SetSetting,
-            Some(HostSettingErrorTarget::BackendNativeSettings),
-            CommandErrorCode::Internal,
-            "another host's save failed",
+            "other-write",
+            false,
+            "other write failed",
         );
         for _ in 0..3 {
             next_tick().await;
@@ -14146,20 +13928,22 @@ mod wasm_tests {
                 native_save_state(&state, TYCODE_HOST),
                 Some(NativeSettingsSaveState::Pending { .. })
             ),
-            "a save rejected on another host must not fail this host's save"
+            "a result for another write must leave the save pending"
         );
 
-        // …and finally the one shape that *is* this save's answer.
-        const REJECTION: &str = "Tycode SaveSettings rejected: provider unavailable";
-        dispatch_command_error(
-            &state,
-            TYCODE_HOST,
-            seq,
-            FrameKind::SetSetting,
-            Some(HostSettingErrorTarget::BackendNativeSettings),
-            CommandErrorCode::Internal,
-            REJECTION,
+        dispatch_settings_result(&state, HOST_B, 0, &write_id.0, false, "another host failed");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            matches!(
+                native_save_state(&state, TYCODE_HOST),
+                Some(NativeSettingsSaveState::Pending { .. })
+            ),
+            "the matching id on another host must not fail this host's save"
         );
+
+        dispatch_settings_result(&state, TYCODE_HOST, 1, &write_id.0, false, REJECTION);
         for _ in 0..3 {
             next_tick().await;
         }
@@ -14168,25 +13952,22 @@ mod wasm_tests {
             Some(NativeSettingsSaveState::Failed {
                 message: REJECTION.to_owned(),
             }),
-            "the typed native-settings target, on this host, is this save's answer"
+            "only this host's matching write result is the save's answer"
         );
         assert!(
             container
                 .query_selector(".settings-native-saving")
                 .unwrap()
                 .is_none(),
-            "the matching rejection must release the save gate \u{2014} no snapshot will"
+            "the matching rejection must release the save gate"
         );
         let error = container
             .query_selector(".settings-native-error")
             .unwrap()
-            .expect("the matching rejection must surface an error on the settings page")
+            .expect("the matching rejection must surface an error")
             .text_content()
             .unwrap_or_default();
-        assert!(
-            error.contains(REJECTION),
-            "the server's reason, verbatim: {error:?}"
-        );
+        assert!(error.contains(REJECTION), "the server's reason: {error:?}");
     }
 
     /// The destructive confirmation is a real modal: announced, focused, trapped,
@@ -14231,7 +14012,7 @@ mod wasm_tests {
         .await;
 
         assert!(
-            last_launch_profiles(&calls).is_none(),
+            last_launch_profile_op(&calls).is_none(),
             "Escape must cancel the delete, never persist it"
         );
         assert!(
@@ -14417,7 +14198,7 @@ mod wasm_tests {
     }
 
     /// A server-side rejection of a native save (a `CommandError` for
-    /// `SetSetting` after the save reached the server) must unlock the controls
+    /// `SettingsWrite` after the save reached the server) must unlock the controls
     /// and surface the server's error. The save's result otherwise only lands via
     /// a refreshed native snapshot, and a rejection emits none — so without this
     /// the page stays stuck in "Saving…" forever.
@@ -14440,7 +14221,10 @@ mod wasm_tests {
         state.native_settings_save_state.update(|m| {
             m.entry("host-tyc-native".to_owned()).or_default().insert(
                 BackendKind::Tycode,
-                NativeSettingsSaveState::Pending { base },
+                NativeSettingsSaveState::Pending {
+                    base,
+                    write_id: SettingsWriteId("native-rejection".to_owned()),
+                },
             );
         });
 
@@ -14459,27 +14243,24 @@ mod wasm_tests {
             "the page starts in the in-flight saving state"
         );
 
-        // The server rejects the SetSetting (e.g. Tycode SaveSettings fails). No
-        // refreshed snapshot follows, so only this CommandError can release the
-        // gate.
+        // A rejection has no refreshed snapshot, so its correlated result must
+        // release the gate.
         let env = protocol::Envelope::from_payload(
             protocol::StreamPath("/host/host-tyc-native".to_owned()),
-            protocol::FrameKind::CommandError,
+            protocol::FrameKind::SettingsWriteResult,
             0,
-            &protocol::CommandErrorPayload {
-                stream: protocol::StreamPath("/host/host-tyc-native".to_owned()),
-                request_kind: protocol::FrameKind::SetSetting,
-                // The typed target the server now sends for a rejected native save.
-                // It is what tells the dispatcher this is the save's answer — and,
-                // just as importantly, that it is *not* a managed-projection reset's.
-                setting_target: Some(HostSettingErrorTarget::BackendNativeSettings),
-                operation: "set_setting".to_owned(),
-                code: protocol::CommandErrorCode::Internal,
-                message: "Tycode SaveSettings rejected: provider unavailable".to_owned(),
-                fatal: false,
+            &protocol::SettingsWriteResultPayload {
+                write_id: SettingsWriteId("native-rejection".to_owned()),
+                applied: false,
+                current_etag: "etag".to_owned(),
+                field_errors: vec![protocol::SettingsFieldError {
+                    pointer: "".to_owned(),
+                    code: protocol::SettingsErrorCode::BackendRejected,
+                    message: "Tycode SaveSettings rejected: provider unavailable".to_owned(),
+                }],
             },
         )
-        .expect("synthetic CommandError");
+        .expect("synthetic SettingsWriteResult");
         crate::dispatch::dispatch_envelope(&state, "host-tyc-native", env);
         next_tick().await;
 

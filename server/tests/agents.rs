@@ -1,24 +1,22 @@
 mod fixture;
 
-use fixture::Fixture;
+use fixture::{Fixture, expect_settings_write_applied};
 use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentActivitySummaryPayload, AgentActivitySummaryState, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendConfigSnapshotsPayload, BackendKind,
-    BackgroundAgentFeature, ChatEvent, ClientErrorCode, ClientErrorPayload, CommandErrorCode,
-    CommandErrorPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
-    HostLaunchProfileConfig, HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload,
-    LaunchProfileId, LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData,
-    MessageSender, MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin,
-    OrchestrationPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
-    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionId,
-    SessionListPayload, SessionSettingValue, SessionSettingsValues, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamEndData, StreamPath, TaskTokenUsagePayload,
-    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-    ToolRequestType, write_envelope,
+    AgentRenamedPayload, AgentStartPayload, BackendConfigSnapshotsPayload, BackendKind, ChatEvent,
+    ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, LaunchProfileCatalogPayload, LaunchProfileId,
+    LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
+    MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin, OrchestrationPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
+    SendMessageToolResponse, SessionHistoryPayload, SessionId, SessionListPayload,
+    SessionSettingValue, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
+    StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
+    TaskTokenUsageUnavailableReason, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -32,9 +30,10 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
+use settings_model::HostLaunchProfileConfig;
+use settings_model::{HostBootstrapPayload, HostSettingsPayload};
 use std::future::{self, Future};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -42,213 +41,60 @@ use tyde_dev_driver::agent_control::{AgentControlHandle, SpawnRequest};
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
+        let env = fixture::next_frame_unpacking_agent_bootstrap_on(client, context).await;
+        if fixture::is_routine_control_plane_frame(&env)
+            || matches!(
+                env.kind,
+                FrameKind::AgentsViewPreferencesNotify
+                    | FrameKind::TeamPresetCatalogNotify
+                    | FrameKind::BackendCapacity
+                    | FrameKind::BackendConfigSchemas
+                    | FrameKind::BackendConfigSnapshots
+                    | FrameKind::SessionList
+                    | FrameKind::TaskTokenUsage
+                    | FrameKind::WorkflowNotify
+                    | FrameKind::ContextCompactionNotify
+                    | FrameKind::ContextCompactionCapability
+            )
+        {
             continue;
         }
-
-        if env.kind == FrameKind::AgentBootstrap {
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            if let Some(first) = record_agent_bootstrap_events(&env.stream, bootstrap) {
-                return first;
-            }
-            continue;
-        }
-
-        if matches!(
-            env.kind,
-            FrameKind::SessionSettings
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::BackendConfigSchemas
-                | FrameKind::BackendConfigSnapshots
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionList
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::ContextCompactionNotify
-                | FrameKind::ContextCompactionCapability
-        ) {
-            continue;
-        }
-
         return env;
     }
 }
 
-fn pending_agent_events() -> &'static Mutex<HashMap<StreamPath, VecDeque<Envelope>>> {
-    static PENDING: OnceLock<Mutex<HashMap<StreamPath, VecDeque<Envelope>>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn record_agent_bootstrap_events(
+fn pop_pending_agent_event(
+    client: &client::Connection,
     stream: &StreamPath,
-    bootstrap: AgentBootstrapPayload,
+    kind: FrameKind,
 ) -> Option<Envelope> {
-    let mut events = bootstrap
-        .events
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
-    let first = events.next();
-    let mut rest = events.collect::<VecDeque<_>>();
-    if !rest.is_empty() {
-        pending_agent_events()
-            .lock()
-            .expect("pending agent event mutex poisoned")
-            .entry(stream.clone())
-            .or_default()
-            .append(&mut rest);
-    }
-    first
+    fixture::pop_pending_frame_matching_on(client, |env| env.stream == *stream && env.kind == kind)
 }
 
-fn agent_bootstrap_event_envelope(
+fn pop_front_pending_agent_event(
+    client: &client::Connection,
     stream: &StreamPath,
-    seq: u64,
-    event: AgentBootstrapEvent,
 ) -> Option<Envelope> {
-    match event {
-        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentStart,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::AgentError,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::SessionSettings(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::SessionSettings,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::QueuedMessages(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::QueuedMessages,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
-            stream.clone(),
-            FrameKind::ChatEvent,
-            seq,
-            &payload,
-        )),
-        AgentBootstrapEvent::AgentActivityStats(_)
-        | AgentBootstrapEvent::ContextCompaction(_)
-        | AgentBootstrapEvent::ContextCompactionCapability(_)
-        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
-    }
-    .map(|result| result.expect("serialize synthetic bootstrap event"))
+    fixture::pop_pending_frame_matching_on(client, |env| env.stream == *stream)
 }
 
-fn pop_pending_agent_event(stream: &StreamPath, kind: FrameKind) -> Option<Envelope> {
-    let mut pending = pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned");
-    let queue = pending.get_mut(stream)?;
-    let index = queue.iter().position(|env| env.kind == kind)?;
-    let env = queue.remove(index);
-    if queue.is_empty() {
-        pending.remove(stream);
-    }
-    env
-}
-
-fn pop_front_pending_agent_event(stream: &StreamPath) -> Option<Envelope> {
-    let mut pending = pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned");
-    let queue = pending.get_mut(stream)?;
-    let env = queue.pop_front();
-    if queue.is_empty() {
-        pending.remove(stream);
-    }
-    env
-}
-
-fn push_pending_agent_event(env: Envelope) {
+fn push_pending_agent_event(client: &client::Connection, env: Envelope) {
     if !env.stream.0.starts_with("/agent/") && env.kind != FrameKind::NewAgent {
         return;
     }
-    pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned")
-        .entry(env.stream.clone())
-        .or_default()
-        .push_back(env);
+    fixture::push_pending_frame_on(client, env);
 }
 
-fn push_front_pending_agent_event(env: Envelope) {
+fn push_front_pending_agent_event(client: &client::Connection, env: Envelope) {
     if !env.stream.0.starts_with("/agent/") {
         return;
     }
-    pending_agent_events()
-        .lock()
-        .expect("pending agent event mutex poisoned")
-        .entry(env.stream.clone())
-        .or_default()
-        .push_front(env);
+    fixture::push_front_pending_frame_on(client, env);
 }
 
 /// Wait for the first envelope of a specific kind, skipping noise frames.
 async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        let env = if env.kind == FrameKind::AgentBootstrap {
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            match record_agent_bootstrap_events(&env.stream, bootstrap) {
-                Some(first) => first,
-                None => continue,
-            }
-        } else {
-            env
-        };
-        if env.kind == kind {
-            return env;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::SessionSettings
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendConfigSchemas
-                | FrameKind::BackendConfigSnapshots
-                | FrameKind::QueuedMessages
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::ContextCompactionNotify
-                | FrameKind::ContextCompactionCapability
-        ) {
-            continue;
-        }
-        // Skip other frame kinds while waiting for the target kind.
-    }
+    fixture::next_logical_frame_matching_on(client, context, |env| env.kind == kind).await
 }
 
 /// Like expect_next_event but also skips proactive SessionList fan-outs that
@@ -307,57 +153,34 @@ fn single_host_stream(client: &client::Connection) -> StreamPath {
     host_stream
 }
 
-async fn expect_turn(client: &mut client::Connection, stream: &StreamPath, expected_text: &str) {
-    expect_turn_on_stream(client, stream, expected_text).await;
-}
-
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    loop {
-        match tokio::time::timeout(duration, client.next_event()).await {
-            Err(_) => return,
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::SessionSettings
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::BackendConfigSchemas
-                            | FrameKind::BackendConfigSnapshots
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionList
-                            | FrameKind::HostSettings
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentActivityStats
-                            | FrameKind::TaskTokenUsage
-                            | FrameKind::ContextCompactionNotify
-                            | FrameKind::ContextCompactionCapability
-                    ) =>
-            {
-                continue;
-            }
-            Ok(Ok(Some(env))) => panic!(
-                "unexpected event before {context}: kind={} stream={}",
-                env.kind, env.stream
-            ),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
+    fixture::assert_no_interesting_frame_on(client, duration, context, |env| {
+        matches!(
+            env.kind,
+            FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::BackendCapacity
+                | FrameKind::BackendConfigSchemas
+                | FrameKind::BackendConfigSnapshots
+                | FrameKind::SessionList
+                | FrameKind::HostSettings
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentActivityStats
+                | FrameKind::TaskTokenUsage
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
+        )
+    })
+    .await;
 }
 
 async fn set_activity_summaries(client: &mut client::Connection, enabled: bool) {
-    client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackgroundAgentFeatureEnabled {
-                feature: BackgroundAgentFeature::AgentActivitySummaries,
-                enabled,
-            },
-        })
+    let write_id = client
+        .replace_setting(
+            "/background_agent_features/agent_activity_summaries",
+            enabled,
+            !enabled,
+        )
         .await
         .expect("set activity summary setting");
 
@@ -376,6 +199,7 @@ async fn set_activity_summaries(client: &mut client::Connection, enabled: bool) 
         enabled,
         "activity summary setting did not round-trip through HostSettings"
     );
+    expect_settings_write_applied(client, &write_id, "activity summary result").await;
 }
 
 async fn expect_activity_summary_matching(
@@ -803,6 +627,7 @@ async fn wait_for_ready_launch_profile(
                 }
             }
             FrameKind::HostSettings
+            | FrameKind::SettingsWriteResult
             | FrameKind::SessionSchemas
             | FrameKind::BackendSetup
             | FrameKind::AgentsViewPreferencesNotify
@@ -975,63 +800,19 @@ fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
     }
 }
 
-const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
-const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
-const MOCK_LIVE_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_live_native_child__";
-const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
-const MOCK_MID_TURN_ERROR_SENTINEL: &str = "__mock_mid_turn_error__";
-const MOCK_BUSY_SELF_TURN_SENTINEL: &str = "__mock_busy_self_turn__";
-const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
-const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
-const MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL: &str = "__mock_agent_control_send_message__";
-const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
-const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
-const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
-const MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL: &str = "__mock_empty_agent_control_output__";
 const MOCK_TURN_TOKEN_TOTAL: u64 = 1590;
 const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
 
 async fn spawn_agent_control_parent(fixture: &mut Fixture, name: &str) -> NewAgentPayload {
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some(name.to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec![format!("/tmp/{name}")],
-                prompt: format!("initialize {name}"),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn agent-control parent");
-    let env = expect_kind(
+    let prompt = format!("initialize {name}");
+    let agent = fixture.spawn(name, &prompt).await;
+    expect_strict_mock_turn(
         &mut fixture.client,
-        FrameKind::NewAgent,
-        "agent-control parent NewAgent",
-    )
-    .await;
-    let parent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
-    expect_agent_start_on_stream(
-        &mut fixture.client,
-        &parent.instance_stream,
-        "agent-control parent AgentStart",
-    )
-    .await;
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &parent.instance_stream,
+        &agent.stream,
         &format!("mock backend response to: initialize {name}"),
     )
     .await;
-    parent
+    agent.new_agent
 }
 
 fn assert_known_turn_usage(
@@ -1114,8 +895,7 @@ async fn expect_task_token_usage_matching(
             continue;
         }
         if env.kind == FrameKind::AgentBootstrap {
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            let _ = record_agent_bootstrap_events(&env.stream, bootstrap);
+            let _ = fixture::buffer_agent_bootstrap_on(client, &env);
             continue;
         }
         if env.kind != FrameKind::TaskTokenUsage {
@@ -1202,20 +982,16 @@ async fn spawn_token_usage_agent(
 #[tokio::test]
 async fn orchestration_chat_events_are_observable_from_mock_backend() {
     let mut fixture = Fixture::new().await;
-    let new_agent = spawn_token_usage_agent(
-        &mut fixture.client,
-        "mock-orchestration-agent",
-        MOCK_ORCHESTRATION_SENTINEL,
-    )
-    .await;
+    let agent = fixture
+        .spawn_scripted(
+            "mock-orchestration-agent",
+            MockScript::one(MockTurn::orchestration_started()),
+        )
+        .await;
 
-    let env = expect_chat_event_on_stream(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "mock orchestration ChatEvent",
-    )
-    .await;
-    let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+    let event = fixture
+        .next_chat_event_matching(&agent, "mock orchestration ChatEvent", |_| true)
+        .await;
     match event {
         ChatEvent::Orchestration(event) => {
             assert_eq!(event.agent_id.0, "mock-root");
@@ -1300,6 +1076,55 @@ async fn expect_completed_turn_on_stream(
     end
 }
 
+async fn expect_strict_mock_turn(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) -> StreamEndData {
+    let turn = fixture::finish_turn_on(client, stream).await;
+    let mut events = turn.chat_events().into_iter();
+    let typing = events.next();
+    assert!(
+        matches!(typing, Some(ChatEvent::TypingStatusChanged(true))),
+        "expected TypingStatusChanged(true) on {stream}, got {typing:?}"
+    );
+    let start = events.next();
+    assert!(
+        matches!(start, Some(ChatEvent::StreamStart(..))),
+        "expected StreamStart on {stream}, got {start:?}"
+    );
+    match events.next() {
+        Some(ChatEvent::StreamDelta(delta)) => assert!(
+            delta.text.contains(expected_text),
+            "unexpected delta text on {stream}: {}",
+            delta.text
+        ),
+        other => panic!("expected StreamDelta on {stream}, got {other:?}"),
+    }
+    let end = match events.next() {
+        Some(ChatEvent::StreamEnd(end)) => {
+            assert!(
+                end.message.content.contains(expected_text),
+                "unexpected stream end content on {stream}: {}",
+                end.message.content
+            );
+            end
+        }
+        other => panic!("expected StreamEnd on {stream}, got {other:?}"),
+    };
+    let idle = events.next();
+    assert!(
+        matches!(idle, Some(ChatEvent::TypingStatusChanged(false))),
+        "expected TypingStatusChanged(false) on {stream}, got {idle:?}"
+    );
+    let rest = events.collect::<Vec<_>>();
+    assert!(
+        rest.is_empty(),
+        "unexpected trailing chat events in turn on {stream}: {rest:?}"
+    );
+    end
+}
+
 async fn expect_metadata_update_and_task_token_usage_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -1330,8 +1155,7 @@ async fn expect_metadata_update_and_task_token_usage_on_stream(
             continue;
         }
         if env.kind == FrameKind::AgentBootstrap {
-            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-            let _ = record_agent_bootstrap_events(&env.stream, bootstrap);
+            let _ = fixture::buffer_agent_bootstrap_on(client, &env);
             continue;
         }
         match env.kind {
@@ -1341,6 +1165,7 @@ async fn expect_metadata_update_and_task_token_usage_on_stream(
                     ChatEvent::MessageMetadataUpdated(metadata) => update = Some(metadata),
                     ChatEvent::TypingStatusChanged(false) => typing_finished = true,
                     other => push_pending_agent_event(
+                        client,
                         protocol::Envelope::from_payload(
                             stream.clone(),
                             FrameKind::ChatEvent,
@@ -1351,7 +1176,7 @@ async fn expect_metadata_update_and_task_token_usage_on_stream(
                     ),
                 }
             }
-            FrameKind::ChatEvent => push_pending_agent_event(env),
+            FrameKind::ChatEvent => push_pending_agent_event(client, env),
             FrameKind::TaskTokenUsage => {
                 let payload: TaskTokenUsagePayload = env.parse_payload().expect("TaskTokenUsage");
                 if payload.root_agent_id == *root_agent_id
@@ -1379,18 +1204,13 @@ async fn expect_raw_agent_bootstrap_on_stream(
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
-        if fixture::is_builtin_team_custom_agent_notify(&env)
+        if fixture::is_routine_control_plane_frame(&env)
             || matches!(
                 env.kind,
-                FrameKind::SessionSettings
-                    | FrameKind::AgentsViewPreferencesNotify
+                FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::TeamPresetCatalogNotify
-                    | FrameKind::SessionSchemas
-                    | FrameKind::LaunchProfileCatalogNotify
-                    | FrameKind::BackendSetup
                     | FrameKind::BackendConfigSchemas
                     | FrameKind::BackendConfigSnapshots
-                    | FrameKind::QueuedMessages
                     | FrameKind::SessionList
                     | FrameKind::WorkflowNotify
             )
@@ -1503,7 +1323,7 @@ async fn expect_agent_control_child_initial_turn_on_stream(
                 stream,
                 message.content
             );
-            drain_pending_agent_control_child_initial_turn_trailer(stream, expected_text);
+            drain_pending_agent_control_child_initial_turn_trailer(client, stream, expected_text);
         }
         other => {
             panic!("expected agent-control child initial turn on {stream}, got {other:?}");
@@ -1535,7 +1355,11 @@ async fn expect_agent_control_child_replayed_stream_tail(
                     saw_expected_text,
                     "agent-control child stream on {stream} ended without expected text {expected_text:?}"
                 );
-                drain_pending_agent_control_child_initial_turn_trailer(stream, expected_text);
+                drain_pending_agent_control_child_initial_turn_trailer(
+                    client,
+                    stream,
+                    expected_text,
+                );
                 return;
             }
             ChatEvent::StreamReasoningDelta(_)
@@ -1550,19 +1374,20 @@ async fn expect_agent_control_child_replayed_stream_tail(
 }
 
 fn drain_pending_agent_control_child_initial_turn_trailer(
+    client: &client::Connection,
     stream: &StreamPath,
     expected_text: &str,
 ) {
-    while let Some(env) = pop_front_pending_agent_event(stream) {
+    while let Some(env) = pop_front_pending_agent_event(client, stream) {
         if env.kind != FrameKind::ChatEvent {
-            push_front_pending_agent_event(env);
+            push_front_pending_agent_event(client, env);
             return;
         }
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
         if is_agent_control_child_initial_turn_trailer(&event, expected_text) {
             continue;
         }
-        push_front_pending_agent_event(env);
+        push_front_pending_agent_event(client, env);
         return;
     }
 }
@@ -1578,55 +1403,10 @@ fn is_agent_control_child_initial_turn_trailer(event: &ChatEvent, expected_text:
     }
 }
 
-async fn expect_error_message_on_stream(
-    client: &mut client::Connection,
-    stream: &StreamPath,
-    expected_text: &str,
-) {
-    loop {
-        let env = expect_chat_event_on_stream(client, stream, "MessageAdded(Error)").await;
-        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-        if let ChatEvent::MessageAdded(message) = event
-            && matches!(message.sender, MessageSender::Error)
-        {
-            assert!(
-                message.content.contains(expected_text),
-                "unexpected error message on {}: {}",
-                stream,
-                message.content
-            );
-            return;
-        }
-    }
-}
-
 async fn expect_typing_false_on_stream(client: &mut client::Connection, stream: &StreamPath) {
     let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-}
-
-async fn expect_failed_tool_completion_on_stream(
-    client: &mut client::Connection,
-    stream: &StreamPath,
-    expected_error: &str,
-) {
-    loop {
-        let env = expect_chat_event_on_stream(client, stream, "ToolExecutionCompleted").await;
-        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-        if let ChatEvent::ToolExecutionCompleted(completion) = event {
-            assert!(
-                !completion.success,
-                "expected failed tool completion on {stream}, got {completion:?}"
-            );
-            let error = completion.error.as_deref().unwrap_or_default();
-            assert!(
-                error.contains(expected_error),
-                "unexpected tool completion error on {stream}: {error}"
-            );
-            return;
-        }
-    }
 }
 
 async fn expect_tool_request_on_stream(
@@ -1753,14 +1533,14 @@ async fn expect_chat_event_on_stream(
     context: &str,
 ) -> Envelope {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::ChatEvent) {
+        if let Some(env) = pop_pending_agent_event(client, stream, FrameKind::ChatEvent) {
             return env;
         }
         let env = expect_chat_event(client, context).await;
         if env.kind == FrameKind::ChatEvent && env.stream == *stream {
             return env;
         }
-        push_pending_agent_event(env);
+        push_pending_agent_event(client, env);
     }
 }
 
@@ -1798,7 +1578,7 @@ async fn expect_agent_error_message(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+        if let Some(env) = pop_pending_agent_event(client, stream, FrameKind::AgentError) {
             let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
             if payload.message == expected_message {
                 return payload;
@@ -1822,7 +1602,7 @@ async fn expect_agent_error_containing(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+        if let Some(env) = pop_pending_agent_event(client, stream, FrameKind::AgentError) {
             let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
             if payload.message.contains(expected_message) {
                 return payload;
@@ -1847,7 +1627,7 @@ async fn expect_agent_error_message_without(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+        if let Some(env) = pop_pending_agent_event(client, stream, FrameKind::AgentError) {
             let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
             assert_ne!(
                 payload.message, forbidden_message,
@@ -1884,19 +1664,14 @@ async fn expect_no_agent_error_message(
             Err(_) => return,
             Ok(Ok(None)) => return,
             Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
+                if fixture::is_routine_control_plane_frame(&env)
                     || matches!(
                         env.kind,
                         FrameKind::HostSettings
                             | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
                             | FrameKind::BackendConfigSchemas
                             | FrameKind::BackendConfigSnapshots
-                            | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::TaskTokenUsage
                             | FrameKind::WorkflowNotify
@@ -1929,7 +1704,7 @@ async fn expect_replayed_new_agent(
     loop {
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::NewAgent {
-            push_pending_agent_event(env);
+            push_pending_agent_event(client, env);
             continue;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
@@ -1984,7 +1759,7 @@ async fn spawn_named_session(
         "named AgentStart",
     )
     .await;
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &new_agent.instance_stream,
         &format!("mock backend response to: create session for {name}"),
@@ -2018,12 +1793,12 @@ async fn expect_agent_start_on_stream(
     context: &str,
 ) -> AgentStartPayload {
     loop {
-        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentStart) {
+        if let Some(env) = pop_pending_agent_event(client, stream, FrameKind::AgentStart) {
             return env.parse_payload().expect("parse AgentStart");
         }
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::AgentStart || env.stream != *stream {
-            push_pending_agent_event(env);
+            push_pending_agent_event(client, env);
             continue;
         }
         return env.parse_payload().expect("parse AgentStart");
@@ -2077,15 +1852,24 @@ async fn spawn_user_child(
 }
 
 async fn spawn_parent_with_native_child(
-    client: &mut client::Connection,
+    fixture: &mut Fixture,
 ) -> (
     NewAgentPayload,
     AgentStartPayload,
     NewAgentPayload,
     AgentStartPayload,
 ) {
-    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_SENTINEL}");
-    client
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-with-native-child",
+            MockScript::one(
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_native_child("mock-native-child", "parent prompt"),
+            ),
+        )
+        .await;
+    fixture
+        .client
         .spawn_agent(SpawnAgentPayload {
             name: Some("parent-with-native-child".to_owned()),
             custom_agent_id: None,
@@ -2093,7 +1877,7 @@ async fn spawn_parent_with_native_child(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/sub-agent-parent".to_owned()],
-                prompt: parent_prompt,
+                prompt: "parent prompt".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -2105,34 +1889,40 @@ async fn spawn_parent_with_native_child(
         .await
         .expect("spawn parent with native child failed");
 
-    let env = expect_next_event(client, "parent NewAgent").await;
+    let env = expect_next_event(&mut fixture.client, "parent NewAgent").await;
     assert_eq!(env.kind, FrameKind::NewAgent);
     let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
 
-    let env = expect_next_event(client, "parent AgentStart").await;
+    let env = expect_next_event(&mut fixture.client, "parent AgentStart").await;
     assert_eq!(env.kind, FrameKind::AgentStart);
     assert_eq!(env.stream, parent_new.instance_stream);
     let parent_start: AgentStartPayload = env.parse_payload().expect("parse parent AgentStart");
+    drop(reservation);
 
     expect_turn_on_stream(
-        client,
+        &mut fixture.client,
         &parent_new.instance_stream,
         "mock backend response to: parent prompt",
     )
     .await;
 
-    let child_new = expect_new_agent(client, "native child NewAgent").await;
+    let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
 
     let child_start = expect_agent_start_on_stream(
-        client,
+        &mut fixture.client,
         &child_new.instance_stream,
         "native child AgentStart",
     )
     .await;
 
-    expect_native_child_prompt_on_stream(client, &child_new.instance_stream, "parent prompt").await;
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "parent prompt",
+    )
+    .await;
     expect_turn_on_stream(
-        client,
+        &mut fixture.client,
         &child_new.instance_stream,
         "mock native child response to: parent prompt",
     )
@@ -2144,12 +1934,11 @@ async fn spawn_parent_with_native_child(
 #[tokio::test]
 async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     let mut fixture = Fixture::new().await;
-    let new_agent =
-        spawn_token_usage_agent(&mut fixture.client, "token-usage-agent", "first usage").await;
+    let agent = fixture.spawn("token-usage-agent", "first usage").await;
 
-    let first = expect_completed_turn_on_stream(
+    let first = expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: first usage",
     )
     .await;
@@ -2173,12 +1962,12 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
 
     fixture
         .client
-        .send_message(&new_agent.instance_stream, "second usage".to_owned())
+        .send_message(&agent.stream, "second usage".to_owned())
         .await
         .expect("send second usage message");
-    let second = expect_completed_turn_on_stream(
+    let second = expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: second usage",
     )
     .await;
@@ -2189,13 +1978,15 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     );
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    let late_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
-    let agent_bootstrap = expect_raw_agent_bootstrap_on_stream(
-        &mut late_client,
-        &late_agent.instance_stream,
-        "late client AgentBootstrap",
-    )
-    .await;
+    let late_agent = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
+    let env =
+        fixture::next_frame_matching_on(&mut late_client, "late client AgentBootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == late_agent.instance_stream
+        })
+        .await;
+    let agent_bootstrap: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse late client AgentBootstrap");
     let stats = agent_bootstrap
         .events
         .iter()
@@ -2213,12 +2004,18 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
 #[tokio::test]
 async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     let mut fixture = Fixture::new().await;
-    let new_agent = spawn_token_usage_agent(
-        &mut fixture.client,
-        "late-token-usage-agent",
-        &format!("first late {MOCK_LATE_USAGE_SENTINEL}"),
-    )
-    .await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "late-token-usage-agent",
+            MockScript::one(MockTurn::text_with_late_usage(
+                "mock backend response to: first late",
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
+    let new_agent =
+        spawn_token_usage_agent(&mut fixture.client, "late-token-usage-agent", "first late").await;
+    drop(reservation);
 
     let stream_end = expect_turn_stream_end_on_stream(
         &mut fixture.client,
@@ -2277,7 +2074,15 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
 #[tokio::test]
 async fn subagent_turn_token_usage_is_strictly_self() {
     let mut fixture = Fixture::new().await;
-    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_SENTINEL}");
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "strict-self-parent",
+            MockScript::one(
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_native_child("mock-native-child", "parent prompt"),
+            ),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -2287,7 +2092,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/token-sub-agent-parent".to_owned()],
-                prompt: parent_prompt,
+                prompt: "parent prompt".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -2308,6 +2113,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         "strict-self parent start",
     )
     .await;
+    drop(reservation);
     let parent_end = expect_completed_turn_on_stream(
         &mut fixture.client,
         &parent_new.instance_stream,
@@ -2363,38 +2169,25 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     assert_known_task_status(&task_usage.total.status);
 }
 
+/// The first turn's backend reports no usage: the turn surfaces as
+/// Unavailable, never zero. A later known-usage turn then leaves the task
+/// rollup Partial rather than pretending the total is complete.
 #[tokio::test]
-async fn missing_backend_usage_is_unavailable_not_zero() {
+async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_partial() {
     let mut fixture = Fixture::new().await;
-    let new_agent = spawn_token_usage_agent(
-        &mut fixture.client,
-        "unavailable-token-usage-agent",
-        &format!("missing usage {MOCK_NO_USAGE_SENTINEL}"),
-    )
-    .await;
+    let agent = fixture
+        .spawn_scripted(
+            "mixed-token-usage-agent",
+            MockScript::one(MockTurn::text_without_usage(
+                "mock backend response to: first missing usage",
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
 
-    let stream_end = expect_completed_turn_on_stream(
+    let first = expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
-        "mock backend response to: missing usage",
-    )
-    .await;
-    assert_unavailable_turn_usage(&stream_end.message.token_usage);
-}
-
-#[tokio::test]
-async fn task_token_usage_stays_partial_after_prior_missing_turn_usage() {
-    let mut fixture = Fixture::new().await;
-    let new_agent = spawn_token_usage_agent(
-        &mut fixture.client,
-        "mixed-token-usage-agent",
-        &format!("first missing usage {MOCK_NO_USAGE_SENTINEL}"),
-    )
-    .await;
-
-    let first = expect_completed_turn_on_stream(
-        &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: first missing usage",
     )
     .await;
@@ -2402,12 +2195,12 @@ async fn task_token_usage_stays_partial_after_prior_missing_turn_usage() {
 
     fixture
         .client
-        .send_message(&new_agent.instance_stream, "second known usage".to_owned())
+        .send_message(&agent.stream, "second known usage".to_owned())
         .await
         .expect("send known usage follow-up");
-    let second = expect_completed_turn_on_stream(
+    let second = expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: second known usage",
     )
     .await;
@@ -2418,7 +2211,7 @@ async fn task_token_usage_stays_partial_after_prior_missing_turn_usage() {
 
     let payload = expect_task_token_usage_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "mixed known and missing self usage",
         |payload| {
             matches!(
@@ -2460,7 +2253,7 @@ async fn task_token_usage_stays_partial_after_prior_missing_turn_usage() {
 }
 
 #[tokio::test]
-async fn task_token_usage_rolls_up_parent_child_and_grandchild() {
+async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     let mut fixture = Fixture::new().await;
     let root = spawn_token_usage_agent(&mut fixture.client, "usage-root", "root usage").await;
     let _ = expect_completed_turn_on_stream(
@@ -2537,31 +2330,108 @@ async fn task_token_usage_rolls_up_parent_child_and_grandchild() {
         MOCK_TURN_TOKEN_TOTAL * 3
     );
     assert_eq!(bootstrapped.descendant_count, 2);
+
+    fixture
+        .client
+        .send_message(&child.instance_stream, "child second usage".to_owned())
+        .await
+        .expect("send child follow-up");
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "mock backend response to: child second usage",
+    )
+    .await;
+
+    let updated = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "updated descendant aggregate",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 4,
+    )
+    .await;
+    assert_known_task_status(&updated.total.status);
+    assert_eq!(
+        updated.descendant_usage.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 3
+    );
+    let child_entry = updated
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("updated child breakdown entry");
+    assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL * 2);
+
+    fixture
+        .client
+        .close_agent(&grandchild.instance_stream)
+        .await
+        .expect("close grandchild");
+    let closed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "grandchild AgentClosed",
+    )
+    .await;
+    let closed: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
+    assert_eq!(closed.agent_id, grandchild.agent_id);
+
+    let after_close = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "aggregate after grandchild close",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 4,
+    )
+    .await;
+    assert_eq!(after_close.descendant_count, 2);
+    let grandchild_entry = after_close
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&grandchild.agent_id))
+        .expect("closed grandchild breakdown entry");
+    assert_known_task_scope(&grandchild_entry.usage, MOCK_TURN_TOKEN_TOTAL);
 }
 
+/// A descendant whose first turn reports no usage first marks the whole
+/// task Partial with an Unavailable descendant scope; once that same child
+/// completes a known-usage turn, the descendant scope becomes Partial and
+/// stays Partial after the child closes and across host bootstrap.
 #[tokio::test]
-async fn task_token_usage_marks_missing_descendant_usage_partial() {
+async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() {
     let mut fixture = Fixture::new().await;
-    let root = spawn_token_usage_agent(&mut fixture.client, "partial-root", "root usage").await;
+    let root =
+        spawn_token_usage_agent(&mut fixture.client, "partial-descendant-root", "root usage").await;
     let _ = expect_completed_turn_on_stream(
         &mut fixture.client,
         &root.instance_stream,
         "mock backend response to: root usage",
     )
     .await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "partial-descendant-child",
+            MockScript::one(MockTurn::text_without_usage(
+                "mock backend response to: child first missing usage",
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
     let child = spawn_user_child(
         &mut fixture.client,
         &root.agent_id,
-        "partial-child",
-        &format!("child missing usage {MOCK_NO_USAGE_SENTINEL}"),
-        "/tmp/partial-child",
+        "partial-descendant-child",
+        "child first missing usage",
+        "/tmp/partial-descendant-child",
     )
     .await;
+    drop(reservation);
 
-    let payload = expect_task_token_usage_matching(
+    // Before the child reports any usage, the aggregate is Partial and the
+    // descendant scope is wholly Unavailable — never a fabricated zero.
+    let missing = expect_task_token_usage_matching(
         &mut fixture.client,
         &root.agent_id,
-        "partial aggregate",
+        "missing descendant aggregate",
         |payload| {
             matches!(
                 &payload.total.status,
@@ -2573,9 +2443,9 @@ async fn task_token_usage_marks_missing_descendant_usage_partial() {
         },
     )
     .await;
-    assert_eq!(payload.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
-    assert_eq!(payload.descendant_count, 1);
-    match &payload.total.status {
+    assert_eq!(missing.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(missing.descendant_count, 1);
+    match &missing.total.status {
         TaskTokenUsageStatus::Partial {
             unavailable_count,
             reasons,
@@ -2588,7 +2458,7 @@ async fn task_token_usage_marks_missing_descendant_usage_partial() {
         }
         other => panic!("expected partial aggregate, got {other:?}"),
     }
-    match &payload.descendant_usage.status {
+    match &missing.descendant_usage.status {
         TaskTokenUsageStatus::Unavailable {
             unavailable_count,
             reasons,
@@ -2601,38 +2471,17 @@ async fn task_token_usage_marks_missing_descendant_usage_partial() {
         }
         other => panic!("expected unavailable descendant usage, got {other:?}"),
     }
-    let child_entry = payload
+    let missing_child_entry = missing
         .breakdown
         .iter()
         .find(|entry| entry.agent_id.eq(&child.agent_id))
         .expect("child breakdown entry");
     assert!(matches!(
-        child_entry.usage,
+        missing_child_entry.usage,
         TaskTokenUsageScope::Unavailable {
             reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
         }
     ));
-}
-
-#[tokio::test]
-async fn task_token_usage_marks_partial_descendant_usage_partial() {
-    let mut fixture = Fixture::new().await;
-    let root =
-        spawn_token_usage_agent(&mut fixture.client, "partial-descendant-root", "root usage").await;
-    let _ = expect_completed_turn_on_stream(
-        &mut fixture.client,
-        &root.instance_stream,
-        "mock backend response to: root usage",
-    )
-    .await;
-    let child = spawn_user_child(
-        &mut fixture.client,
-        &root.agent_id,
-        "partial-descendant-child",
-        &format!("child first missing usage {MOCK_NO_USAGE_SENTINEL}"),
-        "/tmp/partial-descendant-child",
-    )
-    .await;
 
     fixture
         .client
@@ -2807,26 +2656,44 @@ async fn task_token_usage_marks_partial_descendant_usage_partial() {
 #[tokio::test]
 async fn task_token_usage_all_unavailable_omits_split_zeroes() {
     let mut fixture = Fixture::new().await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "unavailable-root",
+            MockScript::one(MockTurn::text_without_usage(
+                "mock backend response to: root missing usage",
+            )),
+        )
+        .await;
     let root = spawn_token_usage_agent(
         &mut fixture.client,
         "unavailable-root",
-        &format!("root missing usage {MOCK_NO_USAGE_SENTINEL}"),
+        "root missing usage",
     )
     .await;
+    drop(reservation);
     let _ = expect_completed_turn_on_stream(
         &mut fixture.client,
         &root.instance_stream,
         "mock backend response to: root missing usage",
     )
     .await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "unavailable-child",
+            MockScript::one(MockTurn::text_without_usage(
+                "mock backend response to: child missing usage",
+            )),
+        )
+        .await;
     let child = spawn_user_child(
         &mut fixture.client,
         &root.agent_id,
         "unavailable-child",
-        &format!("child missing usage {MOCK_NO_USAGE_SENTINEL}"),
+        "child missing usage",
         "/tmp/unavailable-child",
     )
     .await;
+    drop(reservation);
 
     let payload = expect_task_token_usage_matching(
         &mut fixture.client,
@@ -2869,127 +2736,25 @@ async fn task_token_usage_all_unavailable_omits_split_zeroes() {
     ));
 }
 
-#[tokio::test]
-async fn task_token_usage_updates_when_child_usage_changes() {
-    let mut fixture = Fixture::new().await;
-    let root = spawn_token_usage_agent(&mut fixture.client, "update-root", "root usage").await;
-    let _ = expect_completed_turn_on_stream(
-        &mut fixture.client,
-        &root.instance_stream,
-        "mock backend response to: root usage",
-    )
-    .await;
-    let child = spawn_user_child(
-        &mut fixture.client,
-        &root.agent_id,
-        "update-child",
-        "child first usage",
-        "/tmp/update-child",
-    )
-    .await;
-    let first = expect_task_token_usage_matching(
-        &mut fixture.client,
-        &root.agent_id,
-        "initial child aggregate",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
-    )
-    .await;
-    assert_known_task_status(&first.total.status);
-
-    fixture
-        .client
-        .send_message(&child.instance_stream, "child second usage".to_owned())
-        .await
-        .expect("send child follow-up");
-    let _ = expect_completed_turn_on_stream(
-        &mut fixture.client,
-        &child.instance_stream,
-        "mock backend response to: child second usage",
-    )
-    .await;
-
-    let updated = expect_task_token_usage_matching(
-        &mut fixture.client,
-        &root.agent_id,
-        "updated child aggregate",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 3,
-    )
-    .await;
-    assert_known_task_status(&updated.total.status);
-    assert_eq!(
-        updated.descendant_usage.usage.total_tokens,
-        MOCK_TURN_TOKEN_TOTAL * 2
-    );
-    let child_entry = updated
-        .breakdown
-        .iter()
-        .find(|entry| entry.agent_id.eq(&child.agent_id))
-        .expect("child breakdown entry");
-    assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL * 2);
-}
-
-#[tokio::test]
-async fn task_token_usage_keeps_closed_child_in_live_root_rollup() {
-    let mut fixture = Fixture::new().await;
-    let root = spawn_token_usage_agent(&mut fixture.client, "closed-root", "root usage").await;
-    let _ = expect_completed_turn_on_stream(
-        &mut fixture.client,
-        &root.instance_stream,
-        "mock backend response to: root usage",
-    )
-    .await;
-    let child = spawn_user_child(
-        &mut fixture.client,
-        &root.agent_id,
-        "closed-child",
-        "child usage",
-        "/tmp/closed-child",
-    )
-    .await;
-    let before_close = expect_task_token_usage_matching(
-        &mut fixture.client,
-        &root.agent_id,
-        "aggregate before child close",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
-    )
-    .await;
-    assert_known_task_status(&before_close.total.status);
-
-    fixture
-        .client
-        .close_agent(&child.instance_stream)
-        .await
-        .expect("close child");
-    let closed = expect_kind(
-        &mut fixture.client,
-        FrameKind::AgentClosed,
-        "closed child AgentClosed",
-    )
-    .await;
-    let payload: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
-    assert_eq!(payload.agent_id, child.agent_id);
-
-    let after_close = expect_task_token_usage_matching(
-        &mut fixture.client,
-        &root.agent_id,
-        "aggregate immediately after child close",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
-    )
-    .await;
-    assert_eq!(after_close.descendant_count, 1);
-    let child_entry = after_close
-        .breakdown
-        .iter()
-        .find(|entry| entry.agent_id.eq(&child.agent_id))
-        .expect("closed child breakdown entry");
-    assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL);
-}
-
+/// The basic agent journey end to end: a client error report is accepted
+/// up front without disturbing the connection, the spawn publishes
+/// NewAgent/AgentStart with user origin and no parent, two turns stream
+/// strictly, and closing the agent emits AgentClosed, removes it from the
+/// registry, and keeps it out of late-client replays.
 #[tokio::test]
 async fn agent_lifecycle() {
     let mut fixture = Fixture::new().await;
 
-    // 1. Spawn an agent
+    send_client_error_report(
+        &mut fixture.client,
+        &ClientErrorPayload {
+            code: ClientErrorCode::ProtocolParse,
+            message: "failed to parse host frame".to_owned(),
+            raw_context: Some("{not valid protocol json".to_owned()),
+        },
+    )
+    .await;
+
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -3011,7 +2776,6 @@ async fn agent_lifecycle() {
         .await
         .expect("spawn_agent failed");
 
-    // 2. Receive NewAgent on host stream
     let env = expect_next_event(&mut fixture.client, "NewAgent").await;
 
     assert_eq!(env.kind, FrameKind::NewAgent);
@@ -3023,449 +2787,19 @@ async fn agent_lifecycle() {
     assert!(!new_agent.agent_id.0.is_empty());
     assert_eq!(new_agent.backend_kind, BackendKind::Claude);
     assert_eq!(new_agent.name, "test-agent");
+    assert_eq!(new_agent.origin, AgentOrigin::User);
+    assert_eq!(new_agent.parent_agent_id, None);
     let agent_stream = new_agent.instance_stream.clone();
 
-    // 3. Receive AgentStart
     let start =
         expect_agent_start_on_stream(&mut fixture.client, &agent_stream, "AgentStart").await;
     assert!(!start.agent_id.0.is_empty());
     assert_eq!(start.backend_kind, BackendKind::Claude);
     assert_eq!(start.name, "test-agent");
+    assert_eq!(start.origin, AgentOrigin::User);
+    assert_eq!(start.parent_agent_id, None);
 
-    // 4. Receive mock's initial turn: StreamStart → StreamDelta → StreamEnd
-    expect_turn(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: hello",
-    )
-    .await;
-
-    // 5. Send a follow-up message
-    fixture
-        .client
-        .send_message(&agent_stream, "follow up".to_owned())
-        .await
-        .expect("send_message failed");
-
-    // 6. Receive follow-up turn: StreamStart → StreamDelta → StreamEnd
-    expect_turn(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: follow up",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn agent_recovers_after_backend_error_without_idle() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("error-recovery-agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: hello",
-    )
-    .await;
-
-    fixture
-        .client
-        .send_message(&agent_stream, MOCK_ERROR_WITHOUT_IDLE_SENTINEL.to_owned())
-        .await
-        .expect("send error sentinel failed");
-
-    expect_error_message_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend emitted error without idle",
-    )
-    .await;
-    expect_typing_false_on_stream(&mut fixture.client, &agent_stream).await;
-
-    fixture
-        .client
-        .send_message(&agent_stream, "after backend error".to_owned())
-        .await
-        .expect("send follow-up failed");
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: after backend error",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn agent_recovers_after_backend_tool_failure_without_idle() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("tool-failure-recovery-agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: hello",
-    )
-    .await;
-
-    fixture
-        .client
-        .send_message(
-            &agent_stream,
-            MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL.to_owned(),
-        )
-        .await
-        .expect("send tool failure sentinel failed");
-
-    expect_failed_tool_completion_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "history did not contain a tool_result",
-    )
-    .await;
-    expect_typing_false_on_stream(&mut fixture.client, &agent_stream).await;
-
-    fixture
-        .client
-        .send_message(&agent_stream, "after backend tool failure".to_owned())
-        .await
-        .expect("send follow-up failed");
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: after backend tool failure",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn agent_mid_turn_error_is_diagnostic_and_keeps_stream_identity() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("mid-turn-error-agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: hello",
-    )
-    .await;
-
-    fixture
-        .client
-        .send_message(&agent_stream, MOCK_MID_TURN_ERROR_SENTINEL.to_owned())
-        .await
-        .expect("send mid-turn error sentinel failed");
-
-    // The turn starts normally.
-    let env = expect_chat_event_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "TypingStatusChanged(true)",
-    )
-    .await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
-    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamStart").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamStart(..)));
-    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamDelta").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamDelta(..)));
-
-    // The diagnostic error surfaces mid-turn while the backend keeps typing.
-    expect_error_message_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock mid-turn diagnostic error",
-    )
-    .await;
-
-    // The turn must still close with its own StreamEnd and then the backend
-    // idle marker. Without the backend-typing gate, the error ended the turn
-    // early: the agent synthesized idle, discarded the open stream, and the
-    // real StreamEnd surfaced as a "Stream identity violation" error card.
-    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamEnd").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(
-        matches!(event, ChatEvent::StreamEnd(..)),
-        "mid-turn error must not displace the turn's StreamEnd on {agent_stream}, got {event:?}"
-    );
-    let env = expect_chat_event_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "TypingStatusChanged(false)",
-    )
-    .await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(
-        matches!(event, ChatEvent::TypingStatusChanged(false)),
-        "turn must end via the backend idle marker on {agent_stream}, got {event:?}"
-    );
-
-    // Follow-up turns keep working.
-    fixture
-        .client
-        .send_message(&agent_stream, "after mid-turn error".to_owned())
-        .await
-        .expect("send follow-up failed");
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: after mid-turn error",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn agent_requeues_message_when_backend_is_busy_with_self_started_turn() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("busy-self-turn-agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: hello",
-    )
-    .await;
-
-    // The backend hands this send back as Busy while it runs a turn "it
-    // started on its own"; the actor must requeue the message rather than
-    // drop it or surface an error.
-    let message = format!("{MOCK_BUSY_SELF_TURN_SENTINEL} follow up");
-    fixture
-        .client
-        .send_message(&agent_stream, message.clone())
-        .await
-        .expect("send busy-time message failed");
-
-    // The self-started turn runs first…
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "mock backend response to: self-initiated wakeup",
-    )
-    .await;
-
-    // …then the requeued message is delivered as its own turn, with no
-    // error cards in between (expect_turn_on_stream is strict about the
-    // event sequence).
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        &format!("mock backend response to: {message}"),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn client_error_report_is_accepted_before_agent_flow() {
-    let mut fixture = Fixture::new().await;
-
-    send_client_error_report(
-        &mut fixture.client,
-        &ClientErrorPayload {
-            code: ClientErrorCode::ProtocolParse,
-            message: "failed to parse host frame".to_owned(),
-            raw_context: Some("{not valid protocol json".to_owned()),
-        },
-    )
-    .await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("after-client-error-report".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/client-error-report".to_owned()],
-                prompt: "hello after client error report".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent after client error report failed");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent after client error report").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env
-        .parse_payload()
-        .expect("parse NewAgent after client error report");
-    assert_eq!(new_agent.name, "after-client-error-report");
-
-    expect_agent_start_on_stream(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "AgentStart after client error report",
-    )
-    .await;
-
-    expect_turn(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "mock backend response to: hello after client error report",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("close-me".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "close-agent NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse close-agent NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    expect_agent_start_on_stream(&mut fixture.client, &agent_stream, "close-agent AgentStart")
-        .await;
-
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &agent_stream,
         "mock backend response to: hello",
@@ -3478,11 +2812,26 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
 
     fixture
         .client
+        .send_message(&agent_stream, "follow up".to_owned())
+        .await
+        .expect("send_message failed");
+
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: follow up",
+    )
+    .await;
+
+    fixture
+        .client
         .close_agent(&agent_stream)
         .await
         .expect("close_agent failed");
 
-    let env = expect_kind(&mut fixture.client, FrameKind::AgentClosed, "AgentClosed").await;
+    let env = fixture
+        .next_frame_matching("AgentClosed", |env| env.kind == FrameKind::AgentClosed)
+        .await;
     let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
     assert_eq!(closed.agent_id, new_agent.agent_id);
     assert!(
@@ -3504,11 +2853,228 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
 }
 
 #[tokio::test]
+async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
+    let mut fixture = Fixture::new().await;
+    let agent = fixture.spawn("backend-recovery-agent", "hello").await;
+
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue_all([
+            MockTurn::error_card("mock backend emitted error without idle"),
+            MockTurn::echo(),
+            MockTurn::tool_failure_without_idle(),
+            MockTurn::echo(),
+            MockTurn::text_with_mid_turn_error(
+                "mock backend response to: mid-turn error",
+                "mock mid-turn diagnostic error",
+            ),
+            MockTurn::echo(),
+        ])
+        .await;
+
+    fixture
+        .client
+        .send_message(&agent.stream, "trigger backend error".to_owned())
+        .await
+        .expect("send backend error trigger failed");
+    let event = fixture
+        .next_chat_event_matching(&agent, "MessageAdded(Error)", |event| {
+            matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error)
+            )
+        })
+        .await;
+    let ChatEvent::MessageAdded(message) = event else {
+        unreachable!("matched MessageAdded above");
+    };
+    assert!(
+        message
+            .content
+            .contains("mock backend emitted error without idle"),
+        "unexpected error message on {}: {}",
+        agent.stream,
+        message.content
+    );
+    let event = fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(false)", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+
+    fixture
+        .client
+        .send_message(&agent.stream, "after backend error".to_owned())
+        .await
+        .expect("send follow-up failed");
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: after backend error",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&agent.stream, "trigger backend tool failure".to_owned())
+        .await
+        .expect("send backend tool failure trigger failed");
+    let event = fixture
+        .next_chat_event_matching(&agent, "ToolExecutionCompleted", |event| {
+            matches!(event, ChatEvent::ToolExecutionCompleted(_))
+        })
+        .await;
+    let ChatEvent::ToolExecutionCompleted(completion) = event else {
+        unreachable!("matched ToolExecutionCompleted above");
+    };
+    assert!(
+        !completion.success,
+        "expected failed tool completion on {}, got {completion:?}",
+        agent.stream
+    );
+    let error = completion.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("history did not contain a tool_result"),
+        "unexpected tool completion error on {}: {error}",
+        agent.stream
+    );
+    let event = fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(false)", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+
+    fixture
+        .client
+        .send_message(&agent.stream, "after backend tool failure".to_owned())
+        .await
+        .expect("send tool-failure follow-up failed");
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: after backend tool failure",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&agent.stream, "trigger mid-turn error".to_owned())
+        .await
+        .expect("send mid-turn error trigger failed");
+    let event = fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    let event = fixture
+        .next_chat_event_matching(&agent, "StreamStart", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::StreamStart(..)));
+    let event = fixture
+        .next_chat_event_matching(&agent, "StreamDelta", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::StreamDelta(..)));
+    let event = fixture
+        .next_chat_event_matching(&agent, "MessageAdded(Error)", |event| {
+            matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error)
+            )
+        })
+        .await;
+    let ChatEvent::MessageAdded(message) = event else {
+        unreachable!("matched MessageAdded above");
+    };
+    assert!(
+        message.content.contains("mock mid-turn diagnostic error"),
+        "unexpected error message on {}: {}",
+        agent.stream,
+        message.content
+    );
+    let event = fixture
+        .next_chat_event_matching(&agent, "StreamEnd", |_| true)
+        .await;
+    assert!(
+        matches!(event, ChatEvent::StreamEnd(..)),
+        "mid-turn error must not displace the turn's StreamEnd on {}, got {event:?}",
+        agent.stream
+    );
+    let event = fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(false)", |_| true)
+        .await;
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(false)),
+        "turn must end via the backend idle marker on {}, got {event:?}",
+        agent.stream
+    );
+
+    fixture
+        .client
+        .send_message(&agent.stream, "after mid-turn error".to_owned())
+        .await
+        .expect("send mid-turn follow-up failed");
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: after mid-turn error",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_requeues_message_when_backend_is_busy_with_self_started_turn() {
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "busy-self-turn-agent",
+            MockScript::one(MockTurn::text("mock backend response to: hello"))
+                .with_unbounded_echo()
+                .with_busy_self_turn_once(),
+        )
+        .await;
+
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    let message = "follow up".to_owned();
+    fixture
+        .client
+        .send_message(&agent.stream, message.clone())
+        .await
+        .expect("send busy-time message failed");
+
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        "mock backend response to: self-initiated wakeup",
+    )
+    .await;
+
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &agent.stream,
+        &format!("mock backend response to: {message}"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn close_agent_recursively_closes_descendants_first() {
     let mut fixture = Fixture::new().await;
 
     let (parent_new, _parent_start, relay_child_new, _relay_child_start) =
-        spawn_parent_with_native_child(&mut fixture.client).await;
+        spawn_parent_with_native_child(&mut fixture).await;
     let user_child_new = spawn_user_child(
         &mut fixture.client,
         &parent_new.agent_id,
@@ -3612,14 +3178,14 @@ async fn close_agent_recursively_closes_descendants_first() {
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
     let host_stream = single_host_stream(client);
     loop {
-        if let Some(env) = pop_pending_agent_event(&host_stream, FrameKind::NewAgent) {
+        if let Some(env) = pop_pending_agent_event(client, &host_stream, FrameKind::NewAgent) {
             return env.parse_payload().expect("parse pending NewAgent");
         }
         let env = expect_next_event(client, context).await;
         if env.kind == FrameKind::NewAgent {
             return env.parse_payload().expect("parse NewAgent");
         }
-        push_pending_agent_event(env);
+        push_pending_agent_event(client, env);
     }
 }
 
@@ -3628,12 +3194,19 @@ async fn expect_new_agent(client: &mut client::Connection, context: &str) -> New
 /// [`spawn_user_child`] waits for the child's turn to complete, so it cannot
 /// produce the busy child this test needs.
 async fn spawn_busy_user_child(
-    client: &mut client::Connection,
+    fixture: &mut Fixture,
     parent_agent_id: &protocol::AgentId,
     name: &str,
     workspace_root: &str,
 ) -> NewAgentPayload {
-    client
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            name,
+            MockScript::one(MockTurn::held_text(format!("{name} working"))),
+        )
+        .await;
+    fixture
+        .client
         .spawn_agent(SpawnAgentPayload {
             name: Some(name.to_owned()),
             custom_agent_id: None,
@@ -3641,7 +3214,7 @@ async fn spawn_busy_user_child(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec![workspace_root.to_owned()],
-                prompt: format!("__mock_hold_until_interrupt__ {name} working"),
+                prompt: format!("{name} working"),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -3653,13 +3226,17 @@ async fn spawn_busy_user_child(
         .await
         .unwrap_or_else(|error| panic!("spawn {name} failed: {error:?}"));
 
-    let child_new = expect_new_agent(client, &format!("{name} NewAgent")).await;
-    let _ =
-        expect_agent_start_on_stream(client, &child_new.instance_stream, &format!("{name} start"))
-            .await;
+    let child_new = expect_new_agent(&mut fixture.client, &format!("{name} NewAgent")).await;
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        &format!("{name} start"),
+    )
+    .await;
+    drop(reservation);
 
     let env = expect_chat_event_on_stream(
-        client,
+        &mut fixture.client,
         &child_new.instance_stream,
         &format!("{name} TypingStatusChanged(true)"),
     )
@@ -3688,6 +3265,12 @@ async fn spawn_busy_user_child(
 async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
     let mut fixture = Fixture::new().await;
 
+    let parent_reservation = fixture
+        .reserve_next_mock_launch(
+            "busy-close-parent",
+            MockScript::one(MockTurn::held_text("parent awaiting children")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -3697,7 +3280,7 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/busy-close-parent".to_owned()],
-                prompt: "__mock_hold_until_interrupt__ parent awaiting children".to_owned(),
+                prompt: "parent awaiting children".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -3716,6 +3299,7 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
         "busy-close parent start",
     )
     .await;
+    drop(parent_reservation);
     let env = expect_chat_event_on_stream(
         &mut fixture.client,
         &parent_new.instance_stream,
@@ -3726,14 +3310,14 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
 
     let first_child = spawn_busy_user_child(
-        &mut fixture.client,
+        &mut fixture,
         &parent_new.agent_id,
         "busy-close-child-one",
         "/tmp/busy-close-child-one",
     )
     .await;
     let second_child = spawn_busy_user_child(
-        &mut fixture.client,
+        &mut fixture,
         &parent_new.agent_id,
         "busy-close-child-two",
         "/tmp/busy-close-child-two",
@@ -3804,60 +3388,33 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
     }
 }
 
-/// A closing agent must not be able to grow the subtree being torn down.
-///
-/// `close_agent` snapshots the subtree once, so a child spawned after that
-/// snapshot is never part of the teardown — it outlives the parent that owns
-/// it. A real orchestrator spawned a fresh child 69 seconds after it was told
-/// to close.
 #[tokio::test]
 async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
     let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("closing-spawn-parent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/closing-spawn-parent".to_owned()],
-                prompt: "__mock_ignore_interrupt__ parent never settles".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn closing-spawn parent failed");
-
-    let parent_new = expect_new_agent(&mut fixture.client, "closing-spawn parent NewAgent").await;
-    let _ = expect_agent_start_on_stream(
-        &mut fixture.client,
-        &parent_new.instance_stream,
-        "closing-spawn parent start",
-    )
-    .await;
-    let env = expect_chat_event_on_stream(
-        &mut fixture.client,
-        &parent_new.instance_stream,
-        "closing-spawn parent TypingStatusChanged(true)",
-    )
-    .await;
-    let event: ChatEvent = env.parse_payload().expect("parse parent typing true");
+    let parent = fixture
+        .spawn_scripted(
+            "closing-spawn-parent",
+            MockScript::one(MockTurn::held_text_uninterruptible(
+                "mock backend held response to: parent never settles",
+            )),
+        )
+        .await;
+    let event = fixture
+        .next_chat_event_matching(
+            &parent,
+            "closing-spawn parent TypingStatusChanged(true)",
+            |_| true,
+        )
+        .await;
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
 
-    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let caller = fixture
+        .agent_control_caller(&parent.new_agent.agent_id)
+        .await;
 
-    // The mock ignores the close interrupt, so the parent stays closing for the
-    // whole grace period — the window in which it used to keep spawning.
     fixture
         .client
-        .close_agent(&parent_new.instance_stream)
+        .close_agent(&parent.stream)
         .await
         .expect("close closing-spawn parent failed");
 
@@ -3865,7 +3422,9 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
         &caller,
         json!({
             "workspace_roots": ["/tmp/closing-spawn-child"],
-            "prompt": "__mock_slow__ child of a closing parent",
+            // The spawn is refused while the parent is closing, so this prompt
+            // never reaches a backend; it needs no scripted behavior.
+            "prompt": "child of a closing parent",
             "backend_kind": "claude",
             "name": "closing-spawn-child"
         }),
@@ -3880,78 +3439,50 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
 #[tokio::test]
 async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
     let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "close-mid-turn",
+            MockScript::one(MockTurn::gated_text("close mid turn response", &gate)),
+        )
+        .await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("close-mid-turn".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "__mock_slow__ close mid turn".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent failed");
-
-    let env = expect_next_event(&mut fixture.client, "close-mid-turn NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse close-mid-turn NewAgent");
-    let agent_stream = new_agent.instance_stream.clone();
-
-    let env = expect_next_event(&mut fixture.client, "close-mid-turn AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-
-    let env = expect_chat_event_on_stream(
-        &mut fixture.client,
-        &agent_stream,
-        "TypingStatusChanged(true)",
-    )
-    .await;
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("parse close-mid-turn typing true");
+    let event = fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |_| true)
+        .await;
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
 
+    gate.wait_until_entered().await;
+
     fixture
         .client
-        .close_agent(&agent_stream)
+        .close_agent(&agent.stream)
         .await
         .expect("close_agent failed");
+    gate.release_one();
 
     let mut saw_stream_start = false;
     let mut saw_stream_delta = false;
     let mut saw_stream_end = false;
     let mut saw_typing_false = false;
 
-    loop {
-        let env = expect_next_event(&mut fixture.client, "close-mid-turn trailing events").await;
-        if env.kind == FrameKind::AgentClosed {
-            let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
-            assert_eq!(closed.agent_id, new_agent.agent_id);
-            break;
-        }
-        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse close-mid-turn ChatEvent");
-        match event {
-            ChatEvent::StreamStart(_) => saw_stream_start = true,
-            ChatEvent::StreamDelta(_) => saw_stream_delta = true,
-            ChatEvent::StreamEnd(_) => saw_stream_end = true,
-            ChatEvent::TypingStatusChanged(false) => saw_typing_false = true,
-            _ => {}
-        }
-    }
+    let env = fixture
+        .next_frame_matching("close-mid-turn AgentClosed", |env| {
+            if env.kind == FrameKind::ChatEvent && env.stream == agent.stream {
+                let event: ChatEvent = env.parse_payload().expect("parse close-mid-turn ChatEvent");
+                match event {
+                    ChatEvent::StreamStart(_) => saw_stream_start = true,
+                    ChatEvent::StreamDelta(_) => saw_stream_delta = true,
+                    ChatEvent::StreamEnd(_) => saw_stream_end = true,
+                    ChatEvent::TypingStatusChanged(false) => saw_typing_false = true,
+                    _ => {}
+                }
+            }
+            env.kind == FrameKind::AgentClosed
+        })
+        .await;
+    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+    assert_eq!(closed.agent_id, agent.new_agent.agent_id);
 
     assert!(saw_stream_start, "close should not drop StreamStart");
     assert!(saw_stream_delta, "close should not drop StreamDelta");
@@ -3965,15 +3496,21 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
 #[tokio::test]
 async fn agent_control_end_to_end_flow_uses_full_stack() {
     let mut fixture = Fixture::new().await;
-    fixture
+    let write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("enable Claude for launch-profile catalog");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &write_id,
+        "enable Claude for launch-profile catalog",
+    )
+    .await;
     let control = fixture.connect_agent_control().await;
     let options = control.list_launch_options();
     assert!(
@@ -4050,81 +3587,18 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
 }
 
 #[tokio::test]
-async fn agent_control_dev_driver_spawns_explicit_hermes_launch_profile_after_schema_refresh() {
-    let mut fixture = Fixture::new().await;
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::LaunchProfiles {
-                profiles: vec![hermes_claude_launch_profile()],
-            },
-        })
-        .await
-        .expect("configure explicit Hermes launch profile");
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Hermes],
-            },
-        })
-        .await
-        .expect("enable Hermes");
-
-    wait_for_ready_launch_profile(&mut fixture.client, "hermes:claude").await;
-
-    let control = fixture.connect_agent_control().await;
-    let options = control.list_launch_options();
-    assert!(
-        options.catalog.entries.iter().any(|entry| {
-            matches!(
-                entry,
-                protocol::LaunchProfileEntry::Ready { profile }
-                    if profile.id.0 == "hermes:claude"
-                        && profile.kind == LaunchProfileKind::Custom
-                        && profile.backend_kind == BackendKind::Hermes
-                        && profile.session_settings == hermes_claude_session_settings()
-            )
-        }),
-        "dev-driver launch options should include ready hermes:claude"
-    );
-
-    let spawned = control
-        .spawn_agent(SpawnRequest {
-            workspace_roots: vec!["/tmp/agent-control-hermes-dev-driver".to_owned()],
-            prompt: "agent control explicit Hermes launch profile".to_owned(),
-            backend_kind: BackendKind::Hermes,
-            launch_profile_id: Some(LaunchProfileId("hermes:claude".to_owned())),
-            session_settings: None,
-            parent_agent_id: None,
-            project_id: None,
-            name: Some("explicit-hermes-dev-driver".to_owned()),
-            cost_hint: None,
-            access_mode: Default::default(),
-        })
-        .await
-        .expect("agent control spawn should succeed");
-
-    await_dev_driver_agent_ready(
-        &control,
-        &spawned.agent_id,
-        "explicit Hermes launch-profile turn",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn agent_control_http_discovers_and_spawns_launch_profiles() {
     let mut fixture = Fixture::new().await;
-    fixture
+    let write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("enable Claude");
+    expect_settings_write_applied(&mut fixture.client, &write_id, "enable Claude").await;
 
     let parent = spawn_agent_control_parent(&mut fixture, "launch-profile-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
@@ -4157,25 +3631,35 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
     assert_await_result_ready(&awaited, &agent_id);
 }
 
+/// An explicitly configured Hermes launch profile becomes Ready after the
+/// schema refresh and both agent-control surfaces can discover and spawn
+/// it: the HTTP MCP surface (catalog listing + spawn + await) and the
+/// dev-driver surface (launch options + spawn + await).
 #[tokio::test]
-async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_refresh() {
+async fn explicit_hermes_launch_profile_spawns_on_http_and_dev_driver_surfaces() {
     let mut fixture = Fixture::new().await;
-    fixture
+    let profile_write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::LaunchProfiles {
-                profiles: vec![hermes_claude_launch_profile()],
-            },
-        })
+        .replace_setting(
+            "/launch_profiles/hermes:claude",
+            hermes_claude_launch_profile(),
+            serde_json::Value::Null,
+        )
         .await
         .expect("configure explicit Hermes launch profile");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &profile_write_id,
+        "configure explicit Hermes launch profile",
+    )
+    .await;
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Hermes],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Hermes],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("enable Hermes");
 
@@ -4222,6 +3706,67 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
     .await;
     let awaited = mcp_await_agent(&caller, &agent_id).await;
     assert_await_result_ready(&awaited, &agent_id);
+
+    let control = fixture.connect_agent_control().await;
+    let options = control.list_launch_options();
+    assert!(
+        options.catalog.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                protocol::LaunchProfileEntry::Ready { profile }
+                    if profile.id.0 == "hermes:claude"
+                        && profile.kind == LaunchProfileKind::Custom
+                        && profile.backend_kind == BackendKind::Hermes
+                        && profile.session_settings == hermes_claude_session_settings()
+            )
+        }),
+        "dev-driver launch options should include ready hermes:claude"
+    );
+
+    // The HTTP phase already created agents, so the awaited id must be
+    // proven to be the dev-driver spawn: a new agent id carrying the
+    // requested name and Hermes profile-visible properties, not a reused
+    // pre-existing ready agent.
+    let ids_before_dev_driver_spawn = fixture.agent_ids().await;
+    let spawned = control
+        .spawn_agent(SpawnRequest {
+            workspace_roots: vec!["/tmp/agent-control-hermes-dev-driver".to_owned()],
+            prompt: "agent control explicit Hermes launch profile".to_owned(),
+            backend_kind: BackendKind::Hermes,
+            launch_profile_id: Some(LaunchProfileId("hermes:claude".to_owned())),
+            session_settings: None,
+            parent_agent_id: None,
+            project_id: None,
+            name: Some("explicit-hermes-dev-driver".to_owned()),
+            cost_hint: None,
+            access_mode: Default::default(),
+        })
+        .await
+        .expect("agent control spawn should succeed");
+    assert!(
+        !ids_before_dev_driver_spawn.contains(&protocol::AgentId(spawned.agent_id.clone())),
+        "dev-driver spawn must create a new agent, not reuse an existing ready one"
+    );
+    assert_eq!(spawned.name, "explicit-hermes-dev-driver");
+    let dev_driver_agent = control
+        .list_agents()
+        .await
+        .into_iter()
+        .find(|agent| agent.agent_id == spawned.agent_id)
+        .expect("dev-driver spawn missing from agent list");
+    assert_eq!(dev_driver_agent.name, "explicit-hermes-dev-driver");
+    assert_eq!(dev_driver_agent.backend_kind, BackendKind::Hermes);
+    assert_eq!(
+        dev_driver_agent.workspace_roots,
+        vec!["/tmp/agent-control-hermes-dev-driver".to_owned()]
+    );
+
+    await_dev_driver_agent_ready(
+        &control,
+        &spawned.agent_id,
+        "explicit Hermes launch-profile turn",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4230,6 +3775,14 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     let parent = spawn_agent_control_parent(&mut fixture, "plan-await-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "await-exit-plan-mode",
+            MockScript::one(MockTurn::exit_plan_request("epm-await", "# mock plan"))
+                .then(MockTurn::text("mock ExitPlanMode approved"))
+                .then(MockTurn::text("follow-up response after plan approval")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -4239,7 +3792,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode".to_owned()],
-                prompt: "__mock_exit_plan_mode__".to_owned(),
+                prompt: "request plan approval".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -4262,6 +3815,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     )
     .await;
     assert_eq!(start.agent_id, new_agent.agent_id);
+    drop(reservation);
 
     let request =
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
@@ -4342,7 +3896,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     expect_turn_on_stream(
         &mut fixture.client,
         &new_agent.instance_stream,
-        "mock backend response to: after plan approval",
+        "follow-up response after plan approval",
     )
     .await;
 }
@@ -4353,6 +3907,20 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     let parent = spawn_agent_control_parent(&mut fixture, "resuming-await-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
+    let gate_before_completion = MockGateHandle::new();
+    let gate_after_completion = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "await-exit-plan-mode-resume",
+            MockScript::one(MockTurn::exit_plan_request_stream_end_first(
+                "mock-exit-plan-tool",
+                "# Plan\n\nApprove the mock plan.",
+                &gate_before_completion,
+                &gate_after_completion,
+            ))
+            .then(MockTurn::text("mock ExitPlanMode approved")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -4362,7 +3930,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode-resume".to_owned()],
-                prompt: "__mock_exit_plan_mode_stream_end_first__".to_owned(),
+                prompt: "request plan approval".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -4391,6 +3959,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     )
     .await;
     assert_eq!(start.agent_id, new_agent.agent_id);
+    drop(reservation);
 
     let request =
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
@@ -4429,6 +3998,8 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         Duration::from_millis(500),
     )
     .await;
+    gate_before_completion.wait_until_entered().await;
+    gate_before_completion.release_one();
 
     let mut saw_completion = false;
     while !saw_completion {
@@ -4446,6 +4017,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
             saw_completion = true;
         }
     }
+    gate_after_completion.wait_until_entered().await;
 
     wait_for_agent_control_status(
         &caller,
@@ -4464,6 +4036,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         await_while_resuming.is_err(),
         "tyde_await_agents must not report ready between plan approval completion and resumed turn finish"
     );
+    gate_after_completion.release_one();
 
     let mut saw_approval = false;
     let mut saw_final_idle = false;
@@ -4533,6 +4106,13 @@ async fn agent_control_spawn_without_name_returns_generated_name() {
 async fn agent_control_http_binds_parent_to_authenticated_caller() {
     let mut fixture = Fixture::new().await;
 
+    let parent_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "mcp-parent",
+            MockScript::one(MockTurn::gated_text("parent stays active", &parent_gate)),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -4542,7 +4122,7 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/mcp-parent".to_owned()],
-                prompt: "__mock_slow__ parent stays active".to_owned(),
+                prompt: "parent stays active".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -4562,6 +4142,9 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
     assert_eq!(env.kind, FrameKind::AgentStart);
     let parent_start: AgentStartPayload = env.parse_payload().expect("parse mcp parent AgentStart");
     assert_eq!(parent_start.parent_agent_id, None);
+    drop(reservation);
+
+    parent_gate.wait_until_entered().await;
 
     let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
     let child_agent_id = mcp_spawn_agent_as(
@@ -4594,6 +4177,8 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
         Some(&parent_new.agent_id)
     );
     assert_eq!(child_start.project_id, None);
+
+    parent_gate.release_one();
 }
 
 #[tokio::test]
@@ -4754,13 +4339,18 @@ async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
     .await;
     let empty_ready = mcp_await_agent(&caller, &empty_child).await;
     assert_await_result_ready(&empty_ready, &empty_child);
+    fixture
+        .mock_by_id(&empty_child)
+        .await
+        .enqueue(MockTurn::empty_agent_control_output())
+        .await;
     let send_empty = mcp_tool_call_as(
         &caller,
         false,
         "tyde_send_agent_message",
         json!({
             "agent_id": empty_child.0,
-            "message": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL
+            "message": "produce empty output"
         }),
     )
     .await;
@@ -4812,17 +4402,25 @@ async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
     .await;
     let initially_ready = mcp_await_agent(&caller, &failed_child).await;
     assert_await_result_ready(&initially_ready, &failed_child);
+    let close_gate = MockGateHandle::new();
+    fixture
+        .mock_by_id(&failed_child)
+        .await
+        .enqueue(MockTurn::busy_then_close_stream(&close_gate))
+        .await;
     let terminate = mcp_tool_call_as(
         &caller,
         false,
         "tyde_send_agent_message",
         json!({
             "agent_id": failed_child.0,
-            "message": "__mock_die_after_busy__"
+            "message": "terminate the backend"
         }),
     )
     .await;
     assert!(!mcp_result_is_error(&terminate));
+    close_gate.wait_until_entered().await;
+    close_gate.release_one();
     let failed_ready = mcp_await_agent(&caller, &failed_child).await;
     assert_eq!(failed_ready["ready"][0]["status"], "failed");
 
@@ -4851,26 +4449,40 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     let caller_a = fixture.agent_control_caller(&parent_a.agent_id).await;
     let caller_b = fixture.agent_control_caller(&parent_b.agent_id).await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "credential-child-a",
+            MockScript::one(MockTurn::empty_agent_control_output()),
+        )
+        .await;
     let child_a = mcp_spawn_agent_as(
         &caller_a,
         json!({
             "workspace_roots": ["/tmp/credential-child-a"],
-            "prompt": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL,
+            "prompt": "credential child a",
             "backend_kind": "claude",
             "name": "credential-child-a"
         }),
     )
     .await;
+    drop(reservation);
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "credential-child-b",
+            MockScript::one(MockTurn::empty_agent_control_output()),
+        )
+        .await;
     let child_b = mcp_spawn_agent_as(
         &caller_b,
         json!({
             "workspace_roots": ["/tmp/credential-child-b"],
-            "prompt": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL,
+            "prompt": "credential child b",
             "backend_kind": "claude",
             "name": "credential-child-b"
         }),
     )
     .await;
+    drop(reservation);
     let _ = mcp_await_agent(&caller_a, &child_a).await;
     let _ = mcp_await_agent(&caller_b, &child_b).await;
 
@@ -4972,16 +4584,23 @@ async fn agent_control_await_endpoint_isolated_and_remains_pending() {
     let mut fixture = Fixture::new().await;
     let parent = spawn_agent_control_parent(&mut fixture, "isolated-await-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "isolated-await-child",
+            MockScript::one(MockTurn::held_text("isolated await holding")),
+        )
+        .await;
     let held_child = mcp_spawn_agent_as(
         &caller,
         json!({
             "workspace_roots": ["/tmp/isolated-await-child"],
-            "prompt": "__mock_hold_until_interrupt__ isolated await",
+            "prompt": "isolated await",
             "backend_kind": "claude",
             "name": "isolated-await-child"
         }),
     )
     .await;
+    drop(reservation);
     let held_new = expect_replayed_new_agent(
         &mut fixture.client,
         &held_child,
@@ -5036,6 +4655,12 @@ async fn agent_control_http_await_emits_progress_notifications() {
     let parent = spawn_agent_control_parent(&mut fixture, "await-progress-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "await-progress",
+            MockScript::one(MockTurn::held_text("await progress holding")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -5045,7 +4670,7 @@ async fn agent_control_http_await_emits_progress_notifications() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-progress".to_owned()],
-                prompt: "__mock_hold_until_interrupt__ await progress".to_owned(),
+                prompt: "await progress".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -5060,6 +4685,7 @@ async fn agent_control_http_await_emits_progress_notifications() {
     let env = expect_next_event(&mut fixture.client, "await progress NewAgent").await;
     assert_eq!(env.kind, FrameKind::NewAgent);
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse await progress NewAgent");
+    drop(reservation);
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let bearer = caller
@@ -5200,6 +4826,12 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
 
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "await-tool-child",
+            MockScript::one(MockTurn::held_text("child awaited holding")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -5209,7 +4841,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-tool-child".to_owned()],
-                prompt: "__mock_hold_until_interrupt__ child awaited".to_owned(),
+                prompt: "child awaited".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -5240,11 +4872,12 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
         child_start.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id)
     );
+    drop(reservation);
 
     expect_stream_end_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
-        "mock backend held response to: __mock_hold_until_interrupt__ child awaited",
+        "child awaited holding",
     )
     .await;
 
@@ -5258,14 +4891,13 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
 
     fixture
+        .mock_by_id(&parent_new.agent_id)
+        .await
+        .enqueue(MockTurn::agent_control_await([child_new.agent_id.clone()]))
+        .await;
+    fixture
         .client
-        .send_message(
-            &parent_new.instance_stream,
-            format!(
-                "{} {}",
-                MOCK_AGENT_CONTROL_AWAIT_SENTINEL, child_new.agent_id.0
-            ),
-        )
+        .send_message(&parent_new.instance_stream, "await for child".to_owned())
         .await
         .expect("send parent await tool prompt");
 
@@ -5288,27 +4920,39 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
         }
     );
 
-    fixture
+    let stall_seconds_write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1 },
-        })
+        .replace_setting("/supervisor/stall_timeout_seconds", 1_u32, 1_800_u32)
         .await
         .expect("set supervisor stall timeout");
-    fixture
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &stall_seconds_write_id,
+        "set supervisor stall timeout",
+    )
+    .await;
+    let stall_enabled_write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
-        })
+        .replace_setting("/supervisor/stall_timeout_enabled", true, false)
         .await
         .expect("enable supervisor stall timeout");
-    fixture
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &stall_enabled_write_id,
+        "enable supervisor stall timeout",
+    )
+    .await;
+    let supervisor_write_id = fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::SupervisorEnabled { enabled: true },
-        })
+        .replace_setting("/supervisor/enabled", true, false)
         .await
         .expect("enable supervisor");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &supervisor_write_id,
+        "enable supervisor",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
     fixture
@@ -5397,23 +5041,34 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
     let message = "# Follow up\n\n- preserve `markdown`\n- keep exact bytes";
 
     fixture
+        .mock_by_id(&parent.agent_id)
+        .await
+        .enqueue(MockTurn::agent_control_send_message(
+            recipient.clone(),
+            message,
+        ))
+        .await;
+    fixture
         .client
-        .send_message(
-            &parent.instance_stream,
-            format!(
-                "{MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL} {} {message}",
-                recipient.0
-            ),
-        )
+        .send_message(&parent.instance_stream, "send typed message".to_owned())
         .await
         .expect("send typed agent-control message fixture");
 
-    let request = expect_tool_request_on_stream(
+    let event = fixture::next_chat_event_matching_on(
         &mut fixture.client,
         &parent.instance_stream,
-        "tyde_send_agent_message",
+        "tyde_send_agent_message ToolRequest",
+        |event| {
+            matches!(
+                event,
+                ChatEvent::ToolRequest(request) if request.tool_name == "tyde_send_agent_message"
+            )
+        },
     )
     .await;
+    let ChatEvent::ToolRequest(request) = event else {
+        unreachable!("matched ToolRequest above");
+    };
     assert_eq!(request.tool_name, "tyde_send_agent_message");
     assert_eq!(
         request.tool_type,
@@ -5422,33 +5077,64 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
             message: message.to_owned(),
         }
     );
-    let completion = expect_tool_completion_on_stream(
+    let event = fixture::next_chat_event_matching_on(
         &mut fixture.client,
         &parent.instance_stream,
-        &request.tool_call_id,
+        "tyde_send_agent_message ToolExecutionCompleted",
+        |event| {
+            matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == request.tool_call_id
+            )
+        },
     )
     .await;
+    let ChatEvent::ToolExecutionCompleted(completion) = event else {
+        unreachable!("matched ToolExecutionCompleted above");
+    };
     assert!(completion.success);
     assert_eq!(
         completion.tool_result,
         ToolExecutionResult::TydeSendAgentMessage
     );
-    expect_stream_end_on_stream(
+    let event = fixture::next_chat_event_matching_on(
         &mut fixture.client,
         &parent.instance_stream,
-        "mock agent-control message delivered",
+        "delivery StreamEnd",
+        |event| matches!(event, ChatEvent::StreamEnd(_)),
     )
     .await;
-    expect_typing_false_on_stream(&mut fixture.client, &parent.instance_stream).await;
+    let ChatEvent::StreamEnd(end) = event else {
+        unreachable!("matched StreamEnd above");
+    };
+    assert!(
+        end.message
+            .content
+            .contains("mock agent-control message delivered"),
+        "unexpected StreamEnd text on {}: {}",
+        parent.instance_stream,
+        end.message.content
+    );
+    let event = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "TypingStatusChanged(false)",
+        |_| true,
+    )
+    .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     let replayed_parent = bootstrapped_agent(&bootstrap, &parent.agent_id);
-    let replay = expect_raw_agent_bootstrap_on_stream(
-        &mut late_client,
-        &replayed_parent.instance_stream,
-        "typed send-message replay",
-    )
-    .await;
+    let env =
+        fixture::next_frame_matching_on(&mut late_client, "typed send-message replay", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == replayed_parent.instance_stream
+        })
+        .await;
+    let replay: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse typed send-message replay AgentBootstrap");
     assert!(replay.events.iter().any(|event| matches!(
         event,
         AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(ToolRequest {
@@ -5468,9 +5154,38 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
     )));
 }
 
+/// An explicit `parent_agent_id` tool argument requires an agent-control
+/// bearer credential (an unauthenticated caller is refused with the typed
+/// message) and, when the authenticated parent passes its own id, the child
+/// binds to that parent and inherits its project.
 #[tokio::test]
-async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments() {
+async fn agent_control_http_explicit_parent_requires_bearer_and_binds_child() {
     let mut fixture = Fixture::new().await;
+
+    let base_url = fixture.agent_control_http_url().await;
+    let unknown_parent_id = protocol::AgentId("11111111-1111-1111-1111-111111111111".to_owned());
+    let response = post_json(
+        &base_url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_spawn_agent",
+                "arguments": {
+                    "workspace_roots": ["/tmp/unknown-parent-child"],
+                    "prompt": "child with unknown parent",
+                    "backend_kind": "claude",
+                    "name": "unknown-parent-child",
+                    "parent_agent_id": unknown_parent_id.0
+                }
+            }
+        }),
+    )
+    .await;
+    assert!(mcp_result_is_error(&response));
+    assert!(mcp_result_text(&response).contains("requires an agent-control bearer credential"));
+
     let parent_project = create_project(
         &mut fixture.client,
         "Explicit Parent Project",
@@ -5570,34 +5285,6 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
         "mock backend response to: child with explicit parent",
     )
     .await;
-}
-
-#[tokio::test]
-async fn agent_control_http_rejects_unauthenticated_explicit_parent() {
-    let fixture = Fixture::new().await;
-    let base_url = fixture.agent_control_http_url().await;
-    let unknown_parent_id = protocol::AgentId("11111111-1111-1111-1111-111111111111".to_owned());
-    let response = post_json(
-        &base_url,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "tyde_spawn_agent",
-                "arguments": {
-                    "workspace_roots": ["/tmp/unknown-parent-child"],
-                    "prompt": "child with unknown parent",
-                    "backend_kind": "claude",
-                    "name": "unknown-parent-child",
-                    "parent_agent_id": unknown_parent_id.0
-                }
-            }
-        }),
-    )
-    .await;
-    assert!(mcp_result_is_error(&response));
-    assert!(mcp_result_text(&response).contains("requires an agent-control bearer credential"));
 }
 
 #[tokio::test]
@@ -5787,57 +5474,24 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     );
 }
 
-#[tokio::test]
-async fn agent_origin_is_user_for_normal_spawns() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("user-origin".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/user-origin".to_owned()],
-                prompt: "user origin".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("user spawn failed");
-
-    let env = expect_next_event(&mut fixture.client, "user-origin NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let user_new: NewAgentPayload = env.parse_payload().expect("parse user-origin NewAgent");
-    assert_eq!(user_new.origin, AgentOrigin::User);
-    assert_eq!(user_new.parent_agent_id, None);
-
-    let env = expect_next_event(&mut fixture.client, "user-origin AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    let user_start: AgentStartPayload = env.parse_payload().expect("parse user-origin AgentStart");
-    assert_eq!(user_start.origin, AgentOrigin::User);
-    assert_eq!(user_start.parent_agent_id, None);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &user_new.instance_stream,
-        "mock backend response to: user origin",
-    )
-    .await;
-}
-
+/// A backend-native child is a first-class agent: it carries the
+/// BackendNative origin and its parent on both NewAgent and AgentStart, it
+/// appears in the parent's caller-scoped agent-control list, and it replays
+/// to late subscribers — while the parent receives no completion notice
+/// when the child's turn finishes.
 #[tokio::test]
 async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     let mut fixture = Fixture::new().await;
 
     let (parent_new, _parent_start, child_new, child_start) =
-        spawn_parent_with_native_child(&mut fixture.client).await;
+        spawn_parent_with_native_child(&mut fixture).await;
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(200),
+        "backend-native child completion follow-up",
+    )
+    .await;
 
     assert_eq!(child_new.origin, AgentOrigin::BackendNative);
     assert_eq!(child_start.origin, AgentOrigin::BackendNative);
@@ -5894,11 +5548,17 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     .await;
 }
 
+/// A backend-native relay child accepts no direct input of any kind: a
+/// checked agent-control delivery is refused without wedging the parent's
+/// await or appending a secondary transcript error, its session is marked
+/// non-resumable, and resuming it fails with a fatal typed startup error
+/// while the connection stays usable.
 #[tokio::test]
-async fn agent_control_rejects_relay_delivery_without_wedging_await() {
+async fn backend_native_child_rejects_direct_input_and_resume() {
     let mut fixture = Fixture::new().await;
+
     let (parent, _parent_start, child, _child_start) =
-        spawn_parent_with_native_child(&mut fixture.client).await;
+        spawn_parent_with_native_child(&mut fixture).await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let initially_ready = mcp_await_agent(&caller, &child.agent_id).await;
     assert_eq!(initially_ready["ready"][0]["status"], "idle");
@@ -5966,27 +5626,6 @@ async fn agent_control_rejects_relay_delivery_without_wedging_await() {
         Some(0),
         "checked relay rejection must not append a secondary transcript error"
     );
-}
-
-#[tokio::test]
-async fn backend_native_child_does_not_emit_completion_notice_to_parent() {
-    let mut fixture = Fixture::new().await;
-
-    let _ = spawn_parent_with_native_child(&mut fixture.client).await;
-
-    expect_no_event(
-        &mut fixture.client,
-        Duration::from_millis(200),
-        "backend-native child completion follow-up",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn backend_native_child_sessions_are_non_resumable() {
-    let mut fixture = Fixture::new().await;
-
-    let _ = spawn_parent_with_native_child(&mut fixture.client).await;
 
     fixture
         .client
@@ -6003,20 +5642,20 @@ async fn backend_native_child_sessions_are_non_resumable() {
     let list: SessionListPayload = env.parse_payload().expect("parse native child SessionList");
     assert_eq!(list.sessions.len(), 2);
 
-    let parent = list
+    let parent_session = list
         .sessions
         .iter()
         .find(|session| session.user_alias.as_deref() == Some("parent-with-native-child"))
         .expect("missing parent session");
-    let child = list
+    let child_session = list
         .sessions
         .iter()
         .find(|session| session.alias.as_deref() == Some("mock-native-child"))
         .expect("missing backend-native child session");
 
-    assert_eq!(child.parent_id.as_ref(), Some(&parent.id));
+    assert_eq!(child_session.parent_id.as_ref(), Some(&parent_session.id));
     assert!(
-        !child.resumable,
+        !child_session.resumable,
         "backend-native child sessions must be marked non-resumable"
     );
 
@@ -6028,7 +5667,7 @@ async fn backend_native_child_sessions_are_non_resumable() {
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Resume {
-                session_id: child.id.clone(),
+                session_id: child_session.id.clone(),
                 prompt: Some("should fail".to_owned()),
             },
         })
@@ -6046,7 +5685,7 @@ async fn backend_native_child_sessions_are_non_resumable() {
                 let payload: NewAgentPayload = env
                     .parse_payload()
                     .expect("parse non-resumable child resume NewAgent");
-                if payload.session_id.as_ref() == Some(&child.id) {
+                if payload.session_id.as_ref() == Some(&child_session.id) {
                     break payload;
                 }
             }
@@ -6068,12 +5707,12 @@ async fn backend_native_child_sessions_are_non_resumable() {
         "non-resumable child resume AgentStart",
     )
     .await;
-    assert_eq!(resumed_start.session_id.as_ref(), Some(&child.id));
+    assert_eq!(resumed_start.session_id.as_ref(), Some(&child_session.id));
 
     let error = expect_agent_error_containing(
         &mut fixture.client,
         &resumed_agent.instance_stream,
-        &format!("cannot resume non-resumable session {}", child.id),
+        &format!("cannot resume non-resumable session {}", child_session.id),
         "non-resumable child resume AgentError",
     )
     .await;
@@ -6100,11 +5739,22 @@ async fn backend_native_child_sessions_are_non_resumable() {
 /// handle and panicked. The fix parks the relay actor on event-stream close
 /// so Snapshot/ReadOutput/Attach keep working until the host explicitly
 /// closes the agent.
+///
+/// The parked relay must also keep rejecting direct input with the typed
+/// relay rejection — not the router's generic "agent not running" error.
 #[tokio::test]
-async fn backend_native_child_with_closed_event_stream_still_replays_to_late_clients() {
+async fn parked_backend_native_child_replays_to_late_clients_and_rejects_interrupt() {
     let mut fixture = Fixture::new().await;
 
-    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_AND_DROP_SENTINEL}");
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-with-dropped-native-child",
+            MockScript::one(
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_dropped_native_child("mock-native-child", "parent prompt"),
+            ),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -6114,7 +5764,7 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/dropped-sub-agent-parent".to_owned()],
-                prompt: parent_prompt,
+                prompt: "parent prompt".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -6132,6 +5782,7 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
 
     let parent_start_env = expect_next_event(&mut fixture.client, "parent AgentStart").await;
     assert_eq!(parent_start_env.kind, FrameKind::AgentStart);
+    drop(reservation);
 
     expect_turn_on_stream(
         &mut fixture.client,
@@ -6181,6 +5832,30 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
     )
     .await;
     assert_eq!(replayed_child_start.origin, AgentOrigin::BackendNative);
+
+    fixture
+        .client
+        .interrupt(&child_new.instance_stream)
+        .await
+        .expect("interrupt parked backend-native child failed");
+
+    let err = expect_agent_error_message_without(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "backend-native relay agents do not accept direct input",
+        "agent not running",
+        "parked backend-native child relay rejection",
+    )
+    .await;
+    assert!(!err.fatal);
+    expect_no_agent_error_message(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "agent not running",
+        Duration::from_millis(100),
+        "router generic error after relay rejection",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -6190,7 +5865,16 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
         .host_for_test()
         .set_session_schema_ready_for_test(BackendKind::Codex)
         .await;
-    let prompt = format!("__mock_hold_until_interrupt__ {MOCK_LIVE_NATIVE_CHILD_SENTINEL}");
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-with-live-native-child",
+            MockScript::one(MockTurn::held_text_with_live_native_child(
+                "mock backend held response to: parent",
+                "mock-live-native-child",
+                "live native child task",
+            )),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -6200,7 +5884,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/live-native-child-parent".to_owned()],
-                prompt,
+                prompt: "parent".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Codex,
                 launch_profile_id: None,
@@ -6216,6 +5900,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     let parent: NewAgentPayload = parent_env.parse_payload().expect("parse parent NewAgent");
     expect_agent_start_on_stream(&mut fixture.client, &parent.instance_stream, "parent start")
         .await;
+    drop(reservation);
     for context in [
         "parent typing",
         "parent stream start",
@@ -6293,98 +5978,15 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
 }
 
 #[tokio::test]
-async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
-    let mut fixture = Fixture::new().await;
-
-    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_AND_DROP_SENTINEL}");
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("parent-with-dropped-native-child".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/dropped-sub-agent-parent".to_owned()],
-                prompt: parent_prompt,
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn parent with native child failed");
-
-    let parent_new_env = expect_next_event(&mut fixture.client, "parent NewAgent").await;
-    assert_eq!(parent_new_env.kind, FrameKind::NewAgent);
-    let parent_new: NewAgentPayload = parent_new_env.parse_payload().expect("parse NewAgent");
-
-    let parent_start_env = expect_next_event(&mut fixture.client, "parent AgentStart").await;
-    assert_eq!(parent_start_env.kind, FrameKind::AgentStart);
-
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &parent_new.instance_stream,
-        "mock backend response to: parent prompt",
-    )
-    .await;
-
-    let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
-
-    expect_agent_start_on_stream(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "native child AgentStart",
-    )
-    .await;
-
-    expect_native_child_prompt_on_stream(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "parent prompt",
-    )
-    .await;
-    expect_turn_on_stream(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "mock native child response to: parent prompt",
-    )
-    .await;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    fixture
-        .client
-        .interrupt(&child_new.instance_stream)
-        .await
-        .expect("interrupt parked backend-native child failed");
-
-    let err = expect_agent_error_message_without(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "backend-native relay agents do not accept direct input",
-        "agent not running",
-        "parked backend-native child relay rejection",
-    )
-    .await;
-    assert!(!err.fatal);
-    expect_no_agent_error_message(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "agent not running",
-        Duration::from_millis(100),
-        "router generic error after relay rejection",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn interrupting_parent_keeps_agent_control_children_running() {
     let mut fixture = Fixture::new().await;
 
+    let parent_reservation = fixture
+        .reserve_next_mock_launch(
+            "interrupt-parent",
+            MockScript::one(MockTurn::held_text("parent waiting")),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -6394,7 +5996,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/interrupt-parent".to_owned()],
-                prompt: "__mock_hold_until_interrupt__ parent waiting".to_owned(),
+                prompt: "parent waiting".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -6413,6 +6015,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     let env = expect_next_event(&mut fixture.client, "interrupt parent AgentStart").await;
     assert_eq!(env.kind, FrameKind::AgentStart);
     assert_eq!(env.stream, parent_new.instance_stream);
+    drop(parent_reservation);
 
     let env = expect_chat_event_on_stream(
         &mut fixture.client,
@@ -6424,16 +6027,24 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
 
     let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "agent-control-child",
+            MockScript::one(MockTurn::text("agent-control child first response"))
+                .then(MockTurn::text("agent-control child follow-up response")),
+        )
+        .await;
     let child_agent_id = mcp_spawn_agent_as(
         &caller,
         json!({
             "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
-            "prompt": "__mock_slow__ agent-control child first",
+            "prompt": "agent-control child first",
             "backend_kind": "claude",
             "name": "agent-control-child"
         }),
     )
     .await;
+    drop(child_reservation);
 
     let child_new = expect_replayed_new_agent(
         &mut fixture.client,
@@ -6462,7 +6073,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     expect_agent_control_child_initial_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
-        "mock backend response to: __mock_slow__ agent-control child first",
+        "agent-control child first response",
     )
     .await;
 
@@ -6489,7 +6100,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     expect_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
-        "mock backend response to: agent-control child follow-up",
+        "agent-control child follow-up response",
     )
     .await;
 }
@@ -6498,6 +6109,9 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
 async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host() {
     let mut fixture = Fixture::new().await;
 
+    let reservation = fixture
+        .reserve_next_mock_spawn_failure("spawn-failure", "mock backend forced spawn failure")
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -6507,7 +6121,7 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "__mock_fail_spawn__".to_owned(),
+                prompt: "trigger startup failure".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Tycode,
                 launch_profile_id: None,
@@ -6539,6 +6153,7 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
         "fatal AgentError",
     )
     .await;
+    drop(reservation);
     assert!(
         err.fatal,
         "startup failure should terminate the agent stream"
@@ -6620,7 +6235,7 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
     .await;
     assert_eq!(start.name, "Review Auth Logs");
 
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &new_agent.instance_stream,
         "mock backend response to: review auth logs",
@@ -7506,98 +7121,109 @@ async fn held_fork_does_not_block_later_connection_request() {
     startup_gate.release_one();
 }
 
+/// An authoritatively Unavailable session schema surfaces as exactly one
+/// fatal typed AgentError inside the seq-0 AgentBootstrap (never a router
+/// CommandError) for both New spawns and Resumes, and repeated attempts of
+/// either kind never trigger another schema probe.
+///
+/// The two lifecycle ops deliberately run on separate hosts: the New phase
+/// uses a cold fixture where Unavailable is installed before any Codex use
+/// (first-contact failure — the original condition of the former
+/// `unavailable_new_schema_without_settings_is_typed_and_not_reprobed`,
+/// preserved so a regression that depends on a previously warmed
+/// schema/session path cannot mask it), and the Resume phase runs on the
+/// fixture that owns the source session.
 #[tokio::test]
-async fn unavailable_new_schema_without_settings_is_typed_and_not_reprobed() {
-    let mut fixture = Fixture::new().await;
-    let host = fixture.host_for_test();
-    host.set_session_schema_unavailable_for_test(
-        BackendKind::Codex,
-        "controlled unavailable New schema",
-    )
-    .await;
-    let probe_count = host.session_schema_probe_count_for_test().await;
-
-    for attempt in 0..2 {
-        fixture
-            .client
-            .spawn_agent(SpawnAgentPayload {
-                name: Some(format!("Unavailable New {attempt}")),
-                custom_agent_id: None,
-                parent_agent_id: None,
-                project_id: None,
-                params: SpawnAgentParams::New {
-                    workspace_roots: vec!["/tmp/test".to_owned()],
-                    prompt: format!("unavailable New attempt {attempt}"),
-                    images: None,
-                    backend_kind: BackendKind::Codex,
-                    launch_profile_id: None,
-                    cost_hint: None,
-                    access_mode: Default::default(),
-                    session_settings: None,
-                },
-            })
-            .await
-            .expect("send unavailable-schema New");
-        let env = expect_kind(
-            &mut fixture.client,
-            FrameKind::NewAgent,
-            "unavailable-schema NewAgent",
+async fn unavailable_session_schema_is_typed_and_not_reprobed_for_new_and_resume() {
+    {
+        let mut fixture = Fixture::new().await;
+        let host = fixture.host_for_test();
+        host.set_session_schema_unavailable_for_test(
+            BackendKind::Codex,
+            "controlled unavailable New schema",
         )
         .await;
-        let spawned: NewAgentPayload = env
-            .parse_payload()
-            .expect("parse unavailable-schema NewAgent");
-        let bootstrap = loop {
-            let env = fixture
-                .client
-                .next_event()
-                .await
-                .expect("read unavailable-schema New AgentBootstrap")
-                .expect("connection remained open");
-            assert_ne!(
-                env.kind,
-                FrameKind::CommandError,
-                "schema startup failure must not be a router frame"
-            );
-            if env.stream != spawned.instance_stream {
-                continue;
-            }
-            assert_eq!(env.kind, FrameKind::AgentBootstrap);
-            assert_eq!(env.seq, 0);
-            break env
-                .parse_payload::<AgentBootstrapPayload>()
-                .expect("parse unavailable-schema New AgentBootstrap");
-        };
-        let errors = bootstrap
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                AgentBootstrapEvent::AgentError(error) => Some(error),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            errors.len(),
-            1,
-            "schema failure must be emitted exactly once"
-        );
-        assert!(errors[0].fatal);
-        assert_eq!(errors[0].code, AgentErrorCode::BackendFailed);
-        assert!(
-            errors[0]
-                .message
-                .contains("controlled unavailable New schema")
-        );
-        assert_eq!(
-            host.session_schema_probe_count_for_test().await,
-            probe_count,
-            "authoritative Unavailable schema must not trigger another New probe"
-        );
-    }
-}
+        let probe_count = host.session_schema_probe_count_for_test().await;
 
-#[tokio::test]
-async fn unavailable_resume_schema_is_typed_and_not_reprobed() {
+        for attempt in 0..2 {
+            fixture
+                .client
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some(format!("Unavailable New {attempt}")),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: vec!["/tmp/test".to_owned()],
+                        prompt: format!("unavailable New attempt {attempt}"),
+                        images: None,
+                        backend_kind: BackendKind::Codex,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+                .expect("send unavailable-schema New");
+            let env = expect_kind(
+                &mut fixture.client,
+                FrameKind::NewAgent,
+                "unavailable-schema NewAgent",
+            )
+            .await;
+            let spawned: NewAgentPayload = env
+                .parse_payload()
+                .expect("parse unavailable-schema NewAgent");
+            let bootstrap = loop {
+                let env = fixture
+                    .client
+                    .next_event()
+                    .await
+                    .expect("read unavailable-schema New AgentBootstrap")
+                    .expect("connection remained open");
+                assert_ne!(
+                    env.kind,
+                    FrameKind::CommandError,
+                    "schema startup failure must not be a router frame"
+                );
+                if env.stream != spawned.instance_stream {
+                    continue;
+                }
+                assert_eq!(env.kind, FrameKind::AgentBootstrap);
+                assert_eq!(env.seq, 0);
+                break env
+                    .parse_payload::<AgentBootstrapPayload>()
+                    .expect("parse unavailable-schema New AgentBootstrap");
+            };
+            let errors = bootstrap
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentBootstrapEvent::AgentError(error) => Some(error),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                errors.len(),
+                1,
+                "schema failure must be emitted exactly once"
+            );
+            assert!(errors[0].fatal);
+            assert_eq!(errors[0].code, AgentErrorCode::BackendFailed);
+            assert!(
+                errors[0]
+                    .message
+                    .contains("controlled unavailable New schema")
+            );
+            assert_eq!(
+                host.session_schema_probe_count_for_test().await,
+                probe_count,
+                "authoritative Unavailable schema must not trigger another New probe"
+            );
+        }
+    }
+
     let mut fixture = Fixture::new().await;
     let host = fixture.host_for_test();
     host.set_session_schema_ready_for_test(BackendKind::Codex)
@@ -7632,6 +7258,7 @@ async fn unavailable_resume_schema_is_typed_and_not_reprobed() {
     )
     .await;
     let probe_count = host.session_schema_probe_count_for_test().await;
+
     for attempt in 0..2 {
         fixture
             .client
@@ -7687,6 +7314,12 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
     let startup_gate = fixture
         .host_for_test()
         .install_agent_startup_completion_test_gate("Terminal Bootstrap First");
+    let reservation = fixture
+        .reserve_next_mock_spawn_failure(
+            "Terminal Bootstrap First",
+            "mock backend forced spawn failure",
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -7696,7 +7329,7 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "__mock_fail_spawn__".to_owned(),
+                prompt: "trigger startup failure".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Tycode,
                 launch_profile_id: None,
@@ -7770,6 +7403,7 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
         )),
         "the immediate input rejection must follow Bootstrap as a live actor event"
     );
+    drop(reservation);
 
     let rejection = loop {
         let env = fixture
@@ -8043,44 +7677,15 @@ async fn agent_activity_summaries_default_off_stay_disabled() {
             .agent_activity_summaries
     );
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("summary-off".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "summaries are disabled".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn with summaries off failed");
-
-    let env = expect_next_event(&mut fixture.client, "summaries-off NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse summaries-off NewAgent");
+    let agent = fixture.spawn("summary-off", "summaries are disabled").await;
     assert!(matches!(
-        new_agent.activity_summary,
+        agent.new_agent.activity_summary,
         AgentActivitySummaryState::Disabled
     ));
-    expect_agent_start_on_stream(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "summaries-off AgentStart",
-    )
-    .await;
 
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: summaries are disabled",
     )
     .await;
@@ -8092,7 +7697,7 @@ async fn agent_activity_summaries_default_off_stay_disabled() {
     .await;
     assert_eq!(
         fixture.agent_ids().await,
-        vec![new_agent.agent_id],
+        vec![agent.new_agent.agent_id],
         "disabled summarizer must not register background agents"
     );
 }
@@ -8102,51 +7707,24 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
     let mut fixture = Fixture::new().await;
     set_activity_summaries(&mut fixture.client, true).await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("summary-on".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "summarize recent activity".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn with summaries on failed");
-
-    let env = expect_next_event(&mut fixture.client, "summaries-on NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse summaries-on NewAgent");
+    let agent = fixture
+        .spawn("summary-on", "summarize recent activity")
+        .await;
     assert!(matches!(
-        new_agent.activity_summary,
+        agent.new_agent.activity_summary,
         AgentActivitySummaryState::Empty
     ));
-    expect_agent_start_on_stream(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "summaries-on AgentStart",
-    )
-    .await;
 
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: summarize recent activity",
     )
     .await;
 
     let pending = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "Pending",
         |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
     )
@@ -8158,7 +7736,7 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
 
     let fresh = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "Fresh",
         |state| matches!(state, AgentActivitySummaryState::Fresh { .. }),
     )
@@ -8174,12 +7752,12 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
     assert!(summary.source_through_seq.is_some());
     assert_eq!(
         fixture.agent_ids().await,
-        vec![new_agent.agent_id.clone()],
+        vec![agent.new_agent.agent_id.clone()],
         "summary helper must not register transient agents"
     );
 
     let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    let replayed = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
+    let replayed = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
     assert!(matches!(
         replayed.activity_summary,
         AgentActivitySummaryState::Fresh { .. }
@@ -8187,17 +7765,16 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
 
     fixture
         .client
-        .close_agent(&new_agent.instance_stream)
+        .close_agent(&agent.stream)
         .await
         .expect("close summarized agent");
-    let env = expect_kind(
-        &mut fixture.client,
-        FrameKind::AgentClosed,
-        "summarized AgentClosed",
-    )
-    .await;
+    let env = fixture
+        .next_frame_matching("summarized AgentClosed", |env| {
+            env.kind == FrameKind::AgentClosed
+        })
+        .await;
     let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
-    assert_eq!(closed.agent_id, new_agent.agent_id);
+    assert_eq!(closed.agent_id, agent.new_agent.agent_id);
     assert!(
         fixture.agent_ids().await.is_empty(),
         "closed summarized agent should be removed from registry"
@@ -8214,46 +7791,22 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
     let mut fixture = Fixture::new().await;
     set_activity_summaries(&mut fixture.client, true).await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("summary-offswitch".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "__mock_slow_activity_summary__ keep working".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn slow summary agent failed");
+    let agent = fixture
+        .spawn(
+            "summary-offswitch",
+            "__mock_slow_activity_summary__ keep working",
+        )
+        .await;
 
-    let env = expect_next_event(&mut fixture.client, "slow-summary NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse slow-summary NewAgent");
-    expect_agent_start_on_stream(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
-        "slow-summary AgentStart",
-    )
-    .await;
-
-    expect_turn(
-        &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: __mock_slow_activity_summary__ keep working",
     )
     .await;
     let _pending = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "slow Pending",
         |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
     )
@@ -8262,7 +7815,7 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
     set_activity_summaries(&mut fixture.client, false).await;
     let disabled = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "Disabled",
         |state| matches!(state, AgentActivitySummaryState::Disabled),
     )
@@ -8280,7 +7833,7 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
     .await;
     assert_eq!(
         fixture.agent_ids().await,
-        vec![new_agent.agent_id],
+        vec![agent.new_agent.agent_id],
         "off switch must not leave registered summary agents"
     );
 }
@@ -8290,46 +7843,22 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
     let mut fixture = Fixture::new().await;
     set_activity_summaries(&mut fixture.client, true).await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("summary-error".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "__mock_fail_activity_summary__ keep working".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn failing summary agent failed");
+    let agent = fixture
+        .spawn(
+            "summary-error",
+            "__mock_fail_activity_summary__ keep working",
+        )
+        .await;
 
-    let env = expect_next_event(&mut fixture.client, "failing-summary NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse failing-summary NewAgent");
-    expect_agent_start_on_stream(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
-        "failing-summary AgentStart",
-    )
-    .await;
-
-    expect_turn(
-        &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: __mock_fail_activity_summary__ keep working",
     )
     .await;
     let _pending = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "error Pending",
         |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
     )
@@ -8337,7 +7866,7 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
 
     let error = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "Error",
         |state| matches!(state, AgentActivitySummaryState::Error { .. }),
     )
@@ -8353,15 +7882,12 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
 
     fixture
         .client
-        .send_message(
-            &new_agent.instance_stream,
-            "activity after summary failure".to_owned(),
-        )
+        .send_message(&agent.stream, "activity after summary failure".to_owned())
         .await
         .expect("send follow-up after summary failure failed");
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: activity after summary failure",
     )
     .await;
@@ -8378,55 +7904,26 @@ async fn agent_activity_summaries_unchanged_history_does_not_resummarize() {
     let mut fixture = Fixture::new().await;
     set_activity_summaries(&mut fixture.client, true).await;
 
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("summary-unchanged".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "summarize unchanged history".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn unchanged summary agent failed");
+    let agent = fixture
+        .spawn("summary-unchanged", "summarize unchanged history")
+        .await;
 
-    let env = expect_next_event(&mut fixture.client, "unchanged-summary NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let new_agent: NewAgentPayload = env
-        .parse_payload()
-        .expect("parse unchanged-summary NewAgent");
-    expect_agent_start_on_stream(
+    expect_strict_mock_turn(
         &mut fixture.client,
-        &new_agent.instance_stream,
-        "unchanged-summary AgentStart",
-    )
-    .await;
-
-    expect_turn(
-        &mut fixture.client,
-        &new_agent.instance_stream,
+        &agent.stream,
         "mock backend response to: summarize unchanged history",
     )
     .await;
     let _pending = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "unchanged Pending",
         |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
     )
     .await;
     let _fresh = expect_activity_summary_matching(
         &mut fixture.client,
-        &new_agent.agent_id,
+        &agent.new_agent.agent_id,
         "unchanged Fresh",
         |state| matches!(state, AgentActivitySummaryState::Fresh { .. }),
     )
@@ -8474,7 +7971,7 @@ async fn renaming_agent_updates_live_streams_and_replay() {
             .await;
     assert_eq!(start.name, "Original Name");
 
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &agent_stream,
         "mock backend response to: hello",
@@ -8563,31 +8060,10 @@ async fn multiple_agents() {
         .await
         .expect("spawn second agent failed");
 
-    // Collect all events from both agents, filtering out SessionSettings/SessionSchemas.
-    // Each agent produces:
-    //   NewAgent (host stream) + AgentStart + TypingStatusChanged(true) + StreamStart + StreamDelta + StreamEnd + TypingStatusChanged(false)
-    // Two agents = 14 events total (after filtering).
     let mut events = Vec::new();
     while events.len() < 14 {
         let env = expect_next_event(&mut fixture.client, "multiple agent events").await;
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::SessionSettings
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendConfigSchemas
-                | FrameKind::BackendConfigSnapshots
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionList
-                | FrameKind::AgentActivityStats
-                | FrameKind::TaskTokenUsage
-        ) {
+        if env.kind == FrameKind::AgentActivityStats {
             continue;
         }
         events.push(env);
@@ -8814,9 +8290,54 @@ async fn late_joining_client_gets_replay() {
     .await;
 }
 
+/// The project lifecycle end to end: an invalid create is refused with a
+/// non-fatal typed CommandError that leaves the connection alive and
+/// persists nothing, then a valid create/rename/add-root/delete each fan
+/// out to every connected client and the deleted project stops replaying.
 #[tokio::test]
-async fn project_mutations_fan_out_and_delete() {
+async fn project_mutations_validate_fan_out_and_delete() {
     let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .project_create(ProjectCreatePayload {
+            name: "Invalid".to_owned(),
+            roots: vec![
+                ProjectRootPath("/tmp/dup".to_owned()),
+                ProjectRootPath("/tmp/dup".to_owned()),
+            ],
+        })
+        .await
+        .expect("project_create write failed");
+
+    let error = expect_command_error(&mut fixture.client, "invalid project_create").await;
+    assert_eq!(error.operation, "project_create");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("roots must be unique"),
+        "unexpected project_create error: {}",
+        error.message
+    );
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(150),
+        "connection should stay open after invalid project_create",
+    )
+    .await;
+
+    let (mut fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        fresh_bootstrap.projects.is_empty(),
+        "invalid project_create should not persist any project"
+    );
+    expect_no_event(
+        &mut fresh_client,
+        Duration::from_millis(150),
+        "invalid project_create should not persist any project",
+    )
+    .await;
 
     fixture
         .client
@@ -8970,7 +8491,7 @@ async fn project_replay_happens_before_agent_replay() {
     .await;
     assert_eq!(start.project_id.as_ref(), Some(&project.id));
 
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &new_agent.instance_stream,
         "mock backend response to: hello from project",
@@ -9062,7 +8583,7 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         "delete guard AgentStart",
     )
     .await;
-    expect_turn(
+    expect_strict_mock_turn(
         &mut fixture.client,
         &new_agent.instance_stream,
         "mock backend response to: hold project",
@@ -9133,52 +8654,6 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         .find(|session| session.id == session_id)
         .expect("detached session should replay");
     assert_eq!(session.project_id, None);
-}
-
-#[tokio::test]
-async fn invalid_project_input_surfaces_command_error_and_keeps_connection_alive() {
-    let mut fixture = Fixture::new().await;
-
-    fixture
-        .client
-        .project_create(ProjectCreatePayload {
-            name: "Invalid".to_owned(),
-            roots: vec![
-                ProjectRootPath("/tmp/dup".to_owned()),
-                ProjectRootPath("/tmp/dup".to_owned()),
-            ],
-        })
-        .await
-        .expect("project_create write failed");
-
-    let error = expect_command_error(&mut fixture.client, "invalid project_create").await;
-    assert_eq!(error.operation, "project_create");
-    assert_eq!(error.code, CommandErrorCode::InvalidInput);
-    assert!(!error.fatal);
-    assert!(
-        error.message.contains("roots must be unique"),
-        "unexpected project_create error: {}",
-        error.message
-    );
-
-    expect_no_event(
-        &mut fixture.client,
-        Duration::from_millis(150),
-        "connection should stay open after invalid project_create",
-    )
-    .await;
-
-    let (mut fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    assert!(
-        bootstrap.projects.is_empty(),
-        "invalid project_create should not persist any project"
-    );
-    expect_no_event(
-        &mut fresh_client,
-        Duration::from_millis(150),
-        "invalid project_create should not persist any project",
-    )
-    .await;
 }
 
 #[tokio::test]

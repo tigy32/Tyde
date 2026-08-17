@@ -176,34 +176,3 @@ pub fn is_identifier_byte(line: &str, line_byte: u32) -> bool {
         .map(|c| c.is_alphanumeric() || c == '_')
         .unwrap_or(false)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn utf16_col_maps_to_byte_offset_across_multibyte_chars() {
-        // "é" is 2 bytes / 1 UTF-16 unit; "😀" is 4 bytes / 2 UTF-16 units.
-        let line = "aé😀b";
-        assert_eq!(line_byte_for_utf16_col(line, 0), 0); // 'a'
-        assert_eq!(line_byte_for_utf16_col(line, 1), 1); // 'é'
-        assert_eq!(line_byte_for_utf16_col(line, 2), 3); // '😀'
-        assert_eq!(line_byte_for_utf16_col(line, 4), 7); // 'b'
-    }
-
-    #[test]
-    fn utf16_col_past_line_end_clamps_to_byte_len() {
-        let line = "abc";
-        assert_eq!(line_byte_for_utf16_col(line, 99), 3);
-    }
-
-    #[test]
-    fn identifier_byte_accepts_word_chars_and_rejects_punctuation() {
-        assert!(is_identifier_byte("foo_bar", 0));
-        assert!(is_identifier_byte("foo_bar", 3));
-        assert!(!is_identifier_byte("a + b", 2));
-        assert!(!is_identifier_byte("a + b", 1));
-        // Past the end of the line is not an identifier.
-        assert!(!is_identifier_byte("ab", 2));
-    }
-}

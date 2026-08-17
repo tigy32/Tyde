@@ -5,97 +5,64 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
     AgentId, AgentStartPayload, BackendAccessMode, BackendKind, CommandErrorCode,
     CommandErrorPayload, CustomAgent, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
-    GitBranchName, HostSettingValue, NewAgentPayload, NewTerminalPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectNotifyPayload, ProjectRootPath, ProjectSource, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, Steering, SteeringId, SteeringScope, SteeringUpsertPayload,
-    TeamCreatePayload, TeamMemberCreateSpec, TerminalCreatePayload, TerminalLaunchTarget,
-    ToolPolicy, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    GitBranchName, NewAgentPayload, NewTerminalPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectNotifyPayload,
+    ProjectRootPath, ProjectSource, SpawnAgentParams, SpawnAgentPayload, Steering, SteeringId,
+    SteeringScope, SteeringUpsertPayload, TeamCreatePayload, TeamMemberCreateSpec,
+    TerminalCreatePayload, TerminalLaunchTarget, ToolPolicy, WorkbenchCreatePayload,
+    WorkbenchRemovePayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(10), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::SessionList
-                | FrameKind::TaskTokenUsage
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::AgentActivityStats
-                | FrameKind::CustomAgentNotify
-                | FrameKind::SteeringNotify
-                | FrameKind::SkillNotify
-                | FrameKind::McpServerNotify
-                | FrameKind::ProjectBootstrap
-                | FrameKind::ProjectEvent
-                | FrameKind::ProjectFileList
-                | FrameKind::ProjectGitStatus
-                | FrameKind::CodeIntelOverview
-                | FrameKind::ChatEvent
-                | FrameKind::AgentBootstrap
-                | FrameKind::AgentStart
-                | FrameKind::NewAgent
-                | FrameKind::TerminalBootstrap
-                | FrameKind::TerminalStart
-                | FrameKind::NewTerminal
-                | FrameKind::TerminalOutput
-                | FrameKind::TerminalExit
-                | FrameKind::TerminalError
-                | FrameKind::AgentError
-                | FrameKind::AgentClosed
-        ) {
-            continue;
-        }
-        return env;
-    }
+    next_frame_matching_on(client, context, |env| {
+        !fixture::is_routine_control_plane_frame(env)
+            && !matches!(
+                env.kind,
+                FrameKind::HostSettings
+                    | FrameKind::BackendCapacity
+                    | FrameKind::SessionList
+                    | FrameKind::TaskTokenUsage
+                    | FrameKind::WorkflowNotify
+                    | FrameKind::AgentsViewPreferencesNotify
+                    | FrameKind::AgentActivityStats
+                    | FrameKind::CustomAgentNotify
+                    | FrameKind::SteeringNotify
+                    | FrameKind::SkillNotify
+                    | FrameKind::McpServerNotify
+                    | FrameKind::ProjectBootstrap
+                    | FrameKind::ProjectEvent
+                    | FrameKind::ProjectFileList
+                    | FrameKind::ProjectGitStatus
+                    | FrameKind::CodeIntelOverview
+                    | FrameKind::ChatEvent
+                    | FrameKind::AgentBootstrap
+                    | FrameKind::AgentStart
+                    | FrameKind::NewAgent
+                    | FrameKind::TerminalBootstrap
+                    | FrameKind::TerminalStart
+                    | FrameKind::NewTerminal
+                    | FrameKind::TerminalOutput
+                    | FrameKind::TerminalExit
+                    | FrameKind::TerminalError
+                    | FrameKind::AgentError
+                    | FrameKind::AgentClosed
+            )
+    })
+    .await
 }
 
 async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(10), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if env.kind == kind {
-            return env;
-        }
-        if env.kind == FrameKind::AgentBootstrap && kind == FrameKind::AgentStart {
-            let bootstrap: protocol::AgentBootstrapPayload =
-                env.parse_payload().expect("AgentBootstrap payload");
-            if let Some(protocol::AgentBootstrapEvent::AgentStart(start)) = bootstrap
-                .events
-                .into_iter()
-                .find(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_)))
-            {
-                return Envelope::from_payload(env.stream, FrameKind::AgentStart, env.seq, &start)
-                    .expect("serialize AgentStart");
-            }
-        }
-    }
+    fixture::next_logical_frame_matching_on(client, context, |env| env.kind == kind).await
 }
 
 async fn expect_project_notify(
@@ -387,15 +354,21 @@ async fn spawn_project_caller(
         })
         .await
         .expect("spawn project caller");
-    loop {
-        let payload: NewAgentPayload = expect_kind(client, FrameKind::NewAgent, name)
-            .await
-            .parse_payload()
-            .expect("NewAgent");
-        if payload.name == name {
-            return payload;
+    let mut caller = None;
+    next_frame_matching_on(client, name, |env| {
+        if env.kind != FrameKind::NewAgent {
+            return false;
         }
-    }
+        let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+        if payload.name == name {
+            caller = Some(payload);
+            true
+        } else {
+            false
+        }
+    })
+    .await;
+    caller.expect("project caller NewAgent")
 }
 
 #[tokio::test]
@@ -864,11 +837,11 @@ async fn workbench_remove_cascades_team_member_reference() {
 
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Claude],
-            },
-        })
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude],
+            Vec::<BackendKind>::new(),
+        )
         .await
         .expect("set enabled backends failed");
     let custom_agent = CustomAgent {
@@ -940,6 +913,13 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     let agent_parent = create_project(&mut fixture.client, vec![agent_repo.path()]).await;
     let agent_workbench =
         create_workbench(&mut fixture.client, &agent_parent, "agent-blocker").await;
+    let hold_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "workbench-live-agent",
+            MockScript::one(MockTurn::gated_text("hold workbench", &hold_gate)),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -949,7 +929,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
             project_id: Some(agent_workbench.id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: project_roots(&agent_workbench),
-                prompt: "__mock_slow__ hold workbench".to_owned(),
+                prompt: "hold workbench".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -974,6 +954,8 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         "live agent persisted session",
     )
     .await;
+    hold_gate.wait_until_entered().await;
+    drop(reservation);
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -982,6 +964,8 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         })
         .await
         .expect("workbench_remove write failed");
+    // The close command cannot reach a backend parked behind this gate.
+    drop(hold_gate);
     let _ = expect_kind(
         &mut fixture.client,
         FrameKind::AgentClosed,
@@ -1201,13 +1185,21 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
         })
         .await
         .expect("spawn orchestrator");
-    let orchestrator = loop {
-        let env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "orchestrator").await;
+    let mut orchestrator = None;
+    next_frame_matching_on(&mut fixture.client, "orchestrator", |env| {
+        if env.kind != FrameKind::NewAgent {
+            return false;
+        }
         let agent: NewAgentPayload = env.parse_payload().expect("NewAgent");
         if agent.name == "workbench-orchestrator" {
-            break agent;
+            orchestrator = Some(agent);
+            true
+        } else {
+            false
         }
-    };
+    })
+    .await;
+    let orchestrator = orchestrator.expect("orchestrator NewAgent");
 
     let (is_error, body) = call_agent_control(
         &fixture,

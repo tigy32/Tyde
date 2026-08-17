@@ -2,7 +2,7 @@
 //!
 //! The document travels as the opaque `settings` value inside
 //! [`crate::BackendNativeSettingsSnapshot`] (server → client) and
-//! [`crate::HostSettingValue::BackendNativeSettings`] (client → server). Both
+//! `BackendNativeSettingsWritePayload` (client → server). Both
 //! sides deserialize it into these types; the wire frames stay generic.
 //!
 //! Server snapshots describe every discovered Tycode profile: the shared
@@ -29,10 +29,11 @@ pub struct TycodeNativeSettingsDoc {
     pub version: u32,
     /// Discovery order: the default profile first, named profiles sorted.
     pub profiles: Vec<TycodeProfileSettings>,
-    /// Profile file operations, executed before per-profile settings saves.
-    /// Never present in server snapshots.
+    /// Resources removed by the action that produced this snapshot. The
+    /// profiles list remains authoritative; tombstones let clients retire a
+    /// selected resource without guessing why it disappeared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub actions: Vec<TycodeProfileAction>,
+    pub tombstones: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -51,19 +52,4 @@ pub struct TycodeProfileSettings {
     /// overwrite concurrent changes. Absent in server snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_settings: Option<serde_json::Value>,
-}
-
-/// Write-only profile file operation, executed before settings saves.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TycodeProfileAction {
-    /// Create `profiles/<name>.toml` as a byte-for-byte copy of the
-    /// `copy_from` profile's settings file (default: the default profile).
-    CreateProfile {
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        copy_from: Option<String>,
-    },
-    /// Delete `profiles/<name>.toml`. The default profile cannot be deleted.
-    DeleteProfile { name: String },
 }

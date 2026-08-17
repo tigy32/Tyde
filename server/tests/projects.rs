@@ -1,6 +1,6 @@
 mod fixture;
 
-use fixture::Fixture;
+use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
     BrowseBootstrapListing, BrowseBootstrapPayload, CommandErrorCode, CommandErrorPayload,
     DiffContextMode, Envelope, FileEntryOp, FrameKind, GitBranchName, HostAbsPath,
@@ -19,70 +19,26 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+fn is_control_plane_noise(env: &Envelope) -> bool {
+    matches!(
+        env.kind,
+        FrameKind::HostSettings
+            | FrameKind::BackendCapacity
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::ProjectEvent
+    )
+}
+
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(
-            env.kind,
-            FrameKind::HostSettings
-                | FrameKind::SessionSchemas
-                | FrameKind::LaunchProfileCatalogNotify
-                | FrameKind::BackendSetup
-                | FrameKind::BackendCapacity
-                | FrameKind::QueuedMessages
-                | FrameKind::SessionSettings
-                | FrameKind::TeamPresetCatalogNotify
-                | FrameKind::SessionList
-                | FrameKind::WorkflowNotify
-                | FrameKind::AgentsViewPreferencesNotify
-                | FrameKind::ProjectEvent
-        ) {
-            continue;
-        }
-        return env;
-    }
+    fixture::next_interesting_frame_on(client, context, is_control_plane_noise).await
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    loop {
-        match tokio::time::timeout(duration, client.next_event()).await {
-            Err(_) => return,
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionList
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::ProjectEvent
-                    ) =>
-            {
-                continue;
-            }
-            Ok(Ok(Some(env))) => panic!(
-                "unexpected event before {context}: kind={} stream={}",
-                env.kind, env.stream
-            ),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
+    fixture::assert_no_interesting_frame_on(client, duration, context, is_control_plane_noise)
+        .await;
 }
 
 async fn expect_project_notify(
@@ -218,8 +174,7 @@ async fn expect_browse_event(
     kind: FrameKind,
     context: &str,
 ) -> Envelope {
-    loop {
-        let env = expect_next_event(client, context).await;
+    next_frame_matching_on(client, context, |env| {
         if env.kind == FrameKind::CommandError {
             let error: CommandErrorPayload = env
                 .parse_payload()
@@ -229,10 +184,9 @@ async fn expect_browse_event(
                 error.operation, error.message
             );
         }
-        if env.stream == *browse_stream && env.kind == kind {
-            return env;
-        }
-    }
+        env.stream == *browse_stream && env.kind == kind
+    })
+    .await
 }
 
 async fn open_browse_and_read_initial(
@@ -358,22 +312,10 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
             Ok(Ok(None)) => return,
             Ok(Err(err)) => panic!("next_event failed while draining {context}: {err:?}"),
             Ok(Ok(Some(env)))
-                if fixture::is_builtin_team_custom_agent_notify(&env)
+                if is_control_plane_noise(&env)
                     || matches!(
                         env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSchemas
-                            | FrameKind::LaunchProfileCatalogNotify
-                            | FrameKind::BackendSetup
-                            | FrameKind::BackendCapacity
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionList
-                            | FrameKind::WorkflowNotify
-                            | FrameKind::AgentsViewPreferencesNotify
-                            | FrameKind::ProjectEvent
-                            | FrameKind::ProjectBootstrap
+                        FrameKind::ProjectBootstrap
                             | FrameKind::ProjectFileList
                             | FrameKind::ProjectGitStatus
                             | FrameKind::CodeIntelOverview

@@ -354,7 +354,7 @@ Client                              Server
   │    ]}                             │
 ```
 
-If `enabled_backends` changes (via `SetSetting`), the server re-emits
+If `enabled_backends` changes (via `SettingsWrite`), the server re-emits
 `SessionSchemas` with only the schemas for currently enabled backends.
 
 ### 5.2 Spawning with Session Settings

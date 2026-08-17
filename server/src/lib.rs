@@ -47,6 +47,7 @@ pub use host::{
 #[cfg(feature = "test-support")]
 pub use host::{
     InstalledAgentNameGate, InstalledSpawnOperationTestGate, InstalledWorkbenchRemoveHook,
+    MockLaunchReservation,
 };
 
 use std::collections::HashMap;

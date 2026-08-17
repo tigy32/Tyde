@@ -408,7 +408,7 @@ pub mod client {
                 .and_then(|mut pending| pending.on_done.take())
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "wasm32"))]
         fn contains_active(&self, task_id: u64) -> bool {
             self.active.borrow().contains_key(&task_id)
         }

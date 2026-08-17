@@ -1382,9 +1382,10 @@ mod wasm_tests {
     use crate::state::{AgentInfo, AgentRef, AppState, LocalHostId};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, CustomAgent, CustomAgentId, HostSettings,
-        QueuedMessageEntry, QueuedMessageId, SessionId, StreamPath, ToolPolicy,
+        AgentId, AgentOrigin, BackendKind, CustomAgent, CustomAgentId, QueuedMessageEntry,
+        QueuedMessageId, SessionId, StreamPath, ToolPolicy,
     };
+    use settings_model::HostSettings;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;

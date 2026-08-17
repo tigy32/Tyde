@@ -1943,6 +1943,60 @@ fn hermes_config_default_profile() -> &'static str {
     protocol::hermes_config::HERMES_DEFAULT_PROFILE
 }
 
+/// Settings-dependent stand-in for [`probe_session_settings_schema`] used
+/// when real backend probing is disabled (test fixtures): a fixed
+/// two-provider model catalog run through the SAME parsing/filtering as a
+/// real `model.options` payload, including `hermes_disabled_providers`. This
+/// makes the provider-disable → session-schema re-probe coupling observable
+/// at the protocol level in sims — disabling `mock-openai` visibly removes
+/// its model option from the published `SessionSchemas` frame — instead of
+/// only proving that a refresh routine was entered.
+pub(crate) fn mock_probe_session_settings_schema(
+    disabled_providers: &HashMap<String, Vec<String>>,
+) -> SessionSettingsSchema {
+    let payload = serde_json::json!({
+        "providers": [
+            {
+                "slug": "mock-anthropic",
+                "name": "Mock Anthropic",
+                "authenticated": true,
+                "models": ["mock-claude"],
+            },
+            {
+                "slug": "mock-openai",
+                "name": "Mock OpenAI",
+                "authenticated": true,
+                "models": ["mock-gpt"],
+            },
+        ],
+    });
+    let disabled = disabled_providers
+        .get(hermes_config_default_profile())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let (options, default) = model_select_options_from_payload(&payload, disabled)
+        .expect("static mock Hermes model catalog parses");
+    let mut fields = vec![SessionSettingField {
+        key: "model".to_string(),
+        label: "Model".to_string(),
+        description: Some(
+            "Hermes model from authenticated providers reported by model.options.".to_string(),
+        ),
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: SessionSettingFieldType::Select {
+            options,
+            default,
+            nullable: true,
+        },
+    }];
+    fields.extend(hermes_base_session_fields());
+    SessionSettingsSchema {
+        backend_kind: BackendKind::Hermes,
+        fields,
+    }
+}
+
 /// The profile's currently effective `provider/model` from a `model.options`
 /// payload, for display.
 fn model_summary_from_payload(value: &Value) -> Option<String> {
@@ -5978,7 +6032,7 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
 /// Parse a `model.options` payload into the per-profile model Select options
 /// plus the option matching the profile's current selection.
 /// `disabled` holds provider slugs Tyde must not offer for this profile (see
-/// [`protocol::HostSettings::hermes_disabled_providers`]). They are dropped
+/// [`settings_model::HostSettings::hermes_disabled_providers`]). They are dropped
 /// after parsing, never before: a malformed provider row is still a malformed
 /// payload whether or not the user has hidden that provider.
 fn model_select_options_from_payload(

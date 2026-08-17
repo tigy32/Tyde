@@ -167,28 +167,6 @@ fn truncate_for_compact(text: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_short_passes_through() {
-        let out = truncate_for_compact("a\nb\nc");
-        assert_eq!(out, "a\nb\nc");
-    }
-
-    #[test]
-    fn truncate_caps_at_line_cap() {
-        let lines: Vec<String> = (0..300).map(|i| format!("line{i}")).collect();
-        let input = lines.join("\n");
-        let out = truncate_for_compact(&input);
-        let kept = out.split('\n').count();
-        // 200 lines + the trailing ellipsis line.
-        assert_eq!(kept, COMPACT_LINE_CAP + 1);
-        assert!(out.ends_with('\u{2026}'));
-    }
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;

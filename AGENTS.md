@@ -230,6 +230,57 @@ in. When pull-request checks surface that kind of collateral:
 Mention the collateral fix in the commit body so it's discoverable, but
 don't split it into a separate commit just for purity.
 
+## Writing tests
+
+**Unit tests have absolutely zero value. Do not write them.** In-process tests
+that construct a value and assert on it — serde round-trips, struct field
+checks, method-level logic tests — test that the compiler works and certify
+whatever the author already believed. Every such test has been deleted from
+this repository deliberately. If a test does not exercise the system across a
+real boundary — a real server, a real backend, a real DOM, a real running
+instance — it does not get written.
+
+**How each layer is tested. There is exactly one way per layer:**
+
+| Layer | The only permitted tests |
+|---|---|
+| **Agent backends** | Real e2e conformance tests (`real_cert_*`): a real provider, a real CLI, real money. Nothing else counts as backend coverage — no fakes, no scripted providers, no canned events. |
+| **tyde-server** | E2e "sim" tests at the protocol level: spawn the real server with the mock backend, drive it over the real protocol (handshake, envelopes, seq), assert on the events a client receives. Never test server internals directly. |
+| **Frontend** | Wasm tests only: real Leptos components mounted in a real DOM in headless Chrome, asserting on what the user perceives. No native frontend tests. |
+
+Where they live and run:
+
+- **Backend conformance** — registered in the agent-adapter certification
+  registry, implemented in `tests/tests/backend.rs`, opt-in via
+  `TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=<kind>`. Required when a
+  backend changes (§3); run deliberately — think first, run once.
+- **Server sim tests** — `server/tests/`, one file per server feature
+  (agents, settings, projects, teams, queue, …), each driving the real server
+  through the protocol on the shared fixture (`server/tests/fixture.rs`) with
+  the mock backend; run in `./dev.sh check`. The fixture and mock backend are
+  the ergonomic surface for these tests — extend them rather than building
+  one-off harnesses.
+- **Wasm UI tests** — inline under
+  `#[cfg(all(test, target_arch = "wasm32"))] mod wasm_tests`; run in
+  `./dev.sh check`.
+- **Real dev-instance testing** — a disposable Tyde instance via
+  `tyde_dev_instance_start`, driving the rendered UI
+  (`dev-docs/backend-dev-instance-manual-qa.md` is the workflow). This is
+  manual QA, not a substitute for the suites above.
+
+**Fewer, bigger, higher-value tests.** We want 100 tests that each exercise an
+entire feature flow end to end, not 1,000 tests that each pin one line.  A
+good test walks a real user-visible scenario — spawn an agent, send a message,
+stream the reply, interrupt it, resume the session — and asserts every
+contract along the way. Before writing a new test, extend the existing flow
+test for that feature; write a new one only for a genuinely new flow. A test
+whose failure would not point at broken user-visible behavior should not
+exist.
+
+A new test must prove it can fail: it fails against the broken behavior it
+guards and passes against the fix. A test that cannot fail is noise and gets
+rejected in review.
+
 ## Frontend UI tests are load-bearing
 
 Component-level wasm tests live inline in their component file under

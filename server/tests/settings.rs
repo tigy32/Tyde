@@ -1,26 +1,31 @@
 mod fixture;
 
+use settings_model::HostSettingsPayload;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{
+    Fixture, next_frame_matching_on, next_frame_matching_strict_on,
+    routine_control_plane_noise_plus,
+};
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload,
     AgentStartPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload,
     BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
     BackendNativeSettingsGroupKind, BackendSetupAction, BackendSetupDiagnosticCode,
     BackendSetupPayload, BackendSetupStatus, ChatEvent, CodeIntelProviderId, CommandErrorPayload,
-    Envelope, FrameKind, HostExecutablePath, HostSettingValue, HostSettings, HostSettingsPayload,
-    ListSessionsPayload, NewAgentPayload, NewTerminalPayload, RunBackendSetupPayload, SessionId,
-    SessionListPayload, SessionSettingValue, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, TerminalBootstrapPayload, TerminalExitPayload,
-    TerminalOutputPayload,
+    Envelope, FrameKind, ListSessionsPayload, NewAgentPayload, NewTerminalPayload,
+    RunBackendSetupPayload, SessionId, SessionListPayload, SessionSchemasPayload,
+    SessionSettingValue, SettingExpectation, SettingOp, SettingsErrorCode, SettingsWriteId,
+    SettingsWritePayload, SettingsWriteResultPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, TerminalBootstrapPayload, TerminalExitPayload, TerminalOutputPayload,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
 use server::store::settings::HostSettingsStore;
+use settings_model::{HostExecutablePath, HostSettings};
 use tokio::sync::Mutex;
 
 fn env_lock() -> &'static Mutex<()> {
@@ -67,54 +72,26 @@ async fn expect_no_backend_setup_replay(client: &mut client::Connection) {
     }
 }
 
-async fn expect_backend_config_snapshots(
-    client: &mut client::Connection,
-    context: &str,
-) -> BackendConfigSnapshotsPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let now = tokio::time::Instant::now();
-        assert!(now < deadline, "timed out waiting for {context}");
-        let env = match tokio::time::timeout(deadline - now, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if env.kind == FrameKind::BackendConfigSnapshots {
-            return env.parse_payload().unwrap_or_else(|err| {
-                panic!("failed to parse BackendConfigSnapshots for {context}: {err}")
-            });
-        }
-        if env.kind == FrameKind::CommandError {
-            let error: CommandErrorPayload = env
-                .parse_payload()
-                .unwrap_or_else(|err| panic!("failed to parse CommandError for {context}: {err}"));
-            panic!("unexpected CommandError before {context}: {error:?}");
-        }
-    }
-}
-
-async fn next_required_event(
-    client: &mut client::Connection,
-    deadline: tokio::time::Instant,
-    context: &str,
-) -> Envelope {
-    let now = tokio::time::Instant::now();
-    assert!(now < deadline, "timed out waiting for {context}");
-    let env = match tokio::time::timeout(deadline - now, client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
-    };
+fn panic_on_command_error(env: &Envelope, context: &str) {
     if env.kind == FrameKind::CommandError {
         let error: CommandErrorPayload = env
             .parse_payload()
             .unwrap_or_else(|err| panic!("failed to parse CommandError for {context}: {err}"));
         panic!("unexpected CommandError before {context}: {error:?}");
     }
-    env
+}
+
+async fn expect_backend_config_snapshots(
+    client: &mut client::Connection,
+    context: &str,
+) -> BackendConfigSnapshotsPayload {
+    next_frame_matching_on(client, context, |env| {
+        panic_on_command_error(env, context);
+        env.kind == FrameKind::BackendConfigSnapshots
+    })
+    .await
+    .parse_payload()
+    .unwrap_or_else(|err| panic!("failed to parse BackendConfigSnapshots for {context}: {err}"))
 }
 
 async fn expect_tycode_agent_launch(
@@ -234,15 +211,13 @@ async fn expect_tycode_agent_launch(
 }
 
 async fn expect_session_list(client: &mut client::Connection, context: &str) -> SessionListPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let env = next_required_event(client, deadline, context).await;
-        if env.kind == FrameKind::SessionList {
-            return env
-                .parse_payload()
-                .unwrap_or_else(|err| panic!("failed to parse SessionList for {context}: {err}"));
-        }
-    }
+    next_frame_matching_on(client, context, |env| {
+        panic_on_command_error(env, context);
+        env.kind == FrameKind::SessionList
+    })
+    .await
+    .parse_payload()
+    .unwrap_or_else(|err| panic!("failed to parse SessionList for {context}: {err}"))
 }
 
 async fn expect_tycode_turn_quiescent(
@@ -250,12 +225,11 @@ async fn expect_tycode_turn_quiescent(
     stream: &StreamPath,
     context: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut saw_stream_end = false;
-    loop {
-        let env = next_required_event(client, deadline, context).await;
+    next_frame_matching_on(client, context, |env| {
+        panic_on_command_error(env, context);
         if env.stream != *stream {
-            continue;
+            return false;
         }
         match env.kind {
             FrameKind::ChatEvent => {
@@ -263,9 +237,12 @@ async fn expect_tycode_turn_quiescent(
                     .parse_payload()
                     .unwrap_or_else(|err| panic!("failed to parse ChatEvent for {context}: {err}"));
                 match event {
-                    ChatEvent::StreamEnd(_) => saw_stream_end = true,
-                    ChatEvent::TypingStatusChanged(false) if saw_stream_end => return,
-                    _ => {}
+                    ChatEvent::StreamEnd(_) => {
+                        saw_stream_end = true;
+                        false
+                    }
+                    ChatEvent::TypingStatusChanged(false) => saw_stream_end,
+                    _ => false,
                 }
             }
             FrameKind::AgentError => {
@@ -274,9 +251,10 @@ async fn expect_tycode_turn_quiescent(
                 });
                 panic!("unexpected AgentError before {context}: {error:?}");
             }
-            _ => {}
+            _ => false,
         }
-    }
+    })
+    .await;
 }
 
 async fn expect_agent_closed(
@@ -284,23 +262,20 @@ async fn expect_agent_closed(
     expected_agent_id: &protocol::AgentId,
     context: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let env = next_required_event(client, deadline, context).await;
-        if env.kind == FrameKind::AgentClosed {
-            let closed: AgentClosedPayload = env
-                .parse_payload()
-                .unwrap_or_else(|err| panic!("failed to parse AgentClosed for {context}: {err}"));
-            assert_eq!(&closed.agent_id, expected_agent_id);
-            return;
-        }
+    let closed: AgentClosedPayload = next_frame_matching_on(client, context, |env| {
+        panic_on_command_error(env, context);
         if env.kind == FrameKind::AgentError {
             let error: AgentErrorPayload = env
                 .parse_payload()
                 .unwrap_or_else(|err| panic!("failed to parse AgentError for {context}: {err}"));
             panic!("unexpected AgentError before {context}: {error:?}");
         }
-    }
+        env.kind == FrameKind::AgentClosed
+    })
+    .await
+    .parse_payload()
+    .unwrap_or_else(|err| panic!("failed to parse AgentClosed for {context}: {err}"));
+    assert_eq!(&closed.agent_id, expected_agent_id);
 }
 
 struct FakeTycode {
@@ -351,12 +326,18 @@ import copy
 import json
 import os
 import sys
+import time
 import tomllib
 
 behavior_path = __BEHAVIOR_PATH__
 log_path = __LOG_PATH__
 with open(behavior_path, "r", encoding="utf-8") as behavior_file:
     behavior = json.load(behavior_file)
+
+# Widens the window every fake-Tycode process holds open, so concurrency
+# tests can deterministically overlap a second settings write with an
+# in-flight refresh. Default off.
+time.sleep(behavior.get("startup_delay_seconds", 0))
 
 def log(value):
     with open(log_path, "a", encoding="utf-8") as log_file:
@@ -746,6 +727,11 @@ for raw_line in sys.stdin:
             })
     elif isinstance(command, dict) and "SaveSettings" in command:
         save = command["SaveSettings"]
+        persist_gate_path = behavior.get("persist_gate_path")
+        if save.get("persist") is True and persist_gate_path:
+            log({"type": "persist_gate_entered", "pid": os.getpid()})
+            while not os.path.exists(persist_gate_path):
+                time.sleep(0.01)
         settings = normalize({
             key: value for key, value in save["settings"].items() if key != "profile"
         })
@@ -980,16 +966,17 @@ fn expected_empty_settings() -> HostSettings {
         default_backend: None,
         enable_mobile_connections: false,
         mobile_broker_url: None,
+        mobile_broker_auth: Default::default(),
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
-        tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+        tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         supervisor: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
-        launch_profiles: Vec::new(),
+        launch_profiles: Default::default(),
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
     }
@@ -1073,7 +1060,7 @@ fn persisted_native_voice_settings_migrate_without_legacy_network_fields() {
     assert_eq!(settings.voice.nova_model, "amazon.nova-2-sonic-v1:0");
     assert_eq!(
         settings.voice.endpointing_sensitivity,
-        protocol::VoiceEndpointingSensitivity::Low,
+        settings_model::VoiceEndpointingSensitivity::Low,
         "voice settings written before endpointing control default to the patient value"
     );
     assert_eq!(
@@ -1173,148 +1160,168 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             default_backend: Some(BackendKind::Claude),
             enable_mobile_connections: false,
             mobile_broker_url: None,
+            mobile_broker_auth: Default::default(),
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
-            tyde_agent_control_max_depth: protocol::default_agent_control_max_depth(),
+            tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
-            launch_profiles: Vec::new(),
+            launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
         }
     );
 }
 
-#[test]
-fn supervisor_settings_default_apply_and_validate() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-    let store = HostSettingsStore::load(path).expect("load empty settings store");
-
-    let defaults = store.get().expect("read empty settings").supervisor;
-    assert!(!defaults.enabled, "supervisor must default off");
-    assert!(
-        !defaults.auto_compact_on_success,
-        "auto-compact must default off"
-    );
+#[tokio::test(start_paused = true)]
+async fn supervisor_settings_apply_and_validate_over_protocol() {
+    let mut fixture = Fixture::new().await;
+    let defaults = &fixture.bootstrap.settings.supervisor;
+    assert!(!defaults.enabled);
+    assert!(!defaults.auto_compact_on_success);
     assert_eq!(defaults.auto_compact_min_context_tokens, 200_000);
     assert_eq!(defaults.auto_compact_inactivity_delay_seconds, 300);
     assert_eq!(defaults.max_kicks_per_task, 3);
     assert_eq!(defaults.retry_attempts, 1);
 
-    let settings = store
-        .apply(HostSettingValue::SupervisorEnabled { enabled: true })
-        .expect("enable supervisor");
-    assert!(settings.supervisor.enabled);
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true })
-        .expect("enable auto-compact");
-    assert!(settings.supervisor.auto_compact_on_success);
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 })
-        .expect("minimum inactivity delay is valid");
-    assert_eq!(settings.supervisor.auto_compact_inactivity_delay_seconds, 1);
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_400 })
-        .expect("maximum inactivity delay is valid");
-    assert_eq!(
-        settings.supervisor.auto_compact_inactivity_delay_seconds,
-        86_400
-    );
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 17 })
-        .expect("persist non-default inactivity delay");
-    assert_eq!(
-        settings.supervisor.auto_compact_inactivity_delay_seconds,
-        17
-    );
-    store
-        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 0 })
-        .expect_err("zero inactivity delay must be rejected");
-    store
-        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_401 })
-        .expect_err("inactivity delay above the maximum must be rejected");
-    assert_eq!(
-        store
-            .get()
-            .expect("read delay after rejected updates")
-            .supervisor
-            .auto_compact_inactivity_delay_seconds,
-        17,
-        "rejected updates must not clobber the prior valid delay"
-    );
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 })
-        .expect("set auto-compact minimum context");
-    assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 275_000);
-    assert_eq!(
-        store
-            .get()
-            .expect("re-read nonzero auto-compact minimum")
-            .supervisor
-            .auto_compact_min_context_tokens,
-        275_000,
-        "the nonzero minimum must survive the read-modify-write cycle"
-    );
-    let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 0 })
-        .expect("zero is a valid auto-compact minimum context");
-    assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 0);
-    let settings = store
-        .apply(HostSettingValue::SupervisorMaxKicksPerTask { count: 5 })
-        .expect("set kick limit");
-    assert_eq!(settings.supervisor.max_kicks_per_task, 5);
-    let settings = store
-        .apply(HostSettingValue::SupervisorRetryAttempts { count: 0 })
-        .expect("retries can be disabled entirely");
-    assert_eq!(settings.supervisor.retry_attempts, 0);
-    let settings = store
-        .apply(HostSettingValue::SupervisorRetryAttempts { count: 5 })
-        .expect("five delayed attempts is the maximum");
-    assert_eq!(settings.supervisor.retry_attempts, 5);
-    store
-        .apply(HostSettingValue::SupervisorRetryAttempts { count: 6 })
-        .expect_err("six delayed attempts must be rejected");
-    assert_eq!(
-        settings.supervisor.cost_tier,
-        protocol::SupervisorCostTier::Low,
-        "the verdict tier defaults to the cheap tier"
-    );
-    let settings = store
-        .apply(HostSettingValue::SupervisorCostTier {
-            tier: protocol::SupervisorCostTier::High,
-        })
-        .expect("set verdict tier");
-    assert_eq!(
-        settings.supervisor.cost_tier,
-        protocol::SupervisorCostTier::High
-    );
+    let valid = [
+        (
+            "supervisor-enabled",
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
+        (
+            "supervisor-auto",
+            "/supervisor/auto_compact_on_success",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
+        (
+            "supervisor-delay-min",
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            serde_json::json!(1),
+            serde_json::json!(300),
+        ),
+        (
+            "supervisor-delay-max",
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            serde_json::json!(86_400),
+            serde_json::json!(1),
+        ),
+        (
+            "supervisor-delay-final",
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            serde_json::json!(17),
+            serde_json::json!(86_400),
+        ),
+        (
+            "supervisor-context-nonzero",
+            "/supervisor/auto_compact_min_context_tokens",
+            serde_json::json!(275_000),
+            serde_json::json!(200_000),
+        ),
+        (
+            "supervisor-context-zero",
+            "/supervisor/auto_compact_min_context_tokens",
+            serde_json::json!(0),
+            serde_json::json!(275_000),
+        ),
+        (
+            "supervisor-kicks",
+            "/supervisor/max_kicks_per_task",
+            serde_json::json!(5),
+            serde_json::json!(3),
+        ),
+        (
+            "supervisor-retries-zero",
+            "/supervisor/retry_attempts",
+            serde_json::json!(0),
+            serde_json::json!(1),
+        ),
+        (
+            "supervisor-retries-max",
+            "/supervisor/retry_attempts",
+            serde_json::json!(5),
+            serde_json::json!(0),
+        ),
+        (
+            "supervisor-tier",
+            "/supervisor/cost_tier",
+            serde_json::json!("high"),
+            serde_json::json!("low"),
+        ),
+    ];
+    for (write_id, path, value, expected) in valid {
+        send_settings_write(
+            &mut fixture.client,
+            write_id,
+            vec![replace_op(path, value, expected)],
+        )
+        .await;
+        let fanout = expect_host_settings_frame(&mut fixture.client, write_id).await;
+        let result = expect_settings_write_result(&mut fixture.client, write_id, write_id).await;
+        assert!(result.applied, "{write_id}: {:?}", result.field_errors);
+        assert_eq!(result.current_etag, fanout.etag);
+    }
 
-    store
-        .apply(HostSettingValue::SupervisorMaxKicksPerTask { count: 0 })
-        .expect_err("a zero kick limit must be rejected, not stored");
+    for (write_id, path, value, expected) in [
+        (
+            "supervisor-delay-zero",
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            serde_json::json!(0),
+            serde_json::json!(17),
+        ),
+        (
+            "supervisor-delay-over",
+            "/supervisor/auto_compact_inactivity_delay_seconds",
+            serde_json::json!(86_401),
+            serde_json::json!(17),
+        ),
+        (
+            "supervisor-kicks-zero",
+            "/supervisor/max_kicks_per_task",
+            serde_json::json!(0),
+            serde_json::json!(5),
+        ),
+        (
+            "supervisor-retries-over",
+            "/supervisor/retry_attempts",
+            serde_json::json!(6),
+            serde_json::json!(5),
+        ),
+    ] {
+        send_settings_write(
+            &mut fixture.client,
+            write_id,
+            vec![replace_op(path, value, expected)],
+        )
+        .await;
+        let result = expect_settings_write_result(&mut fixture.client, write_id, write_id).await;
+        assert!(!result.applied, "{write_id}");
+        assert!(
+            result
+                .field_errors
+                .iter()
+                .any(|error| error.pointer == path && error.code == SettingsErrorCode::Invalid)
+        );
+    }
 
-    let persisted = store.get().expect("re-read persisted settings").supervisor;
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let persisted = bootstrap.settings.supervisor;
     assert!(persisted.enabled);
     assert!(persisted.auto_compact_on_success);
     assert_eq!(persisted.auto_compact_inactivity_delay_seconds, 17);
-    assert_eq!(
-        persisted.auto_compact_min_context_tokens, 0,
-        "the explicit zero minimum must persist"
-    );
-    assert_eq!(
-        persisted.max_kicks_per_task, 5,
-        "the rejected zero write must not clobber the stored kick limit"
-    );
+    assert_eq!(persisted.auto_compact_min_context_tokens, 0);
+    assert_eq!(persisted.max_kicks_per_task, 5);
     assert_eq!(persisted.retry_attempts, 5);
     assert_eq!(
         persisted.cost_tier,
-        protocol::SupervisorCostTier::High,
-        "the verdict tier must survive the read-modify-write cycle"
+        settings_model::SupervisorCostTier::High
     );
 }
 
@@ -1367,160 +1374,108 @@ fn invalid_persisted_supervisor_retry_attempts_is_rejected() {
     assert!(error.contains("retry attempts must be between 0 and 5"));
 }
 
-#[test]
-fn code_intel_language_server_paths_default_set_and_clear() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-    let store = HostSettingsStore::load(path).expect("load empty settings store");
+#[tokio::test(start_paused = true)]
+async fn code_intel_language_server_path_sets_and_clears_over_protocol() {
+    let mut fixture = Fixture::new().await;
     let provider = CodeIntelProviderId("rust-analyzer".to_owned());
     let executable = HostExecutablePath("/opt/rust-analyzer/bin/rust-analyzer".to_owned());
-
     assert!(
-        store
-            .get()
-            .expect("read empty settings")
+        fixture
+            .bootstrap
+            .settings
             .code_intel
             .language_server_paths
-            .is_empty(),
-        "code-intel language server paths should default empty"
+            .is_empty()
     );
 
-    let settings = store
-        .apply(HostSettingValue::CodeIntelLanguageServerPath {
-            provider: provider.clone(),
-            path: Some(executable.clone()),
-        })
-        .expect("set rust-analyzer path");
+    send_settings_write(
+        &mut fixture.client,
+        "code-intel-set",
+        vec![replace_op(
+            "/code_intel/language_server_paths/rust-analyzer",
+            serde_json::to_value(&executable).expect("serialize executable path"),
+            serde_json::Value::Null,
+        )],
+    )
+    .await;
+    let set = expect_host_settings_frame(&mut fixture.client, "set code-intel path").await;
     assert_eq!(
-        settings.code_intel.language_server_paths.get(&provider),
+        set.settings.code_intel.language_server_paths.get(&provider),
         Some(&executable)
     );
-    assert_eq!(
-        store
-            .get()
-            .expect("re-read set path")
-            .code_intel
-            .language_server_paths
-            .get(&provider),
-        Some(&executable)
+    assert!(
+        expect_settings_write_result(
+            &mut fixture.client,
+            "code-intel-set",
+            "set code-intel result"
+        )
+        .await
+        .applied
     );
 
-    let settings = store
-        .apply(HostSettingValue::CodeIntelLanguageServerPath {
-            provider: provider.clone(),
-            path: None,
-        })
-        .expect("clear rust-analyzer path");
+    send_settings_write(
+        &mut fixture.client,
+        "code-intel-clear",
+        vec![SettingOp::Remove {
+            path: "/code_intel/language_server_paths/rust-analyzer".to_owned(),
+            expected: SettingExpectation::Value {
+                value: serde_json::to_value(&executable).expect("serialize executable path"),
+            },
+        }],
+    )
+    .await;
+    let cleared = expect_host_settings_frame(&mut fixture.client, "clear code-intel path").await;
+    assert!(cleared.settings.code_intel.language_server_paths.is_empty());
     assert!(
-        settings.code_intel.language_server_paths.is_empty(),
-        "clearing the path should remove the provider entry"
-    );
-    assert!(
-        store
-            .get()
-            .expect("re-read cleared path")
-            .code_intel
-            .language_server_paths
-            .is_empty(),
-        "cleared path should persist"
+        expect_settings_write_result(
+            &mut fixture.client,
+            "code-intel-clear",
+            "clear code-intel result"
+        )
+        .await
+        .applied
     );
 }
 
-#[test]
-fn backend_config_updates_merge_and_clear_explicitly_in_store() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-    let store = HostSettingsStore::load(path).expect("load empty settings store");
-
-    // No built-in backend publishes a typed deep-config schema anymore
-    // (Hermes moved to backend-native settings), so storing values for one
-    // is a visible refusal instead of a silent write.
-    let mut values = BackendConfigValues::default();
-    values.0.insert(
-        "default_model".to_owned(),
-        SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
-    );
-    let err = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Hermes,
-            values,
-        })
-        .expect_err("schema-less backend config writes must be refused");
-    assert!(
-        err.contains("does not support backend configuration"),
-        "{err}"
-    );
-
-    // An explicit empty update still clears any stored entry and persists.
-    let settings = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Hermes,
-            values: BackendConfigValues::default(),
-        })
-        .expect("empty update clears backend config");
-    assert!(!settings.backend_config.contains_key(&BackendKind::Hermes));
-}
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn backend_config_updates_are_refused_over_client_events() {
     let mut fixture = Fixture::new().await;
 
-    // No built-in backend accepts typed deep-config writes anymore (Hermes
-    // moved to backend-native settings), so a BackendConfig set must come
-    // back as a typed CommandError instead of a settings update.
     let mut model = BackendConfigValues::default();
     model.0.insert(
         "default_model".to_owned(),
         SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
     );
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendConfig {
-                backend: BackendKind::Hermes,
-                values: model,
-            },
-        })
-        .await
-        .expect("send Hermes backend config set");
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let now = tokio::time::Instant::now();
-        assert!(now < deadline, "timed out waiting for the refusal");
-        let env = match tokio::time::timeout(deadline - now, fixture.client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before the refusal"),
-            Ok(Err(err)) => panic!("next_event failed before the refusal: {err:?}"),
-            Err(_) => panic!("timed out waiting for the refusal"),
-        };
-        match env.kind {
-            FrameKind::CommandError => {
-                let error: CommandErrorPayload = env
-                    .parse_payload()
-                    .expect("parse CommandError for Hermes backend config refusal");
-                assert!(
-                    error
-                        .message
-                        .contains("does not support backend configuration"),
-                    "unexpected refusal message: {error:?}"
-                );
-                break;
-            }
-            FrameKind::HostSettings => {
-                let settings: HostSettingsPayload = env
-                    .parse_payload()
-                    .expect("parse HostSettings while awaiting the refusal");
-                assert!(
-                    !settings
-                        .settings
-                        .backend_config
-                        .contains_key(&BackendKind::Hermes),
-                    "refused Hermes backend config must never reach host settings"
-                );
-            }
-            _ => {}
-        }
-    }
+    send_settings_write(
+        &mut fixture.client,
+        "hermes-config-refusal",
+        vec![replace_op(
+            "/backend_config/hermes",
+            serde_json::to_value(model).expect("serialize backend config"),
+            serde_json::Value::Null,
+        )],
+    )
+    .await;
+    let error = expect_settings_write_result(
+        &mut fixture.client,
+        "hermes-config-refusal",
+        "Hermes backend config refusal",
+    )
+    .await;
+    assert!(!error.applied);
+    assert!(
+        error.field_errors.iter().any(|field| field
+            .message
+            .contains("does not support backend configuration")),
+        "unexpected refusal message: {error:?}"
+    );
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        !bootstrap
+            .settings
+            .backend_config
+            .contains_key(&BackendKind::Hermes)
+    );
 }
 #[test]
 fn generated_alias_never_overrides_user_alias() {
@@ -2125,7 +2080,7 @@ async fn tycode_requires_installed_artifact_and_successful_exact_version_exit() 
 }
 
 #[tokio::test]
-async fn set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot() {
+async fn backend_native_settings_persist_and_profile_actions_publish_resources() {
     let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     let fake = write_fake_tycode_binary(temp_home.path());
@@ -2181,12 +2136,7 @@ secret = "shared-save-secret"
 
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: save_doc,
-            },
-        })
+        .backend_native_settings_write(BackendKind::Tycode, save_doc)
         .await
         .expect("save Tycode native settings");
     let refreshed =
@@ -2286,12 +2236,7 @@ secret = "shared-save-secret"
     });
     fixture
         .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: noop_doc,
-            },
-        })
+        .backend_native_settings_write(BackendKind::Tycode, noop_doc)
         .await
         .expect("persist an unchanged Tycode native settings document");
     let second_refresh = expect_backend_config_snapshots(
@@ -2319,6 +2264,71 @@ secret = "shared-save-secret"
             }),
         "an unchanged save must not rewrite the settings file"
     );
+
+    let create_id = fixture
+        .client
+        .invoke_settings_action(
+            BackendKind::Tycode,
+            "profiles",
+            "create",
+            serde_json::json!({ "name": "review", "copy_from": "default" }),
+        )
+        .await
+        .expect("create Tycode profile resource");
+    let (created, create_result) = expect_settings_action_outcome(
+        &mut fixture.client,
+        &create_id,
+        "Tycode snapshot after profile creation",
+    )
+    .await;
+    let created_doc = tycode_native_snapshot(&created)
+        .settings
+        .as_ref()
+        .expect("created profile settings document");
+    let created_profiles = created_doc["profiles"]
+        .as_array()
+        .expect("authoritative Tycode profile list");
+    assert!(
+        created_profiles
+            .iter()
+            .any(|profile| profile["name"] == "review"),
+        "created resource must appear in the authoritative profile list: {created_doc:?}"
+    );
+    assert!(created_doc["tombstones"].is_null());
+    assert!(create_result.applied, "{:?}", create_result.field_errors);
+
+    let delete_id = fixture
+        .client
+        .invoke_settings_action(
+            BackendKind::Tycode,
+            "profiles/review",
+            "delete",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("delete Tycode profile resource");
+    let (deleted, delete_result) = expect_settings_action_outcome(
+        &mut fixture.client,
+        &delete_id,
+        "Tycode snapshot after profile deletion",
+    )
+    .await;
+    let deleted_doc = tycode_native_snapshot(&deleted)
+        .settings
+        .as_ref()
+        .expect("deleted profile settings document");
+    assert!(
+        deleted_doc["profiles"]
+            .as_array()
+            .is_some_and(|profiles| profiles.iter().all(|profile| profile["name"] != "review")),
+        "deleted resource must be absent from the authoritative list: {deleted_doc:?}"
+    );
+    assert_eq!(
+        deleted_doc["tombstones"],
+        serde_json::json!(["profiles/review"]),
+        "the deletion snapshot must identify the retired resource"
+    );
+    assert!(delete_result.applied, "{:?}", delete_result.field_errors);
 }
 
 #[tokio::test]
@@ -2613,61 +2623,44 @@ async fn trusted_tycode_setup_exit_refreshes_setup_session_and_native_snapshots(
     assert!(request_json.get("arguments").is_none());
     send_host_payload(&mut fixture.client, FrameKind::RunBackendSetup, &request).await;
 
-    let terminal = loop {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("read event before setup NewTerminal")
-            .expect("connection closed before setup NewTerminal");
-        if env.kind == FrameKind::NewTerminal {
-            break env
-                .parse_payload::<NewTerminalPayload>()
-                .expect("parse setup NewTerminal");
-        }
-    };
-    let bootstrap = loop {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("read event before setup TerminalBootstrap")
-            .expect("connection closed before setup TerminalBootstrap");
-        if env.kind == FrameKind::TerminalBootstrap && env.stream == terminal.stream {
-            break env
-                .parse_payload::<TerminalBootstrapPayload>()
-                .expect("parse setup TerminalBootstrap");
-        }
-    };
+    let terminal: NewTerminalPayload =
+        next_frame_matching_on(&mut fixture.client, "setup NewTerminal", |env| {
+            env.kind == FrameKind::NewTerminal
+        })
+        .await
+        .parse_payload()
+        .expect("parse setup NewTerminal");
+    let bootstrap: TerminalBootstrapPayload =
+        next_frame_matching_on(&mut fixture.client, "setup TerminalBootstrap", |env| {
+            env.kind == FrameKind::TerminalBootstrap && env.stream == terminal.stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse setup TerminalBootstrap");
     assert_eq!(bootstrap.terminal_id, terminal.terminal_id);
     assert_eq!(bootstrap.start.shell, "/bin/sh");
 
     let mut output = String::new();
-    let exit = loop {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("read trusted setup terminal event")
-            .expect("connection closed before trusted setup exit");
-        if env.stream != terminal.stream {
-            continue;
-        }
-        match env.kind {
-            FrameKind::TerminalOutput => {
-                let payload: TerminalOutputPayload =
-                    env.parse_payload().expect("parse setup TerminalOutput");
-                output.push_str(&payload.data);
+    let exit: TerminalExitPayload =
+        next_frame_matching_on(&mut fixture.client, "trusted setup TerminalExit", |env| {
+            if env.stream != terminal.stream {
+                return false;
             }
-            FrameKind::TerminalExit => {
-                break env
-                    .parse_payload::<TerminalExitPayload>()
-                    .expect("parse setup TerminalExit");
+            match env.kind {
+                FrameKind::TerminalOutput => {
+                    let payload: TerminalOutputPayload =
+                        env.parse_payload().expect("parse setup TerminalOutput");
+                    output.push_str(&payload.data);
+                    false
+                }
+                FrameKind::TerminalExit => true,
+                FrameKind::TerminalError => panic!("trusted setup emitted TerminalError"),
+                _ => false,
             }
-            FrameKind::TerminalError => panic!("trusted setup emitted TerminalError"),
-            _ => {}
-        }
-    };
+        })
+        .await
+        .parse_payload()
+        .expect("parse setup TerminalExit");
     assert_eq!(exit.exit_code, Some(23));
     assert!(output.contains("$ /bin/sh '"));
     assert!(!output.contains("/bin/sh -l"));
@@ -2684,33 +2677,31 @@ async fn trusted_tycode_setup_exit_refreshes_setup_session_and_native_snapshots(
 
     let mut refresh_order = Vec::new();
     let mut refreshed_setup = None;
-    let mut refreshed_native = None;
-    while refreshed_native.is_none() {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("read post-setup refresh event")
-            .expect("connection closed before post-setup refresh completed");
-        match env.kind {
-            FrameKind::BackendSetup => {
-                refresh_order.push(FrameKind::BackendSetup);
-                refreshed_setup = Some(
-                    env.parse_payload::<BackendSetupPayload>()
-                        .expect("parse refreshed BackendSetup"),
-                );
+    let native: BackendConfigSnapshotsPayload =
+        next_frame_matching_on(&mut fixture.client, "post-setup refresh", |env| {
+            match env.kind {
+                FrameKind::BackendSetup => {
+                    refresh_order.push(FrameKind::BackendSetup);
+                    refreshed_setup = Some(
+                        env.parse_payload::<BackendSetupPayload>()
+                            .expect("parse refreshed BackendSetup"),
+                    );
+                    false
+                }
+                FrameKind::SessionSchemas => {
+                    refresh_order.push(FrameKind::SessionSchemas);
+                    false
+                }
+                FrameKind::BackendConfigSnapshots => {
+                    refresh_order.push(FrameKind::BackendConfigSnapshots);
+                    true
+                }
+                _ => false,
             }
-            FrameKind::SessionSchemas => refresh_order.push(FrameKind::SessionSchemas),
-            FrameKind::BackendConfigSnapshots => {
-                refresh_order.push(FrameKind::BackendConfigSnapshots);
-                refreshed_native = Some(
-                    env.parse_payload::<BackendConfigSnapshotsPayload>()
-                        .expect("parse refreshed BackendConfigSnapshots"),
-                );
-            }
-            _ => {}
-        }
-    }
+        })
+        .await
+        .parse_payload()
+        .expect("parse refreshed BackendConfigSnapshots");
     assert_eq!(
         refresh_order,
         vec![
@@ -2724,7 +2715,6 @@ async fn trusted_tycode_setup_exit_refreshes_setup_session_and_native_snapshots(
         backend.backend_kind == BackendKind::Tycode
             && backend.status == BackendSetupStatus::Installed
     }));
-    let native = refreshed_native.expect("forced native settings refresh");
     assert_eq!(
         tycode_native_snapshot(&native).status,
         BackendConfigSnapshotStatus::Ready
@@ -2733,4 +2723,1066 @@ async fn trusted_tycode_setup_exit_refreshes_setup_session_and_native_snapshots(
         !staged_path.exists(),
         "trusted setup script must be removed after terminal exit and refresh"
     );
+}
+
+fn replace_op(path: &str, value: serde_json::Value, expected: serde_json::Value) -> SettingOp {
+    SettingOp::Replace {
+        path: path.to_owned(),
+        value,
+        expected: SettingExpectation::Value { value: expected },
+    }
+}
+
+async fn send_settings_write(client: &mut client::Connection, write_id: &str, ops: Vec<SettingOp>) {
+    client
+        .settings_write(SettingsWritePayload {
+            write_id: SettingsWriteId(write_id.to_owned()),
+            ops,
+        })
+        .await
+        .unwrap_or_else(|err| panic!("send settings_write {write_id}: {err:?}"));
+}
+
+/// Waits for the requester-scoped result of `write_id`, skipping unrelated
+/// frames (fanouts, refreshes) but never a foreign write's result.
+async fn expect_settings_write_result(
+    client: &mut client::Connection,
+    write_id: &str,
+    context: &str,
+) -> SettingsWriteResultPayload {
+    let mut result = None;
+    next_frame_matching_on(client, context, |env| {
+        if env.kind != FrameKind::SettingsWriteResult {
+            return false;
+        }
+        let payload: SettingsWriteResultPayload = env
+            .parse_payload()
+            .unwrap_or_else(|err| panic!("parse SettingsWriteResult for {context}: {err}"));
+        assert_eq!(
+            payload.write_id.0, write_id,
+            "a SettingsWriteResult for a write this connection never issued is a \
+             requester-scoping violation ({context})"
+        );
+        result = Some(payload);
+        true
+    })
+    .await;
+    result.expect("matched settings write result")
+}
+
+async fn expect_settings_action_outcome(
+    client: &mut client::Connection,
+    write_id: &SettingsWriteId,
+    context: &str,
+) -> (BackendConfigSnapshotsPayload, SettingsWriteResultPayload) {
+    let mut snapshots = None;
+    let mut result = None;
+    next_frame_matching_on(client, context, |env| {
+        match env.kind {
+            FrameKind::BackendConfigSnapshots => {
+                snapshots = Some(
+                    env.parse_payload::<BackendConfigSnapshotsPayload>()
+                        .expect("parse action BackendConfigSnapshots"),
+                );
+            }
+            FrameKind::SettingsWriteResult => {
+                let payload = env
+                    .parse_payload::<SettingsWriteResultPayload>()
+                    .expect("parse action SettingsWriteResult");
+                assert_eq!(&payload.write_id, write_id);
+                result = Some(payload);
+            }
+            _ => {}
+        }
+        snapshots.is_some() && result.is_some()
+    })
+    .await;
+    (
+        snapshots.expect("action snapshots"),
+        result.expect("action result"),
+    )
+}
+
+/// The next `HostSettings` fanout frame, parsed.
+async fn expect_host_settings_frame(
+    client: &mut client::Connection,
+    context: &str,
+) -> HostSettingsPayload {
+    next_frame_matching_on(client, context, |env| env.kind == FrameKind::HostSettings)
+        .await
+        .parse_payload()
+        .unwrap_or_else(|err| panic!("parse HostSettings for {context}: {err}"))
+}
+
+/// Ambient host-stream frames a settings apply may legitimately fan out to
+/// every subscriber, for strict waits that must reject a leaked
+/// `SettingsWriteResult`.
+fn settings_apply_noise() -> Vec<FrameKind> {
+    routine_control_plane_noise_plus(&[
+        FrameKind::MobileAccessState,
+        FrameKind::VoiceCapabilities,
+        FrameKind::BackendConfigSnapshots,
+        FrameKind::BackendConfigSchemas,
+        FrameKind::SessionList,
+        FrameKind::TaskTokenUsage,
+        FrameKind::AgentsViewPreferencesNotify,
+    ])
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_scalar_applies_advances_etag_and_fans_out() {
+    let mut fixture = Fixture::new().await;
+    let (mut observer, observer_bootstrap) = fixture.connect_with_bootstrap().await;
+
+    let initial_etag = fixture.bootstrap.settings_etag.clone();
+    assert!(
+        !initial_etag.is_empty(),
+        "bootstrap must carry the settings etag"
+    );
+    assert_eq!(
+        observer_bootstrap.settings_etag, initial_etag,
+        "every bootstrap of the same document must carry the same etag"
+    );
+    assert!(
+        fixture
+            .bootstrap
+            .settings_schema
+            .get("properties")
+            .and_then(|properties| properties.get("supervisor"))
+            .is_some(),
+        "bootstrap must carry the host settings JSON Schema (missing supervisor property): {}",
+        fixture.bootstrap.settings_schema
+    );
+    assert!(
+        fixture.bootstrap.configured_secrets.is_empty(),
+        "no secret-bearing host settings exist yet"
+    );
+    assert!(!fixture.bootstrap.settings.supervisor.enabled);
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-scalar",
+        vec![replace_op(
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+
+    let fanout = expect_host_settings_frame(&mut fixture.client, "scalar write fanout").await;
+    assert!(fanout.settings.supervisor.enabled);
+    assert!(!fanout.etag.is_empty());
+    assert_ne!(
+        fanout.etag, initial_etag,
+        "an applied write must advance the etag"
+    );
+
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-scalar", "scalar write result").await;
+    assert!(result.applied, "field_errors: {:?}", result.field_errors);
+    assert!(result.field_errors.is_empty());
+    assert_eq!(
+        result.current_etag, fanout.etag,
+        "draft-clear rule: the result's etag must equal the broadcast snapshot's etag"
+    );
+
+    // The non-requesting subscriber sees the same fanout with the same etag,
+    // and never the requester-scoped result (strict wait: a leaked
+    // SettingsWriteResult panics).
+    let observed: HostSettingsPayload = next_frame_matching_strict_on(
+        &mut observer,
+        "observer fanout for scalar write",
+        &settings_apply_noise(),
+        |env| env.kind == FrameKind::HostSettings,
+    )
+    .await
+    .parse_payload()
+    .expect("parse observer HostSettings");
+    assert!(observed.settings.supervisor.enabled);
+    assert_eq!(observed.etag, result.current_etag);
+}
+
+#[tokio::test(start_paused = true)]
+async fn secret_settings_publish_tokens_and_reject_stale_replacement() {
+    let mut fixture = Fixture::new().await;
+    let mut second = fixture.connect().await;
+    let path = "/mobile_broker_auth/password";
+
+    fixture
+        .client
+        .settings_write(SettingsWritePayload {
+            write_id: SettingsWriteId("secret-a".to_owned()),
+            ops: vec![SettingOp::Replace {
+                path: path.to_owned(),
+                value: serde_json::json!("first-secret"),
+                expected: SettingExpectation::Absent,
+            }],
+        })
+        .await
+        .expect("configure secret from absent");
+    let first = expect_host_settings_frame(&mut fixture.client, "secret A fanout").await;
+    assert!(
+        serde_json::to_value(&first.settings)
+            .expect("serialize redacted host settings")
+            .pointer(path)
+            .is_none(),
+        "secret values must be absent from HostSettings"
+    );
+    let first_secret = first
+        .configured_secrets
+        .iter()
+        .find(|secret| secret.pointer == path)
+        .expect("configured secret token after absent-to-A")
+        .clone();
+    assert!(
+        expect_settings_write_result(&mut fixture.client, "secret-a", "secret A result")
+            .await
+            .applied
+    );
+    let second_first: HostSettingsPayload =
+        next_frame_matching_on(&mut second, "second client secret A fanout", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await
+        .parse_payload()
+        .expect("parse second client HostSettings");
+    assert_eq!(second_first.configured_secrets, first.configured_secrets);
+
+    fixture
+        .client
+        .settings_write(SettingsWritePayload {
+            write_id: SettingsWriteId("secret-b".to_owned()),
+            ops: vec![SettingOp::Replace {
+                path: path.to_owned(),
+                value: serde_json::json!("second-secret"),
+                expected: SettingExpectation::Version {
+                    token: first_secret.token.clone(),
+                },
+            }],
+        })
+        .await
+        .expect("replace secret A with B");
+    let second_value = expect_host_settings_frame(&mut fixture.client, "secret B fanout").await;
+    let second_secret = second_value
+        .configured_secrets
+        .iter()
+        .find(|secret| secret.pointer == path)
+        .expect("configured secret token after A-to-B");
+    assert_ne!(second_secret.token, first_secret.token);
+    assert_ne!(second_value.etag, first.etag);
+    assert!(
+        expect_settings_write_result(&mut fixture.client, "secret-b", "secret B result")
+            .await
+            .applied
+    );
+
+    second
+        .settings_write(SettingsWritePayload {
+            write_id: SettingsWriteId("secret-stale".to_owned()),
+            ops: vec![SettingOp::Replace {
+                path: path.to_owned(),
+                value: serde_json::json!("stale-secret"),
+                expected: SettingExpectation::Version {
+                    token: first_secret.token,
+                },
+            }],
+        })
+        .await
+        .expect("submit stale secret replacement");
+    let stale = expect_settings_write_result(
+        &mut second,
+        "secret-stale",
+        "stale secret replacement result",
+    )
+    .await;
+    assert!(!stale.applied);
+    assert_eq!(stale.field_errors[0].pointer, path);
+    assert_eq!(stale.field_errors[0].code, SettingsErrorCode::Conflict);
+    assert_eq!(stale.current_etag, second_value.etag);
+
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(bootstrap.settings_etag, second_value.etag);
+    assert_eq!(
+        bootstrap.configured_secrets,
+        second_value.configured_secrets
+    );
+    assert!(
+        serde_json::to_value(&bootstrap.settings)
+            .expect("serialize redacted bootstrap settings")
+            .pointer(path)
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_cas_conflict_applies_nothing() {
+    let mut fixture = Fixture::new().await;
+    let mut second = fixture.connect().await;
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-first",
+        vec![replace_op(
+            "/supervisor/max_kicks_per_task",
+            serde_json::json!(5),
+            serde_json::json!(3),
+        )],
+    )
+    .await;
+    let first_fanout = expect_host_settings_frame(&mut fixture.client, "first writer fanout").await;
+    assert_eq!(first_fanout.settings.supervisor.max_kicks_per_task, 5);
+    let first_result =
+        expect_settings_write_result(&mut fixture.client, "w-first", "first writer result").await;
+    assert!(first_result.applied);
+
+    // The second client saw the same fanout but submits with the stale
+    // expectation it started from.
+    let second_fanout = expect_host_settings_frame(&mut second, "second client fanout").await;
+    assert_eq!(second_fanout.settings.supervisor.max_kicks_per_task, 5);
+    send_settings_write(
+        &mut second,
+        "w-stale",
+        vec![replace_op(
+            "/supervisor/max_kicks_per_task",
+            serde_json::json!(4),
+            serde_json::json!(3),
+        )],
+    )
+    .await;
+    let stale_result =
+        expect_settings_write_result(&mut second, "w-stale", "stale writer result").await;
+    assert!(!stale_result.applied, "a stale CAS write must not apply");
+    assert_eq!(
+        stale_result.field_errors.len(),
+        1,
+        "{:?}",
+        stale_result.field_errors
+    );
+    let error = &stale_result.field_errors[0];
+    assert_eq!(error.pointer, "/supervisor/max_kicks_per_task");
+    assert_eq!(error.code, SettingsErrorCode::Conflict);
+    assert_eq!(
+        stale_result.current_etag, first_result.current_etag,
+        "a rejected write must report the unchanged current etag"
+    );
+
+    // Nothing applied: the next fanout both clients see still carries the
+    // first writer's value. (If the stale write had applied, the second
+    // client's next HostSettings frame would carry 4.)
+    send_settings_write(
+        &mut fixture.client,
+        "w-after",
+        vec![replace_op(
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+    let after = expect_host_settings_frame(&mut second, "fanout after rejected write").await;
+    assert_eq!(
+        after.settings.supervisor.max_kicks_per_task, 5,
+        "the rejected write must not have clobbered the stored value"
+    );
+    assert!(after.settings.supervisor.enabled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_overlapping_ops_are_rejected_whole() {
+    let mut fixture = Fixture::new().await;
+    let voice_doc = serde_json::to_value(&fixture.bootstrap.settings.voice)
+        .expect("serialize current voice settings");
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-overlap",
+        vec![
+            replace_op("/voice", serde_json::json!({"enabled": true}), voice_doc),
+            replace_op(
+                "/voice/enabled",
+                serde_json::json!(true),
+                serde_json::json!(false),
+            ),
+        ],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-overlap", "overlap result").await;
+    assert!(!result.applied);
+    let pointers: Vec<&str> = result
+        .field_errors
+        .iter()
+        .map(|error| error.pointer.as_str())
+        .collect();
+    assert!(
+        pointers.contains(&"/voice") && pointers.contains(&"/voice/enabled"),
+        "both overlapping pointers must be named: {:?}",
+        result.field_errors
+    );
+    assert!(
+        result
+            .field_errors
+            .iter()
+            .all(|error| error.code == SettingsErrorCode::OverlapRejected),
+        "{:?}",
+        result.field_errors
+    );
+
+    // Nothing applied: a fresh subscriber's bootstrap still carries the
+    // untouched document under the same etag the result reported.
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(!bootstrap.settings.voice.enabled);
+    assert_eq!(bootstrap.settings_etag, result.current_etag);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_multi_op_is_all_or_nothing() {
+    let mut fixture = Fixture::new().await;
+    let initial_etag = fixture.bootstrap.settings_etag.clone();
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-multi",
+        vec![
+            replace_op(
+                "/supervisor/enabled",
+                serde_json::json!(true),
+                serde_json::json!(false),
+            ),
+            replace_op(
+                "/supervisor/retry_attempts",
+                serde_json::json!(99),
+                serde_json::json!(1),
+            ),
+        ],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-multi", "multi-op result").await;
+    assert!(
+        !result.applied,
+        "one invalid op must reject the whole write"
+    );
+    assert!(
+        result
+            .field_errors
+            .iter()
+            .any(|error| error.code == SettingsErrorCode::Invalid),
+        "{:?}",
+        result.field_errors
+    );
+    assert_eq!(result.current_etag, initial_etag);
+
+    // Neither op applied — including the individually-valid first one.
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(!bootstrap.settings.supervisor.enabled);
+    assert_eq!(bootstrap.settings.supervisor.retry_attempts, 1);
+    assert_eq!(bootstrap.settings_etag, result.current_etag);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_unknown_pointer_is_rejected() {
+    let mut fixture = Fixture::new().await;
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-unknown",
+        vec![
+            replace_op(
+                "/no_such_setting",
+                serde_json::json!(true),
+                serde_json::json!(null),
+            ),
+            replace_op(
+                "/supervisor/nonexistent",
+                serde_json::json!(1),
+                serde_json::json!(null),
+            ),
+        ],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-unknown", "unknown-path result").await;
+    assert!(!result.applied);
+    assert_eq!(result.field_errors.len(), 2, "{:?}", result.field_errors);
+    for (error, pointer) in result
+        .field_errors
+        .iter()
+        .zip(["/no_such_setting", "/supervisor/nonexistent"])
+    {
+        assert_eq!(error.pointer, pointer);
+        assert_eq!(error.code, SettingsErrorCode::UnknownPath);
+    }
+}
+
+/// Named side-effect requirement (a): disabling a Hermes provider through
+/// the generic write path must re-probe the Hermes session schema, exactly
+/// like the typed path does. The probe counter is the sim-observable form of
+/// that re-probe (the fixture's static schema does not change shape, so no
+/// differing SessionSchemas frame exists to wait for); dropping the coupling
+/// from the new path leaves the counter flat and fails this test.
+#[tokio::test(start_paused = true)]
+async fn settings_write_hermes_provider_disable_reprobes_session_schema() {
+    let mut fixture = Fixture::new().await;
+
+    /// The Hermes model option values a `SessionSchemas` frame publishes,
+    /// when its Hermes entry is Ready with a model Select.
+    fn hermes_model_options(payload: &SessionSchemasPayload) -> Option<Vec<String>> {
+        let schema = payload
+            .schemas
+            .iter()
+            .find(|entry| entry.backend_kind() == BackendKind::Hermes)?
+            .ready_schema()?;
+        let field = schema.fields.iter().find(|field| field.key == "model")?;
+        match &field.field_type {
+            protocol::SessionSettingFieldType::Select { options, .. } => {
+                Some(options.iter().map(|option| option.value.clone()).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Collects, in any order (the result rides the control lane and may
+    /// overtake bulk-lane schema frames), the write's fanout, its result,
+    /// and a `SessionSchemas` frame whose Hermes model options satisfy
+    /// `schema_matches` — the user-visible consequence of the re-probe.
+    async fn collect_write_outcome(
+        client: &mut client::Connection,
+        write_id: &str,
+        context: &str,
+        mut schema_matches: impl FnMut(&[String]) -> bool,
+    ) -> (HostSettingsPayload, SettingsWriteResultPayload) {
+        let mut fanout: Option<HostSettingsPayload> = None;
+        let mut result: Option<SettingsWriteResultPayload> = None;
+        let mut saw_schema = false;
+        while !(fanout.is_some() && result.is_some() && saw_schema) {
+            next_frame_matching_on(client, context, |env| match env.kind {
+                FrameKind::HostSettings if fanout.is_none() => {
+                    fanout = Some(env.parse_payload().expect("parse HostSettings"));
+                    true
+                }
+                FrameKind::SettingsWriteResult => {
+                    let payload: SettingsWriteResultPayload =
+                        env.parse_payload().expect("parse SettingsWriteResult");
+                    assert_eq!(payload.write_id.0, write_id);
+                    result = Some(payload);
+                    true
+                }
+                FrameKind::SessionSchemas => {
+                    let payload: SessionSchemasPayload =
+                        env.parse_payload().expect("parse SessionSchemas");
+                    let matched = hermes_model_options(&payload)
+                        .is_some_and(|options| schema_matches(&options));
+                    saw_schema |= matched;
+                    matched
+                }
+                _ => false,
+            })
+            .await;
+        }
+        (
+            fanout.expect("collected fanout"),
+            result.expect("collected result"),
+        )
+    }
+
+    // Enabling Hermes publishes its session schema with the full mock model
+    // catalog: both providers offered.
+    send_settings_write(
+        &mut fixture.client,
+        "w-enable-hermes",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["hermes"]),
+            serde_json::json!([]),
+        )],
+    )
+    .await;
+    let (fanout, enable_result) = collect_write_outcome(
+        &mut fixture.client,
+        "w-enable-hermes",
+        "hermes enable fanout + schema + result",
+        |options| {
+            options.iter().any(|value| value.contains("mock-openai"))
+                && options.iter().any(|value| value.contains("mock-anthropic"))
+        },
+    )
+    .await;
+    assert_eq!(fanout.settings.enabled_backends, vec![BackendKind::Hermes]);
+    assert!(enable_result.applied, "{:?}", enable_result.field_errors);
+
+    let probes_before = fixture
+        .host_for_test()
+        .session_schema_probe_count_for_test()
+        .await;
+
+    // Disabling a provider must re-probe and PUBLISH the filtered schema:
+    // the disabled provider's model option disappears from the
+    // SessionSchemas frame every client receives, while other providers
+    // survive. Dropping the coupling means no such frame ever arrives.
+    send_settings_write(
+        &mut fixture.client,
+        "w-disable-provider",
+        vec![replace_op(
+            "/hermes_disabled_providers/default",
+            serde_json::json!(["mock-openai"]),
+            serde_json::json!(null),
+        )],
+    )
+    .await;
+    let (fanout, result) = collect_write_outcome(
+        &mut fixture.client,
+        "w-disable-provider",
+        "provider disable fanout + filtered schema + result",
+        |options| {
+            !options.iter().any(|value| value.contains("mock-openai"))
+                && options.iter().any(|value| value.contains("mock-anthropic"))
+        },
+    )
+    .await;
+    assert_eq!(
+        fanout
+            .settings
+            .hermes_disabled_providers
+            .get("default")
+            .map(Vec::as_slice),
+        Some(["mock-openai".to_owned()].as_slice())
+    );
+    assert!(result.applied, "{:?}", result.field_errors);
+
+    // Supplemental diagnostics only: the decisive oracle above is the
+    // published filtered schema, not this counter.
+    let probes_after = fixture
+        .host_for_test()
+        .session_schema_probe_count_for_test()
+        .await;
+    assert!(
+        probes_after > probes_before,
+        "disabling a Hermes provider over the generic write path must re-probe the Hermes \
+         session schema (probes before: {probes_before}, after: {probes_after})"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_write_keyed_launch_profiles_preserve_disjoint_edits() {
+    let mut fixture = Fixture::new().await;
+    let mut second = fixture.connect().await;
+
+    for (client, write_id, profile_id) in [
+        (&mut fixture.client, "w-profile-a", "profile-a"),
+        (&mut second, "w-profile-b", "profile-b"),
+    ] {
+        client
+            .settings_write(SettingsWritePayload {
+                write_id: SettingsWriteId(write_id.to_owned()),
+                ops: vec![SettingOp::Replace {
+                    path: format!("/launch_profiles/{profile_id}"),
+                    value: serde_json::json!({
+                        "id": profile_id,
+                        "label": profile_id,
+                        "backend_kind": "claude",
+                    }),
+                    expected: SettingExpectation::Absent,
+                }],
+            })
+            .await
+            .expect("send profile settings_write");
+        let result = expect_settings_write_result(client, write_id, "profile apply").await;
+        assert!(result.applied, "{:?}", result.field_errors);
+    }
+
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(bootstrap.settings.launch_profiles.len(), 2);
+    assert!(
+        bootstrap
+            .settings
+            .launch_profiles
+            .contains_key(&protocol::LaunchProfileId("profile-a".to_owned()))
+    );
+    assert!(
+        bootstrap
+            .settings
+            .launch_profiles
+            .contains_key(&protocol::LaunchProfileId("profile-b".to_owned()))
+    );
+}
+
+/// The settings-apply lifecycle (CAS read, commit, propagation, fanout,
+/// refreshes, result) is serialized across writers: while one write's slow
+/// post-commit refresh window is open, a second write must not commit or
+/// fan out. Otherwise subscribers could finish on a superseded snapshot and
+/// the first writer's `current_etag` would be stale — breaking the
+/// draft-clear correlation. The fake Tycode binary's startup delay holds
+/// the first write's refresh window open deterministically while the
+/// second write arrives.
+#[tokio::test]
+async fn settings_write_lifecycle_is_serialized_across_writers() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    let fake = write_fake_tycode_binary(temp_home.path());
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes_python =
+        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
+
+    let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(Vec::new()).await;
+    let mut second = fixture.connect().await;
+    // Applied after fixture startup so only the write-triggered refresh
+    // probes are slowed.
+    fake.set_behavior(serde_json::json!({ "startup_delay_seconds": 1.0 }));
+
+    // W1: opens a multi-second refresh window (real fake-Tycode probes).
+    send_settings_write(
+        &mut fixture.client,
+        "w-serial-tycode",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["tycode"]),
+            serde_json::json!([]),
+        )],
+    )
+    .await;
+    // W2 arrives while W1's window is open.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send_settings_write(
+        &mut second,
+        "w-serial-scalar",
+        vec![replace_op(
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+
+    // W1's issuer: exactly ONE fanout (W1's own document) may precede W1's
+    // result, and the result's etag must equal that fanout's etag — the
+    // draft-clear correlation the serialization exists to protect. If W2
+    // were allowed to commit inside W1's window, its fanout would arrive
+    // here first and this count would be 2.
+    let mut pre_result_fanouts: Vec<HostSettingsPayload> = Vec::new();
+    let mut w1_result: Option<SettingsWriteResultPayload> = None;
+    while w1_result.is_none() {
+        next_frame_matching_on(
+            &mut fixture.client,
+            "W1 fanout/result lifecycle",
+            |env| match env.kind {
+                FrameKind::HostSettings => {
+                    pre_result_fanouts.push(env.parse_payload().expect("parse HostSettings"));
+                    true
+                }
+                FrameKind::SettingsWriteResult => {
+                    let payload: SettingsWriteResultPayload =
+                        env.parse_payload().expect("parse SettingsWriteResult");
+                    assert_eq!(
+                        payload.write_id.0, "w-serial-tycode",
+                        "a foreign write's result on this connection is a requester-scoping \
+                         violation"
+                    );
+                    w1_result = Some(payload);
+                    true
+                }
+                _ => false,
+            },
+        )
+        .await;
+    }
+    let w1_result = w1_result.expect("W1 result");
+    assert!(w1_result.applied, "{:?}", w1_result.field_errors);
+    assert_eq!(
+        pre_result_fanouts.len(),
+        1,
+        "no other settings write may fan out inside W1's apply window"
+    );
+    assert_eq!(
+        pre_result_fanouts[0].settings.enabled_backends,
+        vec![BackendKind::Tycode]
+    );
+    assert!(!pre_result_fanouts[0].settings.supervisor.enabled);
+    assert_eq!(
+        w1_result.current_etag, pre_result_fanouts[0].etag,
+        "W1's result must report the etag of the snapshot that was current when it was emitted"
+    );
+
+    // After W1's lifecycle completes, W2's fanout follows on the same
+    // connection.
+    let w2_fanout_on_first =
+        expect_host_settings_frame(&mut fixture.client, "W2 fanout after W1 completes").await;
+    assert!(w2_fanout_on_first.settings.supervisor.enabled);
+    assert_ne!(w2_fanout_on_first.etag, w1_result.current_etag);
+
+    // W2's issuer observes the same serialized order: W1's snapshot, then
+    // W2's snapshot, then W2's result carrying W2's etag.
+    let first_on_second =
+        expect_host_settings_frame(&mut second, "W1 fanout on second client").await;
+    assert_eq!(
+        first_on_second.settings.enabled_backends,
+        vec![BackendKind::Tycode]
+    );
+    assert!(!first_on_second.settings.supervisor.enabled);
+    let second_on_second = expect_host_settings_frame(&mut second, "W2 fanout on its issuer").await;
+    assert!(second_on_second.settings.supervisor.enabled);
+    let w2_result = expect_settings_write_result(&mut second, "w-serial-scalar", "W2 result").await;
+    assert!(w2_result.applied, "{:?}", w2_result.field_errors);
+    assert_eq!(w2_result.current_etag, second_on_second.etag);
+    assert_eq!(w2_result.current_etag, w2_fanout_on_first.etag);
+
+    // Durable state: a fresh bootstrap carries both writes under W2's etag.
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        bootstrap.settings.enabled_backends,
+        vec![BackendKind::Tycode]
+    );
+    assert!(bootstrap.settings.supervisor.enabled);
+    assert_eq!(bootstrap.settings_etag, w2_result.current_etag);
+}
+
+#[tokio::test]
+async fn native_save_serializes_with_generic_settings_write() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    let fake = write_fake_tycode_binary(temp_home.path());
+    write_shared_tycode_settings(
+        temp_home.path(),
+        r#"active_provider = "native-provider"
+model_quality = "high"
+
+[providers.native-provider]
+type = "mock"
+"#,
+    );
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes_python =
+        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
+
+    let mut fixture =
+        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
+    let initial =
+        expect_backend_config_snapshots(&mut fixture.client, "initial Tycode settings").await;
+    let initial_doc = tycode_native_snapshot(&initial)
+        .settings
+        .clone()
+        .expect("initial Tycode settings document");
+    let base_settings = initial_doc["profiles"][0]["settings"].clone();
+    let mut edited_settings = base_settings.clone();
+    edited_settings
+        .as_object_mut()
+        .expect("Tycode settings object")
+        .insert("model_quality".to_owned(), serde_json::json!("low"));
+    let native_save = serde_json::json!({
+        "version": 1,
+        "profiles": [{
+            "name": "default",
+            "settings_path": initial_doc["profiles"][0]["settings_path"],
+            "settings": edited_settings,
+            "base_settings": base_settings,
+        }],
+    });
+
+    let persist_gate = temp_home.path().join("release-native-persist");
+    fake.set_behavior(serde_json::json!({
+        "persist_gate_path": persist_gate.to_string_lossy(),
+    }));
+    let mut second = fixture.connect().await;
+    fixture
+        .client
+        .backend_native_settings_write(BackendKind::Tycode, native_save)
+        .await
+        .expect("start native save");
+    let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !fake
+        .events()
+        .iter()
+        .any(|event| event["type"] == "persist_gate_entered")
+    {
+        assert!(
+            tokio::time::Instant::now() < gate_deadline,
+            "native save never reached the persistence gate"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    send_settings_write(
+        &mut second,
+        "w-during-native-save",
+        vec![replace_op(
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(&persist_gate, b"release").expect("release native persistence gate");
+
+    let mut saw_native_refresh = false;
+    let fanout: HostSettingsPayload = next_frame_matching_on(
+        &mut second,
+        "native refresh before generic fanout",
+        |env| match env.kind {
+            FrameKind::BackendConfigSnapshots => {
+                let payload: BackendConfigSnapshotsPayload = env
+                    .parse_payload()
+                    .expect("parse native refresh during collision");
+                if let Some(settings) = tycode_native_snapshot(&payload).settings.as_ref() {
+                    saw_native_refresh =
+                        settings["profiles"][0]["settings"]["model_quality"] == "low";
+                }
+                false
+            }
+            FrameKind::HostSettings => {
+                assert!(
+                    saw_native_refresh,
+                    "a generic settings write must wait for the in-flight native save and its refresh"
+                );
+                true
+            }
+            _ => false,
+        },
+    )
+    .await
+    .parse_payload()
+    .expect("parse generic HostSettings fanout");
+    assert!(fanout.settings.supervisor.enabled);
+    let result = expect_settings_write_result(
+        &mut second,
+        "w-during-native-save",
+        "generic result after native save",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    assert_eq!(result.current_etag, fanout.etag);
+
+    let persisted = std::fs::read_to_string(temp_home.path().join(".tycode/settings.toml"))
+        .expect("read Tycode settings after serialized writes");
+    assert!(persisted.contains("model_quality = \"low\""), "{persisted}");
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.settings.supervisor.enabled);
+    assert_eq!(bootstrap.settings_etag, result.current_etag);
+}
+
+/// Named side-effect requirement (b): an EnabledBackends change through the
+/// generic write path must refresh session schemas and backend config
+/// snapshots. Dropping either refresh from the new path means the expected
+/// frame never arrives and the wait times out.
+#[tokio::test]
+async fn settings_write_enabled_backends_refreshes_schemas_and_config_snapshots() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    write_fake_tycode_binary(temp_home.path());
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes_python =
+        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
+
+    let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(Vec::new()).await;
+    assert!(fixture.bootstrap.settings.enabled_backends.is_empty());
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-enable-tycode",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["tycode"]),
+            serde_json::json!([]),
+        )],
+    )
+    .await;
+
+    let fanout = expect_host_settings_frame(&mut fixture.client, "tycode enable fanout").await;
+    assert_eq!(fanout.settings.enabled_backends, vec![BackendKind::Tycode]);
+
+    // The write must produce all three of: a SessionSchemas refresh carrying
+    // Tycode, a BackendConfigSnapshots refresh carrying the Tycode native
+    // probe, and the requester-scoped result. The result rides the control
+    // lane and may overtake the bulk-lane refresh frames, so collect them in
+    // any order; a dropped refresh coupling means its frame never arrives
+    // and the wait times out.
+    let mut saw_tycode_schemas = false;
+    let mut saw_tycode_snapshot = false;
+    let mut result: Option<SettingsWriteResultPayload> = None;
+    while !(saw_tycode_schemas && saw_tycode_snapshot && result.is_some()) {
+        next_frame_matching_on(
+            &mut fixture.client,
+            "session-schema + config-snapshot refreshes and result after enabling Tycode",
+            |env| match env.kind {
+                FrameKind::SessionSchemas => {
+                    let payload: SessionSchemasPayload = env
+                        .parse_payload()
+                        .expect("parse SessionSchemas after enabling Tycode");
+                    let has_tycode = payload
+                        .schemas
+                        .iter()
+                        .any(|entry| entry.backend_kind() == BackendKind::Tycode);
+                    saw_tycode_schemas |= has_tycode;
+                    has_tycode
+                }
+                FrameKind::BackendConfigSnapshots => {
+                    let payload: BackendConfigSnapshotsPayload = env
+                        .parse_payload()
+                        .expect("parse BackendConfigSnapshots after enabling Tycode");
+                    let has_tycode = payload
+                        .native_settings
+                        .iter()
+                        .any(|snapshot| snapshot.backend_kind == BackendKind::Tycode);
+                    saw_tycode_snapshot |= has_tycode;
+                    has_tycode
+                }
+                FrameKind::SettingsWriteResult => {
+                    let payload: SettingsWriteResultPayload = env
+                        .parse_payload()
+                        .expect("parse SettingsWriteResult after enabling Tycode");
+                    assert_eq!(payload.write_id.0, "w-enable-tycode");
+                    result = Some(payload);
+                    true
+                }
+                _ => false,
+            },
+        )
+        .await;
+    }
+    let result = result.expect("collected settings write result");
+    assert!(result.applied, "{:?}", result.field_errors);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequential_settings_writes_preserve_prior_fields() {
+    let mut fixture = Fixture::new().await;
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-first",
+        vec![replace_op(
+            "/supervisor/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+    let first_fanout = expect_host_settings_frame(&mut fixture.client, "first fanout").await;
+    assert!(first_fanout.settings.supervisor.enabled);
+    assert!(
+        !first_fanout.etag.is_empty(),
+        "the first fanout must carry an etag"
+    );
+    let first_result =
+        expect_settings_write_result(&mut fixture.client, "w-first", "first result").await;
+    assert!(first_result.applied, "{:?}", first_result.field_errors);
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-alongside",
+        vec![replace_op(
+            "/supervisor/auto_compact_on_success",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )],
+    )
+    .await;
+    let fanout = expect_host_settings_frame(&mut fixture.client, "generic write fanout").await;
+    assert!(fanout.settings.supervisor.enabled);
+    assert!(fanout.settings.supervisor.auto_compact_on_success);
+    assert_ne!(fanout.etag, first_fanout.etag);
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-alongside", "alongside result").await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    assert_eq!(result.current_etag, fanout.etag);
 }

@@ -1,22 +1,22 @@
 mod fixture;
 
+use settings_model::HostBootstrapPayload;
 use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
-    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
-    AgentGroupAssignment, AgentGroupId, AgentGroupMode, AgentGroupsUpdate, AgentId,
-    AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate, AgentSortMode,
-    AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef,
-    AgentTagsUpdate, AgentsSidebarPreferences, AgentsSidebarProjectVisibility,
+    AgentAnnotationTarget, AgentClosedPayload, AgentGroupAssignment, AgentGroupId, AgentGroupMode,
+    AgentGroupsUpdate, AgentId, AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate,
+    AgentSortMode, AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor,
+    AgentTagRef, AgentTagsUpdate, AgentsSidebarPreferences, AgentsSidebarProjectVisibility,
     AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferences,
     AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
     AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CloseAgentPayload,
-    CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload,
-    ProjectNotifyPayload, SessionId, SetAgentGroupsPayload, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SmartView,
-    SmartViewId, SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, write_envelope,
+    CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind, HostFilterId,
+    LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, SessionId,
+    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SmartView, SmartViewId, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, UserSmartViewId, write_envelope,
 };
 
 async fn connect_host(host: server::HostHandle) -> (client::Connection, HostBootstrapPayload) {
@@ -176,44 +176,20 @@ fn saved_view_filters() -> AgentsViewFilters {
     }
 }
 
-async fn expect_raw_kind(
-    client: &mut client::Connection,
-    kind: FrameKind,
-    context: &str,
-) -> Envelope {
-    loop {
-        let envelope =
-            match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope()).await
-            {
-                Ok(Ok(Some(envelope))) => envelope,
-                Ok(Ok(None)) => panic!("connection closed before {context}"),
-                Ok(Err(err)) => panic!("read envelope failed before {context}: {err:?}"),
-                Err(_) => panic!("timed out waiting for {context}"),
-            };
-        client
-            .incoming_seq
-            .validate(&envelope.stream, envelope.seq, envelope.kind)
-            .expect("incoming sequence should be valid");
-        if fixture::is_builtin_team_custom_agent_notify(&envelope) {
-            continue;
-        }
-        if envelope.kind == kind {
-            return envelope;
-        }
-        if envelope.kind == FrameKind::CommandError {
-            let error: CommandErrorPayload = envelope.parse_payload().expect("CommandError");
-            panic!("unexpected CommandError before {context}: {error:?}");
-        }
-    }
-}
-
 async fn expect_preferences_notify(
     client: &mut client::Connection,
     context: &str,
 ) -> AgentsViewPreferencesNotifyPayload {
-    let env = expect_raw_kind(client, FrameKind::AgentsViewPreferencesNotify, context).await;
-    env.parse_payload()
-        .expect("parse AgentsViewPreferencesNotifyPayload")
+    next_frame_matching_on(client, context, |env| {
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+            panic!("unexpected CommandError before {context}: {error:?}");
+        }
+        env.kind == FrameKind::AgentsViewPreferencesNotify
+    })
+    .await
+    .parse_payload()
+    .expect("parse AgentsViewPreferencesNotifyPayload")
 }
 
 async fn assert_no_agent_closed_for(
@@ -251,12 +227,10 @@ async fn expect_non_empty_group_notify(
     client: &mut client::Connection,
     context: &str,
 ) -> AgentsViewPreferencesNotifyPayload {
-    loop {
-        let notify = expect_preferences_notify(client, context).await;
-        if !notify.snapshot.groups.groups.is_empty() {
-            return notify;
-        }
-    }
+    expect_preferences_notify_where(client, context, |notify| {
+        !notify.snapshot.groups.groups.is_empty()
+    })
+    .await
 }
 
 async fn expect_preferences_notify_where(
@@ -315,20 +289,10 @@ async fn expect_client_kind(
     kind: FrameKind,
     context: &str,
 ) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if env.kind == kind {
-            return env;
-        }
-    }
+    fixture::next_logical_frame_matching_on(client, context, |env| {
+        !fixture::is_builtin_team_custom_agent_notify(env) && env.kind == kind
+    })
+    .await
 }
 
 async fn spawn_agent_for_order(client: &mut client::Connection) -> NewAgentPayload {
@@ -419,21 +383,24 @@ async fn expect_agent_start_payload(
     client: &mut client::Connection,
     agent_stream: &StreamPath,
 ) -> AgentStartPayload {
-    loop {
-        let env = expect_client_kind_any_agent_start(client, "ordered agent start").await;
+    let mut start = None;
+    fixture::next_logical_frame_matching_on(client, "agent start", |env| {
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+            panic!("unexpected CommandError before agent start: {error:?}");
+        }
         if env.stream != *agent_stream {
-            continue;
+            return false;
         }
         if env.kind == FrameKind::AgentStart {
-            return env.parse_payload().expect("parse AgentStartPayload");
+            start = Some(env.parse_payload().expect("parse AgentStartPayload"));
+            true
+        } else {
+            false
         }
-        let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-        for event in bootstrap.events {
-            if let AgentBootstrapEvent::AgentStart(start) = event {
-                return start;
-            }
-        }
-    }
+    })
+    .await;
+    start.expect("agent start payload present when the wait matches")
 }
 
 fn local_session_target(session_id: SessionId) -> AgentAnnotationTarget {
@@ -510,82 +477,24 @@ async fn create_project(client: &mut client::Connection, name: &str) -> protocol
     }
 }
 
-async fn expect_client_kind_any_agent_start(
-    client: &mut client::Connection,
-    context: &str,
-) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
-            .await
-        {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("read envelope failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        client
-            .incoming_seq
-            .validate(&env.stream, env.seq, env.kind)
-            .expect("incoming sequence should be valid");
-        if env.kind == FrameKind::NewAgent {
-            let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
-            client.outgoing_seq.insert(payload.instance_stream, 0);
-            continue;
-        }
-        if env.kind == FrameKind::CommandError {
-            let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
-            panic!("unexpected CommandError before {context}: {error:?}");
-        }
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        if matches!(env.kind, FrameKind::AgentStart | FrameKind::AgentBootstrap) {
-            return env;
-        }
-    }
-}
-
 async fn expect_promoted_manual_assignment(
     client: &mut client::Connection,
     agent_stream: &StreamPath,
     tag_id: &AgentManualTagId,
 ) -> (SessionId, AgentsViewPreferencesNotifyPayload) {
     let mut session_id = None;
-    let mut latest_notify = None;
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
-            .await
-        {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before promoted assignment"),
-            Ok(Err(err)) => panic!("read envelope failed before promoted assignment: {err:?}"),
-            Err(_) => panic!("timed out waiting for promoted assignment"),
-        };
-        client
-            .incoming_seq
-            .validate(&env.stream, env.seq, env.kind)
-            .expect("incoming sequence should be valid");
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
+    let mut latest_notify: Option<AgentsViewPreferencesNotifyPayload> = None;
+    let mut promoted = None;
+    fixture::next_logical_frame_matching_on(client, "promoted assignment", |env| {
         match env.kind {
             FrameKind::AgentStart if env.stream == *agent_stream => {
                 let start: AgentStartPayload =
                     env.parse_payload().expect("parse AgentStartPayload");
                 session_id = start.session_id;
             }
-            FrameKind::AgentBootstrap if env.stream == *agent_stream => {
-                let bootstrap: AgentBootstrapPayload =
-                    env.parse_payload().expect("parse AgentBootstrapPayload");
-                for event in bootstrap.events {
-                    if let AgentBootstrapEvent::AgentStart(start) = event {
-                        session_id = start.session_id;
-                    }
-                }
-            }
             FrameKind::AgentsViewPreferencesNotify => {
                 latest_notify = Some(
-                    env.parse_payload::<AgentsViewPreferencesNotifyPayload>()
+                    env.parse_payload()
                         .expect("parse AgentsViewPreferencesNotifyPayload"),
                 );
             }
@@ -607,10 +516,14 @@ async fn expect_promoted_manual_assignment(
                     assignment.target == target && assignment.tag_ids == vec![tag_id.clone()]
                 })
             {
-                return (session_id, notify.clone());
+                promoted = Some((session_id, notify.clone()));
+                return true;
             }
         }
-    }
+        false
+    })
+    .await;
+    promoted.expect("promoted assignment present when the wait matches")
 }
 
 async fn expect_promoted_group_assignment(
@@ -619,43 +532,18 @@ async fn expect_promoted_group_assignment(
     group_id: &AgentGroupId,
 ) -> (SessionId, AgentsViewPreferencesNotifyPayload) {
     let mut session_id = None;
-    let mut latest_notify = None;
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope())
-            .await
-        {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before promoted group assignment"),
-            Ok(Err(err)) => {
-                panic!("read envelope failed before promoted group assignment: {err:?}")
-            }
-            Err(_) => panic!("timed out waiting for promoted group assignment"),
-        };
-        client
-            .incoming_seq
-            .validate(&env.stream, env.seq, env.kind)
-            .expect("incoming sequence should be valid");
-        if fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
+    let mut latest_notify: Option<AgentsViewPreferencesNotifyPayload> = None;
+    let mut promoted = None;
+    fixture::next_logical_frame_matching_on(client, "promoted group assignment", |env| {
         match env.kind {
             FrameKind::AgentStart if env.stream == *agent_stream => {
                 let start: AgentStartPayload =
                     env.parse_payload().expect("parse AgentStartPayload");
                 session_id = start.session_id;
             }
-            FrameKind::AgentBootstrap if env.stream == *agent_stream => {
-                let bootstrap: AgentBootstrapPayload =
-                    env.parse_payload().expect("parse AgentBootstrapPayload");
-                for event in bootstrap.events {
-                    if let AgentBootstrapEvent::AgentStart(start) = event {
-                        session_id = start.session_id;
-                    }
-                }
-            }
             FrameKind::AgentsViewPreferencesNotify => {
                 latest_notify = Some(
-                    env.parse_payload::<AgentsViewPreferencesNotifyPayload>()
+                    env.parse_payload()
                         .expect("parse AgentsViewPreferencesNotifyPayload"),
                 );
             }
@@ -675,10 +563,14 @@ async fn expect_promoted_group_assignment(
                 .iter()
                 .any(|assignment| assignment.target == target && assignment.group_id == *group_id)
             {
-                return (session_id, notify.clone());
+                promoted = Some((session_id, notify.clone()));
+                return true;
             }
         }
-    }
+        false
+    })
+    .await;
+    promoted.expect("promoted group assignment present when the wait matches")
 }
 
 #[tokio::test]
@@ -1545,13 +1437,18 @@ async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
     assert!(notify.snapshot.groups.groups.is_empty());
     assert!(notify.snapshot.groups.assignments.is_empty());
 
+    // The agent never gets a session, so its group target stays transient.
+    let failure_reservation = fixture
+        .reserve_next_mock_spawn_failure("tagged-agent", "mock backend forced spawn failure")
+        .await;
     let failing = spawn_agent_for_tags(
         &mut fixture.client,
         BackendKind::Claude,
         None,
-        "__mock_fail_spawn__ no group session",
+        "no group session",
     )
     .await;
+    drop(failure_reservation);
     expect_preferences_notify(&mut fixture.client, "sessionless new agent system tags").await;
     send_set_agent_groups(
         &mut fixture.client,
@@ -1674,13 +1571,13 @@ async fn agents_view_preferences_agent_annotations_promote_drop_and_session_dele
     assert!(notify.snapshot.pins.pinned.is_empty());
     assert_eq!(notify.snapshot.tags.manual[0].id, tag_id);
 
-    let failing = spawn_agent_for_tags(
-        &mut fixture.client,
-        BackendKind::Claude,
-        None,
-        "__mock_fail_spawn__ no session",
-    )
-    .await;
+    // The agent never gets a session, so its annotations stay transient.
+    let failure_reservation = fixture
+        .reserve_next_mock_spawn_failure("tagged-agent", "mock backend forced spawn failure")
+        .await;
+    let failing =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "no session").await;
+    drop(failure_reservation);
     let transient = local_transient_target(failing.agent_id.clone());
     expect_preferences_notify(&mut fixture.client, "sessionless new agent system tags").await;
     let cleanup_tag_id = notify.snapshot.tags.manual[0].id.clone();

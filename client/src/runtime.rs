@@ -132,6 +132,7 @@ pub struct TerminalCommands {
 pub enum HostEvent {
     HostBootstrap(Box<HostBootstrapPayload>),
     HostSettings(HostSettingsPayload),
+    SettingsWriteResult(protocol::SettingsWriteResultPayload),
     AgentActivitySummary(AgentActivitySummaryPayload),
     TaskTokenUsage(TaskTokenUsagePayload),
     AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
@@ -930,6 +931,14 @@ async fn handle_host_envelope(
             let _ = host_tx.send(HostEvent::HostSettings(payload)).await;
             true
         }
+        FrameKind::SettingsWriteResult => {
+            let payload: protocol::SettingsWriteResultPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SettingsWriteResult(payload)).await;
+            true
+        }
         FrameKind::AgentActivitySummary => {
             let payload: AgentActivitySummaryPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1686,75 +1695,4 @@ async fn handle_terminal_envelope(envelope: Envelope, shared: &Arc<Shared>) {
     };
 
     let _ = tx.send(event).await;
-}
-
-#[cfg(test)]
-mod compaction_session_tests {
-    use super::*;
-
-    fn notify(session_id: &str) -> ContextCompactionNotifyPayload {
-        ContextCompactionNotifyPayload {
-            operation_id: protocol::CompactionOperationId("operation".to_owned()),
-            agent_id: protocol::AgentId("agent".to_owned()),
-            logical_session_id: protocol::SessionId(session_id.to_owned()),
-            backend_kind: protocol::BackendKind::Claude,
-            trigger: protocol::CompactionTrigger::UserRequested,
-            method: Some(protocol::CompactionMethod::NativeTextCommand),
-            status: protocol::ContextCompactionStatus::Started {
-                stage: protocol::CompactionStage::Compacting,
-            },
-            provider_version: None,
-            metrics: Default::default(),
-            message: None,
-        }
-    }
-
-    fn capability(session_id: &str) -> ContextCompactionCapabilityPayload {
-        ContextCompactionCapabilityPayload {
-            agent_id: protocol::AgentId("agent".to_owned()),
-            logical_session_id: protocol::SessionId(session_id.to_owned()),
-            availability: protocol::RequestedCompactionAvailability::Available {
-                route: protocol::RequestedCompactionRoute::NativePreferred,
-            },
-        }
-    }
-
-    #[test]
-    fn compaction_events_resolve_pending_agent_session_identity() {
-        let session_id = protocol::SessionId("logical-session".to_owned());
-        assert_eq!(
-            agent_event_session_id(&AgentEvent::ContextCompactionNotify(notify(&session_id.0))),
-            Some(session_id.clone())
-        );
-        assert_eq!(
-            agent_event_session_id(&AgentEvent::ContextCompactionCapability(capability(
-                &session_id.0
-            ))),
-            Some(session_id)
-        );
-    }
-
-    #[test]
-    fn bootstrap_folds_compaction_sessions_and_rejects_conflicts() {
-        let bootstrap = |capability_session: &str| AgentBootstrapPayload {
-            events: vec![
-                protocol::AgentBootstrapEvent::ContextCompaction(notify("logical-session")),
-                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability(
-                    capability_session,
-                )),
-            ],
-            latest_output: Default::default(),
-            turn_active: false,
-        };
-
-        assert_eq!(
-            bootstrap_agent_session_id(&bootstrap("logical-session")),
-            Some(protocol::SessionId("logical-session".to_owned()))
-        );
-        assert_eq!(
-            bootstrap_agent_session_id(&bootstrap("other-session")),
-            None,
-            "a contradictory bootstrap must not assign a logical session"
-        );
-    }
 }

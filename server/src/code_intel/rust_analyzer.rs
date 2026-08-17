@@ -8,8 +8,9 @@
 //! diagnostics, go-to-def, hover, find-references, versioning, large-file
 //! delivery, crash/restart — lives in the engine and is reused unchanged.
 
-use protocol::{CodeIntelLanguageId, CodeIntelProviderId, CodeIntelSettings};
+use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
 use serde_json::{Value, json};
+use settings_model::CodeIntelSettings;
 
 use super::bootstrap;
 use super::language_server::LanguageServerConfig;
@@ -36,133 +37,4 @@ fn rust_initialization_options() -> Value {
         "cargo": { "buildScripts": { "enable": true } },
         "procMacro": { "enable": true }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use protocol::{
-        CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
-        CodeIntelStatusPayload, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
-        StreamPath,
-    };
-
-    use super::super::bootstrap::{self};
-    use super::super::language_server::ServerDiscovery;
-    use super::super::lsp_provider::LspProvider;
-    use super::super::provider::CodeIntelProvider;
-    use super::rust_config;
-    use crate::stream::Stream;
-    use protocol::CodeIntelResourceMode;
-
-    #[test]
-    fn rust_config_identifies_as_rust_analyzer() {
-        let config = rust_config(&Default::default());
-        assert_eq!(config.language.0, "rust");
-        assert_eq!(config.provider_id.0, "rust-analyzer");
-        assert_eq!(config.lsp_language_id, "rust");
-        assert_eq!(config.extensions, &["rs"]);
-        assert_eq!(config.workspace_markers, &["Cargo.toml"]);
-        assert_eq!(config.configured_path, None);
-    }
-
-    /// rust-analyzer-gated end-to-end test, now driving the **generic**
-    /// [`LspProvider`] with the rust config: spin up a real RA over a tiny Cargo
-    /// project with a deliberate type error and assert an error diagnostic
-    /// eventually arrives. Opt-in with `TYDE_RUN_REAL_LSP_TESTS=1`; skips-with-log
-    /// when RA is not installed — never a hard failure on a machine without RA.
-    #[tokio::test]
-    #[ignore = "real external LSP test; use --ignored and TYDE_RUN_REAL_LSP_TESTS=1"]
-    async fn rust_analyzer_emits_diagnostics_for_broken_file() {
-        if std::env::var("TYDE_RUN_REAL_LSP_TESTS").ok().as_deref() != Some("1") {
-            eprintln!(
-                "SKIP rust_analyzer_emits_diagnostics_for_broken_file: set TYDE_RUN_REAL_LSP_TESTS=1 to run"
-            );
-            return;
-        }
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path();
-        if matches!(
-            bootstrap::discover_rust_analyzer(root, None),
-            ServerDiscovery::Absent { .. }
-        ) {
-            eprintln!(
-                "SKIP rust_analyzer_emits_diagnostics_for_broken_file: rust-analyzer not found"
-            );
-            return;
-        }
-
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"tyde_ci_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
-        std::fs::write(
-            root.join("src/main.rs"),
-            "fn main() {\n    let _x: i32 = \"not an int\";\n}\n",
-        )
-        .expect("write main.rs");
-
-        let root_path = ProjectRootPath(root.to_string_lossy().into_owned());
-        let mut provider = LspProvider::new(
-            rust_config(&Default::default()),
-            root_path.clone(),
-            CodeIntelResourceMode::Full,
-        );
-
-        let (tx, mut rx) = crate::stream::output_channel();
-        let stream = Stream::new(StreamPath("/project/ci".to_owned()), tx);
-        let path = ProjectPath {
-            root: root_path,
-            relative_path: "src/main.rs".to_owned(),
-        };
-        provider.subscribe(path, ProjectFileVersion(1), stream);
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(!remaining.is_zero(), "no error diagnostics within timeout");
-            let envelope = match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(envelope)) => envelope,
-                Ok(None) => panic!("output stream closed before diagnostics arrived"),
-                Err(_) => panic!("timed out waiting for diagnostics"),
-            };
-            match envelope.kind {
-                FrameKind::CodeIntelDiagnostics => {
-                    let payload: CodeIntelDiagnosticsPayload =
-                        serde_json::from_value(envelope.payload).expect("diagnostics payload");
-                    if payload
-                        .diagnostics
-                        .iter()
-                        .any(|d| d.severity == CodeIntelSeverity::Error)
-                    {
-                        return; // success
-                    }
-                }
-                FrameKind::CodeIntelError => {
-                    let error: CodeIntelErrorPayload =
-                        serde_json::from_value(envelope.payload).expect("error payload");
-                    panic!("rust-analyzer emitted CodeIntelError before diagnostics: {error:?}");
-                }
-                FrameKind::CodeIntelStatus => {
-                    let status: CodeIntelStatusPayload =
-                        serde_json::from_value(envelope.payload).expect("status payload");
-                    if matches!(
-                        status.state,
-                        CodeIntelState::Unsupported
-                            | CodeIntelState::Unavailable
-                            | CodeIntelState::Failed
-                    ) {
-                        panic!(
-                            "rust-analyzer reached terminal status before diagnostics: {status:?}"
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 }

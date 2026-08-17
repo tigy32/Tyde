@@ -1,20 +1,19 @@
 mod fixture;
 
+use settings_model::HostBootstrapPayload;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
 
-use fixture::Fixture;
+use fixture::{Fixture, finish_turn_on, next_frame_matching_on};
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, BackendAccessMode,
-    BackendKind, CancelWorkflowPayload, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope,
-    FrameKind, HostBootstrapPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, TriggerWorkflowPayload, WorkflowId,
-    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowSaveResponse, WorkflowStepRunSnapshotStatus,
-    WorkflowTargetsResponse,
+    AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, ChatEvent,
+    CommandErrorCode, CommandErrorPayload, FrameKind, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeleteRootPayload, ProjectNotifyPayload,
+    ProjectRootPath, SpawnAgentParams, SpawnAgentPayload, StreamPath, TriggerWorkflowPayload,
+    WorkflowId, WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload,
+    WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSaveResponse,
+    WorkflowStepRunSnapshotStatus, WorkflowTargetsResponse,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -65,34 +64,6 @@ impl Drop for GlobalWorkflowsEnv {
     }
 }
 
-async fn next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if fixture::is_builtin_team_custom_agent_notify(&env)
-            || matches!(
-                env.kind,
-                FrameKind::SessionSchemas
-                    | FrameKind::LaunchProfileCatalogNotify
-                    | FrameKind::BackendSetup
-                    | FrameKind::AgentsViewPreferencesNotify
-                    | FrameKind::TeamPresetCatalogNotify
-                    | FrameKind::SkillNotify
-                    | FrameKind::CustomAgentNotify
-                    | FrameKind::McpServerNotify
-                    | FrameKind::SteeringNotify
-            )
-        {
-            continue;
-        }
-        return env;
-    }
-}
-
 async fn create_project(client: &mut client::Connection, root: &str) -> Project {
     client
         .project_create(ProjectCreatePayload {
@@ -101,18 +72,24 @@ async fn create_project(client: &mut client::Connection, root: &str) -> Project 
         })
         .await
         .expect("project_create failed");
-    loop {
-        let env = next_event(client, "project create").await;
-        if env.kind == FrameKind::ProjectNotify {
-            match env
-                .parse_payload::<ProjectNotifyPayload>()
-                .expect("ProjectNotify")
-            {
-                ProjectNotifyPayload::Upsert { project } => return project,
-                ProjectNotifyPayload::Delete { .. } => continue,
-            }
+    let mut created = None;
+    next_frame_matching_on(client, "project create", |env| {
+        if env.kind != FrameKind::ProjectNotify {
+            return false;
         }
-    }
+        match env
+            .parse_payload::<ProjectNotifyPayload>()
+            .expect("ProjectNotify")
+        {
+            ProjectNotifyPayload::Upsert { project } => {
+                created = Some(project);
+                true
+            }
+            ProjectNotifyPayload::Delete { .. } => false,
+        }
+    })
+    .await;
+    created.expect("project upsert")
 }
 
 fn write_workflow(root: &std::path::Path, access_mode: &str) {
@@ -143,12 +120,10 @@ fn workflow_markdown_with_inputs(id: &str, name: &str) -> String {
 }
 
 async fn wait_for_workflow_catalog(client: &mut client::Connection) {
-    loop {
-        let env = next_event(client, "workflow catalog").await;
-        if env.kind == FrameKind::WorkflowNotify {
-            break;
-        }
-    }
+    next_frame_matching_on(client, "workflow catalog", |env| {
+        env.kind == FrameKind::WorkflowNotify
+    })
+    .await;
 }
 
 async fn wait_for_workflow_notify<F>(
@@ -159,66 +134,56 @@ async fn wait_for_workflow_notify<F>(
 where
     F: FnMut(&WorkflowNotifyPayload) -> bool,
 {
-    for _ in 0..30 {
-        let env = next_event(client, context).await;
+    let mut matched = None;
+    next_frame_matching_on(client, context, |env| {
         if env.kind != FrameKind::WorkflowNotify {
-            continue;
+            return false;
         }
         let payload: WorkflowNotifyPayload = env.parse_payload().expect("WorkflowNotify");
         if predicate(&payload) {
-            return payload;
+            matched = Some(payload);
+            true
+        } else {
+            false
         }
-    }
-    panic!("timed out waiting for matching WorkflowNotify: {context}");
+    })
+    .await;
+    matched.expect("matched workflow notify")
 }
 
 async fn wait_for_workflow_command_error(
     client: &mut client::Connection,
     context: &str,
 ) -> CommandErrorPayload {
-    for _ in 0..20 {
-        let env = next_event(client, context).await;
-        match env.kind {
-            FrameKind::CommandError => {
-                return env.parse_payload().expect("CommandErrorPayload");
+    let env = next_frame_matching_on(client, context, |env| match env.kind {
+        FrameKind::CommandError => true,
+        FrameKind::WorkflowRunNotify => {
+            let payload: WorkflowRunNotifyPayload = env.parse_payload().expect("WorkflowRunNotify");
+            if payload.run.status == WorkflowRunSnapshotStatus::Running {
+                panic!(
+                    "workflow run was created before expected command error {context}: {:?}",
+                    payload.run
+                );
             }
-            FrameKind::WorkflowRunNotify => {
-                let payload: WorkflowRunNotifyPayload =
-                    env.parse_payload().expect("WorkflowRunNotify");
-                if payload.run.status == WorkflowRunSnapshotStatus::Running {
-                    panic!(
-                        "workflow run was created before expected command error {context}: {:?}",
-                        payload.run
-                    );
-                }
-            }
-            _ => {}
+            false
         }
-    }
-    panic!("timed out waiting for workflow command error: {context}");
+        _ => false,
+    })
+    .await;
+    env.parse_payload().expect("CommandErrorPayload")
 }
 
-async fn collect_turn_delta_text(
-    client: &mut client::Connection,
-    stream: &StreamPath,
-    context: &str,
-) -> String {
-    let mut text = String::new();
-    let mut saw_turn = false;
-    loop {
-        let env = next_event(client, context).await;
-        if env.stream != *stream || env.kind != FrameKind::ChatEvent {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("ChatEvent");
-        match event {
-            ChatEvent::TypingStatusChanged(true) => saw_turn = true,
-            ChatEvent::StreamDelta(delta) => text.push_str(&delta.text),
-            ChatEvent::StreamEnd(end) => text.push_str(&end.message.content),
-            ChatEvent::TypingStatusChanged(false) if saw_turn => return text,
-            _ => {}
-        }
-    }
+async fn collect_turn_delta_text(client: &mut client::Connection, stream: &StreamPath) -> String {
+    finish_turn_on(client, stream)
+        .await
+        .chat_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamDelta(delta) => Some(delta.text),
+            ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn trigger_workflow_and_wait_for_coordinator(
@@ -236,8 +201,7 @@ async fn trigger_workflow_and_wait_for_coordinator(
 
     let mut run_id = None;
     let mut coordinator = None;
-    for _ in 0..20 {
-        let env = next_event(client, "workflow coordinator").await;
+    next_frame_matching_on(client, "workflow coordinator", |env| {
         match env.kind {
             FrameKind::WorkflowRunNotify => {
                 let payload: WorkflowRunNotifyPayload =
@@ -255,10 +219,9 @@ async fn trigger_workflow_and_wait_for_coordinator(
             }
             _ => {}
         }
-        if run_id.is_some() && coordinator.is_some() {
-            break;
-        }
-    }
+        run_id.is_some() && coordinator.is_some()
+    })
+    .await;
 
     (
         run_id.expect("workflow run notify missing"),
@@ -386,16 +349,21 @@ async fn spawn_test_agent(
         .await
         .expect("spawn_agent failed");
 
-    loop {
-        let env = next_event(client, "spawn test agent").await;
+    let mut spawned = None;
+    next_frame_matching_on(client, "spawn test agent", |env| {
         if env.kind != FrameKind::NewAgent {
-            continue;
+            return false;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
         if payload.name == name {
-            return payload;
+            spawned = Some(payload);
+            true
+        } else {
+            false
         }
-    }
+    })
+    .await;
+    spawned.expect("spawned test agent NewAgent")
 }
 
 #[tokio::test]
@@ -412,21 +380,20 @@ async fn workflow_refresh_reports_catalog_and_diagnostics() {
         .await
         .expect("workflow_refresh failed");
 
-    loop {
-        let env = next_event(&mut fixture.client, "workflow notify").await;
-        if env.kind != FrameKind::WorkflowNotify {
-            continue;
-        }
-        let payload: WorkflowNotifyPayload = env.parse_payload().expect("WorkflowNotify");
-        assert_eq!(payload.summaries.len(), 1);
-        assert_eq!(payload.summaries[0].id, WorkflowId("build".to_owned()));
-        assert!(matches!(
-            payload.summaries[0].source.scope,
-            protocol::WorkflowSourceScope::Project { ref project_id, .. } if project_id == &project.id
-        ));
-        assert!(!payload.diagnostics.is_empty());
-        return;
-    }
+    let payload: WorkflowNotifyPayload =
+        next_frame_matching_on(&mut fixture.client, "workflow notify", |env| {
+            env.kind == FrameKind::WorkflowNotify
+        })
+        .await
+        .parse_payload()
+        .expect("WorkflowNotify");
+    assert_eq!(payload.summaries.len(), 1);
+    assert_eq!(payload.summaries[0].id, WorkflowId("build".to_owned()));
+    assert!(matches!(
+        payload.summaries[0].source.scope,
+        protocol::WorkflowSourceScope::Project { ref project_id, .. } if project_id == &project.id
+    ));
+    assert!(!payload.diagnostics.is_empty());
 }
 
 #[tokio::test]
@@ -595,8 +562,7 @@ async fn workflow_trigger_applies_defaults_and_spawns_coordinator() {
 
     let mut run = None;
     let mut coordinator = None;
-    for _ in 0..30 {
-        let env = next_event(&mut fixture.client, "valid input workflow").await;
+    next_frame_matching_on(&mut fixture.client, "valid input workflow", |env| {
         match env.kind {
             FrameKind::WorkflowRunNotify => {
                 let payload: WorkflowRunNotifyPayload =
@@ -616,10 +582,9 @@ async fn workflow_trigger_applies_defaults_and_spawns_coordinator() {
             }
             _ => {}
         }
-        if run.is_some() && coordinator.is_some() {
-            break;
-        }
-    }
+        run.is_some() && coordinator.is_some()
+    })
+    .await;
     let run = run.expect("workflow run notify missing");
     assert_eq!(run.inputs.get("target"), Some(&json!("src/lib.rs")));
     assert_eq!(
@@ -632,12 +597,7 @@ async fn workflow_trigger_applies_defaults_and_spawns_coordinator() {
     assert_eq!(run.inputs.get("mode"), Some(&json!("safe")));
 
     let coordinator = coordinator.expect("workflow coordinator missing");
-    let response = collect_turn_delta_text(
-        &mut fixture.client,
-        &coordinator.instance_stream,
-        "coordinator prompt with inputs",
-    )
-    .await;
+    let response = collect_turn_delta_text(&mut fixture.client, &coordinator.instance_stream).await;
     assert!(
         response.contains("\"target\": \"src/lib.rs\""),
         "coordinator prompt did not include supplied target: {response}"
@@ -689,17 +649,24 @@ async fn workflow_progress_finish_and_reconnect_replay_run() {
         WorkflowStepRunSnapshotStatus::Running
     );
 
-    loop {
-        let env = next_event(&mut fixture.client, "workflow step notify").await;
+    let mut stepped = None;
+    next_frame_matching_on(&mut fixture.client, "workflow step notify", |env| {
         if env.kind != FrameKind::WorkflowRunNotify {
-            continue;
+            return false;
         }
         let payload: WorkflowRunNotifyPayload = env.parse_payload().expect("WorkflowRunNotify");
         if payload.run.id == step_snapshot.id && !payload.run.steps.is_empty() {
-            assert_eq!(payload.run.steps[0].title, "Compile");
-            break;
+            stepped = Some(payload.run);
+            true
+        } else {
+            false
         }
-    }
+    })
+    .await;
+    assert_eq!(
+        stepped.expect("workflow step notify").steps[0].title,
+        "Compile"
+    );
 
     let finished = call_mcp_json_tool(
         &fixture,
@@ -749,17 +716,26 @@ async fn workflow_cancel_marks_run_cancelled_and_replays_agent() {
         .await
         .expect("cancel_workflow failed");
 
-    loop {
-        let env = next_event(&mut fixture.client, "workflow cancel notify").await;
+    let mut cancelled = None;
+    next_frame_matching_on(&mut fixture.client, "workflow cancel notify", |env| {
         if env.kind != FrameKind::WorkflowRunNotify {
-            continue;
+            return false;
         }
         let payload: WorkflowRunNotifyPayload = env.parse_payload().expect("WorkflowRunNotify");
         if payload.run.id == run_id && payload.run.status == WorkflowRunSnapshotStatus::Cancelled {
-            assert!(payload.run.agent_ids.contains(&coordinator.agent_id));
-            break;
+            cancelled = Some(payload.run);
+            true
+        } else {
+            false
         }
-    }
+    })
+    .await;
+    assert!(
+        cancelled
+            .expect("cancelled workflow run")
+            .agent_ids
+            .contains(&coordinator.agent_id)
+    );
 
     let (_reconnect, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(
@@ -795,16 +771,14 @@ async fn late_workflow_finish_after_cancel_cannot_resurrect_run() {
         .await
         .expect("cancel_workflow failed");
 
-    loop {
-        let env = next_event(&mut fixture.client, "workflow cancel notify").await;
+    next_frame_matching_on(&mut fixture.client, "workflow cancel notify", |env| {
         if env.kind != FrameKind::WorkflowRunNotify {
-            continue;
+            return false;
         }
         let payload: WorkflowRunNotifyPayload = env.parse_payload().expect("WorkflowRunNotify");
-        if payload.run.id == run_id && payload.run.status == WorkflowRunSnapshotStatus::Cancelled {
-            break;
-        }
-    }
+        payload.run.id == run_id && payload.run.status == WorkflowRunSnapshotStatus::Cancelled
+    })
+    .await;
 
     let workflow_url = fixture.workflow_mcp_http_url().await;
     let (is_error, body) = call_mcp_tool(
@@ -897,59 +871,45 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
             .to_owned(),
     );
 
-    let child_new = loop {
-        let env = next_event(&mut fixture.client, "workflow child NewAgent").await;
+    let mut child_new = None;
+    next_frame_matching_on(&mut fixture.client, "workflow child NewAgent", |env| {
         if env.kind != FrameKind::NewAgent {
-            continue;
+            return false;
         }
         let child: NewAgentPayload = env.parse_payload().expect("NewAgent");
         if child.agent_id != child_agent_id {
-            continue;
+            return false;
         }
-        assert_eq!(child.origin, AgentOrigin::Workflow);
-        assert_eq!(child.parent_agent_id, Some(coordinator.agent_id.clone()));
-        assert_eq!(child.project_id.as_ref(), Some(&project.id));
-        let metadata = child
-            .workflow
-            .as_ref()
-            .expect("child workflow metadata missing");
-        assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
-        assert_eq!(metadata.workflow_run_id, run_id);
-        break child;
-    };
+        child_new = Some(child);
+        true
+    })
+    .await;
+    let child_new = child_new.expect("workflow child NewAgent");
+    assert_eq!(child_new.origin, AgentOrigin::Workflow);
+    assert_eq!(
+        child_new.parent_agent_id,
+        Some(coordinator.agent_id.clone())
+    );
+    assert_eq!(child_new.project_id.as_ref(), Some(&project.id));
+    let metadata = child_new
+        .workflow
+        .as_ref()
+        .expect("child workflow metadata missing");
+    assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
+    assert_eq!(metadata.workflow_run_id, run_id);
 
-    loop {
-        let env = next_event(&mut fixture.client, "workflow child AgentStart").await;
-        if env.stream != child_new.instance_stream {
-            continue;
-        }
-        let start = match env.kind {
-            FrameKind::AgentStart => env.parse_payload().expect("AgentStart"),
-            FrameKind::AgentBootstrap => {
-                let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
-                let Some(start) = bootstrap.events.into_iter().find_map(|event| match event {
-                    AgentBootstrapEvent::AgentStart(start) => Some(start),
-                    AgentBootstrapEvent::AgentError(_)
-                    | AgentBootstrapEvent::SessionSettings(_)
-                    | AgentBootstrapEvent::QueuedMessages(_)
-                    | AgentBootstrapEvent::AgentActivityStats(_)
-                    | AgentBootstrapEvent::ChatEvent(_)
-                    | AgentBootstrapEvent::ContextCompaction(_)
-                    | AgentBootstrapEvent::ContextCompactionCapability(_)
-                    | AgentBootstrapEvent::HasPriorHistory { .. } => None,
-                }) else {
-                    continue;
-                };
-                start
-            }
-            _ => continue,
-        };
-        assert_eq!(start.agent_id, child_agent_id);
-        assert_eq!(start.origin, AgentOrigin::Workflow);
-        assert_eq!(start.parent_agent_id, Some(coordinator.agent_id.clone()));
-        assert_eq!(start.project_id.as_ref(), Some(&project.id));
-        break;
-    }
+    let start: protocol::AgentStartPayload = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "workflow child AgentStart",
+        |env| env.stream == child_new.instance_stream && env.kind == FrameKind::AgentStart,
+    )
+    .await
+    .parse_payload()
+    .expect("AgentStart");
+    assert_eq!(start.agent_id, child_agent_id);
+    assert_eq!(start.origin, AgentOrigin::Workflow);
+    assert_eq!(start.parent_agent_id, Some(coordinator.agent_id.clone()));
+    assert_eq!(start.project_id.as_ref(), Some(&project.id));
 }
 
 #[tokio::test]
@@ -1036,26 +996,27 @@ async fn workflow_save_mcp_notifies_and_triggers_without_refresh() {
 
     let mut saw_run = false;
     let mut saw_coordinator = false;
-    for _ in 0..20 {
-        let env = next_event(&mut fixture.client, "saved workflow trigger").await;
-        match env.kind {
-            FrameKind::WorkflowRunNotify => {
-                let payload: WorkflowRunNotifyPayload =
-                    env.parse_payload().expect("WorkflowRunNotify");
-                saw_run |= payload.run.workflow_id == WorkflowId("agent-build".to_owned());
+    next_frame_matching_on(
+        &mut fixture.client,
+        "saved workflow run and workflow-origin coordinator",
+        |env| {
+            match env.kind {
+                FrameKind::WorkflowRunNotify => {
+                    let payload: WorkflowRunNotifyPayload =
+                        env.parse_payload().expect("WorkflowRunNotify");
+                    saw_run |= payload.run.workflow_id == WorkflowId("agent-build".to_owned());
+                }
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+                    saw_coordinator |= payload.origin == AgentOrigin::Workflow
+                        && payload.name == "Workflow: Agent Build";
+                }
+                _ => {}
             }
-            FrameKind::NewAgent => {
-                let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
-                saw_coordinator |= payload.origin == AgentOrigin::Workflow
-                    && payload.name == "Workflow: Agent Build";
-            }
-            _ => {}
-        }
-        if saw_run && saw_coordinator {
-            return;
-        }
-    }
-    panic!("saved workflow did not spawn a workflow-origin coordinator");
+            saw_run && saw_coordinator
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1418,17 +1379,15 @@ async fn workflow_project_shadowing_is_scoped_per_project() {
 }
 
 async fn wait_for_workflow_coordinator_name(client: &mut client::Connection, expected_name: &str) {
-    for _ in 0..20 {
-        let env = next_event(client, expected_name).await;
+    let context = format!("workflow coordinator named {expected_name}");
+    next_frame_matching_on(client, &context, |env| {
         if env.kind != FrameKind::NewAgent {
-            continue;
+            return false;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
-        if payload.origin == AgentOrigin::Workflow && payload.name == expected_name {
-            return;
-        }
-    }
-    panic!("missing workflow coordinator named {expected_name}");
+        payload.origin == AgentOrigin::Workflow && payload.name == expected_name
+    })
+    .await;
 }
 
 #[tokio::test]

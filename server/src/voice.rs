@@ -137,14 +137,14 @@ pub(crate) trait NovaSession: Send {
 pub(crate) trait NovaProvider: Send + Sync {
     fn open<'a>(
         &'a self,
-        settings: &'a protocol::VoiceSettings,
+        settings: &'a settings_model::VoiceSettings,
         session: &'a VoiceSessionId,
     ) -> ProviderFuture<'a, Box<dyn NovaSession>>;
 }
 
 async fn open_provider(
     provider: std::sync::Arc<dyn NovaProvider>,
-    settings: protocol::VoiceSettings,
+    settings: settings_model::VoiceSettings,
     session: VoiceSessionId,
 ) -> Result<Box<dyn NovaSession>, ProviderFailure> {
     provider.open(&settings, &session).await
@@ -157,7 +157,7 @@ pub(crate) struct SyntheticNovaProvider;
 impl NovaProvider for SyntheticNovaProvider {
     fn open<'a>(
         &'a self,
-        _: &'a protocol::VoiceSettings,
+        _: &'a settings_model::VoiceSettings,
         _: &'a VoiceSessionId,
     ) -> ProviderFuture<'a, Box<dyn NovaSession>> {
         Box::pin(async {
@@ -1334,61 +1334,5 @@ pub(crate) async fn run_agent_tool(
             }
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn long_agent_turn_resets_inactivity_and_still_completes() {
-        let start = Instant::now();
-        let mut deadline = ToolDeadline::new(start);
-        for seconds in [30, 60, 90, 120] {
-            assert!(!deadline.expired(start + Duration::from_secs(seconds)));
-            assert!(deadline.observe(start + Duration::from_secs(seconds)));
-        }
-        assert!(
-            !deadline.expired(start + Duration::from_secs(121)),
-            "active events keep the correlated tool alive"
-        );
-    }
-
-    #[test]
-    fn opus_48khz_encode_decodes_directly_at_16khz() {
-        let source = (0..960)
-            .map(|index| {
-                (((index as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()) * 12_000.0)
-                    as i16
-            })
-            .collect::<Vec<_>>();
-        let mut encoder =
-            opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
-        let mut packet = vec![0; 1275];
-        let len = encoder.encode(&source, &mut packet).unwrap();
-        packet.truncate(len);
-        let mut decoder = opus::Decoder::new(16_000, opus::Channels::Mono).unwrap();
-        let mut decoded = vec![0i16; 320];
-        let samples = decoder.decode(&packet, &mut decoded, false).unwrap();
-        assert_eq!(samples, 320);
-        assert!(decoded[..samples].iter().any(|sample| sample.abs() > 100));
-    }
-
-    #[test]
-    fn tool_result_is_utf8_bounded_and_marks_truncation() {
-        let value = format!("{}é", "x".repeat(MAX_TOOL_RESULT_BYTES));
-        let bounded = bounded_tool_result(value);
-        assert!(bounded.len() <= MAX_TOOL_RESULT_BYTES);
-        assert!(bounded.ends_with("[truncated]"));
-    }
-
-    #[tokio::test]
-    async fn observer_guard_closes_production_queue_on_every_exit() {
-        let queue = crate::stream::OutputQueue::default();
-        {
-            let _guard = ObserverGuard(queue.clone());
-        }
-        assert!(queue.pop().await.unwrap().is_none());
     }
 }
