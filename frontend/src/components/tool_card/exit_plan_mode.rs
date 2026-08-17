@@ -284,9 +284,7 @@ mod wasm_tests {
     use crate::components::tool_card::{ToolCardView, test_utils::*};
     use crate::state::{AgentInfo, AppState, TabContent, ToolRequestEntry};
     use leptos::mount::mount_to;
-    use protocol::{
-        AgentId, AgentOrigin, BackendKind, StreamPath, ToolExecutionCompletedData, ToolRequest,
-    };
+    use protocol::{AgentId, AgentOrigin, BackendKind, StreamPath, ToolRequest};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlButtonElement, HtmlElement, HtmlTextAreaElement};
@@ -315,20 +313,20 @@ mod wasm_tests {
 
     fn completed_entry(success: bool) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
-                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: exit_plan_req(),
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_plan".to_owned(),
-                tool_name: "ExitPlanMode".to_owned(),
-                tool_result: ToolExecutionResult::Other {
-                    result: serde_json::json!({ "decision": "approve" }),
-                },
-                success,
-                error: (!success).then(|| "rejected".to_owned()),
-                normalization_failure: None,
+            result: Some(if success {
+                succeeded_completion(
+                    "toolu_plan",
+                    ToolExecutionResult::Other {
+                        result: serde_json::json!({ "decision": "approve" }),
+                    },
+                )
+            } else {
+                failed_completion("toolu_plan", "rejected", None, None)
             }),
         }
     }
@@ -547,9 +545,9 @@ mod wasm_tests {
 
     fn pending_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
-                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: exit_plan_req(),
             },
             result: None,

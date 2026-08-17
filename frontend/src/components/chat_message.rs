@@ -100,7 +100,7 @@ pub(crate) fn interleave_message(
     let placement_for = |tool_call_id: &str| -> Option<usize> {
         tool_calls
             .iter()
-            .find(|call| call.id == tool_call_id)
+            .find(|call| call.tool_call_id == tool_call_id)
             .and_then(|call| call.content_offset)
             .filter(|offset| (*offset as usize) <= scalar_len)
             .map(|offset| byte_at(offset as usize))
@@ -680,7 +680,7 @@ mod wasm_tests {
 
     fn tool_call(id: &str, offset: Option<u32>) -> protocol::ToolUseData {
         protocol::ToolUseData {
-            id: id.to_owned(),
+            tool_call_id: id.to_owned(),
             name: "run".to_owned(),
             arguments: serde_json::json!({}),
             content_offset: offset,
@@ -689,9 +689,9 @@ mod wasm_tests {
 
     fn tool_entry(id: &str) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "run".to_owned(),
             request: protocol::ToolRequest {
                 tool_call_id: id.to_owned(),
-                tool_name: "run".to_owned(),
                 tool_type: protocol::ToolRequestType::Other {
                     args: serde_json::json!({}),
                 },

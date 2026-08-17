@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -7021,60 +7021,43 @@ pub enum OrchestrationWorkflowPhase {
     },
 }
 
-/// Events a backend emits on a chat stream. Mirrors the Tycode
-/// `ChatEvent` enum in `tycode-core/src/chat/events.rs`; any semantic
-/// change must be made there first so every backend (Claude, Codex,
-/// Antigravity, ACP, Tycode) shares one contract.
+/// Events emitted on an agent's ordered chat stream.
 ///
-/// ## Invariants backends MUST uphold
+/// A provider turn is not a message boundary. One provider turn may contain
+/// many model requests. Every `StreamStart` through `StreamEnd` pair is one
+/// model request/response and produces exactly one assistant `ChatMessage`.
+/// `OperationCancelled` may instead abort the one open response without
+/// fabricating a partial assistant message.
 ///
-/// These are the rules the server-side `ProtocolValidator` enforces.
-/// If a backend violates one the stream is terminated with a protocol
-/// error — do not paper over it in the validator.
+/// `StreamDelta` and `StreamReasoningDelta` belong to the one currently open
+/// response, so they do not carry message ids. `StreamEnd.message` is the
+/// authoritative response and owns its text, reasoning, images, token usage,
+/// context, and tool declarations.
 ///
-/// ### Stream pairing
-/// Every `StreamStart` on a stream must be followed by exactly one
-/// `StreamEnd` before the next `StreamStart` on the same stream. Backends must
-/// reserve provider identities without publishing a stream until the response
-/// has renderable text, reasoning, tools, or images; clients must not synthesize
-/// fallback content, and backends must not infer evidence their provider schema
-/// does not expose. `StreamDelta` /
-/// `StreamReasoningDelta` are only valid between a `StreamStart` and
-/// its matching `StreamEnd`.
+/// Every `ToolRequest` must refer to a `ToolUseData` declaration from an
+/// assistant response. `tool_call_id` is the only tool execution identity.
+/// The tool's name and provider arguments live on the declaration and are not
+/// repeated on progress or completion events.
 ///
-/// ### Tool pairing
-/// `ToolRequest` is only valid while an assistant turn is open (after a
-/// `MessageAdded { Assistant }` or a `StreamStart`). Every emitted
-/// `ToolRequest` must be answered by exactly one
-/// `ToolExecutionCompleted` with the same `tool_call_id`.
+/// A tool may move from foreground to background without becoming a different
+/// task or receiving another id. It remains open until exactly one
+/// `ToolExecutionCompleted`. No `ToolProgress` is valid after completion.
 ///
 /// ### Activity
 /// `TypingStatusChanged` is the authoritative foreground-turn activity signal.
-/// Detached background tasks, subagents, and workflows remain visible through
-/// their own progress events and must not keep the foreground turn active.
+/// Background tools, subagents, and workflows remain visible through progress
+/// events and must not keep the foreground turn active.
 /// A backend emits `false` as soon as it can accept another user turn, even
 /// while detached work continues. Provider-initiated continuation starts a new
 /// foreground turn and therefore emits its own paired activity signals.
 ///
 /// ### Cancellation ordering
-/// When a turn is cancelled the backend must, in this order:
-///   1. If a stream is currently open, emit `StreamEnd` to close it. A reserved
-///      identity that was never published has no stream to close.
-///   2. Emit `ToolExecutionCompleted` for any outstanding
-///      `ToolRequest`s the backend originated in this turn (mark them
-///      unsuccessful / cancelled).
+/// When foreground work is cancelled the backend must, in this order:
+///   1. Abort any open response. Its partial deltas do not become a message.
+///   2. Emit a cancelled `ToolExecutionCompleted` for each open foreground
+///      tool. Calls already moved to `Background` continue independently.
 ///   3. Emit exactly one `OperationCancelled`.
 ///   4. Emit `TypingStatusChanged(false)`.
-///
-/// This matches `tycode-core::chat::protocol::TurnProtocol::abort`.
-/// Without step 1, the next turn's `StreamStart` violates the stream
-/// pairing invariant above.
-///
-/// An identity-violation discard is the sole exception: because its active
-/// stream is untrusted, the backend must not fabricate `StreamEnd` content.
-/// It emits one visible error followed by `OperationCancelled` and
-/// `TypingStatusChanged(false)`; validators discard the active stream at the
-/// cancellation boundary and retain its id as terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
@@ -7086,13 +7069,7 @@ pub enum ChatEvent {
     StreamReasoningDelta(StreamTextDeltaData),
     StreamEnd(StreamEndData),
     ToolRequest(ToolRequest),
-    /// Live progress for a tool call. Zero or more may arrive for a
-    /// `tool_call_id`, both before and *after* its
-    /// `ToolExecutionCompleted` — background tasks (e.g. Claude Code
-    /// workflows) outlive the tool call that started them, so progress
-    /// keeps flowing after the tool result and across turn boundaries.
-    /// Each event carries a full snapshot, never a delta: consumers keep
-    /// only the latest per `tool_call_id`.
+    /// Zero or more full progress snapshots for an open tool call.
     ToolProgress(ToolProgressData),
     ToolExecutionCompleted(ToolExecutionCompletedData),
     TaskUpdate(TaskList),
@@ -7113,6 +7090,9 @@ pub enum MessageSender {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Tyde-owned presentation identity. Provider response ids and tool-call
+    /// ids are never reused as message ids. Consumers still render a message
+    /// when this is absent; it only loses addressable late metadata.
     #[serde(default)]
     pub message_id: Option<ChatMessageId>,
     pub timestamp: u64,
@@ -7129,6 +7109,8 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageMetadataUpdateData {
+    /// Presentation-only correlation. Consumers ignore an update whose message
+    /// is no longer known rather than rejecting the chat stream.
     pub message_id: ChatMessageId,
     pub model_info: Option<ModelInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7146,7 +7128,7 @@ pub struct ReasoningData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolUseData {
-    pub id: String,
+    pub tool_call_id: String,
     pub name: String,
     pub arguments: Value,
     /// Unicode scalar-value offset into the owning message's `content` at
@@ -7309,127 +7291,27 @@ pub struct ImageData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStartData {
-    /// Required for valid assistant stream frames. Kept optional in the wire
-    /// type only so older persisted frames can still deserialize; validators
-    /// reject a missing or empty value.
-    pub message_id: Option<String>,
     pub agent: String,
     pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamTextDeltaData {
-    /// Required for valid assistant stream frames. It must equal the id from
-    /// the matching `StreamStart`.
-    pub message_id: Option<String>,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEndData {
-    /// `message.message_id` is required for valid assistant stream frames and
-    /// must equal the id from the matching `StreamStart`.
+    /// The complete provider response. It must never be a synthetic message
+    /// created merely to give a tool call a parent.
     pub message: ChatMessage,
-}
-
-/// A value-free classification for an assistant stream identity violation.
-///
-/// The category is safe to surface across protocol boundaries: it carries no
-/// provider payload, message text, or identifier value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamIdentityViolation {
-    MissingMessageId,
-    ForeignActiveMessageId,
-    MismatchedEndMessageId,
-    DuplicateTerminalMessageId,
-    ConflictingDuplicateCompletion,
-}
-
-/// A server-authored contract for an assistant message whose provider response
-/// does not expose a stable item identifier. Generation is explicit: callers
-/// must persist and replay the same contract fields rather than infer an id
-/// from text or stream timing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerGeneratedChatMessageIdentity {
-    pub origin: ServerGeneratedChatMessageIdOrigin,
-    pub stream_epoch: u64,
-    pub item_ordinal: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServerGeneratedChatMessageIdOrigin {
-    IdlessProviderResponseItem,
-    IdlessReasoning,
-    LegacyReplay,
-}
-
-impl ServerGeneratedChatMessageIdentity {
-    /// Produces a deterministic, value-free message id from the persisted
-    /// server contract.
-    pub fn message_id(&self) -> ChatMessageId {
-        let origin = match self.origin {
-            ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem => {
-                "idless_provider_response_item"
-            }
-            ServerGeneratedChatMessageIdOrigin::IdlessReasoning => "idless_reasoning",
-            ServerGeneratedChatMessageIdOrigin::LegacyReplay => "legacy_replay",
-        };
-        ChatMessageId(format!(
-            "server-generated:{origin}:{}:{}",
-            self.stream_epoch, self.item_ordinal
-        ))
-    }
-}
-
-impl StreamStartData {
-    /// Converts the compatibility wire field into the required runtime
-    /// assistant-stream identity.
-    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
-        required_stream_message_id(&self.message_id)
-    }
-}
-
-impl StreamTextDeltaData {
-    /// Converts the compatibility wire field into the required runtime
-    /// assistant-stream identity.
-    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
-        required_stream_message_id(&self.message_id)
-    }
-}
-
-impl StreamEndData {
-    /// Returns the required immutable assistant-stream completion identity.
-    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
-        let Some(message_id) = self
-            .message
-            .message_id
-            .as_ref()
-            .filter(|message_id| !message_id.0.trim().is_empty())
-        else {
-            return Err(StreamIdentityViolation::MissingMessageId);
-        };
-        Ok(message_id.clone())
-    }
-}
-
-fn required_stream_message_id(
-    message_id: &Option<String>,
-) -> Result<ChatMessageId, StreamIdentityViolation> {
-    let Some(message_id) = message_id
-        .as_ref()
-        .filter(|message_id| !message_id.trim().is_empty())
-    else {
-        return Err(StreamIdentityViolation::MissingMessageId);
-    };
-    Ok(ChatMessageId(message_id.clone()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub tool_call_id: String,
-    pub tool_name: String,
+    /// Tyde's normalized executable form. The provider name and arguments are
+    /// read from the owning response's `ToolUseData`.
     pub tool_type: ToolRequestType,
 }
 
@@ -7554,8 +7436,19 @@ pub struct AskUserQuestionOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolProgressData {
     pub tool_call_id: String,
-    pub tool_name: String,
+    /// The same tool call may move from foreground to background. That changes
+    /// scheduling, not identity.
+    #[serde(default)]
+    pub execution_mode: ToolExecutionMode,
     pub update: ToolProgressUpdate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionMode {
+    #[default]
+    Foreground,
+    Background,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7564,60 +7457,7 @@ pub enum ToolProgressUpdate {
     SubAgent(SubAgentProgress),
     Workflow(WorkflowRunState),
     AgentControl(AgentControlProgress),
-    BackgroundTask(BackgroundTaskState),
-    Other {
-        #[serde(default)]
-        status: OpaqueToolProgressStatus,
-        payload: Value,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpaqueToolProgressStatus {
-    Running,
-    Completed,
-    Failed,
-    Stopped,
-    #[default]
-    Unknown,
-}
-
-/// Live status of a backgrounded shell command, reduced server-side from
-/// backend-native process/task lifecycle frames.
-/// Keyed to the launching tool call by `tool_call_id`, like a workflow.
-/// Backends may include the backend-verified command; consumers can otherwise
-/// join with the originating tool request by `tool_call_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackgroundTaskState {
-    /// The CLI's task id (distinct from the tool_use id).
-    pub task_id: String,
-    /// Actual command from the originating normalized tool request.
-    #[serde(default)]
-    pub description: Option<String>,
-    pub status: BackgroundTaskStatus,
-    /// Completion summary from the `task_notification` frame. It remains
-    /// presentation-only; command results are never inferred from this prose.
-    #[serde(default)]
-    pub summary: Option<String>,
-    /// Why final stdout/stderr could not be captured. This is backend-owned
-    /// metadata, never command stderr and never an internal temporary path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_unavailable: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundTaskStatus {
-    Running,
-    Completed,
-    /// Ended without completing — killed at session teardown or via
-    /// TaskStop (`task_updated` patch status `killed`, notification
-    /// status `stopped`).
-    Stopped,
-    Failed,
-    #[serde(other)]
-    Unknown,
+    Other { payload: Value },
 }
 
 /// Live status of a sub-agent spawned by a Task-style tool call,
@@ -7774,24 +7614,30 @@ impl ToolExecutionNormalizationFailure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionCompletedData {
     pub tool_call_id: String,
-    pub tool_name: String,
-    pub tool_result: ToolExecutionResult,
-    pub success: bool,
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    pub outcome: ToolExecutionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolExecutionOutcome {
+    Succeeded {
+        result: ToolExecutionResult,
+    },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    },
+    Cancelled {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ToolExecutionResult {
-    /// The containing turn was cancelled before the tool produced an
-    /// authoritative result. This is deliberately distinct from `Error`: a
-    /// cancelled command did not necessarily exit non-zero, and provider
-    /// control prose is not command stderr.
-    Cancelled {
-        message: String,
-    },
     ModifyFile {
         lines_added: u64,
         lines_removed: u64,
@@ -7809,10 +7655,6 @@ pub enum ToolExecutionResult {
     },
     GetTypeDocs {
         documentation: String,
-    },
-    Error {
-        short_message: String,
-        detailed_message: String,
     },
     /// Delivery acknowledgement for `tyde_send_agent_message`. The MCP tool
     /// returns `{"ok": true}` and nothing else, so there is no result body to

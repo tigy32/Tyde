@@ -17,12 +17,14 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use protocol::{
-    BackendAccessMode, BackgroundTaskState, BackgroundTaskStatus, CapacityBucket, CapacityBucketId,
-    CapacityBucketStatus, CapacityCoverage, CapacityMeasure, CapacityReport, CapacityReset,
-    CapacityScope, CapacitySource, CapacityUnavailableReason, CapacityWindow, ClaudeLimitType,
-    ExitPlanModeDecision, SendMessageToolResponse, SessionId, ToolPolicy, ToolProgressData,
-    ToolProgressUpdate, ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState,
-    WorkflowRunStatus,
+    BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage,
+    CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
+    CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ContextBreakdown,
+    ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo, ReasoningData,
+    SendMessageToolResponse, SessionId, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolProgressData,
+    ToolProgressUpdate, ToolRequestType, ToolUseData, ValueProvenance, WorkflowAgentState,
+    WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::agent::customization::SkillSelection;
@@ -32,8 +34,8 @@ use crate::backend::claude_skills::{
     unsupported_plugin_dir_notice, verify_init_frame, verify_plugin_inventory,
 };
 use crate::backend::turn_emitter::{
-    AgentName, AssistantMessagePayload, RetryAttemptPayload, StreamEndPayload,
-    ToolCompletedPayload, TurnEmitter,
+    AgentName, AssistantMessagePayload, ResponseHandle, RetryAttemptPayload, StreamEndPayload,
+    TurnEmitter,
 };
 use crate::backend::{
     AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
@@ -48,7 +50,6 @@ struct SubAgentStream {
     summary: ClaudeStdoutSummary,
     segment: SegmentState,
     message_id: String,
-    has_explicit_task_prompt: bool,
     /// A local ClaudeInner that routes events to the sub-agent's channel.
     inner: Arc<ClaudeInner>,
     /// The parent's Task tool_use id — the `tool_call_id` for live
@@ -498,6 +499,7 @@ impl ClaudeSession {
                 event_tx,
                 AgentName(CLAUDE_AGENT_NAME),
             )),
+            active_response: StdMutex::new(None),
             state: Mutex::new(ClaudeState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
@@ -837,6 +839,7 @@ struct ClaudeInner {
     /// session-control ones like `SessionStarted` / `Error` — goes
     /// through here; there is no raw `event_tx` fallback.
     emitter: Arc<TurnEmitter>,
+    active_response: StdMutex<Option<(String, ResponseHandle)>>,
     state: Mutex<ClaudeState>,
     runtime: Mutex<Option<ClaudeProcessRuntime>>,
     turn_event_gate: Mutex<()>,
@@ -872,6 +875,24 @@ struct ClaudeInner {
 struct BackgroundTaskRegistry {
     owner_active: bool,
     entries: HashMap<String, BackgroundTaskEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundTaskState {
+    task_id: String,
+    description: Option<String>,
+    status: BackgroundTaskStatus,
+    summary: Option<String>,
+    output_unavailable: Option<String>,
 }
 
 impl BackgroundTaskRegistry {
@@ -992,8 +1013,10 @@ struct ClaudeResumeStartupGuard {
 struct ClaudeDetachedStartupCancelGuard(Option<oneshot::Sender<()>>);
 
 impl ClaudeDetachedStartupCancelGuard {
-    fn disarm(&mut self) {
-        self.0 = None;
+    fn disarm(&mut self) -> oneshot::Sender<()> {
+        self.0
+            .take()
+            .expect("Claude startup cancellation guard already disarmed")
     }
 }
 
@@ -1388,15 +1411,15 @@ impl ClaudeStdoutSummary {
     }
 
     fn best_reasoning(&self) -> Option<String> {
-        if contains_non_whitespace(&self.streamed_reasoning) {
-            return Some(self.streamed_reasoning.clone());
-        }
         if let Some(reasoning) = self
             .result_reasoning
             .as_ref()
             .filter(|text| contains_non_whitespace(text))
         {
             return Some(reasoning.clone());
+        }
+        if contains_non_whitespace(&self.streamed_reasoning) {
+            return Some(self.streamed_reasoning.clone());
         }
         None
     }
@@ -1490,6 +1513,67 @@ struct ClaudeMessageUsage {
     request: Option<Value>,
     turn: Option<Value>,
     cumulative: Option<Value>,
+}
+
+fn claude_message_token_usage(usage: ClaudeMessageUsage) -> Option<MessageTokenUsage> {
+    let request = usage.request.and_then(claude_token_usage);
+    let turn = usage.turn.and_then(claude_token_usage);
+    let cumulative = usage.cumulative.and_then(claude_token_usage);
+    if request.is_none() && turn.is_none() && cumulative.is_none() {
+        return None;
+    }
+    let turn_reported = turn.is_some();
+    let known = |usage| TokenUsageScope::Known {
+        usage: Box::new(usage),
+    };
+    let unavailable = |reason| TokenUsageScope::Unavailable { reason };
+    Some(MessageTokenUsage {
+        request: request
+            .map(known)
+            .unwrap_or_else(|| unavailable(TokenUsageUnavailableReason::BackendDidNotReport)),
+        turn: turn
+            .map(known)
+            .unwrap_or_else(|| unavailable(TokenUsageUnavailableReason::BackendDidNotReport)),
+        cumulative: cumulative.map(known).unwrap_or_else(|| {
+            unavailable(if turn_reported {
+                TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            } else {
+                TokenUsageUnavailableReason::BackendDidNotReport
+            })
+        }),
+    })
+}
+
+fn claude_token_usage(value: Value) -> Option<TokenUsage> {
+    serde_json::from_value(value)
+        .map_err(|error| tracing::warn!(%error, "dropping invalid Claude token usage"))
+        .ok()
+}
+
+fn claude_tool_use_data(value: Value, default_content_offset: u32) -> Option<ToolUseData> {
+    let tool_call_id = value
+        .get("tool_call_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_owned();
+    if tool_call_id.is_empty() {
+        return None;
+    }
+    let name = value.get("name").and_then(Value::as_str)?.trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    Some(ToolUseData {
+        tool_call_id,
+        name,
+        arguments: value.get("arguments").cloned().unwrap_or(Value::Null),
+        content_offset: value
+            .get("content_offset")
+            .and_then(Value::as_u64)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .or(Some(default_content_offset)),
+    })
 }
 
 enum ClaudeHistoryReplayItem {
@@ -4498,17 +4582,12 @@ impl ClaudeInner {
             self.emitter.task_update(&tasks);
         }
         let tool_type = claude_tool_request_type(&tool_call.name, &tool_call.arguments);
-        let emitted = if require_declared_response {
-            self.emitter.tool_request_for_declared_response(
-                &tool_call.id,
-                &tool_call.name,
-                tool_type,
-            )
-        } else {
-            self.emitter
-                .tool_request(&tool_call.id, &tool_call.name, tool_type);
-            self.emitter.has_pending_tool_request(&tool_call.id)
-        };
+        let tool_type = serde_json::from_value(tool_type.clone())
+            .unwrap_or(ToolRequestType::Other { args: tool_type });
+        let emitted = self.emitter.tool_request(&tool_call.id, tool_type);
+        if !require_declared_response && !emitted {
+            return false;
+        }
         if !emitted {
             return false;
         }
@@ -4521,19 +4600,6 @@ impl ClaudeInner {
             eprintln!(
                 "TYDE CLAUDE NATIVE TASK TRACK request={} inserted={inserted}",
                 tool_call.id
-            );
-        }
-        if is_subagent_tool_name(&tool_call.name)
-            && tool_call
-                .arguments
-                .get("run_in_background")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            && !self.emitter.detach_tool(&tool_call.id)
-        {
-            tracing::warn!(
-                tool_call_id = tool_call.id,
-                "background Agent request could not detach from foreground turn"
             );
         }
         self.adopt_background_task_awaiting_tool_request(&tool_call.id);
@@ -4584,24 +4650,21 @@ impl ClaudeInner {
         if entry.state.description.is_none() {
             entry.state.description = owner.tool_request_command(tool_call_id);
         }
+        let mut completion_emitted = false;
         if entry.tool_name.is_some() {
             tracing::debug!(
                 task_id = entry.state.task_id,
                 tool_use_id = tool_call_id,
                 "adopted background task on its late tool request"
             );
-            if !entry.terminal_progress_emitted {
+            if entry.state.status == BackgroundTaskStatus::Running {
                 emit_background_task_snapshot(&owner, entry);
-                if entry.state.status != BackgroundTaskStatus::Running {
-                    entry.terminal_progress_emitted = true;
-                }
-            }
-            if entry.state.status != BackgroundTaskStatus::Running && !entry.completion_emitted {
+            } else if entry.terminal_notification_received {
                 emit_background_task_completion(&owner, entry);
-                entry.completion_emitted = true;
+                completion_emitted = true;
             }
         }
-        if entry.terminal_progress_emitted && entry.completion_emitted {
+        if completion_emitted {
             registry.entries.remove(&task_id);
         }
     }
@@ -4628,20 +4691,19 @@ impl ClaudeInner {
         } else {
             error
         };
-        let completed = ToolCompletedPayload {
-            tool_call_id,
-            tool_name,
-            tool_result,
-            success,
-            error: error.as_deref(),
-        };
+        let outcome = claude_tool_execution_outcome(success, tool_result, error);
         let pending_before_completion = self.emitter.has_pending_tool_request(tool_call_id);
-        let emitted_message_id = emit_tool_completion_for_known_request(&self.emitter, completed);
+        eprintln!(
+            "TYDE CLAUDE TOOL COMPLETION id={tool_call_id} name={tool_name} pending={pending_before_completion} known={}",
+            self.emitter.has_known_tool_request(tool_call_id)
+        );
+        let emitted =
+            emit_tool_completion_for_known_request(&self.emitter, tool_call_id, tool_name, outcome);
         tracing::info!(
             tool_call_id,
             tool_name,
             pending_before_completion,
-            emitted = emitted_message_id.is_some(),
+            emitted,
             "Claude tool completion emission"
         );
         if let Some(tasks) = task_update {
@@ -4683,19 +4745,20 @@ impl ClaudeInner {
     }
 
     fn emit_stream_start(&self, message_id: &str, model: Option<String>) {
-        self.emitter
-            .stream_start(message_id, AgentName(CLAUDE_AGENT_NAME), model.as_deref());
+        let response = self.emitter.stream_start(model.as_deref());
+        *self
+            .active_response
+            .lock()
+            .expect("Claude response mutex poisoned") = Some((message_id.to_owned(), response));
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
         let image_payload = images.map(|images| {
             images
                 .iter()
-                .map(|image| {
-                    json!({
-                        "media_type": image.media_type,
-                        "data": image.data,
-                    })
+                .map(|image| ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
                 })
                 .collect::<Vec<_>>()
         });
@@ -4703,11 +4766,25 @@ impl ClaudeInner {
     }
 
     fn emit_stream_delta(&self, message_id: &str, text: &str) {
-        self.emitter.stream_delta(message_id, text);
+        let Some(response) = self.response_handle(message_id, "text delta") else {
+            debug_assert!(
+                false,
+                "Claude emitted a text delta outside its active response"
+            );
+            return;
+        };
+        self.emitter.stream_delta(&response, text);
     }
 
     fn emit_stream_reasoning_delta(&self, message_id: &str, text: &str) {
-        self.emitter.stream_reasoning_delta(message_id, text);
+        let Some(response) = self.response_handle(message_id, "reasoning delta") else {
+            debug_assert!(
+                false,
+                "Claude emitted a reasoning delta outside its active response"
+            );
+            return;
+        };
+        self.emitter.stream_reasoning_delta(&response, text);
     }
 
     fn emit_stream_end(
@@ -4719,21 +4796,64 @@ impl ClaudeInner {
         tool_calls: Vec<Value>,
         context_breakdown: Option<Value>,
     ) {
-        let token_usage_unavailable_reason = (usage.turn.is_some() && usage.cumulative.is_none())
-            .then_some(protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous);
-        self.emitter.stream_end(StreamEndPayload {
+        let content_offset = u32::try_from(content.chars().count()).unwrap_or(u32::MAX);
+        let Some(response) = self
+            .active_response
+            .lock()
+            .expect("Claude response mutex poisoned")
+            .take()
+            .map(|(_, response)| response)
+        else {
+            tracing::error!("Claude ended a response that was not open");
+            debug_assert!(false, "Claude ended a response that was not open");
+            return;
+        };
+        self.emitter.stream_end(response, StreamEndPayload {
             content,
-            agent: Some(AgentName(CLAUDE_AGENT_NAME)),
-            model,
-            request_usage: usage.request,
-            turn_usage: usage.turn,
-            cumulative_usage: usage.cumulative,
-            token_usage_unavailable_reason,
-            reasoning,
-            tool_calls,
-            context_breakdown,
+            model_info: model.map(|model| ModelInfo { model }),
+            token_usage: claude_message_token_usage(usage),
+            reasoning: reasoning.map(|text| ReasoningData {
+                text,
+                tokens: None,
+                signature: None,
+                blob: None,
+            }),
+            tool_calls: tool_calls
+                .into_iter()
+                .filter_map(|tool_call| claude_tool_use_data(tool_call, content_offset))
+                .collect(),
+            context_breakdown: context_breakdown.and_then(|value| {
+                serde_json::from_value::<ContextBreakdown>(value)
+                    .map_err(|error| tracing::warn!(%error, "dropping invalid Claude context breakdown"))
+                    .ok()
+            }),
             images: Vec::new(),
         });
+    }
+
+    fn response_handle(&self, message_id: &str, event: &str) -> Option<ResponseHandle> {
+        let active = self
+            .active_response
+            .lock()
+            .expect("Claude response mutex poisoned");
+        let Some((active_message_id, response)) = active.as_ref() else {
+            tracing::error!(
+                message_id,
+                event,
+                "Claude response event arrived without StreamStart"
+            );
+            return None;
+        };
+        if active_message_id != message_id {
+            tracing::error!(
+                message_id,
+                active_message_id,
+                event,
+                "Claude response event used a stale response key"
+            );
+            return None;
+        }
+        Some(response.clone())
     }
 
     fn emit_placeholder_stream_end(
@@ -4773,7 +4893,10 @@ impl ClaudeInner {
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let images = message.get("images").and_then(Value::as_array).cloned();
+            let images = message
+                .get("images")
+                .cloned()
+                .and_then(|images| serde_json::from_value(images).ok());
             self.emitter.user_message(content, images);
             return;
         }
@@ -4784,36 +4907,54 @@ impl ClaudeInner {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let reasoning = message.get("reasoning").cloned().filter(|v| !v.is_null());
+        let reasoning = message
+            .get("reasoning")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<ReasoningData>(value).ok());
         let tool_calls = message
             .get("tool_calls")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let model_info = message.get("model_info").cloned().filter(|v| !v.is_null());
-        let token_usage = message.get("token_usage").cloned().filter(|v| !v.is_null());
+        let model_info = message
+            .get("model_info")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());
+        let token_usage = message
+            .get("token_usage")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<MessageTokenUsage>(value).ok());
         let context_breakdown = message
             .get("context_breakdown")
             .cloned()
-            .filter(|v| !v.is_null());
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<ContextBreakdown>(value).ok());
         let images = message
             .get("images")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        self.emitter.assistant_message(AssistantMessagePayload {
-            agent: AgentName(CLAUDE_AGENT_NAME),
-            message_id: None,
-            content,
-            reasoning,
-            tool_calls,
-            model_info,
-            request_usage: token_usage,
-            turn_usage: None,
-            cumulative_usage: None,
-            context_breakdown,
-            images,
-        });
+            .into_iter()
+            .flatten()
+            .filter_map(|image| serde_json::from_value::<ImageData>(image.clone()).ok())
+            .collect::<Vec<_>>();
+        let content_offset = u32::try_from(content.chars().count()).unwrap_or(u32::MAX);
+        let tool_calls = tool_calls
+            .into_iter()
+            .filter_map(|tool_call| claude_tool_use_data(tool_call, content_offset))
+            .collect();
+        self.emitter
+            .replay_assistant_message(AssistantMessagePayload {
+                message_id: None,
+                content,
+                reasoning,
+                tool_calls,
+                model_info,
+                token_usage,
+                context_breakdown,
+                images,
+            });
     }
 
     fn emit_error(&self, message: &str) {
@@ -5485,6 +5626,7 @@ async fn read_claude_stdout_persistent(
     let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
     let mut known_subagent_ids = HashSet::new();
     let mut pending_subagent_prompts: HashMap<u64, PendingSubAgentPrompt> = HashMap::new();
+    let mut pending_subagent_spawns: HashMap<String, SubAgentSpawnSpec> = HashMap::new();
     let mut local_agent_tasks: HashMap<String, String> = HashMap::new();
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
@@ -5916,6 +6058,10 @@ async fn read_claude_stdout_persistent(
             close_current_phase(&mut turn_state.summary, &mut turn_state.segment, &inner);
             flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
         }
+        if subagent_emitter.is_some() {
+            detect_subagent_completions(&value, &mut subagent_streams).await;
+            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
+        }
         consume_claude_stream_value_with_interrupt(
             &value,
             &mut turn_state.summary,
@@ -5927,14 +6073,23 @@ async fn read_claude_stdout_persistent(
         );
         flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
         if let Some(ref emitter) = subagent_emitter {
+            flush_pending_subagent_spawns(
+                emitter.as_ref(),
+                &inner.emitter,
+                &mut subagent_streams,
+                &mut pending_subagent_spawns,
+            )
+            .await;
             detect_subagent_spawns(
                 &value,
                 emitter.as_ref(),
                 &inner.emitter,
                 &mut subagent_streams,
                 &mut pending_subagent_prompts,
+                &mut pending_subagent_spawns,
             )
             .await;
+            finalize_ready_background_subagents(&mut subagent_streams);
             known_subagent_ids.extend(subagent_streams.keys().cloned());
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
@@ -5949,11 +6104,6 @@ async fn read_claude_stdout_persistent(
                 &inner.emitter,
                 &subagent_streams,
             );
-        }
-
-        if subagent_emitter.is_some() {
-            detect_subagent_completions(&value, &mut subagent_streams).await;
-            sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
         }
 
         if value.get("type").and_then(Value::as_str) == Some("result") {
@@ -6910,7 +7060,15 @@ fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolP
     }
     ToolProgressData {
         tool_call_id: stream.parent_tool_use_id.clone(),
-        tool_name: stream.parent_tool_name.clone(),
+        execution_mode: if stream.execution == SubAgentExecution::Background
+            || stream
+                .parent_emitter
+                .is_tool_background(&stream.parent_tool_use_id)
+        {
+            ToolExecutionMode::Background
+        } else {
+            ToolExecutionMode::Foreground
+        },
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: stream.agent_id.clone(),
             agent_name: stream.agent_name.clone(),
@@ -6971,15 +7129,7 @@ fn flush_subagent_progress(stream: &mut SubAgentStream) -> bool {
     true
 }
 
-fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description: &str) {
-    let trimmed = description.trim();
-    if stream.has_explicit_task_prompt || trimmed.is_empty() {
-        return;
-    }
-    stream.has_explicit_task_prompt = true;
-    stream.inner.emitter.user_message(trimmed, None);
-}
-
+#[derive(Clone)]
 struct SubAgentSpawnSpec {
     tool_use_id: String,
     parent_tool_name: Option<String>,
@@ -7006,6 +7156,9 @@ async fn ensure_subagent_stream(
         execution,
     } = spec;
     if let Some(stream) = streams.get_mut(&tool_use_id) {
+        if execution != SubAgentExecution::Unknown {
+            stream.execution = execution;
+        }
         if let Some(parent_tool_name) = parent_tool_name {
             stream.parent_tool_name = parent_tool_name;
         }
@@ -7056,6 +7209,7 @@ async fn ensure_subagent_stream(
             raw_event_tx,
             AgentName(CLAUDE_AGENT_NAME),
         )),
+        active_response: StdMutex::new(None),
         state: Mutex::new(ClaudeState::default()),
         runtime: Mutex::new(None),
         turn_event_gate: Mutex::new(()),
@@ -7070,6 +7224,13 @@ async fn ensure_subagent_stream(
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
+    // Relay agents start active in the host registry, so mirror that state in
+    // the child emitter before any streamed output arrives. The terminal
+    // typing(false) emitted by `finalize_subagent_stream` must be observable;
+    // otherwise TurnEmitter correctly deduplicates it against its default
+    // idle state and the rendered child remains active forever.
+    sa_inner.emit_typing_status(true);
+
     let mut stream = SubAgentStream {
         summary: ClaudeStdoutSummary::default(),
         segment: SegmentState {
@@ -7077,7 +7238,6 @@ async fn ensure_subagent_stream(
             ..SegmentState::default()
         },
         message_id: sa_message_id,
-        has_explicit_task_prompt: false,
         inner: sa_inner,
         parent_tool_use_id: tool_use_id.clone(),
         // Prefer the caller-observed block name, then the emitted request
@@ -7302,7 +7462,7 @@ fn flush_workflow_snapshots(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry)
     for snapshot in entry.pending_snapshots.drain(..) {
         emitter.tool_progress(&ToolProgressData {
             tool_call_id: entry.tool_use_id.clone(),
-            tool_name: "Workflow".to_string(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::Workflow(snapshot),
         });
     }
@@ -7469,8 +7629,7 @@ struct BackgroundTaskEntry {
     state: BackgroundTaskState,
     output: Option<ClaudeRunCommandResult>,
     output_path: Option<String>,
-    terminal_progress_emitted: bool,
-    completion_emitted: bool,
+    terminal_notification_received: bool,
 }
 
 fn background_task_parent_tool_use_id(value: &Value) -> Option<&str> {
@@ -7593,17 +7752,10 @@ fn refresh_unresolved_background_tasks(
         if !was_ready
             && let (Some(owner), Some(_)) = (entry.owner.as_deref(), entry.tool_name.as_deref())
         {
-            if !entry.terminal_progress_emitted {
+            if entry.state.status == BackgroundTaskStatus::Running {
                 emit_background_task_snapshot(owner, entry);
-                if entry.state.status != BackgroundTaskStatus::Running {
-                    entry.terminal_progress_emitted = true;
-                }
-            }
-            if entry.state.status != BackgroundTaskStatus::Running && !entry.completion_emitted {
+            } else if entry.terminal_notification_received {
                 emit_background_task_completion(owner, entry);
-                entry.completion_emitted = true;
-            }
-            if entry.terminal_progress_emitted && entry.completion_emitted {
                 resolved_terminals.push(entry.state.task_id.clone());
             }
         }
@@ -7678,13 +7830,19 @@ fn capture_background_command_output(
 }
 
 fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
-    let Some(tool_name) = entry.tool_name.as_ref() else {
+    if entry.tool_name.is_none() || entry.state.status != BackgroundTaskStatus::Running {
         return;
-    };
+    }
     emitter.tool_progress(&ToolProgressData {
         tool_call_id: entry.tool_use_id.clone(),
-        tool_name: tool_name.clone(),
-        update: ToolProgressUpdate::BackgroundTask(entry.state.clone()),
+        execution_mode: ToolExecutionMode::Background,
+        update: ToolProgressUpdate::Other {
+            payload: json!({
+                "task_id": entry.state.task_id,
+                "description": entry.state.description,
+                "summary": entry.state.summary,
+            }),
+        },
     });
 }
 
@@ -7692,88 +7850,82 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
     let Some(tool_name) = entry.tool_name.as_deref() else {
         return;
     };
-    let summary = entry.state.summary.as_deref().unwrap_or_default();
-    if let Some(result) = entry.output.as_ref()
+    let outcome = if let Some(result) = entry.output.as_ref()
         && entry.state.status != BackgroundTaskStatus::Stopped
     {
-        let _ = emit_tool_completion_for_known_request(
-            emitter,
-            ToolCompletedPayload {
-                tool_call_id: &entry.tool_use_id,
-                tool_name,
-                tool_result: result.as_tool_result(),
-                success: result.exit_code == 0,
-                error: (result.exit_code != 0).then_some("Background command exited non-zero"),
+        if result.exit_code == 0 {
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::RunCommand {
+                    exit_code: result.exit_code,
+                    stdout: result.stdout.clone(),
+                    stderr: result.stderr.clone(),
+                },
+            }
+        } else {
+            ToolExecutionOutcome::Failed {
+                message: "Background command exited non-zero".to_owned(),
+                details: Some(if result.stderr.trim().is_empty() {
+                    result.stdout.clone()
+                } else {
+                    result.stderr.clone()
+                }),
+                normalization_failure: None,
+            }
+        }
+    } else {
+        match entry.state.status {
+            BackgroundTaskStatus::Completed => ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
             },
-        );
-        return;
-    }
-    let (success, tool_result, error) = match entry.state.status {
-        BackgroundTaskStatus::Completed => (
-            true,
-            json!({
-                "kind": "RunCommand",
-                "exit_code": 0,
-                "stdout": "",
-                "stderr": "",
-            }),
-            None,
-        ),
-        BackgroundTaskStatus::Stopped => (
-            false,
-            json!({
-                "kind": "Cancelled",
-                "message": entry
+            BackgroundTaskStatus::Stopped => ToolExecutionOutcome::Cancelled {
+                message: entry
                     .state
                     .output_unavailable
+                    .clone()
+                    .unwrap_or_else(|| "Background command stopped".to_owned()),
+            },
+            BackgroundTaskStatus::Failed | BackgroundTaskStatus::Unknown => {
+                let message = entry
+                    .state
+                    .summary
                     .as_deref()
-                    .unwrap_or("Background command stopped"),
-            }),
-            None,
-        ),
-        BackgroundTaskStatus::Failed | BackgroundTaskStatus::Unknown => {
-            let message = normalize_nonempty(summary)
-                .unwrap_or_else(|| "Background command failed".to_string());
-            (
-                false,
-                json!({
-                    "kind": "Error",
-                    "short_message": first_line_trimmed(&message, 140),
-                    "detailed_message": message,
-                }),
-                Some("Background command failed".to_string()),
-            )
+                    .and_then(normalize_nonempty)
+                    .unwrap_or_else(|| "Background command failed".to_owned());
+                ToolExecutionOutcome::Failed {
+                    message: first_line_trimmed(&message, 140),
+                    details: Some(message),
+                    normalization_failure: None,
+                }
+            }
+            BackgroundTaskStatus::Running => return,
         }
-        BackgroundTaskStatus::Running => return,
     };
-    let _ = emit_tool_completion_for_known_request(
-        emitter,
-        ToolCompletedPayload {
-            tool_call_id: &entry.tool_use_id,
-            tool_name,
-            tool_result,
-            success,
-            error: error.as_deref(),
-        },
-    );
+    let _ = emit_tool_completion_for_known_request(emitter, &entry.tool_use_id, tool_name, outcome);
 }
 
 fn emit_tool_completion_for_known_request(
     emitter: &TurnEmitter,
-    completed: ToolCompletedPayload<'_>,
-) -> Option<protocol::ChatMessageId> {
-    if !emitter.has_pending_tool_request(completed.tool_call_id) {
+    tool_call_id: &str,
+    tool_name: &str,
+    outcome: ToolExecutionOutcome,
+) -> bool {
+    if !emitter.has_pending_tool_request(tool_call_id) {
         tracing::error!(
-            tool_call_id = completed.tool_call_id,
-            tool_name = completed.tool_name,
+            tool_call_id,
+            tool_name,
             "Claude tool completion had no pending declared request"
         );
         emitter.backend_error(
             "Claude emitted a tool completion without a pending declared provider-response request",
         );
-        return None;
+        return false;
     }
-    emitter.tool_completed(completed)
+    emitter.tool_completed(tool_call_id, outcome);
+    true
 }
 
 fn drain_background_task_entries(background_tasks: &mut HashMap<String, BackgroundTaskEntry>) {
@@ -7784,7 +7936,7 @@ fn drain_background_task_entries(background_tasks: &mut HashMap<String, Backgrou
         if entry.tool_name.is_none() {
             continue;
         }
-        if !entry.terminal_progress_emitted {
+        if !entry.terminal_notification_received {
             entry.state.status = BackgroundTaskStatus::Stopped;
             entry.state.summary = Some(
                 "Claude process exited before the background command reported final output"
@@ -7792,13 +7944,8 @@ fn drain_background_task_entries(background_tasks: &mut HashMap<String, Backgrou
             );
             entry.state.output_unavailable =
                 Some("Background command output unavailable after Claude process exit".to_string());
-            entry.terminal_progress_emitted = true;
-            emit_background_task_snapshot(owner, &entry);
         }
-        if !entry.completion_emitted {
-            entry.completion_emitted = true;
-            emit_background_task_completion(owner, &entry);
-        }
+        emit_background_task_completion(owner, &entry);
     }
 }
 
@@ -7885,8 +8032,7 @@ fn handle_background_bash_task_frame_with_owners(
                 },
                 output: None,
                 output_path: None,
-                terminal_progress_emitted: false,
-                completion_emitted: false,
+                terminal_notification_received: false,
             };
             tracing::debug!(
                 task_id,
@@ -7934,11 +8080,10 @@ fn handle_background_bash_task_frame_with_owners(
                 return true;
             }
             entry.state.status = next_status;
-            if let Some(owner) = entry.owner.as_ref().map(Arc::clone) {
+            if entry.state.status == BackgroundTaskStatus::Running
+                && let Some(owner) = entry.owner.as_ref().map(Arc::clone)
+            {
                 emit_background_task_snapshot(&owner, entry);
-                if entry.state.status != BackgroundTaskStatus::Running {
-                    entry.terminal_progress_emitted = true;
-                }
             }
             true
         }
@@ -7966,17 +8111,13 @@ fn handle_background_bash_task_frame_with_owners(
                 Ok(output) => entry.output = Some(output),
                 Err(reason) => entry.state.output_unavailable = Some(reason.to_owned()),
             }
+            entry.terminal_notification_received = true;
+            let mut completion_emitted = false;
             if let Some(owner) = entry.owner.as_deref()
                 && entry.tool_name.is_some()
             {
-                if !entry.terminal_progress_emitted {
-                    entry.terminal_progress_emitted = true;
-                    emit_background_task_snapshot(owner, entry);
-                }
-                if !entry.completion_emitted {
-                    entry.completion_emitted = true;
-                    emit_background_task_completion(owner, entry);
-                }
+                emit_background_task_completion(owner, entry);
+                completion_emitted = true;
             } else {
                 tracing::error!(
                     task_id,
@@ -7985,7 +8126,7 @@ fn handle_background_bash_task_frame_with_owners(
                     "retaining terminal background task frame until ownership resolves"
                 );
             }
-            if entry.terminal_progress_emitted && entry.completion_emitted {
+            if completion_emitted {
                 background_tasks.remove(&task_id);
             }
             true
@@ -8052,12 +8193,6 @@ async fn detect_subagent_task_system_spawns(
         },
     )
     .await;
-
-    if let Some(stream) = streams.get_mut(&tool_use_id)
-        && let Some(initial_prompt) = prompt.as_deref().or(task_name.as_deref())
-    {
-        emit_subagent_task_prompt_if_needed(stream, initial_prompt);
-    }
 }
 
 /// Captured Claude Code local-agent lifecycle:
@@ -8155,21 +8290,20 @@ fn normalize_stream_event_for_spawn(value: &Value) -> Option<Value> {
 
 fn track_pending_subagent_prompt_event(
     value: &Value,
-    streams: &mut HashMap<String, SubAgentStream>,
     pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
+    pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
 ) {
-    fn maybe_emit_prompt_from_pending(
+    fn maybe_update_prompt_from_pending(
         pending: &PendingSubAgentPrompt,
-        streams: &mut HashMap<String, SubAgentStream>,
+        pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
     ) {
         let Ok(parsed) = serde_json::from_str::<Value>(&pending.partial_json) else {
             return;
         };
         let description = extract_spawn_description(Some(&parsed));
-        let Some(stream) = streams.get_mut(&pending.tool_use_id) else {
-            return;
-        };
-        emit_subagent_task_prompt_if_needed(stream, &description);
+        if let Some(spawn) = pending_spawns.get_mut(&pending.tool_use_id) {
+            spawn.description = description;
+        }
     }
 
     let Some(event) = normalize_stream_event_for_spawn(value) else {
@@ -8187,7 +8321,7 @@ fn track_pending_subagent_prompt_event(
             let Some(block) = event.get("content_block") else {
                 return;
             };
-            let Some((tool_use_id, _name, description, _agent_type)) = extract_spawn_info(block)
+            let Some((tool_use_id, _name, _description, _agent_type)) = extract_spawn_info(block)
             else {
                 return;
             };
@@ -8198,9 +8332,6 @@ fn track_pending_subagent_prompt_event(
                     partial_json: String::new(),
                 },
             );
-            if let Some(stream) = streams.get_mut(&tool_use_id) {
-                emit_subagent_task_prompt_if_needed(stream, &description);
-            }
         }
         "content_block_delta" => {
             let Some(index) = content_block_index(&event) else {
@@ -8219,19 +8350,19 @@ fn track_pending_subagent_prompt_event(
                 return;
             };
             pending.partial_json.push_str(partial);
-            maybe_emit_prompt_from_pending(pending, streams);
+            maybe_update_prompt_from_pending(pending, pending_spawns);
         }
         "content_block_stop" => {
             let Some(index) = content_block_index(&event) else {
                 return;
             };
             if let Some(pending) = pending_prompts.remove(&index) {
-                maybe_emit_prompt_from_pending(&pending, streams);
+                maybe_update_prompt_from_pending(&pending, pending_spawns);
             }
         }
         "message_stop" => {
             for pending in pending_prompts.values() {
-                maybe_emit_prompt_from_pending(pending, streams);
+                maybe_update_prompt_from_pending(pending, pending_spawns);
             }
             pending_prompts.clear();
         }
@@ -8246,8 +8377,9 @@ async fn detect_subagent_spawns(
     parent_emitter: &Arc<TurnEmitter>,
     streams: &mut HashMap<String, SubAgentStream>,
     pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
+    pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
 ) {
-    track_pending_subagent_prompt_event(value, streams, pending_prompts);
+    track_pending_subagent_prompt_event(value, pending_prompts, pending_spawns);
 
     // Sub-agent spawns appear as tool_use content blocks in assistant messages
     // or as content_block_start events in the stream.
@@ -8272,28 +8404,46 @@ async fn detect_subagent_spawns(
                     SubAgentExecution::Foreground
                 }
             });
-            ensure_subagent_stream(
-                emitter,
-                parent_emitter,
-                streams,
-                SubAgentSpawnSpec {
-                    tool_use_id: tool_use_id.clone(),
-                    parent_tool_name: Some(block_name.to_owned()),
-                    name,
-                    description: description.clone(),
-                    agent_type,
-                    session_id_hint: None,
-                    execution: requested_execution.unwrap_or_default(),
-                },
-            )
-            .await;
-            if let Some(stream) = streams.get_mut(&tool_use_id) {
-                if let Some(execution) = requested_execution {
-                    stream.execution = execution;
-                }
-                emit_subagent_task_prompt_if_needed(stream, &description);
+            let spec = SubAgentSpawnSpec {
+                tool_use_id: tool_use_id.clone(),
+                parent_tool_name: Some(block_name.to_owned()),
+                name,
+                description: description.clone(),
+                agent_type,
+                session_id_hint: None,
+                execution: requested_execution.unwrap_or_default(),
+            };
+            if parent_emitter.has_known_tool_request(&tool_use_id) {
+                ensure_subagent_stream(emitter, parent_emitter, streams, spec).await;
+            } else {
+                pending_spawns.insert(tool_use_id.clone(), spec);
+                continue;
+            }
+            if let Some(stream) = streams.get_mut(&tool_use_id)
+                && let Some(execution) = requested_execution
+            {
+                stream.execution = execution;
             }
         }
+    }
+}
+
+async fn flush_pending_subagent_spawns(
+    emitter: &dyn SubAgentEmitter,
+    parent_emitter: &Arc<TurnEmitter>,
+    streams: &mut HashMap<String, SubAgentStream>,
+    pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
+) {
+    let ready = pending_spawns
+        .keys()
+        .filter(|tool_use_id| parent_emitter.has_known_tool_request(tool_use_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for tool_use_id in ready {
+        let Some(spec) = pending_spawns.remove(&tool_use_id) else {
+            continue;
+        };
+        ensure_subagent_stream(emitter, parent_emitter, streams, spec).await;
     }
 }
 
@@ -8507,7 +8657,10 @@ fn finalize_background_subagent_completion(
     else {
         return;
     };
-    if let Some(stream) = streams.get_mut(tool_use_id) {
+    if let Some(stream) = streams
+        .get_mut(tool_use_id)
+        .filter(|stream| stream.execution != SubAgentExecution::Foreground)
+    {
         let status = value
             .get("status")
             .and_then(Value::as_str)
@@ -8530,7 +8683,9 @@ fn finalize_ready_background_subagents(streams: &mut HashMap<String, SubAgentStr
     let ready = streams
         .iter()
         .filter(|(_, stream)| {
-            stream.pending_terminal.is_some() && !stream.inner.emitter.has_pending_detached_tools()
+            stream.execution == SubAgentExecution::Background
+                && stream.pending_terminal.is_some()
+                && !stream.inner.emitter.has_pending_background_tools()
         })
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
@@ -8548,15 +8703,12 @@ fn finalize_ready_background_subagents(streams: &mut HashMap<String, SubAgentStr
         if succeeded {
             let _ = emit_tool_completion_for_known_request(
                 &parent_emitter,
-                ToolCompletedPayload {
-                    tool_call_id: &parent_tool_use_id,
-                    tool_name: &parent_tool_name,
-                    tool_result: json!({
-                        "kind": "Other",
-                        "result": { "status": status },
-                    }),
-                    success: true,
-                    error: None,
+                &parent_tool_use_id,
+                &parent_tool_name,
+                ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::Other {
+                        result: json!({ "status": status }),
+                    },
                 },
             );
         } else if !parent_emitter.fail_pending_tool(
@@ -8771,8 +8923,10 @@ fn consume_claude_stream_value_with_interrupt(
                 summary.result_text = Some(text.to_string());
             }
             if let Some(reasoning) = extract_reasoning_from_result(value) {
-                summary.result_reasoning = Some(reasoning.clone());
-                append_reasoning_text(summary, &reasoning, true);
+                summary.reasoning_bytes = summary
+                    .reasoning_bytes
+                    .max(u64::try_from(reasoning.len()).unwrap_or(u64::MAX));
+                summary.result_reasoning = Some(reasoning);
             }
             // result.usage aggregates the API calls made by this CLI invocation.
             // Store it separately from the latest per-call assistant usage.
@@ -8986,7 +9140,10 @@ fn consume_assistant_message(
     }
 
     if let Some(reasoning) = next_reasoning {
-        append_reasoning_text(summary, &reasoning, true);
+        summary.reasoning_bytes = summary
+            .reasoning_bytes
+            .max(u64::try_from(reasoning.len()).unwrap_or(u64::MAX));
+        summary.result_reasoning = Some(reasoning);
         segment.has_content = true;
     }
 
@@ -9087,12 +9244,6 @@ fn consume_user_tool_result(
                         .unwrap_or(false)
             });
         if background_launch {
-            if !inner.emitter.detach_tool(&completion.tool_call_id) {
-                tracing::warn!(
-                    tool_call_id = completion.tool_call_id,
-                    "background Bash launch could not detach its emitted tool request"
-                );
-            }
             continue;
         }
         inner.emit_tool_execution_completed(
@@ -9304,6 +9455,7 @@ fn auto_close_unresolved_tool_requests(
 ) {
     let unresolved = std::mem::take(&mut summary.unresolved_tool_requests);
     for (tool_call_id, tool_name) in unresolved {
+        eprintln!("TYDE CLAUDE AUTO CLOSE id={tool_call_id} name={tool_name} reason={message:?}");
         summary
             .auto_closed_tool_requests
             .insert(tool_call_id.clone());
@@ -11089,6 +11241,48 @@ fn claude_public_tool_result(tool_name: &str, success: bool, tool_result: Value)
     .expect("serialize Claude agent result")
 }
 
+fn claude_tool_execution_outcome(
+    success: bool,
+    tool_result: Value,
+    error: Option<String>,
+) -> ToolExecutionOutcome {
+    if success {
+        let result = serde_json::from_value::<ToolExecutionResult>(tool_result.clone()).unwrap_or(
+            ToolExecutionResult::Other {
+                result: tool_result,
+            },
+        );
+        return ToolExecutionOutcome::Succeeded { result };
+    }
+    if tool_result.get("kind").and_then(Value::as_str) == Some("Cancelled") {
+        return ToolExecutionOutcome::Cancelled {
+            message: tool_result
+                .get("message")
+                .and_then(Value::as_str)
+                .and_then(normalize_nonempty)
+                .unwrap_or_else(|| "Tool execution was cancelled".to_owned()),
+        };
+    }
+    let details = tool_result
+        .get("detailed_message")
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)
+        .or_else(|| (!tool_result.is_null()).then(|| tool_result.to_string()));
+    ToolExecutionOutcome::Failed {
+        message: error
+            .and_then(|message| normalize_nonempty(&message))
+            .or_else(|| {
+                tool_result
+                    .get("short_message")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_nonempty)
+            })
+            .unwrap_or_else(|| "Tool execution failed".to_owned()),
+        details,
+        normalization_failure: None,
+    }
+}
+
 fn claude_home_dir() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("CLAUDE_CONFIG_DIR") {
         let trimmed = explicit.trim();
@@ -11634,6 +11828,29 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             } else {
                 last_emitted_assistant_message_id = None;
             }
+        } else if is_tool_only_assistant_continuation {
+            let Some(previous) = restored.iter_mut().rev().find_map(|item| match item {
+                ClaudeHistoryReplayItem::Message(message) => Some(message),
+                _ => None,
+            }) else {
+                tracing::error!("Claude replay tool continuation had no owning assistant message");
+                debug_assert!(
+                    false,
+                    "Claude replay tool continuation had no owning assistant message"
+                );
+                continue;
+            };
+            let Some(previous_tool_calls) =
+                previous.get_mut("tool_calls").and_then(Value::as_array_mut)
+            else {
+                tracing::error!("Claude replay assistant message had no tool_calls array");
+                debug_assert!(
+                    false,
+                    "Claude replay assistant message had no tool_calls array"
+                );
+                continue;
+            };
+            previous_tool_calls.extend(message_tool_calls.clone());
         }
 
         if role == "assistant" {
@@ -12581,6 +12798,7 @@ fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'s
 pub struct ClaudeBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<ClaudeInterrupt>,
+    startup_cancel_tx: Option<oneshot::Sender<()>>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     /// Direct handle to the live session, populated once the spawn task has
@@ -12894,12 +13112,13 @@ impl ClaudeBackend {
             Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
             Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
         }
-        startup_cancel_guard.disarm();
+        let startup_cancel_tx = startup_cancel_guard.disarm();
 
         Ok((
             Self {
                 input_tx,
                 interrupt_tx,
+                startup_cancel_tx: Some(startup_cancel_tx),
                 session_id,
                 subagent_emitter_tx,
                 command_handle,
@@ -13773,6 +13992,7 @@ impl Backend for ClaudeBackend {
             Self {
                 input_tx,
                 interrupt_tx,
+                startup_cancel_tx: None,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
                 command_handle: Arc::new(StdMutex::new(Some(backend_command_handle))),
@@ -13917,8 +14137,10 @@ impl Backend for ClaudeBackend {
         done.await.unwrap_or(false)
     }
 
-    async fn shutdown(self) {
-        drop(self);
+    async fn shutdown(mut self) {
+        if let Some(cancel) = self.startup_cancel_tx.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 

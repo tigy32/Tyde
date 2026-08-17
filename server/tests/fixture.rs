@@ -8,7 +8,8 @@ use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentStartPayload, BackendKind, ChatEvent,
     CustomAgentNotifyPayload, Envelope, ExitPlanModeDecision, FrameKind, NewAgentPayload,
     QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SettingsWriteId,
-    SettingsWriteResultPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, ToolRequest,
+    SettingsWriteResultPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    ToolExecutionCompletedData, ToolRequest,
 };
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
@@ -435,15 +436,17 @@ impl Turn {
     }
 
     #[allow(dead_code)]
-    pub fn assert_tool_completed(&self, tool_name: &str) {
+    pub fn assert_tool_completed(&self, tool_call_id: &str) {
+        let events = self.chat_events();
         assert!(
-            self.chat_events().iter().any(|event| matches!(
+            events.iter().any(|event| matches!(
                 event,
                 ChatEvent::ToolExecutionCompleted(completion)
-                    if completion.tool_name == tool_name && completion.success
+                    if completion.tool_call_id == tool_call_id
+                        && tool_completion_succeeded(completion)
             )),
-            "no successful ToolExecutionCompleted for {tool_name:?} in turn; events: {:?}",
-            self.chat_events()
+            "no successful ToolExecutionCompleted for {tool_call_id:?} in turn; events: {:?}",
+            events
         );
     }
 }
@@ -830,7 +833,8 @@ pub async fn expect_paused_tool_request_on(
         match event {
             ChatEvent::ToolRequest(r) => {
                 assert_eq!(
-                    r.tool_name, tool_name,
+                    tool_request_name(&r),
+                    tool_name,
                     "unexpected tool request while waiting for {tool_name}"
                 );
                 request = Some(r);
@@ -840,6 +844,49 @@ pub async fn expect_paused_tool_request_on(
         }
     }
     request.expect("tool request present when loop exits")
+}
+
+#[allow(dead_code)]
+pub fn tool_request_name(request: &ToolRequest) -> &str {
+    match &request.tool_type {
+        protocol::ToolRequestType::ModifyFile { .. } => "modify_file",
+        protocol::ToolRequestType::RunCommand { .. } => "Bash",
+        protocol::ToolRequestType::ReadFiles { .. } => "read_files",
+        protocol::ToolRequestType::SearchTypes { .. } => "search_types",
+        protocol::ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
+        protocol::ToolRequestType::AskUserQuestion { .. } => "AskUserQuestion",
+        protocol::ToolRequestType::ExitPlanMode { .. } => "ExitPlanMode",
+        protocol::ToolRequestType::AgentSpawn { .. } => "Task",
+        protocol::ToolRequestType::GenerateImage { .. } => "generate_image",
+        protocol::ToolRequestType::WebSearch { .. } => "web_search",
+        protocol::ToolRequestType::ViewImage { .. } => "view_image",
+        protocol::ToolRequestType::Sleep { .. } => "sleep",
+        protocol::ToolRequestType::TydeSendAgentMessage { .. } => "tyde_send_agent_message",
+        protocol::ToolRequestType::TydeAwaitAgents { .. } => "tyde_await_agents",
+        protocol::ToolRequestType::Other { args } => args
+            .get("name")
+            .or_else(|| args.get("tool_name"))
+            .or_else(|| args.get("tool"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("other"),
+    }
+}
+
+#[allow(dead_code)]
+pub fn tool_completion_succeeded(completion: &ToolExecutionCompletedData) -> bool {
+    matches!(
+        completion.outcome,
+        protocol::ToolExecutionOutcome::Succeeded { .. }
+    )
+}
+
+#[allow(dead_code)]
+pub fn tool_completion_failed(completion: &ToolExecutionCompletedData) -> bool {
+    matches!(
+        completion.outcome,
+        protocol::ToolExecutionOutcome::Failed { .. }
+            | protocol::ToolExecutionOutcome::Cancelled { .. }
+    )
 }
 
 /// Wait for a `QueuedMessages` snapshot with exactly `count` entries on

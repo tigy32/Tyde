@@ -252,11 +252,7 @@ impl MockTurn {
         let message_id = Some(Uuid::new_v4().to_string());
         let steps = vec![
             MockStep::emit(emit::typing(true)),
-            MockStep::emit(emit::stream_start(
-                message_id.clone(),
-                "mock",
-                Some(MOCK_MODEL.to_owned()),
-            )),
+            MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
             MockStep::AgentControlAwait(MockAgentControlAwait {
                 message_id,
                 agent_ids: agent_ids.into_iter().map(|id| id.0).collect(),
@@ -452,12 +448,8 @@ fn text_steps(text: String, shape: TextShape) -> Vec<MockStep> {
     let message_id = Some(Uuid::new_v4().to_string());
     let mut steps = vec![
         MockStep::emit(emit::typing(true)),
-        MockStep::emit(emit::stream_start(
-            message_id.clone(),
-            "mock",
-            Some(MOCK_MODEL.to_owned()),
-        )),
-        MockStep::emit(emit::stream_delta(message_id.clone(), text.clone())),
+        MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
+        MockStep::emit(emit::stream_delta(text.clone())),
     ];
     if let Some(diagnostic) = &shape.mid_turn_error {
         steps.push(MockStep::emit(emit::error_card(diagnostic)));
@@ -509,12 +501,8 @@ fn held_steps(text: String) -> Vec<MockStep> {
     let message_id = Some(Uuid::new_v4().to_string());
     vec![
         MockStep::emit(emit::typing(true)),
-        MockStep::emit(emit::stream_start(
-            message_id.clone(),
-            "mock",
-            Some(MOCK_MODEL.to_owned()),
-        )),
-        MockStep::emit(emit::stream_delta(message_id.clone(), text.clone())),
+        MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
+        MockStep::emit(emit::stream_delta(text.clone())),
         MockStep::emit(emit::stream_end(emit::mock_assistant_message(
             message_id.map(ChatMessageId),
             text,

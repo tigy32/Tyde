@@ -8,18 +8,16 @@
 //! variant (usually empty), what `Compact` shows under per-tool caps, and what
 //! `Full` lays out without truncation.
 //!
-//! Errors are special-cased in the shell: any completed tool whose result is
-//! `ToolExecutionResult::Error` routes through `error_result::render`, no
-//! matter the request kind.
+//! Failures are special-cased in the shell and route through
+//! `error_result::render`, no matter the request kind.
 
 use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
-    AgentControlProgress, AgentControlProgressKind, BackgroundTaskState, BackgroundTaskStatus,
-    SubAgentProgress, ToolExecutionCompletedData, ToolExecutionNormalizationFailure,
-    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
-    WorkflowRunStatus,
+    AgentControlProgress, AgentControlProgressKind, SubAgentProgress, ToolExecutionCompletedData,
+    ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolProgressData,
+    ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -69,10 +67,27 @@ fn malformed_request_payload<'a>(
 
 fn request_normalization_failed(completion: &ToolExecutionCompletedData) -> bool {
     matches!(
-        completion.normalization_failure,
-        Some(ToolExecutionNormalizationFailure::CanonicalRequest)
-            | Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult)
+        &completion.outcome,
+        ToolExecutionOutcome::Failed {
+            normalization_failure: Some(
+                ToolExecutionNormalizationFailure::CanonicalRequest
+                    | ToolExecutionNormalizationFailure::CanonicalRequestAndResult
+            ),
+            ..
+        }
     )
+}
+
+fn normalization_failure(
+    completion: &ToolExecutionCompletedData,
+) -> Option<ToolExecutionNormalizationFailure> {
+    match &completion.outcome {
+        ToolExecutionOutcome::Failed {
+            normalization_failure,
+            ..
+        } => *normalization_failure,
+        ToolExecutionOutcome::Succeeded { .. } | ToolExecutionOutcome::Cancelled { .. } => None,
+    }
 }
 
 fn sanitized_request_payload_json(value: &serde_json::Value) -> String {
@@ -332,11 +347,14 @@ fn is_important_tool(entry: &ToolRequestEntry) -> bool {
     matches!(
         &entry.request.tool_type,
         ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
-    ) || entry.result.as_ref().is_none_or(|result| !result.success)
+    ) || entry
+        .result
+        .as_ref()
+        .is_none_or(|result| !matches!(&result.outcome, ToolExecutionOutcome::Succeeded { .. }))
         || entry
             .result
             .as_ref()
-            .is_some_and(|result| result.normalization_failure.is_some())
+            .is_some_and(|result| normalization_failure(result).is_some())
 }
 
 #[component]
@@ -350,14 +368,12 @@ pub fn ToolCardView(
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
 
-    let tool_name = entry.request.tool_name.clone();
+    let tool_name = entry.tool_name;
     let tool_call_id = entry.request.tool_call_id.clone();
     let tool_type = entry.request.tool_type;
     let result = entry.result;
     let malformed_payload = malformed_request_payload(&tool_type, result.as_ref()).cloned();
-    let normalization_failure = result
-        .as_ref()
-        .and_then(|result| result.normalization_failure);
+    let normalization_failure = result.as_ref().and_then(normalization_failure);
     let normalization_failed = normalization_failure.is_some();
 
     // Live progress is read reactively from the central store — never
@@ -391,15 +407,8 @@ pub fn ToolCardView(
             Some(ToolProgressUpdate::AgentControl(progress)) => Some(progress),
             _ => None,
         });
-    let background_task: Signal<Option<BackgroundTaskState>> =
-        Signal::derive(move || match progress.get().map(|data| data.update) {
-            Some(ToolProgressUpdate::BackgroundTask(task)) => Some(task),
-            _ => None,
-        });
-    // A background task can outlive its tool call: the Workflow tool
-    // result is just the run id, the real work keeps going. Agent-control
-    // cards deliberately don't contribute — child-agent liveness renders in
-    // the In-flight tray, and a spawn receipt is Done once its result lands.
+    // Background execution is a scheduling mode of the same tool call. The
+    // call stays running until its one terminal completion arrives.
     let background_running = Signal::derive(move || {
         workflow_run
             .get()
@@ -407,9 +416,6 @@ pub fn ToolCardView(
             || subagent_progress
                 .get()
                 .is_some_and(|progress| !progress.completed)
-            || background_task
-                .get()
-                .is_some_and(|task| task.status == BackgroundTaskStatus::Running)
     });
     // The body shape (workflow panel vs regular renderer) flips at most
     // once, when the first snapshot arrives — memoized so per-snapshot
@@ -417,11 +423,12 @@ pub fn ToolCardView(
     let is_workflow = Memo::new(move |_| workflow_run.with(|run| run.is_some()));
 
     let has_result = result.is_some();
-    let result_success =
-        result.as_ref().map(|r| r.success).unwrap_or(false) && !normalization_failed;
+    let result_success = result.as_ref().is_some_and(|completion| {
+        matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { .. })
+    }) && !normalization_failed;
     let result_cancelled = result
         .as_ref()
-        .is_some_and(|result| matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. }));
+        .is_some_and(|result| matches!(&result.outcome, ToolExecutionOutcome::Cancelled { .. }));
     let result_failed = has_result && !result_success;
 
     let status_class = move || {
@@ -472,7 +479,6 @@ pub fn ToolCardView(
                     .get()
                     .map(|progress| agent_control_header_detail(&progress))
             })
-            .or_else(|| background_task.get().and_then(|task| task.description))
             .or_else(|| recipient_detail.get())
             .or_else(|| header_detail.clone())
     };
@@ -492,14 +498,14 @@ pub fn ToolCardView(
     } else {
         result
             .as_ref()
-            .map(|r| completion_header_summary(&tool_type, &r.tool_result))
+            .map(|completion| completion_outcome_summary(&tool_type, &completion.outcome))
     };
 
     let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
     let body_tool_type = tool_type.clone();
-    let body_result = result.as_ref().map(|r| r.tool_result.clone());
+    let body_outcome = result.as_ref().map(|r| r.outcome.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
-    let body_result_slot = StoredValue::new_local(body_result);
+    let body_outcome_slot = StoredValue::new_local(body_outcome);
     let malformed_payload_slot = StoredValue::new_local(malformed_payload);
     let tool_call_id_slot = StoredValue::new_local(tool_call_id);
     let details_open = RwSignal::new(
@@ -592,13 +598,13 @@ pub fn ToolCardView(
                                     let mode = tool_output_mode.get();
                                     tool_call_id_slot.with_value(|tool_call_id| {
                                         body_tool_type_slot.with_value(|body_tool_type| {
-                                            body_result_slot.with_value(|body_result| {
+                                            body_outcome_slot.with_value(|body_outcome| {
                                                 malformed_payload_slot.with_value(|malformed_payload| {
                                                     render_body(
                                                         agent_ref,
                                                         tool_call_id,
                                                         body_tool_type,
-                                                        body_result.as_ref(),
+                                                        body_outcome.as_ref(),
                                                         malformed_payload.as_ref(),
                                                         mode,
                                                         result_failed,
@@ -622,27 +628,37 @@ pub fn ToolCardView(
 /// exhaustiveness here: adding a new `ToolRequestType` variant fails the build
 /// until a renderer is wired in.
 ///
-/// Errors short-circuit the dispatch — any completed tool whose result is
-/// `Error` renders via `error_result`, regardless of which request kind issued
-/// it. Cancellation is likewise terminal, but is not presented as a failure.
+/// Failures short-circuit the dispatch regardless of which request kind issued
+/// them. Cancellation is likewise terminal, but is not presented as a failure.
 fn render_body(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: &str,
     req: &ToolRequestType,
-    result: Option<&ToolExecutionResult>,
+    outcome: Option<&ToolExecutionOutcome>,
     malformed_payload: Option<&serde_json::Value>,
     mode: ToolOutputMode,
     result_failed: bool,
 ) -> AnyView {
-    if let Some(ToolExecutionResult::Cancelled { message }) = result {
+    if let Some(ToolExecutionOutcome::Cancelled { message }) = outcome {
         return view! {
             <div class="tool-cancelled" role="status">{message.clone()}</div>
         }
         .into_any();
     }
-    if let Some(ToolExecutionResult::Error { .. }) = result {
-        return error_result::render(result.unwrap(), malformed_payload, mode).into_any();
+    if let Some(ToolExecutionOutcome::Failed {
+        message, details, ..
+    }) = outcome
+    {
+        return error_result::render(message, details.as_deref(), malformed_payload, mode)
+            .into_any();
     }
+    let result = match outcome {
+        Some(ToolExecutionOutcome::Succeeded { result }) => Some(result),
+        None => None,
+        Some(ToolExecutionOutcome::Failed { .. } | ToolExecutionOutcome::Cancelled { .. }) => {
+            unreachable!("terminal outcomes returned before typed result dispatch")
+        }
+    };
 
     match req {
         ToolRequestType::ModifyFile { .. } => modify_file::render(req, result, mode).into_any(),
@@ -663,9 +679,8 @@ fn render_body(
         }
         // A failed completion for a question is no longer answerable: render the
         // raw result instead of the interactive card, mirroring the mobile tool
-        // card. The realistic failure carries `ToolExecutionResult::Error`, which
-        // the shell short-circuits above; this arm covers a non-`Error` result
-        // that still reports `success=false`.
+        // card. Failed outcomes short-circuit above; this arm only covers a
+        // typed result that the caller has independently classified as failed.
         ToolRequestType::AskUserQuestion { .. } if result_failed => {
             failed_result_body(result).into_any()
         }
@@ -1134,12 +1149,26 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
 /// Short header line attached next to the status — legacy parity with
 /// `completionHeaderDetail` in tools.ts. Renderer modules don't use this; the
 /// shell does.
+fn completion_outcome_summary(req: &ToolRequestType, outcome: &ToolExecutionOutcome) -> String {
+    match outcome {
+        ToolExecutionOutcome::Succeeded { result } => completion_header_summary(req, result),
+        ToolExecutionOutcome::Cancelled { .. } => "cancelled".to_owned(),
+        ToolExecutionOutcome::Failed { message, .. } => {
+            let trimmed = message.replace('\n', " ");
+            if trimmed.len() > 90 {
+                format!("error \u{b7} {}\u{2026}", &trimmed[..87])
+            } else {
+                format!("error \u{b7} {trimmed}")
+            }
+        }
+    }
+}
+
 pub(crate) fn completion_header_summary(
     req: &ToolRequestType,
     result: &ToolExecutionResult,
 ) -> String {
     match result {
-        ToolExecutionResult::Cancelled { .. } => "cancelled".to_owned(),
         ToolExecutionResult::ModifyFile {
             lines_added,
             lines_removed,
@@ -1189,14 +1218,6 @@ pub(crate) fn completion_header_summary(
                 "no documentation".to_owned()
             } else {
                 format!("documentation \u{b7} {lines}L")
-            }
-        }
-        ToolExecutionResult::Error { short_message, .. } => {
-            let trimmed = short_message.replace('\n', " ");
-            if trimmed.len() > 90 {
-                format!("error \u{b7} {}\u{2026}", &trimmed[..87])
-            } else {
-                format!("error \u{b7} {trimmed}")
             }
         }
         // The send tool's result is a bare ack, so the header carries the whole
@@ -1282,9 +1303,8 @@ mod live_card_wasm_tests {
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
         AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
-        BackgroundTaskState, BackgroundTaskStatus, FileInfo, ProjectId, StreamPath, TeamMemberId,
-        ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
-        WorkflowAgentStatus,
+        FileInfo, ProjectId, StreamPath, TeamMemberId, ToolExecutionCompletedData,
+        ToolExecutionMode, ToolProgressData, ToolRequest, WorkflowAgentState, WorkflowAgentStatus,
     };
     use serde_json::json;
     use wasm_bindgen_test::*;
@@ -1332,21 +1352,17 @@ mod live_card_wasm_tests {
 
     fn completed_other_request(tool_call_id: &str, tool_name: &str) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: tool_name.to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
-                tool_name: tool_name.to_owned(),
                 tool_type: ToolRequestType::Other { args: json!({}) },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: tool_call_id.to_owned(),
-                tool_name: tool_name.to_owned(),
-                tool_result: ToolExecutionResult::Other {
+            result: Some(succeeded_completion(
+                tool_call_id,
+                ToolExecutionResult::Other {
                     result: json!({"runId": "wf_123"}),
                 },
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            )),
         }
     }
 
@@ -1356,21 +1372,14 @@ mod live_card_wasm_tests {
         tool_result: ToolExecutionResult,
     ) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "Read".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
-                tool_name: "Read".to_owned(),
                 tool_type: ToolRequestType::ReadFiles {
                     file_paths: file_paths.into_iter().map(str::to_owned).collect(),
                 },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: tool_call_id.to_owned(),
-                tool_name: "Read".to_owned(),
-                tool_result,
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            result: Some(succeeded_completion(tool_call_id, tool_result)),
         }
     }
 
@@ -1522,9 +1531,9 @@ mod live_card_wasm_tests {
     async fn background_command_header_uses_actual_command_not_summary() {
         let tool_call_id = "tool-background";
         let entry = ToolRequestEntry {
+            tool_name: "Bash".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
-                tool_name: "Bash".to_owned(),
                 tool_type: ToolRequestType::RunCommand {
                     command: "sleep 60".to_owned(),
                     working_directory: "/tmp".to_owned(),
@@ -1534,14 +1543,13 @@ mod live_card_wasm_tests {
         };
         let progress = ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
-            tool_name: "Bash".to_owned(),
-            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                task_id: "task-background".to_owned(),
-                description: Some("sleep 60".to_owned()),
-                status: BackgroundTaskStatus::Completed,
-                summary: Some("Slept for 60 seconds in background".to_owned()),
-                output_unavailable: None,
-            }),
+            execution_mode: ToolExecutionMode::Background,
+            update: ToolProgressUpdate::Other {
+                payload: json!({
+                    "task_id": "task-background",
+                    "description": "sleep 60",
+                }),
+            },
         };
 
         let (container, _state) = mount_card(entry, Some(progress));
@@ -1559,7 +1567,7 @@ mod live_card_wasm_tests {
     fn workflow_progress(status: WorkflowRunStatus) -> ToolProgressData {
         ToolProgressData {
             tool_call_id: "toolu_wf".to_owned(),
-            tool_name: "Workflow".to_owned(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::Workflow(workflow_state(status)),
         }
     }
@@ -1567,7 +1575,7 @@ mod live_card_wasm_tests {
     fn subagent_progress_data(tool_calls: u64, completed: bool) -> ToolProgressData {
         ToolProgressData {
             tool_call_id: "toolu_task".to_owned(),
-            tool_name: "Task".to_owned(),
+            execution_mode: ToolExecutionMode::Background,
             update: ToolProgressUpdate::SubAgent(SubAgentProgress {
                 agent_id: AgentId("agent-sub".to_owned()),
                 agent_name: "Explore".to_owned(),
@@ -1586,11 +1594,7 @@ mod live_card_wasm_tests {
     fn agent_control_progress_data(progress_kind: AgentControlProgressKind) -> ToolProgressData {
         ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
-            tool_name: match progress_kind {
-                AgentControlProgressKind::Spawn => "tyde_spawn_agent",
-                AgentControlProgressKind::Await => "tyde_await_agents",
-            }
-            .to_owned(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind,
                 agents: vec![AgentControlAgentRef {
@@ -1968,7 +1972,7 @@ mod live_card_wasm_tests {
         let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
         let progress = ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
-            tool_name: "tyde_await_agents".to_owned(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents: vec![
@@ -1981,7 +1985,7 @@ mod live_card_wasm_tests {
                         name: Some("Claude design".to_owned()),
                     },
                 ],
-                status: protocol::AgentControlProgressStatus::Completed,
+                status: protocol::AgentControlProgressStatus::Running,
             }),
         };
         let (container, _state) = mount_card(entry, Some(progress));
@@ -2015,14 +2019,14 @@ mod live_card_wasm_tests {
         let entry = completed_other_request("native-wait", "wait");
         let progress = ToolProgressData {
             tool_call_id: "native-wait".to_owned(),
-            tool_name: "wait".to_owned(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents: vec![AgentControlAgentRef {
                     agent_id: AgentId("native-child".to_owned()),
                     name: Some("/root/sleeper".to_owned()),
                 }],
-                status: protocol::AgentControlProgressStatus::Completed,
+                status: protocol::AgentControlProgressStatus::Running,
             }),
         };
         let (container, state) = mount_card(entry, Some(progress));
@@ -2294,54 +2298,42 @@ mod live_card_wasm_tests {
     // shell: the agent-control card rendered and then *fell through* to the
     // generic body.
 
-    fn typed_send_entry(
-        message: &str,
-        result: Option<ToolExecutionResult>,
-        success: bool,
-    ) -> ToolRequestEntry {
+    fn typed_send_entry(message: &str, outcome: Option<ToolExecutionOutcome>) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send".to_owned(),
-                tool_name: "tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: message.to_owned(),
                 },
             },
-            result: result.map(|tool_result| ToolExecutionCompletedData {
+            result: outcome.map(|outcome| ToolExecutionCompletedData {
                 tool_call_id: "toolu_send".to_owned(),
-                tool_name: "tyde_send_agent_message".to_owned(),
-                tool_result,
-                success,
-                error: (!success).then(|| "send failed".to_owned()),
-                normalization_failure: None,
+                outcome,
             }),
         }
     }
 
     fn typed_await_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "tyde_await_agents".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_agent_control".to_owned(),
-                tool_name: "tyde_await_agents".to_owned(),
                 tool_type: ToolRequestType::TydeAwaitAgents {
                     agent_ids: vec![AgentId("agent-sub".to_owned())],
                 },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_agent_control".to_owned(),
-                tool_name: "tyde_await_agents".to_owned(),
-                tool_result: ToolExecutionResult::TydeAwaitAgents {
+            result: Some(succeeded_completion(
+                "toolu_agent_control",
+                ToolExecutionResult::TydeAwaitAgents {
                     ready: vec![protocol::TydeAgentWaitStatus {
                         agent_id: AgentId("agent-sub".to_owned()),
                         status: protocol::AgentControlStatus::Idle,
                     }],
                     still_thinking: Vec::new(),
                 },
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            )),
         }
     }
 
@@ -2423,8 +2415,9 @@ mod live_card_wasm_tests {
         let (container, state) = mount_card(
             typed_send_entry(
                 "## Fixing exact rerun behavior\n\n- check `mock.rs`\n- then rerun",
-                Some(ToolExecutionResult::TydeSendAgentMessage),
-                true,
+                Some(ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::TydeSendAgentMessage,
+                }),
             ),
             None,
         );
@@ -2471,11 +2464,11 @@ mod live_card_wasm_tests {
         let (container, _state) = mount_card(
             typed_send_entry(
                 "please pick this up",
-                Some(ToolExecutionResult::Error {
-                    short_message: "unknown agent_id".to_owned(),
-                    detailed_message: "agent-sub is not a direct child".to_owned(),
+                Some(ToolExecutionOutcome::Failed {
+                    message: "unknown agent_id".to_owned(),
+                    details: Some("agent-sub is not a direct child".to_owned()),
+                    normalization_failure: None,
                 }),
-                false,
             ),
             None,
         );
@@ -2493,11 +2486,15 @@ mod live_card_wasm_tests {
         );
     }
 
-    fn malformed_entry(result: ToolExecutionResult, success: bool) -> ToolRequestEntry {
+    fn malformed_entry(
+        message: &str,
+        details: Option<&str>,
+        normalization_failure: ToolExecutionNormalizationFailure,
+    ) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: json!({
                         "tool": "mcp__tyde-agent-control__tyde_send_agent_message",
@@ -2505,21 +2502,23 @@ mod live_card_wasm_tests {
                     }),
                 },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
-                tool_result: result,
-                success,
-                error: None,
-                normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
-            }),
+            result: Some(failed_completion(
+                "toolu_send_3",
+                message,
+                details,
+                Some(normalization_failure),
+            )),
         }
     }
 
     #[wasm_bindgen_test]
     async fn malformed_drift_forces_open_failed_accessible_shell() {
         let (container, _state) = mount_card(
-            malformed_entry(ToolExecutionResult::TydeSendAgentMessage, true),
+            malformed_entry(
+                "canonical data could not be normalized",
+                None,
+                ToolExecutionNormalizationFailure::CanonicalRequest,
+            ),
             None,
         );
         next_tick().await;
@@ -2562,11 +2561,16 @@ mod live_card_wasm_tests {
     async fn result_only_marker_fails_shell_without_request_diagnostic() {
         let mut entry = typed_send_entry(
             "message remains semantic",
-            Some(ToolExecutionResult::TydeSendAgentMessage),
-            true,
+            Some(ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::TydeSendAgentMessage,
+            }),
         );
-        entry.result.as_mut().unwrap().normalization_failure =
-            Some(ToolExecutionNormalizationFailure::CanonicalResult);
+        entry.result = Some(failed_completion(
+            "toolu_send",
+            "result normalization failed",
+            None,
+            Some(ToolExecutionNormalizationFailure::CanonicalResult),
+        ));
         let (container, _state) = mount_card(entry, None);
         next_tick().await;
 
@@ -2585,9 +2589,11 @@ mod live_card_wasm_tests {
 
     #[wasm_bindgen_test]
     async fn combined_marker_keeps_request_diagnostic_and_combined_header() {
-        let mut entry = malformed_entry(ToolExecutionResult::Other { result: json!({}) }, true);
-        entry.result.as_mut().unwrap().normalization_failure =
-            Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult);
+        let entry = malformed_entry(
+            "request and result normalization failed",
+            None,
+            ToolExecutionNormalizationFailure::CanonicalRequestAndResult,
+        );
         let (container, _state) = mount_card(entry, None);
         next_tick().await;
 
@@ -2599,11 +2605,9 @@ mod live_card_wasm_tests {
     #[wasm_bindgen_test]
     async fn normalization_error_completion_keeps_sanitized_request() {
         let mut entry = malformed_entry(
-            ToolExecutionResult::Error {
-                short_message: "worker launch failed".to_owned(),
-                detailed_message: "request rejected before execution".to_owned(),
-            },
-            false,
+            "worker launch failed",
+            Some("request rejected before execution"),
+            ToolExecutionNormalizationFailure::CanonicalRequest,
         );
         let ToolRequestType::Other { args } = &mut entry.request.tool_type else {
             unreachable!();
@@ -2623,17 +2627,12 @@ mod live_card_wasm_tests {
     #[wasm_bindgen_test]
     async fn matching_error_prose_without_marker_does_not_trigger_diagnostic() {
         let mut entry = completed_other_request("toolu_spawn_error", "tyde_spawn_agent");
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_spawn_error".to_owned(),
-            tool_name: "tyde_spawn_agent".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "worker launch failed".to_owned(),
-                detailed_message: "process exited before ready".to_owned(),
-            },
-            success: false,
-            error: Some("Failed to normalize canonical tool request".to_owned()),
-            normalization_failure: None,
-        });
+        entry.result = Some(failed_completion(
+            "toolu_spawn_error",
+            "worker launch failed",
+            Some("process exited before ready"),
+            None,
+        ));
         let (container, _state) = mount_card(entry, None);
         next_tick().await;
 

@@ -82,7 +82,7 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
     fixture.approve_exit_plan_mode(&agent, &request).await;
 
     let approval_turn = fixture.finish_turn(&agent).await;
-    approval_turn.assert_tool_completed("ExitPlanMode");
+    approval_turn.assert_tool_completed(&request.tool_call_id);
     approval_turn.assert_stream_end_contains("mock ExitPlanMode approved");
 
     let drain_turn = fixture.finish_turn(&agent).await;

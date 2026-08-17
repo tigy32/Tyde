@@ -305,7 +305,6 @@ pub fn WorkflowView(agent_ref: ActiveAgentRef, tool_call_id: ToolCallId) -> impl
                 ToolProgressUpdate::Workflow(run) => Some(run),
                 ToolProgressUpdate::SubAgent(_)
                 | ToolProgressUpdate::AgentControl(_)
-                | ToolProgressUpdate::BackgroundTask(_)
                 | ToolProgressUpdate::Other { .. } => None,
             }
         }

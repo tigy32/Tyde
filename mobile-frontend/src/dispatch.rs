@@ -1974,7 +1974,18 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
             );
         }
         ChatEvent::ToolRequest(request) => {
+            let tool_call_id = request.tool_call_id.clone();
+            let tool_name = state
+                .chat_messages
+                .with_untracked(|messages| {
+                    messages
+                        .get(&agent_ref)
+                        .and_then(|messages| messages.last())
+                        .and_then(|entry| mobile_message_tool_name(&entry.message, &tool_call_id))
+                })
+                .unwrap_or_else(|| mobile_fallback_tool_name(&request));
             let tool_entry = ToolRequestEntry {
+                tool_name,
                 request,
                 result: None,
             };
@@ -2179,6 +2190,37 @@ fn apply_session_history(
     });
 }
 
+fn mobile_message_tool_name(message: &protocol::ChatMessage, tool_call_id: &str) -> Option<String> {
+    message
+        .tool_calls
+        .iter()
+        .find(|tool| tool.tool_call_id == tool_call_id)
+        .map(|tool| tool.name.clone())
+}
+
+fn mobile_fallback_tool_name(request: &protocol::ToolRequest) -> String {
+    use protocol::ToolRequestType;
+
+    match &request.tool_type {
+        ToolRequestType::ModifyFile { .. } => "modify_file",
+        ToolRequestType::RunCommand { .. } => "run_command",
+        ToolRequestType::ReadFiles { .. } => "read_files",
+        ToolRequestType::SearchTypes { .. } => "search_types",
+        ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
+        ToolRequestType::AskUserQuestion { .. } => "ask_user_question",
+        ToolRequestType::ExitPlanMode { .. } => "exit_plan_mode",
+        ToolRequestType::AgentSpawn { .. } => "agent_spawn",
+        ToolRequestType::GenerateImage { .. } => "generate_image",
+        ToolRequestType::WebSearch { .. } => "web_search",
+        ToolRequestType::ViewImage { .. } => "view_image",
+        ToolRequestType::Sleep { .. } => "sleep",
+        ToolRequestType::TydeSendAgentMessage { .. } => "tyde_send_agent_message",
+        ToolRequestType::TydeAwaitAgents { .. } => "tyde_await_agents",
+        ToolRequestType::Other { .. } => "tool",
+    }
+    .to_owned()
+}
+
 #[derive(Default)]
 struct MobileHistoryReplay {
     rows: Vec<ChatMessageEntry>,
@@ -2221,9 +2263,14 @@ impl MobileHistoryReplay {
                 });
             }
             ChatEvent::ToolRequest(request) => {
-                let tool_name = request.tool_name.clone();
                 let tool_call_id = request.tool_call_id.clone();
+                let tool_name = self
+                    .rows
+                    .last()
+                    .and_then(|row| mobile_message_tool_name(&row.message, &tool_call_id))
+                    .unwrap_or_else(|| mobile_fallback_tool_name(&request));
                 let tool_entry = ToolRequestEntry {
+                    tool_name: tool_name.clone(),
                     request,
                     result: None,
                 };
@@ -4366,7 +4413,6 @@ mod wasm_tests {
             &state,
             &agent_ref,
             protocol::ChatEvent::StreamStart(protocol::StreamStartData {
-                message_id: Some(message_id.0.clone()),
                 agent: "test-agent".to_owned(),
                 model: Some("gpt-test".to_owned()),
             }),
@@ -4461,7 +4507,6 @@ mod wasm_tests {
             &state,
             &agent_ref,
             ChatEvent::StreamStart(protocol::StreamStartData {
-                message_id: Some("start-id".to_owned()),
                 agent: "codex".to_owned(),
                 model: None,
             }),
@@ -4470,7 +4515,6 @@ mod wasm_tests {
             &state,
             &agent_ref,
             ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
-                message_id: Some("delta-id".to_owned()),
                 text: "server text".to_owned(),
             }),
         );
@@ -4478,7 +4522,6 @@ mod wasm_tests {
             &state,
             &agent_ref,
             ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
-                message_id: None,
                 text: "server reasoning".to_owned(),
             }),
         );
@@ -4558,7 +4601,6 @@ mod wasm_tests {
             &state,
             &agent_ref,
             ChatEvent::StreamStart(protocol::StreamStartData {
-                message_id: Some("empty-item".to_owned()),
                 agent: "codex".to_owned(),
                 model: None,
             }),
@@ -4601,7 +4643,7 @@ mod wasm_tests {
             blob: None,
         });
         authoritative.tool_calls = vec![protocol::ToolUseData {
-            id: "tool-call".to_owned(),
+            tool_call_id: "tool-call".to_owned(),
             name: "tool".to_owned(),
             arguments: serde_json::json!({}),
             content_offset: None,

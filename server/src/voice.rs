@@ -1295,7 +1295,7 @@ pub(crate) async fn run_agent_tool(
         })
         .await?;
     let mut deadline = ToolDeadline::new(Instant::now());
-    let mut message_id: Option<String> = None;
+    let mut response_open = false;
     loop {
         let now = Instant::now();
         if deadline.expired(now) {
@@ -1318,14 +1318,13 @@ pub(crate) async fn run_agent_tool(
         }
         let event: protocol::ChatEvent = item.parse_payload().map_err(|_| "invalid agent event")?;
         match event {
-            protocol::ChatEvent::StreamStart(start) if message_id.is_none() => {
-                message_id = start.message_id
-            }
-            protocol::ChatEvent::StreamEnd(end)
-                if end.message.message_id.as_ref().map(|v| v.0.as_str())
-                    == message_id.as_deref() =>
-            {
-                let id = message_id.ok_or("assistant stream missing message_id")?;
+            protocol::ChatEvent::StreamStart(_) if !response_open => response_open = true,
+            protocol::ChatEvent::StreamEnd(end) if response_open => {
+                let id = end
+                    .message
+                    .message_id
+                    .ok_or("assistant response missing presentation id")?
+                    .0;
                 tokio::select! {
                     _ = cancel.cancelled() => return Err("voice tool observer cancelled".into()),
                     sent = progress.send(NovaInput::ToolResult { tool_use_id, message_id: id, result: bounded_tool_result(end.message.content) }) => sent.map_err(|_|"provider tool channel closed")?,

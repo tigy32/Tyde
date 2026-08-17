@@ -31,7 +31,7 @@ pub struct ConformanceSnapshot {
     pub replaying: bool,
     pub pending_inputs: u32,
     pub completed_turns: u64,
-    pub open_stream_id: Option<String>,
+    pub stream_open: bool,
     pub open_tool_count: usize,
     pub running_background_task_count: usize,
 }
@@ -113,11 +113,10 @@ pub struct BackendConformanceValidator {
     pending_inputs: u32,
     active_turn: bool,
     completed_turns: u64,
-    open_stream_id: Option<String>,
-    terminal_stream_ids: HashSet<String>,
+    stream_open: bool,
     open_tools: HashMap<String, String>,
     known_tools: HashMap<String, String>,
-    background_tasks: HashMap<String, (String, protocol::BackgroundTaskStatus)>,
+    background_tools: HashSet<String>,
     progress_phases: HashMap<(String, &'static str), ProgressPhase>,
     turn: TurnEvidence,
     usage_turn_id: Option<String>,
@@ -145,11 +144,10 @@ impl BackendConformanceValidator {
             pending_inputs: 0,
             active_turn: false,
             completed_turns: 0,
-            open_stream_id: None,
-            terminal_stream_ids: HashSet::new(),
+            stream_open: false,
             open_tools: HashMap::new(),
             known_tools: HashMap::new(),
-            background_tasks: HashMap::new(),
+            background_tools: HashSet::new(),
             progress_phases: HashMap::new(),
             turn: TurnEvidence::default(),
             usage_turn_id: None,
@@ -194,7 +192,7 @@ impl BackendConformanceValidator {
         if !self.replaying {
             return Err(self.error("resume replay ended without starting"));
         }
-        if self.open_stream_id.is_some() {
+        if self.stream_open {
             return Err(self.error("resume replay ended with an open assistant stream"));
         }
         if !self.open_tools.is_empty() {
@@ -217,52 +215,33 @@ impl BackendConformanceValidator {
             ChatEvent::TypingStatusChanged(false) => self.finish_turn(),
             ChatEvent::StreamStart(start) => {
                 self.ensure_turn("assistant stream started")?;
-                if self.open_stream_id.is_some() {
+                if self.stream_open {
                     return Err(
                         self.error("assistant stream started while another stream was open")
                     );
                 }
-                let message_id = start
-                    .message_id
-                    .as_deref()
-                    .filter(|message_id| !message_id.trim().is_empty())
-                    .ok_or_else(|| self.error("assistant stream started without a message id"))?;
-                if self.terminal_stream_ids.contains(message_id) {
-                    return Err(self.error(format!(
-                        "assistant stream reused terminal message id {message_id}"
-                    )));
+                if start.agent.trim().is_empty() {
+                    return Err(self.error("assistant stream started without an agent name"));
                 }
-                self.open_stream_id = Some(message_id.to_owned());
+                self.stream_open = true;
                 self.turn.assistant_output = true;
                 Ok(())
             }
             ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-                let message_id = delta
-                    .message_id
-                    .as_deref()
-                    .filter(|message_id| !message_id.trim().is_empty())
-                    .ok_or_else(|| self.error("stream delta did not carry a message id"))?;
-                self.require_open_stream(message_id, "stream delta")
+                let _ = delta;
+                self.require_open_stream("stream delta")
             }
             ChatEvent::StreamEnd(end) => {
-                let message_id = end
-                    .message
-                    .message_id
-                    .as_ref()
-                    .map(|message_id| message_id.0.as_str())
-                    .filter(|message_id| !message_id.trim().is_empty())
-                    .ok_or_else(|| self.error("assistant stream ended without a message id"))?;
-                self.require_open_stream(message_id, "stream end")?;
-                self.open_stream_id = None;
-                self.terminal_stream_ids.insert(message_id.to_owned());
-                self.observe_message(&end.message);
+                self.require_open_stream("stream end")?;
+                self.stream_open = false;
+                self.observe_message(&end.message)?;
                 Ok(())
             }
             ChatEvent::MessageAdded(message) => {
                 if matches!(&message.sender, MessageSender::Assistant { .. }) {
                     self.ensure_turn("assistant message was added")?;
                     self.turn.assistant_output = true;
-                    self.observe_message(message);
+                    self.observe_message(message)?;
                 }
                 Ok(())
             }
@@ -275,69 +254,62 @@ impl BackendConformanceValidator {
                 if request.tool_call_id.trim().is_empty() {
                     return Err(self.error("tool request had an empty id"));
                 }
-                if request.tool_name.trim().is_empty() {
-                    return Err(self.error("tool request had an empty name"));
-                }
-                if self.known_tools.contains_key(&request.tool_call_id) {
+                if self.open_tools.contains_key(&request.tool_call_id) {
                     return Err(
                         self.error(format!("duplicate tool request {}", request.tool_call_id))
                     );
                 }
+                let Some(tool_name) = self.known_tools.get(&request.tool_call_id).cloned() else {
+                    return Err(self.error(format!(
+                        "tool request {} had no owning assistant declaration",
+                        request.tool_call_id
+                    )));
+                };
                 self.open_tools
-                    .insert(request.tool_call_id.clone(), request.tool_name.clone());
-                self.known_tools
-                    .insert(request.tool_call_id.clone(), request.tool_name.clone());
+                    .insert(request.tool_call_id.clone(), tool_name);
                 Ok(())
             }
             ChatEvent::ToolExecutionCompleted(completion) => {
-                let Some(tool_name) = self.open_tools.remove(&completion.tool_call_id) else {
+                let Some(_) = self.open_tools.remove(&completion.tool_call_id) else {
                     return Err(self.error(format!(
                         "tool completion referenced unknown or completed tool {}",
                         completion.tool_call_id
                     )));
                 };
-                if tool_name != completion.tool_name {
-                    return Err(self.error(format!(
-                        "tool completion name mismatch for {}: expected {tool_name}, got {}",
-                        completion.tool_call_id, completion.tool_name
-                    )));
-                }
+                self.background_tools.remove(&completion.tool_call_id);
                 Ok(())
             }
             ChatEvent::ToolProgress(progress) => {
-                let Some(tool_name) = self.known_tools.get(&progress.tool_call_id) else {
+                if !self.open_tools.contains_key(&progress.tool_call_id) {
                     return Err(self.error(format!(
-                        "tool progress referenced unknown tool {}",
+                        "tool progress referenced unknown or completed tool {}",
                         progress.tool_call_id
                     )));
-                };
-                if tool_name != &progress.tool_name {
+                }
+                if self.background_tools.contains(&progress.tool_call_id)
+                    && progress.execution_mode != protocol::ToolExecutionMode::Background
+                {
                     return Err(self.error(format!(
-                        "tool progress name mismatch for {}: expected {tool_name}, got {}",
-                        progress.tool_call_id, progress.tool_name
+                        "background tool {} moved back to foreground",
+                        progress.tool_call_id
                     )));
+                }
+                if progress.execution_mode == protocol::ToolExecutionMode::Background {
+                    if !self
+                        .capabilities
+                        .contains(BackendCapability::BackgroundTasks)
+                    {
+                        return Err(self.error(
+                            "background tool progress arrived without BackgroundTasks capability",
+                        ));
+                    }
+                    self.background_tools.insert(progress.tool_call_id.clone());
                 }
                 if !self.active_turn
                     && !self.replaying
-                    && !self
-                        .capabilities
-                        .contains(BackendCapability::BackgroundTasks)
+                    && progress.execution_mode != protocol::ToolExecutionMode::Background
                 {
-                    return Err(self.error(
-                        "tool progress arrived while idle without BackgroundTasks capability",
-                    ));
-                }
-                if matches!(&progress.update, ToolProgressUpdate::BackgroundTask(_))
-                    && !self
-                        .capabilities
-                        .contains(BackendCapability::BackgroundTasks)
-                {
-                    return Err(self.error(
-                        "background task progress arrived without BackgroundTasks capability",
-                    ));
-                }
-                if let ToolProgressUpdate::BackgroundTask(task) = &progress.update {
-                    self.observe_background_task(&progress.tool_call_id, task)?;
+                    return Err(self.error("foreground tool progress arrived while idle"));
                 }
                 self.observe_progress_phase(&progress.tool_call_id, &progress.update)?;
                 Ok(())
@@ -346,10 +318,12 @@ impl BackendConformanceValidator {
                 if !self.active_turn {
                     return Err(self.error("operation cancellation arrived while idle"));
                 }
-                if self.open_stream_id.is_some() {
-                    return Err(self.error("operation cancellation arrived before stream end"));
-                }
-                if !self.open_tools.is_empty() {
+                self.stream_open = false;
+                if self
+                    .open_tools
+                    .keys()
+                    .any(|tool_call_id| !self.background_tools.contains(tool_call_id))
+                {
                     return Err(self.error("operation cancellation arrived before tool completion"));
                 }
                 if self.turn.cancelled {
@@ -486,22 +460,7 @@ impl BackendConformanceValidator {
                     ProgressPhase::Terminal
                 },
             ),
-            ToolProgressUpdate::BackgroundTask(progress) => (
-                "background-task",
-                if progress.status == protocol::BackgroundTaskStatus::Running {
-                    ProgressPhase::Running
-                } else {
-                    ProgressPhase::Terminal
-                },
-            ),
-            ToolProgressUpdate::Other { status, .. } => (
-                "other",
-                if *status == protocol::OpaqueToolProgressStatus::Running {
-                    ProgressPhase::Running
-                } else {
-                    ProgressPhase::Terminal
-                },
-            ),
+            ToolProgressUpdate::Other { .. } => ("other", ProgressPhase::Running),
         };
         let key = (tool_call_id.to_owned(), family);
         if self.progress_phases.get(&key) == Some(&ProgressPhase::Terminal) {
@@ -593,7 +552,7 @@ impl BackendConformanceValidator {
         if self.active_turn {
             return Err(self.error("event stream ended during an active turn"));
         }
-        if self.open_stream_id.is_some() {
+        if self.stream_open {
             return Err(self.error("event stream ended with an open assistant stream"));
         }
         if !self.open_tools.is_empty() {
@@ -605,11 +564,7 @@ impl BackendConformanceValidator {
                 self.pending_inputs
             )));
         }
-        let running_background_tasks = self
-            .background_tasks
-            .values()
-            .filter(|(_, status)| *status == protocol::BackgroundTaskStatus::Running)
-            .count();
+        let running_background_tasks = self.background_tools.len();
         if running_background_tasks != 0 {
             return Err(self.error(format!(
                 "event stream ended with {running_background_tasks} running background tasks"
@@ -624,56 +579,9 @@ impl BackendConformanceValidator {
             replaying: self.replaying,
             pending_inputs: self.pending_inputs,
             completed_turns: self.completed_turns,
-            open_stream_id: self.open_stream_id.clone(),
+            stream_open: self.stream_open,
             open_tool_count: self.open_tools.len(),
-            running_background_task_count: self
-                .background_tasks
-                .values()
-                .filter(|(_, status)| *status == protocol::BackgroundTaskStatus::Running)
-                .count(),
-        }
-    }
-
-    fn observe_background_task(
-        &mut self,
-        tool_call_id: &str,
-        task: &protocol::BackgroundTaskState,
-    ) -> Result<(), BackendConformanceError> {
-        if task.task_id.trim().is_empty() {
-            return Err(self.error("background task had an empty task id"));
-        }
-        let previous = self.background_tasks.get(tool_call_id).cloned();
-        match previous {
-            None if task.status != protocol::BackgroundTaskStatus::Running => {
-                Err(self.error(format!(
-                    "background task {} first appeared terminal as {:?}",
-                    task.task_id, task.status
-                )))
-            }
-            None => {
-                self.background_tasks
-                    .insert(tool_call_id.to_owned(), (task.task_id.clone(), task.status));
-                Ok(())
-            }
-            Some((previous_task_id, _)) if previous_task_id != task.task_id => {
-                Err(self.error(format!(
-                    "background tool {tool_call_id} changed task id from {previous_task_id} to {}",
-                    task.task_id
-                )))
-            }
-            Some((_, previous_status))
-                if previous_status != protocol::BackgroundTaskStatus::Running =>
-            {
-                Err(self.error(format!(
-                    "background task {} emitted {:?} after terminal status {:?}",
-                    task.task_id, task.status, previous_status
-                )))
-            }
-            Some(_) => {
-                self.background_tasks
-                    .insert(tool_call_id.to_owned(), (task.task_id.clone(), task.status));
-                Ok(())
-            }
+            running_background_task_count: self.background_tools.len(),
         }
     }
 
@@ -714,10 +622,14 @@ impl BackendConformanceValidator {
         if !self.active_turn {
             return Err(self.error("typing became idle without an active turn"));
         }
-        if self.open_stream_id.is_some() {
+        if self.stream_open {
             return Err(self.error("typing became idle before the assistant stream ended"));
         }
-        if !self.open_tools.is_empty() {
+        if self
+            .open_tools
+            .keys()
+            .any(|tool_call_id| !self.background_tools.contains(tool_call_id))
+        {
             return Err(self.error("typing became idle before all tool requests completed"));
         }
         if !self.replaying && !self.turn.cancelled && self.turn.assistant_output {
@@ -767,23 +679,35 @@ impl BackendConformanceValidator {
         Ok(())
     }
 
-    fn require_open_stream(
-        &self,
-        message_id: &str,
-        event: &str,
-    ) -> Result<(), BackendConformanceError> {
-        let Some(open) = self.open_stream_id.as_deref() else {
+    fn require_open_stream(&self, event: &str) -> Result<(), BackendConformanceError> {
+        if !self.stream_open {
             return Err(self.error(format!("{event} arrived without an open stream")));
-        };
-        if open != message_id {
-            return Err(self.error(format!(
-                "{event} message id {message_id} did not match open stream {open}"
-            )));
         }
         Ok(())
     }
 
-    fn observe_message(&mut self, message: &ChatMessage) {
+    fn observe_message(&mut self, message: &ChatMessage) -> Result<(), BackendConformanceError> {
+        for tool in &message.tool_calls {
+            if tool.tool_call_id.trim().is_empty() {
+                return Err(self.error("assistant declared a tool with an empty id"));
+            }
+            if tool.name.trim().is_empty() {
+                return Err(self.error(format!(
+                    "assistant tool {} had an empty name",
+                    tool.tool_call_id
+                )));
+            }
+            if self
+                .known_tools
+                .insert(tool.tool_call_id.clone(), tool.name.clone())
+                .is_some()
+            {
+                return Err(self.error(format!(
+                    "assistant declared duplicate tool {}",
+                    tool.tool_call_id
+                )));
+            }
+        }
         if let Some(usage) = &message.token_usage
             && matches!(&usage.turn, TokenUsageScope::Known { .. })
         {
@@ -793,6 +717,7 @@ impl BackendConformanceValidator {
             self.turn.context_usage = context.context_window > 0;
             self.turn.context_breakdown = true;
         }
+        Ok(())
     }
 
     fn observe_metadata(&mut self, metadata: &MessageMetadataUpdateData) {

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use protocol::types::StreamIdentityViolation;
 use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput, AgentErrorCode,
@@ -16,13 +15,13 @@ use protocol::{
     CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
-    MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
-    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData, ReviewErrorContext,
-    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues,
-    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
+    MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
+    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
+    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -175,7 +174,6 @@ struct QueueDispatchTerminalContext<'a> {
     pending_inputs: &'a mut VecDeque<AgentInput>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
     open_tool_call_ids: &'a mut HashSet<String>,
-    open_tool_call_names: &'a mut HashMap<String, String>,
     pending_tool_response_ids: &'a mut HashSet<String>,
     active_agent_await_ids: &'a mut HashSet<String>,
 }
@@ -623,9 +621,6 @@ struct PreparedContextFallback {
 #[derive(Default)]
 struct AgentReplayState {
     active_stream: Option<ReplayActiveStream>,
-    completed_stream: Option<ReplayCompletedStream>,
-    terminal_stream_message_ids: HashSet<ChatMessageId>,
-    recorded_message_senders: HashMap<ChatMessageId, MessageSender>,
     typing: bool,
     operation_cancelled: bool,
     resume_history_settled_idle: bool,
@@ -637,20 +632,15 @@ struct AgentReplayState {
     progress_log_index: HashMap<String, usize>,
     active_tool_progress: HashMap<String, protocol::ToolProgressData>,
     active_background_progress: HashMap<String, protocol::ToolProgressData>,
-    active_subagent_progress: HashMap<String, protocol::ToolProgressData>,
 }
 
 impl AgentReplayState {
     fn clear_active_stream(&mut self) {
         self.active_stream = None;
-        self.completed_stream = None;
     }
 
     fn discard_active_stream(&mut self) {
-        if let Some(stream) = self.active_stream.take() {
-            self.terminal_stream_message_ids.insert(stream.message_id);
-        }
-        self.completed_stream = None;
+        self.active_stream = None;
     }
 
     fn active_stream_events(&self) -> Vec<ChatEvent> {
@@ -660,175 +650,31 @@ impl AgentReplayState {
         }
 
         let Some(active) = &self.active_stream else {
-            if self.typing {
-                self.completed_stream_events(&mut events);
-            }
             return events;
         };
 
-        let current_message_id = active.message_id.0.clone();
         events.push(ChatEvent::StreamStart(active.start.clone()));
         if !active.reasoning.is_empty() {
             events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id: Some(current_message_id.clone()),
                 text: active.reasoning.clone(),
             }));
         }
         if !active.text.is_empty() {
             events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: Some(current_message_id),
                 text: active.text.clone(),
             }));
         }
         events.extend(active.tool_events.iter().cloned());
         events
     }
-
-    fn completed_stream_events(&self, events: &mut Vec<ChatEvent>) {
-        let Some(completed) = &self.completed_stream else {
-            return;
-        };
-        let current_message_id = completed.stream.message_id.0.clone();
-        events.push(ChatEvent::StreamStart(completed.stream.start.clone()));
-        if !completed.stream.reasoning.is_empty() {
-            events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id: Some(current_message_id.clone()),
-                text: completed.stream.reasoning.clone(),
-            }));
-        }
-        if !completed.stream.text.is_empty() {
-            events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: Some(current_message_id),
-                text: completed.stream.text.clone(),
-            }));
-        }
-        events.extend(completed.stream.tool_events.iter().cloned());
-        events.push(ChatEvent::StreamEnd(completed.end.clone()));
-        events.extend(completed.post_end_events.iter().cloned());
-    }
-
-    fn active_completed_stream_history_filter(&self) -> Option<CompletedStreamHistoryFilter> {
-        if !self.typing || self.active_stream.is_some() {
-            return None;
-        }
-        let completed = self.completed_stream.as_ref()?;
-        let mut tool_call_ids = completed
-            .stream
-            .tool_events
-            .iter()
-            .filter_map(chat_event_tool_call_id)
-            .map(ToOwned::to_owned)
-            .collect::<HashSet<_>>();
-        tool_call_ids.extend(
-            completed
-                .post_end_events
-                .iter()
-                .filter_map(chat_event_tool_call_id)
-                .map(ToOwned::to_owned),
-        );
-        let message = Some(completed.end.message.clone());
-        Some(CompletedStreamHistoryFilter {
-            message,
-            tool_call_ids,
-        })
-    }
-
-    fn update_completed_stream_metadata(&mut self, update: &MessageMetadataUpdateData) {
-        if !self.typing || self.active_stream.is_some() {
-            return;
-        }
-        let Some(completed) = self.completed_stream.as_mut() else {
-            return;
-        };
-        if completed.end.message.message_id.as_ref() != Some(&update.message_id) {
-            return;
-        }
-        if update.model_info.is_some() {
-            completed.end.message.model_info = update.model_info.clone();
-        }
-        if update.token_usage.is_some() {
-            completed.end.message.token_usage = update.token_usage.clone();
-        }
-        if update.context_breakdown.is_some() {
-            completed.end.message.context_breakdown = update.context_breakdown.clone();
-        }
-    }
-
-    fn update_completed_stream_tool_snapshot(&mut self, event: &ChatEvent) {
-        if !self.typing || self.active_stream.is_some() {
-            return;
-        }
-        let Some(completed) = self.completed_stream.as_mut() else {
-            return;
-        };
-        let Some(tool_call_id) = chat_event_tool_call_id(event) else {
-            return;
-        };
-        if upsert_tool_event(&mut completed.post_end_events, event) {
-            return;
-        }
-        let belongs_to_completed_stream = completed
-            .stream
-            .tool_events
-            .iter()
-            .filter_map(chat_event_tool_call_id)
-            .any(|existing_tool_call_id| existing_tool_call_id == tool_call_id);
-        if belongs_to_completed_stream {
-            if !upsert_tool_event(&mut completed.stream.tool_events, event) {
-                completed.post_end_events.push(event.clone());
-            }
-            return;
-        }
-        completed.post_end_events.push(event.clone());
-    }
-}
-
-struct CompletedStreamHistoryFilter {
-    message: Option<ChatMessage>,
-    tool_call_ids: HashSet<String>,
-}
-
-impl CompletedStreamHistoryFilter {
-    fn matches(&self, event: &ChatEvent) -> bool {
-        let completed_message_id = self
-            .message
-            .as_ref()
-            .and_then(|message| message.message_id.as_ref())
-            .map(|message_id| message_id.0.as_str());
-        match event {
-            ChatEvent::MessageAdded(message) => self
-                .message
-                .as_ref()
-                .is_some_and(|completed_message| same_chat_message(completed_message, message)),
-            ChatEvent::StreamStart(start) => start.message_id.as_deref() == completed_message_id,
-            ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-                delta.message_id.as_deref() == completed_message_id
-            }
-            ChatEvent::StreamEnd(end) => self.message.as_ref().is_some_and(|completed_message| {
-                same_chat_message(completed_message, &end.message)
-            }),
-            ChatEvent::ToolRequest(_)
-            | ChatEvent::ToolProgress(_)
-            | ChatEvent::ToolExecutionCompleted(_) => chat_event_tool_call_id(event)
-                .is_some_and(|tool_call_id| self.tool_call_ids.contains(tool_call_id)),
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone)]
 struct ReplayActiveStream {
-    message_id: ChatMessageId,
     start: StreamStartData,
     text: String,
     reasoning: String,
     tool_events: Vec<ChatEvent>,
-}
-
-struct ReplayCompletedStream {
-    stream: ReplayActiveStream,
-    end: StreamEndData,
-    post_end_events: Vec<ChatEvent>,
 }
 
 #[derive(Clone)]
@@ -2532,7 +2378,7 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
                 ChatEvent::ToolRequest(request) => {
                     return Err(format!(
                         "fallback summary generator attempted tool {}",
-                        request.tool_name
+                        tool_request_label(&request.tool_type)
                     ));
                 }
                 ChatEvent::TypingStatusChanged(false) if !summary.trim().is_empty() => break,
@@ -2608,7 +2454,7 @@ async fn collect_agent_activity_summary_events(
                 );
             }
             ChatEvent::ToolRequest(requested_tool) => {
-                let tool_name = requested_tool.tool_name;
+                let tool_name = tool_request_label(&requested_tool.tool_type).to_string();
                 let tool_call_id = requested_tool.tool_call_id;
                 tracing::warn!(
                     summary_agent_id = %request.summary_agent_id,
@@ -3187,7 +3033,6 @@ pub(crate) fn spawn_agent_actor(
         let mut last_supervisor_failure_warning_activity_counter = None;
         let mut last_backend_event_at: Option<Instant> = None;
         let mut last_stall_interrupt_at: Option<Instant> = None;
-        let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(backend_kind);
@@ -3662,7 +3507,6 @@ pub(crate) fn spawn_agent_actor(
         let mut backend_typing = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
-        let mut open_tool_call_names: HashMap<String, String> = HashMap::new();
         let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
         let mut completed_tool_call_ids = if resume_uses_authoritative_transcript {
             load_authoritative_completed_tool_call_ids(&transcript_store, &actor_session_id).await
@@ -3952,7 +3796,6 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                    open_tool_call_names: &mut open_tool_call_names,
                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                     active_agent_await_ids: &mut active_agent_await_ids,
                                 },
@@ -4028,7 +3871,6 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                    open_tool_call_names: &mut open_tool_call_names,
                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                     active_agent_await_ids: &mut active_agent_await_ids,
                                 },
@@ -4052,7 +3894,6 @@ pub(crate) fn spawn_agent_actor(
                                 replay_state: &mut replay_state,
                                 subscribers: &mut subscribers,
                                 open_tool_call_ids: &mut open_tool_call_ids,
-                                open_tool_call_names: &mut open_tool_call_names,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
                                 active_agent_await_ids: &mut active_agent_await_ids,
                             },
@@ -4271,52 +4112,6 @@ pub(crate) fn spawn_agent_actor(
                             continue;
                         }
                     };
-                    if let Err(violation) =
-                        validate_chat_event_stream_identity(&replay_state, &event)
-                    {
-                        eprintln!(
-                            "TYDE RESUME IDENTITY VIOLATION agent={} violation={violation:?} event={event:?}",
-                            current_start.agent_id
-                        );
-                        if last_stream_identity_violation != Some(violation) {
-                            last_stream_identity_violation = Some(violation);
-                            let error = stream_identity_violation_event(violation);
-                            append_chat_event(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &mut replay_state,
-                                &error,
-                            )
-                            .await;
-                        }
-                        match recover_stream_identity_violation(
-                            &replay_state,
-                            &mut event,
-                            violation,
-                        ) {
-                            StreamIdentityRecovery::Resync { finalize_abandoned } => {
-                                if let Some(finalize) = finalize_abandoned {
-                                    append_chat_event(
-                                        &canonical_stream,
-                                        &mut event_log,
-                                        &mut subscribers,
-                                        &mut replay_state,
-                                        &finalize,
-                                    )
-                                    .await;
-                                }
-                                if validate_chat_event_stream_identity(&replay_state, &event)
-                                    .is_err()
-                                {
-                                    continue;
-                                }
-                            }
-                            StreamIdentityRecovery::Unrecoverable => continue,
-                        }
-                    } else {
-                        last_stream_identity_violation = None;
-                    }
                     if resume_replay_gate_pending {
                         if !resume_uses_authoritative_transcript {
                             ingest_gated_replay_event(
@@ -4480,10 +4275,6 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::ToolRequest(request) => {
                             open_tool_call_ids.insert(request.tool_call_id.clone());
-                            open_tool_call_names.insert(
-                                request.tool_call_id.clone(),
-                                request.tool_name.clone(),
-                            );
                             open_tool_requests
                                 .insert(request.tool_call_id.clone(), request.clone());
                             if matches!(
@@ -4516,16 +4307,14 @@ pub(crate) fn spawn_agent_actor(
                         ChatEvent::ToolExecutionCompleted(completion) => {
                             if completed_tool_call_ids.contains(&completion.tool_call_id) {
                                 eprintln!(
-                                    "TYDE DUPLICATE TOOL COMPLETION DROPPED agent={} tool_call_id={} tool_name={}",
+                                    "TYDE DUPLICATE TOOL COMPLETION DROPPED agent={} tool_call_id={}",
                                     current_start.agent_id,
                                     completion.tool_call_id,
-                                    completion.tool_name,
                                 );
                                 continue;
                             }
                             completed_tool_call_ids.insert(completion.tool_call_id.clone());
                             open_tool_call_ids.remove(&completion.tool_call_id);
-                            open_tool_call_names.remove(&completion.tool_call_id);
                             open_tool_requests.remove(&completion.tool_call_id);
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
@@ -4541,7 +4330,6 @@ pub(crate) fn spawn_agent_actor(
                                 tracing::warn!(
                                     agent_id = %current_start.agent_id,
                                     tool_call_id = %completion.tool_call_id,
-                                    tool_name = %completion.tool_name,
                                     "interrupted tool completion ended active turn without idle marker"
                                 );
                                 real_idle_transition = true;
@@ -4563,7 +4351,7 @@ pub(crate) fn spawn_agent_actor(
                                 if interrupted_tool_ends_turn {
                                     s.turn_completed = true;
                                     s.is_thinking = false;
-                                    s.last_error = completion.error.clone();
+                                    s.last_error = tool_completion_error(completion);
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -4700,7 +4488,6 @@ pub(crate) fn spawn_agent_actor(
                                 replay_state: &mut replay_state,
                                 subscribers: &mut subscribers,
                                 open_tool_call_ids: &mut open_tool_call_ids,
-                                open_tool_call_names: &mut open_tool_call_names,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
                                 active_agent_await_ids: &mut active_agent_await_ids,
                             },
@@ -4846,7 +4633,6 @@ pub(crate) fn spawn_agent_actor(
                                         replay_state: &mut replay_state,
                                         subscribers: &mut subscribers,
                                         open_tool_call_ids: &mut open_tool_call_ids,
-                                        open_tool_call_names: &mut open_tool_call_names,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
                                     },
@@ -5200,8 +4986,6 @@ pub(crate) fn spawn_agent_actor(
                                                     subscribers: &mut subscribers,
                                                     open_tool_call_ids:
                                                         &mut open_tool_call_ids,
-                                                    open_tool_call_names:
-                                                        &mut open_tool_call_names,
                                                     pending_tool_response_ids:
                                                         &mut pending_tool_response_ids,
                                                     active_agent_await_ids:
@@ -5307,7 +5091,6 @@ pub(crate) fn spawn_agent_actor(
                                             replay_state: &mut replay_state,
                                             subscribers: &mut subscribers,
                                             open_tool_call_ids: &mut open_tool_call_ids,
-                                            open_tool_call_names: &mut open_tool_call_names,
                                             pending_tool_response_ids: &mut pending_tool_response_ids,
                                             active_agent_await_ids: &mut active_agent_await_ids,
                                         },
@@ -5744,7 +5527,6 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                                    open_tool_call_names: &mut open_tool_call_names,
                                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                                     active_agent_await_ids: &mut active_agent_await_ids,
                                                 },
@@ -5893,13 +5675,11 @@ pub(crate) fn spawn_agent_actor(
                                                 &ChatEvent::ToolExecutionCompleted(
                                                     ToolExecutionCompletedData {
                                                         tool_call_id: tool_call_id.clone(),
-                                                        tool_name: request.tool_name,
-                                                        tool_result: ToolExecutionResult::Other {
-                                                            result,
+                                                        outcome: ToolExecutionOutcome::Succeeded {
+                                                            result: ToolExecutionResult::Other {
+                                                                result,
+                                                            },
                                                         },
-                                                        success: true,
-                                                        error: None,
-                                                        normalization_failure: None,
                                                     },
                                                 ),
                                             )
@@ -5922,7 +5702,6 @@ pub(crate) fn spawn_agent_actor(
                                                 event_log.len(),
                                             );
                                             open_tool_call_ids.remove(&tool_call_id);
-                                            open_tool_call_names.remove(&tool_call_id);
                                             let completed_pending_response =
                                                 pending_tool_response_ids.remove(&tool_call_id);
                                             if completed_pending_response
@@ -6174,7 +5953,6 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                                    open_tool_call_names: &mut open_tool_call_names,
                                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                                     active_agent_await_ids: &mut active_agent_await_ids,
                                                 },
@@ -7196,7 +6974,6 @@ pub(crate) fn spawn_agent_actor(
                                         pending_inputs: &mut pending_inputs,
                                         rx: &mut rx,
                                         open_tool_call_ids: &mut open_tool_call_ids,
-                                        open_tool_call_names: &mut open_tool_call_names,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
                                     },
@@ -7358,8 +7135,6 @@ pub(crate) fn spawn_agent_actor(
                                                         rx: &mut rx,
                                                         open_tool_call_ids:
                                                             &mut open_tool_call_ids,
-                                                        open_tool_call_names:
-                                                            &mut open_tool_call_names,
                                                         pending_tool_response_ids:
                                                             &mut pending_tool_response_ids,
                                                         active_agent_await_ids:
@@ -7535,7 +7310,6 @@ pub(crate) fn spawn_agent_actor(
                                             pending_inputs: &mut pending_inputs,
                                             rx: &mut rx,
                                             open_tool_call_ids: &mut open_tool_call_ids,
-                                            open_tool_call_names: &mut open_tool_call_names,
                                             pending_tool_response_ids:
                                                 &mut pending_tool_response_ids,
                                             active_agent_await_ids: &mut active_agent_await_ids,
@@ -7809,7 +7583,7 @@ pub(crate) fn spawn_agent_actor(
                                         .expect("live agent must have session_id"),
                                     before_seq,
                                     limit,
-                                    replay_state.active_completed_stream_history_filter(),
+                                    None,
                                 )
                                 .await
                                 .unwrap_or_else(|| {
@@ -7945,7 +7719,6 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                    open_tool_call_names: &mut open_tool_call_names,
                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                     active_agent_await_ids: &mut active_agent_await_ids,
                                 },
@@ -8079,7 +7852,6 @@ pub(crate) fn spawn_agent_actor(
                                         replay_state: &mut replay_state,
                                         subscribers: &mut subscribers,
                                         open_tool_call_ids: &mut open_tool_call_ids,
-                                        open_tool_call_names: &mut open_tool_call_names,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
                                     },
@@ -8161,7 +7933,6 @@ pub(crate) fn spawn_agent_actor(
                             replay_state: &mut replay_state,
                             subscribers: &mut subscribers,
                             open_tool_call_ids: &mut open_tool_call_ids,
-                            open_tool_call_names: &mut open_tool_call_names,
                             pending_tool_response_ids: &mut pending_tool_response_ids,
                             active_agent_await_ids: &mut active_agent_await_ids,
                         },
@@ -8270,7 +8041,6 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
-        let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
@@ -8279,7 +8049,6 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut pending_alias = None;
         let mut in_turn = false;
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
-        let mut open_tool_call_names: HashMap<String, String> = HashMap::new();
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
@@ -8396,7 +8165,6 @@ pub(crate) fn spawn_relay_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     open_tool_call_ids: &mut open_tool_call_ids,
-                                    open_tool_call_names: &mut open_tool_call_names,
                                     pending_tool_response_ids: &mut pending_tool_response_ids,
                                     active_agent_await_ids: &mut active_agent_await_ids,
                                 },
@@ -8451,49 +8219,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
 
-                    if let Err(violation) =
-                        validate_chat_event_stream_identity(&replay_state, &event)
-                    {
-                        if last_stream_identity_violation != Some(violation) {
-                            last_stream_identity_violation = Some(violation);
-                            let error = stream_identity_violation_event(violation);
-                            append_chat_event(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &mut replay_state,
-                                &error,
-                            )
-                            .await;
-                        }
-                        match recover_stream_identity_violation(
-                            &replay_state,
-                            &mut event,
-                            violation,
-                        ) {
-                            StreamIdentityRecovery::Resync { finalize_abandoned } => {
-                                if let Some(finalize) = finalize_abandoned {
-                                    append_chat_event(
-                                        &canonical_stream,
-                                        &mut event_log,
-                                        &mut subscribers,
-                                        &mut replay_state,
-                                        &finalize,
-                                    )
-                                    .await;
-                                }
-                                if validate_chat_event_stream_identity(&replay_state, &event)
-                                    .is_err()
-                                {
-                                    continue;
-                                }
-                            }
-                            StreamIdentityRecovery::Unrecoverable => continue,
-                        }
-                    } else {
-                        last_stream_identity_violation = None;
-                    }
-
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if matches!(message.sender, MessageSender::Error) {
@@ -8546,10 +8271,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::ToolRequest(request) => {
                             open_tool_call_ids.insert(request.tool_call_id.clone());
-                            open_tool_call_names.insert(
-                                request.tool_call_id.clone(),
-                                request.tool_name.clone(),
-                            );
                             if matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::TydeAwaitAgents { .. }
@@ -8573,7 +8294,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
                             open_tool_call_ids.remove(&completion.tool_call_id);
-                            open_tool_call_names.remove(&completion.tool_call_id);
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
@@ -8643,7 +8363,6 @@ pub(crate) fn spawn_relay_agent_actor(
                                 replay_state: &mut replay_state,
                                 subscribers: &mut subscribers,
                                 open_tool_call_ids: &mut open_tool_call_ids,
-                                open_tool_call_names: &mut open_tool_call_names,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
                                 active_agent_await_ids: &mut active_agent_await_ids,
                             },
@@ -8806,7 +8525,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     &session_id,
                                     before_seq,
                                     limit,
-                                    replay_state.active_completed_stream_history_filter(),
+                                    None,
                                 )
                                 .await
                                 .unwrap_or_else(|| {
@@ -8867,7 +8586,6 @@ pub(crate) fn spawn_relay_agent_actor(
                                         replay_state: &mut replay_state,
                                         subscribers: &mut subscribers,
                                         open_tool_call_ids: &mut open_tool_call_ids,
-                                        open_tool_call_names: &mut open_tool_call_names,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
                                     },
@@ -8956,7 +8674,6 @@ pub(crate) fn spawn_relay_agent_actor(
                             replay_state: &mut replay_state,
                             subscribers: &mut subscribers,
                             open_tool_call_ids: &mut open_tool_call_ids,
-                            open_tool_call_names: &mut open_tool_call_names,
                             pending_tool_response_ids: &mut pending_tool_response_ids,
                             active_agent_await_ids: &mut active_agent_await_ids,
                         },
@@ -9326,7 +9043,6 @@ struct LiveActivityTerminalContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     open_tool_call_ids: &'a mut HashSet<String>,
-    open_tool_call_names: &'a mut HashMap<String, String>,
     pending_tool_response_ids: &'a mut HashSet<String>,
     active_agent_await_ids: &'a mut HashSet<String>,
 }
@@ -9341,30 +9057,19 @@ async fn terminalize_live_activity(
     let replay_state = &mut context.replay_state;
     let subscribers = &mut context.subscribers;
     let open_tool_call_ids = &mut context.open_tool_call_ids;
-    let open_tool_call_names = &mut context.open_tool_call_names;
     let pending_tool_response_ids = &mut context.pending_tool_response_ids;
     let active_agent_await_ids = &mut context.active_agent_await_ids;
-    if let Some(active) = replay_state.active_stream.clone() {
-        append_chat_event(
-            canonical_stream,
-            event_log,
-            subscribers,
-            replay_state,
-            &synthesized_end_for_abandoned_stream(&active),
-        )
-        .await;
-    }
 
-    let open_tools = open_tool_call_names.drain().collect::<Vec<_>>();
-    for (tool_call_id, tool_name) in open_tools {
-        open_tool_call_ids.remove(&tool_call_id);
+    let open_tools = open_tool_call_ids.drain().collect::<Vec<_>>();
+    for tool_call_id in open_tools {
         pending_tool_response_ids.remove(&tool_call_id);
-        let tool_result = match status {
-            LiveActivityTerminalStatus::Failed => ToolExecutionResult::Error {
-                short_message: message.to_owned(),
-                detailed_message: message.to_owned(),
+        let outcome = match status {
+            LiveActivityTerminalStatus::Failed => ToolExecutionOutcome::Failed {
+                message: message.to_owned(),
+                details: Some(message.to_owned()),
+                normalization_failure: None,
             },
-            LiveActivityTerminalStatus::Stopped => ToolExecutionResult::Cancelled {
+            LiveActivityTerminalStatus::Stopped => ToolExecutionOutcome::Cancelled {
                 message: message.to_owned(),
             },
         };
@@ -9375,11 +9080,7 @@ async fn terminalize_live_activity(
             replay_state,
             &ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
                 tool_call_id,
-                tool_name,
-                tool_result,
-                success: false,
-                error: Some(message.to_owned()),
-                normalization_failure: None,
+                outcome,
             }),
         )
         .await;
@@ -9387,63 +9088,6 @@ async fn terminalize_live_activity(
     open_tool_call_ids.clear();
     pending_tool_response_ids.clear();
     active_agent_await_ids.clear();
-
-    let active_progress = replay_state
-        .active_tool_progress
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for mut progress in active_progress {
-        match &mut progress.update {
-            protocol::ToolProgressUpdate::BackgroundTask(task) => {
-                task.status = match status {
-                    LiveActivityTerminalStatus::Failed => protocol::BackgroundTaskStatus::Failed,
-                    LiveActivityTerminalStatus::Stopped => protocol::BackgroundTaskStatus::Stopped,
-                };
-                task.summary = Some(message.to_owned());
-            }
-            protocol::ToolProgressUpdate::SubAgent(child) => {
-                child.completed = true;
-                child.status = match status {
-                    LiveActivityTerminalStatus::Failed => protocol::SubAgentProgressStatus::Failed,
-                    LiveActivityTerminalStatus::Stopped => {
-                        protocol::SubAgentProgressStatus::Stopped
-                    }
-                };
-            }
-            protocol::ToolProgressUpdate::Workflow(workflow) => {
-                workflow.status = protocol::WorkflowRunStatus::Failed;
-            }
-            protocol::ToolProgressUpdate::AgentControl(control) => {
-                control.status = match status {
-                    LiveActivityTerminalStatus::Failed => {
-                        protocol::AgentControlProgressStatus::Failed
-                    }
-                    LiveActivityTerminalStatus::Stopped => {
-                        protocol::AgentControlProgressStatus::Stopped
-                    }
-                };
-            }
-            protocol::ToolProgressUpdate::Other { status: opaque, .. } => {
-                *opaque = match status {
-                    LiveActivityTerminalStatus::Failed => {
-                        protocol::OpaqueToolProgressStatus::Failed
-                    }
-                    LiveActivityTerminalStatus::Stopped => {
-                        protocol::OpaqueToolProgressStatus::Stopped
-                    }
-                };
-            }
-        }
-        append_chat_event(
-            canonical_stream,
-            event_log,
-            subscribers,
-            replay_state,
-            &ChatEvent::ToolProgress(progress),
-        )
-        .await;
-    }
     if replay_state.typing {
         if !replay_state.operation_cancelled {
             append_chat_event(
@@ -10267,41 +9911,22 @@ fn backend_session_is_resumable(
 
 fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool {
     const CLAUDE_MISSING_TOOL_RESULT: &str = "history did not contain a tool_result";
-    const TOOL_INTERRUPTED: &str = "Tool execution was interrupted";
 
-    if completion.success {
-        return false;
-    }
+    matches!(
+        &completion.outcome,
+        ToolExecutionOutcome::Failed { message, details, .. }
+            if message.contains(CLAUDE_MISSING_TOOL_RESULT)
+                || details.as_deref().is_some_and(|details| {
+                    details.contains(CLAUDE_MISSING_TOOL_RESULT)
+                })
+    )
+}
 
-    if completion
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains(CLAUDE_MISSING_TOOL_RESULT))
-    {
-        return true;
-    }
-
-    match &completion.tool_result {
-        ToolExecutionResult::Cancelled { .. } => false,
-        ToolExecutionResult::Error {
-            short_message,
-            detailed_message,
-        } => {
-            short_message == TOOL_INTERRUPTED
-                && detailed_message.contains(CLAUDE_MISSING_TOOL_RESULT)
-        }
-        ToolExecutionResult::RunCommand { .. } => false,
-        ToolExecutionResult::ModifyFile { .. }
-        | ToolExecutionResult::ReadFiles { .. }
-        | ToolExecutionResult::SearchTypes { .. }
-        | ToolExecutionResult::GetTypeDocs { .. }
-        | ToolExecutionResult::TydeSendAgentMessage
-        | ToolExecutionResult::TydeAwaitAgents { .. }
-        | ToolExecutionResult::GenerateImage { .. }
-        | ToolExecutionResult::WebSearch
-        | ToolExecutionResult::ViewImage
-        | ToolExecutionResult::Sleep
-        | ToolExecutionResult::Other { .. } => false,
+fn tool_completion_error(completion: &ToolExecutionCompletedData) -> Option<String> {
+    match &completion.outcome {
+        ToolExecutionOutcome::Succeeded { .. } => None,
+        ToolExecutionOutcome::Failed { message, .. }
+        | ToolExecutionOutcome::Cancelled { message } => Some(message.clone()),
     }
 }
 
@@ -10364,22 +9989,7 @@ async fn append_chat_event_with_transcript_metadata(
     event: &ChatEvent,
 ) {
     let replay_len_before = event_log.len();
-    if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
-        let error = stream_identity_violation_event(violation);
-        record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
-            .expect("identity violation error is a non-stream event");
-        journal_new_replay_records(
-            canonical_stream,
-            event_log,
-            replay_len_before,
-            HashMap::new(),
-        )
-        .await;
-        broadcast_live_event(subscribers, FrameKind::ChatEvent, &error).await;
-        return;
-    }
-    record_chat_event_for_replay(canonical_stream, event_log, replay_state, event)
-        .expect("preflighted replay event remains valid");
+    record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
     if event_log.len() == replay_len_before
         && replay_state.active_stream.is_none()
         && matches!(event, ChatEvent::ToolProgress(_))
@@ -10892,7 +10502,6 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
             replay_state: context.replay_state,
             subscribers: context.subscribers,
             open_tool_call_ids: context.open_tool_call_ids,
-            open_tool_call_names: context.open_tool_call_names,
             pending_tool_response_ids: context.pending_tool_response_ids,
             active_agent_await_ids: context.active_agent_await_ids,
         },
@@ -11019,20 +10628,6 @@ async fn ingest_gated_replay_event(
     activity_event_seq: &mut u64,
 ) {
     project_legacy_native_collaboration_event(event);
-    if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
-        // The rejected candidate reaches only the in-memory event log (the
-        // visible Error card), never the journal — without this WARN the
-        // incident leaves zero durable trace to debug from.
-        tracing::warn!(
-            agent_id = %agent_id.0,
-            violation = ?violation,
-            "Replay-gated chat event rejected for stream identity violation"
-        );
-        let error = stream_identity_violation_event(violation);
-        record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
-            .expect("identity violation error is a non-stream event");
-        return;
-    }
     match &*event {
         ChatEvent::StreamStart(_) => active_stream_text.clear(),
         ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
@@ -11053,8 +10648,7 @@ async fn ingest_gated_replay_event(
     if matches!(&*event, ChatEvent::StreamEnd(_)) {
         active_stream_text.clear();
     }
-    record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event)
-        .expect("preflighted replay event remains valid");
+    record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event);
 }
 
 fn record_chat_event_for_replay(
@@ -11062,14 +10656,13 @@ fn record_chat_event_for_replay(
     event_log: &mut Vec<Envelope>,
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
-) -> Result<(), StreamIdentityViolation> {
-    validate_chat_event_stream_identity(replay_state, event)?;
+) {
     match event {
         ChatEvent::StreamStart(start) => {
-            let message_id = required_replay_stream_message_id(start.required_message_id())?;
-            replay_state.completed_stream = None;
+            if replay_state.active_stream.take().is_some() {
+                tracing::warn!("replacing an unterminated response with a new StreamStart");
+            }
             replay_state.active_stream = Some(ReplayActiveStream {
-                message_id,
                 start: start.clone(),
                 text: String::new(),
                 reasoning: String::new(),
@@ -11077,110 +10670,66 @@ fn record_chat_event_for_replay(
             });
         }
         ChatEvent::StreamDelta(delta) => {
-            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
-            let Some(active) = replay_state.active_stream.as_mut() else {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
-            };
-            if message_id != active.message_id {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            if let Some(active) = replay_state.active_stream.as_mut() {
+                active.text.push_str(&delta.text);
+            } else {
+                tracing::warn!("dropping StreamDelta without an active response");
             }
-            active.text.push_str(&delta.text);
         }
         ChatEvent::StreamReasoningDelta(delta) => {
-            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
-            let Some(active) = replay_state.active_stream.as_mut() else {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
-            };
-            if message_id != active.message_id {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            if let Some(active) = replay_state.active_stream.as_mut() {
+                active.reasoning.push_str(&delta.text);
+            } else {
+                tracing::warn!("dropping StreamReasoningDelta without an active response");
             }
-            active.reasoning.push_str(&delta.text);
         }
         ChatEvent::StreamEnd(data) => {
-            let message_id = required_replay_chat_message_id(data.required_message_id())?;
-            let stream = replay_state
-                .active_stream
-                .take()
-                .expect("active stream was checked above");
-            replay_state
-                .terminal_stream_message_ids
-                .insert(message_id.clone());
-            let message = data.message.clone();
-            let retains_explicit_stream = !message.tool_calls.is_empty();
-            let stream_start = stream.start.clone();
-            let stream_text = stream.text.clone();
-            let stream_reasoning = stream.reasoning.clone();
-            replay_state.recorded_message_senders.insert(
-                message
-                    .message_id
-                    .clone()
-                    .expect("validated StreamEnd message id"),
-                message.sender.clone(),
+            let Some(stream) = replay_state.active_stream.take() else {
+                tracing::warn!("recording StreamEnd without a preceding StreamStart");
+                push_chat_event_to_replay_log(canonical_stream, event_log, event);
+                return;
+            };
+            push_chat_event_to_replay_log(
+                canonical_stream,
+                event_log,
+                &ChatEvent::StreamStart(stream.start),
             );
-            let tool_events = stream.tool_events.clone();
-            replay_state.completed_stream = Some(ReplayCompletedStream {
-                stream,
-                end: StreamEndData {
-                    message: message.clone(),
-                },
-                post_end_events: Vec::new(),
-            });
-            if retains_explicit_stream {
+            if !stream.reasoning.is_empty() {
                 push_chat_event_to_replay_log(
                     canonical_stream,
                     event_log,
-                    &ChatEvent::StreamStart(stream_start),
-                );
-                if !stream_reasoning.is_empty() {
-                    push_chat_event_to_replay_log(
-                        canonical_stream,
-                        event_log,
-                        &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                            message_id: Some(message_id.0.clone()),
-                            text: stream_reasoning,
-                        }),
-                    );
-                }
-                if !stream_text.is_empty() {
-                    push_chat_event_to_replay_log(
-                        canonical_stream,
-                        event_log,
-                        &ChatEvent::StreamDelta(StreamTextDeltaData {
-                            message_id: Some(message_id.0.clone()),
-                            text: stream_text,
-                        }),
-                    );
-                }
-            } else {
-                push_chat_event_to_replay_log(
-                    canonical_stream,
-                    event_log,
-                    &ChatEvent::MessageAdded(message.clone()),
+                    &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                        text: stream.reasoning,
+                    }),
                 );
             }
-            for tool_event in tool_events {
-                if let ChatEvent::ToolProgress(data) = &tool_event {
+            if !stream.text.is_empty() {
+                push_chat_event_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    &ChatEvent::StreamDelta(StreamTextDeltaData { text: stream.text }),
+                );
+            }
+            for tool_event in stream.tool_events {
+                if let ChatEvent::ToolProgress(progress) = &tool_event {
                     coalesce_progress_into_replay_log(
                         canonical_stream,
                         event_log,
                         replay_state,
-                        data.tool_call_id.clone(),
+                        progress.tool_call_id.clone(),
                         &tool_event,
                     );
                 } else {
                     push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
                 }
             }
-            if retains_explicit_stream {
-                push_chat_event_to_replay_log(
-                    canonical_stream,
-                    event_log,
-                    &ChatEvent::StreamEnd(StreamEndData { message }),
-                );
-            }
+            push_chat_event_to_replay_log(
+                canonical_stream,
+                event_log,
+                &ChatEvent::StreamEnd(data.clone()),
+            );
         }
         ChatEvent::MessageMetadataUpdated(update) => {
-            replay_state.update_completed_stream_metadata(update);
             push_chat_event_to_replay_log(
                 canonical_stream,
                 event_log,
@@ -11191,26 +10740,27 @@ fn record_chat_event_for_replay(
             if let Some(active) = replay_state.active_stream.as_mut() {
                 active.tool_events.push(event.clone());
             } else {
-                replay_state.update_completed_stream_tool_snapshot(event);
                 push_chat_event_to_replay_log(canonical_stream, event_log, event);
             }
         }
         ChatEvent::ToolExecutionCompleted(completion) => {
-            if let Some(active) = replay_state.active_stream.as_mut() {
-                let belongs_to_active_stream = active.tool_events.iter().any(|buffered| {
+            replay_state
+                .active_tool_progress
+                .remove(&completion.tool_call_id);
+            replay_state
+                .active_background_progress
+                .remove(&completion.tool_call_id);
+            if let Some(active) = replay_state.active_stream.as_mut()
+                && active.tool_events.iter().any(|buffered| {
                     matches!(
                         buffered,
                         ChatEvent::ToolRequest(request)
                             if request.tool_call_id == completion.tool_call_id
                     )
-                });
-                if belongs_to_active_stream {
-                    active.tool_events.push(event.clone());
-                } else {
-                    push_chat_event_to_replay_log(canonical_stream, event_log, event);
-                }
+                })
+            {
+                active.tool_events.push(event.clone());
             } else {
-                replay_state.update_completed_stream_tool_snapshot(event);
                 push_chat_event_to_replay_log(canonical_stream, event_log, event);
             }
         }
@@ -11225,12 +10775,7 @@ fn record_chat_event_for_replay(
                 protocol::ToolProgressUpdate::AgentControl(state) => {
                     state.status == protocol::AgentControlProgressStatus::Running
                 }
-                protocol::ToolProgressUpdate::BackgroundTask(state) => {
-                    state.status == protocol::BackgroundTaskStatus::Running
-                }
-                protocol::ToolProgressUpdate::Other { status, .. } => {
-                    *status == protocol::OpaqueToolProgressStatus::Running
-                }
+                protocol::ToolProgressUpdate::Other { .. } => true,
             };
             if running {
                 replay_state
@@ -11239,33 +10784,17 @@ fn record_chat_event_for_replay(
             } else {
                 replay_state.active_tool_progress.remove(&data.tool_call_id);
             }
-            if let protocol::ToolProgressUpdate::BackgroundTask(task) = &data.update {
-                if task.status == protocol::BackgroundTaskStatus::Running {
-                    replay_state
-                        .active_background_progress
-                        .insert(data.tool_call_id.clone(), data.clone());
-                } else {
-                    replay_state
-                        .active_background_progress
-                        .remove(&data.tool_call_id);
-                }
-            }
-            if let protocol::ToolProgressUpdate::SubAgent(child) = &data.update {
-                if child.completed {
-                    replay_state
-                        .active_subagent_progress
-                        .remove(&data.tool_call_id);
-                } else {
-                    replay_state
-                        .active_subagent_progress
-                        .insert(data.tool_call_id.clone(), data.clone());
-                }
+            if data.execution_mode == ToolExecutionMode::Background {
+                replay_state
+                    .active_background_progress
+                    .insert(data.tool_call_id.clone(), data.clone());
             }
             if let Some(active) = replay_state.active_stream.as_mut() {
                 let existing = active.tool_events.iter_mut().find(|buffered| {
                     matches!(
                         buffered,
-                        ChatEvent::ToolProgress(p) if p.tool_call_id == data.tool_call_id
+                        ChatEvent::ToolProgress(progress)
+                            if progress.tool_call_id == data.tool_call_id
                     )
                 });
                 if let Some(existing) = existing {
@@ -11274,7 +10803,6 @@ fn record_chat_event_for_replay(
                     active.tool_events.push(event.clone());
                 }
             } else {
-                replay_state.update_completed_stream_tool_snapshot(event);
                 coalesce_progress_into_replay_log(
                     canonical_stream,
                     event_log,
@@ -11287,25 +10815,10 @@ fn record_chat_event_for_replay(
         ChatEvent::OperationCancelled(_) => {
             replay_state.operation_cancelled = true;
             if let Some(stream) = replay_state.active_stream.take() {
-                replay_state
-                    .terminal_stream_message_ids
-                    .insert(stream.message_id.clone());
-                let message = cancelled_stream_message(&stream);
-                if message_has_renderable_content(&message, !stream.tool_events.is_empty()) {
-                    replay_state
-                        .recorded_message_senders
-                        .insert(stream.message_id.clone(), message.sender.clone());
-                    push_chat_event_to_replay_log(
-                        canonical_stream,
-                        event_log,
-                        &ChatEvent::MessageAdded(message),
-                    );
-                }
                 for tool_event in stream.tool_events {
                     push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
                 }
             }
-            replay_state.completed_stream = None;
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
         ChatEvent::TypingStatusChanged(typing) => {
@@ -11313,290 +10826,19 @@ fn record_chat_event_for_replay(
             if *typing {
                 replay_state.operation_cancelled = false;
                 replay_state.resume_history_settled_idle = false;
-            }
-            if !typing {
-                replay_state.completed_stream = None;
-            }
-            push_chat_event_to_replay_log(canonical_stream, event_log, event);
-        }
-        ChatEvent::MessageAdded(message) => {
-            if let Some(message_id) = &message.message_id {
-                replay_state
-                    .recorded_message_senders
-                    .insert(message_id.clone(), message.sender.clone());
+            } else if replay_state.active_stream.take().is_some() {
+                tracing::warn!("discarding an unterminated response when the agent became idle");
             }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
-        ChatEvent::TaskUpdate(_)
+        ChatEvent::MessageAdded(_)
+        | ChatEvent::TaskUpdate(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
         | ChatEvent::ContextCompaction(_) => {
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
     }
-    Ok(())
-}
-
-fn validate_chat_event_stream_identity(
-    replay_state: &AgentReplayState,
-    event: &ChatEvent,
-) -> Result<(), StreamIdentityViolation> {
-    match event {
-        ChatEvent::StreamStart(start) => {
-            let message_id = required_replay_stream_message_id(start.required_message_id())?;
-            if replay_state.active_stream.is_some() {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
-            }
-            if replay_state
-                .terminal_stream_message_ids
-                .contains(&message_id)
-            {
-                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
-            }
-            if replay_state
-                .recorded_message_senders
-                .contains_key(&message_id)
-            {
-                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
-            }
-        }
-        ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
-            let Some(active) = replay_state.active_stream.as_ref() else {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
-            };
-            if message_id != active.message_id {
-                return Err(StreamIdentityViolation::ForeignActiveMessageId);
-            }
-        }
-        ChatEvent::StreamEnd(data) => {
-            let message_id = required_replay_chat_message_id(data.required_message_id())?;
-            let Some(active) = replay_state.active_stream.as_ref() else {
-                return Err(
-                    if replay_state
-                        .terminal_stream_message_ids
-                        .contains(&message_id)
-                    {
-                        StreamIdentityViolation::ConflictingDuplicateCompletion
-                    } else {
-                        StreamIdentityViolation::ForeignActiveMessageId
-                    },
-                );
-            };
-            if message_id != active.message_id {
-                return Err(StreamIdentityViolation::MismatchedEndMessageId);
-            }
-            if replay_state
-                .recorded_message_senders
-                .contains_key(&message_id)
-            {
-                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
-            }
-        }
-        ChatEvent::MessageAdded(message) => {
-            if let Some(message_id) = &message.message_id
-                && replay_state
-                    .recorded_message_senders
-                    .contains_key(message_id)
-            {
-                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// How the ingest loop should proceed after a stream identity violation.
-enum StreamIdentityRecovery {
-    /// The event has been rewritten (or the abandoned stream can be closed)
-    /// so processing may continue. `finalize_abandoned` closes the still-open
-    /// stream the backend walked away from before the event is applied.
-    Resync {
-        finalize_abandoned: Option<Box<ChatEvent>>,
-    },
-    /// No unambiguous interpretation exists; drop the event after reporting.
-    Unrecoverable,
-}
-
-/// A violation must cost one diagnostic, not the rest of the session. The two
-/// resyncable shapes are the ones with exactly one faithful interpretation:
-/// an id-less `StreamEnd` while a single stream is active can only be ending
-/// that stream, and a fresh `StreamStart` while another stream is active can
-/// only mean the backend abandoned the previous stream without ending it.
-/// Everything else (duplicates, mismatched ends, orphan deltas) stays
-/// report-and-drop because guessing would fabricate transcript state.
-fn recover_stream_identity_violation(
-    replay_state: &AgentReplayState,
-    event: &mut ChatEvent,
-    violation: StreamIdentityViolation,
-) -> StreamIdentityRecovery {
-    match (violation, event) {
-        (StreamIdentityViolation::MissingMessageId, ChatEvent::StreamEnd(end)) => {
-            let Some(active) = replay_state.active_stream.as_ref() else {
-                return StreamIdentityRecovery::Unrecoverable;
-            };
-            end.message.message_id = Some(active.message_id.clone());
-            StreamIdentityRecovery::Resync {
-                finalize_abandoned: None,
-            }
-        }
-        (StreamIdentityViolation::ForeignActiveMessageId, ChatEvent::StreamStart(_)) => {
-            let Some(active) = replay_state.active_stream.as_ref() else {
-                return StreamIdentityRecovery::Unrecoverable;
-            };
-            StreamIdentityRecovery::Resync {
-                finalize_abandoned: Some(Box::new(synthesized_end_for_abandoned_stream(active))),
-            }
-        }
-        _ => StreamIdentityRecovery::Unrecoverable,
-    }
-}
-
-fn synthesized_end_for_abandoned_stream(active: &ReplayActiveStream) -> ChatEvent {
-    ChatEvent::StreamEnd(StreamEndData {
-        message: cancelled_stream_message(active),
-    })
-}
-
-fn required_replay_stream_message_id(
-    message_id: Result<ChatMessageId, StreamIdentityViolation>,
-) -> Result<ChatMessageId, StreamIdentityViolation> {
-    message_id
-}
-
-fn required_replay_chat_message_id(
-    message_id: Result<ChatMessageId, StreamIdentityViolation>,
-) -> Result<ChatMessageId, StreamIdentityViolation> {
-    message_id
-}
-
-fn stream_identity_violation_event(violation: StreamIdentityViolation) -> ChatEvent {
-    let content = match violation {
-        StreamIdentityViolation::MissingMessageId => {
-            "Stream identity violation: missing message id"
-        }
-        StreamIdentityViolation::ForeignActiveMessageId => {
-            "Stream identity violation: foreign active message id"
-        }
-        StreamIdentityViolation::MismatchedEndMessageId => {
-            "Stream identity violation: mismatched end message id"
-        }
-        StreamIdentityViolation::DuplicateTerminalMessageId => {
-            "Stream identity violation: duplicate terminal message id"
-        }
-        StreamIdentityViolation::ConflictingDuplicateCompletion => {
-            "Stream identity violation: conflicting duplicate completion"
-        }
-    };
-    ChatEvent::MessageAdded(ChatMessage {
-        message_id: None,
-        timestamp: now_ms(),
-        sender: MessageSender::Error,
-        content: content.to_owned(),
-        reasoning: None,
-        tool_calls: Vec::new(),
-        model_info: None,
-        token_usage: None,
-        context_breakdown: None,
-        images: None,
-    })
-}
-
-fn cancelled_stream_message(stream: &ReplayActiveStream) -> ChatMessage {
-    ChatMessage {
-        message_id: Some(stream.message_id.clone()),
-        timestamp: now_ms(),
-        sender: MessageSender::Assistant {
-            agent: stream.start.agent.clone(),
-        },
-        content: stream.text.clone(),
-        reasoning: (!stream.reasoning.is_empty()).then(|| ReasoningData {
-            text: stream.reasoning.clone(),
-            tokens: None,
-            signature: None,
-            blob: None,
-        }),
-        tool_calls: Vec::new(),
-        model_info: stream.start.model.clone().map(|model| ModelInfo { model }),
-        token_usage: None,
-        context_breakdown: None,
-        images: None,
-    }
-}
-
-fn message_has_renderable_content(message: &ChatMessage, has_tool_events: bool) -> bool {
-    !message.content.trim().is_empty()
-        || message
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
-        || !message.tool_calls.is_empty()
-        || message
-            .images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-        || has_tool_events
-}
-
-fn same_chat_message(expected: &ChatMessage, actual: &ChatMessage) -> bool {
-    if let Some(message_id) = &expected.message_id {
-        return actual.message_id.as_ref() == Some(message_id);
-    }
-    actual.message_id.is_none()
-        && actual.timestamp == expected.timestamp
-        && actual.content == expected.content
-        && same_message_sender(&actual.sender, &expected.sender)
-}
-
-fn same_message_sender(left: &MessageSender, right: &MessageSender) -> bool {
-    match (left, right) {
-        (MessageSender::User, MessageSender::User)
-        | (MessageSender::System, MessageSender::System)
-        | (MessageSender::Warning, MessageSender::Warning)
-        | (MessageSender::Error, MessageSender::Error) => true,
-        (MessageSender::Assistant { agent: left }, MessageSender::Assistant { agent: right }) => {
-            left == right
-        }
-        _ => false,
-    }
-}
-
-fn chat_event_tool_call_id(event: &ChatEvent) -> Option<&str> {
-    match event {
-        ChatEvent::ToolRequest(request) => Some(request.tool_call_id.as_str()),
-        ChatEvent::ToolProgress(progress) => Some(progress.tool_call_id.as_str()),
-        ChatEvent::ToolExecutionCompleted(completion) => Some(completion.tool_call_id.as_str()),
-        _ => None,
-    }
-}
-
-fn upsert_tool_event(events: &mut Vec<ChatEvent>, event: &ChatEvent) -> bool {
-    let Some(tool_call_id) = chat_event_tool_call_id(event) else {
-        return false;
-    };
-    for existing in events {
-        let Some(existing_tool_call_id) = chat_event_tool_call_id(existing) else {
-            continue;
-        };
-        if existing_tool_call_id == tool_call_id && same_tool_event_kind(existing, event) {
-            *existing = event.clone();
-            return true;
-        }
-    }
-    false
-}
-
-fn same_tool_event_kind(left: &ChatEvent, right: &ChatEvent) -> bool {
-    matches!(
-        (left, right),
-        (ChatEvent::ToolRequest(_), ChatEvent::ToolRequest(_))
-            | (ChatEvent::ToolProgress(_), ChatEvent::ToolProgress(_))
-            | (
-                ChatEvent::ToolExecutionCompleted(_),
-                ChatEvent::ToolExecutionCompleted(_)
-            )
-    )
 }
 
 /// Latest-wins coalescing for `ToolProgress`: at most one envelope per
@@ -11901,6 +11143,26 @@ fn rendered_activity_entries_len(entries: &[(u64, String)]) -> usize {
         .sum()
 }
 
+fn tool_request_label(tool_type: &ToolRequestType) -> &'static str {
+    match tool_type {
+        ToolRequestType::ModifyFile { .. } => "modify_file",
+        ToolRequestType::RunCommand { .. } => "run_command",
+        ToolRequestType::ReadFiles { .. } => "read_files",
+        ToolRequestType::SearchTypes { .. } => "search_types",
+        ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
+        ToolRequestType::AskUserQuestion { .. } => "ask_user_question",
+        ToolRequestType::ExitPlanMode { .. } => "exit_plan_mode",
+        ToolRequestType::AgentSpawn { .. } => "agent_spawn",
+        ToolRequestType::GenerateImage { .. } => "generate_image",
+        ToolRequestType::WebSearch { .. } => "web_search",
+        ToolRequestType::ViewImage { .. } => "view_image",
+        ToolRequestType::Sleep { .. } => "sleep",
+        ToolRequestType::TydeSendAgentMessage { .. } => "tyde_send_agent_message",
+        ToolRequestType::TydeAwaitAgents { .. } => "tyde_await_agents",
+        ToolRequestType::Other { .. } => "other",
+    }
+}
+
 fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
     match event {
         ChatEvent::MessageAdded(message) => {
@@ -11954,16 +11216,19 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
         }
         ChatEvent::ToolRequest(request) => Some(format!(
             "Tool requested: {} [{}]",
-            request.tool_name, request.tool_call_id
+            tool_request_label(&request.tool_type),
+            request.tool_call_id
         )),
-        ChatEvent::ToolProgress(progress) => Some(format!("Tool progress: {}", progress.tool_name)),
+        ChatEvent::ToolProgress(progress) => {
+            Some(format!("Tool progress: {}", progress.tool_call_id))
+        }
         ChatEvent::ToolExecutionCompleted(completion) => Some(format!(
             "Tool {} {}",
-            completion.tool_name,
-            if completion.success {
-                "completed"
-            } else {
-                "failed"
+            completion.tool_call_id,
+            match &completion.outcome {
+                ToolExecutionOutcome::Succeeded { .. } => "completed",
+                ToolExecutionOutcome::Failed { .. } => "failed",
+                ToolExecutionOutcome::Cancelled { .. } => "was cancelled",
             }
         )),
         ChatEvent::TaskUpdate(tasks) => {
@@ -12973,18 +12238,9 @@ fn attach_subscriber_with_latest_output(
 
 fn filtered_session_history_entries_from_log(
     event_log: &[Envelope],
-    replay_state: Option<&AgentReplayState>,
+    _replay_state: Option<&AgentReplayState>,
 ) -> Vec<(u64, ChatEvent)> {
-    let completed_stream_filter =
-        replay_state.and_then(AgentReplayState::active_completed_stream_history_filter);
     session_history_entries_from_log(event_log)
-        .into_iter()
-        .filter(|(_, event)| {
-            completed_stream_filter
-                .as_ref()
-                .is_none_or(|filter| !filter.matches(event))
-        })
-        .collect()
 }
 
 fn initial_history_tail_entries(entries: &[(u64, ChatEvent)]) -> Vec<(u64, ChatEvent)> {
@@ -13057,7 +12313,7 @@ async fn authoritative_session_history_window(
     session_id: &SessionId,
     before_seq: Option<u64>,
     limit: usize,
-    completed_stream_filter: Option<CompletedStreamHistoryFilter>,
+    _completed_stream_filter: Option<()>,
 ) -> Option<SessionHistoryWindow> {
     if !store.actor_io_enabled() {
         return None;
@@ -13082,14 +12338,7 @@ async fn authoritative_session_history_window(
             })
             .map(|record| (record.sequence, record.event))
             .collect::<Vec<_>>();
-        let entries = project_session_history_entries(entries)
-            .into_iter()
-            .filter(|(_, event)| {
-                completed_stream_filter
-                    .as_ref()
-                    .is_none_or(|filter| !filter.matches(event))
-            })
-            .collect::<Vec<_>>();
+        let entries = project_session_history_entries(entries);
         let end = entries.len();
         let start = history_start_for_message_limit(&entries, end, limit.max(1));
         let selected = &entries[start..end];
@@ -13145,22 +12394,17 @@ fn history_message_terminal(event: &ChatEvent) -> bool {
 }
 
 fn history_message_start(entries: &[(u64, ChatEvent)], terminal_index: usize) -> usize {
-    let ChatEvent::StreamEnd(end) = &entries[terminal_index].1 else {
+    let ChatEvent::StreamEnd(_) = &entries[terminal_index].1 else {
         return terminal_index;
     };
-    let Some(message_id) = end.message.message_id.as_ref() else {
-        return terminal_index;
-    };
-    entries[..terminal_index]
-        .iter()
-        .rposition(|(_, event)| {
-            matches!(
-                event,
-                ChatEvent::StreamStart(start)
-                    if start.message_id.as_deref() == Some(message_id.0.as_str())
-            )
-        })
-        .unwrap_or(terminal_index)
+    for index in (0..terminal_index).rev() {
+        match &entries[index].1 {
+            ChatEvent::StreamStart(_) => return index,
+            ChatEvent::MessageAdded(_) | ChatEvent::StreamEnd(_) => break,
+            _ => {}
+        }
+    }
+    terminal_index
 }
 
 /// Older session logs persisted provider-native collaboration payloads as
@@ -13179,7 +12423,7 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
                 let action = args
                     .get("tool")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or(request.tool_name.as_str());
+                    .unwrap_or("collaboration");
                 if prompt.is_some()
                     && matches!(action.to_ascii_lowercase().as_str(), "spawn" | "spawnagent")
                 {
@@ -13196,7 +12440,7 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
                         }),
                     };
                 }
-            } else if legacy_claude_agent_request(&request.tool_name, args) {
+            } else if legacy_claude_agent_request(args) {
                 let prompt = ["prompt", "task", "instruction", "message"]
                     .into_iter()
                     .find_map(|key| nonempty_json_string(args, key));
@@ -13219,31 +12463,28 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
             }
         }
         ChatEvent::ToolExecutionCompleted(completion) => {
-            let ToolExecutionResult::Other { result } = &completion.tool_result else {
+            let ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other { result },
+            } = &mut completion.outcome
+            else {
                 return;
             };
             if legacy_codex_collaboration_value(result) {
                 let action = result
                     .get("tool")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or(completion.tool_name.as_str());
-                completion.tool_result = ToolExecutionResult::Other {
-                    result: serde_json::json!({
-                        "action": action,
-                        "status": if completion.success { "completed" } else { "failed" },
-                        "agent_count": legacy_codex_agent_count(result),
-                    }),
-                };
-                completion.error =
-                    (!completion.success).then(|| format!("{} failed", completion.tool_name));
-            } else if legacy_claude_agent_result(&completion.tool_name, result) {
-                completion.tool_result = ToolExecutionResult::Other {
-                    result: serde_json::json!({
-                        "status": if completion.success { "completed" } else { "failed" },
-                    }),
-                };
-                completion.error =
-                    (!completion.success).then(|| format!("{} failed", completion.tool_name));
+                    .unwrap_or("collaboration")
+                    .to_owned();
+                let agent_count = legacy_codex_agent_count(result);
+                *result = serde_json::json!({
+                    "action": action,
+                    "status": "completed",
+                    "agent_count": agent_count,
+                });
+            } else if legacy_claude_agent_result(result) {
+                *result = serde_json::json!({
+                    "status": "completed",
+                });
             }
         }
         _ => {}
@@ -13282,9 +12523,8 @@ fn legacy_codex_agent_count(value: &serde_json::Value) -> usize {
         .map_or(0, serde_json::Map::len)
 }
 
-fn legacy_claude_agent_request(tool_name: &str, args: &serde_json::Value) -> bool {
-    matches!(tool_name, "Task" | "Agent")
-        && args.get("prompt").is_some()
+fn legacy_claude_agent_request(args: &serde_json::Value) -> bool {
+    args.get("prompt").is_some()
         && [
             "subagent_type",
             "run_in_background",
@@ -13295,17 +12535,16 @@ fn legacy_claude_agent_request(tool_name: &str, args: &serde_json::Value) -> boo
         .any(|key| args.get(key).is_some())
 }
 
-fn legacy_claude_agent_result(tool_name: &str, result: &serde_json::Value) -> bool {
-    matches!(tool_name, "Task" | "Agent")
-        && [
-            "agentId",
-            "agent_id",
-            "session_id",
-            "task_id",
-            "output_file",
-        ]
-        .into_iter()
-        .any(|key| result.get(key).is_some())
+fn legacy_claude_agent_result(result: &serde_json::Value) -> bool {
+    [
+        "agentId",
+        "agent_id",
+        "session_id",
+        "task_id",
+        "output_file",
+    ]
+    .into_iter()
+    .any(|key| result.get(key).is_some())
 }
 
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {

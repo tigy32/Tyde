@@ -676,6 +676,7 @@ pub struct SessionHistoryState {
 
 #[derive(Clone, Debug)]
 pub struct ToolRequestEntry {
+    pub tool_name: String,
     pub request: ToolRequest,
     pub result: Option<ToolExecutionCompletedData>,
 }

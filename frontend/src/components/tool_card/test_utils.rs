@@ -8,8 +8,47 @@
 
 use leptos::IntoView;
 use leptos::mount::mount_to;
+use protocol::{
+    ToolExecutionCompletedData, ToolExecutionNormalizationFailure, ToolExecutionOutcome,
+    ToolExecutionResult,
+};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
+
+pub fn succeeded_completion(
+    tool_call_id: &str,
+    result: ToolExecutionResult,
+) -> ToolExecutionCompletedData {
+    ToolExecutionCompletedData {
+        tool_call_id: tool_call_id.to_owned(),
+        outcome: ToolExecutionOutcome::Succeeded { result },
+    }
+}
+
+pub fn failed_completion(
+    tool_call_id: &str,
+    message: &str,
+    details: Option<&str>,
+    normalization_failure: Option<ToolExecutionNormalizationFailure>,
+) -> ToolExecutionCompletedData {
+    ToolExecutionCompletedData {
+        tool_call_id: tool_call_id.to_owned(),
+        outcome: ToolExecutionOutcome::Failed {
+            message: message.to_owned(),
+            details: details.map(str::to_owned),
+            normalization_failure,
+        },
+    }
+}
+
+pub fn cancelled_completion(tool_call_id: &str, message: &str) -> ToolExecutionCompletedData {
+    ToolExecutionCompletedData {
+        tool_call_id: tool_call_id.to_owned(),
+        outcome: ToolExecutionOutcome::Cancelled {
+            message: message.to_owned(),
+        },
+    }
+}
 
 /// Append a sized container to the body so child elements have real layout.
 pub fn make_container() -> HtmlElement {

@@ -387,8 +387,7 @@ mod wasm_tests {
     use crate::state::{AgentInfo, AppState, TabContent, ToolRequestEntry};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, AskUserQuestionOption, BackendKind, StreamPath,
-        ToolExecutionCompletedData, ToolRequest,
+        AgentId, AgentOrigin, AskUserQuestionOption, BackendKind, StreamPath, ToolRequest,
     };
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_test::*;
@@ -760,21 +759,17 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn completed_tool_card_stays_open_for_answering() {
         let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
-                tool_result: ToolExecutionResult::Other {
+            result: Some(succeeded_completion(
+                "toolu_ask",
+                ToolExecutionResult::Other {
                     result: serde_json::json!({}),
                 },
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            )),
         };
         let container = mount_with_state(move || {
             view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
@@ -798,21 +793,17 @@ mod wasm_tests {
         // longer answerable. Mirror mobile: render the normal completion body,
         // not the interactive card.
         let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
-                tool_result: ToolExecutionResult::Other {
-                    result: serde_json::json!({ "error": "question failed" }),
-                },
-                success: false,
-                error: Some("question failed".to_owned()),
-                normalization_failure: None,
-            }),
+            result: Some(failed_completion(
+                "toolu_ask",
+                "question failed",
+                None,
+                None,
+            )),
         };
         let container = mount_with_state(move || {
             view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
@@ -1096,9 +1087,9 @@ mod wasm_tests {
         );
 
         let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask_agent_a".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
             result: None,

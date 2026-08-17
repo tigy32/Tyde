@@ -197,6 +197,9 @@ fn assert_bootstrap_tail_messages(
             AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => {
                 Some(message.content.as_str())
             }
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => {
+                Some(end.message.content.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -259,18 +262,28 @@ fn assert_history_page(
 ) {
     assert_eq!(
         page.events.len(),
-        expected_newest_first.len(),
+        expected_newest_first.len() * 3,
         "unexpected SessionHistory event count: {:?}",
         page.events
     );
-    for (event, expected) in page.events.iter().zip(expected_newest_first) {
-        let ChatEvent::MessageAdded(message) = event else {
-            panic!("expected MessageAdded history event, got {event:?}");
+    for (response, expected) in page.events.chunks_exact(3).zip(expected_newest_first) {
+        let [
+            ChatEvent::StreamEnd(end),
+            ChatEvent::StreamDelta(delta),
+            ChatEvent::StreamStart(_),
+        ] = response
+        else {
+            panic!("expected newest-first response boundary, got {response:?}");
         };
         assert!(
-            message.content.contains(expected),
+            end.message.content.contains(expected),
             "history message content {:?} did not contain {expected:?}",
-            message.content
+            end.message.content
+        );
+        assert!(
+            delta.text.contains(expected),
+            "history delta text {:?} did not contain {expected:?}",
+            delta.text
         );
     }
     assert_eq!(page.has_more_before, expected_has_more_before);
@@ -706,12 +719,11 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
         true,
     );
     assert!(
-        first_page.events.iter().all(|event| {
-            !matches!(
-                event,
-                ChatEvent::MessageAdded(message)
-                    if message.content.contains("new visible message")
-            )
+        first_page.events.iter().all(|event| match event {
+            ChatEvent::MessageAdded(message) => !message.content.contains("new visible message"),
+            ChatEvent::StreamDelta(delta) => !delta.text.contains("new visible message"),
+            ChatEvent::StreamEnd(end) => !end.message.content.contains("new visible message"),
+            _ => true,
         }),
         "first history fetch must not duplicate live rows: {:?}",
         first_page.events
@@ -1267,29 +1279,32 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
     assert_bootstrap_has_no_prior_history_indicator(&payload);
     assert_bootstrap_tail_messages(&payload, &["parent ready"]);
+    let active_start_index = payload
+        .events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(_))
+            )
+        })
+        .expect("active StreamStart should be replayed in AgentBootstrap");
+    let active_events = &payload.events[active_start_index + 1..];
     assert!(
-        payload.events.iter().any(|event| matches!(
-            event,
-            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(_))
-        )),
-        "active StreamStart should be replayed in AgentBootstrap: {:?}",
-        payload.events
-    );
-    assert!(
-        payload.events.iter().any(|event| matches!(
+        active_events.iter().any(|event| matches!(
             event,
             AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(request))
-                if request.tool_name == "tyde_await_agents"
+                if fixture::tool_request_name(request) == "tyde_await_agents"
         )),
         "active tool request should be replayed in AgentBootstrap: {:?}",
         payload.events
     );
     assert!(
-        payload.events.iter().all(|event| !matches!(
+        active_events.iter().all(|event| !matches!(
             event,
             AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(_))
         )),
-        "active bootstrap should not synthesize a completed prior turn: {:?}",
+        "active response should remain open after its final StreamStart: {:?}",
         payload.events
     );
 

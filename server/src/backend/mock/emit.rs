@@ -6,8 +6,8 @@ use protocol::{
     CompactionTrigger, MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo,
     OperationCancelledData, OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent,
     OrchestrationId, OrchestrationPayload, SessionId, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData, ToolExecutionResult,
-    ToolProgressData, ToolRequest, ToolRequestType,
+    StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData, ToolExecutionOutcome,
+    ToolExecutionResult, ToolProgressData, ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,23 +86,15 @@ pub(super) fn typing(active: bool) -> BackendEvent {
     chat(ChatEvent::TypingStatusChanged(active))
 }
 
-pub(super) fn stream_start(
-    message_id: Option<String>,
-    agent: &str,
-    model: Option<String>,
-) -> BackendEvent {
+pub(super) fn stream_start(agent: &str, model: Option<String>) -> BackendEvent {
     chat(ChatEvent::StreamStart(StreamStartData {
-        message_id,
         agent: agent.to_owned(),
         model,
     }))
 }
 
-pub(super) fn stream_delta(message_id: Option<String>, text: String) -> BackendEvent {
-    chat(ChatEvent::StreamDelta(StreamTextDeltaData {
-        message_id,
-        text,
-    }))
+pub(super) fn stream_delta(text: String) -> BackendEvent {
+    chat(ChatEvent::StreamDelta(StreamTextDeltaData { text }))
 }
 
 pub(super) fn stream_end(message: ChatMessage) -> BackendEvent {
@@ -139,7 +131,7 @@ pub(super) fn empty_agent_control_output_frames() -> Vec<BackendEvent> {
     let empty_output_message_id = ChatMessageId(Uuid::new_v4().to_string());
     vec![
         typing(true),
-        stream_start(Some(empty_output_message_id.0.clone()), "mock", None),
+        stream_start("mock", None),
         stream_end(ChatMessage {
             reasoning: Some(protocol::ReasoningData {
                 text: "hidden reasoning".to_owned(),
@@ -269,11 +261,7 @@ pub(super) fn compact_turn_frames(
     vec![
         typing(true),
         user_bubble(prompt),
-        stream_start(
-            Some(message_id.0.clone()),
-            "mock",
-            Some(MOCK_MODEL.to_owned()),
-        ),
+        stream_start("mock", Some(MOCK_MODEL.to_owned())),
         compaction_observation(
             session_id,
             prompt_index,
@@ -315,32 +303,24 @@ pub(super) fn agent_control_send_message_frames(
     agent_id: AgentId,
     message: String,
 ) -> Vec<BackendEvent> {
-    let message_id = Some(Uuid::new_v4().to_string());
     let tool_call_id = format!("mock-agent-control-send-message-{}", Uuid::new_v4());
-    let tool_name = "tyde_send_agent_message";
     let response_text = "mock agent-control message delivered".to_owned();
 
     vec![
         typing(true),
-        stream_start(message_id.clone(), "mock", Some(MOCK_MODEL.to_owned())),
+        stream_start("mock", Some(MOCK_MODEL.to_owned())),
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.to_owned(),
             tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message },
         }),
         tool_completed(ToolExecutionCompletedData {
             tool_call_id,
-            tool_name: tool_name.to_owned(),
-            tool_result: ToolExecutionResult::TydeSendAgentMessage,
-            success: true,
-            error: None,
-            normalization_failure: None,
+            outcome: ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::TydeSendAgentMessage,
+            },
         }),
-        stream_delta(message_id.clone(), response_text.clone()),
-        stream_end(mock_assistant_message(
-            message_id.map(ChatMessageId),
-            response_text,
-        )),
+        stream_delta(response_text.clone()),
+        stream_end(mock_assistant_message(None, response_text)),
         typing(false),
     ]
 }
@@ -355,12 +335,8 @@ pub(super) fn exit_plan_mode_request_frames(
     let mut frames = vec![typing(true)];
     if stream_end_before_request {
         let message_id = Some(Uuid::new_v4().to_string());
-        frames.push(stream_start(
-            message_id.clone(),
-            "mock",
-            Some(MOCK_MODEL.to_owned()),
-        ));
-        frames.push(stream_delta(message_id.clone(), WAITING_TEXT.to_owned()));
+        frames.push(stream_start("mock", Some(MOCK_MODEL.to_owned())));
+        frames.push(stream_delta(WAITING_TEXT.to_owned()));
         frames.push(stream_end(mock_assistant_message(
             message_id.map(ChatMessageId),
             WAITING_TEXT.to_owned(),
@@ -373,7 +349,6 @@ pub(super) fn exit_plan_mode_request_frames(
     }
     frames.push(tool_request(ToolRequest {
         tool_call_id: tool_call_id.to_owned(),
-        tool_name: "ExitPlanMode".to_owned(),
         tool_type: ToolRequestType::ExitPlanMode {
             plan: Some(plan.to_owned()),
             plan_path: Some(plan_path.to_owned()),
@@ -401,16 +376,14 @@ pub(super) fn exit_plan_mode_completion(
 
     let completion = tool_completed(ToolExecutionCompletedData {
         tool_call_id: tool_call_id.to_owned(),
-        tool_name: "ExitPlanMode".to_owned(),
-        tool_result: ToolExecutionResult::Other {
-            result: serde_json::json!({
-                "decision": decision_label,
-                "feedback": feedback,
-            }),
+        outcome: ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::Other {
+                result: serde_json::json!({
+                    "decision": decision_label,
+                    "feedback": feedback,
+                }),
+            },
         },
-        success: true,
-        error: None,
-        normalization_failure: None,
     });
     (completion, message)
 }
@@ -421,7 +394,6 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
         typing(true),
         tool_request(ToolRequest {
             tool_call_id: TOOL_CALL_ID.to_owned(),
-            tool_name: "Bash".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "printf done".to_owned(),
                 working_directory: "/tmp/test".to_owned(),
@@ -429,15 +401,13 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
         }),
         tool_completed(ToolExecutionCompletedData {
             tool_call_id: TOOL_CALL_ID.to_owned(),
-            tool_name: "Bash".to_owned(),
-            tool_result: ToolExecutionResult::RunCommand {
-                exit_code: 0,
-                stdout: "done".to_owned(),
-                stderr: String::new(),
+            outcome: ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: "done".to_owned(),
+                    stderr: String::new(),
+                },
             },
-            success: true,
-            error: None,
-            normalization_failure: None,
         }),
         warning_card("Codex warning: Internal server error"),
         typing(false),
@@ -446,13 +416,11 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
 }
 
 pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<BackendEvent> {
-    let message_id = Some(Uuid::new_v4().to_string());
     vec![
         typing(true),
-        stream_start(message_id, "mock", Some(MOCK_MODEL.to_owned())),
+        stream_start("mock", Some(MOCK_MODEL.to_owned())),
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
-            tool_name: "Bash".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "mock interrupted command".to_owned(),
                 working_directory: "/tmp/test".to_owned(),
@@ -460,17 +428,11 @@ pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<Backen
         }),
         tool_completed(ToolExecutionCompletedData {
             tool_call_id: tool_call_id.to_owned(),
-            tool_name: "Bash".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "Tool execution was interrupted".to_owned(),
-                detailed_message: "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned(),
+            outcome: ToolExecutionOutcome::Failed {
+                message: "Tool execution was interrupted".to_owned(),
+                details: Some("Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned()),
+                normalization_failure: None,
             },
-            success: false,
-            error: Some(
-                "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted."
-                    .to_owned(),
-            ),
-            normalization_failure: None,
         }),
     ]
 }
@@ -491,7 +453,6 @@ pub(super) async fn spawn_native_child(
     };
     let _ = events_tx.send_event(tool_request(ToolRequest {
         tool_call_id: tool_use_id.clone(),
-        tool_name: "Agent".to_owned(),
         tool_type: ToolRequestType::AgentSpawn {
             prompt: Some(child.prompt.clone()),
             name: Some(child.name.clone()),
@@ -560,19 +521,16 @@ const LIVE_NATIVE_CHILD_TEXT: &str = "mock live native child working";
 const LIVE_NATIVE_CHILD_AGENT: &str = "mock-live-native-child";
 
 fn emit_live_native_child_stream(handle: &SubAgentHandle) {
-    let message_id = Some(live_native_child_message_id(handle));
     let _ = handle.event_tx.send(ChatEvent::TypingStatusChanged(true));
     let _ = handle
         .event_tx
         .send(ChatEvent::StreamStart(StreamStartData {
-            message_id: message_id.clone(),
             agent: LIVE_NATIVE_CHILD_AGENT.to_owned(),
             model: Some(MOCK_MODEL.to_owned()),
         }));
     let _ = handle
         .event_tx
         .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-            message_id,
             text: LIVE_NATIVE_CHILD_TEXT.to_owned(),
         }));
 }
@@ -612,12 +570,10 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
 
     let _ = event_tx.send(ChatEvent::TypingStatusChanged(true));
     let _ = event_tx.send(ChatEvent::StreamStart(StreamStartData {
-        message_id: message_id.clone(),
         agent: "mock-native-child".to_owned(),
         model: Some(MOCK_MODEL.to_owned()),
     }));
     let _ = event_tx.send(ChatEvent::StreamDelta(StreamTextDeltaData {
-        message_id: message_id.clone(),
         text: response_text.clone(),
     }));
     let _ = event_tx.send(ChatEvent::StreamEnd(StreamEndData {
@@ -697,7 +653,6 @@ pub(super) async fn agent_control_await(
 
     if !events_tx.send_event(tool_request(ToolRequest {
         tool_call_id: tool_call_id.clone(),
-        tool_name: tool_name.to_owned(),
         tool_type: ToolRequestType::TydeAwaitAgents {
             agent_ids: typed_agent_ids,
         },
@@ -714,50 +669,41 @@ pub(super) async fn agent_control_await(
         Some(config) => call_agent_control_await_mcp(config, &agent_ids).await,
         None => Err("mock backend has no tyde-agent-await MCP server".to_owned()),
     };
-    let (success, tool_result, error, response_text, normalization_failure) = match result {
+    let (outcome, response_text) = match result {
         Ok(body) => match tyde_tool_result(tool_name, &body) {
             Ok(Some(tool_result)) => (
-                true,
-                tool_result,
-                None,
+                ToolExecutionOutcome::Succeeded {
+                    result: tool_result,
+                },
                 format!("mock agent-control await completed: {body}"),
-                None,
             ),
             Ok(None) => unreachable!("canonical await tool must normalize"),
             Err(error) => (
-                false,
-                ToolExecutionResult::Error {
-                    short_message: "tyde_await_agents result normalization failed".to_owned(),
-                    detailed_message: error.to_string(),
+                ToolExecutionOutcome::Failed {
+                    message: "tyde_await_agents result normalization failed".to_owned(),
+                    details: Some(error.to_string()),
+                    normalization_failure: Some(error.normalization_failure),
                 },
-                Some(error.to_string()),
                 format!("mock agent-control await normalization failed: {error}"),
-                Some(error.normalization_failure),
             ),
         },
         Err(error) => (
-            false,
-            ToolExecutionResult::Error {
-                short_message: "tyde_await_agents failed".to_owned(),
-                detailed_message: error.clone(),
+            ToolExecutionOutcome::Failed {
+                message: "tyde_await_agents failed".to_owned(),
+                details: Some(error.clone()),
+                normalization_failure: None,
             },
-            Some(error.clone()),
             format!("mock agent-control await failed: {error}"),
-            None,
         ),
     };
 
     if !events_tx.send_event(tool_completed(ToolExecutionCompletedData {
         tool_call_id,
-        tool_name: tool_name.to_owned(),
-        tool_result,
-        success,
-        error,
-        normalization_failure,
+        outcome,
     })) {
         return false;
     }
-    if !events_tx.send_event(stream_delta(message_id.clone(), response_text.clone())) {
+    if !events_tx.send_event(stream_delta(response_text.clone())) {
         return false;
     }
     events_tx.send_event(stream_end(mock_assistant_message(

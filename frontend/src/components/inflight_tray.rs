@@ -34,10 +34,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentId, BackendKind, BackgroundTaskState, BackgroundTaskStatus,
-    CancelQueuedMessagePayload, FrameKind, QueuedMessageId, SendQueuedMessageNowPayload,
-    SessionSettingValue, SubAgentProgress, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
-    WorkflowRunStatus,
+    AgentActivitySummaryState, AgentId, BackendKind, CancelQueuedMessagePayload, FrameKind,
+    QueuedMessageId, SendQueuedMessageNowPayload, SessionSettingValue, SubAgentProgress,
+    ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
@@ -239,7 +238,21 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
             if *agent_id != parent.agent_id {
                 continue;
             }
-            match progress.get().update {
+            let completed = state
+                .chat_row_for_tool_untracked(agent_id, &call_id.0)
+                .and_then(|row| row.message_entry().cloned())
+                .is_some_and(|entry| {
+                    entry.with(|entry| {
+                        entry.tool_requests.iter().any(|tool| {
+                            tool.request.tool_call_id == call_id.0 && tool.result.is_some()
+                        })
+                    })
+                });
+            if completed {
+                continue;
+            }
+            let progress = progress.get();
+            match progress.update {
                 ToolProgressUpdate::Workflow(run) => {
                     if run.status == WorkflowRunStatus::Running {
                         snapshot.counts.running += 1;
@@ -256,8 +269,8 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
                     snapshot.counts.running += 1;
                     snapshot.subagents.push(call_id.clone());
                 }
-                ToolProgressUpdate::BackgroundTask(task)
-                    if task.status == BackgroundTaskStatus::Running =>
+                ToolProgressUpdate::Other { .. }
+                    if progress.execution_mode == ToolExecutionMode::Background =>
                 {
                     snapshot.counts.running += 1;
                     snapshot.commands.push(call_id.clone());
@@ -642,16 +655,6 @@ fn WorkflowRow(
     }
 }
 
-fn background_status_label(status: BackgroundTaskStatus) -> &'static str {
-    match status {
-        BackgroundTaskStatus::Running => "Running",
-        BackgroundTaskStatus::Completed => "Completed",
-        BackgroundTaskStatus::Stopped => "Stopped",
-        BackgroundTaskStatus::Failed => "Failed",
-        BackgroundTaskStatus::Unknown => "Unknown",
-    }
-}
-
 /// One backgrounded shell command, shown only while it runs (the tray is
 /// active-only); the row carries the actual command.
 #[component]
@@ -661,36 +664,37 @@ fn CommandRow(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let task: Signal<Option<BackgroundTaskState>> = Signal::derive({
+    let title: Signal<Option<String>> = Signal::derive({
         let state = state.clone();
         let tool_call_id = tool_call_id.clone();
         move || {
             let parent = parent_ref.get()?;
-            let key = (parent.agent_id, tool_call_id.clone());
+            let key = (parent.agent_id.clone(), tool_call_id.clone());
             let progress = state.tool_progress.with(|map| map.get(&key).cloned())?;
-            match progress.get().update {
-                ToolProgressUpdate::BackgroundTask(task) => Some(task),
-                _ => None,
+            if progress.get().execution_mode != ToolExecutionMode::Background {
+                return None;
             }
+            state
+                .chat_row_for_tool_untracked(&parent.agent_id, &tool_call_id.0)
+                .and_then(|row| row.message_entry().cloned())
+                .and_then(|entry| {
+                    entry.with(|entry| {
+                        entry
+                            .tool_requests
+                            .iter()
+                            .find(|tool| tool.request.tool_call_id == tool_call_id.0)
+                            .map(|tool| match &tool.request.tool_type {
+                                ToolRequestType::RunCommand { command, .. } => command.clone(),
+                                _ => tool.tool_name.clone(),
+                            })
+                    })
+                })
+                .or_else(|| Some("Background tool".to_owned()))
         }
     });
 
-    let title = move || {
-        task.get().map(|task| {
-            let fallback = || format!("Background command {}", task.task_id);
-            task.description.clone().unwrap_or_else(fallback)
-        })
-    };
-
-    let status_label = move || {
-        task.get()
-            .map(|task| background_status_label(task.status).to_owned())
-    };
-    let status_class = move || match task.get().map(|task| task.status) {
-        Some(BackgroundTaskStatus::Running) => "tool-live-agent-status running",
-        Some(BackgroundTaskStatus::Failed) => "tool-live-agent-status failed",
-        _ => "tool-live-agent-status idle",
-    };
+    let status_label = || "Running";
+    let status_class = || "tool-live-agent-status running";
 
     view! {
         <div class="tool-live-agent-row inflight-tray-row">
@@ -1072,7 +1076,10 @@ fn truncate_inline(text: &str, max_chars: usize) -> String {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::components::tool_card::test_utils::{count, make_container, next_tick, text};
+    use crate::components::tool_card::test_utils::{
+        cancelled_completion, count, failed_completion, make_container, next_tick,
+        succeeded_completion, text,
+    };
     use crate::dispatch::{ChatEventSource, apply_chat_event, apply_chat_event_from};
     use crate::state::{AgentInfo, ToolCallId};
     use leptos::mount::mount_to;
@@ -1347,7 +1354,7 @@ mod wasm_tests {
                     (parent_ref().agent_id, ToolCallId("call-fatal".to_owned())),
                     ArcRwSignal::new(ToolProgressData {
                         tool_call_id: "call-fatal".to_owned(),
-                        tool_name: "Workflow".to_owned(),
+                        execution_mode: ToolExecutionMode::Foreground,
                         update: ToolProgressUpdate::Workflow(WorkflowRunState {
                             workflow_name: "stale-workflow".to_owned(),
                             description: None,
@@ -1395,7 +1402,7 @@ mod wasm_tests {
                     (parent_ref().agent_id, ToolCallId("call-1".to_owned())),
                     ArcRwSignal::new(ToolProgressData {
                         tool_call_id: "call-1".to_owned(),
-                        tool_name: "Workflow".to_owned(),
+                        execution_mode: ToolExecutionMode::Foreground,
                         update: ToolProgressUpdate::Workflow(run),
                     }),
                 );
@@ -1417,27 +1424,22 @@ mod wasm_tests {
         );
     }
 
-    fn background_command_progress(
-        status: BackgroundTaskStatus,
-        summary: Option<&str>,
-    ) -> ToolProgressData {
+    fn background_command_progress() -> ToolProgressData {
         ToolProgressData {
             tool_call_id: "toolu_bg_bash".to_owned(),
-            tool_name: "Bash".to_owned(),
-            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                task_id: "task-bg".to_owned(),
-                description: Some("./dev.sh check --locked".to_owned()),
-                status,
-                summary: summary.map(str::to_owned),
-                output_unavailable: None,
-            }),
+            execution_mode: ToolExecutionMode::Background,
+            update: ToolProgressUpdate::Other {
+                payload: serde_json::json!({
+                    "task_id": "task-bg",
+                    "description": "./dev.sh check --locked",
+                }),
+            },
         }
     }
 
     fn command_request() -> ChatEvent {
         ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: "toolu_bg_bash".to_owned(),
-            tool_name: "run_command".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "./dev.sh check --locked".to_owned(),
                 working_directory: "/tmp/work".to_owned(),
@@ -1446,24 +1448,42 @@ mod wasm_tests {
     }
 
     fn command_completion(result: ToolExecutionResult) -> ChatEvent {
-        let success = matches!(
-            &result,
-            ToolExecutionResult::RunCommand { exit_code: 0, .. }
-        );
-        ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-            tool_call_id: "toolu_bg_bash".to_owned(),
-            tool_name: "run_command".to_owned(),
-            tool_result: result,
-            success,
-            error: None,
-            normalization_failure: None,
-        })
+        ChatEvent::ToolExecutionCompleted(succeeded_completion("toolu_bg_bash", result))
     }
 
-    fn seed_command_stream(state: &AppState) {
-        state.streaming_text.update(|map| {
-            map.insert(parent_ref().agent_id, streaming_state("running command"));
-        });
+    fn seed_command_response(state: &AppState) {
+        apply_live(
+            state,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: None,
+            }),
+        );
+        apply_live(
+            state,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "claude".to_owned(),
+                    },
+                    content: "running command".to_owned(),
+                    reasoning: None,
+                    tool_calls: vec![protocol::ToolUseData {
+                        tool_call_id: "toolu_bg_bash".to_owned(),
+                        name: "run_command".to_owned(),
+                        arguments: serde_json::json!({}),
+                        content_offset: None,
+                    }],
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }),
+        );
+        apply_live(state, command_request());
     }
 
     fn apply_live(state: &AppState, event: ChatEvent) {
@@ -1482,8 +1502,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn foreground_command_never_creates_tray_held_or_after_replay() {
-        let (container, state) = mount_tray(seed_command_stream);
-        apply_live(&state, command_request());
+        let (container, state) = mount_tray(seed_command_response);
         next_tick().await;
 
         assert_eq!(
@@ -1508,8 +1527,7 @@ mod wasm_tests {
         );
 
         let (replayed_container, _replayed_state) = mount_tray(|state| {
-            seed_command_stream(state);
-            apply_replay(state, command_request());
+            seed_command_response(state);
             apply_replay(
                 state,
                 command_completion(ToolExecutionResult::RunCommand {
@@ -1529,14 +1547,10 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn genuine_background_command_renders_once_then_stays_gone_after_replay() {
-        let (container, state) = mount_tray(seed_command_stream);
-        apply_live(&state, command_request());
+        let (container, state) = mount_tray(seed_command_response);
         apply_live(
             &state,
-            ChatEvent::ToolProgress(background_command_progress(
-                BackgroundTaskStatus::Running,
-                None,
-            )),
+            ChatEvent::ToolProgress(background_command_progress()),
         );
         next_tick().await;
 
@@ -1554,13 +1568,6 @@ mod wasm_tests {
 
         apply_live(
             &state,
-            ChatEvent::ToolProgress(background_command_progress(
-                BackgroundTaskStatus::Completed,
-                Some("Background command completed (exit code 0)"),
-            )),
-        );
-        apply_live(
-            &state,
             command_completion(ToolExecutionResult::RunCommand {
                 exit_code: 0,
                 stdout: "done".to_owned(),
@@ -1575,21 +1582,10 @@ mod wasm_tests {
         );
 
         let (replayed_container, _replayed_state) = mount_tray(|state| {
-            seed_command_stream(state);
-            apply_replay(state, command_request());
+            seed_command_response(state);
             apply_replay(
                 state,
-                ChatEvent::ToolProgress(background_command_progress(
-                    BackgroundTaskStatus::Running,
-                    None,
-                )),
-            );
-            apply_replay(
-                state,
-                ChatEvent::ToolProgress(background_command_progress(
-                    BackgroundTaskStatus::Completed,
-                    Some("Background command completed (exit code 0)"),
-                )),
+                ChatEvent::ToolProgress(background_command_progress()),
             );
             apply_replay(
                 state,
@@ -1610,8 +1606,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn cancelled_command_without_late_running_update_stays_tray_free() {
-        let (container, state) = mount_tray(seed_command_stream);
-        apply_live(&state, command_request());
+        let (container, state) = mount_tray(seed_command_response);
         next_tick().await;
         assert_eq!(
             count(&container, ".inflight-tray"),
@@ -1621,9 +1616,7 @@ mod wasm_tests {
 
         apply_live(
             &state,
-            command_completion(ToolExecutionResult::Cancelled {
-                message: "Interrupted".to_owned(),
-            }),
+            ChatEvent::ToolExecutionCompleted(cancelled_completion("toolu_bg_bash", "Interrupted")),
         );
         apply_live(
             &state,
@@ -1649,12 +1642,11 @@ mod wasm_tests {
     /// used to be invisible because the server dropped bash task frames.
     #[wasm_bindgen_test]
     async fn running_background_command_renders_named_row() {
-        let (container, _state) = mount_tray(|state| {
-            seed_progress(
-                state,
-                background_command_progress(BackgroundTaskStatus::Running, None),
-            );
-        });
+        let (container, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
         next_tick().await;
 
         let body = text(&container);
@@ -1676,12 +1668,11 @@ mod wasm_tests {
     /// finished" ceremony. Its exit-code summary lives on the tool card.
     #[wasm_bindgen_test]
     async fn completed_background_command_leaves_the_tray() {
-        let (container, state) = mount_tray(|state| {
-            seed_progress(
-                state,
-                background_command_progress(BackgroundTaskStatus::Running, None),
-            );
-        });
+        let (container, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
         next_tick().await;
 
         let body = text(&container);
@@ -1690,18 +1681,14 @@ mod wasm_tests {
             "the running command is visible first: {body}"
         );
 
-        let key = (
-            parent_ref().agent_id,
-            ToolCallId("toolu_bg_bash".to_owned()),
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            }),
         );
-        let progress = state
-            .tool_progress
-            .with_untracked(|map| map.get(&key).cloned())
-            .expect("seeded progress entry exists");
-        progress.set(background_command_progress(
-            BackgroundTaskStatus::Completed,
-            Some("Background command \"Run repository validation\" completed (exit code 0)"),
-        ));
         next_tick().await;
 
         assert_eq!(
@@ -1715,27 +1702,21 @@ mod wasm_tests {
     /// leaving the backend's teardown correction visible as active work.
     #[wasm_bindgen_test]
     async fn stopped_background_command_leaves_the_tray() {
-        let (container, state) = mount_tray(|state| {
-            seed_progress(
-                state,
-                background_command_progress(BackgroundTaskStatus::Running, None),
-            );
-        });
+        let (container, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
         next_tick().await;
         assert_eq!(count(&container, ".inflight-tray-row"), 1);
 
-        let key = (
-            parent_ref().agent_id,
-            ToolCallId("toolu_bg_bash".to_owned()),
+        apply_live(
+            &state,
+            ChatEvent::ToolExecutionCompleted(cancelled_completion(
+                "toolu_bg_bash",
+                "Background command owner exited",
+            )),
         );
-        let progress = state
-            .tool_progress
-            .with_untracked(|map| map.get(&key).cloned())
-            .expect("seeded progress entry exists");
-        progress.set(background_command_progress(
-            BackgroundTaskStatus::Stopped,
-            Some("Background command owner exited"),
-        ));
         next_tick().await;
 
         assert_eq!(
@@ -1749,12 +1730,16 @@ mod wasm_tests {
     /// the failure's record is the tool card, not the activity hub.
     #[wasm_bindgen_test]
     async fn failed_background_command_is_not_shown() {
-        let (container, _state) = mount_tray(|state| {
-            seed_progress(
-                state,
-                background_command_progress(BackgroundTaskStatus::Failed, None),
-            );
-        });
+        let (container, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolExecutionCompleted(failed_completion(
+                "toolu_bg_bash",
+                "command failed",
+                None,
+                None,
+            )),
+        );
         next_tick().await;
 
         assert_eq!(
@@ -1794,10 +1779,7 @@ mod wasm_tests {
 
     use crate::components::tool_card::ToolCardView;
     use crate::state::{StreamingState, ToolRequestEntry};
-    use protocol::{
-        AgentControlAgentRef, AgentControlProgress, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest,
-    };
+    use protocol::{AgentControlAgentRef, AgentControlProgress, ToolExecutionResult, ToolRequest};
     use serde_json::json;
 
     fn streaming_state(text: &str) -> StreamingState {
@@ -1912,14 +1894,14 @@ mod wasm_tests {
     fn spawn_progress_for(agent_id: &str, name: &str) -> ToolProgressData {
         ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
-            tool_name: "tyde_spawn_agent".to_owned(),
+            execution_mode: ToolExecutionMode::Foreground,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Spawn,
                 agents: vec![AgentControlAgentRef {
                     agent_id: AgentId(agent_id.to_owned()),
                     name: Some(name.to_owned()),
                 }],
-                status: protocol::AgentControlProgressStatus::Completed,
+                status: protocol::AgentControlProgressStatus::Running,
             }),
         }
     }
@@ -2652,7 +2634,7 @@ mod wasm_tests {
                 state,
                 ToolProgressData {
                     tool_call_id: "toolu_task".to_owned(),
-                    tool_name: "Task".to_owned(),
+                    execution_mode: ToolExecutionMode::Foreground,
                     update: ToolProgressUpdate::SubAgent(SubAgentProgress {
                         agent_id: AgentId("agent-sub".to_owned()),
                         agent_name: "Explore".to_owned(),
@@ -2770,19 +2752,15 @@ mod wasm_tests {
 
         fn card_entry(tool_name: &str) -> ToolRequestEntry {
             ToolRequestEntry {
+                tool_name: tool_name.to_owned(),
                 request: ToolRequest {
                     tool_call_id: format!("toolu_{tool_name}"),
-                    tool_name: tool_name.to_owned(),
                     tool_type: ToolRequestType::Other { args: json!({}) },
                 },
-                result: Some(ToolExecutionCompletedData {
-                    tool_call_id: format!("toolu_{tool_name}"),
-                    tool_name: tool_name.to_owned(),
-                    tool_result: ToolExecutionResult::Other { result: json!({}) },
-                    success: true,
-                    error: None,
-                    normalization_failure: None,
-                }),
+                result: Some(succeeded_completion(
+                    &format!("toolu_{tool_name}"),
+                    ToolExecutionResult::Other { result: json!({}) },
+                )),
             }
         }
 
@@ -2792,7 +2770,7 @@ mod wasm_tests {
         ) -> ToolProgressData {
             ToolProgressData {
                 tool_call_id: format!("toolu_{tool_name}"),
-                tool_name: tool_name.to_owned(),
+                execution_mode: ToolExecutionMode::Foreground,
                 update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                     progress_kind,
                     agents: vec![AgentControlAgentRef {

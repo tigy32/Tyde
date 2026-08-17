@@ -18,10 +18,9 @@ use protocol::tycode_config::{
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
     BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsSnapshot,
-    ChatEvent, ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageSender, ModelInfo,
-    OrchestrationEvent, ReasoningData, SelectOption, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    StreamEndData, StreamTextDeltaData, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    ChatEvent, ChatMessage, MessageSender, OrchestrationEvent, SelectOption, SessionId,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SessionSettingsValues, StreamEndData, ToolExecutionCompletedData,
 };
 
 use super::{
@@ -1081,6 +1080,7 @@ struct TycodeStartupController {
     follow_up: TycodeStartupFollowUp,
     persist_settings: bool,
     runtime_settings: Option<Value>,
+    follow_up_started: bool,
 }
 
 impl TycodeStartupController {
@@ -1099,6 +1099,7 @@ impl TycodeStartupController {
             follow_up,
             persist_settings,
             runtime_settings: None,
+            follow_up_started: false,
         }
     }
 
@@ -1201,7 +1202,18 @@ impl TycodeStartupController {
                 }
                 Ok(tycode_startup_internal_observation(value))
             }
-            TycodeStartupPhase::Complete => Ok(TycodeStartupObservation::Allow),
+            TycodeStartupPhase::Complete => {
+                if tycode_follow_up_started(value) {
+                    self.follow_up_started = true;
+                }
+                if !self.follow_up_started
+                    && value.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                    && value.get("data").and_then(Value::as_bool) == Some(false)
+                {
+                    return Ok(TycodeStartupObservation::Suppress);
+                }
+                Ok(TycodeStartupObservation::Allow)
+            }
         }
     }
 
@@ -1772,6 +1784,16 @@ fn tycode_startup_internal_observation(value: &Value) -> TycodeStartupObservatio
     }
 }
 
+fn tycode_follow_up_started(value: &Value) -> bool {
+    match value.get("kind").and_then(Value::as_str) {
+        Some("TypingStatusChanged") => value.get("data").and_then(Value::as_bool) == Some(true),
+        Some("MessageAdded") => {
+            value.pointer("/data/sender").and_then(Value::as_str) == Some("User")
+        }
+        _ => false,
+    }
+}
+
 fn tycode_settings_verification_error(expected: &Value, actual: &Value) -> String {
     let managed_keys = [
         "active_provider",
@@ -2076,6 +2098,7 @@ impl Backend for TycodeBackend {
                         continue;
                     }
                 };
+                eprintln!("TYDE TYCODE RAW EVENT {}", tycode_event_diagnostic(&value));
 
                 if session_id_task
                     .lock()
@@ -2116,12 +2139,13 @@ impl Backend for TycodeBackend {
                     runtime_settings = Some(settings.clone());
                 }
 
+                stream_state.observe_provider_event(&value);
                 let events = map_tycode_value_to_chat_events(&value);
                 if events.is_empty() {
                     continue;
                 }
 
-                for event in tycode_events_with_synthesized_completion(events, &mut stream_state) {
+                for event in tycode_normalize_events(events, &mut stream_state) {
                     if events_tx.send(event).is_err() {
                         break;
                     }
@@ -2131,14 +2155,11 @@ impl Backend for TycodeBackend {
                 }
             }
 
-            // Some tycode builds terminate without emitting StreamEnd. Synthesize
-            // one so downstream callers don't hang waiting for end-of-turn.
-            if stream_state.open {
-                let _ = events_tx.send(stream_state.synthetic_stream_end());
-            }
-            for diagnostic in stream_state.take_orphaned_completion_diagnostics("transport closed")
-            {
-                let _ = events_tx.send(diagnostic);
+            if !stream_state.pending_tool_completions.is_empty() {
+                tracing::warn!(
+                    count = stream_state.pending_tool_completions.len(),
+                    "Tycode transport closed with unowned tool completions"
+                );
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -2420,24 +2441,24 @@ impl Backend for TycodeBackend {
                     }
                 }
 
+                stream_state.observe_provider_event(&value);
                 let events = map_tycode_value_to_chat_events(&value);
                 if events.is_empty() {
                     continue;
                 }
 
-                for event in tycode_events_with_synthesized_completion(events, &mut stream_state) {
+                for event in tycode_normalize_events(events, &mut stream_state) {
                     if events_tx.send(event).is_err() {
                         break;
                     }
                 }
             }
 
-            if stream_state.open {
-                let _ = events_tx.send(stream_state.synthetic_stream_end());
-            }
-            for diagnostic in stream_state.take_orphaned_completion_diagnostics("transport closed")
-            {
-                let _ = events_tx.send(diagnostic);
+            if !stream_state.pending_tool_completions.is_empty() {
+                tracing::warn!(
+                    count = stream_state.pending_tool_completions.len(),
+                    "Tycode transport closed with unowned tool completions"
+                );
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -3105,36 +3126,32 @@ fn normalize_tycode_event_value(value: &Value) -> Value {
         }
         Some("ToolExecutionCompleted") => {
             if let Some(data) = normalized.get_mut("data")
-                && data.get("success").and_then(Value::as_bool) == Some(false)
+                && data.get("outcome").is_none()
             {
-                let message = data
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "Tycode tool failed".to_owned());
-                let cancelled = {
+                let result = data.get("tool_result").cloned().unwrap_or(Value::Null);
+                let error = data.get("error").and_then(Value::as_str).map(str::to_owned);
+                data["outcome"] = if data.get("success").and_then(Value::as_bool) == Some(true) {
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "result": result,
+                    })
+                } else {
+                    let message = error.unwrap_or_else(|| "Tycode tool failed".to_owned());
                     let lower = message.to_ascii_lowercase();
-                    lower.contains("cancelled") || lower.contains("canceled")
+                    if lower.contains("cancelled") || lower.contains("canceled") {
+                        serde_json::json!({
+                            "status": "cancelled",
+                            "message": message,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "status": "failed",
+                            "message": message,
+                            "details": serde_json::to_string_pretty(&result)
+                                .unwrap_or_else(|_| result.to_string()),
+                        })
+                    }
                 };
-                if cancelled {
-                    data["tool_result"] = serde_json::json!({
-                        "kind": "Cancelled",
-                        "message": message,
-                    });
-                } else if !matches!(
-                    data.pointer("/tool_result/kind").and_then(Value::as_str),
-                    Some("Error" | "Cancelled")
-                ) {
-                    let detailed_message = data
-                        .get("tool_result")
-                        .and_then(|result| serde_json::to_string_pretty(result).ok())
-                        .unwrap_or_else(|| message.clone());
-                    data["tool_result"] = serde_json::json!({
-                        "kind": "Error",
-                        "short_message": message,
-                        "detailed_message": detailed_message,
-                    });
-                }
             }
         }
         _ => {}
@@ -3143,10 +3160,26 @@ fn normalize_tycode_event_value(value: &Value) -> Value {
 }
 
 fn normalize_tycode_chat_message(message: &mut Value) {
+    let content_offset = message
+        .get("content")
+        .and_then(Value::as_str)
+        .and_then(|content| u32::try_from(content.chars().count()).ok());
     if let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
         tool_calls.retain(|tool_call| {
             tool_call.get("name").and_then(Value::as_str) != Some("complete_task")
         });
+        for tool_call in tool_calls {
+            if tool_call.get("tool_call_id").is_none()
+                && let Some(id) = tool_call.get("id").cloned()
+            {
+                tool_call["tool_call_id"] = id;
+            }
+            if tool_call.get("content_offset").is_none()
+                && let Some(content_offset) = content_offset
+            {
+                tool_call["content_offset"] = Value::from(content_offset);
+            }
+        }
     }
     let Some(token_usage) = message.get_mut("token_usage") else {
         return;
@@ -3332,170 +3365,67 @@ fn tycode_stream_end_event(content: String) -> ChatEvent {
 
 #[derive(Debug, Default)]
 struct TycodeStreamState {
-    open: bool,
-    typing_active: bool,
-    pending_typing_start: bool,
-    message_id: Option<String>,
-    agent: Option<String>,
-    model: Option<String>,
-    accumulated_text: String,
-    accumulated_reasoning: String,
-    synthetic_completion: Option<SyntheticTycodeCompletion>,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
     emitted_tool_request_ids: HashSet<String>,
     pending_tool_completions: VecDeque<ToolExecutionCompletedData>,
-}
-
-#[derive(Debug)]
-struct SyntheticTycodeCompletion {
-    message_id: Option<ChatMessageId>,
-    content: String,
-    reasoning_text: Option<String>,
+    active_message_id: Option<protocol::ChatMessageId>,
 }
 
 impl TycodeStreamState {
-    fn events_with_synthesized_completion(&mut self, events: Vec<ChatEvent>) -> Vec<ChatEvent> {
-        let mut output = Vec::new();
-        for event in events {
-            if matches!(
-                &event,
-                ChatEvent::ToolRequest(request) if request.tool_name == "complete_task"
-            ) || matches!(
-                &event,
-                ChatEvent::ToolExecutionCompleted(completion)
-                    if completion.tool_name == "complete_task"
-            ) {
-                continue;
-            }
-            let completion_needs_request = matches!(
-                &event,
-                ChatEvent::ToolExecutionCompleted(completion)
-                    if !self.emitted_tool_request_ids.contains(&completion.tool_call_id)
-            );
-            if completion_needs_request {
-                let ChatEvent::ToolExecutionCompleted(completion) = event else {
-                    unreachable!("completion predicate matched a non-completion event")
-                };
-                self.pending_tool_completions.push_back(completion);
-                continue;
-            }
-            let (mut event, _) = normalize_tyde_chat_event(event, &mut self.normalization_failures);
-            if let ChatEvent::ToolRequest(request) = &event
-                && !self
-                    .emitted_tool_request_ids
-                    .insert(request.tool_call_id.clone())
-            {
-                eprintln!(
-                    "TYDE TYCODE BATCH TOOL suppressed_duplicate_request={}",
-                    request.tool_call_id
-                );
-                continue;
-            }
-            if matches!(&event, ChatEvent::TypingStatusChanged(true)) {
-                if self.typing_active || self.pending_typing_start {
-                    tracing::warn!("suppressed duplicate Tycode TypingStatusChanged(true)");
-                } else {
-                    self.pending_typing_start = true;
-                }
-                continue;
-            }
-
-            let user_echo = matches!(
-                &event,
-                ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::User,
-                    ..
-                })
-            );
-            if user_echo {
-                self.inject_stream_identity(&mut event);
-                self.update(&event);
-                output.push(event);
-                self.flush_pending_typing_start(&mut output);
-                continue;
-            }
-
-            if matches!(&event, ChatEvent::StreamStart(_)) {
-                if !self.typing_active && !self.pending_typing_start {
-                    tracing::warn!(
-                        "Tycode StreamStart arrived without TypingStatusChanged(true); synthesized start"
-                    );
-                    self.pending_typing_start = true;
-                }
-                self.flush_pending_typing_start(&mut output);
-            } else if matches!(&event, ChatEvent::TypingStatusChanged(false)) {
-                self.flush_pending_typing_start(&mut output);
-                if !self.typing_active {
-                    tracing::warn!("suppressed idle Tycode TypingStatusChanged(false)");
-                    continue;
-                }
-            }
-
-            self.synthesize_tool_requests_from_stream_end(&event, &mut output);
-            if let Some(mut events) = self.late_authoritative_stream_end_events(&event) {
-                events.extend(self.take_orphaned_completion_diagnostics("turn ended"));
-                output.extend(events);
-                continue;
-            }
-            if let Some(stream_end) = self.synthesize_stream_end_before(&event) {
-                output.push(stream_end);
-            }
-            self.inject_stream_identity(&mut event);
-            self.update(&event);
-            if matches!(&event, ChatEvent::TypingStatusChanged(false)) {
-                self.typing_active = false;
-            }
-            let emitted_request_id = match &event {
-                ChatEvent::ToolRequest(request) => Some(request.tool_call_id.clone()),
-                _ => None,
-            };
-            let terminal = match &event {
-                ChatEvent::StreamEnd(_) => Some("turn ended"),
-                ChatEvent::OperationCancelled(_) => Some("turn cancelled"),
-                ChatEvent::TypingStatusChanged(false) => Some("backend became idle"),
-                _ => None,
-            };
-            output.push(event);
-            if let Some(tool_call_id) = emitted_request_id {
-                self.flush_completions_after_request(&tool_call_id, &mut output);
-            }
-            if let Some(terminal) = terminal {
-                output.extend(self.take_orphaned_completion_diagnostics(terminal));
-            }
+    fn observe_provider_event(&mut self, value: &Value) {
+        if value.get("kind").and_then(Value::as_str) == Some("StreamStart") {
+            self.active_message_id = value
+                .pointer("/data/message_id")
+                .and_then(Value::as_str)
+                .map(|id| protocol::ChatMessageId(id.to_owned()));
         }
-
-        output
     }
 
-    fn synthesize_tool_requests_from_stream_end(
-        &mut self,
-        event: &ChatEvent,
-        output: &mut Vec<ChatEvent>,
-    ) {
-        let ChatEvent::StreamEnd(end) = event else {
-            return;
-        };
-        for tool_call in &end.message.tool_calls {
-            if tool_call.name == "complete_task"
-                || !self.emitted_tool_request_ids.insert(tool_call.id.clone())
-            {
-                continue;
+    fn normalize_events(&mut self, events: Vec<ChatEvent>) -> Vec<ChatEvent> {
+        let mut output = Vec::new();
+        for event in events {
+            let (event, _) = normalize_tyde_chat_event(event, &mut self.normalization_failures);
+            match event {
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if !self
+                        .emitted_tool_request_ids
+                        .contains(&completion.tool_call_id) =>
+                {
+                    self.pending_tool_completions.push_back(completion);
+                }
+                ChatEvent::ToolRequest(request)
+                    if !self
+                        .emitted_tool_request_ids
+                        .insert(request.tool_call_id.clone()) =>
+                {
+                    tracing::debug!(
+                        tool_call_id = request.tool_call_id,
+                        "Ignored duplicate Tycode tool request"
+                    );
+                }
+                ChatEvent::ToolRequest(request) => {
+                    let tool_call_id = request.tool_call_id.clone();
+                    self.emitted_tool_request_ids.insert(tool_call_id.clone());
+                    output.push(ChatEvent::ToolRequest(request));
+                    self.flush_completions_after_request(&tool_call_id, &mut output);
+                }
+                ChatEvent::StreamEnd(mut end) => {
+                    if end.message.message_id.is_none() {
+                        end.message.message_id = self.active_message_id.take();
+                    } else {
+                        self.active_message_id = None;
+                    }
+                    output.push(ChatEvent::StreamEnd(end));
+                }
+                ChatEvent::TypingStatusChanged(false) | ChatEvent::OperationCancelled(_) => {
+                    self.active_message_id = None;
+                    self.warn_about_orphaned_completions();
+                    output.push(event);
+                }
+                event => output.push(event),
             }
-            eprintln!(
-                "TYDE TYCODE BATCH TOOL announced_request={} tool={}",
-                tool_call.id, tool_call.name
-            );
-            let request = ChatEvent::ToolRequest(ToolRequest {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                tool_type: ToolRequestType::Other {
-                    args: tool_call.arguments.clone(),
-                },
-            });
-            let (request, _) = normalize_tyde_chat_event(request, &mut self.normalization_failures);
-            output.push(request);
-            self.flush_completions_after_request(&tool_call.id, output);
         }
+        output
     }
 
     fn flush_completions_after_request(&mut self, tool_call_id: &str, output: &mut Vec<ChatEvent>) {
@@ -3514,223 +3444,21 @@ impl TycodeStreamState {
         self.pending_tool_completions = remaining;
     }
 
-    fn take_orphaned_completion_diagnostics(&mut self, terminal: &str) -> Vec<ChatEvent> {
-        std::mem::take(&mut self.pending_tool_completions)
-            .into_iter()
-            .map(|completion| {
-                let message = format!(
-                    "Tycode emitted completion for tool {:?} with call id {:?}, but no authoritative ToolRequest arrived before {terminal}",
-                    completion.tool_name, completion.tool_call_id
-                );
-                tracing::error!(
-                    tool_name = %completion.tool_name,
-                    tool_call_id = %completion.tool_call_id,
-                    terminal,
-                    "Tycode tool completion had no authoritative request"
-                );
-                tycode_error_chat_event(message)
-            })
-            .collect()
-    }
-
-    fn flush_pending_typing_start(&mut self, output: &mut Vec<ChatEvent>) {
-        if !self.pending_typing_start {
-            return;
-        }
-        self.pending_typing_start = false;
-        self.typing_active = true;
-        let event = ChatEvent::TypingStatusChanged(true);
-        self.update(&event);
-        output.push(event);
-    }
-
-    /// The Tycode wire predates Tyde's stream identity contract: `StreamEnd`
-    /// carries no message id at all, and start/delta ids are advisory. Tyde
-    /// validators reject id-less stream frames, so the adapter must own the
-    /// translation: adopt the open stream's id for id-less frames and mint one
-    /// when Tycode never provided an id for the stream.
-    fn inject_stream_identity(&mut self, event: &mut ChatEvent) {
-        match event {
-            ChatEvent::StreamStart(start) => {
-                if start
-                    .message_id
-                    .as_ref()
-                    .is_none_or(|message_id| message_id.trim().is_empty())
-                {
-                    start.message_id = Some(minted_tycode_message_id());
-                }
-            }
-            ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-                if self.open
-                    && delta
-                        .message_id
-                        .as_ref()
-                        .is_none_or(|message_id| message_id.trim().is_empty())
-                {
-                    delta.message_id.clone_from(&self.message_id);
-                }
-            }
-            ChatEvent::StreamEnd(end) if self.open && end.message.message_id.is_none() => {
-                end.message.message_id = self.message_id.clone().map(ChatMessageId);
-            }
-            _ => {}
-        }
-    }
-
-    fn late_authoritative_stream_end_events(
-        &mut self,
-        event: &ChatEvent,
-    ) -> Option<Vec<ChatEvent>> {
-        let ChatEvent::StreamEnd(end) = event else {
-            return None;
-        };
-        if self.open {
-            return None;
-        }
-        let synthetic = self.synthetic_completion.take()?;
-        self.warn_if_late_stream_end_has_unmerged_fields(&synthetic, &end.message);
-
-        let message_id = synthetic
-            .message_id
-            .clone()
-            .or_else(|| end.message.message_id.clone());
-        let Some(message_id) = message_id else {
+    fn warn_about_orphaned_completions(&mut self) {
+        for completion in self.pending_tool_completions.drain(..) {
             tracing::warn!(
-                "Forwarding delayed Tycode StreamEnd after synthesized completion because no \
-                 message_id is available for metadata merge"
-            );
-            return Some(vec![event.clone()]);
-        };
-
-        if end.message.model_info.is_none()
-            && end.message.token_usage.is_none()
-            && end.message.context_breakdown.is_none()
-        {
-            return Some(Vec::new());
-        }
-
-        Some(vec![ChatEvent::MessageMetadataUpdated(
-            MessageMetadataUpdateData {
-                message_id,
-                model_info: end.message.model_info.clone(),
-                token_usage: end.message.token_usage.clone(),
-                context_breakdown: end.message.context_breakdown.clone(),
-            },
-        )])
-    }
-
-    fn synthesize_stream_end_before(&mut self, event: &ChatEvent) -> Option<ChatEvent> {
-        if matches!(event, ChatEvent::TypingStatusChanged(false)) && self.open {
-            let stream_end = self.synthetic_stream_end();
-            if let ChatEvent::StreamEnd(end) = &stream_end {
-                self.synthetic_completion = Some(SyntheticTycodeCompletion {
-                    message_id: end.message.message_id.clone(),
-                    content: end.message.content.clone(),
-                    reasoning_text: end
-                        .message
-                        .reasoning
-                        .as_ref()
-                        .map(|reasoning| reasoning.text.clone()),
-                });
-            }
-            self.open = false;
-            return Some(stream_end);
-        }
-
-        None
-    }
-
-    fn synthetic_stream_end(&self) -> ChatEvent {
-        ChatEvent::StreamEnd(StreamEndData {
-            message: ChatMessage {
-                message_id: self.message_id.clone().map(ChatMessageId),
-                timestamp: unix_now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: self.agent.clone().unwrap_or_else(|| "tycode".to_string()),
-                },
-                content: self.accumulated_text.clone(),
-                reasoning: (!self.accumulated_reasoning.is_empty()).then(|| ReasoningData {
-                    text: self.accumulated_reasoning.clone(),
-                    tokens: None,
-                    signature: None,
-                    blob: None,
-                }),
-                tool_calls: Vec::new(),
-                model_info: self.model.clone().map(|model| ModelInfo { model }),
-                token_usage: None,
-                context_breakdown: None,
-                images: None,
-            },
-        })
-    }
-
-    fn update(&mut self, event: &ChatEvent) {
-        match event {
-            ChatEvent::TypingStatusChanged(true) | ChatEvent::StreamStart(_) => {
-                if let ChatEvent::StreamStart(start) = event {
-                    self.open = true;
-                    self.message_id.clone_from(&start.message_id);
-                    self.agent = Some(start.agent.clone());
-                    self.model.clone_from(&start.model);
-                    self.accumulated_text.clear();
-                    self.accumulated_reasoning.clear();
-                }
-                self.synthetic_completion = None;
-            }
-            ChatEvent::StreamDelta(StreamTextDeltaData { message_id, text }) if self.open => {
-                if let Some(message_id) = message_id {
-                    self.message_id = Some(message_id.clone());
-                }
-                self.accumulated_text.push_str(text);
-            }
-            ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id, text, ..
-            }) if self.open => {
-                if let Some(message_id) = message_id {
-                    self.message_id = Some(message_id.clone());
-                }
-                self.accumulated_reasoning.push_str(text);
-            }
-            ChatEvent::StreamEnd(_) => {
-                self.open = false;
-                self.synthetic_completion = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn warn_if_late_stream_end_has_unmerged_fields(
-        &self,
-        synthetic: &SyntheticTycodeCompletion,
-        message: &ChatMessage,
-    ) {
-        let authoritative_reasoning = message
-            .reasoning
-            .as_ref()
-            .map(|reasoning| reasoning.text.as_str());
-        if message.content != synthetic.content
-            || authoritative_reasoning != synthetic.reasoning_text.as_deref()
-            || !message.tool_calls.is_empty()
-            || message
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-        {
-            tracing::warn!(
-                message_id = ?message.message_id,
-                "Delayed Tycode StreamEnd after synthesized completion contains content fields \
-                 that cannot be merged into the already visible assistant message without a \
-                 duplicate StreamEnd"
+                tool_call_id = completion.tool_call_id,
+                "Tycode tool completion had no matching request"
             );
         }
     }
 }
 
-fn tycode_events_with_synthesized_completion(
+fn tycode_normalize_events(
     events: Vec<ChatEvent>,
     stream_state: &mut TycodeStreamState,
 ) -> Vec<ChatEvent> {
-    stream_state.events_with_synthesized_completion(events)
+    stream_state.normalize_events(events)
 }
 
 fn unix_now_ms() -> u64 {
@@ -3738,8 +3466,4 @@ fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn minted_tycode_message_id() -> String {
-    format!("tycode-unidentified-{}", uuid::Uuid::new_v4())
 }

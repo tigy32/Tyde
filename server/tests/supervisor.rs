@@ -719,8 +719,12 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
                 }
                 match (predicate, chat_event_on(env, &stream)) {
                     (0, Some(ChatEvent::TypingStatusChanged(true))) => true,
-                    (1, Some(ChatEvent::ToolRequest(request))) => request.tool_name == "Bash",
-                    (2, Some(ChatEvent::ToolExecutionCompleted(result))) => result.success,
+                    (1, Some(ChatEvent::ToolRequest(request))) => {
+                        fixture::tool_request_name(&request) == "Bash"
+                    }
+                    (2, Some(ChatEvent::ToolExecutionCompleted(result))) => {
+                        fixture::tool_completion_succeeded(&result)
+                    }
                     (3, Some(ChatEvent::MessageAdded(message))) => {
                         matches!(message.sender, MessageSender::Warning)
                             && message.content == "Codex warning: Internal server error"

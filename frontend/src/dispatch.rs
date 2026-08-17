@@ -5105,10 +5105,38 @@ fn is_root_orchestration_record(record: &OrchestrationRecord) -> bool {
 /// `tool_call_id`s that message issued. This association comes straight from
 /// the typed payload; it never looks at a tool's *name*.
 fn message_declares_tool_call(message: &protocol::ChatMessage, tool_call_id: &str) -> bool {
+    message_tool_name(message, tool_call_id).is_some()
+}
+
+fn message_tool_name(message: &protocol::ChatMessage, tool_call_id: &str) -> Option<String> {
     message
         .tool_calls
         .iter()
-        .any(|call| call.id == tool_call_id)
+        .find(|call| call.tool_call_id == tool_call_id)
+        .map(|call| call.name.clone())
+}
+
+fn fallback_tool_name(request: &protocol::ToolRequest) -> String {
+    use protocol::ToolRequestType;
+
+    match &request.tool_type {
+        ToolRequestType::ModifyFile { .. } => "modify_file",
+        ToolRequestType::RunCommand { .. } => "run_command",
+        ToolRequestType::ReadFiles { .. } => "read_files",
+        ToolRequestType::SearchTypes { .. } => "search_types",
+        ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
+        ToolRequestType::AskUserQuestion { .. } => "ask_user_question",
+        ToolRequestType::ExitPlanMode { .. } => "exit_plan_mode",
+        ToolRequestType::AgentSpawn { .. } => "agent_spawn",
+        ToolRequestType::GenerateImage { .. } => "generate_image",
+        ToolRequestType::WebSearch { .. } => "web_search",
+        ToolRequestType::ViewImage { .. } => "view_image",
+        ToolRequestType::Sleep { .. } => "sleep",
+        ToolRequestType::TydeSendAgentMessage { .. } => "tyde_send_agent_message",
+        ToolRequestType::TydeAwaitAgents { .. } => "tyde_await_agents",
+        ToolRequestType::Other { .. } => "tool",
+    }
+    .to_owned()
 }
 
 /// The already-materialized row whose message issued this tool call.
@@ -5202,12 +5230,7 @@ impl HistoryReplay {
                 });
             }
             ChatEvent::ToolRequest(request) => {
-                let tool_name = request.tool_name.clone();
                 let tool_call_id = request.tool_call_id.clone();
-                let tool_entry = ToolRequestEntry {
-                    request,
-                    result: None,
-                };
                 // Replay sees the same event order as the live stream — including the
                 // `MessageAdded(Error)` a failed normalization pushes between the
                 // `StreamEnd` and its request — so it needs the same identity-based
@@ -5233,6 +5256,19 @@ impl HistoryReplay {
                             .rev()
                             .find(|row| row.message_entry().is_some())
                     });
+                let tool_name = row
+                    .and_then(|row| row.message_entry())
+                    .and_then(|entry| {
+                        entry.with_untracked(|entry| {
+                            message_tool_name(&entry.message, &tool_call_id)
+                        })
+                    })
+                    .unwrap_or_else(|| fallback_tool_name(&request));
+                let tool_entry = ToolRequestEntry {
+                    tool_name: tool_name.clone(),
+                    request,
+                    result: None,
+                };
                 if let Some(row) = row.and_then(|row| row.message_entry().map(|e| (row.id, e))) {
                     let (row_id, row_entry) = row;
                     row_entry.update(|entry| {
@@ -5442,10 +5478,9 @@ pub fn apply_chat_event_from(
         }
         ChatEvent::StreamStart(data) => {
             log::trace!(
-                "dispatch chat_event host={} agent_id={} type=stream_start message_id={:?} model={:?}",
+                "dispatch chat_event host={} agent_id={} type=stream_start model={:?}",
                 host_id,
                 agent_id,
-                data.message_id,
                 data.model
             );
             state.transient_events.update(|events| {
@@ -5464,10 +5499,9 @@ pub fn apply_chat_event_from(
         }
         ChatEvent::StreamDelta(data) => {
             log::trace!(
-                "dispatch chat_event host={} agent_id={} type=stream_delta message_id={:?} text_len={}",
+                "dispatch chat_event host={} agent_id={} type=stream_delta text_len={}",
                 host_id,
                 agent_id,
-                data.message_id,
                 data.text.len()
             );
             if let Some(streaming) = state
@@ -5479,10 +5513,9 @@ pub fn apply_chat_event_from(
         }
         ChatEvent::StreamReasoningDelta(data) => {
             log::trace!(
-                "dispatch chat_event host={} agent_id={} type=reasoning_delta message_id={:?} text_len={}",
+                "dispatch chat_event host={} agent_id={} type=reasoning_delta text_len={}",
                 host_id,
                 agent_id,
-                data.message_id,
                 data.text.len()
             );
             if let Some(streaming) = state
@@ -5528,16 +5561,24 @@ pub fn apply_chat_event_from(
             state.push_chat_entry(agent_id.clone(), entry);
         }
         ChatEvent::ToolRequest(request) => {
+            let tool_call_id = request.tool_call_id.clone();
+            let declared_row = chat_row_declaring_tool_call(state, &agent_id, &tool_call_id);
+            let tool_name = declared_row
+                .as_ref()
+                .and_then(|row| row.message_entry())
+                .and_then(|entry| {
+                    entry.with_untracked(|entry| message_tool_name(&entry.message, &tool_call_id))
+                })
+                .unwrap_or_else(|| fallback_tool_name(&request));
             log::trace!(
                 "dispatch chat_event host={} agent_id={} type=tool_request tool_call_id={} tool_name={}",
                 host_id,
                 agent_id,
-                request.tool_call_id,
-                request.tool_name
+                tool_call_id,
+                tool_name
             );
-            let tool_name = request.tool_name.clone();
-            let tool_call_id = request.tool_call_id.clone();
             let tool_entry = ToolRequestEntry {
+                tool_name: tool_name.clone(),
                 request,
                 result: None,
             };
@@ -5562,8 +5603,7 @@ pub fn apply_chat_event_from(
             // error row rather than the row that made the call.
             // The fallback asks for the last *message* row, not the last row:
             // a compaction marker can be newest and has nowhere to put a card.
-            let row = chat_row_declaring_tool_call(state, &agent_id, &tool_call_id)
-                .or_else(|| state.last_chat_message_row_untracked(&agent_id));
+            let row = declared_row.or_else(|| state.last_chat_message_row_untracked(&agent_id));
             if let Some((row_id, row_entry)) =
                 row.and_then(|row| row.message_entry().map(|e| (row.id, e.clone())))
             {
@@ -5583,15 +5623,13 @@ pub fn apply_chat_event_from(
         }
         ChatEvent::ToolExecutionCompleted(data) => {
             log::trace!(
-                "dispatch chat_event host={} agent_id={} type=tool_execution_completed tool_call_id={} tool_name={} success={}",
+                "dispatch chat_event host={} agent_id={} type=tool_execution_completed tool_call_id={} outcome={:?}",
                 host_id,
                 agent_id,
                 data.tool_call_id,
-                data.tool_name,
-                data.success
+                data.outcome
             );
             let call_id = data.tool_call_id.clone();
-            let tool_name = data.tool_name.clone();
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
@@ -5629,8 +5667,7 @@ pub fn apply_chat_event_from(
                 }
             }
             log::error!(
-                "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — no matching request found",
-                tool_name,
+                "TOOL RESULT ORPHANED: completion for call_id={} for host {} agent {} — no matching request found",
                 call_id,
                 host_id,
                 agent_id
@@ -5638,11 +5675,11 @@ pub fn apply_chat_event_from(
         }
         ChatEvent::ToolProgress(data) => {
             log::trace!(
-                "dispatch chat_event host={} agent_id={} type=tool_progress tool_call_id={} tool_name={}",
+                "dispatch chat_event host={} agent_id={} type=tool_progress tool_call_id={} mode={:?}",
                 host_id,
                 agent_id,
                 data.tool_call_id,
-                data.tool_name
+                data.execution_mode
             );
             // Single store: tool cards and the workflow tab read this map
             // reactively by (agent, tool_call_id). No row mutation — a
@@ -8499,7 +8536,7 @@ mod wasm_tests {
                     content: String::new(),
                     reasoning: None,
                     tool_calls: vec![protocol::ToolUseData {
-                        id: "toolu_send_3".to_owned(),
+                        tool_call_id: "toolu_send_3".to_owned(),
                         name: tool_name.to_owned(),
                         arguments: malformed_arguments.clone(),
                         content_offset: None,
@@ -8538,7 +8575,6 @@ mod wasm_tests {
             &agent_id,
             ChatEvent::ToolRequest(protocol::ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: tool_name.to_owned(),
                 tool_type: protocol::ToolRequestType::Other {
                     args: serde_json::json!({
                         "tool": tool_name,
@@ -8553,13 +8589,13 @@ mod wasm_tests {
             &agent_id,
             ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
                 tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: tool_name.to_owned(),
-                tool_result: protocol::ToolExecutionResult::TydeSendAgentMessage,
-                success: true,
-                error: None,
-                normalization_failure: Some(
-                    protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
-                ),
+                outcome: protocol::ToolExecutionOutcome::Failed {
+                    message: "canonical request could not be normalized".to_owned(),
+                    details: None,
+                    normalization_failure: Some(
+                        protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
+                    ),
+                },
             }),
         );
 
@@ -8672,7 +8708,7 @@ mod wasm_tests {
             content: String::new(),
             reasoning: None,
             tool_calls: vec![protocol::ToolUseData {
-                id: "toolu_send_3".to_owned(),
+                tool_call_id: "toolu_send_3".to_owned(),
                 name: tool_name.to_owned(),
                 arguments: malformed_arguments.clone(),
                 content_offset: None,
@@ -8698,7 +8734,6 @@ mod wasm_tests {
         };
         let request = protocol::ToolRequest {
             tool_call_id: "toolu_send_3".to_owned(),
-            tool_name: tool_name.to_owned(),
             tool_type: protocol::ToolRequestType::Other {
                 args: serde_json::json!({
                     "tool": tool_name,
@@ -8708,13 +8743,13 @@ mod wasm_tests {
         };
         let completion = protocol::ToolExecutionCompletedData {
             tool_call_id: "toolu_send_3".to_owned(),
-            tool_name: tool_name.to_owned(),
-            tool_result: protocol::ToolExecutionResult::TydeSendAgentMessage,
-            success: true,
-            error: None,
-            normalization_failure: Some(
-                protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
-            ),
+            outcome: protocol::ToolExecutionOutcome::Failed {
+                message: "canonical request could not be normalized".to_owned(),
+                details: None,
+                normalization_failure: Some(
+                    protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
+                ),
+            },
         };
 
         // A page applies only against the request this client is waiting for.
@@ -9534,7 +9569,6 @@ mod wasm_tests {
             "host",
             &agent_id,
             ChatEvent::StreamStart(protocol::StreamStartData {
-                message_id: Some("start-id".to_owned()),
                 agent: "codex".to_owned(),
                 model: None,
             }),
@@ -9544,7 +9578,6 @@ mod wasm_tests {
             "host",
             &agent_id,
             ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
-                message_id: Some("delta-id".to_owned()),
                 text: "server text".to_owned(),
             }),
         );
@@ -9553,7 +9586,6 @@ mod wasm_tests {
             "host",
             &agent_id,
             ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
-                message_id: None,
                 text: "server reasoning".to_owned(),
             }),
         );
@@ -9637,7 +9669,6 @@ mod wasm_tests {
             "host",
             &agent_id,
             ChatEvent::StreamStart(protocol::StreamStartData {
-                message_id: Some("empty-item".to_owned()),
                 agent: "codex".to_owned(),
                 model: None,
             }),
@@ -9691,7 +9722,7 @@ mod wasm_tests {
             blob: None,
         });
         authoritative.tool_calls = vec![protocol::ToolUseData {
-            id: "tool-call".to_owned(),
+            tool_call_id: "tool-call".to_owned(),
             name: "tool".to_owned(),
             arguments: serde_json::json!({}),
             content_offset: None,

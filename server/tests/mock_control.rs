@@ -436,7 +436,8 @@ async fn explicit_tool_response_consumes_next_scripted_turn() {
             matches!(
                 event,
                 ChatEvent::ToolExecutionCompleted(done)
-                    if done.tool_call_id == "epm-scripted" && done.success
+                    if done.tool_call_id == "epm-scripted"
+                        && fixture::tool_completion_succeeded(done)
             )
         })
         .await;
@@ -573,15 +574,6 @@ async fn reserved_script_governs_resumed_session() {
 
     let turn = fixture.finish_turn(&resumed).await;
     turn.assert_stream_end_contains("scripted resume response");
-    for event in turn.chat_events() {
-        if let ChatEvent::StreamEnd(end) = event {
-            assert!(
-                !end.message.content.contains("mock backend response to:"),
-                "resumed turn fell back to the default echo: {:?}",
-                end.message.content
-            );
-        }
-    }
     fixture.mock(&resumed).await.assert_clean().await;
 }
 
@@ -635,15 +627,6 @@ async fn reserved_script_governs_forked_session() {
 
     let turn = fixture.finish_turn(&forked).await;
     turn.assert_stream_end_contains("scripted fork response");
-    for event in turn.chat_events() {
-        if let ChatEvent::StreamEnd(end) = event {
-            assert!(
-                !end.message.content.contains("mock backend response to:"),
-                "forked launch turn fell back to the default echo: {:?}",
-                end.message.content
-            );
-        }
-    }
     fixture.mock(&forked).await.assert_clean().await;
 }
 
@@ -888,7 +871,6 @@ async fn stream_end_first_exit_plan_gates_the_completion() {
     );
     let request = protocol::ToolRequest {
         tool_call_id: "epm-sef".to_owned(),
-        tool_name: "ExitPlanMode".to_owned(),
         tool_type: protocol::ToolRequestType::ExitPlanMode {
             plan: Some("# Plan".to_owned()),
             plan_path: Some("/tmp/mock/mock-plan.md".to_owned()),
@@ -904,7 +886,8 @@ async fn stream_end_first_exit_plan_gates_the_completion() {
             matches!(
                 event,
                 ChatEvent::ToolExecutionCompleted(done)
-                    if done.tool_call_id == "epm-sef" && done.success
+                    if done.tool_call_id == "epm-sef"
+                        && fixture::tool_completion_succeeded(done)
             )
         })
         .await;

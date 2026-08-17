@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind,
-    AgentControlProgressStatus, AgentId, ChatEvent, ToolExecutionNormalizationFailure,
-    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType,
-    TydeAgentWaitStatus,
+    AgentControlProgressStatus, AgentId, ChatEvent, ToolExecutionMode,
+    ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolProgressData,
+    ToolProgressUpdate, TydeAgentWaitStatus,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -71,110 +71,6 @@ struct AwaitAgentsResult {
     still_thinking: Vec<TydeAgentWaitStatus>,
 }
 
-pub(crate) fn tyde_tool_request_type(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<Option<ToolRequestType>, ToolNormalizeError> {
-    let typed = if is_tyde_agent_control_spawn_tool_name(tool_name) {
-        let (prompt, name) = find_spawn_request_arguments(arguments, 0).ok_or_else(|| {
-            normalize_error(
-                tool_name,
-                ToolExecutionNormalizationFailure::CanonicalRequest,
-                "expected a non-empty prompt in canonical arguments",
-            )
-        })?;
-        ToolRequestType::AgentSpawn {
-            prompt: Some(prompt),
-            name,
-            execution_mode: protocol::AgentExecutionMode::Background,
-        }
-    } else if is_tyde_agent_control_send_message_tool_name(tool_name) {
-        let (agent_id, message) = find_send_message_arguments(arguments, 0).ok_or_else(|| {
-            normalize_error(
-                tool_name,
-                ToolExecutionNormalizationFailure::CanonicalRequest,
-                "expected non-empty agent_id/agentId and message in canonical arguments",
-            )
-        })?;
-        ToolRequestType::TydeSendAgentMessage { agent_id, message }
-    } else if is_tyde_agent_control_await_tool_name(tool_name) {
-        let agent_ids = parse_await_agent_refs(arguments)
-            .into_iter()
-            .map(|agent| agent.agent_id)
-            .collect::<Vec<_>>();
-        if agent_ids.is_empty() {
-            return Err(normalize_error(
-                tool_name,
-                ToolExecutionNormalizationFailure::CanonicalRequest,
-                "agent_ids must contain at least one non-empty id",
-            ));
-        }
-        ToolRequestType::TydeAwaitAgents { agent_ids }
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(typed))
-}
-
-fn find_spawn_request_arguments(value: &Value, depth: usize) -> Option<(String, Option<String>)> {
-    if depth > MAX_PARSE_DEPTH {
-        return None;
-    }
-    match value {
-        Value::Object(map) => {
-            if let Some(prompt) = map
-                .get("prompt")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|prompt| !prompt.is_empty())
-            {
-                let name = map
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_owned);
-                return Some((prompt.to_owned(), name));
-            }
-            ARGUMENT_WRAPPER_KEYS.iter().find_map(|key| {
-                map.get(*key)
-                    .and_then(|nested| find_spawn_request_arguments(nested, depth + 1))
-            })
-        }
-        Value::String(text) => parse_embedded_json(text)
-            .and_then(|parsed| find_spawn_request_arguments(&parsed, depth + 1)),
-        _ => None,
-    }
-}
-
-fn find_send_message_arguments(value: &Value, depth: usize) -> Option<(AgentId, String)> {
-    if depth > MAX_PARSE_DEPTH {
-        return None;
-    }
-    match value {
-        Value::Object(map) => {
-            let agent_id = ["agent_id", "agentId"]
-                .into_iter()
-                .find_map(|key| map.get(key).and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let message = map.get("message").and_then(Value::as_str);
-            if let (Some(agent_id), Some(message)) = (agent_id, message)
-                && !message.trim().is_empty()
-            {
-                return Some((AgentId(agent_id.to_owned()), message.to_owned()));
-            }
-            ARGUMENT_WRAPPER_KEYS.iter().find_map(|key| {
-                map.get(*key)
-                    .and_then(|nested| find_send_message_arguments(nested, depth + 1))
-            })
-        }
-        Value::String(text) => parse_embedded_json(text)
-            .and_then(|parsed| find_send_message_arguments(&parsed, depth + 1)),
-        _ => None,
-    }
-}
-
 pub(crate) fn tyde_tool_result(
     tool_name: &str,
     result: &Value,
@@ -214,134 +110,17 @@ pub(crate) fn normalize_tyde_chat_event(
     event: ChatEvent,
     normalization_failures: &mut std::collections::HashMap<String, PendingToolNormalizationFailure>,
 ) -> (ChatEvent, Option<String>) {
-    match event {
-        ChatEvent::ToolRequest(mut request) => {
-            let ToolRequestType::Other { args } = &request.tool_type else {
-                return (ChatEvent::ToolRequest(request), None);
-            };
-            match tyde_tool_request_type(&request.tool_name, args) {
-                Ok(Some(typed)) => {
-                    request.tool_type = typed;
-                    (ChatEvent::ToolRequest(request), None)
-                }
-                Ok(None) => (ChatEvent::ToolRequest(request), None),
-                Err(error) => {
-                    normalization_failures.insert(
-                        request.tool_call_id.clone(),
-                        PendingToolNormalizationFailure {
-                            kind: error.normalization_failure,
-                            detail: error.to_string(),
-                        },
-                    );
-                    (ChatEvent::ToolRequest(request), None)
-                }
-            }
-        }
-        ChatEvent::ToolExecutionCompleted(mut completion) => {
-            let request_failure = normalization_failures.remove(&completion.tool_call_id);
-            if is_tyde_agent_control_tool_name(&completion.tool_name, "tydesendagentmessage")
-                || is_tyde_agent_control_await_tool_name(&completion.tool_name)
-            {
-                let cancelled = match &completion.tool_result {
-                    ToolExecutionResult::Cancelled { .. } => true,
-                    ToolExecutionResult::Error {
-                        short_message,
-                        detailed_message,
-                    } => {
-                        short_message.to_ascii_lowercase().contains("cancel")
-                            || detailed_message.to_ascii_lowercase().contains("cancel")
-                    }
-                    _ => false,
-                } || completion
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.to_ascii_lowercase().contains("cancel"));
-                if !completion.success && cancelled {
-                    completion.tool_result = ToolExecutionResult::Cancelled {
-                        message: completion
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Cancelled".to_owned()),
-                    };
-                }
-            }
-            let result_failure = if completion.success {
-                match &completion.tool_result {
-                    ToolExecutionResult::Other { .. } => match tyde_tool_result(
-                        &completion.tool_name,
-                        &serde_json::to_value(&completion.tool_result)
-                            .expect("serialize tool result"),
-                    ) {
-                        Ok(Some(typed)) => {
-                            completion.tool_result = typed;
-                            None
-                        }
-                        Ok(None) => None,
-                        Err(error) => Some(PendingToolNormalizationFailure {
-                            kind: error.normalization_failure,
-                            detail: error.to_string(),
-                        }),
-                    },
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let reported_failure = if request_failure.is_none() && result_failure.is_none() {
-                completion
-                    .normalization_failure
-                    .map(|kind| PendingToolNormalizationFailure {
-                        kind,
-                        detail: normalization_failure_detail(kind),
-                    })
-            } else {
-                None
-            };
-            let failure = merge_pending_normalization_failure(
-                merge_pending_normalization_failure(reported_failure, request_failure),
-                result_failure,
-            );
-            if let Some(failure) = failure {
-                completion.success = false;
-                completion.error = Some(failure.detail);
-                completion.normalization_failure = Some(failure.kind);
-            }
-            (ChatEvent::ToolExecutionCompleted(completion), None)
-        }
-        event => (event, None),
+    let ChatEvent::ToolExecutionCompleted(mut completion) = event else {
+        return (event, None);
+    };
+    if let Some(failure) = normalization_failures.remove(&completion.tool_call_id) {
+        completion.outcome = ToolExecutionOutcome::Failed {
+            message: failure.detail.clone(),
+            details: Some(failure.detail),
+            normalization_failure: Some(failure.kind),
+        };
     }
-}
-
-fn merge_pending_normalization_failure(
-    existing: Option<PendingToolNormalizationFailure>,
-    incoming: Option<PendingToolNormalizationFailure>,
-) -> Option<PendingToolNormalizationFailure> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(failure), None) | (None, Some(failure)) => Some(failure),
-        (Some(existing), Some(incoming)) => Some(PendingToolNormalizationFailure {
-            kind: existing.kind.combined_with(incoming.kind),
-            detail: if existing.detail == incoming.detail {
-                existing.detail
-            } else {
-                format!("{}; {}", existing.detail, incoming.detail)
-            },
-        }),
-    }
-}
-
-fn normalization_failure_detail(failure: ToolExecutionNormalizationFailure) -> String {
-    match failure {
-        ToolExecutionNormalizationFailure::CanonicalRequest => {
-            "Canonical tool request failed typed validation".to_string()
-        }
-        ToolExecutionNormalizationFailure::CanonicalResult => {
-            "Canonical tool result failed typed validation".to_string()
-        }
-        ToolExecutionNormalizationFailure::CanonicalRequestAndResult => {
-            "Canonical tool request and result failed typed validation".to_string()
-        }
-    }
+    (ChatEvent::ToolExecutionCompleted(completion), None)
 }
 
 fn parse_canonical<T: for<'de> Deserialize<'de>>(
@@ -423,7 +202,6 @@ pub(crate) fn await_progress_data_for_tool(
     }
     agent_control_progress_data(
         tool_call_id,
-        tool_name,
         AgentControlProgressKind::Await,
         parse_await_agent_refs(arguments),
     )
@@ -453,7 +231,6 @@ pub(crate) fn spawn_progress_data_for_tool_result(
     }
     agent_control_progress_data(
         tool_call_id,
-        tool_name,
         AgentControlProgressKind::Spawn,
         parse_spawn_agent_ref(tool_result).into_iter().collect(),
     )
@@ -472,13 +249,12 @@ pub(crate) fn parse_spawn_agent_ref(result: &Value) -> Option<AgentControlAgentR
 
 fn agent_control_progress_data(
     tool_call_id: &str,
-    tool_name: &str,
     progress_kind: AgentControlProgressKind,
     agents: Vec<AgentControlAgentRef>,
 ) -> Option<ToolProgressData> {
     (!agents.is_empty()).then(|| ToolProgressData {
         tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
+        execution_mode: ToolExecutionMode::Foreground,
         update: ToolProgressUpdate::AgentControl(AgentControlProgress {
             progress_kind,
             agents,

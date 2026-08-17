@@ -10,8 +10,33 @@ use crate::state::{
 use protocol::{
     AgentControlStatus, AgentId, AskUserQuestion, ExitPlanModeDecision, FrameKind,
     SendMessagePayload, SendMessageToolResponse, StreamPath, ToolExecutionNormalizationFailure,
-    ToolExecutionResult, ToolRequestType, TydeAgentWaitStatus,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType, TydeAgentWaitStatus,
 };
+
+fn completion_result(
+    completion: &protocol::ToolExecutionCompletedData,
+) -> Option<&ToolExecutionResult> {
+    match &completion.outcome {
+        ToolExecutionOutcome::Succeeded { result } => Some(result),
+        ToolExecutionOutcome::Failed { .. } | ToolExecutionOutcome::Cancelled { .. } => None,
+    }
+}
+
+fn completion_succeeded(completion: &protocol::ToolExecutionCompletedData) -> bool {
+    matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { .. })
+}
+
+fn completion_normalization_failure(
+    completion: &protocol::ToolExecutionCompletedData,
+) -> Option<ToolExecutionNormalizationFailure> {
+    match &completion.outcome {
+        ToolExecutionOutcome::Failed {
+            normalization_failure,
+            ..
+        } => *normalization_failure,
+        ToolExecutionOutcome::Succeeded { .. } | ToolExecutionOutcome::Cancelled { .. } => None,
+    }
+}
 
 /// Renders a single tool request inside an assistant message.
 ///
@@ -43,15 +68,15 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
 
-    let tool_name = entry.request.tool_name.clone();
+    let tool_name = entry.tool_name.clone();
     let normalization_failure = entry
         .result
         .as_ref()
-        .and_then(|result| result.normalization_failure);
+        .and_then(completion_normalization_failure);
     let normalization_failed = normalization_failure.is_some();
 
     if let ToolRequestType::AskUserQuestion { questions } = &entry.request.tool_type
-        && entry.result.as_ref().is_none_or(|result| result.success)
+        && entry.result.as_ref().is_none_or(completion_succeeded)
     {
         let questions = questions.clone();
         return view! {
@@ -73,7 +98,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
     // plan read-only (no active controls), matching the desktop card. A failed
     // completion falls through to the generic completion body below.
     if let ToolRequestType::ExitPlanMode { plan, plan_path } = &entry.request.tool_type {
-        let succeeded = entry.result.as_ref().map(|r| r.success);
+        let succeeded = entry.result.as_ref().map(completion_succeeded);
         match succeeded {
             // Pending: interactive Approve/Reject card.
             None => {
@@ -132,9 +157,11 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
     // semantically here rather than falling through to the `Debug` dump below —
     // a new typed variant that degraded to `format!("{:?}", …)` on the PWA would
     // be a silent fallback, which is exactly what the architecture forbids. A
-    // *failed* call still falls through on purpose: the error must stay visible.
-    let succeeded = entry.result.as_ref().map(|result| result.success);
-    if succeeded != Some(false) {
+    // Ordinary failed calls still fall through on purpose: the error must stay
+    // visible. A normalization failure keeps the semantic card so it can explain
+    // which canonical half failed without exposing an unrelated raw payload.
+    let succeeded = entry.result.as_ref().map(completion_succeeded);
+    if succeeded != Some(false) || normalization_failed {
         let status_class = if normalization_failed {
             "completed failed"
         } else if entry.result.is_some() {
@@ -152,7 +179,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             // any other shape means the request and result normalizers disagree —
             // protocol drift, which must be loud rather than silently rendered as
             // if everything were fine.
-            let mismatch = match entry.result.as_ref().map(|result| &result.tool_result) {
+            let mismatch = match entry.result.as_ref().and_then(completion_result) {
                 None | Some(ToolExecutionResult::TydeSendAgentMessage) => false,
                 Some(other) => {
                     log::error!(
@@ -189,7 +216,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             let verdict = if normalization_failed {
                 AwaitVerdict::NormalizationFailure
             } else {
-                match entry.result.as_ref().map(|result| &result.tool_result) {
+                match entry.result.as_ref().and_then(completion_result) {
                     None => AwaitVerdict::Pending,
                     Some(ToolExecutionResult::TydeAwaitAgents {
                         ready,
@@ -231,7 +258,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             let prompt = prompt
                 .clone()
                 .unwrap_or_else(|| "Generating image".to_owned());
-            let detail = match entry.result.as_ref().map(|result| &result.tool_result) {
+            let detail = match entry.result.as_ref().and_then(completion_result) {
                 None => "Generating image".to_owned(),
                 Some(ToolExecutionResult::GenerateImage { image_count, .. }) => format!(
                     "{image_count} image{} generated",
@@ -280,15 +307,15 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
     }
 
     let is_completed = entry.result.is_some();
-    let success = entry.result.as_ref().map(|r| r.success).unwrap_or(false);
+    let success = entry.result.as_ref().is_some_and(completion_succeeded);
     let cancelled = entry
         .result
         .as_ref()
-        .is_some_and(|result| matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. }));
+        .is_some_and(|result| matches!(&result.outcome, ToolExecutionOutcome::Cancelled { .. }));
     let result_summary = entry
         .result
         .as_ref()
-        .map(|r| format!("{:?}", r.tool_result))
+        .map(|r| format!("{:?}", r.outcome))
         .unwrap_or_default();
 
     // A canonical-request normalization marker pairs with the preserved `Other`
@@ -402,9 +429,14 @@ fn malformed_request_payload(entry: &ToolRequestEntry) -> Option<String> {
     };
     let completion = entry.result.as_ref()?;
     if !matches!(
-        completion.normalization_failure,
-        Some(ToolExecutionNormalizationFailure::CanonicalRequest)
-            | Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult)
+        &completion.outcome,
+        ToolExecutionOutcome::Failed {
+            normalization_failure: Some(
+                ToolExecutionNormalizationFailure::CanonicalRequest
+                    | ToolExecutionNormalizationFailure::CanonicalRequestAndResult
+            ),
+            ..
+        }
     ) {
         return None;
     }
@@ -1695,6 +1727,32 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn succeeded_completion(
+        tool_call_id: &str,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionCompletedData {
+        ToolExecutionCompletedData {
+            tool_call_id: tool_call_id.to_owned(),
+            outcome: ToolExecutionOutcome::Succeeded { result },
+        }
+    }
+
+    fn failed_completion(
+        tool_call_id: &str,
+        message: &str,
+        details: Option<&str>,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    ) -> ToolExecutionCompletedData {
+        ToolExecutionCompletedData {
+            tool_call_id: tool_call_id.to_owned(),
+            outcome: ToolExecutionOutcome::Failed {
+                message: message.to_owned(),
+                details: details.map(str::to_owned),
+                normalization_failure,
+            },
+        }
+    }
+
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
@@ -1721,9 +1779,9 @@ mod wasm_tests {
 
     fn ask_entry(multi_select: bool) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
                     questions: vec![AskUserQuestion {
                         id: None,
@@ -1951,16 +2009,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn successful_ask_user_question_still_renders_interactive_card() {
         let mut entry = ask_entry(false);
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_ask".to_owned(),
-            tool_name: "AskUserQuestion".to_owned(),
-            tool_result: ToolExecutionResult::Other {
+        entry.result = Some(succeeded_completion(
+            "toolu_ask",
+            ToolExecutionResult::Other {
                 result: serde_json::json!({}),
             },
-            success: true,
-            error: None,
-            normalization_failure: None,
-        });
+        ));
         let container = mount_card(entry);
         next_tick().await;
 
@@ -1983,17 +2037,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn failed_ask_user_question_renders_error_completion() {
         let mut entry = ask_entry(false);
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_ask".to_owned(),
-            tool_name: "AskUserQuestion".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "ask failed".to_owned(),
-                detailed_message: "AskUserQuestion failed".to_owned(),
-            },
-            success: false,
-            error: Some("ask failed".to_owned()),
-            normalization_failure: None,
-        });
+        entry.result = Some(failed_completion(
+            "toolu_ask",
+            "ask failed",
+            Some("AskUserQuestion failed"),
+            None,
+        ));
         let container = mount_card(entry);
         next_tick().await;
 
@@ -2654,23 +2703,21 @@ mod wasm_tests {
 
     fn exit_plan_entry(completed: bool) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
-                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: ToolRequestType::ExitPlanMode {
                     plan: Some("Step 1: do the thing\nStep 2: verify it".to_owned()),
                     plan_path: Some("docs/plan.md".to_owned()),
                 },
             },
-            result: completed.then(|| ToolExecutionCompletedData {
-                tool_call_id: "toolu_plan".to_owned(),
-                tool_name: "ExitPlanMode".to_owned(),
-                tool_result: ToolExecutionResult::Other {
-                    result: serde_json::json!({ "decision": "approve" }),
-                },
-                success: true,
-                error: None,
-                normalization_failure: None,
+            result: completed.then(|| {
+                succeeded_completion(
+                    "toolu_plan",
+                    ToolExecutionResult::Other {
+                        result: serde_json::json!({ "decision": "approve" }),
+                    },
+                )
             }),
         }
     }
@@ -2944,9 +2991,9 @@ mod wasm_tests {
     /// completion (`{"ok": true}`) still normalizes to the typed ack.
     fn malformed_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: serde_json::json!({
                         "tool": "mcp__tyde-agent-control__tyde_send_agent_message",
@@ -2954,14 +3001,12 @@ mod wasm_tests {
                     }),
                 },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_send_3".to_owned(),
-                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
-                tool_result: ToolExecutionResult::TydeSendAgentMessage,
-                success: true,
-                error: None,
-                normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
-            }),
+            result: Some(failed_completion(
+                "toolu_send_3",
+                "canonical data could not be normalized",
+                None,
+                Some(ToolExecutionNormalizationFailure::CanonicalRequest),
+            )),
         }
     }
 
@@ -3021,8 +3066,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn result_only_marker_fails_semantic_card_without_request_disclosure() {
         let mut entry = send_message_entry(Some(ToolExecutionResult::TydeSendAgentMessage), true);
-        entry.result.as_mut().unwrap().normalization_failure =
-            Some(ToolExecutionNormalizationFailure::CanonicalResult);
+        entry.result = Some(failed_completion(
+            "toolu_send",
+            "result normalization failed",
+            None,
+            Some(ToolExecutionNormalizationFailure::CanonicalResult),
+        ));
         let container = mount_card(entry);
         next_tick().await;
 
@@ -3054,8 +3103,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn combined_marker_keeps_sanitized_request_diagnostic() {
         let mut entry = malformed_entry();
-        entry.result.as_mut().unwrap().normalization_failure =
-            Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult);
+        entry.result = Some(failed_completion(
+            "toolu_send_3",
+            "request and result normalization failed",
+            None,
+            Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult),
+        ));
         let container = mount_card(entry);
         next_tick().await;
 
@@ -3110,17 +3163,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn normalization_error_completion_retains_sanitized_request() {
         let mut entry = malformed_entry();
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_send_3".to_owned(),
-            tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "worker launch failed".to_owned(),
-                detailed_message: "request rejected before execution".to_owned(),
-            },
-            success: false,
-            error: None,
-            normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
-        });
+        entry.result = Some(failed_completion(
+            "toolu_send_3",
+            "worker launch failed",
+            Some("request rejected before execution"),
+            Some(ToolExecutionNormalizationFailure::CanonicalRequest),
+        ));
         let ToolRequestType::Other { args } = &mut entry.request.tool_type else {
             unreachable!();
         };
@@ -3137,18 +3185,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn matching_error_prose_without_marker_does_not_trigger_diagnostic() {
         let mut entry = malformed_entry();
-        entry.request.tool_name = "tyde_spawn_agent".to_owned();
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_send_3".to_owned(),
-            tool_name: "tyde_spawn_agent".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "worker launch failed".to_owned(),
-                detailed_message: "process exited before ready".to_owned(),
-            },
-            success: false,
-            error: Some("Failed to normalize canonical tool request".to_owned()),
-            normalization_failure: None,
-        });
+        entry.tool_name = "tyde_spawn_agent".to_owned();
+        entry.result = Some(failed_completion(
+            "toolu_send_3",
+            "worker launch failed",
+            Some("process exited before ready"),
+            None,
+        ));
 
         let container = mount_card(entry);
         next_tick().await;
@@ -3172,23 +3215,19 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn well_formed_tool_shows_no_malformed_payload() {
         let entry = ToolRequestEntry {
+            tool_name: "tyde_spawn_agent".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_spawn".to_owned(),
-                tool_name: "tyde_spawn_agent".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: serde_json::json!({ "prompt": "do the thing" }),
                 },
             },
-            result: Some(ToolExecutionCompletedData {
-                tool_call_id: "toolu_spawn".to_owned(),
-                tool_name: "tyde_spawn_agent".to_owned(),
-                tool_result: ToolExecutionResult::Other {
+            result: Some(succeeded_completion(
+                "toolu_spawn",
+                ToolExecutionResult::Other {
                     result: serde_json::json!({ "agent_id": "agent-sub" }),
                 },
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            )),
         };
         let container = mount_card(entry);
         next_tick().await;
@@ -3457,42 +3496,39 @@ mod wasm_tests {
 
     fn send_message_entry(result: Option<ToolExecutionResult>, success: bool) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send".to_owned(),
-                tool_name: "tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: SEND_MESSAGE.to_owned(),
                 },
             },
-            result: result.map(|tool_result| ToolExecutionCompletedData {
-                tool_call_id: "toolu_send".to_owned(),
-                tool_name: "tyde_send_agent_message".to_owned(),
-                tool_result,
-                success,
-                error: (!success).then(|| "send failed".to_owned()),
-                normalization_failure: None,
+            result: result.map(|tool_result| {
+                if success {
+                    succeeded_completion("toolu_send", tool_result)
+                } else {
+                    failed_completion(
+                        "toolu_send",
+                        "unknown agent_id",
+                        Some("agent-sub is not a direct child"),
+                        None,
+                    )
+                }
             }),
         }
     }
 
     fn await_entry(result: Option<ToolExecutionResult>) -> ToolRequestEntry {
         ToolRequestEntry {
+            tool_name: "tyde_await_agents".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_await".to_owned(),
-                tool_name: "tyde_await_agents".to_owned(),
                 tool_type: ToolRequestType::TydeAwaitAgents {
                     agent_ids: vec![AgentId("agent-sub".to_owned())],
                 },
             },
-            result: result.map(|tool_result| ToolExecutionCompletedData {
-                tool_call_id: "toolu_await".to_owned(),
-                tool_name: "tyde_await_agents".to_owned(),
-                tool_result,
-                success: true,
-                error: None,
-                normalization_failure: None,
-            }),
+            result: result.map(|tool_result| succeeded_completion("toolu_await", tool_result)),
         }
     }
 
@@ -3598,13 +3634,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn failed_send_message_renders_error_completion() {
         let container = mount_card_with_setup(
-            send_message_entry(
-                Some(ToolExecutionResult::Error {
-                    short_message: "unknown agent_id".to_owned(),
-                    detailed_message: "agent-sub is not a direct child".to_owned(),
-                }),
-                false,
-            ),
+            send_message_entry(Some(ToolExecutionResult::TydeSendAgentMessage), false),
             with_child_agent,
         );
         next_tick().await;
@@ -3970,13 +4000,7 @@ mod wasm_tests {
     async fn failed_tool_result_is_open_in_summary_and_compact() {
         for mode in [ToolOutputMode::Summary, ToolOutputMode::Compact] {
             let container = mount_card_with_setup(
-                send_message_entry(
-                    Some(ToolExecutionResult::Error {
-                        short_message: "unknown agent_id".to_owned(),
-                        detailed_message: "agent-sub is not a direct child".to_owned(),
-                    }),
-                    false,
-                ),
+                send_message_entry(Some(ToolExecutionResult::TydeSendAgentMessage), false),
                 move |state| {
                     with_child_agent(state);
                     state.tool_output_mode.set(mode);

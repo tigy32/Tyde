@@ -778,6 +778,24 @@ for raw_line in sys.stdin:
                 "model": "ClaudeSonnet46",
             },
         })
+        emit({"kind": "StreamDelta", "data": {"text": "fake Tycode response"}})
+        emit({
+            "kind": "StreamEnd",
+            "data": {
+                "message": {
+                    "message_id": "fake-message",
+                    "timestamp": 1,
+                    "sender": {"Assistant": {"agent": "tycode"}},
+                    "content": "fake Tycode response",
+                    "reasoning": None,
+                    "tool_calls": [],
+                    "model_info": {"model": "ClaudeSonnet46"},
+                    "token_usage": None,
+                    "context_breakdown": None,
+                    "images": [],
+                },
+            },
+        })
         emit({"kind": "TypingStatusChanged", "data": False})
     elif isinstance(command, dict) and "ResumeSession" in command:
         emit({"kind": "SessionStarted", "data": {"session_id": command["ResumeSession"]["session_id"]}})

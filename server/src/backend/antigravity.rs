@@ -739,7 +739,6 @@ impl AntigravityInner {
         let stdout_task = tokio::spawn(read_antigravity_stdout(
             stdout,
             self.events_tx.clone(),
-            prepared.message_id.clone(),
             prepared.model.clone(),
             stdout_session_capture,
         ));
@@ -1439,11 +1438,10 @@ fn build_prompt(instructions: Option<&str>, message: &str) -> String {
 async fn read_antigravity_stdout(
     stdout: ChildStdout,
     events_tx: mpsc::UnboundedSender<ChatEvent>,
-    message_id: String,
     model: String,
     startup_capture: Option<SessionCapture>,
 ) -> AntigravityStdoutSummary {
-    let mut state = AntigravityStdoutState::new(events_tx, message_id, model, startup_capture);
+    let mut state = AntigravityStdoutState::new(events_tx, model, startup_capture);
     let mut reader = BufReader::new(stdout);
     let mut buffer = [0_u8; 4096];
     loop {
@@ -1473,7 +1471,6 @@ async fn read_antigravity_stderr(stderr: ChildStderr) -> String {
 
 struct AntigravityStdoutState {
     events_tx: mpsc::UnboundedSender<ChatEvent>,
-    message_id: String,
     model: String,
     stdout: String,
     streamed_text: String,
@@ -1485,13 +1482,11 @@ struct AntigravityStdoutState {
 impl AntigravityStdoutState {
     fn new(
         events_tx: mpsc::UnboundedSender<ChatEvent>,
-        message_id: String,
         model: String,
         startup_capture: Option<SessionCapture>,
     ) -> Self {
         Self {
             events_tx,
-            message_id,
             model,
             stdout: String::new(),
             streamed_text: String::new(),
@@ -1529,7 +1524,6 @@ impl AntigravityStdoutState {
         let _ = self
             .events_tx
             .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: Some(self.message_id.clone()),
                 text: text.to_string(),
             }));
     }
@@ -1548,7 +1542,6 @@ impl AntigravityStdoutState {
             return;
         }
         let _ = self.events_tx.send(ChatEvent::StreamStart(StreamStartData {
-            message_id: Some(self.message_id.clone()),
             agent: ANTIGRAVITY_AGENT_NAME.to_string(),
             model: Some(self.model.clone()),
         }));
@@ -1557,7 +1550,6 @@ impl AntigravityStdoutState {
         let _ = self
             .events_tx
             .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: Some(self.message_id.clone()),
                 text: self.stdout.clone(),
             }));
     }

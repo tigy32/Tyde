@@ -16,7 +16,8 @@ use protocol::{
     SessionSettingValue, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
     StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
     TaskTokenUsageUnavailableReason, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+    ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -1228,12 +1229,15 @@ async fn expect_turn_on_stream(
     stream: &StreamPath,
     expected_text: &str,
 ) {
-    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(
-        matches!(event, ChatEvent::TypingStatusChanged(true)),
-        "expected TypingStatusChanged(true) on {stream}, got {event:?}"
-    );
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        match event {
+            ChatEvent::TypingStatusChanged(false) => continue,
+            ChatEvent::TypingStatusChanged(true) => break,
+            other => panic!("expected TypingStatusChanged(true) on {stream}, got {other:?}"),
+        }
+    }
 
     expect_live_turn_after_typing_true_on_stream(client, stream, expected_text).await;
 }
@@ -1418,7 +1422,7 @@ async fn expect_tool_request_on_stream(
         let env = expect_chat_event_on_stream(client, stream, expected_tool_name).await;
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
         if let ChatEvent::ToolRequest(request) = event
-            && request.tool_name == expected_tool_name
+            && fixture::tool_request_name(&request) == expected_tool_name
         {
             return request;
         }
@@ -1555,7 +1559,7 @@ async fn wait_for_exit_plan_mode_pause_on_stream(
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
         match event {
             ChatEvent::ToolRequest(request) => {
-                assert_eq!(request.tool_name, "ExitPlanMode");
+                assert_eq!(fixture::tool_request_name(&request), "ExitPlanMode");
                 assert!(matches!(
                     &request.tool_type,
                     protocol::ToolRequestType::ExitPlanMode { .. }
@@ -2262,6 +2266,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "mock backend response to: root usage",
     )
     .await;
+    let (mut usage_client, _) = fixture.connect_with_bootstrap().await;
     let child = spawn_user_child(
         &mut fixture.client,
         &root.agent_id,
@@ -2280,7 +2285,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     .await;
 
     let payload = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "root child grandchild aggregate",
         |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 3,
@@ -2344,7 +2349,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     .await;
 
     let updated = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "updated descendant aggregate",
         |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 4,
@@ -2377,7 +2382,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     assert_eq!(closed.agent_id, grandchild.agent_id);
 
     let after_close = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "aggregate after grandchild close",
         |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 4,
@@ -2936,11 +2941,17 @@ async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
         unreachable!("matched ToolExecutionCompleted above");
     };
     assert!(
-        !completion.success,
+        fixture::tool_completion_failed(&completion),
         "expected failed tool completion on {}, got {completion:?}",
         agent.stream
     );
-    let error = completion.error.as_deref().unwrap_or_default();
+    let error = match &completion.outcome {
+        ToolExecutionOutcome::Failed {
+            message, details, ..
+        } => details.as_deref().unwrap_or(message),
+        ToolExecutionOutcome::Cancelled { message } => message,
+        ToolExecutionOutcome::Succeeded { .. } => "",
+    };
     assert!(
         error.contains("history did not contain a tool_result"),
         "unexpected tool completion error on {}: {error}",
@@ -3868,9 +3879,8 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
             ChatEvent::ToolExecutionCompleted(completion)
-                if completion.tool_name == "ExitPlanMode" =>
+                if fixture::tool_completion_succeeded(&completion) =>
             {
-                assert!(completion.success);
                 saw_completion = true;
             }
             ChatEvent::StreamEnd(end)
@@ -4011,9 +4021,8 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         .await;
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         if let ChatEvent::ToolExecutionCompleted(completion) = event
-            && completion.tool_name == "ExitPlanMode"
+            && fixture::tool_completion_succeeded(&completion)
         {
-            assert!(completion.success);
             saw_completion = true;
         }
     }
@@ -4909,10 +4918,8 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
     let ToolRequest {
         tool_call_id,
-        tool_name,
         tool_type,
     } = await_request;
-    assert_eq!(tool_name, "tyde_await_agents");
     assert_eq!(
         tool_type,
         ToolRequestType::TydeAwaitAgents {
@@ -4977,15 +4984,17 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
     assert_eq!(completion.tool_call_id, tool_call_id);
-    assert_eq!(completion.tool_name, "tyde_await_agents");
     assert!(
-        completion.success,
+        fixture::tool_completion_succeeded(&completion),
         "await completion failed: {completion:?}"
     );
-    let ToolExecutionResult::TydeAwaitAgents {
-        ready,
-        still_thinking,
-    } = completion.tool_result
+    let ToolExecutionOutcome::Succeeded {
+        result:
+            ToolExecutionResult::TydeAwaitAgents {
+                ready,
+                still_thinking,
+            },
+    } = completion.outcome
     else {
         panic!("expected typed await completion");
     };
@@ -5023,8 +5032,10 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
         AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
             if completion.tool_call_id == tool_call_id
                 && matches!(
-                    &completion.tool_result,
-                    ToolExecutionResult::TydeAwaitAgents { ready, still_thinking }
+                    &completion.outcome,
+                    ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::TydeAwaitAgents { ready, still_thinking }
+                    }
                         if still_thinking.is_empty()
                             && ready.len() == 1
                             && ready[0].agent_id == child_new.agent_id
@@ -5061,7 +5072,8 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
         |event| {
             matches!(
                 event,
-                ChatEvent::ToolRequest(request) if request.tool_name == "tyde_send_agent_message"
+                ChatEvent::ToolRequest(request)
+                    if fixture::tool_request_name(request) == "tyde_send_agent_message"
             )
         },
     )
@@ -5069,7 +5081,10 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
     let ChatEvent::ToolRequest(request) = event else {
         unreachable!("matched ToolRequest above");
     };
-    assert_eq!(request.tool_name, "tyde_send_agent_message");
+    assert_eq!(
+        fixture::tool_request_name(&request),
+        "tyde_send_agent_message"
+    );
     assert_eq!(
         request.tool_type,
         ToolRequestType::TydeSendAgentMessage {
@@ -5093,11 +5108,12 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
     let ChatEvent::ToolExecutionCompleted(completion) = event else {
         unreachable!("matched ToolExecutionCompleted above");
     };
-    assert!(completion.success);
-    assert_eq!(
-        completion.tool_result,
-        ToolExecutionResult::TydeSendAgentMessage
-    );
+    assert!(matches!(
+        completion.outcome,
+        ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::TydeSendAgentMessage
+        }
+    ));
     let event = fixture::next_chat_event_matching_on(
         &mut fixture.client,
         &parent.instance_stream,
@@ -5149,8 +5165,12 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
         event,
         AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
             if completion.tool_call_id == request.tool_call_id
-                && completion.success
-                && completion.tool_result == ToolExecutionResult::TydeSendAgentMessage
+                && matches!(
+                    completion.outcome,
+                    ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::TydeSendAgentMessage
+                    }
+                )
     )));
 }
 

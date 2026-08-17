@@ -1106,13 +1106,13 @@ async fn drain_prepared_binding_bootstrap(
                 BackendEvent::Chat(ChatEvent::ToolRequest(request)) => {
                     return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                         backend_kind: kind,
-                        activity: format!("tool request {}", request.tool_name),
+                        activity: format!("tool request {}", request.tool_call_id),
                     });
                 }
                 BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion)) => {
                     return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                         backend_kind: kind,
-                        activity: format!("tool completion {}", completion.tool_name),
+                        activity: format!("tool completion {}", completion.tool_call_id),
                     });
                 }
                 BackendEvent::Chat(ChatEvent::Orchestration(_)) => {
@@ -1171,13 +1171,13 @@ fn drain_prepared_binding_replay(
             Ok(BackendEvent::Chat(ChatEvent::ToolRequest(request))) => {
                 return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                     backend_kind: kind,
-                    activity: format!("replayed tool request {}", request.tool_name),
+                    activity: format!("replayed tool request {}", request.tool_call_id),
                 });
             }
             Ok(BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion))) => {
                 return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                     backend_kind: kind,
-                    activity: format!("replayed tool completion {}", completion.tool_name),
+                    activity: format!("replayed tool completion {}", completion.tool_call_id),
                 });
             }
             Ok(BackendEvent::Chat(ChatEvent::ToolProgress(progress))) => {

@@ -40,7 +40,8 @@ use protocol::{
     TeamContextCompactionNotifyPayload, TeamContextCompactionStatus, TeamCreatePayload,
     TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
     TeamMemberCreateSpec, TeamMemberNotifyPayload, TeamNotifyPayload, TokenUsage, TokenUsageScope,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+    ToolRequestType,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
@@ -87,6 +88,90 @@ use uuid::Uuid;
 
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(120);
 const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
+
+trait ToolCompletionOutcomeExt {
+    fn success(&self) -> bool;
+    fn tool_result(&self) -> &ToolExecutionResult;
+    fn error(&self) -> Option<&str>;
+    fn normalization_failure(&self) -> Option<protocol::ToolExecutionNormalizationFailure>;
+}
+
+impl ToolCompletionOutcomeExt for ToolExecutionCompletedData {
+    fn success(&self) -> bool {
+        matches!(self.outcome, ToolExecutionOutcome::Succeeded { .. })
+    }
+
+    fn tool_result(&self) -> &ToolExecutionResult {
+        match &self.outcome {
+            ToolExecutionOutcome::Succeeded { result } => result,
+            ToolExecutionOutcome::Failed { .. } | ToolExecutionOutcome::Cancelled { .. } => {
+                panic!("failed tool completion has no result: {:?}", self.outcome)
+            }
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match &self.outcome {
+            ToolExecutionOutcome::Failed { message, .. }
+            | ToolExecutionOutcome::Cancelled { message } => Some(message),
+            ToolExecutionOutcome::Succeeded { .. } => None,
+        }
+    }
+
+    fn normalization_failure(&self) -> Option<protocol::ToolExecutionNormalizationFailure> {
+        match self.outcome {
+            ToolExecutionOutcome::Failed {
+                normalization_failure,
+                ..
+            } => normalization_failure,
+            ToolExecutionOutcome::Succeeded { .. } | ToolExecutionOutcome::Cancelled { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ObservedBackgroundTaskProgress {
+    task_id: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+fn background_task_progress(
+    update: &protocol::ToolProgressUpdate,
+) -> Option<ObservedBackgroundTaskProgress> {
+    let protocol::ToolProgressUpdate::Other { payload } = update else {
+        return None;
+    };
+    let task: ObservedBackgroundTaskProgress = serde_json::from_value(payload.clone()).ok()?;
+    (!task.task_id.trim().is_empty()).then_some(task)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedBackgroundOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl ExpectedBackgroundOutcome {
+    fn matches(self, outcome: &ToolExecutionOutcome) -> bool {
+        matches!(
+            (self, outcome),
+            (
+                ExpectedBackgroundOutcome::Succeeded,
+                ToolExecutionOutcome::Succeeded { .. }
+            ) | (
+                ExpectedBackgroundOutcome::Failed,
+                ToolExecutionOutcome::Failed { .. }
+            ) | (
+                ExpectedBackgroundOutcome::Cancelled,
+                ToolExecutionOutcome::Cancelled { .. }
+            )
+        )
+    }
+}
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
@@ -1126,7 +1211,6 @@ struct ValidatedConnection {
     validator: ProtocolValidator,
     pending_bootstrap_events: VecDeque<Envelope>,
     restored_events: VecDeque<Envelope>,
-    terminal_background_tasks: HashMap<(StreamPath, String), protocol::BackgroundTaskStatus>,
     progress_families: HashMap<(StreamPath, String), ProgressFamily>,
     terminal_progress: HashSet<(StreamPath, String, ProgressFamily)>,
     running_progress: HashSet<(StreamPath, String, ProgressFamily)>,
@@ -1160,7 +1244,6 @@ struct SpawnInputAdmission {
 struct ReplayTraceAudit {
     open_tools: HashSet<String>,
     terminal_tools: HashSet<String>,
-    terminal_background_tasks: HashMap<String, protocol::BackgroundTaskStatus>,
     progress_families: HashMap<String, ProgressFamily>,
     terminal_progress: HashSet<(String, ProgressFamily)>,
     running_progress: HashSet<(String, ProgressFamily)>,
@@ -1190,6 +1273,20 @@ impl ReplayTraceAudit {
                     "replayed tool completed without one correlated request: {}",
                     completion.tool_call_id
                 );
+                if let Some(family) = self
+                    .progress_families
+                    .get(&completion.tool_call_id)
+                    .copied()
+                {
+                    let progress_key = (completion.tool_call_id.clone(), family);
+                    assert!(
+                        self.terminal_progress.insert(progress_key.clone()),
+                        "replayed progress completed more than once: {progress_key:?}"
+                    );
+                    self.running_progress.remove(&progress_key);
+                }
+                self.running_background_tasks
+                    .remove(&completion.tool_call_id);
             }
             ChatEvent::ToolProgress(progress) => {
                 let family = progress_family(&progress.update);
@@ -1204,39 +1301,12 @@ impl ReplayTraceAudit {
                     );
                 }
                 let progress_key = (progress.tool_call_id.clone(), family);
-                if progress_update_is_running(&progress.update) {
-                    assert!(
-                        !self.terminal_progress.contains(&progress_key),
-                        "replayed terminal progress regressed to running: {progress_key:?}"
-                    );
-                    self.running_progress.insert(progress_key.clone());
-                } else {
-                    assert!(
-                        self.terminal_progress.insert(progress_key.clone()),
-                        "replayed progress emitted duplicate terminal: {progress_key:?}"
-                    );
-                    self.running_progress.remove(&progress_key);
-                }
-                let protocol::ToolProgressUpdate::BackgroundTask(task) = &progress.update else {
-                    return;
-                };
-                if let Some(terminal) = self.terminal_background_tasks.get(&progress.tool_call_id) {
-                    assert_ne!(
-                        task.status,
-                        protocol::BackgroundTaskStatus::Running,
-                        "replayed background task regressed from {terminal:?} to Running: {}",
-                        progress.tool_call_id
-                    );
-                    panic!(
-                        "replayed background task emitted more than one terminal state: {}",
-                        progress.tool_call_id
-                    );
-                }
-                if task.status != protocol::BackgroundTaskStatus::Running {
-                    self.running_background_tasks.remove(&progress.tool_call_id);
-                    self.terminal_background_tasks
-                        .insert(progress.tool_call_id.clone(), task.status);
-                } else {
+                assert!(
+                    !self.terminal_progress.contains(&progress_key),
+                    "replayed progress arrived after completion: {progress_key:?}"
+                );
+                self.running_progress.insert(progress_key);
+                if progress.execution_mode == protocol::ToolExecutionMode::Background {
                     self.running_background_tasks
                         .insert(progress.tool_call_id.clone());
                 }
@@ -1248,7 +1318,6 @@ impl ReplayTraceAudit {
 
 impl ValidatedConnection {
     fn inherit_live_trace_from(&mut self, previous: &Self) {
-        self.terminal_background_tasks = previous.terminal_background_tasks.clone();
         self.progress_families = previous.progress_families.clone();
         self.terminal_progress = previous.terminal_progress.clone();
         self.running_progress = previous.running_progress.clone();
@@ -1409,7 +1478,6 @@ impl ValidatedConnection {
             }
         }
         if !already_validated && !(replayed_bootstrap && envelope.kind == FrameKind::ChatEvent) {
-            self.validate_background_terminal_monotonicity(&envelope);
             self.validate_trace_invariants(&envelope);
         }
 
@@ -1717,9 +1785,9 @@ impl ValidatedConnection {
                 );
             }
             ChatEvent::ToolExecutionCompleted(completion) => {
-                let key = (envelope.stream.clone(), completion.tool_call_id);
+                let key = (envelope.stream.clone(), completion.tool_call_id.clone());
                 if let Some((target_stream, message)) = self.agent_control_input_tools.remove(&key)
-                    && !completion.success
+                    && !completion.success()
                 {
                     let pending = self.pending_inputs.get_mut(&target_stream).unwrap_or_else(|| {
                         panic!(
@@ -1743,6 +1811,15 @@ impl ValidatedConnection {
                     self.open_tools.remove(&key),
                     "tool completed without one live correlated request: {key:?}"
                 );
+                if let Some(family) = self.progress_families.get(&key).copied() {
+                    let progress_key = (key.0.clone(), key.1.clone(), family);
+                    assert!(
+                        self.terminal_progress.insert(progress_key.clone()),
+                        "progress completed more than once: {progress_key:?}"
+                    );
+                    self.running_progress.remove(&progress_key);
+                }
+                self.running_background_tasks.remove(&key);
             }
             ChatEvent::ToolProgress(progress) => {
                 let key = (envelope.stream.clone(), progress.tool_call_id.clone());
@@ -1759,25 +1836,17 @@ impl ValidatedConnection {
                     );
                 }
                 let progress_key = (key.0.clone(), key.1.clone(), family);
-                if progress_update_is_running(&progress.update) {
-                    assert!(
-                        !self.terminal_progress.contains(&progress_key),
-                        "terminal progress regressed to running: {progress_key:?}"
-                    );
-                    self.running_progress.insert(progress_key);
-                } else {
-                    assert!(
-                        self.terminal_progress.insert(progress_key.clone()),
-                        "progress emitted more than one terminal snapshot: {progress_key:?}"
-                    );
-                    self.running_progress.remove(&progress_key);
-                }
+                assert!(
+                    !self.terminal_progress.contains(&progress_key),
+                    "progress arrived after completion: {progress_key:?}"
+                );
+                self.running_progress.insert(progress_key);
                 let observed_kind = match &progress.update {
-                    protocol::ToolProgressUpdate::BackgroundTask(_) => {
-                        Some(ObservedAmbientWorkKind::Command)
-                    }
                     protocol::ToolProgressUpdate::SubAgent(_) => {
                         Some(ObservedAmbientWorkKind::Subagent)
+                    }
+                    _ if progress.execution_mode == protocol::ToolExecutionMode::Background => {
+                        Some(ObservedAmbientWorkKind::Command)
                     }
                     _ => None,
                 };
@@ -1790,17 +1859,8 @@ impl ValidatedConnection {
                         "ambient work identity changed observable kind: {key:?}"
                     );
                 }
-                let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
-                    return;
-                };
-                if task.status == protocol::BackgroundTaskStatus::Running {
-                    assert!(
-                        !self.terminal_background_tasks.contains_key(&key),
-                        "terminal background task regressed to Running: {key:?}"
-                    );
+                if progress.execution_mode == protocol::ToolExecutionMode::Background {
                     self.running_background_tasks.insert(key);
-                } else {
-                    self.running_background_tasks.remove(&key);
                 }
             }
             ChatEvent::TypingStatusChanged(true) => {
@@ -1834,30 +1894,6 @@ impl ValidatedConnection {
         }
     }
 
-    fn validate_background_terminal_monotonicity(&mut self, envelope: &Envelope) {
-        if envelope.kind != FrameKind::ChatEvent {
-            return;
-        }
-        let Ok(ChatEvent::ToolProgress(progress)) = envelope.parse_payload::<ChatEvent>() else {
-            return;
-        };
-        let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
-            return;
-        };
-        let key = (envelope.stream.clone(), progress.tool_call_id);
-        if let Some(terminal) = self.terminal_background_tasks.get(&key) {
-            assert_ne!(
-                task.status,
-                protocol::BackgroundTaskStatus::Running,
-                "background task regressed from {terminal:?} to Running: {key:?}"
-            );
-            panic!("background task emitted more than one terminal state: {key:?}");
-        }
-        if task.status != protocol::BackgroundTaskStatus::Running {
-            self.terminal_background_tasks.insert(key, task.status);
-        }
-    }
-
     fn observe_agent_start(&mut self, stream: &StreamPath, start: AgentStartPayload) {
         eprintln!(
             "CONFORMANCE AGENT START agent={} stream={} prior_stream={:?} startup_inputs={:?}",
@@ -1869,23 +1905,6 @@ impl ValidatedConnection {
         if let Some(previous_stream) = self.agent_streams.get(&start.agent_id).cloned()
             && previous_stream != *stream
         {
-            self.terminal_background_tasks = self
-                .terminal_background_tasks
-                .drain()
-                .map(|((candidate, id), status)| {
-                    (
-                        (
-                            if candidate == previous_stream {
-                                stream.clone()
-                            } else {
-                                candidate
-                            },
-                            id,
-                        ),
-                        status,
-                    )
-                })
-                .collect();
             self.progress_families = self
                 .progress_families
                 .drain()
@@ -2211,12 +2230,6 @@ impl ValidatedConnection {
                 .into_iter()
                 .map(|(id, family)| (envelope.stream.clone(), id, family)),
         );
-        self.terminal_background_tasks.extend(
-            replay_audit
-                .terminal_background_tasks
-                .into_iter()
-                .map(|(id, status)| ((envelope.stream.clone(), id), status)),
-        );
         self.running_background_tasks.extend(
             replay_audit
                 .running_background_tasks
@@ -2498,7 +2511,6 @@ impl RealBackendFixture {
                 validator: ProtocolValidator::new(),
                 pending_bootstrap_events: VecDeque::new(),
                 restored_events: VecDeque::new(),
-                terminal_background_tasks: HashMap::new(),
                 progress_families: HashMap::new(),
                 terminal_progress: HashSet::new(),
                 running_progress: HashSet::new(),
@@ -2573,7 +2585,6 @@ impl RealBackendFixture {
                 validator: ProtocolValidator::new(),
                 pending_bootstrap_events: VecDeque::new(),
                 restored_events: VecDeque::new(),
-                terminal_background_tasks: HashMap::new(),
                 progress_families: HashMap::new(),
                 terminal_progress: HashSet::new(),
                 running_progress: HashSet::new(),
@@ -2613,7 +2624,6 @@ impl RealBackendFixture {
             validator: _,
             pending_bootstrap_events: _,
             restored_events: _,
-            terminal_background_tasks,
             progress_families,
             terminal_progress,
             running_progress,
@@ -2673,7 +2683,6 @@ impl RealBackendFixture {
                 validator: ProtocolValidator::new(),
                 pending_bootstrap_events: VecDeque::new(),
                 restored_events: VecDeque::new(),
-                terminal_background_tasks,
                 progress_families,
                 terminal_progress,
                 running_progress,
@@ -3068,6 +3077,11 @@ async fn expect_assistant_turn_after_user_echo(
                     delta_count = 0;
                     continue;
                 }
+                let message_id = data
+                    .message
+                    .message_id
+                    .clone()
+                    .expect("assistant response omitted its message id");
                 let final_text = if data.message.content.trim().is_empty() {
                     std::mem::take(&mut streamed_text)
                 } else {
@@ -3082,6 +3096,7 @@ async fn expect_assistant_turn_after_user_echo(
                 return AssistantTurn {
                     final_text,
                     delta_count,
+                    message_id,
                 };
             }
             ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
@@ -3654,6 +3669,11 @@ async fn expect_assistant_turn_after_user_echo_with_images(
                     continue;
                 }
                 assert!(got_stream_start, "received StreamEnd before StreamStart");
+                let message_id = data
+                    .message
+                    .message_id
+                    .clone()
+                    .expect("assistant response omitted its message id");
                 let final_text = if data.message.content.trim().is_empty() {
                     std::mem::take(&mut streamed_text)
                 } else {
@@ -3667,6 +3687,7 @@ async fn expect_assistant_turn_after_user_echo_with_images(
                 return AssistantTurn {
                     final_text,
                     delta_count,
+                    message_id,
                 };
             }
             ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
@@ -3681,6 +3702,7 @@ async fn expect_assistant_turn_after_user_echo_with_images(
 struct AssistantTurn {
     final_text: String,
     delta_count: usize,
+    message_id: ChatMessageId,
 }
 
 #[derive(Debug)]
@@ -5068,7 +5090,6 @@ async fn assert_workflow_progress_transition(
     )
     .await;
     let mut tool_call_id = None;
-    let mut tool_name = None;
     let mut saw_running = false;
     let mut terminal = None;
     tokio::time::timeout(Duration::from_secs(300), async {
@@ -5081,11 +5102,17 @@ async fn assert_workflow_progress_transition(
                 .parse_payload::<ChatEvent>()
                 .expect("parse workflow progress")
             {
+                ChatEvent::StreamEnd(end) => {
+                    for tool in end.message.tool_calls {
+                        if tool.name.eq_ignore_ascii_case("workflow") {
+                            assert!(tool_call_id.replace(tool.tool_call_id).is_none());
+                        }
+                    }
+                }
                 ChatEvent::ToolRequest(request)
-                    if request.tool_name.eq_ignore_ascii_case("workflow") =>
+                    if tool_call_id.as_deref() == Some(request.tool_call_id.as_str()) =>
                 {
-                    assert!(tool_call_id.replace(request.tool_call_id).is_none());
-                    tool_name = Some(request.tool_name);
+                    assert!(matches!(request.tool_type, ToolRequestType::Other { .. }));
                 }
                 ChatEvent::ToolRequest(request) => {
                     panic!("workflow progress issued an unexpected tool request: {request:?}")
@@ -5098,7 +5125,6 @@ async fn assert_workflow_progress_transition(
                         tool_call_id.as_deref(),
                         Some(progress.tool_call_id.as_str())
                     );
-                    assert_eq!(tool_name.as_deref(), Some(progress.tool_name.as_str()));
                     if state.status == protocol::WorkflowRunStatus::Running {
                         assert!(terminal.is_none(), "workflow regressed to running");
                         saw_running = true;
@@ -5149,7 +5175,6 @@ async fn assert_workflow_progress_transition(
                         && let protocol::ToolProgressUpdate::Workflow(state) = progress.update
                         && state.status != protocol::WorkflowRunStatus::Running
                     {
-                        assert_eq!(progress.tool_name, tool_name.clone().unwrap());
                         break state;
                     }
                 }
@@ -5249,61 +5274,51 @@ async fn assert_opaque_tool_progress_lifecycle(
     )
     .await;
     let mut request_identity = None;
-    let (tool_call_id, tool_name, running_payload) =
-        tokio::time::timeout(Duration::from_secs(180), async {
-            loop {
-                let envelope = expect_next_event(&mut fixture.client, "opaque tool progress").await;
-                if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
-                    continue;
-                }
-                match envelope
-                    .parse_payload::<ChatEvent>()
-                    .expect("parse opaque progress event")
-                {
-                    ChatEvent::ToolRequest(request) => match request.tool_type {
-                        ToolRequestType::RunCommand {
-                            command: observed, ..
-                        } if observed.contains(command) => {
-                            assert!(
-                                request_identity
-                                    .replace((request.tool_call_id, request.tool_name))
-                                    .is_none(),
-                                "opaque progress issued more than one command request"
-                            );
-                        }
-                        other => {
-                            panic!("opaque progress issued an unexpected tool request: {other:?}")
-                        }
-                    },
-                    ChatEvent::ToolProgress(progress)
-                        if matches!(
-                            progress.update,
-                            protocol::ToolProgressUpdate::Other {
-                                status: protocol::OpaqueToolProgressStatus::Running,
-                                ..
-                            }
-                        ) =>
-                    {
-                        let protocol::ToolProgressUpdate::Other { payload, .. } = progress.update
-                        else {
-                            unreachable!()
-                        };
-                        break (progress.tool_call_id, progress.tool_name, payload);
-                    }
-                    ChatEvent::MessageAdded(ChatMessage {
-                        sender: MessageSender::Error,
-                        content,
-                        ..
-                    }) => panic!("{backend_kind:?} opaque progress failed: {content}"),
-                    _ => {}
-                }
+    let (tool_call_id, running_payload) = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let envelope = expect_next_event(&mut fixture.client, "opaque tool progress").await;
+            if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
+                continue;
             }
-        })
-        .await
-        .expect("provider emitted no opaque tool progress");
+            match envelope
+                .parse_payload::<ChatEvent>()
+                .expect("parse opaque progress event")
+            {
+                ChatEvent::ToolRequest(request) => match request.tool_type {
+                    ToolRequestType::RunCommand {
+                        command: observed, ..
+                    } if observed.contains(command) => {
+                        assert!(
+                            request_identity.replace(request.tool_call_id).is_none(),
+                            "opaque progress issued more than one command request"
+                        );
+                    }
+                    other => {
+                        panic!("opaque progress issued an unexpected tool request: {other:?}")
+                    }
+                },
+                ChatEvent::ToolProgress(progress)
+                    if matches!(progress.update, protocol::ToolProgressUpdate::Other { .. }) =>
+                {
+                    let protocol::ToolProgressUpdate::Other { payload } = progress.update else {
+                        unreachable!()
+                    };
+                    break (progress.tool_call_id, payload);
+                }
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("{backend_kind:?} opaque progress failed: {content}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("provider emitted no opaque tool progress");
     assert_eq!(
         request_identity.as_ref(),
-        Some(&(tool_call_id.clone(), tool_name.clone())),
+        Some(&tool_call_id),
         "opaque progress was not correlated to its real tool request"
     );
     assert!(
@@ -5340,28 +5355,24 @@ async fn assert_opaque_tool_progress_lifecycle(
     }
     let terminal = tokio::time::timeout(Duration::from_secs(180), async {
         loop {
-            let envelope =
-                expect_next_event(&mut fixture.client, "opaque tool terminal progress").await;
+            let envelope = expect_next_event(&mut fixture.client, "opaque tool completion").await;
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
                 continue;
             }
-            if let ChatEvent::ToolProgress(progress) =
+            if let ChatEvent::ToolExecutionCompleted(completion) =
                 envelope.parse_payload::<ChatEvent>().unwrap()
-                && progress.tool_call_id == tool_call_id
-                && let protocol::ToolProgressUpdate::Other { status, .. } = progress.update
-                && status != protocol::OpaqueToolProgressStatus::Running
+                && completion.tool_call_id == tool_call_id
             {
-                assert_eq!(progress.tool_name, tool_name);
-                break status;
+                break completion.outcome;
             }
         }
     })
     .await
-    .expect("opaque progress emitted no terminal state");
+    .expect("opaque progress emitted no completion");
     if transition == ProgressTransition::RunningToFailure {
-        assert_eq!(terminal, protocol::OpaqueToolProgressStatus::Failed);
+        assert!(matches!(terminal, ToolExecutionOutcome::Failed { .. }));
     } else {
-        assert_eq!(terminal, protocol::OpaqueToolProgressStatus::Completed);
+        assert!(matches!(terminal, ToolExecutionOutcome::Succeeded { .. }));
     }
     assert_progress_terminal_is_stable(
         &mut fixture,
@@ -5393,7 +5404,7 @@ async fn assert_reasoning_delta_reported(backend_kind: BackendKind) {
     .await;
     send_user_question_answer(&mut fixture, &stream, &tool_call_id, "BLUE").await;
     let mut reasoning = String::new();
-    let mut reasoning_message_id = None;
+    let mut response_open = false;
     let mut final_message = None;
     let mut completed = false;
     tokio::time::timeout(Duration::from_secs(180), async {
@@ -5406,25 +5417,22 @@ async fn assert_reasoning_delta_reported(backend_kind: BackendKind) {
                 .parse_payload::<ChatEvent>()
                 .expect("parse reasoning event")
             {
-                ChatEvent::StreamReasoningDelta(delta) => {
+                ChatEvent::StreamStart(_) => {
                     assert!(
-                        delta
-                            .message_id
-                            .as_ref()
-                            .is_some_and(|id| !id.trim().is_empty())
+                        !response_open,
+                        "reasoning response overlapped another response"
                     );
-                    let message_id = delta.message_id.expect("reasoning delta message id");
-                    if let Some(expected) = &reasoning_message_id {
-                        assert_eq!(
-                            expected, &message_id,
-                            "reasoning identity changed mid-stream"
-                        );
-                    } else {
-                        reasoning_message_id = Some(message_id);
-                    }
+                    response_open = true;
+                }
+                ChatEvent::StreamReasoningDelta(delta) => {
+                    assert!(response_open, "reasoning delta arrived outside a response");
                     reasoning.push_str(&delta.text);
                 }
-                ChatEvent::StreamEnd(end) => final_message = Some(end.message),
+                ChatEvent::StreamEnd(end) => {
+                    assert!(response_open, "reasoning response ended without a start");
+                    response_open = false;
+                    final_message = Some(end.message);
+                }
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
@@ -5452,11 +5460,7 @@ async fn assert_reasoning_delta_reported(backend_kind: BackendKind) {
         .record(ReasoningCoverageCell::StableMessageIdentity)
         .unwrap();
     let final_message = final_message.expect("reasoned turn emitted no StreamEnd");
-    assert_eq!(
-        final_message.message_id.as_ref().map(|id| id.0.as_str()),
-        reasoning_message_id.as_deref(),
-        "final reasoning message identity differed from its deltas"
-    );
+    assert!(!response_open, "reasoning response never ended");
     let final_reasoning = final_message
         .reasoning
         .as_ref()
@@ -5483,10 +5487,6 @@ async fn assert_reasoning_delta_reported(backend_kind: BackendKind) {
         1,
         "replay did not aggregate reasoning once"
     );
-    assert_eq!(
-        replay_reasoning[0].message_id.as_deref(),
-        reasoning_message_id.as_deref()
-    );
     assert_eq!(replay_reasoning[0].text, reasoning);
     ledger
         .record(ReasoningCoverageCell::ConnectionReplay)
@@ -5506,8 +5506,7 @@ async fn assert_reasoning_delta_reported(backend_kind: BackendKind) {
         assert!(
             replay.iter().any(|event| matches!(event,
                 ChatEvent::StreamReasoningDelta(delta)
-                    if delta.message_id.as_deref() == reasoning_message_id.as_deref()
-                        && delta.text == reasoning
+                    if delta.text == reasoning
             )),
             "resume lost or rewrote prior reasoning"
         );
@@ -8056,14 +8055,15 @@ async fn assert_compaction_lifecycle_matrix(backend_kind: BackendKind) {
                         }
                         ChatEvent::ToolRequest(_) if saw_user => saw_active_tool = true,
                         ChatEvent::ToolProgress(progress) if saw_user => {
-                            if let protocol::ToolProgressUpdate::BackgroundTask(task) =
-                                progress.update
-                            {
-                                saw_background_running |=
-                                    task.status == protocol::BackgroundTaskStatus::Running;
-                                saw_background_failed |=
-                                    task.status == protocol::BackgroundTaskStatus::Failed;
+                            if background_task_progress(&progress.update).is_some() {
+                                saw_background_running = true;
                             }
+                        }
+                        ChatEvent::ToolExecutionCompleted(completion)
+                            if saw_user && saw_background_running =>
+                        {
+                            saw_background_failed |=
+                                matches!(completion.outcome, ToolExecutionOutcome::Failed { .. });
                         }
                         ChatEvent::TypingStatusChanged(false) if saw_user => foreground_idle = true,
                         _ => {}
@@ -9695,6 +9695,16 @@ struct ToolTurn {
     final_text: String,
     tool_requests: Vec<ToolRequest>,
     tool_completions: Vec<ToolExecutionCompletedData>,
+    tool_names: HashMap<String, String>,
+}
+
+impl ToolTurn {
+    fn tool_name(&self, tool_call_id: &str) -> &str {
+        self.tool_names
+            .get(tool_call_id)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("missing owning tool declaration for {tool_call_id}"))
+    }
 }
 
 fn unique_secret() -> String {
@@ -9841,11 +9851,11 @@ fn assert_bootstrap_has_one_normalized_completion(
         "{context} duplicated/lost normalized completion"
     );
     assert!(
-        completions[0].success,
+        completions[0].success(),
         "{context} replayed completion as failure"
     );
     assert!(matches!(
-        &completions[0].tool_result,
+        &completions[0].tool_result(),
         ToolExecutionResult::RunCommand { .. }
     ));
 }
@@ -9948,8 +9958,9 @@ async fn resume_secret_via_protocol(fixture: &mut RealBackendFixture, backend_ki
         .filter(|completion| completion.tool_call_id == source_tool_id)
         .collect();
     assert_eq!(source_completions.len(), 1);
-    assert!(source_completions[0].success);
-    let ToolExecutionResult::RunCommand { stdout, .. } = &source_completions[0].tool_result else {
+    assert!(source_completions[0].success());
+    let ToolExecutionResult::RunCommand { stdout, .. } = &source_completions[0].tool_result()
+    else {
         panic!(
             "source command did not normalize as RunCommand: {:?}",
             source_completions[0]
@@ -11194,13 +11205,13 @@ async fn finish_image_ambient_during_stimulus(
     let expected = if must_observe_boundary {
         match stimulus {
             ContractStimulus::Close | ContractStimulus::HostRestartResume => {
-                protocol::BackgroundTaskStatus::Stopped
+                ExpectedBackgroundOutcome::Cancelled
             }
-            ContractStimulus::TransportClosed => protocol::BackgroundTaskStatus::Failed,
+            ContractStimulus::TransportClosed => ExpectedBackgroundOutcome::Failed,
             _ => unreachable!(),
         }
     } else {
-        expected_background_terminal_status(activity)
+        expected_background_outcome(activity)
             .expect("during-stimulus activity must have a terminal outcome")
     };
     wait_for_background_terminal_lifecycle(fixture, stream, ids, expected, context).await;
@@ -11211,7 +11222,7 @@ async fn assert_image_attachment_activity_cell(
     cell: ImageAttachmentActivityCell,
 ) {
     let mut fixture = RealBackendFixture::new(backend_kind).await;
-    let ambient_stream = spawn_ready_image_stream(
+    let (ambient_stream, _) = spawn_ready_image_stream(
         &mut fixture,
         backend_kind,
         "image-attachment-ambient",
@@ -11708,14 +11719,14 @@ async fn spawn_ready_image_stream(
     backend_kind: BackendKind,
     name: &str,
     marker: &str,
-) -> StreamPath {
+) -> (StreamPath, ChatMessageId) {
     let prompt = format!("Reply exactly {marker} and nothing else.");
     let roots = fixture.workspace_roots();
     let stream =
         spawn_agent_via_protocol(&mut fixture.client, roots, backend_kind, name, &prompt).await;
     let turn = expect_assistant_turn_after_user_echo(&mut fixture.client, &stream, &prompt).await;
     assert_eq!(turn.final_text.trim(), marker);
-    stream
+    (stream, turn.message_id)
 }
 
 async fn assert_concurrent_image_isolation(
@@ -11723,9 +11734,9 @@ async fn assert_concurrent_image_isolation(
     backend_kind: BackendKind,
     multiple_clients: bool,
 ) {
-    let red_stream =
+    let (red_stream, _) =
         spawn_ready_image_stream(fixture, backend_kind, "image-concurrent-red", "RED_READY").await;
-    let green_stream = spawn_ready_image_stream(
+    let (green_stream, _) = spawn_ready_image_stream(
         fixture,
         backend_kind,
         "image-concurrent-green",
@@ -11986,7 +11997,7 @@ async fn assert_image_lifecycle_activity_cell(
         "IMAGE_MEMORY_READY",
     )
     .await;
-    let ambient_stream = spawn_ready_image_stream(
+    let (ambient_stream, _) = spawn_ready_image_stream(
         &mut fixture,
         backend_kind,
         "image-lifecycle-ambient",
@@ -12332,7 +12343,7 @@ async fn assert_inherited_read_only_denies_command(
         .collect();
     assert_eq!(completions.len(), 1);
     assert!(
-        !completions[0].success,
+        !completions[0].success(),
         "inherited read-only command succeeded"
     );
     assert_eq!(
@@ -12481,10 +12492,10 @@ async fn expect_read_only_mutation_denial(
                 {
                     completion_count += 1;
                     assert_eq!(completion_count, 1, "read-only denial completed more than once");
-                    assert!(!completion.success, "read-only mutation reported success: {completion:?}");
+                    assert!(!completion.success(), "read-only mutation reported success: {completion:?}");
                     assert!(
-                        completion.error.as_ref().is_some_and(|error| !error.trim().is_empty())
-                            || matches!(&completion.tool_result, ToolExecutionResult::Error { .. }),
+                        completion.error().as_ref().is_some_and(|error| !error.trim().is_empty())
+                            || matches!(&completion.outcome, ToolExecutionOutcome::Failed { .. }),
                         "read-only denial had no visible error: {completion:?}"
                     );
                     saw_failed_completion = true;
@@ -12548,11 +12559,11 @@ async fn assert_read_only_session_remains_usable(
         .collect::<Vec<_>>();
     assert_eq!(completions.len(), 1);
     assert!(
-        completions[0].success,
+        completions[0].success(),
         "read-only read failed after denied mutation: {:?}",
         completions[0]
     );
-    let ToolExecutionResult::RunCommand { stdout, .. } = &completions[0].tool_result else {
+    let ToolExecutionResult::RunCommand { stdout, .. } = &completions[0].tool_result() else {
         panic!(
             "read-only read completion was not normalized RunCommand: {:?}",
             completions[0]
@@ -12657,7 +12668,7 @@ async fn assert_read_only_native_child_inherits_access(
                     child_completion_count += 1;
                     assert_eq!(child_completion_count, 1);
                     assert!(
-                        !completion.success,
+                        !completion.success(),
                         "inherited read-only child mutation succeeded: {completion:?}"
                     );
                     child_failed = true;
@@ -12693,6 +12704,7 @@ async fn expect_tool_turn_after_user_echo(
     let mut streamed_text = String::new();
     let mut tool_requests: HashMap<String, ToolRequest> = HashMap::new();
     let mut tool_completions: HashMap<String, ToolExecutionCompletedData> = HashMap::new();
+    let mut tool_names = HashMap::new();
 
     loop {
         let env = expect_next_event(client, "tool-assisted ChatEvent").await;
@@ -12712,6 +12724,9 @@ async fn expect_tool_turn_after_user_echo(
                     continue;
                 }
                 saw_stream_end = true;
+                for tool in &data.message.tool_calls {
+                    tool_names.insert(tool.tool_call_id.clone(), tool.name.clone());
+                }
                 final_text = Some(if data.message.content.trim().is_empty() {
                     streamed_text.clone()
                 } else {
@@ -12746,6 +12761,7 @@ async fn expect_tool_turn_after_user_echo(
                 final_text: final_text.unwrap_or_default(),
                 tool_requests: tool_requests.into_values().collect(),
                 tool_completions: tool_completions.into_values().collect(),
+                tool_names,
             };
         }
     }
@@ -12764,6 +12780,7 @@ async fn expect_named_tool_turn_after_user_echo(
     let mut saw_stream_end_after_target = false;
     let mut tool_requests: HashMap<String, ToolRequest> = HashMap::new();
     let mut tool_completions: HashMap<String, ToolExecutionCompletedData> = HashMap::new();
+    let mut tool_names = HashMap::new();
 
     loop {
         let env = expect_next_event(client, "named tool-assisted ChatEvent").await;
@@ -12782,6 +12799,9 @@ async fn expect_named_tool_turn_after_user_echo(
                 streamed_text.push_str(&delta.text);
             }
             ChatEvent::StreamEnd(data) if got_user_message_echo => {
+                for tool in &data.message.tool_calls {
+                    tool_names.insert(tool.tool_call_id.clone(), tool.name.clone());
+                }
                 final_text = if data.message.content.trim().is_empty() {
                     streamed_text.clone()
                 } else {
@@ -12796,9 +12816,10 @@ async fn expect_named_tool_turn_after_user_echo(
                 tool_requests.insert(request.tool_call_id.clone(), request);
             }
             ChatEvent::ToolExecutionCompleted(completion) if got_user_message_echo => {
-                if tool_requests
-                    .get(&completion.tool_call_id)
-                    .is_some_and(|request| request.tool_name.contains(required_tool_name))
+                if tool_requests.contains_key(&completion.tool_call_id)
+                    && tool_names
+                        .get(&completion.tool_call_id)
+                        .is_some_and(|name| name.contains(required_tool_name))
                 {
                     target_completed = true;
                 }
@@ -12818,6 +12839,7 @@ async fn expect_named_tool_turn_after_user_echo(
                 final_text,
                 tool_requests: tool_requests.into_values().collect(),
                 tool_completions: tool_completions.into_values().collect(),
+                tool_names,
             };
         }
     }
@@ -12970,7 +12992,7 @@ async fn assert_backend_emits_tool_events_for_file_copy(
     assert!(
         turn.tool_completions
             .iter()
-            .any(|completion| completion.success),
+            .any(|completion| completion.success()),
         "expected at least one successful ToolExecutionCompleted for {backend_kind:?}; requests={:?} completions={:?} final_text={:?}",
         turn.tool_requests,
         turn.tool_completions,
@@ -13056,12 +13078,13 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
     .await;
 
     let mut saw_user_echo = false;
-    let mut active_stream_id = None::<String>;
+    let mut response_open = false;
+    let mut response_ordinal = 0usize;
     let mut message_ids = Vec::<(usize, &'static str, String)>::new();
-    let mut declarations = HashMap::<String, Vec<(usize, String)>>::new();
+    let mut declarations = HashMap::<String, Vec<(usize, usize)>>::new();
     let mut requests = Vec::<(usize, ToolRequest)>::new();
     let mut completions = HashMap::<String, (usize, ToolExecutionCompletedData)>::new();
-    let mut next_streams = Vec::<(usize, String)>::new();
+    let mut next_streams = Vec::<(usize, usize)>::new();
     let mut saw_terminal_response = false;
     let mut saw_idle_after_terminal = false;
     let mut event_index = 0usize;
@@ -13109,50 +13132,40 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
                         message_ids.push((event_index, "MessageAdded", message_id.0.clone()));
                     }
                 }
-                ChatEvent::StreamStart(start) if saw_user_echo => {
-                    let message_id = start
-                        .required_message_id()
-                        .unwrap_or_else(|error| panic!("invalid BUG-001 StreamStart: {error:?}"))
-                        .0;
+                ChatEvent::StreamStart(_) if saw_user_echo => {
                     assert!(
-                        active_stream_id.replace(message_id.clone()).is_none(),
+                        !response_open,
                         "{backend_kind:?} BUG-001 next assistant stream started while another stream was active"
                     );
+                    response_open = true;
+                    response_ordinal += 1;
                     if !completions.is_empty() {
-                        next_streams.push((event_index, message_id.clone()));
+                        next_streams.push((event_index, response_ordinal));
                     }
-                    message_ids.push((event_index, "StreamStart", message_id));
                 }
                 ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta)
                     if saw_user_echo =>
                 {
-                    let message_id = delta
-                        .required_message_id()
-                        .unwrap_or_else(|error| panic!("invalid BUG-001 stream delta: {error:?}"))
-                        .0;
-                    assert_eq!(
-                        active_stream_id.as_deref(),
-                        Some(message_id.as_str()),
-                        "{backend_kind:?} BUG-001 stream delta changed assistant identity"
+                    let _ = delta;
+                    assert!(
+                        response_open,
+                        "{backend_kind:?} BUG-001 stream delta arrived outside a response"
                     );
-                    message_ids.push((event_index, "StreamDelta", message_id));
                 }
                 ChatEvent::StreamEnd(end) if saw_user_echo => {
-                    let message_id = end
-                        .required_message_id()
-                        .unwrap_or_else(|error| panic!("invalid BUG-001 StreamEnd: {error:?}"))
-                        .0;
-                    assert_eq!(
-                        active_stream_id.take().as_deref(),
-                        Some(message_id.as_str()),
+                    assert!(
+                        response_open,
                         "{backend_kind:?} BUG-001 StreamEnd did not close its own assistant stream"
                     );
-                    message_ids.push((event_index, "StreamEnd", message_id.clone()));
+                    response_open = false;
+                    if let Some(message_id) = &end.message.message_id {
+                        message_ids.push((event_index, "StreamEnd", message_id.0.clone()));
+                    }
                     for tool_call in &end.message.tool_calls {
                         declarations
-                            .entry(tool_call.id.clone())
+                            .entry(tool_call.tool_call_id.clone())
                             .or_default()
-                            .push((event_index, message_id.clone()));
+                            .push((event_index, response_ordinal));
                     }
                     if !completions.is_empty() && end.message.content.contains(FINAL_MARKER) {
                         saw_terminal_response = true;
@@ -13170,10 +13183,10 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
                 }
                 ChatEvent::ToolExecutionCompleted(completion) if saw_user_echo => {
                     assert!(
-                        completion.success,
+                        completion.success(),
                         "{backend_kind:?} BUG-001 tool failed: {completion:?}"
                     );
-                    if let ToolExecutionResult::RunCommand { stdout, .. } = &completion.tool_result {
+                    if let ToolExecutionResult::RunCommand { stdout, .. } = &completion.tool_result() {
                         assert!(
                             stdout.contains(TOOL_OUTPUT),
                             "{backend_kind:?} BUG-001 command returned unexpected output: {completion:?}"
@@ -13227,11 +13240,7 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
         1,
         "{backend_kind:?} BUG-001 ToolRequest was declared by multiple provider responses: {owners:?}"
     );
-    let (owner_end_index, owner_message_id) = &owners[0];
-    assert_ne!(
-        owner_message_id, &request.tool_call_id,
-        "{backend_kind:?} BUG-001 provider response used its tool call id as its message id"
-    );
+    let (owner_end_index, owner_response_ordinal) = &owners[0];
     let (completion_index, _) = completions.get(&request.tool_call_id).unwrap_or_else(|| {
         panic!(
             "{backend_kind:?} BUG-001 ToolRequest had no matching successful completion: {request:?}"
@@ -13248,7 +13257,7 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
         "{backend_kind:?} BUG-001 emitted a message id equal to tool call id {}: {message_ids:?}",
         request.tool_call_id
     );
-    let (next_start_index, next_message_id) = next_streams
+    let (next_start_index, next_response_ordinal) = next_streams
         .iter()
         .find(|(index, _)| index > completion_index)
         .unwrap_or_else(|| {
@@ -13261,8 +13270,7 @@ async fn assert_tool_response_ownership(backend_kind: BackendKind) {
         owner_end_index < next_start_index,
         "{backend_kind:?} BUG-001 next provider response started before the tool owner declared its request"
     );
-    assert_ne!(next_message_id, owner_message_id);
-    assert_ne!(next_message_id, &request.tool_call_id);
+    assert_ne!(next_response_ordinal, owner_response_ordinal);
     assert!(saw_terminal_response);
     assert!(saw_idle_after_terminal);
 
@@ -13997,9 +14005,7 @@ async fn assert_interrupt_allows_follow_up_during_background_work(
                     ..
                 }) => panic!("{backend_kind:?} detached background setup failed: {content}"),
                 ChatEvent::ToolProgress(progress) => {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
-                        && task.status == protocol::BackgroundTaskStatus::Running
-                    {
+                    if background_task_progress(&progress.update).is_some() {
                         background_tool_call_id = Some(progress.tool_call_id);
                     }
                 }
@@ -14063,13 +14069,10 @@ async fn assert_interrupt_allows_follow_up_during_background_work(
                 ChatEvent::ToolProgress(progress)
                     if progress.tool_call_id == background_tool_call_id =>
                 {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update {
-                        assert_eq!(
-                            task.status,
-                            protocol::BackgroundTaskStatus::Running,
-                            "conversation interrupt stopped detached {backend_kind:?} background work"
-                        );
-                    }
+                    assert!(
+                        background_task_progress(&progress.update).is_some(),
+                        "conversation interrupt changed detached {backend_kind:?} background progress family"
+                    );
                 }
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == background_tool_call_id =>
@@ -14254,9 +14257,7 @@ async fn assert_user_question_answer_during_background_work(
                     ..
                 }) => panic!("{backend_kind:?} question setup failed: {content}"),
                 ChatEvent::ToolProgress(progress) => {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
-                        && task.status == protocol::BackgroundTaskStatus::Running
-                    {
+                    if background_task_progress(&progress.update).is_some() {
                         background_tool_call_id = Some(progress.tool_call_id);
                     }
                 }
@@ -14331,9 +14332,9 @@ async fn assert_user_question_answer_during_background_work(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == question_tool_call_id =>
                 {
-                    assert!(completion.success, "question completion failed: {completion:?}");
+                    assert!(completion.success(), "question completion failed: {completion:?}");
                     let ToolExecutionResult::Other { result: normalized } =
-                        &completion.tool_result
+                        &completion.tool_result()
                     else {
                         panic!(
                             "question answer did not carry its normalized result: {completion:?}"
@@ -14356,13 +14357,9 @@ async fn assert_user_question_answer_during_background_work(
                 ChatEvent::ToolProgress(progress)
                     if progress.tool_call_id == background_tool_call_id =>
                 {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
-                        continue;
-                    };
-                    assert_eq!(
-                        task.status,
-                        protocol::BackgroundTaskStatus::Running,
-                        "background task stopped while the foreground question was answered"
+                    assert!(
+                        background_task_progress(&progress.update).is_some(),
+                        "background task changed progress family while the foreground question was answered"
                     );
                 }
                 ChatEvent::StreamEnd(end)
@@ -14907,7 +14904,7 @@ async fn assert_user_question_survives_reconnect(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success);
+                    assert!(completion.success());
                     completion_count += 1;
                 }
                 ChatEvent::StreamDelta(delta) => {
@@ -15029,7 +15026,7 @@ async fn assert_user_question_not_copied_to_fork(
                 envelope.parse_payload::<ChatEvent>().unwrap()
                 && completion.tool_call_id == source_tool_call_id
             {
-                assert!(completion.success);
+                assert!(completion.success());
                 completed = true;
             }
         }
@@ -15085,7 +15082,7 @@ async fn assert_user_question_expires_on_host_restart(
     )
     .await;
     assert!(
-        !completion.success,
+        !completion.success(),
         "expired pending question was not visibly failed: {completion:?}"
     );
     fixture.restart_host().await;
@@ -15189,7 +15186,7 @@ async fn assert_user_question_fails_on_backend_transport_close(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(!completion.success);
+                    assert!(!completion.success());
                     completion_count += 1;
                 }
                 ChatEvent::MessageAdded(ChatMessage {
@@ -15267,9 +15264,7 @@ fn background_terminal_after_stimulus(activity: ActivityCondition) -> bool {
     )
 }
 
-fn expected_background_terminal_status(
-    activity: ActivityCondition,
-) -> Option<protocol::BackgroundTaskStatus> {
+fn expected_background_outcome(activity: ActivityCondition) -> Option<ExpectedBackgroundOutcome> {
     match activity {
         ActivityCondition::BackgroundCompletesBeforeStimulus
         | ActivityCondition::BackgroundCompletesDuringStimulus
@@ -15280,7 +15275,7 @@ fn expected_background_terminal_status(
         | ActivityCondition::MixedBackgroundWorkCompletesBeforeStimulus
         | ActivityCondition::MixedBackgroundWorkCompletesDuringStimulus
         | ActivityCondition::MixedBackgroundWorkCompletesAfterStimulus => {
-            Some(protocol::BackgroundTaskStatus::Completed)
+            Some(ExpectedBackgroundOutcome::Succeeded)
         }
         ActivityCondition::BackgroundFailsBeforeStimulus
         | ActivityCondition::BackgroundFailsDuringStimulus
@@ -15291,7 +15286,7 @@ fn expected_background_terminal_status(
         | ActivityCondition::MixedBackgroundWorkFailsBeforeStimulus
         | ActivityCondition::MixedBackgroundWorkFailsDuringStimulus
         | ActivityCondition::MixedBackgroundWorkFailsAfterStimulus => {
-            Some(protocol::BackgroundTaskStatus::Failed)
+            Some(ExpectedBackgroundOutcome::Failed)
         }
         ActivityCondition::ForegroundOnly
         | ActivityCondition::OneBackgroundTaskRunning
@@ -15341,30 +15336,47 @@ enum ObservedAmbientWorkKind {
 
 #[derive(Default)]
 struct AmbientWorkObservation {
-    running: HashMap<String, ObservedAmbientWorkKind>,
+    running: HashMap<(String, String), ObservedAmbientWorkKind>,
 }
 
 impl AmbientWorkObservation {
     fn observe_running(&mut self, progress: &protocol::ToolProgressData) {
-        let kind = match &progress.update {
-            protocol::ToolProgressUpdate::BackgroundTask(task)
-                if task.status == protocol::BackgroundTaskStatus::Running =>
-            {
-                Some(ObservedAmbientWorkKind::Command)
-            }
-            protocol::ToolProgressUpdate::SubAgent(subagent) if !subagent.completed => {
-                Some(ObservedAmbientWorkKind::Subagent)
+        let observed = match &progress.update {
+            protocol::ToolProgressUpdate::SubAgent(subagent) if !subagent.completed => Some((
+                ObservedAmbientWorkKind::Subagent,
+                subagent.agent_id.0.clone(),
+            )),
+            // A completed SubAgent snapshot keeps the background execution
+            // mode of the running snapshot; it is not a command observation.
+            protocol::ToolProgressUpdate::SubAgent(_) => None,
+            _ if progress.execution_mode == protocol::ToolExecutionMode::Background => {
+                // Codex can yield several command sessions from one model
+                // tool invocation, so the session id—not only the enclosing
+                // tool-call id—is the observable background-work identity.
+                let task_id = match &progress.update {
+                    protocol::ToolProgressUpdate::Other { payload } => payload
+                        .get("task_id")
+                        .and_then(|task_id| {
+                            task_id
+                                .as_str()
+                                .map(str::to_owned)
+                                .or_else(|| task_id.as_u64().map(|task_id| task_id.to_string()))
+                        })
+                        .unwrap_or_else(|| progress.tool_call_id.clone()),
+                    _ => progress.tool_call_id.clone(),
+                };
+                Some((ObservedAmbientWorkKind::Command, task_id))
             }
             _ => None,
         };
-        let Some(kind) = kind else {
+        let Some((kind, item_id)) = observed else {
             return;
         };
-        if let Some(previous) = self.running.insert(progress.tool_call_id.clone(), kind) {
+        let identity = (progress.tool_call_id.clone(), item_id);
+        if let Some(previous) = self.running.insert(identity.clone(), kind) {
             assert_eq!(
                 previous, kind,
-                "ambient work identity changed observable kind: {}",
-                progress.tool_call_id
+                "ambient work identity changed observable kind: {identity:?}",
             );
         }
     }
@@ -15421,7 +15433,10 @@ impl AmbientWorkObservation {
     }
 
     fn ids(self) -> HashSet<String> {
-        self.running.into_keys().collect()
+        self.running
+            .into_keys()
+            .map(|(tool_call_id, _)| tool_call_id)
+            .collect()
     }
 }
 
@@ -15457,7 +15472,6 @@ impl<'a> BufferedEventCollector<'a> {
 
 #[derive(Default)]
 struct BackgroundTerminalObservation {
-    terminal_count: usize,
     completion_count: usize,
 }
 
@@ -15465,7 +15479,7 @@ async fn wait_for_background_terminal_lifecycle(
     fixture: &mut RealBackendFixture,
     stream: &StreamPath,
     background_ids: &HashSet<String>,
-    expected_status: protocol::BackgroundTaskStatus,
+    expected_outcome: ExpectedBackgroundOutcome,
     context: &str,
 ) {
     if background_ids.is_empty() {
@@ -15481,7 +15495,7 @@ async fn wait_for_background_terminal_lifecycle(
     tokio::time::timeout(Duration::from_secs(30), async {
         while observations
             .values()
-            .any(|observation| observation.terminal_count != 1 || observation.completion_count != 1)
+            .any(|observation| observation.completion_count != 1)
         {
             let envelope = collector.next(context).await;
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != *stream {
@@ -15496,38 +15510,11 @@ async fn wait_for_background_terminal_lifecycle(
                 ChatEvent::ToolProgress(progress)
                     if background_ids.contains(&progress.tool_call_id) =>
                 {
-                    let observation = observations
-                        .get_mut(&progress.tool_call_id)
-                        .expect("tracked ambient work");
-                    let terminal = match progress.update {
-                        protocol::ToolProgressUpdate::BackgroundTask(task) => {
-                            if observation.terminal_count > 0 {
-                                assert_ne!(
-                                    task.status,
-                                    protocol::BackgroundTaskStatus::Running,
-                                    "{context}: terminal background task regressed to Running"
-                                );
-                            }
-                            if task.status != protocol::BackgroundTaskStatus::Running {
-                                assert_eq!(task.status, expected_status, "{context}: wrong terminal status");
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        protocol::ToolProgressUpdate::SubAgent(subagent) => subagent.completed,
-                        _ => {
-                            collector.defer(envelope);
-                            continue;
-                        }
-                    };
-                    if terminal {
-                        observation.terminal_count += 1;
-                        assert_eq!(
-                            observation.terminal_count, 1,
-                            "{context}: duplicate terminal progress"
-                        );
-                    }
+                    assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background,
+                        "{context}: ambient work changed execution mode"
+                    );
                 }
                 ChatEvent::ToolExecutionCompleted(completion)
                     if background_ids.contains(&completion.tool_call_id) =>
@@ -15540,16 +15527,9 @@ async fn wait_for_background_terminal_lifecycle(
                         observation.completion_count, 1,
                         "{context}: duplicate correlated completion"
                     );
-                    let expected_success =
-                        expected_status == protocol::BackgroundTaskStatus::Completed;
-                    assert_ne!(
-                        expected_status,
-                        protocol::BackgroundTaskStatus::Running,
-                        "{context}: terminal observer expected Running"
-                    );
-                    assert_eq!(
-                        completion.success, expected_success,
-                        "{context}: terminal status and correlated completion disagree: {completion:?}"
+                    assert!(
+                        expected_outcome.matches(&completion.outcome),
+                        "{context}: correlated completion had the wrong outcome: {completion:?}"
                     );
                 }
                 _ => collector.defer(envelope),
@@ -15570,26 +15550,10 @@ async fn wait_for_background_terminal_lifecycle(
                     ChatEvent::ToolProgress(progress)
                         if background_ids.contains(&progress.tool_call_id) =>
                     {
-                        match progress.update {
-                            protocol::ToolProgressUpdate::BackgroundTask(task) => {
-                                assert_ne!(
-                                    task.status,
-                                    protocol::BackgroundTaskStatus::Running,
-                                    "{context}: terminal background task regressed to Running"
-                                );
-                                panic!(
-                                    "{context}: duplicate terminal progress for {}",
-                                    progress.tool_call_id
-                                );
-                            }
-                            protocol::ToolProgressUpdate::SubAgent(subagent) if subagent.completed => {
-                                panic!(
-                                    "{context}: duplicate terminal progress for {}",
-                                    progress.tool_call_id
-                                );
-                            }
-                            _ => collector.defer(envelope),
-                        }
+                        panic!(
+                            "{context}: progress arrived after completion for {}",
+                            progress.tool_call_id
+                        );
                     }
                     ChatEvent::ToolExecutionCompleted(completion)
                         if background_ids.contains(&completion.tool_call_id) =>
@@ -15641,14 +15605,14 @@ async fn assert_background_remains_running(
                 if background_ids.contains(&progress.tool_call_id) =>
             {
                 match progress.update {
-                    protocol::ToolProgressUpdate::BackgroundTask(task) => assert_eq!(
-                        task.status,
-                        protocol::BackgroundTaskStatus::Running,
-                        "{context}: independent background command did not remain running"
-                    ),
                     protocol::ToolProgressUpdate::SubAgent(subagent) => assert!(
                         !subagent.completed,
                         "{context}: independent background subagent did not remain running"
+                    ),
+                    update if background_task_progress(&update).is_some() => assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background,
+                        "{context}: independent background command changed execution mode"
                     ),
                     _ => collector.defer(envelope),
                 }
@@ -15677,15 +15641,15 @@ async fn release_and_wait_for_background_terminal(
     let boundary_controls_terminal = !background_terminal_before_stimulus(activity);
     let expected = match stimulus {
         ContractStimulus::Close if boundary_controls_terminal => {
-            Some(protocol::BackgroundTaskStatus::Stopped)
+            Some(ExpectedBackgroundOutcome::Cancelled)
         }
         ContractStimulus::HostRestartResume if boundary_controls_terminal => {
-            Some(protocol::BackgroundTaskStatus::Stopped)
+            Some(ExpectedBackgroundOutcome::Cancelled)
         }
         ContractStimulus::TransportClosed if boundary_controls_terminal => {
-            Some(protocol::BackgroundTaskStatus::Failed)
+            Some(ExpectedBackgroundOutcome::Failed)
         }
-        _ => expected_background_terminal_status(activity),
+        _ => expected_background_outcome(activity),
     }
     .unwrap_or_else(|| panic!("{context}: activity has no terminal background outcome"));
     if !boundary_controls_terminal
@@ -16219,7 +16183,11 @@ async fn reach_input_admission_state(
                 }
                 if let ChatEvent::ToolRequest(request) =
                     envelope.parse_payload::<ChatEvent>().unwrap()
-                    && request.tool_name.contains(ADVERSARIAL_MCP_TOOL)
+                    && matches!(
+                        &request.tool_type,
+                        ToolRequestType::Other { args }
+                            if args.get("value") == Some(&Value::String(sentinel.clone()))
+                    )
                 {
                     break request;
                 }
@@ -16440,15 +16408,7 @@ async fn reach_input_admission_state(
                     }
                     match envelope.parse_payload::<ChatEvent>().unwrap() {
                         ChatEvent::ToolProgress(progress)
-                            if matches!(
-                                &progress.update,
-                                protocol::ToolProgressUpdate::BackgroundTask(
-                                    protocol::BackgroundTaskState {
-                                        status: protocol::BackgroundTaskStatus::Running,
-                                        ..
-                                    }
-                                )
-                            ) =>
+                            if background_task_progress(&progress.update).is_some() =>
                         {
                             background_tool_ids.insert(progress.tool_call_id);
                             running = true
@@ -16756,7 +16716,7 @@ async fn expect_interaction_probe_completion(
     )
     .await;
     assert!(
-        completion.success,
+        completion.success(),
         "interaction response failed: {completion:?}"
     );
 }
@@ -16799,7 +16759,7 @@ async fn expect_interaction_probe_completion_with_images(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == probe.tool_call_id =>
                 {
-                    assert!(completion.success, "interaction response failed: {completion:?}");
+                    assert!(completion.success(), "interaction response failed: {completion:?}");
                     completions += 1;
                     assert_eq!(completions, 1, "typed interaction completed twice");
                 }
@@ -16844,7 +16804,7 @@ async fn expect_two_interaction_probe_completions(
             let key = (stream, completion.tool_call_id.clone());
             if expected.contains(&key) {
                 assert!(
-                    completion.success,
+                    completion.success(),
                     "interaction response failed: {completion:?}"
                 );
                 assert!(
@@ -17038,7 +16998,7 @@ async fn expect_provider_rejected_interaction_image(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == probe.tool_call_id =>
                 {
-                    assert!(completion.success);
+                    assert!(completion.success());
                     completions += 1;
                 }
                 ChatEvent::MessageAdded(ChatMessage {
@@ -17319,10 +17279,10 @@ async fn run_interaction_two_clients_conflicting(
                     if completion.tool_call_id == probe.tool_call_id =>
                 {
                     assert!(
-                        completion.success,
+                        completion.success(),
                         "winning response failed: {completion:?}"
                     );
-                    let ToolExecutionResult::Other { result } = &completion.tool_result else {
+                    let ToolExecutionResult::Other { result } = &completion.tool_result() else {
                         panic!("winning typed response was not normalized: {completion:?}")
                     };
                     match contract {
@@ -17443,13 +17403,10 @@ async fn assert_no_typing_resurrection_after_question_interrupt(
                 ChatEvent::ToolProgress(progress)
                     if background_tool_ids.contains(&progress.tool_call_id) =>
                 {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update {
-                        assert_eq!(
-                            task.status,
-                            protocol::BackgroundTaskStatus::Running,
-                            "{context}: interrupt changed independent background work"
-                        );
-                    }
+                    assert!(
+                        background_task_progress(&progress.update).is_some(),
+                        "{context}: interrupt changed independent background progress family"
+                    );
                 }
                 _ => {}
             }
@@ -17604,7 +17561,7 @@ async fn run_user_question_interrupt_race_with_background(
             }
             let cancelled = completion
                 .as_ref()
-                .is_some_and(|completion| !completion.success);
+                .is_some_and(|completion| !completion.success());
             let needs_rejection =
                 matches!(order, QuestionInterruptRaceOrder::Concurrent) && cancelled;
             if completion.is_some()
@@ -17625,13 +17582,13 @@ async fn run_user_question_interrupt_race_with_background(
     match order {
         QuestionInterruptRaceOrder::ResponseThenInterrupt => {
             assert!(
-                completion.success,
+                completion.success(),
                 "{context}: admitted answer lost: {completion:?}"
             );
         }
         QuestionInterruptRaceOrder::InterruptThenResponse => {
             assert!(
-                !completion.success,
+                !completion.success(),
                 "{context}: interrupted question succeeded"
             );
             fixture
@@ -17648,7 +17605,7 @@ async fn run_user_question_interrupt_race_with_background(
             .await;
         }
         QuestionInterruptRaceOrder::Concurrent => {
-            if !completion.success {
+            if !completion.success() {
                 assert!(
                     rejection_count >= 1,
                     "{context}: losing answer was not visibly rejected"
@@ -18164,9 +18121,12 @@ async fn complete_pending_question_for_probe(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success, "question probe failed: {completion:?}");
+                    assert!(
+                        completion.success(),
+                        "question probe failed: {completion:?}"
+                    );
                     assert!(!completed, "question probe completed more than once");
-                    let ToolExecutionResult::Other { result } = &completion.tool_result else {
+                    let ToolExecutionResult::Other { result } = &completion.tool_result() else {
                         panic!("question probe result was not normalized: {completion:?}")
                     };
                     assert_eq!(
@@ -18195,17 +18155,13 @@ async fn expect_interaction_with_background_terminal(
     stream: &StreamPath,
     interaction_tool_call_id: &str,
     background_tool_ids: &HashSet<String>,
-    expected_status: protocol::BackgroundTaskStatus,
+    expected_outcome: ExpectedBackgroundOutcome,
 ) -> ToolExecutionCompletedData {
     let mut interaction = None;
-    let mut terminal_progress = HashSet::new();
     let mut terminal_completions = HashSet::new();
     let mut collector = BufferedEventCollector::new(&mut fixture.client);
     tokio::time::timeout(Duration::from_secs(120), async {
-        while interaction.is_none()
-            || terminal_progress.len() != background_tool_ids.len()
-            || terminal_completions.len() != background_tool_ids.len()
-        {
+        while interaction.is_none() || terminal_completions.len() != background_tool_ids.len() {
             let envelope = collector
                 .next("interaction response with background terminal")
                 .await;
@@ -18226,23 +18182,17 @@ async fn expect_interaction_with_background_terminal(
                 ChatEvent::ToolProgress(progress)
                     if background_tool_ids.contains(&progress.tool_call_id) =>
                 {
-                    let terminal = match progress.update {
-                        protocol::ToolProgressUpdate::BackgroundTask(task) => {
-                            task.status == expected_status
-                        }
-                        protocol::ToolProgressUpdate::SubAgent(subagent) => subagent.completed,
-                        _ => false,
-                    };
-                    if terminal {
-                        assert!(terminal_progress.insert(progress.tool_call_id));
-                    }
+                    assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background
+                    );
                 }
                 ChatEvent::ToolExecutionCompleted(completion)
                     if background_tool_ids.contains(&completion.tool_call_id) =>
                 {
-                    assert_eq!(
-                        completion.success,
-                        expected_status == protocol::BackgroundTaskStatus::Completed
+                    assert!(
+                        expected_outcome.matches(&completion.outcome),
+                        "background work completed with the wrong outcome: {completion:?}"
                     );
                     assert!(terminal_completions.insert(completion.tool_call_id));
                 }
@@ -18658,7 +18608,7 @@ async fn complete_typed_admission_probe(
     )
     .await;
     assert!(
-        completion.success,
+        completion.success(),
         "{context}: valid response failed: {completion:?}"
     );
 }
@@ -18694,7 +18644,7 @@ async fn recover_focal_input_admission_state(
         )
         .await;
         assert!(
-            completion.success,
+            completion.success(),
             "{context}: focal interaction failed: {completion:?}"
         );
         return;
@@ -18812,7 +18762,7 @@ async fn run_typed_interaction_admission_cell(
         )
         .await;
         assert!(
-            completion.success,
+            completion.success(),
             "matching current response failed: {completion:?}"
         );
     } else {
@@ -18998,7 +18948,7 @@ async fn run_input_admission_cell(
                 "admitted interaction response before host restart",
             )
             .await;
-            assert!(completion.success);
+            assert!(completion.success());
         }
         if cell.action == InputAdmissionAction::Close {
             fixture
@@ -19027,7 +18977,7 @@ async fn run_input_admission_cell(
                             envelope.parse_payload::<ChatEvent>().unwrap()
                         && completion.tool_call_id == tool_call_id
                     {
-                        assert!(completion.success);
+                        assert!(completion.success());
                         completed += 1;
                         assert_eq!(completed, 1);
                     }
@@ -19119,7 +19069,7 @@ async fn run_input_admission_cell(
                 matches!(
                     event,
                     AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
-                        if completion.tool_call_id == tool_call_id && completion.success
+                        if completion.tool_call_id == tool_call_id && completion.success()
                 )
             });
             let continued = bootstrap_events.iter().any(|event| {
@@ -19163,9 +19113,9 @@ async fn run_input_admission_cell(
                     &tool_call_id,
                     &run.background_tool_ids,
                     if cell.action == InputAdmissionAction::BackgroundTerminal {
-                        protocol::BackgroundTaskStatus::Completed
+                        ExpectedBackgroundOutcome::Succeeded
                     } else {
-                        protocol::BackgroundTaskStatus::Failed
+                        ExpectedBackgroundOutcome::Failed
                     },
                 )
                 .await,
@@ -19183,7 +19133,7 @@ async fn run_input_admission_cell(
         };
         if let Some(completion) = completion {
             assert!(
-                completion.success,
+                completion.success(),
                 "interaction response was not consumed: {completion:?}"
             );
         }
@@ -20055,12 +20005,12 @@ async fn expect_exact_cancelled_tool_request(
                         completion_count, 1,
                         "{context}: interrupted tool completed more than once"
                     );
-                    assert!(!completion.success, "{context}: interrupted tool succeeded");
                     assert!(
-                        matches!(
-                            &completion.tool_result,
-                            ToolExecutionResult::Cancelled { .. }
-                        ),
+                        !completion.success(),
+                        "{context}: interrupted tool succeeded"
+                    );
+                    assert!(
+                        matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
                         "{context}: interrupted tool did not return Cancelled: {completion:?}"
                     );
                 }
@@ -20345,8 +20295,9 @@ async fn assert_plan_approval_answer_contract(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success, "plan approval failed: {completion:?}");
-                    let ToolExecutionResult::Other { result: normalized } = &completion.tool_result
+                    assert!(completion.success(), "plan approval failed: {completion:?}");
+                    let ToolExecutionResult::Other { result: normalized } =
+                        &completion.tool_result()
                     else {
                         panic!("plan response did not carry its normalized result: {completion:?}")
                     };
@@ -20483,9 +20434,10 @@ async fn complete_pending_plan_for_probe(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success);
+                    assert!(completion.success());
                     assert!(!completed, "plan probe completed more than once");
-                    let ToolExecutionResult::Other { result: normalized } = &completion.tool_result
+                    let ToolExecutionResult::Other { result: normalized } =
+                        &completion.tool_result()
                     else {
                         panic!("plan probe completion was not normalized: {completion:?}")
                     };
@@ -21184,7 +21136,7 @@ async fn assert_plan_approval_reconnect_contract(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success);
+                    assert!(completion.success());
                     completion_count += 1;
                 }
                 ChatEvent::StreamDelta(delta) => {
@@ -21309,7 +21261,7 @@ async fn assert_plan_approval_not_copied_to_fork(
                 envelope.parse_payload::<ChatEvent>().unwrap()
                 && completion.tool_call_id == source_tool_call_id
             {
-                assert!(completion.success);
+                assert!(completion.success());
                 break;
             }
         }
@@ -21364,7 +21316,7 @@ async fn assert_plan_approval_expires_on_host_restart(
     )
     .await;
     assert!(
-        !completion.success,
+        !completion.success(),
         "expired pending plan approval was not visibly failed: {completion:?}"
     );
     fixture.restart_host().await;
@@ -21466,7 +21418,7 @@ async fn assert_plan_approval_fails_on_backend_transport_close(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(!completion.success);
+                    assert!(!completion.success());
                     completion_count += 1;
                 }
                 ChatEvent::MessageAdded(ChatMessage {
@@ -21588,11 +21540,11 @@ async fn assert_user_question_answer_contract(
                     answer_echoes += 1;
                 }
                 ChatEvent::ToolExecutionCompleted(completion) => {
-                    eprintln!("QUESTION COMPLETION expected={tool_call_id} actual={} success={}", completion.tool_call_id, completion.success);
+                    eprintln!("QUESTION COMPLETION expected={tool_call_id} actual={} success={}", completion.tool_call_id, completion.success());
                     if completion.tool_call_id == tool_call_id {
-                        assert!(completion.success, "question answer failed: {completion:?}");
+                        assert!(completion.success(), "question answer failed: {completion:?}");
                         let ToolExecutionResult::Other { result: normalized } =
-                            &completion.tool_result
+                            &completion.tool_result()
                         else {
                             panic!(
                                 "question answer did not carry its normalized result: {completion:?}"
@@ -21908,8 +21860,8 @@ async fn complete_question_response_events(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    assert!(completion.success, "typed answer failed: {completion:?}");
-                    let ToolExecutionResult::Other { result } = &completion.tool_result else {
+                    assert!(completion.success(), "typed answer failed: {completion:?}");
+                    let ToolExecutionResult::Other { result } = &completion.tool_result() else {
                         panic!("typed answer result was not normalized: {completion:?}")
                     };
                     assert_eq!(
@@ -22213,7 +22165,7 @@ async fn assert_interaction_duplicate_attempt_isolation(
                     if completion.tool_call_id == tool_call_id =>
                 {
                     assert!(
-                        completion.success,
+                        completion.success(),
                         "first response attempt failed: {completion:?}"
                     );
                     completion_count += 1;
@@ -22221,7 +22173,7 @@ async fn assert_interaction_duplicate_attempt_isolation(
                         completion_count, 1,
                         "one interaction completed more than once"
                     );
-                    let ToolExecutionResult::Other { result } = &completion.tool_result else {
+                    let ToolExecutionResult::Other { result } = &completion.tool_result() else {
                         panic!("interaction completion was not normalized: {completion:?}")
                     };
                     match kind {
@@ -22896,11 +22848,7 @@ for line in sys.stdin:
     let reached = tokio::time::timeout(Duration::from_secs(120), async {
         while let Some(event) = events.recv().await {
             match event {
-                ChatEvent::ToolRequest(request)
-                    if request.tool_name.contains("capability_truth_probe") =>
-                {
-                    return true;
-                }
+                ChatEvent::ToolRequest(_) => return true,
                 ChatEvent::StreamEnd(end)
                     if end.message.content.contains("CAPABILITY_MCP_REACHED") =>
                 {
@@ -23066,7 +23014,7 @@ fn event_reaches_capability(event: &ChatEvent, capability: BackendCapability) ->
         (
             BackendCapability::BackgroundTasks,
             ChatEvent::ToolProgress(protocol::ToolProgressData {
-                update: protocol::ToolProgressUpdate::BackgroundTask(_),
+                execution_mode: protocol::ToolExecutionMode::Background,
                 ..
             }),
         )
@@ -24947,15 +24895,13 @@ fn assert_direct_certification_case(
             );
         }
         CertificationCase::StreamIdentityIsStable => {
-            let start_id = observation.chat.iter().find_map(|event| match event {
-                ChatEvent::StreamStart(start) => start.message_id.as_ref(),
-                _ => None,
-            });
             let final_message = observation.final_message();
-            assert_eq!(
-                start_id,
-                final_message.message_id.as_ref().map(|id| &id.0),
-                "stream identity changed; trace:\n{trace}"
+            assert!(
+                final_message
+                    .message_id
+                    .as_ref()
+                    .is_some_and(|id| !id.0.trim().is_empty()),
+                "final response omitted its presentation identity; trace:\n{trace}"
             );
         }
         CertificationCase::DeltasReconstructFinalMessage => {
@@ -25212,7 +25158,7 @@ async fn assert_backend_reports_tool_failure(
     assert!(
         turn.tool_completions
             .iter()
-            .any(|completion| !completion.success),
+            .any(|completion| !completion.success()),
         "{} did not report a failed completion: {:?}",
         backend_label(backend_kind),
         turn.tool_completions
@@ -25241,7 +25187,7 @@ fn assert_exact_generic_tool_pair(
         "generic request omitted its correlation identity: {turn:?}"
     );
     assert!(
-        !requests[0].tool_name.trim().is_empty(),
+        !turn.tool_name(&requests[0].tool_call_id).trim().is_empty(),
         "generic request omitted its canonical tool name: {turn:?}"
     );
     assert_request(&requests[0].tool_type);
@@ -25256,26 +25202,25 @@ fn assert_exact_generic_tool_pair(
         "generic completion did not correlate to its request: {turn:?}"
     );
     assert_eq!(
-        completions[0].success, expected_success,
+        completions[0].success(),
+        expected_success,
         "wrong generic result: {turn:?}"
     );
     assert_eq!(
-        completions[0].tool_name, requests[0].tool_name,
-        "generic completion changed its request name: {turn:?}"
-    );
-    assert_eq!(
-        completions[0].normalization_failure, None,
+        completions[0].normalization_failure(),
+        None,
         "generic completion was not canonically normalized: {turn:?}"
     );
     if expected_success {
         assert_eq!(
-            completions[0].error, None,
+            completions[0].error(),
+            None,
             "successful generic completion carried an error: {turn:?}"
         );
     } else {
         assert!(
             completions[0]
-                .error
+                .error()
                 .as_ref()
                 .is_some_and(|error| !error.trim().is_empty()),
             "failed generic completion omitted its visible exact error field: {turn:?}"
@@ -25285,10 +25230,6 @@ fn assert_exact_generic_tool_pair(
         assert_eq!(
             progress.tool_call_id, requests[0].tool_call_id,
             "generic progress did not correlate to its request: {turn:?}"
-        );
-        assert_eq!(
-            progress.tool_name, requests[0].tool_name,
-            "generic progress changed its request name: {turn:?}"
         );
         if let protocol::ToolProgressUpdate::Other { payload, .. } = &progress.update {
             assert_ne!(
@@ -25330,6 +25271,16 @@ struct GenericToolTrace {
     tool_completions: Vec<ToolExecutionCompletedData>,
     events: Vec<GenericToolTraceEvent>,
     ambient_ids: HashSet<String>,
+    tool_names: HashMap<String, String>,
+}
+
+impl GenericToolTrace {
+    fn tool_name(&self, tool_call_id: &str) -> &str {
+        self.tool_names
+            .get(tool_call_id)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("missing owning tool declaration for {tool_call_id}"))
+    }
 }
 
 async fn expect_generic_tool_trace_after_user_echo(
@@ -25351,6 +25302,7 @@ async fn expect_generic_tool_trace_after_user_echo(
     let mut tool_progress = Vec::new();
     let mut tool_completions = Vec::new();
     let mut events = Vec::new();
+    let mut tool_names = HashMap::new();
     tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             let envelope = expect_next_event(client, "generic tool lifecycle").await;
@@ -25370,6 +25322,9 @@ async fn expect_generic_tool_trace_after_user_echo(
                 ChatEvent::StreamDelta(delta) if saw_user => streamed_text.push_str(&delta.text),
                 ChatEvent::StreamEnd(end) if saw_user => {
                     saw_stream_end = true;
+                    for tool in &end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id.clone(), tool.name.clone());
+                    }
                     final_text = if end.message.content.trim().is_empty() {
                         streamed_text.clone()
                     } else {
@@ -25431,6 +25386,7 @@ async fn expect_generic_tool_trace_after_user_echo(
         tool_completions,
         events,
         ambient_ids,
+        tool_names,
     }
 }
 
@@ -26100,7 +26056,7 @@ async fn assert_generic_tool_terminal_boundaries(
             fixture,
             stream,
             &trace.ambient_ids,
-            expected_background_terminal_status(activity).unwrap(),
+            expected_background_outcome(activity).unwrap(),
             "generic terminal ambient during boundary",
         )
         .await;
@@ -26294,8 +26250,11 @@ async fn assert_generic_sleep_pending_boundaries(
             "natural pending sleep completion",
         )
         .await;
-        assert!(completion.success);
-        assert!(matches!(completion.tool_result, ToolExecutionResult::Sleep));
+        assert!(completion.success());
+        assert!(matches!(
+            completion.tool_result(),
+            ToolExecutionResult::Sleep
+        ));
         ambient_after_stimulus(
             &mut fixture,
             &stream,
@@ -26353,7 +26312,7 @@ async fn assert_generic_sleep_pending_boundaries(
                 &mut fixture,
                 &stream,
                 &ambient_ids,
-                expected_background_terminal_status(activity).unwrap(),
+                expected_background_outcome(activity).unwrap(),
                 "pending sleep ambient during interrupt",
             )
             .await;
@@ -26647,8 +26606,8 @@ async fn assert_generic_sleep_pending_boundaries(
         .await;
         assert_visible_generic_other_failure(&completion, "pending sleep transport close");
         assert!(matches!(
-            completion.tool_result,
-            ToolExecutionResult::Error { .. }
+            &completion.outcome,
+            ToolExecutionOutcome::Failed { .. }
         ));
         ambient_during_stimulus(
             &mut fixture,
@@ -26902,27 +26861,32 @@ async fn assert_generic_codex_native_tool_contract(
         )
         .await;
         let completion = &turn.tool_completions[0];
-        match (contract, succeeds, &completion.tool_result) {
-            (
-                GenericToolContract::GenerateImage,
-                true,
-                ToolExecutionResult::GenerateImage {
-                    revised_prompt,
-                    image_count,
-                },
-            ) => {
-                assert!(
-                    revised_prompt
-                        .as_deref()
-                        .is_some_and(|prompt| !prompt.trim().is_empty())
-                );
-                assert!(*image_count > 0);
+        if !succeeds {
+            assert!(matches!(
+                completion.outcome,
+                ToolExecutionOutcome::Failed { .. }
+            ));
+        } else {
+            match (contract, completion.tool_result()) {
+                (
+                    GenericToolContract::GenerateImage,
+                    ToolExecutionResult::GenerateImage {
+                        revised_prompt,
+                        image_count,
+                    },
+                ) => {
+                    assert!(
+                        revised_prompt
+                            .as_deref()
+                            .is_some_and(|prompt| !prompt.trim().is_empty())
+                    );
+                    assert!(*image_count > 0);
+                }
+                (GenericToolContract::WebSearch, ToolExecutionResult::WebSearch)
+                | (GenericToolContract::ViewImage, ToolExecutionResult::ViewImage)
+                | (GenericToolContract::Sleep, ToolExecutionResult::Sleep) => {}
+                _ => panic!("Codex Luna emitted the wrong native completion: {completion:?}"),
             }
-            (GenericToolContract::WebSearch, true, ToolExecutionResult::WebSearch)
-            | (GenericToolContract::ViewImage, true, ToolExecutionResult::ViewImage)
-            | (GenericToolContract::Sleep, true, ToolExecutionResult::Sleep)
-            | (GenericToolContract::ViewImage, false, ToolExecutionResult::Error { .. }) => {}
-            _ => panic!("Codex Luna emitted the wrong native completion: {completion:?}"),
         }
         if succeeds {
             assert!(turn.final_text.contains(&format!("DONE_{nonce}")));
@@ -27118,38 +27082,40 @@ async fn assert_generic_file_contract(
             .iter()
             .find(|completion| completion.tool_call_id == request.tool_call_id)
             .unwrap();
-        match (contract, succeeds, &completion.tool_result) {
-            (
-                tyde_agent_adapter::GenericToolContract::ModifyFile,
-                true,
-                ToolExecutionResult::ModifyFile {
-                    lines_added,
-                    lines_removed,
-                },
-            ) => {
-                assert_eq!((*lines_added, *lines_removed), (1, 1));
+        if !succeeds {
+            let ToolExecutionOutcome::Failed {
+                message, details, ..
+            } = &completion.outcome
+            else {
+                panic!("generic file failure returned a non-failure outcome: {completion:?}")
+            };
+            assert!(!message.trim().is_empty());
+            assert!(
+                details
+                    .as_deref()
+                    .is_some_and(|details| !details.trim().is_empty())
+            );
+        } else {
+            match (contract, completion.tool_result()) {
+                (
+                    tyde_agent_adapter::GenericToolContract::ModifyFile,
+                    ToolExecutionResult::ModifyFile {
+                        lines_added,
+                        lines_removed,
+                    },
+                ) => {
+                    assert_eq!((*lines_added, *lines_removed), (1, 1));
+                }
+                (
+                    tyde_agent_adapter::GenericToolContract::ReadFiles,
+                    ToolExecutionResult::ReadFiles { files },
+                ) => {
+                    assert_eq!(files.len(), 1);
+                    assert!(files[0].path.ends_with(&target));
+                    assert_eq!(files[0].bytes, sentinel.len() as u64);
+                }
+                _ => panic!("generic file result was not normalized exactly: {completion:?}"),
             }
-            (
-                tyde_agent_adapter::GenericToolContract::ReadFiles,
-                true,
-                ToolExecutionResult::ReadFiles { files },
-            ) => {
-                assert_eq!(files.len(), 1);
-                assert!(files[0].path.ends_with(&target));
-                assert_eq!(files[0].bytes, sentinel.len() as u64);
-            }
-            (
-                _,
-                false,
-                ToolExecutionResult::Error {
-                    short_message,
-                    detailed_message,
-                },
-            ) => {
-                assert!(!short_message.trim().is_empty());
-                assert!(!detailed_message.trim().is_empty());
-            }
-            _ => panic!("generic file result was not normalized exactly: {completion:?}"),
         }
         if succeeds && contract == tyde_agent_adapter::GenericToolContract::ModifyFile {
             let actual = std::fs::read_to_string(fixture.workspace_dir.path().join(valid_path))
@@ -27373,14 +27339,14 @@ async fn assert_pending_generic_file_cell(
             )
             .await;
             assert_eq!(completion.tool_call_id, tool_call_id);
-            assert_eq!(completion.normalization_failure, None);
+            assert_eq!(completion.normalization_failure(), None);
             assert!(
-                completion.success,
+                completion.success(),
                 "released FIFO file tool failed: {completion:?}"
             );
-            assert_eq!(completion.error, None);
+            assert_eq!(completion.error(), None);
             assert!(matches!(
-                (cell.contract, &completion.tool_result),
+                (cell.contract, &completion.tool_result()),
                 (
                     GenericToolContract::ModifyFile,
                     ToolExecutionResult::ModifyFile { .. }
@@ -27696,8 +27662,13 @@ for line in sys.stdin:
                 GenericToolLifecyclePhase::TerminalFailure
             };
             let completion = &turn.tool_completions[0];
-            match (&completion.tool_result, succeeds) {
-                (ToolExecutionResult::Other { result }, true) => {
+            match (&completion.outcome, succeeds) {
+                (
+                    ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::Other { result },
+                    },
+                    true,
+                ) => {
                     assert_eq!(
                         result,
                         &serde_json::json!({
@@ -27711,15 +27682,16 @@ for line in sys.stdin:
                     );
                 }
                 (
-                    ToolExecutionResult::Error {
-                        short_message,
-                        detailed_message,
+                    ToolExecutionOutcome::Failed {
+                        message, details, ..
                     },
                     false,
                 ) => {
-                    assert!(!short_message.trim().is_empty());
+                    assert!(!message.trim().is_empty());
                     assert!(
-                        detailed_message.contains(&sentinel),
+                        details
+                            .as_deref()
+                            .is_some_and(|details| details.contains(&sentinel)),
                         "generic Other failure lost the exact MCP error payload: {completion:?}"
                     );
                 }
@@ -28084,7 +28056,7 @@ async fn assert_generic_other_before_request_boundaries(
             assert_eq!(args, &serde_json::json!({"value": sentinel}));
         });
         assert!(matches!(
-            trace.tool_completions[0].tool_result,
+            trace.tool_completions[0].tool_result(),
             ToolExecutionResult::Other { .. }
         ));
         ledger.record(cell).unwrap();
@@ -28370,6 +28342,7 @@ for line in sys.stdin:
     )
     .await;
     let mut saw_user = false;
+    let mut tool_names = HashMap::new();
     let mut saw_idle = false;
     let mut final_text = String::new();
     let mut trace = Vec::new();
@@ -28395,8 +28368,13 @@ for line in sys.stdin:
                 ChatEvent::ToolExecutionCompleted(completion) if saw_user => {
                     trace.push(GenericToolTraceEvent::Completion(completion));
                 }
-                ChatEvent::StreamEnd(end) if saw_user && !end.message.content.trim().is_empty() => {
-                    final_text = end.message.content;
+                ChatEvent::StreamEnd(end) if saw_user => {
+                    for tool in end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id, tool.name);
+                    }
+                    if !end.message.content.trim().is_empty() {
+                        final_text = end.message.content;
+                    }
                 }
                 ChatEvent::TypingStatusChanged(false) if saw_user => saw_idle = true,
                 ChatEvent::MessageAdded(ChatMessage {
@@ -28433,7 +28411,9 @@ for line in sys.stdin:
     );
     for (_, request) in &requests {
         assert!(
-            request.tool_name.contains("generic_other_ordered"),
+            tool_names
+                .get(&request.tool_call_id)
+                .is_some_and(|name| name.contains("generic_other_ordered")),
             "concurrent generic setup invoked a different tool: {trace:?}"
         );
     }
@@ -28480,22 +28460,25 @@ for line in sys.stdin:
         .iter()
         .find(|(_, completion)| &completion.tool_call_id == medium_id)
         .expect("medium request had no completion");
-    assert!(!fast_completion.1.success, "fast failure reported success");
-    assert!(slow_completion.1.success, "slow success reported failure");
     assert!(
-        medium_completion.1.success,
+        !fast_completion.1.success(),
+        "fast failure reported success"
+    );
+    assert!(slow_completion.1.success(), "slow success reported failure");
+    assert!(
+        medium_completion.1.success(),
         "medium success reported failure"
     );
     assert!(matches!(
-        &fast_completion.1.tool_result,
-        ToolExecutionResult::Error { .. }
+        fast_completion.1.outcome,
+        ToolExecutionOutcome::Failed { .. }
     ));
     assert!(matches!(
-        &slow_completion.1.tool_result,
+        &slow_completion.1.tool_result(),
         ToolExecutionResult::Other { .. }
     ));
     assert!(matches!(
-        &medium_completion.1.tool_result,
+        &medium_completion.1.tool_result(),
         ToolExecutionResult::Other { .. }
     ));
     assert!(
@@ -28506,30 +28489,28 @@ for line in sys.stdin:
     // even when the real MCP server finishes them in reverse. Tyde receives no
     // provider timing signal from which it could reconstruct a different order.
     for (completion_index, completion) in &completions {
-        let (request_index, request) = requests
+        let request_index = requests
             .iter()
             .find(|(_, request)| request.tool_call_id == completion.tool_call_id)
+            .map(|(index, _)| index)
             .expect("completion without correlated request");
         assert!(
             request_index < completion_index,
             "completion preceded request: {trace:?}"
         );
-        assert_eq!(completion.tool_name, request.tool_name);
-        assert_eq!(completion.normalization_failure, None);
-        for (progress_index, progress) in
-            trace
-                .iter()
-                .enumerate()
-                .filter_map(|(index, event)| match event {
-                    GenericToolTraceEvent::Progress(progress)
-                        if progress.tool_call_id == completion.tool_call_id =>
-                    {
-                        Some((index, progress))
-                    }
-                    _ => None,
-                })
+        assert_eq!(completion.normalization_failure(), None);
+        for progress_index in trace
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                GenericToolTraceEvent::Progress(progress)
+                    if progress.tool_call_id == completion.tool_call_id =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
         {
-            assert_eq!(progress.tool_name, request.tool_name);
             assert!(
                 request_index < &progress_index && progress_index < *completion_index,
                 "progress escaped request/completion boundaries: {trace:?}"
@@ -28833,11 +28814,10 @@ for line in sys.stdin:
                 .unwrap()
                 .0;
             assert!(request_index < *completion_index);
-            assert!(completion.success);
-            assert_eq!(completion.tool_name, request.tool_name);
-            assert_eq!(completion.normalization_failure, None);
+            assert!(completion.success());
+            assert_eq!(completion.normalization_failure(), None);
             assert!(
-                serde_json::to_string(&completion.tool_result)
+                serde_json::to_string(&completion.tool_result())
                     .unwrap()
                     .contains(expected)
             );
@@ -28930,7 +28910,7 @@ async fn expect_generic_other_turn(
         panic!("generic Other turn emitted the wrong request: {trace:?}")
     };
     assert!(
-        request.tool_name.contains(tool_name),
+        trace.tool_name(&request.tool_call_id).contains(tool_name),
         "generic Other request lost its tool identity: {trace:?}"
     );
     assert_eq!(
@@ -29022,6 +29002,7 @@ async fn reach_pending_generic_other(
         .await
         .unwrap();
     let mut saw_user = false;
+    let mut tool_names = HashMap::new();
     let tool_call_id = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let envelope =
@@ -29038,6 +29019,11 @@ async fn reach_pending_generic_other(
                     content,
                     ..
                 }) if content == prompt => saw_user = true,
+                ChatEvent::StreamEnd(end) if saw_user => {
+                    for tool in end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id, tool.name);
+                    }
+                }
                 ChatEvent::ToolRequest(request) if saw_user => {
                     let ToolRequestType::Other { args } = &request.tool_type else {
                         panic!(
@@ -29045,7 +29031,9 @@ async fn reach_pending_generic_other(
                         )
                     };
                     assert!(
-                        request.tool_name.contains("generic_other_pending"),
+                        tool_names
+                            .get(&request.tool_call_id)
+                            .is_some_and(|name| name.contains("generic_other_pending")),
                         "pending generic Other setup invoked the wrong MCP tool: {request:?}"
                     );
                     assert_eq!(
@@ -29146,18 +29134,14 @@ async fn expect_one_generic_other_terminal(
 
 fn assert_visible_generic_other_failure(completion: &ToolExecutionCompletedData, context: &str) {
     assert!(
-        !completion.success,
+        !completion.success(),
         "{context}: pending generic Other reported success"
     );
     assert!(
         completion
-            .error
+            .error()
             .as_ref()
-            .is_some_and(|error| !error.trim().is_empty())
-            || matches!(
-                completion.tool_result,
-                ToolExecutionResult::Error { .. } | ToolExecutionResult::Cancelled { .. }
-            ),
+            .is_some_and(|error| !error.trim().is_empty()),
         "{context}: pending generic Other failed without a visible typed/error terminal: {completion:?}"
     );
 }
@@ -29247,12 +29231,12 @@ async fn close_pending_generic_other_with_terminal(
                         "close emitted duplicate generic Other terminal"
                     );
                     assert!(
-                        !completion.success,
+                        !completion.success(),
                         "close reported pending generic Other success"
                     );
                     assert!(matches!(
-                        &completion.tool_result,
-                        ToolExecutionResult::Cancelled { .. }
+                        &completion.outcome,
+                        ToolExecutionOutcome::Cancelled { .. }
                     ));
                 } else {
                     deferred.push(envelope);
@@ -29338,15 +29322,15 @@ async fn assert_generic_other_pending_boundaries(
         .await;
         assert_visible_generic_other_failure(&completion, "directly interrupted generic Other");
         assert!(matches!(
-            &completion.tool_result,
-            ToolExecutionResult::Cancelled { .. }
+            &completion.outcome,
+            ToolExecutionOutcome::Cancelled { .. }
         ));
         if background_terminal_during_stimulus(activity) {
             wait_for_background_terminal_lifecycle(
                 &mut fixture,
                 &stream,
                 &ambient_ids,
-                expected_background_terminal_status(activity).unwrap(),
+                expected_background_outcome(activity).unwrap(),
                 "pending generic Other ambient during interrupt",
             )
             .await;
@@ -29373,7 +29357,7 @@ async fn assert_generic_other_pending_boundaries(
                 &mut fixture,
                 &stream,
                 &ambient_ids,
-                protocol::BackgroundTaskStatus::Completed,
+                ExpectedBackgroundOutcome::Succeeded,
                 "pending generic Other ambient interrupt cleanup",
             )
             .await;
@@ -29417,13 +29401,13 @@ async fn assert_generic_other_pending_boundaries(
             "natural generic Other completion",
         )
         .await;
-        assert!(completion.success, "natural pending generic Other failed");
+        assert!(completion.success(), "natural pending generic Other failed");
         assert!(matches!(
-            &completion.tool_result,
+            &completion.tool_result(),
             ToolExecutionResult::Other { .. }
         ));
         assert!(
-            serde_json::to_string(&completion.tool_result)
+            serde_json::to_string(&completion.tool_result())
                 .unwrap()
                 .contains(&sentinel),
             "natural pending generic Other lost its result"
@@ -29653,8 +29637,8 @@ async fn assert_generic_other_pending_boundaries(
             "source generic Other cleanup after fork",
         );
         assert!(matches!(
-            &completion.tool_result,
-            ToolExecutionResult::Cancelled { .. }
+            &completion.outcome,
+            ToolExecutionOutcome::Cancelled { .. }
         ));
         ledger
             .record(cell(GenericToolLifecycleBoundary::Fork))
@@ -29690,8 +29674,8 @@ async fn assert_generic_other_pending_boundaries(
         .await;
         assert_visible_generic_other_failure(&completion, "generic Other host restart failure");
         assert!(matches!(
-            completion.tool_result,
-            ToolExecutionResult::Cancelled { .. }
+            &completion.outcome,
+            ToolExecutionOutcome::Cancelled { .. }
         ));
         ambient_during_stimulus(
             &mut fixture,
@@ -29756,8 +29740,8 @@ async fn assert_generic_other_pending_boundaries(
         .await;
         assert_visible_generic_other_failure(&completion, "generic Other backend transport close");
         assert!(matches!(
-            &completion.tool_result,
-            ToolExecutionResult::Error { .. }
+            &completion.outcome,
+            ToolExecutionOutcome::Failed { .. }
         ));
         ambient_during_stimulus(
             &mut fixture,
@@ -31041,11 +31025,10 @@ async fn assert_progress_concurrency_matrix(backend_kind: BackendKind) {
     .await;
     let mut requests = HashSet::new();
     let mut running = HashSet::new();
-    let mut terminal = HashSet::new();
     let mut completed = HashSet::new();
     let mut trace = Vec::new();
     tokio::time::timeout(Duration::from_secs(180), async {
-        while terminal.len() != 2 || completed.len() != 2 {
+        while completed.len() != 2 {
             let envelope = expect_next_event(&mut fixture.client, "concurrent progress").await;
             if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
                 continue;
@@ -31056,33 +31039,25 @@ async fn assert_progress_concurrency_matrix(backend_kind: BackendKind) {
                     assert!(requests.insert(request.tool_call_id));
                 }
                 ChatEvent::ToolProgress(progress) => {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                    let Some(_task) = background_task_progress(&progress.update) else {
                         continue;
                     };
                     assert!(requests.contains(&progress.tool_call_id));
-                    if task.status == protocol::BackgroundTaskStatus::Running {
-                        trace.push(format!("running:{}", progress.tool_call_id));
-                        assert!(running.insert(progress.tool_call_id));
-                    } else {
-                        trace.push(format!(
-                            "terminal:{}:{:?}",
-                            progress.tool_call_id, task.status
-                        ));
-                        assert!(running.contains(&progress.tool_call_id));
-                        assert!(completed.contains(&progress.tool_call_id));
-                        assert_eq!(task.status, protocol::BackgroundTaskStatus::Completed);
-                        assert!(terminal.insert(progress.tool_call_id));
-                    }
+                    assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background
+                    );
+                    trace.push(format!("running:{}", progress.tool_call_id));
+                    running.insert(progress.tool_call_id);
                 }
                 ChatEvent::ToolExecutionCompleted(completion) => {
                     trace.push(format!("completion:{}", completion.tool_call_id));
                     assert!(requests.contains(&completion.tool_call_id));
                     assert!(running.contains(&completion.tool_call_id));
-                    assert!(!terminal.contains(&completion.tool_call_id));
-                    assert!(completion.success, "background command completion failed");
+                    assert!(completion.success(), "background command completion failed");
                     assert!(completed.insert(completion.tool_call_id));
                 }
-                ChatEvent::TypingStatusChanged(false) if terminal.len() < 2 => {
+                ChatEvent::TypingStatusChanged(false) if completed.len() < 2 => {
                     assert_eq!(
                         running.len(),
                         2,
@@ -31102,7 +31077,7 @@ async fn assert_progress_concurrency_matrix(backend_kind: BackendKind) {
     })
     .await
     .unwrap_or_else(|_| {
-        panic!("two concurrent progress identities did not terminalize exactly once: {trace:?}")
+        panic!("two concurrent progress identities did not complete exactly once: {trace:?}")
     });
     assert_eq!(requests.len(), 2);
     assert_eq!(running.len(), 2);
@@ -31110,18 +31085,20 @@ async fn assert_progress_concurrency_matrix(backend_kind: BackendKind) {
 }
 
 fn progress_family(update: &protocol::ToolProgressUpdate) -> ProgressFamily {
+    if background_task_progress(update).is_some() {
+        return ProgressFamily::BackgroundTask;
+    }
     match update {
         protocol::ToolProgressUpdate::SubAgent(_) => ProgressFamily::SubAgent,
         protocol::ToolProgressUpdate::Workflow(_) => ProgressFamily::Workflow,
         protocol::ToolProgressUpdate::AgentControl(_) => ProgressFamily::AgentControl,
-        protocol::ToolProgressUpdate::BackgroundTask(_) => ProgressFamily::BackgroundTask,
         protocol::ToolProgressUpdate::Other { .. } => ProgressFamily::Other,
     }
 }
 
 fn assert_progress_payload_contract(progress: &protocol::ToolProgressData, context: &str) {
     assert!(
-        !progress.tool_call_id.trim().is_empty() && !progress.tool_name.trim().is_empty(),
+        !progress.tool_call_id.trim().is_empty(),
         "{context}: progress omitted its correlated request identity: {progress:?}"
     );
     let normalized_optional = |label: &str, value: Option<&str>| {
@@ -31187,25 +31164,15 @@ fn assert_progress_payload_contract(progress: &protocol::ToolProgressData, conte
                 normalized_optional("agent-control name", agent.name.as_deref());
             }
         }
-        protocol::ToolProgressUpdate::BackgroundTask(task) => {
-            assert!(!task.task_id.trim().is_empty());
-            assert_ne!(task.status, protocol::BackgroundTaskStatus::Unknown);
-            normalized_optional("background description", task.description.as_deref());
-            normalized_optional("background summary", task.summary.as_deref());
-            normalized_optional(
-                "background output-unavailable reason",
-                task.output_unavailable.as_deref(),
-            );
-            if task.status == protocol::BackgroundTaskStatus::Running {
-                assert!(task.output_unavailable.is_none());
-            }
-        }
-        protocol::ToolProgressUpdate::Other { status, payload } => {
-            assert_ne!(*status, protocol::OpaqueToolProgressStatus::Unknown);
+        protocol::ToolProgressUpdate::Other { payload } => {
             assert!(
                 !payload.is_null(),
                 "{context}: opaque progress lost its payload"
             );
+            if let Some(task) = background_task_progress(&progress.update) {
+                normalized_optional("background description", task.description.as_deref());
+                normalized_optional("background summary", task.summary.as_deref());
+            }
         }
     }
 }
@@ -31345,12 +31312,7 @@ fn progress_update_is_running(update: &protocol::ToolProgressUpdate) -> bool {
         protocol::ToolProgressUpdate::AgentControl(state) => {
             state.status == protocol::AgentControlProgressStatus::Running
         }
-        protocol::ToolProgressUpdate::BackgroundTask(state) => {
-            state.status == protocol::BackgroundTaskStatus::Running
-        }
-        protocol::ToolProgressUpdate::Other { status, .. } => {
-            *status == protocol::OpaqueToolProgressStatus::Running
-        }
+        protocol::ToolProgressUpdate::Other { .. } => true,
     }
 }
 
@@ -31367,12 +31329,10 @@ async fn assert_progress_boundary_is_stable(
             let envelope = collector.next(context).await;
             if envelope.kind == FrameKind::ChatEvent
                 && envelope.stream == *stream
-                && let ChatEvent::ToolProgress(progress) = envelope
+                && let ChatEvent::ToolExecutionCompleted(completion) = envelope
                     .parse_payload::<ChatEvent>()
-                    .expect("parse boundary progress")
-                && progress.tool_call_id == tool_call_id
-                && progress_family(&progress.update) == family
-                && !progress_update_is_running(&progress.update)
+                    .expect("parse boundary completion")
+                && completion.tool_call_id == tool_call_id
             {
                 break;
             }
@@ -31380,7 +31340,7 @@ async fn assert_progress_boundary_is_stable(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{context}: {family:?} emitted no terminal progress"));
+    .unwrap_or_else(|_| panic!("{context}: {family:?} emitted no terminal completion"));
     collector.restore();
     assert_progress_terminal_is_stable(fixture, stream, tool_call_id, family, context).await;
 }
@@ -31573,15 +31533,7 @@ async fn assert_progress_family_lifecycle_matrix(backend_kind: BackendKind) {
                             },
                             ChatEvent::ToolProgress(progress)
                                 if progress_family(&progress.update) == family
-                                    && matches!(
-                                        progress.update,
-                                        protocol::ToolProgressUpdate::BackgroundTask(
-                                            protocol::BackgroundTaskState {
-                                                status: protocol::BackgroundTaskStatus::Running,
-                                                ..
-                                            }
-                                        )
-                                    ) =>
+                                    && background_task_progress(&progress.update).is_some() =>
                             {
                                 assert_eq!(
                                     tool_id.as_deref(),
@@ -31631,51 +31583,33 @@ async fn assert_progress_family_lifecycle_matrix(backend_kind: BackendKind) {
                 tokio::time::timeout(Duration::from_secs(120), async {
                     loop {
                         let envelope =
-                            expect_next_event(&mut fixture.client, "background progress terminal")
+                            expect_next_event(&mut fixture.client, "background tool completion")
                                 .await;
                         if envelope.kind != FrameKind::ChatEvent || envelope.stream != stream {
                             continue;
                         }
-                        if let ChatEvent::ToolProgress(progress) =
+                        if let ChatEvent::ToolExecutionCompleted(completion) =
                             envelope.parse_payload::<ChatEvent>().unwrap()
-                            && progress_family(&progress.update) == family
+                            && tool_id.as_deref() == Some(completion.tool_call_id.as_str())
                         {
-                            let protocol::ToolProgressUpdate::BackgroundTask(state) =
-                                progress.update
-                            else {
-                                unreachable!()
-                            };
-                            if state.status != protocol::BackgroundTaskStatus::Running {
-                                assert_eq!(
-                                    tool_id.as_deref(),
-                                    Some(progress.tool_call_id.as_str())
-                                );
-                                if transition == ProgressTransition::RunningToFailure {
-                                    assert_eq!(
-                                        state.status,
-                                        protocol::BackgroundTaskStatus::Failed
-                                    );
-                                } else {
-                                    assert_eq!(
-                                        state.status,
-                                        protocol::BackgroundTaskStatus::Completed
-                                    );
-                                }
-                                break;
+                            if transition == ProgressTransition::RunningToFailure {
+                                assert!(matches!(
+                                    completion.outcome,
+                                    ToolExecutionOutcome::Failed { .. }
+                                        | ToolExecutionOutcome::Cancelled { .. }
+                                ));
+                            } else {
+                                assert!(matches!(
+                                    completion.outcome,
+                                    ToolExecutionOutcome::Succeeded { .. }
+                                ));
                             }
+                            break;
                         }
                     }
                 })
                 .await
-                .expect("background progress emitted no terminal state");
-                assert_progress_terminal_is_stable(
-                    &mut fixture,
-                    &stream,
-                    tool_id.as_deref().unwrap(),
-                    ProgressFamily::BackgroundTask,
-                    "background progress terminal stability",
-                )
-                .await;
+                .expect("background tool emitted no completion");
             }
             ProgressFamily::Workflow => {
                 assert_workflow_progress_transition(backend_kind, transition).await;
@@ -32929,16 +32863,16 @@ async fn assert_mcp_http_transport_activity_row(
     let request = turn
         .tool_requests
         .iter()
-        .find(|request| request.tool_name.contains("http_probe"))
+        .find(|request| turn.tool_name(&request.tool_call_id).contains("http_probe"))
         .expect("authenticated HTTP MCP tool was not discovered or called");
     let completion = turn
         .tool_completions
         .iter()
         .find(|completion| completion.tool_call_id == request.tool_call_id)
         .expect("authenticated HTTP MCP call lacked correlated completion");
-    assert!(completion.success, "HTTP MCP call failed: {completion:?}");
+    assert!(completion.success(), "HTTP MCP call failed: {completion:?}");
     assert!(
-        serde_json::to_string(&completion.tool_result)
+        serde_json::to_string(&completion.tool_result())
             .expect("serialize HTTP MCP result")
             .contains("HTTP_MCP_AUTH_OK"),
         "HTTP MCP result was not preserved: {completion:?}"
@@ -33055,7 +32989,7 @@ async fn assert_mcp_http_transport_activity_row(
     let requests = turn
         .tool_requests
         .iter()
-        .filter(|request| request.tool_name.contains("http_probe"))
+        .filter(|request| turn.tool_name(&request.tool_call_id).contains("http_probe"))
         .collect::<Vec<_>>();
     assert_eq!(
         requests.len(),
@@ -33079,7 +33013,8 @@ async fn assert_mcp_http_transport_activity_row(
     );
     let diagnostic = format!(
         "{:?} {:?}",
-        completions[0].error, completions[0].tool_result
+        completions[0].error(),
+        completions[0].tool_result()
     );
     assert!(
         diagnostic.contains("HTTP_MCP_CALL_ERROR"),
@@ -33164,7 +33099,7 @@ async fn assert_mcp_http_transport_activity_row(
     let requests = turn
         .tool_requests
         .iter()
-        .filter(|request| request.tool_name.contains("http_probe"))
+        .filter(|request| turn.tool_name(&request.tool_call_id).contains("http_probe"))
         .collect::<Vec<_>>();
     assert_eq!(
         requests.len(),
@@ -33246,7 +33181,10 @@ fn assert_connection_ownership_tool_turn(turn: &ToolTurn, context: &str) {
     let requests = turn
         .tool_requests
         .iter()
-        .filter(|request| request.tool_name.contains("connection_ownership_probe"))
+        .filter(|request| {
+            turn.tool_name(&request.tool_call_id)
+                .contains("connection_ownership_probe")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         requests.len(),
@@ -33264,12 +33202,12 @@ fn assert_connection_ownership_tool_turn(turn: &ToolTurn, context: &str) {
         "{context}: ownership probe did not terminalize exactly once"
     );
     assert!(
-        completions[0].success,
+        completions[0].success(),
         "{context}: ownership probe failed: {:?}",
         completions[0]
     );
     assert!(
-        serde_json::to_string(&completions[0].tool_result)
+        serde_json::to_string(&completions[0].tool_result())
             .expect("serialize ownership probe result")
             .contains("MCP_CONNECTION_OWNERSHIP_OK"),
         "{context}: ownership probe result was lost: {:?}",
@@ -33487,9 +33425,11 @@ for line in sys.stdin:
     let mut turn = expect_tool_turn_after_user_echo(&mut fixture.client, &stream, prompt).await;
     let complete = |turn: &ToolTurn| {
         turn.tool_requests.iter().any(|request| {
-            request.tool_name.to_ascii_lowercase().contains(TOOL_NAME)
+            turn.tool_name(&request.tool_call_id)
+                .to_ascii_lowercase()
+                .contains(TOOL_NAME)
                 && turn.tool_completions.iter().any(|completion| {
-                    completion.tool_call_id == request.tool_call_id && completion.success
+                    completion.tool_call_id == request.tool_call_id && completion.success()
                 })
         }) && turn.final_text.contains(SENTINEL)
     };
@@ -33552,7 +33492,11 @@ for line in sys.stdin:
         "narrow MCP probe emitted missing, wrong, or extra terminals: {turn:?}"
     );
     let request = &turn.tool_requests[0];
-    assert!(request.tool_name.to_ascii_lowercase().contains(TOOL_NAME));
+    assert!(
+        turn.tool_name(&request.tool_call_id)
+            .to_ascii_lowercase()
+            .contains(TOOL_NAME)
+    );
     let ToolRequestType::Other { args } = &request.tool_type else {
         panic!("narrow MCP probe did not normalize to generic Other: {turn:?}")
     };
@@ -33562,7 +33506,6 @@ for line in sys.stdin:
         "narrow MCP probe changed its empty arguments"
     );
     assert_eq!(turn.tool_completions[0].tool_call_id, request.tool_call_id);
-    assert_eq!(turn.tool_completions[0].tool_name, request.tool_name);
     turn
 }
 
@@ -33824,6 +33767,7 @@ async fn reach_adversarial_mcp_request(
     .await;
     let mut saw_user = false;
     let mut events = Vec::new();
+    let mut tool_names = HashMap::new();
     let tool_request = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let envelope = expect_next_event(&mut fixture.client, "adversarial MCP request").await;
@@ -33845,9 +33789,16 @@ async fn reach_adversarial_mcp_request(
                     content,
                     ..
                 }) if content == prompt => saw_user = true,
+                ChatEvent::StreamEnd(end) if saw_user => {
+                    for tool in end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id, tool.name);
+                    }
+                }
                 ChatEvent::ToolRequest(request) if saw_user => {
                     assert!(
-                        request.tool_name.contains(ADVERSARIAL_MCP_TOOL),
+                        tool_names
+                            .get(&request.tool_call_id)
+                            .is_some_and(|name| name.contains(ADVERSARIAL_MCP_TOOL)),
                         "adversarial MCP setup invoked a wrong tool: {request:?}"
                     );
                     let ToolRequestType::Other { args } = &request.tool_type else {
@@ -34213,7 +34164,8 @@ async fn expect_adversarial_call_terminal(
     let completion =
         expect_correlated_tool_completion(fixture, stream, tool_call_id, context).await;
     assert_eq!(
-        completion.success, expected_success,
+        completion.success(),
+        expected_success,
         "{context}: wrong terminal: {completion:?}"
     );
     let duplicate = tokio::time::timeout(Duration::from_millis(500), async {
@@ -34254,24 +34206,21 @@ fn assert_failed_mcp_request_result_contract(
         completion.tool_call_id, request.tool_call_id,
         "{context}: MCP failure crossed request identities"
     );
-    assert_eq!(
-        completion.tool_name, request.tool_name,
-        "{context}: MCP failure changed its request name"
-    );
     assert!(
-        !completion.success,
+        !completion.success(),
         "{context}: MCP failure reported success"
     );
     assert_eq!(
-        completion.normalization_failure, None,
+        completion.normalization_failure(),
+        None,
         "{context}: generic MCP failure was misclassified as a normalization failure"
     );
     assert!(
         completion
-            .error
+            .error()
             .as_ref()
             .is_some_and(|error| !error.trim().is_empty())
-            || matches!(&completion.tool_result, ToolExecutionResult::Error { .. }),
+            || matches!(&completion.outcome, ToolExecutionOutcome::Failed { .. }),
         "{context}: MCP failure had no visible diagnostic: {completion:?}"
     );
 }
@@ -34286,6 +34235,7 @@ async fn expect_adversarial_calls_after_user_echo(
     let mut saw_user = false;
     let mut requests = Vec::new();
     let mut completions = Vec::new();
+    let mut tool_names = HashMap::new();
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let envelope = expect_next_event(&mut fixture.client, context).await;
@@ -34302,8 +34252,16 @@ async fn expect_adversarial_calls_after_user_echo(
                     content,
                     ..
                 }) if content == prompt => saw_user = true,
+                ChatEvent::StreamEnd(end) if saw_user => {
+                    for tool in end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id, tool.name);
+                    }
+                }
                 ChatEvent::ToolRequest(request)
-                    if saw_user && request.tool_name.contains(ADVERSARIAL_MCP_TOOL) =>
+                    if saw_user
+                        && tool_names
+                            .get(&request.tool_call_id)
+                            .is_some_and(|name| name.contains(ADVERSARIAL_MCP_TOOL)) =>
                 {
                     assert!(
                         !requests.iter().any(|existing: &protocol::ToolRequest| {
@@ -34546,7 +34504,7 @@ async fn assert_mcp_extended_adversarial_activity_row(
         .await;
         if expected_success {
             assert!(
-                serde_json::to_string(&completion.tool_result)
+                serde_json::to_string(&completion.tool_result())
                     .unwrap()
                     .contains(&sentinel)
             );
@@ -34631,7 +34589,7 @@ async fn assert_mcp_extended_adversarial_activity_row(
         )
         .await;
         assert!(
-            serde_json::to_string(&completion.tool_result)
+            serde_json::to_string(&completion.tool_result())
                 .unwrap()
                 .contains("MCP_STDIO_ENV:STDIO_ENV_OK"),
             "stdio MCP environment did not reach the real child: {completion:?}"
@@ -34717,9 +34675,9 @@ async fn assert_mcp_extended_adversarial_activity_row(
                 .iter()
                 .find(|completion| completion.tool_call_id == request.tool_call_id)
                 .expect("concurrent MCP request lacked its correlated terminal");
-            assert!(completion.success);
+            assert!(completion.success());
             assert!(
-                serde_json::to_string(&completion.tool_result)
+                serde_json::to_string(&completion.tool_result())
                     .unwrap()
                     .contains(value),
                 "concurrent MCP completion crossed identities: {completion:?}"
@@ -34801,9 +34759,9 @@ async fn assert_mcp_extended_adversarial_activity_row(
             "MCP tool-name collision",
         )
         .await;
-        assert!(completions[0].success);
+        assert!(completions[0].success());
         assert!(
-            serde_json::to_string(&completions[0].tool_result)
+            serde_json::to_string(&completions[0].tool_result())
                 .unwrap()
                 .contains(&sentinel)
         );
@@ -34884,7 +34842,7 @@ async fn assert_mcp_extended_adversarial_activity_row(
         )
         .await;
         assert!(
-            serde_json::to_string(&old_completion.tool_result)
+            serde_json::to_string(&old_completion.tool_result())
                 .unwrap()
                 .contains("MCP_REPLACE_OLD")
         );
@@ -34903,9 +34861,9 @@ async fn assert_mcp_extended_adversarial_activity_row(
             "replacement excluded from existing MCP agent",
         )
         .await;
-        assert!(retained_completions[0].success);
+        assert!(retained_completions[0].success());
         assert!(
-            serde_json::to_string(&retained_completions[0].tool_result)
+            serde_json::to_string(&retained_completions[0].tool_result())
                 .unwrap()
                 .contains("MCP_REPLACE_EXISTING_RETAINS_OLD")
         );
@@ -34948,7 +34906,7 @@ async fn assert_mcp_extended_adversarial_activity_row(
         )
         .await;
         assert!(
-            serde_json::to_string(&new_completion.tool_result)
+            serde_json::to_string(&new_completion.tool_result())
                 .unwrap()
                 .contains("MCP_REPLACE_NEW")
         );
@@ -35061,7 +35019,7 @@ async fn assert_mcp_extended_adversarial_activity_row(
         )
         .await;
         assert!(
-            serde_json::to_string(&completion.tool_result)
+            serde_json::to_string(&completion.tool_result())
                 .unwrap()
                 .contains("MCP_DYNAMIC_DELETE")
         );
@@ -35084,9 +35042,9 @@ async fn assert_mcp_extended_adversarial_activity_row(
         )
         .await;
         assert_eq!(retained_requests.len(), 1);
-        assert!(retained_completions[0].success);
+        assert!(retained_completions[0].success());
         assert!(
-            serde_json::to_string(&retained_completions[0].tool_result)
+            serde_json::to_string(&retained_completions[0].tool_result())
                 .unwrap()
                 .contains("MCP_DYNAMIC_DELETE_RETAINED")
         );
@@ -35270,7 +35228,7 @@ async fn assert_mcp_pending_process_death_contract(backend_kind: BackendKind) {
     )
     .await;
     assert!(
-        serde_json::to_string(&recovery_completion.tool_result)
+        serde_json::to_string(&recovery_completion.tool_result())
             .unwrap()
             .contains(recovery_value),
         "replacement MCP process did not recover the failed server: {recovery_completion:?}"
@@ -35359,7 +35317,7 @@ async fn assert_mcp_reconnect_contract(backend_kind: BackendKind) {
         "MCP completion after reconnect",
     )
     .await;
-    assert!(completion.success);
+    assert!(completion.success());
     wait_for_adversarial_turn_idle(&mut fixture, &replay_stream, "MCP turn after reconnect").await;
     assert_no_adversarial_mcp_activity(
         &mut fixture,
@@ -35393,6 +35351,7 @@ async fn assert_mcp_host_restart_resume_contract(backend_kind: BackendKind) {
     )
     .await;
     let mut saw_user = false;
+    let mut tool_names = HashMap::new();
     let second_id = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let envelope = expect_next_event(&mut fixture.client, "MCP request after resume").await;
@@ -35405,13 +35364,20 @@ async fn assert_mcp_host_restart_resume_contract(backend_kind: BackendKind) {
                     content,
                     ..
                 }) if content == second_prompt => saw_user = true,
+                ChatEvent::StreamEnd(end) if saw_user => {
+                    for tool in end.message.tool_calls {
+                        tool_names.insert(tool.tool_call_id, tool.name);
+                    }
+                }
                 ChatEvent::ToolRequest(request) if saw_user => {
                     assert_ne!(
                         request.tool_call_id, first_request.tool_call_id,
                         "host restart replayed the abandoned MCP call"
                     );
                     assert!(
-                        request.tool_name.contains(ADVERSARIAL_MCP_TOOL),
+                        tool_names
+                            .get(&request.tool_call_id)
+                            .is_some_and(|name| name.contains(ADVERSARIAL_MCP_TOOL)),
                         "resumed MCP session invoked a wrong tool: {request:?}"
                     );
                     let ToolRequestType::Other { args } = &request.tool_type else {
@@ -35444,7 +35410,7 @@ async fn assert_mcp_host_restart_resume_contract(backend_kind: BackendKind) {
         "MCP completion after host restart",
     )
     .await;
-    assert!(second.success);
+    assert!(second.success());
     wait_for_adversarial_turn_idle(&mut fixture, &resumed, "MCP turn after host restart").await;
     assert_no_adversarial_mcp_activity(
         &mut fixture,
@@ -35517,9 +35483,9 @@ async fn assert_mcp_fork_contract(backend_kind: BackendKind) {
     .await;
     assert_eq!(requests.len(), 1);
     assert_eq!(completions.len(), 1);
-    assert!(completions[0].success);
+    assert!(completions[0].success());
     assert!(
-        serde_json::to_string(&completions[0].tool_result)
+        serde_json::to_string(&completions[0].tool_result())
             .unwrap()
             .contains("MCP_AFTER_FORK"),
         "forked MCP result was not preserved: {:?}",
@@ -35540,7 +35506,7 @@ async fn assert_mcp_fork_contract(backend_kind: BackendKind) {
         "source MCP completion after fork",
     )
     .await;
-    assert!(source_completion.success);
+    assert!(source_completion.success());
     wait_for_adversarial_turn_idle(&mut fixture, &source, "MCP source turn after fork").await;
     assert_no_adversarial_mcp_activity(
         &mut fixture,
@@ -36680,6 +36646,7 @@ async fn assert_authoritative_resume_preserves_concurrent_events(backend_kind: B
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message, queued);
     let mut terminal_progress = HashMap::<String, usize>::new();
+    let mut subagent_progress = HashSet::new();
     let mut terminal_completions = HashMap::<String, usize>::new();
     let mut saw_stats = false;
     for event in bootstrap {
@@ -36689,10 +36656,11 @@ async fn assert_authoritative_resume_preserves_concurrent_events(backend_kind: B
                 if run.background_tool_ids.contains(&progress.tool_call_id) =>
             {
                 let terminal = match progress.update {
-                    protocol::ToolProgressUpdate::BackgroundTask(task) => {
-                        task.status != protocol::BackgroundTaskStatus::Running
+                    protocol::ToolProgressUpdate::SubAgent(subagent) => {
+                        subagent_progress.insert(progress.tool_call_id.clone());
+                        subagent.completed
                     }
-                    protocol::ToolProgressUpdate::SubAgent(subagent) => subagent.completed,
+                    update if background_task_progress(&update).is_some() => false,
                     _ => false,
                 };
                 if terminal {
@@ -36714,11 +36682,19 @@ async fn assert_authoritative_resume_preserves_concurrent_events(backend_kind: B
         "authoritative resume dropped its usage/activity snapshot"
     );
     for id in &run.background_tool_ids {
-        assert_eq!(
-            terminal_progress.get(id),
-            Some(&1),
-            "resume lost or duplicated terminal progress for {id}"
-        );
+        if subagent_progress.contains(id) {
+            assert_eq!(
+                terminal_progress.get(id),
+                Some(&1),
+                "resume lost or duplicated terminal subagent progress for {id}"
+            );
+        } else {
+            assert_eq!(
+                terminal_progress.get(id),
+                None,
+                "resume fabricated terminal progress for background command {id}"
+            );
+        }
         assert_eq!(
             terminal_completions.get(id),
             Some(&1),
@@ -36820,7 +36796,7 @@ async fn assert_host_fork_case(backend_kind: BackendKind) {
         source_turn
             .tool_completions
             .iter()
-            .filter(|completion| completion.tool_call_id == source_tool_id && completion.success)
+            .filter(|completion| completion.tool_call_id == source_tool_id && completion.success())
             .count(),
         1
     );
@@ -37293,7 +37269,6 @@ async fn assert_agent_control_spawn_contract(backend_kind: BackendKind) {
                 match event {
                     ChatEvent::ToolRequest(ToolRequest {
                         tool_call_id,
-                        tool_name,
                         tool_type:
                             ToolRequestType::AgentSpawn {
                                 prompt: Some(actual_prompt),
@@ -37301,13 +37276,7 @@ async fn assert_agent_control_spawn_contract(backend_kind: BackendKind) {
                                 execution_mode,
                             },
                         ..
-                    }) if tool_name
-                        .chars()
-                        .filter(|character| character.is_ascii_alphanumeric())
-                        .map(|character| character.to_ascii_lowercase())
-                        .collect::<String>()
-                        .ends_with("tydespawnagent") =>
-                    {
+                    }) => {
                         assert_eq!(actual_prompt, child_prompt);
                         assert_eq!(name.as_deref(), Some(child_name));
                         assert_eq!(execution_mode, protocol::AgentExecutionMode::Background);
@@ -37338,7 +37307,7 @@ async fn assert_agent_control_spawn_contract(backend_kind: BackendKind) {
                         if request_id.as_deref() == Some(completion.tool_call_id.as_str()) =>
                     {
                         assert!(
-                            completion.success,
+                            completion.success(),
                             "agent-control spawn failed: {completion:?}"
                         );
                         completion_count += 1;
@@ -37648,10 +37617,10 @@ async fn assert_agent_message_case(
         "agent-message turn emitted an unrelated tool completion: {:?}",
         turn.tool_completions
     );
-    assert_eq!(completions[0].success, !child_failed);
+    assert_eq!(completions[0].success(), !child_failed);
     if !child_failed {
         assert!(matches!(
-            &completions[0].tool_result,
+            &completions[0].tool_result(),
             ToolExecutionResult::TydeSendAgentMessage
         ));
         std::fs::write(&pair.child_release, b"release").expect("release messaged child");
@@ -37948,7 +37917,7 @@ async fn expect_native_spawn_terminal(
                     completions += 1;
                     assert_eq!(completions, 1);
                     assert_eq!(
-                        completion.success, expected_success,
+                        completion.success(), expected_success,
                         "wrong spawn terminal: {completion:?}"
                     );
                     observed_completion = Some(completion);
@@ -37960,12 +37929,9 @@ async fn expect_native_spawn_terminal(
             }
         }
         let completion = observed_completion.expect("native spawn completion");
-        let expected_status = if completion.success {
+        let expected_status = if completion.success() {
             protocol::SubAgentProgressStatus::Completed
-        } else if matches!(
-            &completion.tool_result,
-            ToolExecutionResult::Cancelled { .. }
-        ) {
+        } else if matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }) {
             protocol::SubAgentProgressStatus::Stopped
         } else {
             protocol::SubAgentProgressStatus::Failed
@@ -38158,10 +38124,7 @@ async fn assert_native_spawn_contract_cell(
                 )
                 .await;
                 assert!(
-                    matches!(
-                        completion.tool_result,
-                        ToolExecutionResult::Cancelled { .. }
-                    ),
+                    matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
                     "foreground spawn interrupt was not normalized as Cancelled: {completion:?}"
                 );
             } else {
@@ -38667,10 +38630,7 @@ async fn reach_pending_foreground_command(
                     if request_id.as_deref() == Some(progress.tool_call_id.as_str()) =>
                 {
                     assert!(
-                        !matches!(
-                            progress.update,
-                            protocol::ToolProgressUpdate::BackgroundTask(_)
-                        ),
+                        progress.execution_mode != protocol::ToolExecutionMode::Background,
                         "foreground command was reclassified as background work: {progress:?}"
                     );
                 }
@@ -38739,10 +38699,7 @@ async fn assert_foreground_command_remains_pending(
             }
             ChatEvent::ToolProgress(progress) if progress.tool_call_id == run.tool_call_id => {
                 assert!(
-                    !matches!(
-                        progress.update,
-                        protocol::ToolProgressUpdate::BackgroundTask(_)
-                    ),
+                    progress.execution_mode != protocol::ToolExecutionMode::Background,
                     "{context}: foreground command became background work: {progress:?}"
                 );
             }
@@ -38782,10 +38739,7 @@ async fn expect_one_foreground_command_terminal(
                 }
                 ChatEvent::ToolProgress(progress) if progress.tool_call_id == run.tool_call_id => {
                     assert!(
-                        !matches!(
-                            progress.update,
-                            protocol::ToolProgressUpdate::BackgroundTask(_)
-                        ),
+                        progress.execution_mode != protocol::ToolExecutionMode::Background,
                         "{context}: foreground command emitted background progress: {progress:?}"
                     );
                 }
@@ -38804,7 +38758,7 @@ async fn expect_one_foreground_command_terminal(
     .await
     .unwrap_or_else(|_| panic!("{context}: correlated foreground-command terminal did not arrive"));
     assert_eq!(
-        completion.success,
+        completion.success(),
         expected_exit == 0,
         "{context}: wrong success bit"
     );
@@ -38812,7 +38766,7 @@ async fn expect_one_foreground_command_terminal(
         exit_code,
         stdout,
         stderr,
-    } = &completion.tool_result
+    } = &completion.tool_result()
     else {
         panic!("{context}: foreground command returned wrong normalized result: {completion:?}")
     };
@@ -38882,10 +38836,7 @@ async fn expect_one_foreground_command_boundary_terminal(
                 }
                 ChatEvent::ToolProgress(progress) if progress.tool_call_id == run.tool_call_id => {
                     assert!(
-                        !matches!(
-                            progress.update,
-                            protocol::ToolProgressUpdate::BackgroundTask(_)
-                        ),
+                        progress.execution_mode != protocol::ToolExecutionMode::Background,
                         "{context}: foreground command became background work: {progress:?}"
                     );
                 }
@@ -39033,7 +38984,7 @@ async fn assert_foreground_command_contract_cell(
             )
             .await;
             assert!(
-                !completion.success,
+                !completion.success(),
                 "close reported pending foreground command success"
             );
             tokio::time::timeout(Duration::from_secs(120), async {
@@ -39225,7 +39176,7 @@ async fn assert_foreground_command_contract_cell(
             )
             .await;
             assert!(
-                !completion.success,
+                !completion.success(),
                 "host restart reported pending foreground command success"
             );
             fixture.restart_host().await;
@@ -39272,7 +39223,7 @@ async fn assert_foreground_command_contract_cell(
             )
             .await;
             assert!(
-                !completion.success,
+                !completion.success(),
                 "transport close reported pending foreground command success"
             );
         }
@@ -39375,7 +39326,7 @@ async fn reach_running_background_command(
     let roots = fixture.workspace_roots();
     let ready_prompt = match backend_kind {
         BackendKind::Claude => {
-            "This is an automated backend conformance handshake. Do not ask for context or use tools. Reply with exactly the literal token BACKGROUND_CONTRACT_PARENT_READY and nothing else."
+            "Before we begin a software engineering task, confirm you are ready. Do not use tools yet. Reply with exactly the single line BACKGROUND_CONTRACT_PARENT_READY and nothing else."
         }
         _ => "Reply exactly BACKGROUND_CONTRACT_PARENT_READY.",
     };
@@ -39485,8 +39436,7 @@ async fn reach_running_background_command(
                     }
                 }
                 ChatEvent::ToolProgress(progress) => {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
-                        && task.status == protocol::BackgroundTaskStatus::Running
+                    if background_task_progress(&progress.update).is_some()
                         && request_id.as_deref() == Some(progress.tool_call_id.as_str())
                     {
                         focal_event = true;
@@ -39529,7 +39479,7 @@ async fn reach_running_background_command(
             fixture,
             &stream,
             &ambient_ids,
-            expected_background_terminal_status(activity).unwrap(),
+            expected_background_outcome(activity).unwrap(),
             "background-command ambient work during acceptance",
         )
         .await;
@@ -39601,9 +39551,9 @@ async fn assert_background_command_contract_cell(
             )
             .await;
             let expected = if stimulus == ContractStimulus::ToolCompletes {
-                protocol::BackgroundTaskStatus::Completed
+                ExpectedBackgroundOutcome::Succeeded
             } else {
-                protocol::BackgroundTaskStatus::Failed
+                ExpectedBackgroundOutcome::Failed
             };
             wait_for_background_terminal_lifecycle(
                 fixture,
@@ -39656,7 +39606,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Completed,
+                ExpectedBackgroundOutcome::Succeeded,
                 "focal background command after interrupt",
             )
             .await;
@@ -39680,7 +39630,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Stopped,
+                ExpectedBackgroundOutcome::Cancelled,
                 "focal background command at close",
             )
             .await;
@@ -39745,7 +39695,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &lifecycle_stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Completed,
+                ExpectedBackgroundOutcome::Succeeded,
                 "focal background command after reconnect",
             )
             .await;
@@ -39789,7 +39739,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Completed,
+                ExpectedBackgroundOutcome::Succeeded,
                 "source background command after fork",
             )
             .await;
@@ -39810,7 +39760,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Stopped,
+                ExpectedBackgroundOutcome::Cancelled,
                 "focal background command at host restart",
             )
             .await;
@@ -39850,7 +39800,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Failed,
+                ExpectedBackgroundOutcome::Failed,
                 "focal background command at transport close",
             )
             .await;
@@ -39878,7 +39828,7 @@ async fn assert_background_command_contract_cell(
                 fixture,
                 &run.stream,
                 &focal_ids,
-                protocol::BackgroundTaskStatus::Completed,
+                ExpectedBackgroundOutcome::Succeeded,
                 "focal background command after timeout",
             )
             .await;
@@ -40088,11 +40038,11 @@ async fn finish_successful_agent_message_delivery(
     let completion =
         expect_correlated_tool_completion(fixture, parent_stream, tool_call_id, context).await;
     assert!(
-        completion.success,
+        completion.success(),
         "agent-message was rejected: {completion:?}"
     );
     assert!(matches!(
-        completion.tool_result,
+        completion.tool_result(),
         ToolExecutionResult::TydeSendAgentMessage
     ));
     std::fs::write(child_release, b"release").expect("release successfully messaged child");
@@ -40251,7 +40201,7 @@ async fn assert_agent_message_contract_cell(
                 "failed agent-message",
             )
             .await;
-            assert!(!completion.success, "message to failed child succeeded");
+            assert!(!completion.success(), "message to failed child succeeded");
         }
         ContractStimulus::Interrupt => {
             fixture
@@ -40275,12 +40225,9 @@ async fn assert_agent_message_contract_cell(
                 "interrupted agent-message",
             )
             .await;
-            assert!(!completion.success);
+            assert!(!completion.success());
             assert!(
-                matches!(
-                    completion.tool_result,
-                    ToolExecutionResult::Cancelled { .. }
-                ),
+                matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
                 "interrupted agent-message returned the wrong terminal result: {completion:?}"
             );
             fixture
@@ -40444,7 +40391,7 @@ async fn assert_agent_message_contract_cell(
             )
             .await;
             assert!(
-                !completion.success,
+                !completion.success(),
                 "host restart did not visibly fail the pending agent-message"
             );
             fixture
@@ -40539,7 +40486,7 @@ async fn assert_agent_message_contract_cell(
                 "transport-closed agent-message",
             )
             .await;
-            assert!(!completion.success);
+            assert!(!completion.success());
             fixture
                 .host
                 .hold_agent_message_delivery_for_conformance(false)
@@ -40834,7 +40781,7 @@ async fn reach_agent_await(
             fixture,
             &pair.parent_stream,
             &ambient_ids,
-            expected_background_terminal_status(activity).unwrap(),
+            expected_background_outcome(activity).unwrap(),
             "ambient work during await acceptance",
         )
         .await;
@@ -40992,12 +40939,10 @@ async fn expect_agent_await_completion(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if completion.tool_call_id == tool_call_id =>
                 {
-                    let expected_status = if completion.success {
+                    let expected_status = if completion.success() {
                         protocol::AgentControlProgressStatus::Completed
-                    } else if matches!(
-                        &completion.tool_result,
-                        ToolExecutionResult::Cancelled { .. }
-                    ) {
+                    } else if matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. })
+                    {
                         protocol::AgentControlProgressStatus::Stopped
                     } else {
                         protocol::AgentControlProgressStatus::Failed
@@ -41084,11 +41029,11 @@ fn assert_exact_agent_await_partition(
     expected_ready: &[(protocol::AgentId, protocol::AgentControlStatus)],
     expected_still_thinking: &[(protocol::AgentId, protocol::AgentControlStatus)],
 ) {
-    assert!(completion.success, "agent-await failed: {completion:?}");
+    assert!(completion.success(), "agent-await failed: {completion:?}");
     let ToolExecutionResult::TydeAwaitAgents {
         ready,
         still_thinking,
-    } = &completion.tool_result
+    } = &completion.tool_result()
     else {
         panic!("agent-await completion was not normalized: {completion:?}")
     };
@@ -41391,11 +41336,11 @@ async fn expect_rejected_agent_control_call(
                 ChatEvent::ToolExecutionCompleted(completion)
                     if request_id.as_ref() == Some(&completion.tool_call_id) =>
                 {
-                    assert!(!completion.success, "invalid call succeeded: {completion:?}");
+                    assert!(!completion.success(), "invalid call succeeded: {completion:?}");
                     let error = completion
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| format!("{:?}", completion.tool_result));
+                        .error()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{:?}", completion.tool_result()));
                     assert!(
                         error.to_ascii_lowercase().contains(expected_error_fragment),
                         "invalid call returned the wrong error: {completion:?}"
@@ -41556,7 +41501,7 @@ async fn expect_successful_agent_control_call(
         .find(|completion| completion.tool_call_id == request.tool_call_id)
         .expect("successful control request did not terminalize");
     assert!(
-        completion.success,
+        completion.success(),
         "successful {tool} failed: {completion:?}"
     );
     request.tool_call_id.clone()
@@ -42322,20 +42267,28 @@ fn normalized_turn_shape_prompt(backend_kind: BackendKind, shape: NormalizedTurn
         BackendKind::Claude => "Bash",
         BackendKind::Codex => "exec_command",
         BackendKind::Hermes => "terminal",
+        BackendKind::Tycode => "bash",
         _ => "the command tool",
     };
     match shape {
         NormalizedTurnShape::ReasoningBeforeText => {
             "Reason internally before answering, then reply exactly TURN_SHAPE_REASONED.".to_owned()
         }
+        NormalizedTurnShape::ToolOnly | NormalizedTurnShape::EmptyFinal
+            if matches!(backend_kind, BackendKind::Hermes | BackendKind::Tycode) =>
+        {
+            format!(
+                "Call {tool} exactly once to run `printf TURN_SHAPE_TOOL_ONLY`. After the command completes, do not call any tool again; reply exactly TURN_SHAPE_TOOL_DONE."
+            )
+        }
         NormalizedTurnShape::ToolOnly | NormalizedTurnShape::EmptyFinal => format!(
             "Call {tool} exactly once to run `printf TURN_SHAPE_TOOL_ONLY`. Do not emit any assistant text before or after the tool call; finish with an empty final response."
         ),
         NormalizedTurnShape::MultipleAssistantItems => format!(
-            "First emit assistant text exactly TURN_SHAPE_FIRST_é🙂. Then call {tool} to run `printf TURN_SHAPE_TOOL_ONE`, and after it completes call {tool} again to run `printf TURN_SHAPE_TOOL_TWO`. Preserve that declared order and use no other tools. After both complete emit a separate assistant item exactly TURN_SHAPE_SECOND."
+            "Perform this repository smoke-check workflow. First write the exact status line TURN_SHAPE_FIRST_é🙂. Then use {tool} to run `printf TURN_SHAPE_TOOL_ONE`. After that command reports success, use {tool} to run `printf TURN_SHAPE_TOOL_TWO`. Do not run the commands in parallel and use no other tools. Finally write the exact completion line TURN_SHAPE_SECOND."
         ),
         NormalizedTurnShape::PartialThenError => {
-            "Begin a long response with the exact text TURN_SHAPE_PARTIAL, then continue writing for at least 500 words.".to_owned()
+            "Without using tools, write a detailed incident-response runbook of at least 800 words for diagnosing a production service outage. Use TURN_SHAPE_PARTIAL as the exact first line, then begin the runbook on the next line.".to_owned()
         }
         NormalizedTurnShape::CloseBeforeOutput => {
             "Do not use tools. Reply exactly TURN_SHAPE_MUST_NOT_APPEAR.".to_owned()
@@ -42384,15 +42337,23 @@ fn assert_exact_assistant_tool_representation(events: &[ChatEvent], require_unic
     );
     let mut saw_unicode_owner = false;
     for ((content, tool), request) in represented.iter().zip(&requests) {
-        assert_eq!(tool.id, request.tool_call_id, "tool id was rewritten");
-        assert_eq!(tool.name, request.tool_name, "tool name was rewritten");
-        let ToolRequestType::RunCommand { command, .. } = &request.tool_type else {
-            panic!("tool representation probe emitted an unexpected request: {request:?}")
-        };
-        assert!(
-            json_contains_exact_string(&tool.arguments, command),
-            "assistant arguments did not preserve the exact normalized command: tool={tool:?} request={request:?}"
+        assert_eq!(
+            tool.tool_call_id, request.tool_call_id,
+            "tool id was rewritten"
         );
+        match &request.tool_type {
+            ToolRequestType::RunCommand { command, .. } => assert!(
+                json_contains_exact_string(&tool.arguments, command),
+                "assistant arguments did not preserve the exact normalized command: tool={tool:?} request={request:?}"
+            ),
+            ToolRequestType::Other { .. } => assert_eq!(
+                tool.arguments,
+                serde_json::to_value(&request.tool_type)
+                    .expect("opaque tool request must serialize"),
+                "assistant arguments did not preserve the complete opaque request: tool={tool:?} request={request:?}"
+            ),
+            _ => panic!("tool representation probe emitted an unexpected request: {request:?}"),
+        }
         let offset = tool
             .content_offset
             .expect("assistant tool representation omitted content_offset");
@@ -42928,30 +42889,32 @@ async fn assert_message_metadata_update_contract(backend_kind: BackendKind) {
 
 async fn assert_concurrent_message_metadata_isolation(backend_kind: BackendKind) {
     let mut fixture = RealBackendFixture::new(backend_kind).await;
-    let first = spawn_ready_image_stream(
+    let (first, first_ready_message_id) = spawn_ready_image_stream(
         &mut fixture,
         backend_kind,
         "metadata-isolation-first",
         "METADATA_FIRST_READY",
     )
     .await;
-    let second = spawn_ready_image_stream(
+    let (second, second_ready_message_id) = spawn_ready_image_stream(
         &mut fixture,
         backend_kind,
         "metadata-isolation-second",
         "METADATA_SECOND_READY",
     )
     .await;
-    let mut second_client = fixture.connect().await;
-    second_client.inherit_live_trace_from(&fixture.client);
     let first_prompt = "Do not use tools. Reply exactly METADATA_FIRST_FINAL.";
     let second_prompt = "Do not use tools. Reply exactly METADATA_SECOND_FINAL.";
-    let (first_send, second_send) = tokio::join!(
-        fixture.client.send_message(&first, first_prompt.to_owned()),
-        second_client.send_message(&second, second_prompt.to_owned()),
-    );
-    first_send.unwrap();
-    second_send.unwrap();
+    fixture
+        .client
+        .send_message(&first, first_prompt.to_owned())
+        .await
+        .unwrap();
+    fixture
+        .client
+        .send_message(&second, second_prompt.to_owned())
+        .await
+        .unwrap();
 
     let mut events = HashMap::<StreamPath, Vec<ChatEvent>>::from([
         (first.clone(), Vec::new()),
@@ -42995,9 +42958,19 @@ async fn assert_concurrent_message_metadata_isolation(backend_kind: BackendKind)
         }
     }
 
-    for (stream, prompt, marker) in [
-        (&first, first_prompt, "METADATA_FIRST_FINAL"),
-        (&second, second_prompt, "METADATA_SECOND_FINAL"),
+    for (stream, prompt, marker, ready_message_id) in [
+        (
+            &first,
+            first_prompt,
+            "METADATA_FIRST_FINAL",
+            &first_ready_message_id,
+        ),
+        (
+            &second,
+            second_prompt,
+            "METADATA_SECOND_FINAL",
+            &second_ready_message_id,
+        ),
     ] {
         let stream_events = &events[stream];
         assert!(stream_events.iter().any(|event| matches!(
@@ -43040,8 +43013,15 @@ async fn assert_concurrent_message_metadata_isolation(backend_kind: BackendKind)
         assert!(
             updates
                 .iter()
-                .all(|update| &update.message_id == message_id),
+                .all(|update| &update.message_id == message_id
+                    || &update.message_id == ready_message_id),
             "concurrent foreign-stream metadata crossed ownership: {stream_events:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|update| &update.message_id == message_id),
+            "concurrent final response received no metadata update: {stream_events:?}"
         );
     }
     let first_id = events[&first]
@@ -43390,18 +43370,13 @@ async fn assert_plain_termination_cell(
                 );
             }
         }
-        let completed_message_id = completed[0]
-            .message
-            .message_id
-            .as_ref()
-            .expect("surviving plain turn completion omitted message identity");
         assert_eq!(
             complete_trace
                 .iter()
-                .filter(|event| matches!(event, ChatEvent::StreamStart(start) if start.message_id.as_deref() == Some(completed_message_id.0.as_str())))
+                .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
                 .count(),
             1,
-            "surviving plain turn did not retain exactly one correlated StreamStart"
+            "surviving plain turn did not retain exactly one response start"
         );
         let streamed = complete_trace
             .iter()
@@ -43624,7 +43599,7 @@ async fn assert_agent_await_case(
             let completion =
                 expect_agent_await_completion(fixture, &pair.parent_stream, &tool_call_id).await;
             assert!(
-                completion.success,
+                completion.success(),
                 "await should successfully report child failure"
             );
             assert_exact_agent_await_partition(
@@ -43650,12 +43625,9 @@ async fn assert_agent_await_case(
             .await;
             let completion =
                 expect_agent_await_completion(fixture, &pair.parent_stream, &tool_call_id).await;
-            assert!(!completion.success);
+            assert!(!completion.success());
             assert!(
-                matches!(
-                    &completion.tool_result,
-                    ToolExecutionResult::Cancelled { .. }
-                ),
+                matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
                 "interrupted await returned the wrong terminal result: {completion:?}"
             );
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -43806,7 +43778,7 @@ async fn assert_agent_await_case(
                 expect_agent_await_completion(fixture, &pair.parent_stream, &tool_call_id).await;
             eprintln!("AGENT AWAIT FAILURE COMPLETION {completion:?}");
             assert!(
-                !completion.success,
+                !completion.success(),
                 "host restart did not visibly fail the pending await: {completion:?}"
             );
             fixture.restart_host().await;
@@ -43947,7 +43919,7 @@ async fn assert_agent_await_case(
             .await;
             let completion =
                 expect_agent_await_completion(fixture, &pair.parent_stream, &tool_call_id).await;
-            assert!(!completion.success);
+            assert!(!completion.success());
             std::fs::write(&pair.child_release, b"release")
                 .expect("release child after parent exit");
         }
@@ -45584,8 +45556,7 @@ async fn run_certification_case_for_backend(
                 .tool_requests
                 .iter()
                 .filter(|request| {
-                    request
-                        .tool_name
+                    turn.tool_name(&request.tool_call_id)
                         .to_ascii_lowercase()
                         .contains("narrow_probe")
                 })
@@ -45619,18 +45590,20 @@ async fn run_certification_case_for_backend(
                 }
                 CertificationCase::McpCompletionSuccessful => {
                     assert_eq!(completions.len(), 1);
-                    assert!(completions[0].success);
-                    assert!(completions[0].error.is_none());
-                    assert!(completions[0].normalization_failure.is_none());
+                    assert!(completions[0].success());
+                    assert!(completions[0].error().is_none());
+                    assert!(completions[0].normalization_failure().is_none());
                 }
                 CertificationCase::McpToolNamesCorrelate => {
                     assert_eq!(requests.len(), 1);
                     assert_eq!(completions.len(), 1);
-                    assert_eq!(requests[0].tool_name, completions[0].tool_name);
+                    assert_eq!(requests[0].tool_call_id, completions[0].tool_call_id);
+                    assert!(!turn.tool_name(&requests[0].tool_call_id).is_empty());
                 }
                 CertificationCase::McpCanonicalResultPreserved => {
                     assert_eq!(completions.len(), 1);
-                    let ToolExecutionResult::Other { result } = &completions[0].tool_result else {
+                    let ToolExecutionResult::Other { result } = &completions[0].tool_result()
+                    else {
                         panic!(
                             "generic MCP completion was not canonical Other: {:?}",
                             completions[0]
@@ -46291,7 +46264,7 @@ fn assert_completed_native_projection_replay(
                 if completion.tool_call_id == tool_call_id =>
             {
                 assert!(
-                    completion.success,
+                    completion.success(),
                     "{context} replayed child completion as failure"
                 );
                 completion_positions.push(position);
@@ -46499,7 +46472,7 @@ async fn completed_native_projection_run(backend_kind: BackendKind) -> NativePro
                 {
                     completion_count += 1;
                     assert_eq!(completion_count, 1, "duplicate native spawn completion");
-                    assert!(completion.success, "native child failed: {completion:?}");
+                    assert!(completion.success(), "native child failed: {completion:?}");
                     completion_position = Some(position);
                 }
                 ChatEvent::StreamEnd(end) if end.message.content.contains("SUBAGENT_OK") => {
@@ -46882,7 +46855,6 @@ async fn assert_background_completion_lifecycle(
     let mut initial_turn_count = 0usize;
     let mut saw_launched = false;
     let mut saw_initial_idle = false;
-    let mut terminal_progress_count = 0usize;
     let mut completion_count = 0usize;
     let mut saw_resumed_typing = false;
     let mut resumed_turn_count = 0usize;
@@ -46932,22 +46904,18 @@ async fn assert_background_completion_lifecycle(
                     "{backend_kind:?} background lifecycle issued an unexpected tool request: {request:?}"
                 ),
                 ChatEvent::StreamEnd(end) => {
-                    if terminal_progress_count == 0
-                        && end.message.content.contains(LAUNCHED)
-                    {
+                    if completion_count == 0 && end.message.content.contains(LAUNCHED) {
                         initial_turn_count += 1;
                         assert_eq!(initial_turn_count, 1, "duplicate initial launch turn");
                         saw_launched = true;
-                    } else if terminal_progress_count == 1
-                        && end.message.content.contains(RESUMED)
-                    {
+                    } else if completion_count == 1 && end.message.content.contains(RESUMED) {
                         resumed_turn_count += 1;
                         assert_eq!(resumed_turn_count, 1, "duplicate resumed turn");
                         saw_resumed_result = true;
                     }
                 }
                 ChatEvent::ToolProgress(progress) => {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                    let Some(_task) = background_task_progress(&progress.update) else {
                         continue;
                     };
                     assert_eq!(
@@ -46955,40 +46923,21 @@ async fn assert_background_completion_lifecycle(
                         Some(progress.tool_call_id.as_str()),
                         "{backend_kind:?} background lifecycle was not correlated to its command request"
                     );
-                    match task.status {
-                        protocol::BackgroundTaskStatus::Running => {
-                            assert_eq!(
-                                terminal_progress_count, 0,
-                                "{backend_kind:?} background progress regressed to Running"
-                            );
-                            assert!(
-                                background_tool_call_id
-                                    .as_ref()
-                                    .is_none_or(|known| known == &progress.tool_call_id),
-                                "{backend_kind:?} changed background tool identity"
-                            );
-                            background_tool_call_id = Some(progress.tool_call_id);
-                        }
-                        protocol::BackgroundTaskStatus::Completed => {
-                            assert_eq!(
-                                background_tool_call_id.as_deref(),
-                                Some(progress.tool_call_id.as_str()),
-                                "{backend_kind:?} terminal progress used a different tool identity"
-                            );
-                            assert!(
-                                saw_initial_idle,
-                                "{backend_kind:?} kept the initial foreground turn active until background completion"
-                            );
-                            terminal_progress_count += 1;
-                            assert_eq!(
-                                terminal_progress_count, 1,
-                                "{backend_kind:?} emitted duplicate terminal background progress"
-                            );
-                        }
-                        status => panic!(
-                            "{backend_kind:?} background command did not complete successfully: {status:?}"
-                        ),
-                    }
+                    assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background
+                    );
+                    assert_eq!(
+                        completion_count, 0,
+                        "{backend_kind:?} emitted progress after completion"
+                    );
+                    assert!(
+                        background_tool_call_id
+                            .as_ref()
+                            .is_none_or(|known| known == &progress.tool_call_id),
+                        "{backend_kind:?} changed background tool identity"
+                    );
+                    background_tool_call_id = Some(progress.tool_call_id);
                 }
                 ChatEvent::ToolExecutionCompleted(completion)
                     if background_tool_call_id.as_deref()
@@ -46998,10 +46947,10 @@ async fn assert_background_completion_lifecycle(
                         saw_initial_idle,
                         "{backend_kind:?} completed background work before initial idle"
                     );
-                    assert!(completion.success, "background command failed: {completion:?}");
+                    assert!(completion.success(), "background command failed: {completion:?}");
                     let ToolExecutionResult::RunCommand {
                         exit_code, stdout, ..
-                    } = &completion.tool_result
+                    } = &completion.tool_result()
                     else {
                         panic!("background command returned a non-command result: {completion:?}")
                     };
@@ -47017,7 +46966,7 @@ async fn assert_background_completion_lifecycle(
                     "{backend_kind:?} background lifecycle completed an unrequested tool: {completion:?}"
                 ),
                 ChatEvent::TypingStatusChanged(false)
-                    if background_tool_call_id.is_some() && terminal_progress_count == 0 =>
+                    if background_tool_call_id.is_some() && completion_count == 0 =>
                 {
                     assert!(
                         saw_launched && initial_turn_count == 1,
@@ -47025,7 +46974,7 @@ async fn assert_background_completion_lifecycle(
                     );
                     saw_initial_idle = true;
                 }
-                ChatEvent::TypingStatusChanged(true) if terminal_progress_count == 1 => {
+                ChatEvent::TypingStatusChanged(true) if completion_count == 1 => {
                     saw_resumed_typing = true;
                 }
                 ChatEvent::TypingStatusChanged(false)
@@ -47038,7 +46987,6 @@ async fn assert_background_completion_lifecycle(
                     break;
                 }
                 _ if !require_agent_initiated_turn
-                    && terminal_progress_count == 1
                     && completion_count == 1 =>
                 {
                     break;
@@ -47064,7 +47012,6 @@ async fn assert_background_completion_lifecycle(
     assert_eq!(initial_turn_count, 1);
     assert!(saw_launched);
     assert!(saw_initial_idle);
-    assert_eq!(terminal_progress_count, 1);
     assert_eq!(completion_count, 1);
     if require_agent_initiated_turn {
         assert!(saw_resumed_typing);
@@ -47111,7 +47058,6 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
 
     let mut command_tool_call_id = None;
     let mut background_tool_call_id = None;
-    let mut terminal_count = 0usize;
     let mut completions = HashMap::<String, (usize, bool)>::new();
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -47153,7 +47099,7 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
                     ),
                 },
                 ChatEvent::ToolProgress(progress) => {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                    let Some(task) = background_task_progress(&progress.update) else {
                         continue;
                     };
                     assert_eq!(
@@ -47161,42 +47107,27 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
                         Some(progress.tool_call_id.as_str()),
                         "{backend_kind:?} background tray progress was not correlated to its command"
                     );
-                    match task.status {
-                        protocol::BackgroundTaskStatus::Running => {
-                            assert_eq!(
-                                terminal_count, 0,
-                                "{backend_kind:?} regressed terminal background progress to Running"
-                            );
-                            assert!(
-                                task.description
-                                    .as_deref()
-                                    .is_some_and(|description| description.contains(DONE)),
-                                "{backend_kind:?} reported unrelated background work: {task:?}"
-                            );
-                            assert!(
-                                background_tool_call_id
-                                    .as_ref()
-                                    .is_none_or(|known| known == &progress.tool_call_id),
-                                "{backend_kind:?} changed background tool identity"
-                            );
-                            background_tool_call_id = Some(progress.tool_call_id);
-                        }
-                        protocol::BackgroundTaskStatus::Completed => {
-                            assert_eq!(
-                                background_tool_call_id.as_deref(),
-                                Some(progress.tool_call_id.as_str()),
-                                "{backend_kind:?} completed a background task without retiring the running tray entry"
-                            );
-                            terminal_count += 1;
-                            assert_eq!(
-                                terminal_count, 1,
-                                "{backend_kind:?} emitted duplicate terminal background progress"
-                            );
-                        }
-                        status => panic!(
-                            "{backend_kind:?} background task ended with {status:?} instead of Completed"
-                        ),
-                    }
+                    assert_eq!(
+                        progress.execution_mode,
+                        protocol::ToolExecutionMode::Background
+                    );
+                    assert!(
+                        task.description
+                            .as_deref()
+                            .is_some_and(|description| description.contains(DONE)),
+                        "{backend_kind:?} reported unrelated background work: {task:?}"
+                    );
+                    assert!(
+                        background_tool_call_id
+                            .as_ref()
+                            .is_none_or(|known| known == &progress.tool_call_id),
+                        "{backend_kind:?} changed background tool identity"
+                    );
+                    assert!(
+                        !completions.contains_key(&progress.tool_call_id),
+                        "{backend_kind:?} emitted progress after completion"
+                    );
+                    background_tool_call_id = Some(progress.tool_call_id);
                 }
                 ChatEvent::ToolExecutionCompleted(completion) => {
                     assert_eq!(
@@ -47206,9 +47137,9 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
                     );
                     let (count, success) = completions
                         .entry(completion.tool_call_id.clone())
-                        .or_insert((0, completion.success));
+                        .or_insert((0, completion.success()));
                     *count += 1;
-                    *success &= completion.success;
+                    *success &= completion.success();
                     assert_eq!(
                         *count, 1,
                         "{backend_kind:?} completed one background command more than once"
@@ -47217,15 +47148,14 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
                         == Some(completion.tool_call_id.as_str())
                     {
                         assert!(
-                            completion.success,
+                            completion.success(),
                             "{backend_kind:?} reported successful terminal progress but failed its tool: {completion:?}"
                         );
                     }
                 }
                 _ => {}
             }
-            if terminal_count == 1
-                && background_tool_call_id.as_ref().is_some_and(|tool_call_id| {
+            if background_tool_call_id.as_ref().is_some_and(|tool_call_id| {
                         completions.get(tool_call_id).map(|value| value.0) == Some(1)
                 })
             {
@@ -47236,7 +47166,7 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "{backend_kind:?} never emitted terminal progress to retire its running background tray entry: tool_call_id={background_tool_call_id:?}"
+            "{backend_kind:?} never completed the running background tray entry: tool_call_id={background_tool_call_id:?}"
         )
     });
 
@@ -47248,7 +47178,6 @@ async fn assert_background_completion_retires_tray_entry(backend_kind: BackendKi
         background_tool_call_id.is_some(),
         "{backend_kind:?} never reported the command as background work"
     );
-    assert_eq!(terminal_count, 1);
     assert_eq!(
         completions
             .get(background_tool_call_id.as_ref().unwrap())
@@ -47339,9 +47268,7 @@ async fn assert_background_work_is_not_supervisor_stalled(backend_kind: BackendK
                 .expect("parse background supervisor event")
             {
                 ChatEvent::ToolProgress(progress) => {
-                    if let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update
-                        && task.status == protocol::BackgroundTaskStatus::Running
-                    {
+                    if background_task_progress(&progress.update).is_some() {
                         running_tools.insert(progress.tool_call_id);
                     }
                 }
@@ -47420,10 +47347,7 @@ async fn assert_background_work_is_not_supervisor_stalled(backend_kind: BackendK
                 ChatEvent::ToolProgress(progress)
                     if running_tools.contains(&progress.tool_call_id) =>
                 {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
-                        continue;
-                    };
-                    assert_eq!(task.status, protocol::BackgroundTaskStatus::Running);
+                    assert!(background_task_progress(&progress.update).is_some());
                 }
                 _ => {}
             }
@@ -47482,14 +47406,10 @@ async fn assert_background_work_allows_foreground_idle(backend_kind: BackendKind
                 .expect("parse background idle event")
             {
                 ChatEvent::ToolProgress(progress) => {
-                    let protocol::ToolProgressUpdate::BackgroundTask(task) = progress.update else {
+                    let Some(_task) = background_task_progress(&progress.update) else {
                         continue;
                     };
-                    if task.status == protocol::BackgroundTaskStatus::Running {
-                        running_tool = Some(progress.tool_call_id);
-                    } else if running_tool.as_deref() == Some(progress.tool_call_id.as_str()) {
-                        panic!("{backend_kind:?} background command terminated before foreground idle: {task:?}");
-                    }
+                    running_tool = Some(progress.tool_call_id);
                 }
                 ChatEvent::StreamEnd(end)
                     if end.message.content.contains("BACKGROUND_IDLE_READY") =>
@@ -48057,11 +47977,12 @@ fn normalized_tool_metadata_for_path(
     );
     let completion = completions[0];
     assert!(
-        completion.success,
+        completion.success(),
         "{context} read tool failed: {completion:?}"
     );
     assert_eq!(
-        completion.normalization_failure, None,
+        completion.normalization_failure(),
+        None,
         "{context} did not produce fully normalized tool metadata"
     );
     NormalizedToolMetadata {

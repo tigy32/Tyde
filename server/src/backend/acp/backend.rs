@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use protocol::{
-    ChatMessageId, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
-    StreamIdentityViolation, TokenUsageUnavailableReason,
+    ChatMessageId, ContextBreakdown, ImageData, MessageTokenUsage, ModelInfo, ReasoningData,
+    TokenUsage, TokenUsageUnavailableReason, ToolExecutionOutcome, ToolExecutionResult,
+    ToolRequestType, ToolUseData,
 };
 
 use crate::acp::adapter::{
@@ -24,7 +24,7 @@ use crate::acp::{
     extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
-    AgentName, RetryAttemptPayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+    AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
 use crate::backend::{
     BackendStartupError, SessionCommand, StartupMcpServer, backend_fork_unsupported_message,
@@ -550,8 +550,7 @@ impl KiroSession {
                 model: initial_model,
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
-                active_message_id: None,
-                idless_message_ordinal: 0,
+                active_response: None,
                 active_stream_text: String::new(),
                 active_stream_tool_calls: Vec::new(),
                 active_tool_contexts: HashMap::new(),
@@ -562,8 +561,6 @@ impl KiroSession {
                 provider_turn_quarantined: false,
                 replaying_history: false,
                 replay_session_id: None,
-                replay_next_event_ordinal: 0,
-                replay_assistant_message_count: 0,
                 replay_assistant_identity: None,
                 replay_assistant_text: String::new(),
                 replay_assistant_reasoning: String::new(),
@@ -609,13 +606,9 @@ struct KiroState {
     model: Option<String>,
     mode: Option<String>,
     known_models: Vec<Value>,
-    active_message_id: Option<ChatMessageId>,
-    /// Counts the assistant messages this session has had to name itself,
-    /// because the agent supplied no `messageId`. Monotonic for the life of the
-    /// session and never reused, so two id-less messages never collide.
-    idless_message_ordinal: u64,
+    active_response: Option<ResponseHandle>,
     active_stream_text: String,
-    active_stream_tool_calls: Vec<Value>,
+    active_stream_tool_calls: Vec<ToolUseData>,
     active_tool_contexts: HashMap<String, KiroToolContext>,
     tool_call_aliases: HashMap<String, String>,
     /// Canonical ids whose call already reached a terminal completion.
@@ -631,8 +624,6 @@ struct KiroState {
     provider_turn_quarantined: bool,
     replaying_history: bool,
     replay_session_id: Option<String>,
-    replay_next_event_ordinal: u64,
-    replay_assistant_message_count: u64,
     replay_assistant_identity: Option<KiroReplayMessageIdentity>,
     replay_assistant_text: String,
     replay_assistant_reasoning: String,
@@ -640,134 +631,14 @@ struct KiroState {
     replay_error: Option<String>,
 }
 
-/// Derives the `stream_epoch` used to name assistant messages from an agent
-/// that sends no `messageId`. Keyed on the ACP session so ids from different
-/// sessions cannot collide, and pure so the same session always derives the
-/// same epoch.
-fn idless_stream_epoch(session_id: &str) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(b"tyde:acp:idless-live-stream:v1");
-    hasher.update([0]);
-    hasher.update(session_id.as_bytes());
-    let digest = hasher.finalize();
-    u64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("SHA-256 digest has at least eight bytes"),
-    )
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KiroReplayMessageIdentity {
-    message_id: ChatMessageId,
-    origin: KiroReplayIdentityOrigin,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum KiroReplayIdentityOrigin {
-    Provider,
-    LegacyMigration {
-        session_id: String,
-        event_ordinal: u64,
-        first_event: KiroLegacyReplayEventKind,
-        identity: ServerGeneratedChatMessageIdentity,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KiroLegacyReplayEventKind {
-    Reasoning,
-    Text,
-    ToolCall,
-}
-
-impl KiroLegacyReplayEventKind {
-    fn tag(self) -> &'static str {
-        match self {
-            Self::Reasoning => "reasoning",
-            Self::Text => "text",
-            Self::ToolCall => "tool_call",
-        }
-    }
-
-    fn ordinal(self) -> u64 {
-        match self {
-            Self::Reasoning => 0,
-            Self::Text => 1,
-            Self::ToolCall => 2,
-        }
-    }
+    message_id: Option<ChatMessageId>,
 }
 
 impl KiroReplayMessageIdentity {
-    fn provider(message_id: ChatMessageId) -> Self {
-        Self {
-            message_id,
-            origin: KiroReplayIdentityOrigin::Provider,
-        }
-    }
-
-    fn legacy_migration(
-        session_id: String,
-        event_ordinal: u64,
-        first_event: KiroLegacyReplayEventKind,
-    ) -> Result<Self, String> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tyde:kiro:legacy-replay:v1");
-        hasher.update([0]);
-        hasher.update(session_id.as_bytes());
-        let digest = hasher.finalize();
-        let stream_epoch = u64::from_be_bytes(
-            digest[..8]
-                .try_into()
-                .expect("SHA-256 digest has at least eight bytes"),
-        );
-        let item_ordinal = event_ordinal
-            .checked_mul(3)
-            .and_then(|ordinal| ordinal.checked_add(first_event.ordinal()))
-            .ok_or_else(|| {
-                "Kiro legacy replay item ordinal exceeded its supported range".to_string()
-            })?;
-        let identity = ServerGeneratedChatMessageIdentity {
-            origin: ServerGeneratedChatMessageIdOrigin::LegacyReplay,
-            stream_epoch,
-            item_ordinal,
-        };
-
-        Ok(Self {
-            message_id: identity.message_id(),
-            origin: KiroReplayIdentityOrigin::LegacyMigration {
-                session_id,
-                event_ordinal,
-                first_event,
-                identity,
-            },
-        })
-    }
-
-    fn origin_label(&self) -> &'static str {
-        match &self.origin {
-            KiroReplayIdentityOrigin::Provider => "provider",
-            KiroReplayIdentityOrigin::LegacyMigration { .. } => "legacy_migration",
-        }
-    }
-}
-
-impl KiroState {
-    fn new_replay_message_identity(
-        &mut self,
-        provider_message_id: Option<ChatMessageId>,
-        first_event: KiroLegacyReplayEventKind,
-        event_ordinal: u64,
-    ) -> Result<KiroReplayMessageIdentity, String> {
-        if let Some(message_id) = provider_message_id {
-            return Ok(KiroReplayMessageIdentity::provider(message_id));
-        }
-
-        let session_id = self.replay_session_id.clone().ok_or_else(|| {
-            "Kiro legacy replay identity unavailable outside session/load".to_string()
-        })?;
-        KiroReplayMessageIdentity::legacy_migration(session_id, event_ordinal, first_event)
+    fn new(message_id: Option<ChatMessageId>) -> Self {
+        Self { message_id }
     }
 }
 
@@ -913,12 +784,21 @@ impl KiroInner {
                             return Ok(());
                         }
                         drop(state);
-                        self.emitter.typing_status_changed(false);
+                        if !self.shutting_down.load(Ordering::Acquire) {
+                            self.abort_active_turn(&format!("Kiro request failed: {err}"))
+                                .await;
+                        }
                         return Err(err);
                     }
                 };
 
-                self.bridge.sync_inbound().await?;
+                if let Err(err) = self.bridge.sync_inbound().await {
+                    if !self.shutting_down.load(Ordering::Acquire) {
+                        self.abort_active_turn(&format!("Kiro response stream failed: {err}"))
+                            .await;
+                    }
+                    return Err(err);
+                }
 
                 if self.state.lock().await.provider_turn_quarantined {
                     return Ok(());
@@ -945,8 +825,6 @@ impl KiroInner {
                     .to_ascii_lowercase();
 
                 if stop_reason == "cancelled" {
-                    self.force_finalize_active_stream_if_any(Some(response.clone()), true)
-                        .await;
                     // If the user initiated the cancel, `CancelConversation` already
                     // fired OperationCancelled + TypingStatusChanged — don't double-emit.
                     let user_initiated = {
@@ -956,7 +834,7 @@ impl KiroInner {
                         was
                     };
                     if !user_initiated {
-                        self.emitter.operation_cancelled("Operation cancelled");
+                        self.abort_active_turn("Operation cancelled").await;
                     }
                     return Ok(());
                 }
@@ -969,8 +847,7 @@ impl KiroInner {
                         .or_else(|| response.get("message").and_then(Value::as_str))
                         .unwrap_or("Kiro prompt failed")
                         .to_string();
-                    self.force_finalize_active_stream_if_any(Some(response.clone()), true)
-                        .await;
+                    self.abort_active_turn(&message).await;
                     self.emitter.backend_error(&message);
                     return Ok(());
                 }
@@ -984,12 +861,12 @@ impl KiroInner {
                 state.cancelled = true;
                 let session_id = state.session_id.clone();
                 drop(state);
-                self.bridge
+                let result = self
+                    .bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
-                    .await?;
-                self.force_finalize_active_stream_if_any(None, true).await;
-                self.emitter.operation_cancelled("Operation cancelled");
-                Ok(())
+                    .await;
+                self.abort_active_turn("Operation cancelled").await;
+                result
             }
             SessionCommand::GetSettings => {
                 let state = self.state.lock().await;
@@ -1196,9 +1073,6 @@ impl KiroInner {
             state.replaying_history = true;
             state.provider_turn_quarantined = false;
             state.replay_session_id = Some(session_id.clone());
-            state.replay_next_event_ordinal = 0;
-            state.replay_assistant_message_count = 0;
-            state.idless_message_ordinal = 0;
             state.replay_assistant_identity = None;
             state.replay_assistant_text.clear();
             state.replay_assistant_reasoning.clear();
@@ -1296,15 +1170,6 @@ impl KiroInner {
                 ));
             }
             state.session_id = session_id;
-            state.idless_message_ordinal = state
-                .idless_message_ordinal
-                .max(state.replay_assistant_message_count);
-            tracing::debug!(
-                session_id = %state.session_id,
-                replay_assistant_message_count = state.replay_assistant_message_count,
-                next_idless_message_ordinal = state.idless_message_ordinal,
-                "Seeded ACP idless live-message identity after replay"
-            );
             if let Some(model) = extract_current_model(&response) {
                 state.model = Some(model);
             }
@@ -1581,114 +1446,48 @@ impl KiroInner {
             return;
         }
 
-        let provider_message_id = extract_kiro_chat_message_id(params);
         if self.state.lock().await.replaying_history {
-            self.append_replay_assistant_chunk(
-                provider_message_id,
-                KiroLegacyReplayEventKind::Reasoning,
-                &delta,
-                true,
-            )
-            .await;
-            return;
-        }
-
-        let message_id = self
-            .resolve_live_message_id(
-                provider_message_id,
-                ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
-            )
-            .await;
-
-        let (started, model, foreign_message_id) = {
-            let mut state = self.state.lock().await;
-            if state.replaying_history {
-                return;
-            }
-
-            if let Some(active_id) = state.active_message_id.as_ref()
-                && active_id != &message_id
-            {
-                (false, String::new(), Some(message_id.clone()))
-            } else {
-                let started = state.active_message_id.is_none();
-                if started {
-                    state.active_message_id = Some(message_id.clone());
-                    state.active_stream_text.clear();
-                    state.active_stream_tool_calls.clear();
-                }
-                (
-                    started,
-                    state.model.clone().unwrap_or_else(|| "kiro".to_string()),
-                    None,
-                )
-            }
-        };
-
-        if let Some(foreign_message_id) = foreign_message_id {
-            self.reject_foreign_stream_message_id(&foreign_message_id)
+            self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), &delta, true)
                 .await;
             return;
         }
 
-        if started {
-            self.emitter.typing_status_changed(true);
-            self.emitter.stream_start_with_id(
-                message_id.clone(),
-                AgentName(KIRO_AGENT_NAME),
-                Some(&model),
-            );
-            if !self.emitter.is_stream_open() {
-                self.clear_active_stream().await;
-                self.emitter.typing_status_changed(false);
+        let response = {
+            let mut state = self.state.lock().await;
+            if state.replaying_history {
                 return;
             }
-        }
-
-        self.emitter
-            .stream_reasoning_delta_with_id(message_id, &delta);
+            let started = state.active_response.is_none();
+            let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+            if started {
+                self.emitter.typing_status_changed(true);
+                let response = self.emitter.stream_start(Some(&model));
+                state.active_response = Some(response);
+                state.active_stream_text.clear();
+                state.active_stream_tool_calls.clear();
+            }
+            state.active_response.clone().expect("response just opened")
+        };
+        self.emitter.stream_reasoning_delta(&response, &delta);
     }
 
     async fn append_replay_assistant_chunk(
         &self,
         provider_message_id: Option<ChatMessageId>,
-        first_event: KiroLegacyReplayEventKind,
         delta: &str,
         reasoning: bool,
     ) {
         let previous = {
             let mut state = self.state.lock().await;
-            let event_ordinal = state.replay_next_event_ordinal;
-            let Some(next_event_ordinal) = event_ordinal.checked_add(1) else {
-                state.replay_error = Some(
-                    "Kiro legacy replay event ordinal exceeded its supported range".to_string(),
-                );
-                return;
-            };
-            state.replay_next_event_ordinal = next_event_ordinal;
             let active_identity = state.replay_assistant_identity.clone();
             let identity = match active_identity {
                 Some(active)
                     if provider_message_id.is_none()
-                        || provider_message_id.as_ref() == Some(&active.message_id) =>
+                        || provider_message_id == active.message_id =>
                 {
                     active
                 }
-                _ => match state.new_replay_message_identity(
-                    provider_message_id,
-                    first_event,
-                    event_ordinal,
-                ) {
-                    Ok(identity) => {
-                        state.replay_assistant_message_count =
-                            state.replay_assistant_message_count.saturating_add(1);
-                        identity
-                    }
-                    Err(error) => {
-                        state.replay_error = Some(error);
-                        return;
-                    }
-                },
+                _ => KiroReplayMessageIdentity::new(provider_message_id),
             };
 
             let previous = if state
@@ -1731,127 +1530,32 @@ impl KiroInner {
             return;
         }
 
-        let chunk_message_id = extract_kiro_chat_message_id(params);
         if self.state.lock().await.replaying_history {
-            self.append_replay_assistant_chunk(
-                chunk_message_id,
-                KiroLegacyReplayEventKind::Text,
-                &delta,
-                false,
-            )
-            .await;
+            self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), &delta, false)
+                .await;
             return;
         }
 
         if !has_renderable_stream_text(&delta) {
-            let has_active_stream = self.state.lock().await.active_message_id.is_some();
+            let has_active_stream = self.state.lock().await.active_response.is_some();
             if !has_active_stream {
                 return;
             }
         }
 
-        let chunk_message_id = self
-            .resolve_live_message_id(
-                chunk_message_id,
-                ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
-            )
-            .await;
-
-        let (started, model, foreign_message_id) = {
+        let response = {
             let mut state = self.state.lock().await;
-            if let Some(active_id) = state.active_message_id.as_ref()
-                && active_id != &chunk_message_id
-            {
-                (false, String::new(), Some(chunk_message_id.clone()))
-            } else {
-                let started = state.active_message_id.is_none();
-                if started {
-                    state.active_message_id = Some(chunk_message_id.clone());
-                    state.active_stream_text.clear();
-                    state.active_stream_tool_calls.clear();
-                }
-                state.active_stream_text.push_str(&delta);
-                (
-                    started,
-                    state.model.clone().unwrap_or_else(|| "kiro".to_string()),
-                    None,
-                )
+            if state.active_response.is_none() {
+                let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+                self.emitter.typing_status_changed(true);
+                state.active_response = Some(self.emitter.stream_start(Some(&model)));
+                state.active_stream_text.clear();
+                state.active_stream_tool_calls.clear();
             }
+            state.active_stream_text.push_str(&delta);
+            state.active_response.clone().expect("response just opened")
         };
-
-        if let Some(foreign_message_id) = foreign_message_id {
-            self.reject_foreign_stream_message_id(&foreign_message_id)
-                .await;
-            return;
-        }
-
-        if started {
-            self.emitter.typing_status_changed(true);
-            self.emitter.stream_start_with_id(
-                chunk_message_id.clone(),
-                AgentName(KIRO_AGENT_NAME),
-                Some(&model),
-            );
-            if !self.emitter.is_stream_open() {
-                self.clear_active_stream().await;
-                self.emitter.typing_status_changed(false);
-                return;
-            }
-        }
-
-        self.emitter.stream_delta_with_id(chunk_message_id, &delta);
-    }
-
-    /// Resolves the assistant-message identity for an inbound live update.
-    ///
-    /// `messageId` is **optional** in ACP — the field carries an explicit
-    /// "UNSTABLE — not part of the spec yet" marker in the schema — so a fully
-    /// conforming agent may never send one. Kiro 2.15.1 and hermes-agent both
-    /// omit it on every chunk. Requiring it therefore did not detect a
-    /// misbehaving agent; it silently discarded the entire visible response of
-    /// well-behaved ones.
-    ///
-    /// The contract the identity check protects is: *chunks carrying the same
-    /// id belong to one message, and a different id starts a different
-    /// message.* An agent that never sends ids makes no such distinction, so
-    /// its stream has exactly one message in flight at a time — which is what
-    /// this resolves to. The first id-less update of a message names it; every
-    /// later id-less update joins the open message. Agents that do send ids
-    /// take the explicit branch and are wholly unaffected, foreign-id
-    /// rejection included.
-    ///
-    /// The synthesized name is a `ServerGeneratedChatMessageIdentity`, not a
-    /// random id: that contract is deterministic in (session, ordinal), so the
-    /// same event sequence always yields the same id. A UUID here would render
-    /// duplicates on any path that re-derives ids for the same events.
-    async fn resolve_live_message_id(
-        &self,
-        explicit: Option<ChatMessageId>,
-        origin: ServerGeneratedChatMessageIdOrigin,
-    ) -> ChatMessageId {
-        if let Some(id) = explicit {
-            return id;
-        }
-
-        let mut state = self.state.lock().await;
-        if let Some(active) = state.active_message_id.clone() {
-            return active;
-        }
-
-        let identity = ServerGeneratedChatMessageIdentity {
-            origin,
-            stream_epoch: idless_stream_epoch(&state.session_id),
-            item_ordinal: state.idless_message_ordinal,
-        };
-        state.idless_message_ordinal = state.idless_message_ordinal.saturating_add(1);
-        identity.message_id()
-    }
-
-    async fn reject_foreign_stream_message_id(&self, message_id: &ChatMessageId) {
-        self.emitter
-            .stream_delta_with_id(message_id.clone(), "\u{200b}");
-        self.clear_active_stream().await;
-        self.emitter.typing_status_changed(false);
+        self.emitter.stream_delta(&response, &delta);
     }
 
     async fn set_replay_error(&self, message: String) {
@@ -1865,17 +1569,25 @@ impl KiroInner {
         self.state.lock().await.replay_error.is_some()
     }
 
-    async fn ensure_replay_assistant_message_for_tool(&self, identity: KiroReplayMessageIdentity) {
+    async fn ensure_replay_assistant_message_for_tool(
+        &self,
+        identity: KiroReplayMessageIdentity,
+        tool_call: ToolUseData,
+    ) {
         self.flush_replay_assistant_message().await;
         let should_emit = {
             let state = self.state.lock().await;
-            state.replaying_history
-                && state.replay_error.is_none()
-                && !state.replay_assistant_message_emitted_since_user
+            state.replaying_history && state.replay_error.is_none()
         };
         if should_emit {
-            self.emit_replay_assistant_message(identity, String::new(), String::new(), true)
-                .await;
+            self.emit_replay_assistant_message(
+                identity,
+                String::new(),
+                String::new(),
+                vec![tool_call],
+                true,
+            )
+            .await;
         }
     }
 
@@ -1893,13 +1605,8 @@ impl KiroInner {
         };
 
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
-        self.append_replay_assistant_chunk(
-            extract_kiro_chat_message_id(params),
-            KiroLegacyReplayEventKind::ToolCall,
-            "",
-            false,
-        )
-        .await;
+        self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), "", false)
+            .await;
         if self.replay_error_is_set().await {
             return;
         }
@@ -1945,20 +1652,30 @@ impl KiroInner {
             state
                 .tool_call_aliases
                 .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            state.tool_call_aliases.insert(
-                tool_alias_message_key(&identity.message_id.0, &raw_tool_call_id),
-                canonical_id.clone(),
-            );
+            if let Some(message_id) = identity.message_id.as_ref() {
+                state.tool_call_aliases.insert(
+                    tool_alias_message_key(&message_id.0, &raw_tool_call_id),
+                    canonical_id.clone(),
+                );
+            }
         }
 
-        self.ensure_replay_assistant_message_for_tool(identity)
-            .await;
+        self.ensure_replay_assistant_message_for_tool(
+            identity,
+            ToolUseData {
+                tool_call_id: canonical_id.clone(),
+                name: request.tool_name.clone(),
+                arguments: public_acp_tool_arguments(&request.args),
+                content_offset: Some(0),
+            },
+        )
+        .await;
         if self.replay_error_is_set().await {
             return;
         }
 
         self.emitter
-            .tool_request(&canonical_id, &request.tool_name, tool_type);
+            .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
     }
 
     async fn handle_replay_tool_call_update(&self, params: &Value) {
@@ -2042,14 +1759,11 @@ impl KiroInner {
             output
         };
 
-        let (tool_call_id, tool_name, tool_result, success, error) = completion_to_emit;
-        self.emitter.tool_completed(ToolCompletedPayload {
-            tool_call_id: &tool_call_id,
-            tool_name: &tool_name,
-            tool_result,
-            success,
-            error: error.as_deref(),
-        });
+        let (tool_call_id, _tool_name, tool_result, success, error) = completion_to_emit;
+        self.emitter.tool_completed(
+            &tool_call_id,
+            kiro_tool_execution_outcome(tool_result, success, error),
+        );
     }
 
     async fn handle_tool_call(&self, params: &Value) {
@@ -2066,19 +1780,7 @@ impl KiroInner {
         };
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
 
-        let incoming_message_id = self
-            .resolve_live_message_id(
-                extract_kiro_chat_message_id(params),
-                ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
-            )
-            .await;
-        if let Some(active_message_id) = self.state.lock().await.active_message_id.clone()
-            && active_message_id != incoming_message_id
-        {
-            self.reject_foreign_stream_message_id(&incoming_message_id)
-                .await;
-            return;
-        }
+        let incoming_message_id = extract_kiro_message_id(params);
         let (workspace_root, is_mcp_tool) = {
             let state = self.state.lock().await;
             (
@@ -2087,14 +1789,15 @@ impl KiroInner {
             )
         };
 
-        let mut start_event: Option<(ChatMessageId, String)> = None;
+        let mut start_event: Option<String> = None;
         let mut should_finalize_current = false;
         {
             let mut state = self.state.lock().await;
-            let stream_message_id = incoming_message_id.clone();
-
-            let canonical_id =
-                build_canonical_tool_call_id(&mut state, &stream_message_id.0, &raw_tool_call_id);
+            let canonical_id = build_canonical_tool_call_id(
+                &mut state,
+                incoming_message_id.as_deref().unwrap_or_default(),
+                &raw_tool_call_id,
+            );
             let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
             let tool_type = self
                 .map_tool_request(params, &request.args, &workspace_root)
@@ -2133,28 +1836,33 @@ impl KiroInner {
             state
                 .tool_call_aliases
                 .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            state.tool_call_aliases.insert(
-                tool_alias_message_key(&stream_message_id.0, &raw_tool_call_id),
-                canonical_id.clone(),
-            );
+            if let Some(message_id) = incoming_message_id.as_deref() {
+                state.tool_call_aliases.insert(
+                    tool_alias_message_key(message_id, &raw_tool_call_id),
+                    canonical_id.clone(),
+                );
+            }
 
             if !duplicate_request {
-                if state.active_message_id.is_none() {
-                    state.active_message_id = Some(stream_message_id.clone());
+                if state.active_response.is_none() {
                     state.active_stream_text.clear();
                     state.active_stream_tool_calls.clear();
                     let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
-                    start_event = Some((stream_message_id.clone(), model));
+                    start_event = Some(model);
                 }
 
-                let tool_call_entry = json!({
-                    "id": canonical_id.clone(),
-                    "name": request.tool_name.clone(),
-                    "arguments": public_acp_tool_arguments(&request.args),
-                });
-                let already_present = state.active_stream_tool_calls.iter().any(|call| {
-                    call.get("id").and_then(Value::as_str) == Some(canonical_id.as_str())
-                });
+                let tool_call_entry = ToolUseData {
+                    tool_call_id: canonical_id.clone(),
+                    name: request.tool_name.clone(),
+                    arguments: public_acp_tool_arguments(&request.args),
+                    content_offset: Some(
+                        u32::try_from(state.active_stream_text.chars().count()).unwrap_or(u32::MAX),
+                    ),
+                };
+                let already_present = state
+                    .active_stream_tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == canonical_id);
                 if !already_present {
                     state.active_stream_tool_calls.push(tool_call_entry);
                 }
@@ -2162,15 +1870,11 @@ impl KiroInner {
             }
         };
 
-        if let Some((message_id, model)) = start_event {
+        if let Some(model) = start_event {
             self.emitter.typing_status_changed(true);
-            self.emitter
-                .stream_start_with_id(message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
-            if !self.emitter.is_stream_open() {
-                self.clear_active_stream().await;
-                self.emitter.typing_status_changed(false);
-                return;
-            }
+            let response = self.emitter.stream_start(Some(&model));
+            let mut state = self.state.lock().await;
+            state.active_response = Some(response);
         }
 
         if should_finalize_current {
@@ -2330,14 +2034,11 @@ impl KiroInner {
             }
         }
 
-        if let Some((tool_call_id, tool_name, tool_result, success, error)) = emit_completion_now {
-            self.emitter.tool_completed(ToolCompletedPayload {
-                tool_call_id: &tool_call_id,
-                tool_name: &tool_name,
-                tool_result,
-                success,
-                error: error.as_deref(),
-            });
+        if let Some((tool_call_id, _tool_name, tool_result, success, error)) = emit_completion_now {
+            self.emitter.tool_completed(
+                &tool_call_id,
+                kiro_tool_execution_outcome(tool_result, success, error),
+            );
         }
     }
 
@@ -2405,15 +2106,8 @@ impl KiroInner {
             state.provider_turn_quarantined = true;
         }
 
-        if self.emitter.is_stream_open() {
-            self.emitter.discard_open_stream_with_identity_violation(
-                StreamIdentityViolation::MissingMessageId,
-            );
-        } else {
-            self.emitter.backend_error(&message);
-            self.emitter.typing_status_changed(false);
-        }
-        self.clear_active_stream().await;
+        self.abort_active_turn(&message).await;
+        self.emitter.backend_error(&message);
     }
 
     async fn emit_replay_message(
@@ -2425,7 +2119,7 @@ impl KiroInner {
         };
         let text = text.trim().to_string();
         let reasoning = reasoning.trim().to_string();
-        self.emit_replay_assistant_message(identity, text, reasoning, false)
+        self.emit_replay_assistant_message(identity, text, reasoning, Vec::new(), false)
             .await;
     }
 
@@ -2434,6 +2128,7 @@ impl KiroInner {
         identity: KiroReplayMessageIdentity,
         text: String,
         reasoning: String,
+        tool_calls: Vec<ToolUseData>,
         allow_empty: bool,
     ) {
         if text.is_empty() && reasoning.is_empty() && !allow_empty {
@@ -2448,46 +2143,25 @@ impl KiroInner {
                 .clone()
                 .unwrap_or_else(|| "kiro".to_string())
         };
-        match &identity.origin {
-            KiroReplayIdentityOrigin::Provider => tracing::debug!(
-                provider_message_id = %identity.message_id,
-                identity_origin = identity.origin_label(),
-                "Emitting Kiro replay assistant message"
-            ),
-            KiroReplayIdentityOrigin::LegacyMigration {
-                session_id,
-                event_ordinal,
-                first_event,
-                identity: generated_identity,
-            } => tracing::debug!(
-                provider_message_id = %identity.message_id,
-                identity_origin = identity.origin_label(),
-                replay_session_id = session_id,
-                event_ordinal,
-                first_event = first_event.tag(),
-                stream_epoch = generated_identity.stream_epoch,
-                item_ordinal = generated_identity.item_ordinal,
-                "Emitting Kiro replay assistant message"
-            ),
-        }
-
-        self.emitter
-            .assistant_message(crate::backend::turn_emitter::AssistantMessagePayload {
-                agent: AgentName(KIRO_AGENT_NAME),
-                message_id: Some(&identity.message_id.0),
+        self.emitter.replay_assistant_message(
+            crate::backend::turn_emitter::AssistantMessagePayload {
+                message_id: identity.message_id,
                 content: text,
-                reasoning: (!reasoning.is_empty()).then(|| json!({ "text": reasoning })),
-                tool_calls: Vec::new(),
-                model_info: Some(json!({ "model": model })),
-                request_usage: None,
-                turn_usage: None,
-                cumulative_usage: None,
+                reasoning: (!reasoning.is_empty()).then_some(ReasoningData {
+                    text: reasoning,
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls,
+                model_info: Some(ModelInfo { model }),
+                token_usage: None,
                 context_breakdown: None,
                 images: Vec::new(),
-            });
+            },
+        );
         let mut state = self.state.lock().await;
         state.replay_assistant_message_emitted_since_user = true;
-        state.idless_message_ordinal = state.idless_message_ordinal.saturating_add(1);
     }
 
     async fn flush_replay_assistant_message(&self) {
@@ -2505,34 +2179,19 @@ impl KiroInner {
     }
 
     async fn finalize_active_stream_if_any(&self, usage: Option<Value>, end_typing: bool) {
-        self.finalize_active_stream_if_any_with_mode(usage, false, end_typing)
-            .await;
-    }
-
-    async fn force_finalize_active_stream_if_any(&self, usage: Option<Value>, end_typing: bool) {
-        self.finalize_active_stream_if_any_with_mode(usage, true, end_typing)
-            .await;
-    }
-
-    async fn finalize_active_stream_if_any_with_mode(
-        &self,
-        usage: Option<Value>,
-        force_emit: bool,
-        end_typing: bool,
-    ) {
         let active = {
             let mut state = self.state.lock().await;
-            state.active_message_id.take().map(|message_id| {
+            state.active_response.take().map(|response| {
                 (
-                    message_id,
+                    response,
                     std::mem::take(&mut state.active_stream_text),
                     std::mem::take(&mut state.active_stream_tool_calls),
                 )
             })
         };
 
-        if let Some((message_id, text, tool_calls)) = active {
-            self.emit_stream_end(message_id, text, usage, tool_calls, force_emit, end_typing)
+        if let Some((response, text, tool_calls)) = active {
+            self.emit_stream_end(response, text, usage, tool_calls, end_typing)
                 .await;
         } else if end_typing {
             self.emitter.typing_status_changed(false);
@@ -2541,20 +2200,24 @@ impl KiroInner {
 
     async fn clear_active_stream(&self) {
         let mut state = self.state.lock().await;
-        state.active_message_id = None;
+        state.active_response = None;
         state.active_stream_text.clear();
         state.active_stream_tool_calls.clear();
         state.active_tool_contexts.clear();
         state.tool_call_aliases.clear();
     }
 
+    async fn abort_active_turn(&self, message: &str) {
+        self.clear_active_stream().await;
+        self.emitter.operation_cancelled(message);
+    }
+
     async fn emit_stream_end(
         &self,
-        message_id: ChatMessageId,
+        response: ResponseHandle,
         text: String,
         token_usage: Option<Value>,
-        tool_calls: Vec<Value>,
-        force_emit: bool,
+        tool_calls: Vec<ToolUseData>,
         end_typing: bool,
     ) {
         let cleaned_text = self.adapter.sanitize_stream_text(&text).into_owned();
@@ -2568,39 +2231,32 @@ impl KiroInner {
         };
         tracing::debug!(
             session_id,
-            provider_message_id = %message_id,
-            forced = force_emit,
             text_bytes = cleaned_text.len(),
             tool_call_count = tool_calls.len(),
             "Finalizing Kiro response stream"
         );
         let normalized_usage = normalize_token_usage(token_usage.as_ref());
-        let token_usage_unavailable_reason = normalized_usage
-            .is_none()
-            .then_some(TokenUsageUnavailableReason::BackendDidNotReport);
         let context_breakdown = normalized_usage
             .as_ref()
             .map(estimate_context_breakdown_from_usage)
-            .unwrap_or(Value::Null);
+            .and_then(|value| serde_json::from_value::<ContextBreakdown>(value).ok());
+        let message_token_usage = normalized_usage
+            .as_ref()
+            .map(kiro_message_token_usage)
+            .unwrap_or_else(|| {
+                MessageTokenUsage::unavailable(TokenUsageUnavailableReason::BackendDidNotReport)
+            });
         let tool_calls_for_events = tool_calls.clone();
 
-        self.emitter.stream_end_with_id(
-            message_id,
+        self.emitter.stream_end(
+            response,
             StreamEndPayload {
                 content: cleaned_text,
-                agent: Some(AgentName(KIRO_AGENT_NAME)),
-                model: Some(model.clone()),
-                request_usage: normalized_usage.clone(),
-                turn_usage: normalized_usage,
-                cumulative_usage: None,
-                token_usage_unavailable_reason,
+                model_info: Some(ModelInfo { model }),
+                token_usage: Some(message_token_usage),
                 reasoning: None,
                 tool_calls: tool_calls.clone(),
-                context_breakdown: if context_breakdown.is_null() {
-                    None
-                } else {
-                    Some(context_breakdown)
-                },
+                context_breakdown,
                 images: Vec::new(),
             },
         );
@@ -2611,7 +2267,7 @@ impl KiroInner {
         }
     }
 
-    async fn flush_tool_events_after_stream_end(&self, tool_calls: &[Value]) {
+    async fn flush_tool_events_after_stream_end(&self, tool_calls: &[ToolUseData]) {
         let mut completions_to_emit: Vec<(String, String, Value, bool, Option<String>)> =
             Vec::new();
         let mut requests_to_emit: Vec<(String, String, Value)> = Vec::new();
@@ -2619,13 +2275,7 @@ impl KiroInner {
         {
             let mut state = self.state.lock().await;
             for tool_call in tool_calls {
-                let Some(tool_call_id) = tool_call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string())
-                else {
-                    continue;
-                };
+                let tool_call_id = tool_call.tool_call_id.clone();
 
                 if let Some(context) = state.active_tool_contexts.get_mut(&tool_call_id) {
                     if !context.request_emitted {
@@ -2656,18 +2306,16 @@ impl KiroInner {
         }
 
         for (tool_call_id, tool_name, tool_type) in requests_to_emit {
+            let _ = tool_name;
             self.emitter
-                .tool_request(&tool_call_id, &tool_name, tool_type);
+                .tool_request(&tool_call_id, kiro_tool_request_type(tool_type));
         }
 
-        for (tool_call_id, tool_name, tool_result, success, error) in completions_to_emit {
-            self.emitter.tool_completed(ToolCompletedPayload {
-                tool_call_id: &tool_call_id,
-                tool_name: &tool_name,
-                tool_result,
-                success,
-                error: error.as_deref(),
-            });
+        for (tool_call_id, _tool_name, tool_result, success, error) in completions_to_emit {
+            self.emitter.tool_completed(
+                &tool_call_id,
+                kiro_tool_execution_outcome(tool_result, success, error),
+            );
         }
     }
 
@@ -2675,11 +2323,9 @@ impl KiroInner {
         let image_payload = images.map(|images| {
             images
                 .iter()
-                .map(|image| {
-                    json!({
-                        "media_type": image.media_type,
-                        "data": image.data,
-                    })
+                .map(|image| ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
                 })
                 .collect::<Vec<_>>()
         });
@@ -2827,6 +2473,33 @@ pub(crate) fn strip_ansi_and_controls(input: &str) -> String {
 
 fn has_visible_text(input: &str) -> bool {
     input.chars().any(|ch| !ch.is_whitespace())
+}
+
+fn kiro_tool_request_type(value: Value) -> ToolRequestType {
+    serde_json::from_value(value.clone()).unwrap_or(ToolRequestType::Other { args: value })
+}
+
+fn kiro_tool_execution_outcome(
+    result: Value,
+    success: bool,
+    error: Option<String>,
+) -> ToolExecutionOutcome {
+    if success {
+        let result =
+            serde_json::from_value(result.clone()).unwrap_or(ToolExecutionResult::Other { result });
+        ToolExecutionOutcome::Succeeded { result }
+    } else {
+        ToolExecutionOutcome::Failed {
+            message: error.unwrap_or_else(|| "Tool execution failed".to_string()),
+            details: (!result.is_null()).then(|| result.to_string()),
+            normalization_failure: None,
+        }
+    }
+}
+
+fn kiro_message_token_usage(value: &Value) -> MessageTokenUsage {
+    let usage = serde_json::from_value::<TokenUsage>(value.clone()).unwrap_or_default();
+    MessageTokenUsage::request_and_turn_known(usage.clone(), usage)
 }
 
 fn normalize_tool_call_id_fragment(raw: &str) -> String {
@@ -4171,8 +3844,8 @@ pub(crate) fn extract_session_timestamp(metadata: &Value) -> u64 {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId,
-    SessionSettingValue, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId, SessionSettingValue,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
 };
 
 use crate::backend::{
@@ -4707,11 +4380,6 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
         "StreamStart" => {
             let data = value.get("data").unwrap_or(&Value::Null);
             Some(ChatEvent::StreamStart(StreamStartData {
-                message_id: data
-                    .get("message_id")
-                    .or_else(|| data.get("messageId"))
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string()),
                 agent: data
                     .get("agent")
                     .and_then(Value::as_str)
@@ -4733,14 +4401,7 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
             if text.is_empty() {
                 return None;
             }
-            Some(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: data
-                    .get("message_id")
-                    .or_else(|| data.get("messageId"))
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string()),
-                text,
-            }))
+            Some(ChatEvent::StreamDelta(StreamTextDeltaData { text }))
         }
         "StreamEnd" => {
             let data = value.get("data").unwrap_or(&Value::Null);

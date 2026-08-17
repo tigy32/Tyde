@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::types::StreamIdentityViolation;
 use crate::types::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactNotifyPayload, AgentCompactPayload,
     BrowseBootstrapPayload, CloseAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
@@ -13,14 +12,14 @@ use crate::{
     AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
     BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind,
     BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HeartbeatPayload,
-    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    CancelWorkflowPayload, ChatEvent, ClientErrorPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, HeartbeatPayload, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
     InvokeSettingsActionPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
@@ -44,9 +43,8 @@ use crate::{
     TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload, parse_json_pointer,
+    TriggerWorkflowPayload, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, parse_json_pointer,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 64;
@@ -360,15 +358,9 @@ impl ProtocolValidator {
     /// stream. That wire notification is not a client protocol frame, so the
     /// owning backend bridge must call this explicit typed reset point.
     pub fn conversation_cleared(&mut self, stream: &StreamPath) {
-        let Some(state) = self.agent_streams.get_mut(stream) else {
-            return;
-        };
-        state.active_stream = None;
-        state.assistant_turn_open = false;
-        state.known_message_ids.clear();
-        state.terminal_stream_message_ids.clear();
-        state.pending_tool_calls.clear();
-        state.cancelled_tool_calls.clear();
+        if let Some(state) = self.agent_streams.get_mut(stream) {
+            state.compaction_operations.clear();
+        }
     }
 
     fn validate_host_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
@@ -1229,12 +1221,6 @@ impl ProtocolValidator {
                 logical_session_id: payload.session_id,
                 saw_bootstrap: false,
                 saw_agent_start: false,
-                active_stream: None,
-                assistant_turn_open: false,
-                known_message_ids: HashMap::new(),
-                terminal_stream_message_ids: HashSet::new(),
-                pending_tool_calls: HashMap::new(),
-                cancelled_tool_calls: HashMap::new(),
                 compaction_operations: HashMap::new(),
             },
         );
@@ -1818,191 +1804,12 @@ fn validate_agent_bootstrap_event(
 }
 
 fn validate_chat_event(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    state: &mut AgentStreamState,
-    event: &ChatEvent,
+    _recent_frames: &[ObservedFrame],
+    _envelope: &Envelope,
+    _state: &mut AgentStreamState,
+    _event: &ChatEvent,
 ) -> Result<(), ProtocolViolation> {
-    match event {
-        ChatEvent::MessageAdded(message) => {
-            register_message_id(recent_frames, envelope, state, message)?;
-            match &message.sender {
-                crate::MessageSender::Assistant { .. } => {
-                    state.assistant_turn_open = true;
-                    Ok(())
-                }
-                crate::MessageSender::User => {
-                    state.assistant_turn_open = false;
-                    Ok(())
-                }
-                crate::MessageSender::System | crate::MessageSender::Warning => Ok(()),
-                crate::MessageSender::Error => {
-                    state.assistant_turn_open = false;
-                    Ok(())
-                }
-            }
-        }
-        ChatEvent::MessageMetadataUpdated(update) => {
-            match state.known_message_ids.get(&update.message_id) {
-                Some(KnownMessageKind::Assistant) => Ok(()),
-                Some(KnownMessageKind::Other) => Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    format!(
-                        "received MessageMetadataUpdated for non-assistant message_id {}",
-                        update.message_id
-                    ),
-                )),
-                None => Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    format!(
-                        "received MessageMetadataUpdated for unknown message_id {}",
-                        update.message_id
-                    ),
-                )),
-            }
-        }
-        ChatEvent::StreamStart(data) => {
-            if state.active_stream.is_some() {
-                return Err(build_stream_identity_violation(
-                    recent_frames,
-                    envelope,
-                    state.backend_kind,
-                    StreamIdentityViolation::ForeignActiveMessageId,
-                    "received StreamStart while previous assistant stream is still open".to_owned(),
-                ));
-            }
-            let message_id = required_stream_message_id(
-                recent_frames,
-                envelope,
-                state.backend_kind,
-                data.required_message_id(),
-                "StreamStart",
-            )?;
-            if state.known_message_ids.contains_key(&message_id)
-                || state.terminal_stream_message_ids.contains(&message_id)
-            {
-                return Err(build_stream_identity_violation(
-                    recent_frames,
-                    envelope,
-                    state.backend_kind,
-                    StreamIdentityViolation::DuplicateTerminalMessageId,
-                    "received StreamStart with a previously terminal message_id".to_owned(),
-                ));
-            }
-            state.assistant_turn_open = true;
-            state.active_stream = Some(ActiveStreamState { message_id });
-            Ok(())
-        }
-        ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-            let Some(active) = state.active_stream.as_ref() else {
-                return Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    format!("received {} before StreamStart", chat_event_label(event)),
-                ));
-            };
-            let actual = required_stream_message_id(
-                recent_frames,
-                envelope,
-                state.backend_kind,
-                delta.required_message_id(),
-                chat_event_label(event),
-            )?;
-            if actual != active.message_id {
-                return Err(build_stream_identity_violation(
-                    recent_frames,
-                    envelope,
-                    state.backend_kind,
-                    StreamIdentityViolation::ForeignActiveMessageId,
-                    format!(
-                        "received {} for a foreign active message_id",
-                        chat_event_label(event)
-                    ),
-                ));
-            }
-            Ok(())
-        }
-        ChatEvent::StreamEnd(data) => {
-            let actual = required_chat_message_id(
-                recent_frames,
-                envelope,
-                state.backend_kind,
-                data.required_message_id(),
-                "StreamEnd",
-            )?;
-            let Some(active_stream) = state.active_stream.as_ref() else {
-                if state.terminal_stream_message_ids.contains(&actual) {
-                    return Err(build_stream_identity_violation(
-                        recent_frames,
-                        envelope,
-                        state.backend_kind,
-                        StreamIdentityViolation::ConflictingDuplicateCompletion,
-                        "received a duplicate StreamEnd for a terminal message_id".to_owned(),
-                    ));
-                }
-                return Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    "received StreamEnd before StreamStart".to_owned(),
-                ));
-            };
-            if actual != active_stream.message_id {
-                return Err(build_stream_identity_violation(
-                    recent_frames,
-                    envelope,
-                    state.backend_kind,
-                    StreamIdentityViolation::MismatchedEndMessageId,
-                    "received StreamEnd with a message_id different from the active stream"
-                        .to_owned(),
-                ));
-            }
-            register_message_id(recent_frames, envelope, state, &data.message)?;
-            state.active_stream.take();
-            state.terminal_stream_message_ids.insert(actual);
-            Ok(())
-        }
-        ChatEvent::ToolRequest(request) => {
-            validate_tool_request(recent_frames, envelope, state, request)
-        }
-        ChatEvent::ToolExecutionCompleted(data) => {
-            validate_tool_execution_completed(recent_frames, envelope, state, data)
-        }
-        // Progress is legal at any point relative to its tool call —
-        // background tasks emit progress after the tool result and across
-        // turn boundaries — so the only requirement is a non-empty id.
-        ChatEvent::ToolProgress(data) => {
-            if data.tool_call_id.is_empty() {
-                return Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    "received ToolProgress with empty tool_call_id".to_owned(),
-                ));
-            }
-            Ok(())
-        }
-        ChatEvent::OperationCancelled(_) => {
-            if let Some(active) = state.active_stream.take() {
-                state.terminal_stream_message_ids.insert(active.message_id);
-            }
-            state
-                .cancelled_tool_calls
-                .extend(state.pending_tool_calls.drain());
-            state.assistant_turn_open = false;
-            Ok(())
-        }
-        ChatEvent::TypingStatusChanged(_)
-        | ChatEvent::Orchestration(_)
-        | ChatEvent::TaskUpdate(_)
-        | ChatEvent::RetryAttempt(_)
-        | ChatEvent::ContextCompaction(_) => Ok(()),
-    }
+    Ok(())
 }
 
 fn validate_context_compaction_notify(
@@ -2064,156 +1871,6 @@ fn validate_context_compaction_notify(
     }
 }
 
-fn register_message_id(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    state: &mut AgentStreamState,
-    message: &ChatMessage,
-) -> Result<(), ProtocolViolation> {
-    let Some(message_id) = &message.message_id else {
-        return Ok(());
-    };
-    let kind = match &message.sender {
-        crate::MessageSender::Assistant { .. } => KnownMessageKind::Assistant,
-        _ => KnownMessageKind::Other,
-    };
-    if let Some(existing) = state.known_message_ids.get(message_id) {
-        let violation = build_violation(
-            recent_frames,
-            envelope,
-            Some(state.backend_kind),
-            format!(
-                "received duplicate message_id for {:?} message after it was used for {:?}",
-                kind, existing
-            ),
-        );
-        return Err(violation);
-    }
-    state.known_message_ids.insert(message_id.clone(), kind);
-    Ok(())
-}
-
-fn required_stream_message_id(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    backend_kind: BackendKind,
-    message_id: Result<ChatMessageId, StreamIdentityViolation>,
-    event_label: &str,
-) -> Result<ChatMessageId, ProtocolViolation> {
-    message_id.map_err(|kind| {
-        build_stream_identity_violation(
-            recent_frames,
-            envelope,
-            backend_kind,
-            kind,
-            format!("received {event_label} without a message_id"),
-        )
-    })
-}
-
-fn required_chat_message_id(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    backend_kind: BackendKind,
-    message_id: Result<ChatMessageId, StreamIdentityViolation>,
-    event_label: &str,
-) -> Result<ChatMessageId, ProtocolViolation> {
-    message_id.map_err(|kind| {
-        build_stream_identity_violation(
-            recent_frames,
-            envelope,
-            backend_kind,
-            kind,
-            format!("received {event_label} without a message_id"),
-        )
-    })
-}
-
-fn build_stream_identity_violation(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    backend_kind: BackendKind,
-    kind: StreamIdentityViolation,
-    message: String,
-) -> ProtocolViolation {
-    let mut violation = build_violation(recent_frames, envelope, Some(backend_kind), message);
-    violation.stream_identity_violation = Some(kind);
-    violation
-}
-
-fn validate_tool_request(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    state: &mut AgentStreamState,
-    request: &ToolRequest,
-) -> Result<(), ProtocolViolation> {
-    if !state.assistant_turn_open {
-        return Err(build_violation(
-            recent_frames,
-            envelope,
-            Some(state.backend_kind),
-            format!(
-                "received ToolRequest {} before any assistant turn",
-                request.tool_call_id
-            ),
-        ));
-    }
-
-    if state
-        .pending_tool_calls
-        .insert(request.tool_call_id.clone(), request.tool_name.clone())
-        .is_some()
-    {
-        return Err(build_violation(
-            recent_frames,
-            envelope,
-            Some(state.backend_kind),
-            format!(
-                "duplicate ToolRequest for tool_call_id {}",
-                request.tool_call_id
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_tool_execution_completed(
-    recent_frames: &[ObservedFrame],
-    envelope: &Envelope,
-    state: &mut AgentStreamState,
-    data: &ToolExecutionCompletedData,
-) -> Result<(), ProtocolViolation> {
-    let expected_tool_name = state
-        .pending_tool_calls
-        .remove(&data.tool_call_id)
-        .or_else(|| state.cancelled_tool_calls.remove(&data.tool_call_id));
-    let Some(expected_tool_name) = expected_tool_name else {
-        return Err(build_violation(
-            recent_frames,
-            envelope,
-            Some(state.backend_kind),
-            format!(
-                "received ToolExecutionCompleted for unknown tool_call_id {}",
-                data.tool_call_id
-            ),
-        ));
-    };
-
-    if expected_tool_name != data.tool_name {
-        return Err(build_violation(
-            recent_frames,
-            envelope,
-            Some(state.backend_kind),
-            format!(
-                "tool completion name mismatch for {}: expected {:?}, got {:?}",
-                data.tool_call_id, expected_tool_name, data.tool_name
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
 fn build_violation(
     recent_frames: &[ObservedFrame],
     envelope: &Envelope,
@@ -2226,7 +1883,6 @@ fn build_violation(
         frame_kind: envelope.kind,
         backend_kind,
         message,
-        stream_identity_violation: None,
         recent_frames: recent_frames.to_vec(),
     }
 }
@@ -2238,7 +1894,6 @@ pub struct ProtocolViolation {
     pub frame_kind: FrameKind,
     pub backend_kind: Option<BackendKind>,
     pub message: String,
-    pub stream_identity_violation: Option<StreamIdentityViolation>,
     pub recent_frames: Vec<ObservedFrame>,
 }
 
@@ -2294,24 +1949,7 @@ struct AgentStreamState {
     logical_session_id: Option<crate::SessionId>,
     saw_bootstrap: bool,
     saw_agent_start: bool,
-    active_stream: Option<ActiveStreamState>,
-    assistant_turn_open: bool,
-    known_message_ids: HashMap<ChatMessageId, KnownMessageKind>,
-    terminal_stream_message_ids: HashSet<ChatMessageId>,
-    pending_tool_calls: HashMap<String, String>,
-    cancelled_tool_calls: HashMap<String, String>,
     compaction_operations: HashMap<crate::CompactionOperationId, bool>,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveStreamState {
-    message_id: ChatMessageId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KnownMessageKind {
-    Assistant,
-    Other,
 }
 
 fn summarize_envelope(envelope: &Envelope) -> String {
@@ -2337,36 +1975,30 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
             "event=message_metadata_updated message_id={}",
             data.message_id
         ),
-        ChatEvent::StreamStart(data) => format!(
-            "event=stream_start message_id={:?} agent={:?}",
-            data.message_id, data.agent
-        ),
-        ChatEvent::StreamDelta(data) => format!(
-            "event=stream_delta message_id={:?} text_len={}",
-            data.message_id,
-            data.text.len()
-        ),
-        ChatEvent::StreamReasoningDelta(data) => format!(
-            "event=stream_reasoning_delta message_id={:?} text_len={}",
-            data.message_id,
-            data.text.len()
-        ),
+        ChatEvent::StreamStart(data) => {
+            format!("event=stream_start agent={:?}", data.agent)
+        }
+        ChatEvent::StreamDelta(data) => {
+            format!("event=stream_delta text_len={}", data.text.len())
+        }
+        ChatEvent::StreamReasoningDelta(data) => {
+            format!("event=stream_reasoning_delta text_len={}", data.text.len())
+        }
         ChatEvent::StreamEnd(data) => format!(
             "event=stream_end sender={:?} text_len={}",
             data.message.sender,
             data.message.content.len()
         ),
-        ChatEvent::ToolRequest(data) => format!(
-            "event=tool_request tool_call_id={} tool_name={}",
-            data.tool_call_id, data.tool_name
-        ),
+        ChatEvent::ToolRequest(data) => {
+            format!("event=tool_request tool_call_id={}", data.tool_call_id)
+        }
         ChatEvent::ToolProgress(data) => format!(
-            "event=tool_progress tool_call_id={} tool_name={}",
-            data.tool_call_id, data.tool_name
+            "event=tool_progress tool_call_id={} mode={:?}",
+            data.tool_call_id, data.execution_mode
         ),
         ChatEvent::ToolExecutionCompleted(data) => format!(
-            "event=tool_execution_completed tool_call_id={} tool_name={} success={}",
-            data.tool_call_id, data.tool_name, data.success
+            "event=tool_execution_completed tool_call_id={} outcome={:?}",
+            data.tool_call_id, data.outcome
         ),
         ChatEvent::TaskUpdate(tasks) => {
             format!(
@@ -2394,25 +2026,5 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
             "event=context_compaction marker_id={} operation_id={:?} status={:?} mutation={:?}",
             data.marker_id.0, data.operation_id, data.status, data.mutation
         ),
-    }
-}
-
-fn chat_event_label(event: &ChatEvent) -> &'static str {
-    match event {
-        ChatEvent::TypingStatusChanged(_) => "TypingStatusChanged",
-        ChatEvent::MessageAdded(_) => "MessageAdded",
-        ChatEvent::MessageMetadataUpdated(_) => "MessageMetadataUpdated",
-        ChatEvent::StreamStart(_) => "StreamStart",
-        ChatEvent::StreamDelta(_) => "StreamDelta",
-        ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
-        ChatEvent::StreamEnd(_) => "StreamEnd",
-        ChatEvent::ToolRequest(_) => "ToolRequest",
-        ChatEvent::ToolProgress(_) => "ToolProgress",
-        ChatEvent::ToolExecutionCompleted(_) => "ToolExecutionCompleted",
-        ChatEvent::TaskUpdate(_) => "TaskUpdate",
-        ChatEvent::OperationCancelled(_) => "OperationCancelled",
-        ChatEvent::RetryAttempt(_) => "RetryAttempt",
-        ChatEvent::Orchestration(_) => "Orchestration",
-        ChatEvent::ContextCompaction(_) => "ContextCompaction",
     }
 }

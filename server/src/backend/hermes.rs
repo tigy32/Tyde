@@ -8,14 +8,14 @@ use std::{fs, io};
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
-    BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
-    CompactionMethod, CompactionMetrics, CompactionStage, CompactionTrigger, ContextBreakdown,
-    MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, RetryAttemptData,
-    SelectOption, SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
-    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
-    ToolRequest, ToolRequestType, ToolUseData,
+    BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
+    CompactionStage, CompactionTrigger, ContextBreakdown, MessageSender, MessageTokenUsage,
+    ModelInfo, OperationCancelledData, RetryAttemptData, SelectOption, SendMessageToolResponse,
+    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
+    ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -751,6 +751,7 @@ struct HermesNativeSubagent {
 #[derive(Clone)]
 struct HermesTurnTool {
     name: String,
+    arguments: Value,
     content_offset: Option<u32>,
     observed_order: u64,
 }
@@ -788,9 +789,6 @@ struct HermesEventMapper {
 #[derive(Clone)]
 struct HermesDelegationTool {
     tool_call_id: String,
-    /// Raw gateway name from the emitted `ToolRequest` (the authority for
-    /// this `tool_call_id`), carried into every progress frame.
-    tool_name: String,
     goals: Vec<String>,
 }
 
@@ -798,7 +796,6 @@ impl HermesDelegationTool {
     fn anchor(&self) -> HermesDelegationAnchor {
         HermesDelegationAnchor {
             tool_call_id: self.tool_call_id.clone(),
-            tool_name: self.tool_name.clone(),
         }
     }
 }
@@ -806,16 +803,20 @@ impl HermesDelegationTool {
 #[derive(Clone)]
 struct HermesDelegationAnchor {
     tool_call_id: String,
-    tool_name: String,
 }
 
 #[derive(Clone)]
 struct HermesBackgroundTask {
     tool_call_id: String,
-    /// Raw gateway name from the emitted `ToolRequest` (the authority for
-    /// this `tool_call_id`), carried into every progress frame.
     tool_name: String,
     command: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundTaskTerminalStatus {
+    Completed,
+    Failed,
+    Stopped,
 }
 
 pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
@@ -2317,17 +2318,10 @@ impl HermesSessionActor {
                 self.emit(ChatEvent::ToolExecutionCompleted(
                     ToolExecutionCompletedData {
                         tool_call_id: anchor.tool_call_id.clone(),
-                        tool_name: anchor.tool_name.clone(),
-                        tool_result: ToolExecutionResult::Cancelled {
+                        outcome: ToolExecutionOutcome::Cancelled {
                             message: "Hermes gateway owner exited before the native subagent reported completion"
                                 .to_owned(),
                         },
-                        success: false,
-                        error: Some(
-                            "Hermes gateway owner exited before the native subagent reported completion"
-                                .to_owned(),
-                        ),
-                        normalization_failure: None,
                     },
                 ));
             }
@@ -2372,9 +2366,9 @@ impl HermesSessionActor {
                 continue;
             };
             let status = if exit_code == Some(0) {
-                BackgroundTaskStatus::Completed
+                BackgroundTaskTerminalStatus::Completed
             } else {
-                BackgroundTaskStatus::Failed
+                BackgroundTaskTerminalStatus::Failed
             };
             tracing::debug!(
                 task_id,
@@ -2508,11 +2502,9 @@ impl HermesSessionActor {
                         self.emit(ChatEvent::ToolExecutionCompleted(
                             ToolExecutionCompletedData {
                                 tool_call_id,
-                                tool_name: "approval.request".to_string(),
-                                tool_result: ToolExecutionResult::Other { result },
-                                success: true,
-                                error: None,
-                                normalization_failure: None,
+                                outcome: ToolExecutionOutcome::Succeeded {
+                                    result: ToolExecutionResult::Other { result },
+                                },
                             },
                         ));
                         self.mapper.typing_active = true;
@@ -2913,43 +2905,32 @@ impl HermesSessionActor {
                     context_breakdown: None,
                     images: None,
                 }));
-                let (success, tool_result, error) = match status {
-                    protocol::SubAgentProgressStatus::Completed => (
-                        true,
-                        ToolExecutionResult::Other {
-                            result: payload.clone(),
-                        },
-                        None,
-                    ),
-                    protocol::SubAgentProgressStatus::Stopped => (
-                        false,
-                        ToolExecutionResult::Cancelled {
-                            message: "Hermes native subagent was stopped".to_owned(),
-                        },
-                        Some("Hermes native subagent was stopped".to_owned()),
-                    ),
+                let outcome = match status {
+                    protocol::SubAgentProgressStatus::Completed => {
+                        ToolExecutionOutcome::Succeeded {
+                            result: ToolExecutionResult::Other {
+                                result: payload.clone(),
+                            },
+                        }
+                    }
+                    protocol::SubAgentProgressStatus::Stopped => ToolExecutionOutcome::Cancelled {
+                        message: "Hermes native subagent was stopped".to_owned(),
+                    },
                     _ => {
                         let message = optional_string_any(&payload, &["error", "summary", "text"])
                             .unwrap_or_else(|| "Hermes native subagent failed".to_owned());
-                        (
-                            false,
-                            ToolExecutionResult::Error {
-                                short_message: message.clone(),
-                                detailed_message: payload.to_string(),
-                            },
-                            Some(message),
-                        )
+                        ToolExecutionOutcome::Failed {
+                            message,
+                            details: Some(payload.to_string()),
+                            normalization_failure: None,
+                        }
                     }
                 };
                 if let Some(anchor) = child.parent_anchor.as_ref() {
                     parent_completion = Some(ChatEvent::ToolExecutionCompleted(
                         ToolExecutionCompletedData {
                             tool_call_id: anchor.tool_call_id.clone(),
-                            tool_name: anchor.tool_name.clone(),
-                            tool_result,
-                            success,
-                            error,
-                            normalization_failure: None,
+                            outcome,
                         },
                     ));
                 }
@@ -4309,7 +4290,7 @@ impl HermesEventMapper {
                 self.background_terminal_events(
                     &background,
                     &task_id,
-                    BackgroundTaskStatus::Stopped,
+                    BackgroundTaskTerminalStatus::Stopped,
                     -1,
                     String::new(),
                     Some(
@@ -4480,7 +4461,6 @@ impl HermesEventMapper {
             self.typing_active = true;
         }
         events.push(ChatEvent::StreamStart(StreamStartData {
-            message_id: Some(message_id),
             agent: HERMES_AGENT_NAME.to_string(),
             model: self.model.clone(),
         }));
@@ -4527,7 +4507,6 @@ impl HermesEventMapper {
         let message_id = Uuid::new_v4().to_string();
         self.current_message_id = Some(message_id.clone());
         events.push(ChatEvent::StreamStart(StreamStartData {
-            message_id: Some(message_id),
             agent: HERMES_AGENT_NAME.to_string(),
             model: self.model.clone(),
         }));
@@ -4537,17 +4516,14 @@ impl HermesEventMapper {
     fn map_message_delta(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "message.delta")?;
         let text = required_raw_string(&payload, &["text"], "message.delta")?;
-        let Some(message_id) = self.current_message_id.clone() else {
+        if self.current_message_id.is_none() {
             return Err("Hermes emitted message.delta before message.start".to_string());
-        };
+        }
         if text.is_empty() {
             return Ok(Vec::new());
         }
         self.current_text.push_str(&text);
-        Ok(vec![ChatEvent::StreamDelta(StreamTextDeltaData {
-            message_id: Some(message_id),
-            text,
-        })])
+        Ok(vec![ChatEvent::StreamDelta(StreamTextDeltaData { text })])
     }
 
     fn map_reasoning_delta(
@@ -4751,15 +4727,16 @@ impl HermesEventMapper {
         let content_offset = u32::try_from(self.current_text.chars().count()).ok();
         let observed_order = self.next_turn_tool_order;
         self.next_turn_tool_order = self.next_turn_tool_order.saturating_add(1);
+        let arguments = payload.get("args").cloned().unwrap_or(payload);
         self.turn_tools.insert(
             tool_call_id.clone(),
             HermesTurnTool {
                 name: tool_name.clone(),
+                arguments: arguments.clone(),
                 content_offset,
                 observed_order,
             },
         );
-        let arguments = payload.get("args").cloned().unwrap_or(payload);
         self.pending_tool_arguments
             .insert(tool_call_id.clone(), arguments.clone());
         let tool_type =
@@ -4774,13 +4751,11 @@ impl HermesEventMapper {
             }
             self.delegation_tools.push_back(HermesDelegationTool {
                 tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
                 goals: hermes_delegation_goals(&arguments),
             });
         }
         let mut events = vec![ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.clone(),
             tool_type,
         })];
         if let Some(progress) = await_progress_data_for_tool(&tool_call_id, &tool_name, &arguments)
@@ -4794,29 +4769,11 @@ impl HermesEventMapper {
         let payload = required_payload(payload, "tool.progress")?;
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.progress")?;
-        // The registered request name is the authority for this id; the
-        // payload name is consulted only for ids the registry never saw.
-        let tool_name = self
-            .pending_tools
-            .get(&tool_call_id)
-            .cloned()
-            .or_else(|| {
-                self.turn_tools
-                    .get(&tool_call_id)
-                    .map(|tool| tool.name.clone())
-            })
-            .or_else(|| optional_string_any(&payload, &["name", "tool_name"]))
-            .ok_or_else(|| {
-                format!("Hermes tool.progress missing name for unknown tool_id {tool_call_id}")
-            })?;
         self.opaque_progress_tools.insert(tool_call_id.clone());
         Ok(vec![ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id,
-            tool_name,
-            update: ToolProgressUpdate::Other {
-                status: protocol::OpaqueToolProgressStatus::Running,
-                payload,
-            },
+            execution_mode: ToolExecutionMode::Foreground,
+            update: ToolProgressUpdate::Other { payload },
         })])
     }
 
@@ -4880,49 +4837,41 @@ impl HermesEventMapper {
         ) {
             events.push(ChatEvent::ToolProgress(progress));
         }
-        if self.opaque_progress_tools.remove(&completion_tool_call_id) {
-            events.push(ChatEvent::ToolProgress(ToolProgressData {
-                tool_call_id: completion_tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                update: ToolProgressUpdate::Other {
-                    status: if success {
-                        protocol::OpaqueToolProgressStatus::Completed
-                    } else {
-                        protocol::OpaqueToolProgressStatus::Failed
-                    },
-                    payload: payload.clone(),
-                },
-            }));
-        }
-        let tool_result = match normalized_mcp {
-            Some(normalized) if success => serde_json::from_value(normalized.tool_result)
-                .expect("canonical MCP tool result must deserialize"),
-            Some(normalized)
-                if normalized.tool_result.get("kind").and_then(Value::as_str) == Some("Error") =>
-            {
-                serde_json::from_value(normalized.tool_result)
-                    .expect("canonical MCP error result must deserialize")
-            }
-            Some(normalized) => ToolExecutionResult::Error {
-                short_message: error
-                    .clone()
-                    .unwrap_or_else(|| "Hermes MCP tool failed".to_owned()),
-                detailed_message: normalized
-                    .tool_result
-                    .get("result")
-                    .and_then(|result| serde_json::to_string_pretty(result).ok())
-                    .unwrap_or_else(|| normalized.tool_result.to_string()),
-            },
-            None => match &error {
-                None => ToolExecutionResult::Other {
+        self.opaque_progress_tools.remove(&completion_tool_call_id);
+        let outcome = if success {
+            let tool_result = normalized_mcp
+                .map(|normalized| {
+                    serde_json::from_value(normalized.tool_result.clone()).unwrap_or(
+                        ToolExecutionResult::Other {
+                            result: normalized.tool_result,
+                        },
+                    )
+                })
+                .unwrap_or_else(|| ToolExecutionResult::Other {
                     result: result.clone(),
-                },
-                Some(message) => ToolExecutionResult::Error {
-                    short_message: message.clone(),
-                    detailed_message: serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| result.to_string()),
-                },
-            },
+                });
+            ToolExecutionOutcome::Succeeded {
+                result: tool_result,
+            }
+        } else if error.as_ref().is_some_and(|error| {
+            let error = error.to_ascii_lowercase();
+            error.contains("cancel") || error.contains("interrupt")
+        }) {
+            ToolExecutionOutcome::Cancelled {
+                message: error
+                    .clone()
+                    .unwrap_or_else(|| "Hermes tool was cancelled".to_owned()),
+            }
+        } else {
+            ToolExecutionOutcome::Failed {
+                message: error
+                    .clone()
+                    .unwrap_or_else(|| "Hermes tool failed".to_owned()),
+                details: Some(
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
+                ),
+                normalization_failure: None,
+            }
         };
         let background_task_id = (success
             && normalized_hermes_tool_name(&tool_name) == "terminal"
@@ -4939,11 +4888,7 @@ impl HermesEventMapper {
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
                     tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    tool_result: tool_result.clone(),
-                    success,
-                    error: error.clone(),
-                    normalization_failure: None,
+                    outcome,
                 },
             ));
         }
@@ -4957,12 +4902,7 @@ impl HermesEventMapper {
                 tool_name: tool_name.clone(),
                 command,
             };
-            events.extend(self.background_progress_event(
-                &background,
-                &task_id,
-                BackgroundTaskStatus::Running,
-                None,
-            ));
+            events.extend(self.background_progress_event(&background, &task_id));
             self.background_tasks.insert(task_id, background);
         }
         if normalized_hermes_tool_name(&tool_name) == "process"
@@ -4972,9 +4912,9 @@ impl HermesEventMapper {
         {
             let exit_code = result.get("exit_code").and_then(Value::as_i64);
             let status = if success && exit_code == Some(0) {
-                BackgroundTaskStatus::Completed
+                BackgroundTaskTerminalStatus::Completed
             } else {
-                BackgroundTaskStatus::Failed
+                BackgroundTaskTerminalStatus::Failed
             };
             let summary = exit_code.map(|code| format!("Exited with code {code}"));
             events.extend(
@@ -5037,11 +4977,11 @@ impl HermesEventMapper {
             .unwrap_or_else(|| "exited".to_owned());
         let success = exit_code == 0 && completion_reason != "killed";
         let status = if completion_reason == "killed" {
-            BackgroundTaskStatus::Stopped
+            BackgroundTaskTerminalStatus::Stopped
         } else if success {
-            BackgroundTaskStatus::Completed
+            BackgroundTaskTerminalStatus::Completed
         } else {
-            BackgroundTaskStatus::Failed
+            BackgroundTaskTerminalStatus::Failed
         };
         let output = payload
             .get("output")
@@ -5072,7 +5012,7 @@ impl HermesEventMapper {
             return Ok(Vec::new());
         };
         Ok(self
-            .background_progress_event(background, &task_id, BackgroundTaskStatus::Running, None)
+            .background_progress_event(background, &task_id)
             .into_iter()
             .collect())
     }
@@ -5087,8 +5027,6 @@ impl HermesEventMapper {
         &self,
         background: &HermesBackgroundTask,
         task_id: &str,
-        status: BackgroundTaskStatus,
-        summary: Option<String>,
     ) -> Option<ChatEvent> {
         let current_name = self
             .pending_tools
@@ -5112,14 +5050,14 @@ impl HermesEventMapper {
         }
         Some(ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id: background.tool_call_id.clone(),
-            tool_name: background.tool_name.clone(),
-            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-                task_id: task_id.to_owned(),
-                description: background.command.clone(),
-                status,
-                summary,
-                output_unavailable: None,
-            }),
+            execution_mode: ToolExecutionMode::Background,
+            update: ToolProgressUpdate::Other {
+                payload: json!({
+                    "task_id": task_id,
+                    "description": background.command,
+                    "summary": null,
+                }),
+            },
         }))
     }
 
@@ -5127,51 +5065,52 @@ impl HermesEventMapper {
         &self,
         background: &HermesBackgroundTask,
         task_id: &str,
-        status: BackgroundTaskStatus,
+        status: BackgroundTaskTerminalStatus,
         exit_code: i32,
         output: String,
         summary: Option<String>,
     ) -> Vec<ChatEvent> {
-        let Some(progress) =
-            self.background_progress_event(background, task_id, status, summary.clone())
-        else {
-            return Vec::new();
-        };
-        let stopped = status == BackgroundTaskStatus::Stopped;
-        let success = status == BackgroundTaskStatus::Completed && exit_code == 0;
+        tracing::debug!(
+            task_id,
+            ?status,
+            "Hermes background task reached a terminal outcome"
+        );
+        let stopped = status == BackgroundTaskTerminalStatus::Stopped;
+        let success = status == BackgroundTaskTerminalStatus::Completed && exit_code == 0;
         let message = summary.unwrap_or_else(|| match status {
-            BackgroundTaskStatus::Completed => "Hermes background command completed".to_owned(),
-            BackgroundTaskStatus::Failed => {
+            BackgroundTaskTerminalStatus::Completed => {
+                "Hermes background command completed".to_owned()
+            }
+            BackgroundTaskTerminalStatus::Failed => {
                 format!("Hermes background command exited with code {exit_code}")
             }
-            BackgroundTaskStatus::Stopped => "Hermes background command stopped".to_owned(),
-            BackgroundTaskStatus::Running => "Hermes background command is running".to_owned(),
-            BackgroundTaskStatus::Unknown => {
-                "Hermes background command ended with unknown status".to_owned()
-            }
+            BackgroundTaskTerminalStatus::Stopped => "Hermes background command stopped".to_owned(),
         });
-        let tool_result = if stopped {
-            ToolExecutionResult::Cancelled {
+        let outcome = if stopped {
+            ToolExecutionOutcome::Cancelled {
                 message: message.clone(),
             }
+        } else if success {
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::RunCommand {
+                    exit_code,
+                    stdout: output,
+                    stderr: String::new(),
+                },
+            }
         } else {
-            ToolExecutionResult::RunCommand {
-                exit_code,
-                stdout: output,
-                stderr: String::new(),
+            ToolExecutionOutcome::Failed {
+                message,
+                details: Some(output),
+                normalization_failure: None,
             }
         };
-        vec![
-            progress,
-            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+        vec![ChatEvent::ToolExecutionCompleted(
+            ToolExecutionCompletedData {
                 tool_call_id: background.tool_call_id.clone(),
-                tool_name: background.tool_name.clone(),
-                tool_result,
-                success,
-                error: (!success).then_some(message),
-                normalization_failure: None,
-            }),
-        ]
+                outcome,
+            },
+        )]
     }
 
     /// Resolves the delegation card a native child anchors to: an explicit
@@ -5235,7 +5174,6 @@ impl HermesEventMapper {
             .insert(tool_call_id.clone(), "approval.request".to_string());
         Ok(vec![ChatEvent::ToolRequest(ToolRequest {
             tool_call_id,
-            tool_name: "approval.request".to_string(),
             tool_type: ToolRequestType::ExitPlanMode {
                 plan: Some(question),
                 plan_path: None,
@@ -5348,39 +5286,22 @@ impl HermesEventMapper {
     }
 
     fn complete_pending_tools_as_cancelled(&mut self, detailed_message: &str) -> Vec<ChatEvent> {
-        let pending = self
-            .pending_tools
-            .iter()
-            .map(|(id, name)| (id.clone(), name.clone()))
-            .collect::<Vec<_>>();
+        let pending = self.pending_tools.keys().cloned().collect::<Vec<_>>();
         let mut events = Vec::new();
-        for (tool_call_id, tool_name) in pending {
+        for tool_call_id in pending {
             self.pending_tools.remove(&tool_call_id);
             self.pending_tool_arguments.remove(&tool_call_id);
             if self.cancelled_tools.len() >= 256 {
                 self.cancelled_tools.clear();
             }
             self.cancelled_tools.insert(tool_call_id.clone());
-            if self.opaque_progress_tools.remove(&tool_call_id) {
-                events.push(ChatEvent::ToolProgress(ToolProgressData {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    update: ToolProgressUpdate::Other {
-                        status: protocol::OpaqueToolProgressStatus::Stopped,
-                        payload: Value::Null,
-                    },
-                }));
-            }
+            self.opaque_progress_tools.remove(&tool_call_id);
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
                     tool_call_id,
-                    tool_name,
-                    tool_result: ToolExecutionResult::Cancelled {
+                    outcome: ToolExecutionOutcome::Cancelled {
                         message: detailed_message.to_string(),
                     },
-                    success: false,
-                    error: Some("Cancelled".to_string()),
-                    normalization_failure: None,
                 },
             ));
         }
@@ -5403,9 +5324,9 @@ impl HermesEventMapper {
         tools
             .into_iter()
             .map(|(id, tool)| ToolUseData {
-                id: id.clone(),
+                tool_call_id: id.clone(),
                 name: tool.name.clone(),
-                arguments: Value::Null,
+                arguments: tool.arguments.clone(),
                 content_offset: tool.content_offset.and_then(|offset| {
                     reanchor_hermes_content_offset(streamed_text, content, offset)
                 }),
@@ -5677,7 +5598,7 @@ fn hermes_subagent_progress(
 ) -> ToolProgressData {
     ToolProgressData {
         tool_call_id: anchor.tool_call_id.clone(),
-        tool_name: anchor.tool_name.clone(),
+        execution_mode: ToolExecutionMode::Background,
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: handle.agent_id.clone(),
             agent_name: agent_name.to_string(),
@@ -6271,9 +6192,10 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let tool_calls = hermes_history_tool_calls(message)?;
+        let content_offset = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+        let tool_calls = hermes_history_tool_calls(message, content_offset)?;
         for tool_call in &tool_calls {
-            requested_tool_names.insert(tool_call.id.clone(), tool_call.name.clone());
+            requested_tool_names.insert(tool_call.tool_call_id.clone(), tool_call.name.clone());
         }
         let sender = match role.as_str() {
             "user" => MessageSender::User,
@@ -6304,29 +6226,31 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                 let normalized_mcp = tool_name
                     .starts_with("mcp_tyde_")
                     .then(|| normalize_mcp_call_tool_result(&result));
-                let (tool_result, success, error) = match normalized_mcp {
-                    Some(normalized) => (
-                        serde_json::from_value(normalized.tool_result)
-                            .expect("canonical replayed MCP tool result must deserialize"),
-                        normalized.success,
-                        normalized.error,
-                    ),
-                    None => (
-                        ToolExecutionResult::Other {
+                let outcome = match normalized_mcp {
+                    Some(normalized) if normalized.success => ToolExecutionOutcome::Succeeded {
+                        result: serde_json::from_value(normalized.tool_result.clone()).unwrap_or(
+                            ToolExecutionResult::Other {
+                                result: normalized.tool_result,
+                            },
+                        ),
+                    },
+                    Some(normalized) => ToolExecutionOutcome::Failed {
+                        message: normalized
+                            .error
+                            .unwrap_or_else(|| "Hermes MCP tool failed".to_owned()),
+                        details: Some(normalized.tool_result.to_string()),
+                        normalization_failure: None,
+                    },
+                    None => ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::Other {
                             result: result.clone(),
                         },
-                        true,
-                        None,
-                    ),
+                    },
                 };
                 events.push(ChatEvent::ToolExecutionCompleted(
                     ToolExecutionCompletedData {
                         tool_call_id,
-                        tool_name: tool_name.clone(),
-                        tool_result,
-                        success,
-                        error,
-                        normalization_failure: None,
+                        outcome,
                     },
                 ));
                 if is_hermes_todo_tool(&tool_name)
@@ -6359,19 +6283,23 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             images: None,
         }));
         for tool_call in tool_calls {
+            let tool_type = hermes_native_tool_request_type(&tool_call.name, &tool_call.arguments)
+                .unwrap_or_else(|| ToolRequestType::Other {
+                    args: tool_call.arguments.clone(),
+                });
             events.push(ChatEvent::ToolRequest(ToolRequest {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.name,
-                tool_type: ToolRequestType::Other {
-                    args: tool_call.arguments,
-                },
+                tool_call_id: tool_call.tool_call_id,
+                tool_type,
             }));
         }
     }
     Ok(events)
 }
 
-fn hermes_history_tool_calls(message: &Value) -> Result<Vec<ToolUseData>, String> {
+fn hermes_history_tool_calls(
+    message: &Value,
+    default_content_offset: u32,
+) -> Result<Vec<ToolUseData>, String> {
     let Some(raw) = message.get("tool_calls").filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
@@ -6408,10 +6336,14 @@ fn hermes_history_tool_calls(message: &Value) -> Result<Vec<ToolUseData>, String
                 None => Value::Null,
             };
             Ok(ToolUseData {
-                id,
+                tool_call_id: id,
                 name,
                 arguments,
-                content_offset: None,
+                content_offset: call
+                    .get("content_offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|offset| u32::try_from(offset).ok())
+                    .or(Some(default_content_offset)),
             })
         })
         .collect()
