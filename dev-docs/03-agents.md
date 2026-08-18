@@ -832,18 +832,25 @@ The supervisor uses a private three-way verdict. `Done` means the requested
 work is truly complete and no user response is needed. `AwaitingUser` covers
 feedback, clarification, approval, a choice or decision, and a plan or
 proposal presented for review. `Continue` means executable work remains and
-causes a visible supervisor follow-up. Only `Done` authorizes automatic
-compaction; waiting on the user never does.
+causes a visible supervisor follow-up. `Done` and `AwaitingUser` both settle
+the turn, and automatic compaction keys on that settled state rather than on
+which of the two it was: compaction relieves context pressure, which a turn
+that ends by asking the user a question builds up exactly like one that ends
+by finishing the work.
 
 `TypingStatusChanged` remains authoritative for active versus idle. Separately,
 the server's monotonic `activity_counter` identifies inactivity generations:
 accepted input and backend activity advance it, invalidating an old debounce,
 verdict, or compaction intent even when a watch notification coalesces a rapid
-active-to-idle cycle. The single supervisor scheduler records `idle_since` at
-the observed idle transition, waits the three-second verdict debounce, and
-judges that generation once. A successful `Done` verdict is retained while
-the scheduler waits; expiry performs only cheap live checks, not a second paid
-verdict call. A late `MessageMetadataUpdated` patch counts as activity, so one
+active-to-idle cycle. Each agent actor owns its own supervision state: it
+records `idle_since` at the idle transition, waits the three-second verdict
+debounce, and judges that generation once. Because the actor sees its own
+backend events, the stall clock measures real activity directly rather than
+inferring it from a status watch that stream deltas never reach, and a verdict
+result is validated by comparing one activity counter instead of re-reading the
+conversation, the session record, and the settings. A settled verdict is
+retained while the actor waits; expiry performs only cheap local checks, not a
+second paid verdict call. A late `MessageMetadataUpdated` patch counts as activity, so one
 arriving after idle begins restarts the interval and can trigger a fresh
 verdict; patches within the debounce coalesce into that generation.
 
@@ -870,11 +877,9 @@ warning for that activity generation:
 The singular form says `1 attempt`. The count is the typed number of started
 attempts; neither raw backend errors nor coarse failure kinds enter chat.
 Settings-fingerprint invalidation and settings-only exhaustion remain silent.
-The agent actor checks the unchanged activity generation and complete live
-supervisor settings at its mailbox boundary, then owns the one-counter dedupe.
-It awaits the status snapshot first and samples the settings watch last, with
-no intervening await before the canonical append begins; that final settings
-sample is the ordering boundary for concurrent settings commits.
+The actor appends the warning as it lands the exhausting result, so there is no
+mailbox boundary to re-check and no dedupe counter to keep: the generation it
+belongs to is the one it is holding.
 New activity can therefore warn once for its new generation, while activity,
 disable, settings, queue, and close races reject stale appends. The warning is
 recorded before live broadcast and replays through actor-lifetime attachment
@@ -963,8 +968,9 @@ supervisor kick, clears that truncation flag, so the follow-up turn is judged as
 ordinary work.
 
 Automatic compaction requires all four live conditions: the supervisor and
-auto-compact setting are enabled; the accepted verdict for the unchanged
-generation is `Done`; the full inactivity delay has elapsed; and the latest
+auto-compact setting are enabled; the generation has settled (judged `Done` or
+`AwaitingUser`, or exhausted its verdict attempts); the full inactivity delay
+has elapsed; and the latest
 completed assistant turn has known current-context input tokens strictly
 greater than the configured threshold. The delay defaults to 300 seconds and
 accepts `1..=86_400` whole seconds. The threshold defaults to 200,000 tokens,
@@ -973,23 +979,22 @@ minimum but still requires a reported value. Unavailable current context has
 no fallback to older, cumulative, or task usage and is skipped with a distinct
 log reason. Manual compaction is unaffected.
 
-Delay, threshold, and auto-compact changes apply live to an already accepted
-`Done` classification and preserve the original `idle_since`; accepted
-`Done`/`AwaitingUser` classifications are not re-judged for those edits.
-Changing verdict-relevant settings while a verdict is in flight rejects the
-old result but retains that started call in the generation's budget and uses
-the normal delayed retry policy. Auto-compaction-only edits do not invalidate
-classification. Disabling the supervisor clears runtime state; enabling it
-begins a fresh interval. A host or
-scheduler restart likewise observes already-idle agents with a fresh
-`idle_since` and persists none of the generation, phase, verdict, or deadline.
+Delay, threshold, and auto-compact changes apply live to an already settled
+classification and preserve the original `idle_since`; settled classifications
+are not re-judged for those edits. Changing verdict-relevant settings while a
+verdict is in flight rejects the old result but retains that started call in
+the generation's budget and uses the normal delayed retry policy.
+Auto-compaction-only edits do not invalidate classification. Disabling the
+supervisor stops the actor's supervision deadlines; enabling it begins a fresh
+interval. A host or agent restart likewise begins with a fresh `idle_since` and
+persists none of the generation, phase, verdict, or deadline.
 
-At expiry the host sends a conditional compact carrying the expected activity
-counter and supervisor-settings epoch through the agent actor. The actor
-mailbox is the final linearization point: earlier accepted or queued input
-changes the counter, and an earlier committed settings edit changes the epoch,
-so either rejects stale automatic compaction. A conditional compact accepted
-first legitimately crosses the gate. Rotation and post-compaction bootstrap
+At expiry the actor evaluates the context-pressure gate against its own live
+state and, if it passes, asks the host to perform the compaction. The decision
+is the actor's because it is the only place that knows its context size,
+whether input is queued, and whether it is closing; the execution is the
+host's because a legacy compaction rotates the agent into a replacement and
+only the host owns that registry. Rotation and post-compaction bootstrap
 guards still apply.
 
 Native context-compaction availability is capability-based, never inferred

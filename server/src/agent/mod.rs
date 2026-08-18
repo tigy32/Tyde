@@ -16,12 +16,13 @@ use protocol::{
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
     MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
-    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
-    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolRequestType,
+    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SUPERVISOR_MESSAGE_PREFIX,
+    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues,
+    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
+    ToolPolicy, ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -196,6 +197,9 @@ pub(crate) struct AgentActorRuntimeContext {
     pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
     pub(crate) review_registry: ReviewRegistryHandle,
     pub(crate) status_handle: registry::AgentStatusHandle,
+    pub(crate) supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    pub(crate) use_mock_backend: bool,
+    pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
     pub(crate) antigravity_conversations_dir: PathBuf,
 }
@@ -207,6 +211,11 @@ pub(crate) struct AgentActorRuntimeResources {
     pub(crate) capacity_tx: HostCapacityTx,
     pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
     pub(crate) review_registry: ReviewRegistryHandle,
+    /// The supervisor runs inside the actor, so it holds the settings watch for
+    /// its whole life instead of being handed one per host command.
+    pub(crate) supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    pub(crate) use_mock_backend: bool,
+    pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
     pub(crate) antigravity_conversations_dir: PathBuf,
 }
@@ -224,6 +233,9 @@ impl AgentActorRuntimeResources {
             session_summary_count_tx: self.session_summary_count_tx,
             review_registry: self.review_registry,
             status_handle,
+            supervisor_settings_rx: self.supervisor_settings_rx,
+            use_mock_backend: self.use_mock_backend,
+            supervisor_compaction_tx: self.supervisor_compaction_tx,
             provider_version: self.provider_version,
             antigravity_conversations_dir: self.antigravity_conversations_dir,
         }
@@ -238,24 +250,6 @@ enum AgentCommand {
     DeliverMessage {
         payload: SendMessagePayload,
         reply: oneshot::Sender<Result<(), String>>,
-    },
-    BeginSupervisorVerdictIfInactive {
-        expected_activity_counter: u64,
-        expected_verdict_settings: crate::host::VerdictSettingsFingerprint,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-        reply: oneshot::Sender<SupervisorVerdictStart>,
-    },
-    AppendSupervisorFailureWarningIfInactive {
-        expected_activity_counter: u64,
-        attempts_started: u8,
-        expected_settings: crate::host::SupervisorSettingsSignal,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-        reply: oneshot::Sender<AppendSupervisorWarningOutcome>,
-    },
-    InterruptStalledTurnIfStalled {
-        expected_settings: crate::host::SupervisorSettingsSignal,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-        reply: oneshot::Sender<SupervisorStallInterruptOutcome>,
     },
     Compact {
         summary_prompt: String,
@@ -337,9 +331,6 @@ enum AgentCommand {
         max_bytes: usize,
         reply: oneshot::Sender<AgentActivityHistorySnapshot>,
     },
-    ReadSupervisionContext {
-        reply: oneshot::Sender<supervisor::SupervisionContextSnapshot>,
-    },
     ReadUsageSnapshot {
         reply: oneshot::Sender<AgentUsageSnapshot>,
     },
@@ -364,59 +355,6 @@ enum AgentCommand {
         stream: Stream,
         reply: oneshot::Sender<bool>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SupervisorVerdictStartRejection {
-    ActivityChanged,
-    SettingsChanged,
-    Ineligible,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SupervisorVerdictStart {
-    Accepted,
-    Rejected {
-        reason: SupervisorVerdictStartRejection,
-        live_settings: crate::host::SupervisorSettingsSignal,
-    },
-    Closed,
-}
-
-/// Result of asking an agent to cancel a turn that stopped making progress.
-/// The actor owns the decision: it is the only place that sees every backend
-/// event, including the stream deltas that never reach the status watch, so the
-/// scheduler's deadline is a prompt to re-evaluate rather than a verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SupervisorStallInterruptOutcome {
-    /// The stall notice was recorded and the backend was interrupted.
-    Interrupted,
-    /// The live stall is younger than the scheduler believed; ask again after
-    /// this long. Carries no attempt cost — interrupts are free.
-    TooEarly {
-        remaining: Duration,
-    },
-    /// No turn to interrupt, or the turn is parked on a user decision.
-    NotStalled,
-    /// A settings edit was ordered before this mailbox boundary.
-    SettingsChanged {
-        live: crate::host::SupervisorSettingsSignal,
-    },
-    /// The backend refused the interrupt or is mid-compaction.
-    Rejected,
-    Closed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppendSupervisorWarningOutcome {
-    Appended,
-    AlreadyAppended,
-    ActivityChanged,
-    SettingsChanged {
-        live: crate::host::SupervisorSettingsSignal,
-    },
-    Ineligible,
-    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1330,89 +1268,6 @@ impl AgentHandle {
             .unwrap_or_else(|_| Err(DELIVERY_NOT_ACKNOWLEDGED.to_owned()))
     }
 
-    pub(crate) async fn begin_supervisor_verdict_if_inactive(
-        &self,
-        expected_activity_counter: u64,
-        expected_verdict_settings: crate::host::VerdictSettingsFingerprint,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-    ) -> SupervisorVerdictStart {
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return SupervisorVerdictStart::Closed;
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::BeginSupervisorVerdictIfInactive {
-                expected_activity_counter,
-                expected_verdict_settings,
-                supervisor_settings_rx,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return SupervisorVerdictStart::Closed;
-        }
-        reply_rx.await.unwrap_or(SupervisorVerdictStart::Closed)
-    }
-
-    pub(crate) async fn append_supervisor_failure_warning_if_inactive(
-        &self,
-        expected_activity_counter: u64,
-        attempts_started: u8,
-        expected_settings: crate::host::SupervisorSettingsSignal,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-    ) -> AppendSupervisorWarningOutcome {
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return AppendSupervisorWarningOutcome::Closed;
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::AppendSupervisorFailureWarningIfInactive {
-                expected_activity_counter,
-                attempts_started,
-                expected_settings,
-                supervisor_settings_rx,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return AppendSupervisorWarningOutcome::Closed;
-        }
-        reply_rx
-            .await
-            .unwrap_or(AppendSupervisorWarningOutcome::Closed)
-    }
-
-    /// Cancels the running turn if it has genuinely stalled for the configured
-    /// stall timeout, recording a visible notice first so the transcript — and
-    /// the supervision context read from it — attributes the cancel to the
-    /// supervisor rather than to the user.
-    pub(crate) async fn interrupt_stalled_turn_for_supervision(
-        &self,
-        expected_settings: crate::host::SupervisorSettingsSignal,
-        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
-    ) -> SupervisorStallInterruptOutcome {
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return SupervisorStallInterruptOutcome::Closed;
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::InterruptStalledTurnIfStalled {
-                expected_settings,
-                supervisor_settings_rx,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return SupervisorStallInterruptOutcome::Closed;
-        }
-        reply_rx
-            .await
-            .unwrap_or(SupervisorStallInterruptOutcome::Closed)
-    }
-
     pub fn begin_compact(
         &self,
         summary_prompt: String,
@@ -1666,18 +1521,6 @@ impl AgentHandle {
                 max_bytes,
                 reply: reply_tx,
             })
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.await.ok()
-    }
-
-    pub async fn read_supervision_context(&self) -> Option<supervisor::SupervisionContextSnapshot> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::ReadSupervisionContext { reply: reply_tx })
             .is_err()
         {
             return None;
@@ -2965,12 +2808,16 @@ pub(crate) fn spawn_agent_actor(
         transcript_store,
         host_sub_agent_spawn_tx,
         capacity_tx,
+        mut supervisor_settings_rx,
+        use_mock_backend: supervisor_use_mock_backend,
+        supervisor_compaction_tx,
         session_summary_count_tx,
         review_registry,
         status_handle,
         provider_version,
         antigravity_conversations_dir,
     } = runtime;
+    let supervisor_capacity_tx = capacity_tx.clone();
     let sub_agent_context = HostSubAgentEmitterContext {
         host_sub_agent_spawn_tx,
         capacity_tx,
@@ -2979,6 +2826,9 @@ pub(crate) fn spawn_agent_actor(
     let compaction_capacity_tx = sub_agent_context.capacity_tx.clone();
     let compaction_antigravity_conversations_dir = antigravity_conversations_dir.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
+    // A supervisor follow-up is an ordinary message, so it re-enters through
+    // this actor's own mailbox instead of getting a private delivery path.
+    let supervisor_kick_tx = tx.clone();
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
     let closing = Arc::new(AtomicBool::new(false));
@@ -3030,7 +2880,6 @@ pub(crate) fn spawn_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
-        let mut last_supervisor_failure_warning_activity_counter = None;
         let mut last_backend_event_at: Option<Instant> = None;
         let mut last_stall_interrupt_at: Option<Instant> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
@@ -3308,9 +3157,6 @@ pub(crate) fn spawn_agent_actor(
                                 active_stream_included: false,
                             });
                         }
-                        AgentCommand::ReadSupervisionContext { reply } => {
-                            let _ = reply.send(supervisor::SupervisionContextSnapshot::default());
-                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
@@ -3329,24 +3175,6 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
-                        }
-                        AgentCommand::BeginSupervisorVerdictIfInactive {
-                            supervisor_settings_rx,
-                            reply,
-                            ..
-                        } => {
-                            let _ = reply.send(SupervisorVerdictStart::Rejected {
-                                reason: SupervisorVerdictStartRejection::Ineligible,
-                                live_settings: *supervisor_settings_rx.borrow(),
-                            });
-                        }
-                        AgentCommand::AppendSupervisorFailureWarningIfInactive {
-                            reply, ..
-                        } => {
-                            let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
-                        }
-                        AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
-                            let _ = reply.send(SupervisorStallInterruptOutcome::NotStalled);
                         }
                         AgentCommand::CompactIfInactive {
                             accepted, reply, ..
@@ -3734,11 +3562,333 @@ pub(crate) fn spawn_agent_actor(
             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
             return;
         }
+        let mut supervisor_state = supervisor::SupervisorState::new(
+            &status_handle.snapshot().await,
+            supervisor_settings_rx.borrow().settings,
+            Instant::now(),
+        );
+        let mut last_supervisor_settings = *supervisor_settings_rx.borrow();
+        // Carries the activity counter the verdict was launched under, which is
+        // the whole staleness check: if it still matches, nothing happened in
+        // this conversation while the call was out.
+        let (supervisor_verdict_tx, mut supervisor_verdict_rx) = mpsc::unbounded_channel::<(
+            u64,
+            Result<supervisor::SupervisionVerdict, supervisor::SupervisionFailure>,
+        )>();
         loop {
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed agent replay log must project latest output");
+            // The loop turns whenever a backend event or command lands, which
+            // is exactly when this agent's status can have changed, so the
+            // supervisor sees every transition without polling anything.
+            let supervisor_settings = *supervisor_settings_rx.borrow();
+            if supervisor_settings != last_supervisor_settings {
+                supervisor_state.apply_settings_change(
+                    last_supervisor_settings.settings,
+                    supervisor_settings.settings,
+                    Instant::now(),
+                );
+                last_supervisor_settings = supervisor_settings;
+            }
+            let supervisor_status = status_handle.snapshot().await;
+            supervisor_state.observe(
+                &supervisor_status,
+                supervisor_settings.settings,
+                &event_log,
+                active_compaction.is_some() || context_compaction.is_some(),
+                Instant::now(),
+            );
+            let supervisor_deadline = supervisor_state
+                .next_deadline(supervisor_settings.settings, supervisor_settings.epoch);
+            let stall_timeout = Duration::from_secs(u64::from(
+                supervisor_settings.settings.stall_timeout_seconds,
+            ));
+            // The turn's own start counts as progress, so a backend that goes
+            // silent immediately is measured from when it began rather than
+            // from an older event. One interrupt per window: a backend that
+            // swallows the first gets another a full window later, not a loop.
+            let stall_deadline = (supervisor_settings.settings.enabled
+                && supervisor_settings.settings.stall_timeout_enabled
+                && in_turn)
+                .then(|| {
+                    [
+                        supervisor_status.turn_started_at,
+                        last_backend_event_at,
+                        last_stall_interrupt_at,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                    .and_then(|at| at.checked_add(stall_timeout))
+                })
+                .flatten();
+            let supervisor_sleep = tokio::time::sleep_until(
+                supervisor_deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))
+                    .into(),
+            );
+            let stall_sleep = tokio::time::sleep_until(
+                stall_deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))
+                    .into(),
+            );
+            tokio::pin!(supervisor_sleep);
+            tokio::pin!(stall_sleep);
             tokio::select! {
+                _ = &mut supervisor_sleep, if supervisor_deadline.is_some() => {
+                    let now = Instant::now();
+                    let action = supervisor_state.due_action(
+                        supervisor_settings.settings,
+                        supervisor_settings.epoch,
+                        now,
+                    );
+                    // Everything the host used to re-verify over a round trip
+                    // — that the agent is still idle, that nothing is queued,
+                    // that the actor is not closing — is just local state here.
+                    let idle = !supervisor_status.terminated
+                        && !supervisor_status.is_active()
+                        && !supervisor_status.is_user_response_pending()
+                        && !matches!(lifecycle, ActorLifecycle::Closing)
+                        && !in_turn
+                        && queue.is_empty();
+                    if let supervisor::SupervisorAction::LaunchVerdict { attempts_started } = action {
+                        let context = supervisor::supervision_context_snapshot(&event_log);
+                        let record = match current_session_id.as_ref() {
+                            Some(session_id) => session_store.lock().await.get(session_id),
+                            None => None,
+                        };
+                        let allowed = supervisor::supervision_record_allows_action(
+                            record.as_ref(),
+                            &context,
+                            supervisor::SupervisionAction::Verdict,
+                        );
+                        // Spending a paid call with no follow-up left to send
+                        // would buy nothing, so the budget gates the verdict
+                        // rather than only the kick it might produce.
+                        let kick_budget_left = context.kicks_since_user_message
+                            < u32::from(supervisor_settings.settings.max_kicks_per_task.max(1));
+                        match context.last_user_message.clone() {
+                            Some(last_user_message)
+                                if idle
+                                    && allowed
+                                    && kick_budget_left
+                                    && !context.cancelled_since_user_message =>
+                            {
+                                let task_list = match current_session_id.as_ref() {
+                                    Some(session_id) => {
+                                        session_store.lock().await.get_task_list(session_id)
+                                    }
+                                    None => None,
+                                };
+                                let request = supervisor::GenerateSupervisionVerdictRequest {
+                                    verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
+                                    backend_kind,
+                                    last_user_message,
+                                    task_list,
+                                    last_assistant_message: context.last_assistant_message.clone(),
+                                    last_error: context.last_error_since_user_message.clone(),
+                                    stall_interrupted: context.last_turn_was_stall_interrupted,
+                                    kicks_so_far: context.kicks_since_user_message,
+                                    last_kick_message: context.last_kick_message.clone(),
+                                    last_reply_to_kick: context.last_reply_to_kick.clone(),
+                                    cost_hint: supervisor_settings.settings.cost_tier.as_cost_hint(),
+                                    session_settings: crate::host::hidden_helper_session_settings(
+                                        backend_kind,
+                                        record
+                                            .as_ref()
+                                            .and_then(|record| record.session_settings.as_ref()),
+                                    ),
+                                    use_mock_backend: supervisor_use_mock_backend,
+                                    capacity_tx: supervisor_capacity_tx.clone(),
+                                };
+                                supervisor_state
+                                    .begin_verdict(supervisor_settings.settings, attempts_started);
+                                let verdict_tx = supervisor_verdict_tx.clone();
+                                let launched_at = supervisor_status.activity_counter;
+                                tokio::spawn(async move {
+                                    let result = match tokio::time::timeout(
+                                        supervisor::SUPERVISION_GENERATION_TIMEOUT,
+                                        supervisor::generate_supervision_verdict(request),
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => result,
+                                        Err(_) => Err(supervisor::SupervisionFailure {
+                                            kind: supervisor::SupervisionFailureKind::Timeout,
+                                            message: "supervision verdict timed out".to_owned(),
+                                        }),
+                                    };
+                                    let _ = verdict_tx.send((launched_at, result));
+                                });
+                            }
+                            _ => supervisor_state.settle(now),
+                        }
+                    }
+                    if action == supervisor::SupervisorAction::RequestCompaction {
+                        let context = supervisor::supervision_context_snapshot(&event_log);
+                        let record = match current_session_id.as_ref() {
+                            Some(session_id) => session_store.lock().await.get(session_id),
+                            None => None,
+                        };
+                        let over_threshold =
+                            context.current_context_input_tokens.is_some_and(|current| {
+                                current
+                                    > supervisor_settings.settings.auto_compact_min_context_tokens
+                            });
+                        if idle
+                            && over_threshold
+                            && supervisor::supervision_record_allows_action(
+                                record.as_ref(),
+                                &context,
+                                supervisor::SupervisionAction::AutoCompaction,
+                            )
+                        {
+                            supervisor_state.begin_compaction(now);
+                            let _ = supervisor_compaction_tx.send(
+                                crate::host::SupervisorCompactionRequest {
+                                    agent_id: current_start.agent_id.clone(),
+                                    activity_counter: supervisor_status.activity_counter,
+                                    settings_epoch: supervisor_settings.epoch,
+                                },
+                            );
+                        } else {
+                            // Evaluated for this settings epoch: a threshold that
+                            // is not met is checked once, not every tick.
+                            supervisor_state.mark_compaction_evaluated(supervisor_settings.epoch);
+                        }
+                    }
+                }
+                // A settings edit changes what the next deadline should be, and
+                // may arm supervision that was switched off entirely, so it has
+                // to wake the loop rather than wait for unrelated traffic.
+                Ok(()) = supervisor_settings_rx.changed() => {}
+                Some((launched_at, result)) = supervisor_verdict_rx.recv() => {
+                    let now = Instant::now();
+                    let launched_settings = supervisor_state.in_flight_verdict(launched_at);
+                    if launched_settings.is_none() {
+                        tracing::debug!(
+                            agent_id = %current_start.agent_id,
+                            "dropping a supervision verdict the conversation moved past"
+                        );
+                    } else if launched_settings
+                        != Some(supervisor::VerdictSettingsFingerprint::from(
+                            supervisor_settings.settings,
+                        ))
+                    {
+                        // The user edited the question while the call was out,
+                        // so this answer is to the old one.
+                        supervisor_state.note_verdict_failure(
+                            supervisor::SupervisionRetryReason::SettingsChanged,
+                            supervisor_settings.settings,
+                            now,
+                        );
+                    } else {
+                        match result {
+                            Ok(supervisor::SupervisionVerdict::Continue { message }) => {
+                                supervisor_state.settle(now);
+                                let payload = SendMessagePayload {
+                                    message: format!("{SUPERVISOR_MESSAGE_PREFIX}{message}"),
+                                    images: None,
+                                    origin: None,
+                                    tool_response: None,
+                                };
+                                let _ = supervisor_kick_tx.send(AgentCommand::SendInput(
+                                    AgentInput::SendMessage(payload),
+                                ));
+                            }
+                            Ok(_) => supervisor_state.settle(now),
+                            Err(failure) => {
+                                let exhausted = if failure.is_retryable() {
+                                    supervisor_state.note_verdict_failure(
+                                        supervisor::SupervisionRetryReason::Failure(failure.kind),
+                                        supervisor_settings.settings,
+                                        now,
+                                    )
+                                } else {
+                                    supervisor_state.settle(now);
+                                    Some(0)
+                                };
+                                if let Some(attempts_started) = exhausted {
+                                    tracing::warn!(
+                                        agent_id = %current_start.agent_id,
+                                        error = %failure.message,
+                                        "agent supervision gave up on this turn"
+                                    );
+                                    append_chat_event(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &mut replay_state,
+                                        &supervisor_failure_warning_event(attempts_started),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = &mut stall_sleep, if stall_deadline.is_some() => {
+                    let now = Instant::now();
+                    let stalled = !supervisor_status.terminated
+                        && !matches!(lifecycle, ActorLifecycle::Closing)
+                        && supervisor_status.is_active()
+                        // Waiting on a person is not stalling.
+                        && !supervisor_status.is_user_response_pending()
+                        && active_compaction.is_none()
+                        && !compaction_blocked
+                        // Detached background work is real progress that the
+                        // stream cannot show.
+                        && active_agent_await_ids.is_empty()
+                        // Cutting a turn short with no follow-up left to send
+                        // would destroy work and offer nothing in return.
+                        && supervisor::supervision_context_snapshot(&event_log)
+                            .kicks_since_user_message
+                            < u32::from(supervisor_settings.settings.max_kicks_per_task.max(1));
+                    if stalled {
+                        append_chat_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut replay_state,
+                            &supervisor_stall_interrupt_notice_event(
+                                supervisor_settings.settings.stall_timeout_seconds,
+                            ),
+                        )
+                        .await;
+                        let interrupted = backend
+                            .as_ref()
+                            .expect("backend must exist while actor is running")
+                            .interrupt()
+                            .await;
+                        last_stall_interrupt_at = Some(now);
+                        if interrupted {
+                            tracing::warn!(
+                                agent_id = %current_start.agent_id,
+                                stall_timeout_seconds =
+                                    supervisor_settings.settings.stall_timeout_seconds,
+                                "supervisor interrupted a turn that stopped making progress"
+                            );
+                        } else {
+                            let payload = AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(),
+                                code: AgentErrorCode::Internal,
+                                message: "agent backend does not support interrupt".to_owned(),
+                                fatal: false,
+                            };
+                            append_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                FrameKind::AgentError,
+                                &payload,
+                            )
+                            .await;
+                        }
+                    } else {
+                        last_stall_interrupt_at = Some(now);
+                    }
+                }
                 maybe_event = events.recv_backend() => {
                     let Some(event) = maybe_event else {
                         if let Some(compaction) = active_compaction.take() {
@@ -6212,186 +6362,6 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                         }
-                        AgentCommand::BeginSupervisorVerdictIfInactive {
-                            expected_activity_counter,
-                            expected_verdict_settings,
-                            supervisor_settings_rx,
-                            reply,
-                        } => {
-                            let live_status = status_handle.snapshot().await;
-                            wait_for_begin_supervisor_verdict_test_gate(
-                                &current_start.agent_id,
-                            )
-                            .await;
-                            let live_settings = *supervisor_settings_rx.borrow();
-                            let reason = if live_status.activity_counter
-                                != expected_activity_counter
-                            {
-                                Some(SupervisorVerdictStartRejection::ActivityChanged)
-                            } else if !live_settings.settings.enabled
-                                || crate::host::VerdictSettingsFingerprint::from(
-                                    live_settings.settings,
-                                ) != expected_verdict_settings
-                            {
-                                Some(SupervisorVerdictStartRejection::SettingsChanged)
-                            } else if live_status.terminated
-                                || live_status.is_active()
-                                || live_status.is_user_response_pending()
-                                || matches!(lifecycle, ActorLifecycle::Closing)
-                                || in_turn
-                                || !queue.is_empty()
-                            {
-                                Some(SupervisorVerdictStartRejection::Ineligible)
-                            } else {
-                                None
-                            };
-                            let verdict = reason.map_or(
-                                SupervisorVerdictStart::Accepted,
-                                |reason| SupervisorVerdictStart::Rejected {
-                                    reason,
-                                    live_settings,
-                                },
-                            );
-                            let _ = reply.send(verdict);
-                        }
-                        AgentCommand::AppendSupervisorFailureWarningIfInactive {
-                            expected_activity_counter,
-                            attempts_started,
-                            expected_settings,
-                            supervisor_settings_rx,
-                            reply,
-                        } => {
-                            let live_status = status_handle.snapshot().await;
-                            let live = *supervisor_settings_rx.borrow();
-                            let outcome = if !live.settings.enabled || live != expected_settings {
-                                AppendSupervisorWarningOutcome::SettingsChanged { live }
-                            } else if live_status.activity_counter != expected_activity_counter {
-                                AppendSupervisorWarningOutcome::ActivityChanged
-                            } else if live_status.terminated {
-                                AppendSupervisorWarningOutcome::Closed
-                            } else if live_status.is_active()
-                                || live_status.is_user_response_pending()
-                                || matches!(lifecycle, ActorLifecycle::Closing)
-                                || in_turn
-                                || !queue.is_empty()
-                            {
-                                AppendSupervisorWarningOutcome::Ineligible
-                            } else if last_supervisor_failure_warning_activity_counter
-                                == Some(expected_activity_counter)
-                            {
-                                AppendSupervisorWarningOutcome::AlreadyAppended
-                            } else {
-                                append_chat_event(
-                                    &canonical_stream,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut replay_state,
-                                    &supervisor_failure_warning_event(attempts_started),
-                                )
-                                .await;
-                                last_supervisor_failure_warning_activity_counter =
-                                    Some(expected_activity_counter);
-                                AppendSupervisorWarningOutcome::Appended
-                            };
-                            let _ = reply.send(outcome);
-                        }
-                        AgentCommand::InterruptStalledTurnIfStalled {
-                            expected_settings,
-                            supervisor_settings_rx,
-                            reply,
-                        } => {
-                            let live_status = status_handle.snapshot().await;
-                            let live = *supervisor_settings_rx.borrow();
-                            let stall_timeout = Duration::from_secs(u64::from(
-                                live.settings.stall_timeout_seconds,
-                            ));
-                            let now = Instant::now();
-                            // The turn's own start counts as progress so a
-                            // backend that goes silent immediately is measured
-                            // from when it began, not from an older event.
-                            let progress_at = [live_status.turn_started_at, last_backend_event_at]
-                                .into_iter()
-                                .flatten()
-                                .max();
-                            let outcome = if !live.settings.enabled
-                                || !live.settings.stall_timeout_enabled
-                                || live != expected_settings
-                            {
-                                SupervisorStallInterruptOutcome::SettingsChanged { live }
-                            } else if live_status.terminated
-                                || matches!(lifecycle, ActorLifecycle::Closing)
-                            {
-                                SupervisorStallInterruptOutcome::Closed
-                            } else if !in_turn
-                                || !live_status.is_active()
-                                || live_status.is_user_response_pending()
-                            {
-                                // Waiting on the user is not stalling, and the
-                                // clock restarts when that turn resumes.
-                                SupervisorStallInterruptOutcome::NotStalled
-                            } else if active_compaction.is_some() || compaction_blocked {
-                                SupervisorStallInterruptOutcome::Rejected
-                            } else if !active_agent_await_ids.is_empty() {
-                                SupervisorStallInterruptOutcome::NotStalled
-                            } else if let Some(remaining) = progress_at
-                                .map(|at| stall_timeout.saturating_sub(now.saturating_duration_since(at)))
-                                .filter(|remaining| !remaining.is_zero())
-                            {
-                                SupervisorStallInterruptOutcome::TooEarly { remaining }
-                            } else if let Some(remaining) = last_stall_interrupt_at
-                                .map(|at| stall_timeout.saturating_sub(now.saturating_duration_since(at)))
-                                .filter(|remaining| !remaining.is_zero())
-                            {
-                                // One interrupt per stall window: a backend that
-                                // swallows the first one gets another attempt a
-                                // full window later instead of a tight loop.
-                                SupervisorStallInterruptOutcome::TooEarly { remaining }
-                            } else {
-                                append_chat_event(
-                                    &canonical_stream,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut replay_state,
-                                    &supervisor_stall_interrupt_notice_event(
-                                        live.settings.stall_timeout_seconds,
-                                    ),
-                                )
-                                .await;
-                                let interrupted = backend
-                                    .as_ref()
-                                    .expect("backend must exist while actor is running")
-                                    .interrupt()
-                                    .await;
-                                last_stall_interrupt_at = Some(now);
-                                if interrupted {
-                                    tracing::warn!(
-                                        agent_id = %current_start.agent_id,
-                                        stall_timeout_seconds =
-                                            live.settings.stall_timeout_seconds,
-                                        "supervisor interrupted a turn that stopped making progress"
-                                    );
-                                    SupervisorStallInterruptOutcome::Interrupted
-                                } else {
-                                    let payload = AgentErrorPayload {
-                                        agent_id: current_start.agent_id.clone(),
-                                        code: AgentErrorCode::Internal,
-                                        message: "agent backend does not support interrupt"
-                                            .to_owned(),
-                                        fatal: false,
-                                    };
-                                    append_event(
-                                        &canonical_stream,
-                                        &mut event_log,
-                                        &mut subscribers,
-                                        FrameKind::AgentError,
-                                        &payload,
-                                    )
-                                    .await;
-                                    SupervisorStallInterruptOutcome::Rejected
-                                }
-                            };
-                            let _ = reply.send(outcome);
-                        }
                         AgentCommand::ReadCompactionCapability { reply } => {
                             let capability = backend
                                 .as_ref()
@@ -7651,10 +7621,6 @@ pub(crate) fn spawn_agent_actor(
                                 max_bytes,
                             ));
                         }
-                        AgentCommand::ReadSupervisionContext { reply } => {
-                            let _ = reply
-                                .send(supervisor::supervision_context_snapshot(&event_log));
-                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
@@ -8015,8 +7981,6 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
             | BackendKind::Tycode
     )
 }
-
-async fn wait_for_begin_supervisor_verdict_test_gate(_agent_id: &AgentId) {}
 
 async fn wait_for_compact_if_inactive_test_gate(_agent_id: &AgentId) {}
 
@@ -8423,22 +8387,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
                         }
-                        AgentCommand::BeginSupervisorVerdictIfInactive {
-                            supervisor_settings_rx,
-                            reply,
-                            ..
-                        } => {
-                            let _ = reply.send(SupervisorVerdictStart::Rejected {
-                                reason: SupervisorVerdictStartRejection::Ineligible,
-                                live_settings: *supervisor_settings_rx.borrow(),
-                            });
-                        }
-                        AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
-                            let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
-                        }
-                        AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
-                            let _ = reply.send(SupervisorStallInterruptOutcome::NotStalled);
-                        }
                         AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                             let error = "backend-native agents cannot be compacted".to_owned();
                             let _ = accepted.send(Err(error.clone()));
@@ -8592,10 +8540,6 @@ pub(crate) fn spawn_relay_agent_actor(
                                 max_events,
                                 max_bytes,
                             ));
-                        }
-                        AgentCommand::ReadSupervisionContext { reply } => {
-                            let _ = reply
-                                .send(supervisor::supervision_context_snapshot(&event_log));
                         }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
@@ -9270,9 +9214,6 @@ async fn park_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
-            AgentCommand::ReadSupervisionContext { reply } => {
-                let _ = reply.send(supervisor::supervision_context_snapshot(event_log));
-            }
             AgentCommand::ReadUsageSnapshot { reply } => {
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
@@ -9293,22 +9234,6 @@ async fn park_terminal_agent(
             }
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("agent is not running".to_owned()));
-            }
-            AgentCommand::BeginSupervisorVerdictIfInactive {
-                supervisor_settings_rx,
-                reply,
-                ..
-            } => {
-                let _ = reply.send(SupervisorVerdictStart::Rejected {
-                    reason: SupervisorVerdictStartRejection::Ineligible,
-                    live_settings: *supervisor_settings_rx.borrow(),
-                });
-            }
-            AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
-                let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
-            }
-            AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
-                let _ = reply.send(SupervisorStallInterruptOutcome::Closed);
             }
             AgentCommand::CompactIfInactive {
                 accepted, reply, ..
@@ -9473,9 +9398,6 @@ async fn park_relay_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
-            AgentCommand::ReadSupervisionContext { reply } => {
-                let _ = reply.send(supervisor::supervision_context_snapshot(event_log));
-            }
             AgentCommand::ReadUsageSnapshot { reply } => {
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
@@ -9496,22 +9418,6 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
-            }
-            AgentCommand::BeginSupervisorVerdictIfInactive {
-                supervisor_settings_rx,
-                reply,
-                ..
-            } => {
-                let _ = reply.send(SupervisorVerdictStart::Rejected {
-                    reason: SupervisorVerdictStartRejection::Ineligible,
-                    live_settings: *supervisor_settings_rx.borrow(),
-                });
-            }
-            AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
-                let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
-            }
-            AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
-                let _ = reply.send(SupervisorStallInterruptOutcome::Closed);
             }
             AgentCommand::CompactIfInactive {
                 accepted, reply, ..

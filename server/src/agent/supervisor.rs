@@ -7,6 +7,8 @@
 //! throwaway unregistered agent id with an isolated tempdir workspace, no
 //! tools, and inference-only backend hardening.
 
+use std::time::{Duration, Instant};
+
 use protocol::{
     ChatEvent, ChatMessage, Envelope, FrameKind, MessageSender, SUPERVISOR_MESSAGE_PREFIX,
     SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SendMessagePayload, SessionSettingsValues, Task,
@@ -14,6 +16,7 @@ use protocol::{
 };
 use tokio::sync::mpsc;
 
+use super::registry::AgentStatus;
 use super::{
     AgentId, BackendAccessMode, BackendExecutionMode, BackendKind, BackendSpawnConfig, EventStream,
     HostCapacityTx, HostSubAgentEmitterContext, SpawnCostHint, ToolPolicy, spawn_backend,
@@ -229,6 +232,470 @@ fn observe_message(
             snapshot.stall_interrupt_awaiting_cancel = true;
         }
         MessageSender::System | MessageSender::Warning => {}
+    }
+}
+
+/// One supervision verdict reads more context than naming, so it gets a
+/// longer budget per attempt.
+pub(crate) const SUPERVISION_GENERATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Grace period between going idle and judging, so queued-message drains and
+/// immediate user follow-ups win the race instead of being second-guessed.
+const SUPERVISION_DEBOUNCE: Duration = Duration::from_secs(3);
+const SUPERVISION_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(240),
+    Duration::from_secs(480),
+];
+const _: () = assert!(
+    SUPERVISION_RETRY_DELAYS.len() == settings_model::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize
+);
+
+/// Settings a verdict was launched under. Editing any of them mid-flight
+/// invalidates the answer, because the user changed the question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerdictSettingsFingerprint {
+    max_kicks_per_task: u8,
+    retry_attempts: u8,
+    cost_tier: settings_model::SupervisorCostTier,
+}
+
+impl From<settings_model::SupervisorSettings> for VerdictSettingsFingerprint {
+    fn from(settings: settings_model::SupervisorSettings) -> Self {
+        Self {
+            max_kicks_per_task: settings.max_kicks_per_task,
+            retry_attempts: settings.retry_attempts,
+            cost_tier: settings.cost_tier,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SupervisionAction {
+    Verdict,
+    AutoCompaction,
+}
+
+/// Whether the session's compaction history still permits supervising this
+/// turn. A replacement agent's bootstrap summary is not work the user asked
+/// for, so judging or re-compacting it would loop.
+pub(crate) fn supervision_record_allows_action(
+    record: Option<&crate::store::session::SessionRecord>,
+    context: &SupervisionContextSnapshot,
+    action: SupervisionAction,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    if record.compacted_to_session_id.is_some() {
+        return false;
+    }
+    if !record.compaction_operations.is_empty() || context.compaction_user_message_count.is_some() {
+        return match action {
+            SupervisionAction::Verdict => !context.supervision_verdict_dormant_until_real_user,
+            SupervisionAction::AutoCompaction => !context.auto_compaction_blocked_until_real_user,
+        };
+    }
+    !(record.compacted_from_session_id.is_some() && context.user_message_count <= 1)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisionRetryReason {
+    Failure(SupervisionFailureKind),
+    SettingsChanged,
+}
+
+#[derive(Debug)]
+enum Phase {
+    /// A turn is running. Stall timing lives in the actor, which already tracks
+    /// the turn start and the last backend event exactly; duplicating it here
+    /// would only make it staler.
+    Active,
+    Debouncing {
+        idle_since: Instant,
+    },
+    /// A restored transcript is replayed work rather than work this agent just
+    /// did, so judging it is opt-in.
+    RestoreDeferred {
+        idle_since: Instant,
+    },
+    VerdictInFlight {
+        idle_since: Instant,
+        attempts_started: u8,
+        verdict_settings: VerdictSettingsFingerprint,
+    },
+    RetryPending {
+        idle_since: Instant,
+        attempts_started: u8,
+        due_at: Instant,
+    },
+    FailureExhausted {
+        idle_since: Instant,
+        attempts_started: u8,
+        retry_due_at: Option<Instant>,
+        compaction_epoch: Option<u64>,
+    },
+    /// Judged and settled, or deliberately skipped. Auto-compaction keys on
+    /// this phase, so a turn that ends by asking the user a question relieves
+    /// context pressure exactly like one that ends by finishing the work.
+    Settled {
+        idle_since: Instant,
+        compaction_epoch: Option<u64>,
+    },
+    CompactionPending {
+        idle_since: Instant,
+    },
+    Compacting,
+    /// A compaction just landed. Re-judging the replacement's bootstrap turn
+    /// would compact it again forever, so this clears only on a real user
+    /// message — tracked by count, since the bootstrap prompt is itself one.
+    PostCompactionDormant {
+        idle_since: Instant,
+        user_message_count: u32,
+    },
+}
+
+/// What the actor should do now that a supervisor deadline has come due.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorAction {
+    None,
+    LaunchVerdict { attempts_started: u8 },
+    RequestCompaction,
+}
+
+/// Supervisor scheduling state, owned by the agent actor.
+///
+/// This used to be one host-side scheduler over every agent, which meant every
+/// decision had to be re-verified against a status watch that could not observe
+/// stream deltas. Reading the same state from inside the actor makes the stall
+/// clock exact and reduces verdict staleness checks to one activity comparison,
+/// in place of re-fetching the conversation, the session record and the
+/// settings between deciding and acting.
+#[derive(Debug)]
+pub(crate) struct SupervisorState {
+    phase: Phase,
+    last_activity: u64,
+}
+
+impl SupervisorState {
+    pub(crate) fn new(
+        status: &AgentStatus,
+        settings: settings_model::SupervisorSettings,
+        now: Instant,
+    ) -> Self {
+        Self {
+            phase: Self::fresh_phase(status, settings, now),
+            last_activity: status.activity_counter,
+        }
+    }
+
+    fn fresh_phase(
+        status: &AgentStatus,
+        settings: settings_model::SupervisorSettings,
+        now: Instant,
+    ) -> Phase {
+        if status.is_active() {
+            Phase::Active
+        } else if status.is_user_response_pending() {
+            Phase::Settled {
+                idle_since: now,
+                compaction_epoch: None,
+            }
+        } else if status.restored_without_live_turn && !settings.supervise_restored_agents {
+            Phase::RestoreDeferred { idle_since: now }
+        } else {
+            Phase::Debouncing { idle_since: now }
+        }
+    }
+
+    fn idle_since(&self) -> Option<Instant> {
+        match &self.phase {
+            Phase::Debouncing { idle_since }
+            | Phase::RestoreDeferred { idle_since }
+            | Phase::VerdictInFlight { idle_since, .. }
+            | Phase::RetryPending { idle_since, .. }
+            | Phase::FailureExhausted { idle_since, .. }
+            | Phase::Settled { idle_since, .. }
+            | Phase::CompactionPending { idle_since }
+            | Phase::PostCompactionDormant { idle_since, .. } => Some(*idle_since),
+            Phase::Active | Phase::Compacting => None,
+        }
+    }
+
+    /// Auto-compaction reacts to context pressure, not to a verdict, so it
+    /// fires from every phase where the agent has settled and no judgement is
+    /// pending. It stays out of `RestoreDeferred` (supervision there is opt-in)
+    /// and `PostCompactionDormant` (that is the anti-loop guard).
+    fn compaction_epoch(&self) -> Option<Option<u64>> {
+        match &self.phase {
+            Phase::Settled {
+                compaction_epoch, ..
+            }
+            | Phase::FailureExhausted {
+                compaction_epoch, ..
+            } => Some(*compaction_epoch),
+            _ => None,
+        }
+    }
+
+    /// Folds a status the actor just published into the phase machine. A
+    /// compaction in progress owns the phase until its own handshake completes.
+    pub(crate) fn observe(
+        &mut self,
+        status: &AgentStatus,
+        settings: settings_model::SupervisorSettings,
+        event_log: &[Envelope],
+        compaction_in_progress: bool,
+        now: Instant,
+    ) {
+        let activity_changed = self.last_activity != status.activity_counter;
+        self.last_activity = status.activity_counter;
+        match &self.phase {
+            Phase::CompactionPending { .. } if compaction_in_progress => {
+                self.phase = Phase::Compacting;
+                return;
+            }
+            // The request was refused, or activity beat it there.
+            Phase::CompactionPending { .. } if !activity_changed => return,
+            Phase::Compacting if compaction_in_progress => return,
+            Phase::Compacting => {
+                self.phase = Phase::PostCompactionDormant {
+                    idle_since: now,
+                    user_message_count: supervision_context_snapshot(event_log).user_message_count,
+                };
+                return;
+            }
+            _ => {}
+        }
+        // Projecting the log is linear in its length, so it stays in the one
+        // branch that needs it: deciding whether the message that woke a
+        // just-compacted agent was a real user message or its own bootstrap.
+        if let Phase::PostCompactionDormant {
+            user_message_count: at_compaction,
+            ..
+        } = &self.phase
+            && (!activity_changed
+                || supervision_context_snapshot(event_log).user_message_count <= *at_compaction)
+        {
+            return;
+        }
+        if activity_changed {
+            self.phase = Self::fresh_phase(status, settings, now);
+            return;
+        }
+        if status.is_active() {
+            self.phase = Phase::Active;
+        } else if status.is_user_response_pending() {
+            self.phase = Phase::Settled {
+                idle_since: self.idle_since().unwrap_or(now),
+                compaction_epoch: None,
+            };
+        } else if matches!(&self.phase, Phase::Active) {
+            self.phase = if status.restored_without_live_turn && !settings.supervise_restored_agents
+            {
+                Phase::RestoreDeferred { idle_since: now }
+            } else {
+                Phase::Debouncing { idle_since: now }
+            };
+        }
+    }
+
+    /// Earliest instant this agent needs the supervisor to look at it again.
+    pub(crate) fn next_deadline(
+        &self,
+        settings: settings_model::SupervisorSettings,
+        epoch: u64,
+    ) -> Option<Instant> {
+        if !settings.enabled {
+            return None;
+        }
+        if let Some(compaction_epoch) = self.compaction_epoch() {
+            if settings.auto_compact_on_success && compaction_epoch != Some(epoch) {
+                return self
+                    .idle_since()?
+                    .checked_add(Duration::from_secs(u64::from(
+                        settings.auto_compact_inactivity_delay_seconds,
+                    )));
+            }
+            return None;
+        }
+        match &self.phase {
+            Phase::Debouncing { idle_since } => idle_since.checked_add(SUPERVISION_DEBOUNCE),
+            Phase::RetryPending { due_at, .. } => Some(*due_at),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn due_action(
+        &self,
+        settings: settings_model::SupervisorSettings,
+        epoch: u64,
+        now: Instant,
+    ) -> SupervisorAction {
+        if self
+            .next_deadline(settings, epoch)
+            .is_none_or(|due| due > now)
+        {
+            return SupervisorAction::None;
+        }
+        match &self.phase {
+            Phase::Debouncing { .. } => SupervisorAction::LaunchVerdict {
+                attempts_started: 0,
+            },
+            Phase::RetryPending {
+                attempts_started, ..
+            } => SupervisorAction::LaunchVerdict {
+                attempts_started: *attempts_started,
+            },
+            Phase::Settled { .. } | Phase::FailureExhausted { .. } => {
+                SupervisorAction::RequestCompaction
+            }
+            _ => SupervisorAction::None,
+        }
+    }
+
+    pub(crate) fn begin_verdict(
+        &mut self,
+        settings: settings_model::SupervisorSettings,
+        attempts_started: u8,
+    ) {
+        let Some(idle_since) = self.idle_since() else {
+            return;
+        };
+        self.phase = Phase::VerdictInFlight {
+            idle_since,
+            attempts_started: attempts_started.saturating_add(1),
+            verdict_settings: VerdictSettingsFingerprint::from(settings),
+        };
+    }
+
+    /// Settings the in-flight verdict was launched under, or `None` if the
+    /// conversation moved on while it was out — which drops the result. The
+    /// host needed the conversation, the session record and the settings
+    /// re-read here; inside the actor an unchanged activity counter means
+    /// nothing happened.
+    pub(crate) fn in_flight_verdict(
+        &self,
+        activity_counter: u64,
+    ) -> Option<VerdictSettingsFingerprint> {
+        let Phase::VerdictInFlight {
+            verdict_settings, ..
+        } = &self.phase
+        else {
+            return None;
+        };
+        (self.last_activity == activity_counter).then_some(*verdict_settings)
+    }
+
+    pub(crate) fn settle(&mut self, now: Instant) {
+        self.phase = Phase::Settled {
+            idle_since: self.idle_since().unwrap_or(now),
+            compaction_epoch: None,
+        };
+    }
+
+    /// Records a failed or invalidated verdict and schedules the next attempt.
+    /// Returns the attempt count once they are exhausted, so the caller can
+    /// tell the user supervision gave up; `None` while retries remain.
+    pub(crate) fn note_verdict_failure(
+        &mut self,
+        reason: SupervisionRetryReason,
+        settings: settings_model::SupervisorSettings,
+        now: Instant,
+    ) -> Option<u8> {
+        let Phase::VerdictInFlight {
+            idle_since,
+            attempts_started,
+            ..
+        } = &self.phase
+        else {
+            return None;
+        };
+        let (idle_since, attempts_started) = (*idle_since, *attempts_started);
+        let maximum_attempts = settings.retry_attempts.saturating_add(1);
+        let delay_index = usize::from(attempts_started.saturating_sub(1));
+        if attempts_started >= maximum_attempts {
+            self.phase = match reason {
+                // The backoff the next attempt *would* have used is kept, so
+                // raising the retry limit later resumes on the original
+                // schedule instead of firing a burst immediately.
+                SupervisionRetryReason::Failure(_) => Phase::FailureExhausted {
+                    idle_since,
+                    attempts_started,
+                    retry_due_at: SUPERVISION_RETRY_DELAYS
+                        .get(delay_index)
+                        .and_then(|delay| now.checked_add(*delay)),
+                    compaction_epoch: None,
+                },
+                SupervisionRetryReason::SettingsChanged => Phase::Settled {
+                    idle_since,
+                    compaction_epoch: None,
+                },
+            };
+            return Some(attempts_started);
+        }
+        let delay = SUPERVISION_RETRY_DELAYS[delay_index];
+        self.phase = Phase::RetryPending {
+            idle_since,
+            attempts_started,
+            due_at: now.checked_add(delay).unwrap_or(now),
+        };
+        None
+    }
+
+    pub(crate) fn begin_compaction(&mut self, now: Instant) {
+        self.phase = Phase::CompactionPending {
+            idle_since: self.idle_since().unwrap_or(now),
+        };
+    }
+
+    /// Marks the context-pressure gate as answered for this settings epoch, so
+    /// a threshold that is not met is evaluated once rather than every tick.
+    pub(crate) fn mark_compaction_evaluated(&mut self, epoch: u64) {
+        match &mut self.phase {
+            Phase::Settled {
+                compaction_epoch, ..
+            }
+            | Phase::FailureExhausted {
+                compaction_epoch, ..
+            } => *compaction_epoch = Some(epoch),
+            _ => {}
+        }
+    }
+
+    /// Turning `supervise_restored_agents` on judges the restored agents that
+    /// were waiting on it from this edit rather than from their original
+    /// restore instant: the verdict is being authorized now, and the debounce
+    /// exists to let an immediate user follow-up win the race.
+    pub(crate) fn apply_settings_change(
+        &mut self,
+        previous: settings_model::SupervisorSettings,
+        current: settings_model::SupervisorSettings,
+        now: Instant,
+    ) {
+        if !previous.supervise_restored_agents
+            && current.supervise_restored_agents
+            && matches!(&self.phase, Phase::RestoreDeferred { .. })
+        {
+            self.phase = Phase::Debouncing { idle_since: now };
+        }
+        // Raising the retry limit resumes an exhausted agent on the backoff it
+        // had already earned, rather than firing the next attempt immediately.
+        if let Phase::FailureExhausted {
+            idle_since,
+            attempts_started,
+            retry_due_at: Some(due_at),
+            ..
+        } = &self.phase
+            && *attempts_started < current.retry_attempts.saturating_add(1)
+        {
+            self.phase = Phase::RetryPending {
+                idle_since: *idle_since,
+                attempts_started: *attempts_started,
+                due_at: *due_at,
+            };
+        }
     }
 }
 
