@@ -2731,7 +2731,6 @@ struct BufferedCodexToolRequest {
     turn_id: Option<String>,
     provider_item_id: Option<String>,
     provider_call_id: Option<String>,
-    raw_completes_tool: bool,
     tool_call_id: String,
     tool_name: String,
     arguments: Value,
@@ -2955,7 +2954,7 @@ impl CodexResponseSplitter {
             .flat_map(|response| response.raw_tool_requests.iter())
             .chain(self.pending_raw_tool_owners.values())
             .filter(|owner| owner.turn_id.as_deref() == Some(turn_id))
-            .filter(|owner| owner.tool_name == "exec")
+            .filter(|owner| is_codex_shell_tool_name(&owner.tool_name))
             .filter(|owner| !self.claimed_raw_tool_calls.contains(&owner.tool_call_id))
             .cloned();
         let owner = owners.next()?;
@@ -2980,7 +2979,7 @@ impl CodexResponseSplitter {
             .flat_map(|response| response.raw_tool_requests.iter())
             .chain(self.pending_raw_tool_owners.values())
             .filter(|candidate| candidate.turn_id.as_deref() == Some(turn_id))
-            .filter(|candidate| candidate.tool_name == "exec")
+            .filter(|candidate| is_codex_shell_tool_name(&candidate.tool_name))
         {
             if owner
                 .as_ref()
@@ -3156,7 +3155,6 @@ impl CodexResponseSplitter {
             existing.turn_id = turn_id.map(str::to_owned);
             existing.provider_item_id = provider_item_id;
             existing.provider_call_id = provider_call_id;
-            existing.raw_completes_tool = false;
             existing.tool_call_id = tool_call_id.to_owned();
             existing.tool_name = tool_name.to_owned();
             existing.arguments = arguments;
@@ -3166,7 +3164,6 @@ impl CodexResponseSplitter {
                 turn_id: turn_id.map(str::to_owned),
                 provider_item_id,
                 provider_call_id,
-                raw_completes_tool: false,
                 tool_call_id: tool_call_id.to_owned(),
                 tool_name: tool_name.to_owned(),
                 arguments,
@@ -3201,11 +3198,21 @@ impl CodexResponseSplitter {
                 tool_requests.push(raw);
             }
         }
+        // Park *every* owner under its provider `call_id`. Codex reports one
+        // shell tool twice: a raw `function_call` item (`id: fc_…`, `call_id:
+        // call_…`) which is what declares the card below, and a
+        // `commandExecution` item whose `id` *is* that `call_id`. The
+        // execution routinely starts after this response has finalized, and
+        // once `self.open` is gone this map is the only place its owner can
+        // still be found.
+        //
+        // This used to be gated on a `raw_completes_tool` flag that meant
+        // `item_type == "custom_tool_call"`, so `function_call` owners — every
+        // shell command — were dropped here. The execution then found nothing,
+        // minted a *second* card for the same command and completed that one,
+        // leaving the declared card open until the idle sweep cancelled it.
         for request in &tool_requests {
-            if !failed
-                && request.raw_completes_tool
-                && let Some(call_id) = request.provider_call_id.as_ref()
-            {
+            if !failed && let Some(call_id) = request.provider_call_id.as_ref() {
                 self.pending_raw_tool_owners
                     .insert(call_id.clone(), request.clone());
             }
@@ -3787,6 +3794,20 @@ struct CodexUnownedCommand {
     turn_id: String,
 }
 
+/// A tool outcome that arrived before its card existed.
+///
+/// Codex does not order a `commandExecution`'s `item/completed` against the
+/// `rawResponse/completed` that declares the owning card, so a fast command
+/// (`printf`, `cat`) can finish first. Emitting then is a
+/// `completion_without_request` violation; dropping it leaves the card
+/// spinning until the idle sweep cancels it. Hold the outcome here and flush
+/// it in `finalize_strict_response` once the card has been declared.
+struct CodexDeferredToolCompletion {
+    thread_id: String,
+    tool_call_id: String,
+    outcome: ToolExecutionOutcome,
+}
+
 enum CodexUnlinkedRawToolResolution {
     OrdinaryCompletion,
     Correlated(String),
@@ -3878,6 +3899,9 @@ struct CodexState {
     /// still be — or become — a background terminal.
     outstanding_command_executions: HashMap<(String, String), CodexOutstandingCommand>,
     unowned_command_executions: HashMap<(String, String), CodexUnownedCommand>,
+    /// Outcomes that outran the response finalize which declares their card.
+    /// Drained by `flush_deferred_tool_completions`.
+    deferred_tool_completions: Vec<CodexDeferredToolCompletion>,
     /// Whether the background-terminal poll loop is already running.
     background_terminal_poll_active: bool,
     pending_background_wakes: VecDeque<CodexBackgroundWake>,
@@ -3960,6 +3984,7 @@ fn initial_codex_state(
         background_command_owner_active: true,
         outstanding_command_executions: HashMap::new(),
         unowned_command_executions: HashMap::new(),
+        deferred_tool_completions: Vec::new(),
         background_terminal_poll_active: false,
         pending_background_wakes: VecDeque::new(),
         background_wake_request_in_flight: false,
@@ -5198,6 +5223,94 @@ impl CodexInner {
             );
         }
         self.spawn_background_terminal_poll();
+    }
+
+    /// Emit a tool outcome, or hold it if its card has not been declared yet.
+    ///
+    /// See [`CodexDeferredToolCompletion`]. `has_known_tool_request` is the
+    /// discriminator: a card Codex has told us about but that no response has
+    /// declared is unknown to the emitter, and completing it would be dropped
+    /// as `completion_without_request`.
+    async fn emit_or_defer_tool_completion(
+        &self,
+        thread_id: &str,
+        emitter: &Arc<TurnEmitter>,
+        tool_call_id: &str,
+        outcome: ToolExecutionOutcome,
+    ) {
+        if emitter.has_known_tool_request(tool_call_id) {
+            emitter.tool_completed(tool_call_id, outcome);
+            return;
+        }
+        tracing::debug!(
+            thread_id,
+            tool_call_id,
+            "deferring Codex tool completion until its provider response declares the card"
+        );
+        self.state
+            .lock()
+            .await
+            .deferred_tool_completions
+            .push(CodexDeferredToolCompletion {
+                thread_id: thread_id.to_owned(),
+                tool_call_id: tool_call_id.to_owned(),
+                outcome,
+            });
+    }
+
+    /// Emit every held outcome whose card the just-finalized response declared.
+    ///
+    /// Anything still undeclared stays held: a later response in the same turn
+    /// may still declare it. `finalize_incomplete_strict_response` clears the
+    /// remainder so nothing survives its turn.
+    async fn flush_deferred_tool_completions(&self, thread_id: &str, emitter: &Arc<TurnEmitter>) {
+        let ready = {
+            let mut state = self.state.lock().await;
+            let mut ready = Vec::new();
+            state.deferred_tool_completions.retain(|deferred| {
+                if deferred.thread_id != thread_id
+                    || !emitter.has_pending_tool_request(&deferred.tool_call_id)
+                {
+                    return true;
+                }
+                ready.push((deferred.tool_call_id.clone(), deferred.outcome.clone()));
+                false
+            });
+            ready
+        };
+        for (tool_call_id, outcome) in ready {
+            tracing::debug!(
+                thread_id,
+                tool_call_id,
+                "emitting a Codex tool completion that outran its card declaration"
+            );
+            emitter.tool_completed(&tool_call_id, outcome);
+        }
+    }
+
+    /// Drop held outcomes for a thread, reporting each one that never found a
+    /// card. A silent drop here is exactly how a tool card ends up spinning
+    /// until the idle sweep cancels it, so it is logged rather than ignored.
+    async fn discard_deferred_tool_completions(&self, thread_id: &str) {
+        let discarded = {
+            let mut state = self.state.lock().await;
+            let mut discarded = Vec::new();
+            state.deferred_tool_completions.retain(|deferred| {
+                if deferred.thread_id != thread_id {
+                    return true;
+                }
+                discarded.push(deferred.tool_call_id.clone());
+                false
+            });
+            discarded
+        };
+        for tool_call_id in discarded {
+            tracing::error!(
+                thread_id,
+                tool_call_id,
+                "Codex tool completion was never claimed by a declared card"
+            );
+        }
     }
 
     async fn forget_command_execution(
@@ -7336,6 +7449,11 @@ impl CodexInner {
         let resumed = async {
             let response = self
                 .rpc
+                // Deliberately *not* passing `experimentalRawEvents` here.
+                // `ThreadResumeParams` does carry the field (codex 0.146.0), but
+                // sending it changes nothing: a resumed thread still emits only
+                // typed `item/*` notifications and never a single `rawResponse*`
+                // one. Measured, not assumed — see the splitter below.
                 .request("thread/resume", json!({ "threadId": session_id }))
                 .await?;
 
@@ -7384,6 +7502,15 @@ impl CodexInner {
             state.thread_id = resumed_thread_id;
             let resumed_thread_id = state.thread_id.clone();
             state.response_splitters.clear();
+            // Strict splitting stays off for a resumed thread, and this is not
+            // a conservative default — it is what the app-server does. Codex
+            // 0.146.0 accepts `experimentalRawEvents` on `thread/resume` (the
+            // field is in `ThreadResumeParams`) and then emits only typed
+            // `item/*` notifications: measured across a full resumed turn,
+            // zero `rawResponse*` of any kind. Turning the splitter on anyway
+            // makes every resumed turn end in a forced finalize, a failed tool
+            // card and an error card, because the boundary it waits for never
+            // comes.
             state.response_splitters.insert(
                 resumed_thread_id.clone(),
                 CodexResponseSplitter::new(&resumed_thread_id, false),
@@ -7788,18 +7915,38 @@ impl CodexInner {
         }
     }
 
+    /// The emitter and model for a thread, for code that projects *provider
+    /// responses*. Strict-splitting only: returns `None` for a thread whose
+    /// splitter is disabled, because there are no provider-response boundaries
+    /// to project there.
+    ///
+    /// Do not use this to emit a tool card. Tool cards exist on every thread,
+    /// including the resumed and forked ones this returns `None` for — use
+    /// [`Self::tool_projection_target`].
     async fn response_projection_target(
         &self,
         thread_id: &str,
     ) -> Option<(Arc<TurnEmitter>, String)> {
-        let state = self.state.lock().await;
-        if !state
+        if !self
+            .state
+            .lock()
+            .await
             .response_splitters
             .get(thread_id)
             .is_some_and(|splitter| splitter.enabled)
         {
             return None;
         }
+        self.tool_projection_target(thread_id).await
+    }
+
+    /// The emitter and model for a thread, with no strict-splitting condition.
+    ///
+    /// A resumed or forked thread has its splitter disabled — Codex sends it no
+    /// `rawResponse*` notifications — but it still runs tools, and those tool
+    /// cards still belong to the user's chat.
+    async fn tool_projection_target(&self, thread_id: &str) -> Option<(Arc<TurnEmitter>, String)> {
+        let state = self.state.lock().await;
         let model = state
             .effective_model
             .clone()
@@ -8164,7 +8311,7 @@ impl CodexInner {
         let Some(item) = params.get("item") else {
             return false;
         };
-        if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+        if !is_raw_codex_tool_output_item_type(item.get("type").and_then(Value::as_str)) {
             return false;
         }
         let Some(thread_id) = extract_notification_thread_id(params) else {
@@ -8185,9 +8332,23 @@ impl CodexInner {
                 .and_then(|splitter| splitter.raw_tool_owner(call_id))
         };
         let Some(owner) = owner else {
+            // No parked owner for this `call_id`, so this raw output cannot be
+            // attached to the card the model declared for it. Downstream that
+            // shows up as a tool that never completes.
+            tracing::error!(
+                thread_id,
+                call_id,
+                "Codex raw tool output had no parked owner to complete"
+            );
             return false;
         };
         let Some((emitter, _)) = self.response_projection_target(&thread_id).await else {
+            tracing::error!(
+                thread_id,
+                call_id,
+                tool_call_id = owner.tool_call_id,
+                "Codex raw tool output had no emitter to report it on"
+            );
             return false;
         };
         if !emitter.has_pending_tool_request(&owner.tool_call_id) {
@@ -8352,9 +8513,24 @@ impl CodexInner {
                             .map(|command| command.tool_call_id.clone())
                     })
                 else {
+                    // Neither a background group nor an outstanding execution
+                    // owns this item, so there is nobody to complete. The card
+                    // Codex opened for it stays pending until the idle sweep
+                    // cancels it, which is a user-visible stuck tool — report
+                    // it rather than returning in silence.
+                    tracing::error!(
+                        thread_id,
+                        provider_item_id,
+                        "Codex command execution completed with no correlated tool call"
+                    );
                     return;
                 };
                 let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
+                    tracing::error!(
+                        thread_id,
+                        tool_call_id,
+                        "Codex command execution completed with no emitter to report it on"
+                    );
                     return;
                 };
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -8381,7 +8557,13 @@ impl CodexInner {
                     ))
                 };
                 if let Some(outcome) = outcome {
-                    emitter.tool_completed(&tool_call_id, outcome);
+                    self.emit_or_defer_tool_completion(
+                        &thread_id,
+                        &emitter,
+                        &tool_call_id,
+                        outcome,
+                    )
+                    .await;
                     if thread_id == self.state.lock().await.thread_id {
                         self.mark_tool_completed(&tool_call_id).await;
                     }
@@ -8717,6 +8899,10 @@ impl CodexInner {
                 ));
             }
         }
+        // The cards this response declares are open only now, so this is the
+        // first moment any outcome that outran the declaration can be emitted.
+        self.flush_deferred_tool_completions(&thread_id, &emitter)
+            .await;
         tracing::info!(
             thread_id,
             turn_id = finalized.turn_id,
@@ -8739,6 +8925,9 @@ impl CodexInner {
         if let Some((emitter, _)) = target {
             emitter.backend_error(reason);
         }
+        // The response failed, so it declared nothing; anything still held for
+        // this thread has lost its only chance at a card.
+        self.discard_deferred_tool_completions(&thread_id).await;
         true
     }
 
@@ -9323,6 +9512,40 @@ impl CodexInner {
         );
     }
 
+    /// Per-notification trace of everything arriving from the Codex app-server.
+    ///
+    /// Two levels, deliberately:
+    ///
+    /// - `debug` — the *derived* view: method, item id/type/status, the turn and
+    ///   thread this was attributed to, and a monotonic sequence number.
+    /// - `trace` — the **verbatim JSON** Codex sent, same sequence number.
+    ///
+    /// The `trace` level exists because every other log in this file reports
+    /// what Tyde *concluded*, not what the provider *said*. When a tool card
+    /// never completes, the question is almost always "did the item carry a
+    /// correlation id we failed to read, or did Codex genuinely not send one?"
+    /// — and a derived log cannot answer it. Field values are only formatted if
+    /// a subscriber is interested, so the raw dump costs nothing when off.
+    ///
+    /// # Seeing it
+    ///
+    /// Scope the filter to this module; `trace` across the whole crate is
+    /// unreadable. Pair the sequence numbers to line a raw payload up against
+    /// the `debug` line and the `TYDE CODEX STRICT …` lines for the same event.
+    ///
+    /// ```text
+    /// TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=codex \
+    ///   RUST_LOG=server::backend::codex=trace \
+    ///   cargo nextest run -p tests --test conformance --run-ignored all \
+    ///     -E 'test(=real_conversation)' --no-capture
+    /// ```
+    ///
+    /// `tests/tests/conformance.rs` and `tests/tests/backend.rs` both install a
+    /// subscriber over `EnvFilter::from_default_env()`, so `RUST_LOG` is all
+    /// that is required — without it the events are compiled in but discarded.
+    ///
+    /// Keep the model on a cheap pin (`TYDE_CODEX_TEST_MODEL=gpt-5.3-codex-spark`
+    /// reproduces the unowned-`commandExecution` path).
     async fn trace_notification_structure(&self, method: &str, params: &Value) {
         if method == "mcpServer/startupStatus/updated" {
             tracing::info!(?params, "Codex MCP startup status");
@@ -9369,6 +9592,14 @@ impl CodexInner {
             ?tool_container_id,
             pending_tool_count,
             "Codex notification structure"
+        );
+        // Ground truth. Same sequence number as the line above, so the two can
+        // be paired; `%params` is only formatted when a subscriber is enabled.
+        tracing::trace!(
+            codex_notification_sequence = sequence,
+            codex_method = method,
+            params = %params,
+            "Codex notification payload"
         );
         if tool_name.is_some_and(|tool_name| {
             is_tyde_agent_control_spawn_tool_name(tool_name)
@@ -14486,7 +14717,19 @@ impl CodexInner {
         {
             return;
         }
-        let Some((emitter, model)) = self.response_projection_target(thread_id).await else {
+        // Not `response_projection_target`: that one is `None` for a thread with
+        // strict splitting off, which is every resumed and forked thread. Using
+        // it here meant a resumed session dropped *every* tool card silently at
+        // birth, while the completion path — which resolves its emitter without
+        // that condition — still fired, so each tool produced a
+        // `completion_without_request` and no card at all.
+        let Some((emitter, model)) = self.tool_projection_target(thread_id).await else {
+            tracing::error!(
+                thread_id,
+                tool_call_id,
+                tool_name,
+                "Codex tool request had no emitter to declare it on"
+            );
             return;
         };
         if emitter.has_known_tool_request(tool_call_id) {
@@ -16144,6 +16387,24 @@ fn codex_yielded_session_id_from_text(text: &str) -> Option<String> {
                     .map(str::to_owned)
             })
         })
+}
+
+/// The two shapes Codex reports a raw tool's result in.
+///
+/// A `custom_tool_call` is answered by `custom_tool_call_output`, a
+/// `function_call` by `function_call_output`. Only the first was ever
+/// recognised, so a `function_call`'s result was dropped outright.
+///
+/// Shell commands survived that because they finish a second way — their
+/// `commandExecution` item completes the card independently. Tools with no
+/// command behind them have no second route: `write_stdin`, which polls a
+/// running process, was declared and then never completed, and the idle sweep
+/// cancelled it at turn end.
+fn is_raw_codex_tool_output_item_type(item_type: Option<&str>) -> bool {
+    matches!(
+        item_type,
+        Some("custom_tool_call_output" | "function_call_output")
+    )
 }
 
 fn raw_custom_tool_output_text(item: &Value) -> String {
@@ -18346,12 +18607,23 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
         turn_id: None,
         provider_item_id: Some(item_id.to_owned()),
         provider_call_id,
-        raw_completes_tool: item_type == "custom_tool_call",
         tool_call_id,
         tool_name,
         arguments,
         tool_type,
     })
+}
+
+/// Names Codex uses for "run a shell command", across its two tool shapes.
+///
+/// `exec` is the `custom_tool_call` form whose arguments are a JavaScript
+/// source string; `exec_command` is the plain `function_call` form. Only the
+/// former was recognised here, so the by-name fallbacks that exist to recover
+/// an owner when the exact `call_id` join fails could never match a
+/// `function_call` — the safety net for the bug fixed in
+/// `CodexResponseSplitter::finalize` was itself dead code.
+fn is_codex_shell_tool_name(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("exec") || tool_name.eq_ignore_ascii_case("exec_command")
 }
 
 fn raw_codex_tool_request_type(tool_name: &str, arguments: &Value) -> Option<Value> {

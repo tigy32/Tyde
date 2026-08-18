@@ -7914,6 +7914,26 @@ fn emit_tool_completion_for_known_request(
     outcome: ToolExecutionOutcome,
 ) -> bool {
     if !emitter.has_pending_tool_request(tool_call_id) {
+        // Not pending has two very different causes, and only one is a defect.
+        //
+        // A long-running foreground `Bash` is *also* tracked as a background
+        // task by the CLI, so both paths report the same `tool_use_id`. The
+        // foreground result lands first and completes the request; the
+        // background task's terminal status then arrives for a tool that has
+        // already finished. That second completion is redundant, not wrong —
+        // reporting it as a backend error puts a red card in the user's chat
+        // for a tool that ran fine.
+        //
+        // A completion for an id the emitter has never seen is a real protocol
+        // violation and still surfaces.
+        if emitter.has_known_tool_request(tool_call_id) {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                "ignoring duplicate Claude tool completion for an already-finished request"
+            );
+            return false;
+        }
         tracing::error!(
             tool_call_id,
             tool_name,
@@ -8711,17 +8731,48 @@ fn finalize_ready_background_subagents(streams: &mut HashMap<String, SubAgentStr
                     },
                 },
             );
-        } else if !parent_emitter.fail_pending_tool(
-            &parent_tool_use_id,
-            &if status == "completed" {
+        } else {
+            let reason = if status == "completed" {
                 "Background agent reported a failed tool execution".to_string()
             } else {
                 format!("Background agent ended with status '{status}'")
-            },
-        ) {
-            parent_emitter.backend_error(
-                "Claude emitted a tool completion without a pending declared provider-response request",
-            );
+            };
+            // Mirrors `emit_tool_completion_for_known_request`: `fail_pending_tool`
+            // returns false for two unrelated states, and only one is a defect.
+            //
+            // The parent card can legitimately be finished already — cancelled
+            // by the idle sweep or a user interrupt during the window before the
+            // sub-agent's first progress snapshot promotes it to background. A
+            // late failure for a card that already reached a terminal state is
+            // redundant, not a protocol violation, and raising an error card for
+            // it puts a red row in the chat for a sub-agent that merely failed.
+            //
+            // An id the emitter has never seen is still a genuine violation.
+            //
+            // Either way `reason` cannot be attached to a finished card, so log
+            // it rather than dropping the only explanation of why the agent
+            // failed.
+            if !parent_emitter.fail_pending_tool(&parent_tool_use_id, &reason) {
+                if parent_emitter.has_known_tool_request(&parent_tool_use_id) {
+                    tracing::warn!(
+                        tool_call_id = parent_tool_use_id,
+                        tool_name = parent_tool_name,
+                        reason,
+                        "background sub-agent failed after its parent tool card had already \
+                         finished; reason could not be attached to the card"
+                    );
+                } else {
+                    tracing::error!(
+                        tool_call_id = parent_tool_use_id,
+                        tool_name = parent_tool_name,
+                        reason,
+                        "background sub-agent failure had no known parent tool request"
+                    );
+                    parent_emitter.backend_error(
+                        "Claude emitted a tool completion without a pending declared provider-response request",
+                    );
+                }
+            }
         }
     }
 }
