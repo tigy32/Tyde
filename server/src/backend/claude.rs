@@ -7462,7 +7462,10 @@ fn flush_workflow_snapshots(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry)
     for snapshot in entry.pending_snapshots.drain(..) {
         emitter.tool_progress(&ToolProgressData {
             tool_call_id: entry.tool_use_id.clone(),
-            execution_mode: ToolExecutionMode::Foreground,
+            // The Workflow tool hands back a task id about two milliseconds
+            // after the run starts (Claude Code 2.1.220), so every snapshot
+            // but the first belongs to a card that has already closed.
+            execution_mode: ToolExecutionMode::Background,
             update: ToolProgressUpdate::Workflow(snapshot),
         });
     }

@@ -784,6 +784,134 @@ pub async fn ask_expecting_delivery(host: &mut Host, agent: &Agent, prompt: &str
     collect_until_idle(host, agent, &format!("turn for {prompt:?}")).await
 }
 
+/// One native workflow run: the turn that launched it, then everything the
+/// client saw until the run reported a terminal snapshot.
+pub struct Workflow {
+    backend: BackendKind,
+    prompt: String,
+    turn: Turn,
+    /// The launching turn's events followed by everything drained after it, in
+    /// arrival order. Ordering across that boundary is the point: the tool call
+    /// completes in the turn and the run reports for as long as it takes.
+    events: Vec<ChatEvent>,
+}
+
+impl Workflow {
+    pub fn label(&self) -> String {
+        let prompt: String = self.prompt.chars().take(48).collect();
+        format!("{} workflow {prompt:?}", backend_label(self.backend))
+    }
+
+    /// The turn that launched the run, for the universal contract.
+    pub fn turn(&self) -> &Turn {
+        &self.turn
+    }
+
+    pub fn events(&self) -> &[ChatEvent] {
+        &self.events
+    }
+
+    pub fn snapshots(&self) -> impl Iterator<Item = &protocol::WorkflowRunState> {
+        self.events.iter().filter_map(|event| match event {
+            ChatEvent::ToolProgress(progress) => match &progress.update {
+                protocol::ToolProgressUpdate::Workflow(state) => Some(state),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// Index into [`Workflow::events`] of the first terminal snapshot, and of the
+    /// completion of the tool call that launched the run. Both are positions
+    /// rather than values because the assertion that matters is their order.
+    pub fn terminal_snapshot_position(&self) -> Option<usize> {
+        self.events.iter().position(|event| {
+            matches!(event, ChatEvent::ToolProgress(progress)
+                if matches!(&progress.update, protocol::ToolProgressUpdate::Workflow(state)
+                    if state.status != protocol::WorkflowRunStatus::Running))
+        })
+    }
+
+    pub fn launching_completion_position(&self) -> Option<usize> {
+        let tool_call_id = self.tool_call_id()?;
+        self.events.iter().position(|event| {
+            matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == tool_call_id)
+        })
+    }
+
+    /// The id every workflow snapshot is addressed to, which is also the tool
+    /// call that launched the run.
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.events.iter().find_map(|event| match event {
+            ChatEvent::ToolProgress(progress)
+                if matches!(progress.update, protocol::ToolProgressUpdate::Workflow(_)) =>
+            {
+                Some(progress.tool_call_id.as_str())
+            }
+            _ => None,
+        })
+    }
+}
+
+/// How long the client keeps listening for a workflow to finish after the turn
+/// that launched it has gone idle.
+///
+/// Generous on purpose: when the terminal snapshot never arrives this window is
+/// paid in full before the assertion fires, and a run that reports normally
+/// leaves long before it expires.
+const WORKFLOW_SETTLE: Duration = Duration::from_secs(90);
+
+/// Ask for a workflow, then keep listening past the end of the launching turn.
+///
+/// A native workflow outlives its own tool call: the tool returns a task id
+/// immediately and the run reports progress for as long as it takes, so no
+/// turn-shaped collector can see one finish. Returns as soon as a terminal
+/// snapshot arrives, or after [`WORKFLOW_SETTLE`] without one — deciding whether
+/// that silence is a defect is `conformance.rs`'s job, not the harness's.
+pub async fn run_workflow(host: &mut Host, agent: &Agent, prompt: &str) -> Workflow {
+    let backend = host.backend_kind;
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+    let turn = collect_turn(host, agent, prompt).await;
+
+    let mut events = turn.events().to_vec();
+    let deadline = tokio::time::Instant::now() + WORKFLOW_SETTLE;
+    'settle: loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, host.client.next_event()).await {
+            Ok(Ok(Some(envelope))) => {
+                fail_on_agent_error(&envelope, "workflow settle");
+                fail_on_client_error(&envelope, "workflow settle");
+                for event in chat_events_in(&envelope) {
+                    let terminal = matches!(&event, ChatEvent::ToolProgress(progress)
+                        if matches!(&progress.update, protocol::ToolProgressUpdate::Workflow(state)
+                            if state.status != protocol::WorkflowRunStatus::Running));
+                    events.push(event);
+                    if terminal {
+                        break 'settle;
+                    }
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => panic!("workflow settle next_event failed: {error:?}"),
+            Err(_) => break,
+        }
+    }
+
+    Workflow {
+        backend,
+        prompt: prompt.to_owned(),
+        turn,
+        events,
+    }
+}
+
 /// One compaction and every chat event the client saw while it ran.
 pub struct Compaction {
     backend: BackendKind,

@@ -890,22 +890,29 @@ impl TurnEmitterState {
 
     fn send_tool_progress(&mut self, data: &ToolProgressData) {
         let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id) else {
-            if self
+            let finished = self
                 .completed_tool_requests
                 .contains_key(&data.tool_call_id)
-                || self.retired_tool_call_ids.contains_key(&data.tool_call_id)
-            {
+                || self.retired_tool_call_ids.contains_key(&data.tool_call_id);
+            if !finished {
+                self.violation(
+                    "progress_without_request",
+                    format!("tool progress '{}' had no open request", data.tool_call_id),
+                );
+            } else if data.execution_mode == ToolExecutionMode::Background {
+                // Backgrounded work outlives the call that launched it: the tool
+                // returns a handle as soon as the work is handed off, so every
+                // later report — including the one saying it finished — arrives
+                // after the card closed. Dropping those freezes the card on its
+                // first snapshot for good.
+                self.send_chat(ChatEvent::ToolProgress(data.clone()));
+            } else {
                 self.violation(
                     "progress_after_completion",
                     format!(
                         "tool progress followed completion for '{}'",
                         data.tool_call_id
                     ),
-                );
-            } else {
-                self.violation(
-                    "progress_without_request",
-                    format!("tool progress '{}' had no open request", data.tool_call_id),
                 );
             }
             return;

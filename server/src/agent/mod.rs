@@ -10821,13 +10821,21 @@ fn record_chat_event_for_replay(
                 replay_state
                     .active_tool_progress
                     .insert(data.tool_call_id.clone(), data.clone());
+                if data.execution_mode == ToolExecutionMode::Background {
+                    replay_state
+                        .active_background_progress
+                        .insert(data.tool_call_id.clone(), data.clone());
+                }
             } else {
+                // Both sets are otherwise only ever emptied by the tool's
+                // completion, and background work reports its terminal snapshot
+                // *after* that. Leaving the entry behind holds
+                // `background_mutation_active` true for the rest of the session,
+                // which defers every later compaction.
                 replay_state.active_tool_progress.remove(&data.tool_call_id);
-            }
-            if data.execution_mode == ToolExecutionMode::Background {
                 replay_state
                     .active_background_progress
-                    .insert(data.tool_call_id.clone(), data.clone());
+                    .remove(&data.tool_call_id);
             }
             if let Some(active) = replay_state.active_stream.as_mut() {
                 let existing = active.tool_events.iter_mut().find(|buffered| {

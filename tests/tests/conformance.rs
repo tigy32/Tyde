@@ -46,6 +46,7 @@ const MULTI_MARKER: &str = "TYDE_MULTI";
 const BG_MARKER: &str = "TYDE_BG";
 const WAITED_MARKER: &str = "TYDE_WAITED";
 const DELETED_MARKER: &str = "TYDE_DELETED";
+const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
 
@@ -419,8 +420,101 @@ fn real_conversation_in_native_subagent() {
     );
 }
 
+/// Everything about a native workflow, in one conversation.
+///
+/// A workflow is the second thing in Tyde that is *supposed* to outlive its own
+/// turn, and it is the harder of the two. A question outlives its turn with
+/// somebody waiting on it; a workflow outlives its turn with nobody waiting at
+/// all. The provider's tool returns a task id straight away, the turn that
+/// launched it goes idle seconds later, and the run then reports progress —
+/// and its terminal state — into a conversation that has moved on.
+///
+/// Everything asserted here is about that gap. The run itself is the provider's
+/// own subprocess and works regardless; what breaks is Tyde's account of it.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_native_workflow() {
+    run_scenario(
+        &[BackendCapability::WorkflowProgress],
+        |mut host| async move {
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&launched, READY_MARKER);
+
+            let prompt = workflow_prompt(host.backend());
+            let workflow = run_workflow(&mut host, &agent, &prompt).await;
+
+            // The filesystem first: it separates "the run never happened" from
+            // "the run happened and Tyde lost the report", and every assertion
+            // after this one is about the second.
+            assert_workflow_agents_did_their_work(&workflow, host.workspace());
+            assert_no_error_message(&workflow.label(), workflow.events());
+            assert_workflow_reported_its_agents(&workflow);
+            assert_workflow_reached_terminal(&workflow);
+            assert_workflow_outlived_its_tool_call(&workflow);
+
+            assert_universal_contract(&[launched]);
+            assert_universal_contract(std::slice::from_ref(workflow.turn()));
+
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 fn launch_prompt() -> String {
     format!("Reply with exactly {READY_MARKER} and nothing else. Do not use any tools.")
+}
+
+/// Two agents, each writing its own file.
+///
+/// Two rather than one because a workflow snapshot's per-agent state is folded
+/// from a stream of index-addressed deltas (`apply_workflow_agent_delta`,
+/// `claude.rs:7310`), and a single-agent run cannot tell a working fold from one
+/// that collapses every delta into slot zero.
+const WORKFLOW_FILES: [&str; 2] = ["workflow_a.txt", "workflow_b.txt"];
+
+/// Given verbatim rather than described.
+///
+/// Claude's Workflow tool takes a JavaScript script with a `meta` literal, and a
+/// small pinned model asked to author one writes a script that fails to compile
+/// often enough to matter — which surfaces as a run that reports nothing, the
+/// exact shape of the defect this scenario hunts. Handing over the script keeps
+/// the subject Tyde's handling of a workflow rather than the model's ability to
+/// write one.
+fn workflow_script() -> String {
+    let [a, b] = WORKFLOW_FILES;
+    format!(
+        "export const meta = {{ name: 'tyde_conformance', description: 'conformance probe', \
+         phases: [{{ title: 'Probe' }}] }}\n\
+         phase('Probe')\n\
+         await parallel([\n\
+         () => agent('Create a file named {a} in the workspace root whose contents are exactly \
+         A, then reply DONE.'),\n\
+         () => agent('Create a file named {b} in the workspace root whose contents are exactly \
+         B, then reply DONE.'),\n\
+         ])\n\
+         return 'ok'"
+    )
+}
+
+fn workflow_prompt(backend_kind: BackendKind) -> String {
+    let launch = match backend_kind {
+        BackendKind::Claude => format!(
+            "Call the Workflow tool exactly once, passing this script verbatim as its `script` \
+             parameter and changing nothing in it:\n\n{}\n",
+            workflow_script()
+        ),
+        _ => format!(
+            "Use your native workflow tool exactly once to run two agents in parallel: one \
+             creating a file named {} in the workspace root whose contents are exactly A, the \
+             other creating {} whose contents are exactly B.",
+            WORKFLOW_FILES[0], WORKFLOW_FILES[1]
+        ),
+    };
+    format!(
+        "{launch} As soon as the tool returns, reply with exactly {WORKFLOW_MARKER} and nothing \
+         else. Do not wait for the workflow to finish and do not do the work yourself."
+    )
 }
 
 fn write_prompt(payload: &str) -> String {
@@ -850,6 +944,132 @@ fn assert_deleted_directory(turn: &Turn, workspace: &Path) {
         turn.final_text()
     );
     assert_final_text_contains(turn, DELETED_MARKER);
+}
+
+/// The out-of-band check for a workflow: its agents really ran.
+///
+/// A workflow that never started and a workflow whose every progress event Tyde
+/// discarded produce the same near-empty stream, so no stream assertion can tell
+/// them apart. The files can: the agents write them from inside the provider's
+/// own subprocess, which reporting defects do not reach. This passing while the
+/// assertions below fail is the signature of the whole bug class — the work
+/// happened and the account of it was lost.
+fn assert_workflow_agents_did_their_work(workflow: &Workflow, workspace: &Path) {
+    let missing: Vec<_> = WORKFLOW_FILES
+        .iter()
+        .filter(|name| !workspace.join(name).is_file())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{}: {missing:?} were never written, so the workflow's agents never ran and nothing below \
+         this line asserts anything about how a run is reported. The launching turn emitted {:?} \
+         and replied {:?}.",
+        workflow.label(),
+        workflow.turn().tool_request_names(),
+        workflow.turn().final_text()
+    );
+    assert_final_text_contains(workflow.turn(), WORKFLOW_MARKER);
+}
+
+/// The run's agents reach the client, not just the run.
+///
+/// The snapshot taken when the run starts carries no agents yet; every agent the
+/// user ever sees arrives on a later one. A backend that emits the first snapshot
+/// and drops the rest still produces a card, a name and a spinner — it just never
+/// fills in what the workflow is actually doing.
+fn assert_workflow_reported_its_agents(workflow: &Workflow) {
+    let reported = workflow
+        .snapshots()
+        .map(|snapshot| snapshot.agents.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        reported >= WORKFLOW_FILES.len(),
+        "{}: the richest of {} workflow snapshot(s) named {reported} agent(s), expected at least \
+         {}. The agents ran — their files are on disk — so their progress reached Tyde and was \
+         dropped before the client.",
+        workflow.label(),
+        workflow.snapshots().count(),
+        WORKFLOW_FILES.len()
+    );
+}
+
+/// A run that finishes says so.
+///
+/// The terminal snapshot is the only thing that ever clears the card's spinner or
+/// retires the run from the in-flight tray: both key on a non-Running status
+/// (`agent/mod.rs:10812`). A run whose terminal snapshot is dropped renders as
+/// permanently Running, and survives that way through reload and resume, because
+/// the tray is rebuilt from these same events.
+fn assert_workflow_reached_terminal(workflow: &Workflow) {
+    let statuses: Vec<_> = workflow
+        .snapshots()
+        .map(|snapshot| snapshot.status)
+        .collect();
+    let terminal = workflow
+        .snapshots()
+        .find(|snapshot| snapshot.status != protocol::WorkflowRunStatus::Running);
+    let Some(terminal) = terminal else {
+        panic!(
+            "{}: the workflow never reported a terminal snapshot; the client saw only {statuses:?}. \
+             Its agents finished — their files are on disk — so the card is left spinning on a run \
+             that is over, and stays that way.",
+            workflow.label()
+        )
+    };
+    assert_eq!(
+        terminal.status,
+        protocol::WorkflowRunStatus::Completed,
+        "{}: the workflow terminalized as {:?} though every agent wrote its file; snapshots seen: \
+         {statuses:?}",
+        workflow.label(),
+        terminal.status
+    );
+    let unfinished: Vec<_> = terminal
+        .agents
+        .iter()
+        .filter(|agent| agent.state != protocol::WorkflowAgentStatus::Done)
+        .map(|agent| format!("{}={:?}", agent.label, agent.state))
+        .collect();
+    assert!(
+        unfinished.is_empty(),
+        "{}: the workflow reported Completed while still showing {unfinished:?} unfinished; the \
+         card contradicts itself",
+        workflow.label()
+    );
+}
+
+/// The run really did outlive the tool call that launched it.
+///
+/// This is the discriminator, and without it the scenario is vacuous. A provider
+/// whose workflow tool *blocks* for the duration of the run would deliver every
+/// snapshot while the card is still open — the easy case, and not the one that
+/// broke. Claude Code 2.1.220 returns a task id roughly two milliseconds after
+/// the run starts, so the card completes and is retired long before the run
+/// reports anything, and late progress addressed to a retired card is what got
+/// discarded. If this assertion ever fires, the provider changed shape and the
+/// rest of this scenario stopped testing what it says it tests.
+fn assert_workflow_outlived_its_tool_call(workflow: &Workflow) {
+    let completion = workflow.launching_completion_position().unwrap_or_else(|| {
+        panic!(
+            "{}: never saw the launching tool call complete, so there is no boundary to order \
+             progress against",
+            workflow.label()
+        )
+    });
+    let terminal = workflow.terminal_snapshot_position().unwrap_or_else(|| {
+        panic!(
+            "{}: no terminal snapshot to order against the launching tool call",
+            workflow.label()
+        )
+    });
+    assert!(
+        terminal > completion,
+        "{}: the workflow reported its terminal state at event {terminal}, before its own tool \
+         call completed at event {completion}. The run did not outlive its tool call, so this \
+         scenario exercised none of the late-progress handling it exists for.",
+        workflow.label()
+    );
 }
 
 /// Echoing the file back proves the tool *result* travelled into the model, not
