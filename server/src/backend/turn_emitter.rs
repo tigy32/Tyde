@@ -2,9 +2,14 @@
 //!
 //! Backends provide provider data; this emitter owns response presentation
 //! identities, tool ownership, ordering, and terminal state. Illegal backend
-//! transitions panic in debug builds so sim and conformance tests fail at the
-//! source. Release builds log the same violation and contain it without
-//! fabricating messages or tool calls.
+//! transitions are contained without fabricating messages or tool calls, and
+//! reported as an Error message when the turn ends.
+//!
+//! Containment used to be release-only; debug builds panicked instead. That
+//! panic fired while the state mutex guard was held, which poisoned the mutex
+//! and turned every later call into a panic, and it fired on whichever tokio
+//! task the backend happened to be on, where tokio swallowed it. A debug build
+//! therefore did not fail loudly on a violation — it silently stopped emitting.
 
 use std::collections::HashMap;
 
@@ -33,6 +38,7 @@ struct TurnEmitterState {
     open_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashMap<String, CompletedToolRequest>,
     retired_tool_call_ids: IndexMap<String, CompletedToolRequest>,
+    violations: Vec<String>,
 }
 
 const RETIRED_TOOL_CALL_LEDGER_CAP: usize = 1024;
@@ -121,6 +127,7 @@ impl TurnEmitter {
                 open_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashMap::new(),
                 retired_tool_call_ids: IndexMap::new(),
+                violations: Vec::new(),
             }),
         }
     }
@@ -267,7 +274,7 @@ impl TurnEmitter {
     }
 
     pub fn user_message(&self, content: &str, images: Option<Vec<ImageData>>) {
-        let state = self.lock();
+        let mut state = self.lock();
         state.send_chat(ChatEvent::MessageAdded(protocol::ChatMessage {
             message_id: None,
             timestamp: now_ms(),
@@ -283,7 +290,7 @@ impl TurnEmitter {
     }
 
     pub fn system_message(&self, content: &str) {
-        let state = self.lock();
+        let mut state = self.lock();
         state.send_chat(ChatEvent::MessageAdded(simple_message(
             protocol::MessageSender::System,
             content,
@@ -291,7 +298,7 @@ impl TurnEmitter {
     }
 
     pub fn warning_message(&self, content: &str) {
-        let state = self.lock();
+        let mut state = self.lock();
         state.send_chat(ChatEvent::MessageAdded(simple_message(
             protocol::MessageSender::Warning,
             content,
@@ -299,7 +306,7 @@ impl TurnEmitter {
     }
 
     pub fn error_message(&self, content: &str) {
-        let state = self.lock();
+        let mut state = self.lock();
         state.send_chat(ChatEvent::MessageAdded(simple_message(
             protocol::MessageSender::Error,
             content,
@@ -373,6 +380,7 @@ impl TurnEmitter {
                 );
             }
             state.retire_completed_tools();
+            state.report_violations();
         }
         state.send_chat(ChatEvent::TypingStatusChanged(typing));
         state.typing_active = typing;
@@ -480,7 +488,7 @@ impl TurnEmitterState {
         let _ = self.tx.send(event);
     }
 
-    fn send_chat(&self, event: ChatEvent) {
+    fn send_chat(&mut self, event: ChatEvent) {
         match serde_json::to_value(event) {
             Ok(event) => self.send(event),
             Err(error) => self.violation(
@@ -490,15 +498,33 @@ impl TurnEmitterState {
         }
     }
 
-    fn violation(&self, code: &'static str, detail: impl std::fmt::Display) {
+    fn violation(&mut self, code: &'static str, detail: impl std::fmt::Display) {
         let detail = detail.to_string();
         tracing::error!(
             violation = code,
             detail,
             "Backend event transition violated the chat protocol"
         );
-        #[cfg(debug_assertions)]
-        panic!("backend event violation [{code}]: {detail}");
+        self.violations.push(format!("[{code}] {detail}"));
+    }
+
+    /// Emitted before the turn's `TypingStatusChanged(false)` so it lands inside
+    /// the turn that produced it.
+    fn report_violations(&mut self) {
+        if self.violations.is_empty() {
+            return;
+        }
+        let violations = std::mem::take(&mut self.violations);
+        let content = format!(
+            "The backend sent {} malformed event(s) during this turn, so the conversation above \
+             may be missing tool cards or responses:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+        self.send_chat(ChatEvent::MessageAdded(simple_message(
+            protocol::MessageSender::Error,
+            &content,
+        )));
     }
 
     fn stream_start(
@@ -599,7 +625,7 @@ impl TurnEmitterState {
     }
 
     fn accept_ordered_response_event(
-        &self,
+        &mut self,
         response: &ResponseHandle,
         event: &'static str,
     ) -> bool {
@@ -934,6 +960,7 @@ impl TurnEmitterState {
                 message: cancellation_message.to_owned(),
             },
         ));
+        self.report_violations();
         self.send_chat(ChatEvent::TypingStatusChanged(false));
         self.typing_active = false;
         self.reset_turn_state();
@@ -963,6 +990,10 @@ impl TurnEmitterState {
         for tool_call_id in background {
             self.cancel_open_tool(&tool_call_id, message);
         }
+        // Outside the `foreground_active` branch: closing an idle agent is the
+        // one path where violations recorded after the last turn ended would
+        // otherwise never be reported at all.
+        self.report_violations();
         if foreground_active {
             self.send_chat(ChatEvent::OperationCancelled(
                 protocol::OperationCancelledData {
