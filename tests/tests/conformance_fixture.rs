@@ -16,12 +16,15 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentId, AgentStartPayload,
-    BackendKind, ChatEvent, Envelope, FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId,
-    ListSessionsPayload, MessageSender, NewAgentPayload, SessionHistoryPayload, SessionId,
-    SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData,
-    ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactPayload, AgentErrorPayload, AgentId,
+    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ClientErrorPayload,
+    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
+    FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
+    MessageSender, NewAgentPayload, QueuedMessagesPayload, SendMessagePayload,
+    SendMessageToolResponse, SessionHistoryPayload, SessionId, SessionListPayload,
+    SessionSettingValue, SessionSettingsValues, SessionSummary, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequest,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -30,6 +33,9 @@ use uuid::Uuid;
 /// Control-plane replies do not wait on a model. Kept named because three call
 /// sites share it; the per-turn waits are inline at their one use each.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Seeded here and asserted in `conformance.rs`; shared so the two cannot drift.
+pub const SCRATCH_DIR: &str = "scratch";
 
 /// Every model name the provider may report for the pin this suite configures.
 /// The first entry is the value fed to the backend config; the rest are aliases
@@ -259,6 +265,13 @@ impl Host {
     async fn new(backend_kind: BackendKind, store: &Path, workspace: &Path) -> Self {
         std::fs::write(workspace.join("README.txt"), "tyde conformance workspace")
             .expect("seed workspace");
+        // Something for the destructive-command turn to remove. A directory
+        // rather than a file because the providers that gate risky commands
+        // gate on *recursion* — a plain `rm <file>` passes every such check, so
+        // a scenario built on one asserts nothing about the gate.
+        std::fs::create_dir_all(workspace.join(SCRATCH_DIR)).expect("seed scratch directory");
+        std::fs::write(workspace.join(SCRATCH_DIR).join("notes.txt"), "scratch")
+            .expect("seed scratch file");
 
         let settings_path = store.join("settings.json");
         std::fs::write(
@@ -435,6 +448,15 @@ async fn await_agent_start(host: &mut Host, context: &str) -> Agent {
     }
 }
 
+/// Send without collecting, so the caller can do something to an agent that is
+/// still mid-turn.
+pub async fn send_prompt(host: &mut Host, agent: &Agent, prompt: &str) {
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+}
+
 pub async fn ask(host: &mut Host, agent: &Agent, prompt: impl AsRef<str>) -> Turn {
     let prompt = prompt.as_ref();
     host.client
@@ -557,6 +579,304 @@ pub async fn close_agent(host: &mut Host, agent: &Agent) -> Vec<ChatEvent> {
         .await
         .expect("close_agent failed");
     drain_events_for(host, Duration::from_secs(2)).await
+}
+
+/// A question the backend asked, plus everything the client saw for a while
+/// afterwards while deliberately not answering it.
+pub struct Question {
+    backend: BackendKind,
+    prompt: String,
+    request: ToolRequest,
+    question: AskUserQuestion,
+    events: Vec<ChatEvent>,
+}
+
+impl Question {
+    pub fn label(&self) -> String {
+        let prompt: String = self.prompt.chars().take(48).collect();
+        format!("{} question {prompt:?}", backend_label(self.backend))
+    }
+
+    pub fn events(&self) -> &[ChatEvent] {
+        &self.events
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.request.tool_call_id
+    }
+
+    pub fn question(&self) -> &AskUserQuestion {
+        &self.question
+    }
+
+    /// Chosen from what the provider actually offered rather than from the
+    /// prompt: answering with a label the backend did not send would test the
+    /// test, not the tool.
+    pub fn first_option(&self) -> Option<&str> {
+        self.question
+            .options
+            .first()
+            .map(|option| option.label.as_str())
+    }
+
+    pub fn completions(&self) -> impl Iterator<Item = &ToolExecutionCompletedData> {
+        let tool_call_id = self.request.tool_call_id.clone();
+        self.events.iter().filter_map(move |event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == tool_call_id =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+    }
+}
+
+/// How long the client sits quiet with an unanswered question on screen.
+///
+/// An interactive tool is the one kind that is *supposed* to outlive the turn
+/// that asked it, so this window is the only place where a backend that
+/// terminalizes the card behind the user's back becomes observable.
+const QUESTION_SETTLE: Duration = Duration::from_secs(10);
+
+/// Ask something that should make the backend put a question to the user, and
+/// return once it has — then keep listening without answering.
+pub async fn ask_question(host: &mut Host, agent: &Agent, prompt: &str) -> Question {
+    let backend = host.backend_kind;
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+
+    let context = format!("{} question for prompt {prompt:?}", backend_label(backend));
+    let mut events = Vec::new();
+    let mut asked = None;
+    while asked.is_none() {
+        let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            if let ChatEvent::ToolRequest(request) = &event
+                && let protocol::ToolRequestType::AskUserQuestion { questions } = &request.tool_type
+                && let Some(question) = questions.first()
+            {
+                asked = Some((request.clone(), question.clone()));
+            }
+            events.push(event);
+        }
+    }
+    let (request, question) = asked.expect("loop exits only once a question was seen");
+    events.extend(drain_events_for(host, QUESTION_SETTLE).await);
+
+    Question {
+        backend,
+        prompt: prompt.to_owned(),
+        request,
+        question,
+        events,
+    }
+}
+
+/// Answer through the typed tool-response path the UI uses, not as chat text.
+pub async fn answer_question(
+    host: &mut Host,
+    agent: &Agent,
+    question: &Question,
+    answer: &str,
+) -> Turn {
+    host.client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: answer.to_owned(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                    tool_call_id: question.tool_call_id().to_owned(),
+                    answer: answer.to_owned(),
+                }),
+            },
+        )
+        .await
+        .expect("answer send_message failed");
+    collect_until_idle(host, agent, &format!("answer {answer:?}")).await
+}
+
+/// Collect to the next idle without waiting for a user echo. A tool response is
+/// not a chat message, so it never produces one.
+pub async fn collect_until_idle(host: &mut Host, agent: &Agent, label: &str) -> Turn {
+    let backend = host.backend_kind;
+    let context = format!("{} {label}", backend_label(backend));
+    let mut events = Vec::new();
+    loop {
+        let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+            events.push(event);
+            if idle {
+                return Turn {
+                    backend,
+                    prompt: label.to_owned(),
+                    events,
+                };
+            }
+        }
+    }
+}
+
+pub async fn cancel_turn(host: &mut Host, agent: &Agent) -> Vec<ChatEvent> {
+    host.client
+        .interrupt(&agent.stream)
+        .await
+        .expect("interrupt failed");
+    drain_events_for(host, Duration::from_secs(10)).await
+}
+
+/// Send an ordinary message and fail fast if the server parks it in the queue.
+///
+/// A wedged agent queues instead of refusing, and the queue is silent: without
+/// watching for the snapshot frame this reads as a turn that never arrives, and
+/// fails minutes later pointing at the wrong thing.
+pub async fn ask_expecting_delivery(host: &mut Host, agent: &Agent, prompt: &str) -> Turn {
+    let backend = host.backend_kind;
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+
+    let context = format!("{} delivery of {prompt:?}", backend_label(backend));
+    loop {
+        let envelope = host.next_envelope(Duration::from_secs(60), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.kind == FrameKind::QueuedMessages {
+            let queued: QueuedMessagesPayload =
+                envelope.parse_payload().expect("parse QueuedMessages");
+            assert!(
+                !queued
+                    .messages
+                    .iter()
+                    .any(|entry| entry.message.contains(prompt)),
+                "{context}: the agent queued this message instead of running it, so it believes a \
+                 turn is still open. The chat accepts input and never answers."
+            );
+            continue;
+        }
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        if chat_events_in(&envelope).iter().any(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::User)
+                    && message.content.contains(prompt))
+        }) {
+            break;
+        }
+    }
+    collect_until_idle(host, agent, &format!("turn for {prompt:?}")).await
+}
+
+/// One compaction and every chat event the client saw while it ran.
+pub struct Compaction {
+    backend: BackendKind,
+    events: Vec<ChatEvent>,
+    terminal: ContextCompactionNotifyPayload,
+}
+
+impl Compaction {
+    pub fn label(&self) -> String {
+        format!("{} compaction", backend_label(self.backend))
+    }
+
+    pub fn events(&self) -> &[ChatEvent] {
+        &self.events
+    }
+
+    /// The durable timeline markers this compaction produced. One compaction is
+    /// one marker; more than one is a duplicate row in the user's transcript.
+    pub fn markers(&self) -> impl Iterator<Item = &ContextCompactionTimelineEvent> {
+        self.events.iter().filter_map(|event| match event {
+            ChatEvent::ContextCompaction(marker) => Some(marker),
+            _ => None,
+        })
+    }
+
+    pub fn terminal(&self) -> &ContextCompactionNotifyPayload {
+        &self.terminal
+    }
+}
+
+/// How long the collector keeps listening after the terminal notify.
+///
+/// The durable marker and the terminal notify are ordered with respect to each
+/// other, but a backend's own *observation* of the same compaction reaches the
+/// agent loop on a different channel and lands tens of milliseconds later.
+/// Returning at the notify would make a second marker unobservable.
+const COMPACTION_SETTLE: Duration = Duration::from_secs(5);
+
+/// Compact through the same client message the UI's compact button sends, and
+/// return once the operation reports a terminal status.
+pub async fn compact(host: &mut Host, agent: &Agent) -> Compaction {
+    let backend = host.backend_kind;
+    host.client
+        .compact_agent(
+            &agent.stream,
+            AgentCompactPayload {
+                summary_prompt: None,
+                max_summary_bytes: None,
+            },
+        )
+        .await
+        .expect("compact_agent failed");
+
+    let context = format!("{} compaction", backend_label(backend));
+    let mut events = Vec::new();
+    let terminal = loop {
+        // Summarizing the whole conversation is a model round trip.
+        let envelope = host.next_envelope(Duration::from_secs(300), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.kind == FrameKind::ContextCompactionNotify {
+            let notify: ContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("parse ContextCompactionNotify");
+            if notify.status.is_terminal() {
+                break notify;
+            }
+            continue;
+        }
+        // Unfiltered by stream, unlike a turn: the compaction marker is
+        // broadcast by the agent actor rather than echoed back on the stream the
+        // request went out on, and there is only ever one agent here.
+        events.extend(chat_events_in(&envelope));
+    };
+    events.extend(drain_events_for(host, COMPACTION_SETTLE).await);
+
+    Compaction {
+        backend,
+        events,
+        terminal,
+    }
+}
+
+/// A refused control request answers on this frame rather than the agent
+/// stream, so without it a rejected compaction reads as a 300s timeout.
+fn fail_on_client_error(envelope: &Envelope, context: &str) {
+    if envelope.kind == FrameKind::ClientError {
+        let error: ClientErrorPayload = envelope.parse_payload().expect("parse ClientError");
+        panic!(
+            "{context}: server rejected the request with {:?}: {}",
+            error.code, error.message
+        );
+    }
 }
 
 /// Fails when the backend stored anything other than exactly one session, since

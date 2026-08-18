@@ -32,7 +32,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-use protocol::{BackendKind, ChatEvent, MessageSender, ToolExecutionOutcome};
+use protocol::{
+    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, ToolExecutionOutcome,
+};
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
 
@@ -43,6 +45,7 @@ const WROTE_MARKER: &str = "TYDE_WROTE";
 const MULTI_MARKER: &str = "TYDE_MULTI";
 const BG_MARKER: &str = "TYDE_BG";
 const WAITED_MARKER: &str = "TYDE_WAITED";
+const DELETED_MARKER: &str = "TYDE_DELETED";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
 
@@ -57,6 +60,10 @@ const MULTI_FILES: [&str; 3] = ["multi_a.txt", "multi_b.txt", "multi_c.txt"];
 /// finished.
 const BG_SETTLE: Duration = Duration::from_secs(60);
 
+/// Long enough for a replay that has already finished to flush whatever it
+/// recorded, short enough that a clean resume does not pay for it.
+const RESUME_SETTLE: Duration = Duration::from_secs(5);
+
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_conversation() {
@@ -64,17 +71,26 @@ fn real_conversation() {
         let payload = unique_payload();
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
 
+        // Asserted next to the turn that produced it rather than in a block at
+        // the end, matching the newer scenarios: a failure then names the turn
+        // that caused it instead of one four turns later.
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-        let wrote = ask(&mut host, &agent, write_prompt(&payload)).await;
-        let read_back = ask(&mut host, &agent, read_prompt()).await;
-        let multi = ask(&mut host, &agent, multi_tool_prompt()).await;
-
         assert_final_text_contains(&launched, READY_MARKER);
+
+        let wrote = ask(&mut host, &agent, write_prompt(&payload)).await;
         assert_wrote_file(&wrote, host.workspace(), &payload);
         assert_final_text_contains(&wrote, WROTE_MARKER);
+
+        let read_back = ask(&mut host, &agent, read_prompt()).await;
         assert_read_back_payload(&read_back, &payload);
+
+        let multi = ask(&mut host, &agent, multi_tool_prompt()).await;
         assert_multi_tool_turn(&multi, host.workspace());
-        assert_universal_contract(&[launched, wrote, read_back, multi]);
+
+        let deleted = ask(&mut host, &agent, delete_prompt()).await;
+        assert_deleted_directory(&deleted, host.workspace());
+
+        assert_universal_contract(&[launched, wrote, read_back, multi, deleted]);
 
         let session = stored_session(&mut host).await;
         assert!(
@@ -138,8 +154,149 @@ fn real_conversation_on_resumed_session() {
         );
         assert_universal_contract(&[follow_up]);
 
+        assert_replay_has_no_duplicates(
+            &resumed,
+            host.backend(),
+            &[launch_prompt(), write_prompt(&payload)],
+        );
+
         assert_clean_close(&mut host, &resumed).await;
     });
+}
+
+/// Compaction, and what a session looks like once it has been compacted.
+///
+/// Compaction is not just another turn: it rewrites the provider's own session
+/// file, which is the file a resume replays. Both halves of this scenario exist
+/// because that rewrite is unobservable from any single turn.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_compaction_and_resume() {
+    run_scenario(
+        &[
+            BackendCapability::CompactionReported,
+            BackendCapability::ResumeSession,
+        ],
+        |mut host| async move {
+            let payload = unique_payload();
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+
+            // Tool calls before each compaction, because both defects this
+            // scenario covers are carried by tool declarations: a conversation
+            // of plain text compacts and resumes cleanly while still being
+            // wrong.
+            let wrote = ask(&mut host, &agent, write_prompt(&payload)).await;
+            assert_wrote_file(&wrote, host.workspace(), &payload);
+            let from_idle = compact(&mut host, &agent).await;
+
+            // The second one is requested *mid-turn* on purpose. Compacting an
+            // idle agent dispatches immediately; compacting a busy one parks the
+            // request until the turn ends and then dispatches it into a loop
+            // that is already draining that turn's events. Only the second shape
+            // puts the operation's terminal result and the backend's own
+            // observation of the compaction in a position to arrive out of
+            // order, and correlating them is what keeps it to one row.
+            send_prompt(&mut host, &agent, &multi_tool_prompt()).await;
+            let mid_turn = compact(&mut host, &agent).await;
+
+            assert_compaction_left_one_marker(&from_idle);
+            assert_compaction_left_one_marker(&mid_turn);
+            assert_multi_tool_files_were_written(&mid_turn, host.workspace());
+            assert_universal_contract(&[launched, wrote]);
+
+            let session = stored_session(&mut host).await;
+            assert!(
+                session.resumable,
+                "{:?}: session is not resumable after compaction, so the rest of this scenario \
+                 cannot run",
+                host.backend()
+            );
+            assert_clean_close(&mut host, &agent).await;
+
+            let resumed = resume_agent(&mut host, &session.id).await;
+            assert_replayed_history_is_not_empty(&resumed, host.backend());
+            assert_replay_has_no_duplicates(
+                &resumed,
+                host.backend(),
+                &[launch_prompt(), write_prompt(&payload), multi_tool_prompt()],
+            );
+
+            // `TurnEmitter` batches the protocol violations it caught into one
+            // Error card and flushes it when the turn that recorded them goes
+            // idle. Violations recorded while replaying a resumed session belong
+            // to no prompt, so the card can land in the bootstrap, in the quiet
+            // window after it, or in the next turn — all three are checked.
+            let bootstrap_label = format!("{:?} resume replay", host.backend());
+            assert_no_error_message(&bootstrap_label, &resumed.replayed_history);
+            let settled = drain_events_for(&mut host, RESUME_SETTLE).await;
+            assert_no_error_message(&bootstrap_label, &settled);
+
+            // A compacted session that resumes into a broken turn is the same
+            // failure as one that resumes blank, one step later.
+            let follow_up = ask(&mut host, &resumed, read_prompt()).await;
+            assert_read_back_payload(&follow_up, &payload);
+            assert_universal_contract(&[follow_up]);
+
+            assert_clean_close(&mut host, &resumed).await;
+        },
+    );
+}
+
+/// Everything about asking the user a question, in one conversation.
+///
+/// `backend.rs` spends roughly twenty separate paid conversations on this tool
+/// — shape, waiting, answering, interrupting, closing, reconnecting, forking —
+/// and one of them (`assert_user_question_waits_for_answer`, `backend.rs:14550`)
+/// already asserts the invariant that broke in production. It never caught it,
+/// because a suite that costs twenty conversations to check one tool does not
+/// get run. The same guarantees fit in one conversation.
+///
+/// A question is the only tool that is *supposed* to outlive its turn: the turn
+/// goes idle and the card stays open, because the thing it is waiting for is a
+/// human. Everything here follows from that.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_user_question() {
+    run_scenario(
+        &[BackendCapability::UserQuestionRequests],
+        |mut host| async move {
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&launched, READY_MARKER);
+
+            let asked = ask_question(&mut host, &agent, &question_prompt()).await;
+            assert_question_shape(&asked);
+            assert_question_waits_for_an_answer(&asked);
+
+            // Answering with a label the provider actually offered, so this
+            // tests the tool rather than the prompt.
+            let choice = asked
+                .first_option()
+                .expect("question shape assertion guarantees an option")
+                .to_owned();
+            let answered = answer_question(&mut host, &agent, &asked, &choice).await;
+            assert_question_answer_reached_the_model(&asked, &answered, &choice);
+
+            // Second question, abandoned rather than answered. Cancelling is
+            // the user's escape hatch from an interactive tool, and it is the
+            // one path where a card and a turn can be terminalized out of step.
+            let abandoned = ask_question(&mut host, &agent, &question_prompt()).await;
+            assert_question_shape(&abandoned);
+            let cancelled = cancel_turn(&mut host, &agent).await;
+            assert_no_error_message(&format!("{:?} question cancel", host.backend()), &cancelled);
+
+            // The assertion the wedge costs: a cancelled question must leave an
+            // agent that still works. A latched turn queues every later message
+            // instead of running it, and no further cancel can clear it.
+            let recovered = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&recovered, READY_MARKER);
+
+            assert_universal_contract(&[launched, recovered]);
+
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
 }
 
 /// A tool still running when the turn ends.
@@ -313,6 +470,38 @@ fn wait_prompt() -> String {
          background: python3 -c \"import time; time.sleep(25); print('OK')\". \
          Then reply with exactly {WAITED_MARKER} and nothing else."
     )
+}
+
+/// Destructive, through a shell command, and *recursive* specifically.
+///
+/// Recursion is what the gates key on. Hermes ships 47 approval patterns and 12
+/// hard blocks (`~/.hermes/hermes-agent/tools/approval.py`); `rm <file>` matches
+/// none of them, while `rm -r` matches "recursive delete". An earlier version of
+/// this prompt deleted a single file, and every backend sailed through it —
+/// a green result that asserted nothing about the gate.
+///
+/// Tyde cannot answer a prompt a provider raises inside its own runtime, so a
+/// backend that gates here does not fail loudly: it goes quiet with the work
+/// undone, which is why the oracle below is the filesystem and not the reply.
+///
+/// The target is a directory this scenario seeded inside its own temporary
+/// workspace, which is the whole of what the agent can reach.
+fn delete_prompt() -> String {
+    format!(
+        "Delete the directory {SCRATCH_DIR} and everything in it from the workspace root, by \
+         running a single recursive shell command. Then reply with exactly {DELETED_MARKER} and \
+         nothing else."
+    )
+}
+
+/// Names a decision the model cannot make for itself, so asking is the only way
+/// forward. A prompt the model can resolve on its own produces a clean, fast,
+/// meaningless pass.
+fn question_prompt() -> String {
+    "I want you to name a file, but only I know which name is right. Ask me to choose between \
+     exactly two options, ALPHA and BETA, using your question tool. Ask, and then stop and wait \
+     for my answer — do not guess, do not pick one yourself, and do not create any file yet."
+        .to_owned()
 }
 
 fn multi_tool_prompt() -> String {
@@ -640,6 +829,29 @@ fn assert_wrote_file(turn: &Turn, workspace: &Path, payload: &str) {
     );
 }
 
+/// The directory is gone, and the model says so.
+///
+/// The filesystem is the oracle in both directions. A backend that stops to ask
+/// its own user for confirmation leaves a turn that looks entirely reasonable —
+/// tool requested, turn ended, no error — with the work simply not done, and
+/// only the surviving directory tells those apart. The reverse also happens: a
+/// model that reports deleting something it never touched.
+fn assert_deleted_directory(turn: &Turn, workspace: &Path) {
+    let path = workspace.join(SCRATCH_DIR);
+    assert!(
+        !path.exists(),
+        "{}: {} still exists after a turn that was asked to remove it recursively. The turn \
+         emitted {:?} and {} completion(s), and replied {:?}. A provider that gates recursive \
+         deletes behind its own confirmation ends the turn exactly like this, with the work undone.",
+        turn.label(),
+        path.display(),
+        turn.tool_request_names(),
+        turn.tool_completions().count(),
+        turn.final_text()
+    );
+    assert_final_text_contains(turn, DELETED_MARKER);
+}
+
 /// Echoing the file back proves the tool *result* travelled into the model, not
 /// merely that a card was rendered — a backend can emit a perfectly shaped
 /// completion whose payload never reaches the provider.
@@ -669,6 +881,198 @@ async fn assert_clean_close(host: &mut Host, agent: &Agent) {
     let label = format!("{:?} shutdown", host.backend());
     let closing = close_agent(host, agent).await;
     assert_no_error_message(&label, &closing);
+}
+
+/// What the user is actually shown: a question with text, and choices to pick.
+///
+/// A backend that normalizes the tool into an empty question, or into a choice
+/// with no labels, renders as an unanswerable card — and every later assertion
+/// here would pass over it, because the tool call did happen.
+fn assert_question_shape(question: &Question) {
+    let asked = question.question();
+    assert!(
+        !asked.question.trim().is_empty(),
+        "{}: emitted a question with no text; the card has nothing to read",
+        question.label()
+    );
+    assert!(
+        !asked.options.is_empty(),
+        "{}: asked {:?} with no options, so there is nothing for the user to pick",
+        question.label(),
+        asked.question
+    );
+    for option in &asked.options {
+        assert!(
+            !option.label.trim().is_empty(),
+            "{}: emitted an unlabelled option among {:?}",
+            question.label(),
+            asked.options
+        );
+    }
+}
+
+/// The one guarantee unique to interactive tools: the turn ends, the card does
+/// not.
+///
+/// `TurnEmitter` treats any foreground tool still open at idle as a protocol
+/// violation and cancels it (`turn_emitter.rs:370`), which for a question means
+/// destroying the card the user was about to answer. The real answer then
+/// arrives for an id the emitter has already retired and is dropped, and the
+/// provider waits forever on a response Tyde can no longer send.
+fn assert_question_waits_for_an_answer(question: &Question) {
+    assert_no_error_message(&question.label(), question.events());
+    let completions: Vec<_> = question
+        .completions()
+        .map(|completion| format!("{:?}", completion.outcome))
+        .collect();
+    assert!(
+        completions.is_empty(),
+        "{}: the question {:?} was completed before anyone answered it ({completions:?}). The card \
+         the user was asked to act on was terminalized behind their back.",
+        question.label(),
+        question.question().question
+    );
+}
+
+/// An answered question must close its card exactly once *and* reach the model.
+///
+/// These are separate failures: a card can be completed for the user while the
+/// answer never reaches the provider, in which case the model carries on as if
+/// it were never told, and the conversation silently diverges from the UI.
+fn assert_question_answer_reached_the_model(question: &Question, answered: &Turn, choice: &str) {
+    let completions = answered
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == question.tool_call_id())
+        .count();
+    assert_eq!(
+        completions,
+        1,
+        "{}: answering the question produced {completions} completions for {:?}, expected exactly \
+         1. Zero leaves the card spinning; more than one means two owners answered it.",
+        answered.label(),
+        question.tool_call_id()
+    );
+    let final_text = answered.final_text();
+    assert!(
+        final_text.contains(choice),
+        "{}: the model's reply {final_text:?} never mentions the chosen option {choice:?}. The card \
+         closed but the answer did not reach the provider.",
+        answered.label()
+    );
+}
+
+/// The mid-turn compaction must not have swallowed the turn it interrupted.
+///
+/// A compaction requested while a turn is in flight is parked and dispatched at
+/// turn end, so the work still has to finish. Without this, a backend that
+/// dropped the turn on the floor would satisfy every marker assertion here.
+fn assert_multi_tool_files_were_written(compaction: &Compaction, workspace: &Path) {
+    let missing: Vec<_> = MULTI_FILES
+        .iter()
+        .filter(|name| !workspace.join(name).is_file())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{}: {missing:?} were never written, so the turn that was interrupted by this compaction \
+         never completed its work",
+        compaction.label()
+    );
+}
+
+/// One compaction leaves exactly one row in the transcript.
+///
+/// A Tyde-requested compaction is sighted twice — once as the requested
+/// operation's terminal marker, once as the backend's own observation of the
+/// same event — and the agent loop correlates them into a single row by looking
+/// up the in-flight operation. The terminal result and the observation reach the
+/// loop on different channels, so when the terminal wins the race it has already
+/// taken the flight the correlation needs, and the observation lands as a second
+/// independent row. Both rows are persisted, so the duplicate survives reload.
+fn assert_compaction_left_one_marker(compaction: &Compaction) {
+    assert!(
+        matches!(
+            compaction.terminal().status,
+            ContextCompactionStatus::Completed
+        ),
+        "{}: reported {:?}, so nothing here asserted anything about a compaction that worked",
+        compaction.label(),
+        compaction.terminal().status
+    );
+    assert_no_error_message(&compaction.label(), compaction.events());
+
+    let markers: Vec<_> = compaction
+        .markers()
+        .map(|marker| {
+            (
+                marker.marker_id.0.clone(),
+                marker.trigger,
+                marker.operation_id.as_ref().map(|id| id.0.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "{}: one compaction produced {} timeline markers, so the chat shows {} rows for a single \
+         event: {markers:?}",
+        compaction.label(),
+        markers.len(),
+        markers.len()
+    );
+}
+
+/// A resumed session replays each thing that happened once.
+///
+/// Claude rewrites its whole conversation into the session file again on every
+/// compaction, preserving each row's original uuid, so a transcript compacted
+/// twice holds three copies of the earliest turns. Nothing downstream treats a
+/// repeated row as a repeat: the replay re-declares tool ids it has already
+/// declared and completed, and re-emits assistant turns the user already read.
+///
+/// The prompt check is the one that sees a re-appended transcript. Duplicate
+/// tool ids do not survive to the client — `TurnEmitter` remembers completed ids
+/// and drops the second declaration — so the tool half of this assertion is a
+/// guard on that ledger rather than a detector, and the visible damage is the
+/// user's own messages appearing twice. Both are asserted because either failing
+/// alone points somewhere different.
+fn assert_replay_has_no_duplicates(agent: &Agent, backend_kind: BackendKind, prompts: &[String]) {
+    let mut requests: BTreeMap<&str, usize> = BTreeMap::new();
+    for event in &agent.replayed_history {
+        if let ChatEvent::ToolRequest(request) = event {
+            *requests.entry(request.tool_call_id.as_str()).or_default() += 1;
+        }
+    }
+    let repeated: Vec<_> = requests
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(id, count)| format!("{id}×{count}"))
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "{backend_kind:?}: the resumed session replayed {} tool request(s) more than once out of \
+         {} distinct id(s): {repeated:?}. One tool call became several cards in the restored \
+         conversation.",
+        repeated.len(),
+        requests.len()
+    );
+
+    for prompt in prompts {
+        let count = agent
+            .replayed_history
+            .iter()
+            .filter(|event| {
+                matches!(event, ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User)
+                        && message.content.contains(prompt.as_str()))
+            })
+            .count();
+        assert!(
+            count <= 1,
+            "{backend_kind:?}: the resumed session replayed the prompt {:?} {count} times; the \
+             user's history repeats itself",
+            prompt.chars().take(48).collect::<String>()
+        );
+    }
 }
 
 fn assert_replayed_history_is_not_empty(agent: &Agent, backend_kind: BackendKind) {
