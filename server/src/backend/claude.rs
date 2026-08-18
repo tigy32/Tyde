@@ -11701,7 +11701,20 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
     let mut deferred_completions = Vec::<ClaudeReplayToolExecution>::new();
     let mut last_emitted_assistant_message_id = None::<String>;
 
+    // Claude appends the whole conversation to this file again every time it
+    // compacts, reusing each row's original uuid, so a session compacted N times
+    // holds N+1 copies of its earliest turns. Replaying a copy re-declares tool
+    // ids this replay already completed — which the emitter reports as a
+    // protocol violation per duplicate — and re-emits messages the user has
+    // already read. The uuid is the provider's own row identity and is stable
+    // across those re-appends, so it is the thing to deduplicate on.
+    let mut replayed_row_uuids = HashSet::<String>::new();
     for value in parsed_values {
+        if let Some(uuid) = value.get("uuid").and_then(Value::as_str)
+            && !replayed_row_uuids.insert(uuid.to_owned())
+        {
+            continue;
+        }
         let line_type = value
             .get("type")
             .and_then(Value::as_str)
