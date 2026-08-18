@@ -389,6 +389,32 @@ pub enum BackendCompactionTerminalEvidence {
     None,
 }
 
+impl BackendCompactionTerminalEvidence {
+    /// The id the backend will mint when it reports observing this same
+    /// compaction, when the terminal result carries enough to name it.
+    ///
+    /// A requested compaction is sighted twice — once as this operation's
+    /// terminal result, once as the backend's own observation — and the two
+    /// travel different channels, so their arrival order is not fixed. Naming
+    /// the observation here is what lets the second sighting be recognized as a
+    /// duplicate rather than becoming a second row in the user's transcript.
+    ///
+    /// Only Claude is answerable: it is the only backend that reports a
+    /// requested compaction as `BackendObservedManual`, and so the only one
+    /// whose observation can collide with an operation of its own. Codex always
+    /// reports `BackendAutomatic`, and Hermes carries no per-event id at all.
+    pub(crate) fn observation_id(&self) -> Option<CompactionObservationId> {
+        match self {
+            Self::Claude {
+                session_id: Some(session_id),
+                boundary_uuid: Some(boundary_uuid),
+                ..
+            } => Some(stable_observation_id("claude", session_id, boundary_uuid)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BackendCompactionEvent {
     Progress(BackendCompactionProgress),

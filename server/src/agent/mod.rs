@@ -3519,6 +3519,14 @@ pub(crate) fn spawn_agent_actor(
         let mut close_deadline: Option<tokio::time::Instant> = None;
         let mut active_compaction: Option<ActiveCompaction> = None;
         let mut context_compaction: Option<CompactionFlight> = None;
+        // Observations already accounted for by a requested operation's marker.
+        // The flight alone cannot carry this: the terminal result takes it, and
+        // the backend's observation of the same compaction arrives afterwards on
+        // a different channel with nothing left to correlate against. Bounded
+        // because a long-lived agent compacts many times; an entry that is never
+        // consumed can only ever suppress the one observation it names.
+        let mut correlated_compaction_observations: VecDeque<CompactionObservationId> =
+            VecDeque::new();
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
         register_transcript_session(&canonical_stream, &actor_session_id, &transcript_store);
@@ -4024,15 +4032,21 @@ pub(crate) fn spawn_agent_actor(
                         BackendEvent::Compaction(
                             crate::backend::BackendCompactionEvent::Observed(observed),
                         ) => {
+                            let already_correlated = correlated_compaction_observations
+                                .iter()
+                                .position(|candidate| *candidate == observed.observation_id)
+                                .map(|index| correlated_compaction_observations.remove(index))
+                                .is_some();
                             let belongs_to_requested_operation = observed.trigger
                                 == CompactionTrigger::BackendObservedManual
-                                && context_compaction.as_ref().is_some_and(|flight| {
-                                    matches!(
-                                        flight.state,
-                                        StoredCompactionState::NativeDispatchPossible
-                                            | StoredCompactionState::NativeAccepted
-                                    )
-                                });
+                                && (already_correlated
+                                    || context_compaction.as_ref().is_some_and(|flight| {
+                                        matches!(
+                                            flight.state,
+                                            StoredCompactionState::NativeDispatchPossible
+                                                | StoredCompactionState::NativeAccepted
+                                        )
+                                    }));
                             let post_tokens = observed.metrics.after_tokens;
                             if let Some(session_id) = current_session_id.as_ref() {
                                 let session_id = session_id.clone();
@@ -4066,14 +4080,17 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                             }
                             if belongs_to_requested_operation {
-                                eprintln!(
-                                    "TYDE COMPACTION CORRELATED observed={} operation={}",
-                                    observed.observation_id.0,
-                                    context_compaction
+                                tracing::debug!(
+                                    agent_id = %current_start.agent_id,
+                                    observation_id = %observed.observation_id.0,
+                                    // Absent once the terminal result has taken
+                                    // the flight, which is the ordering this
+                                    // correlation exists to survive.
+                                    operation_id = context_compaction
                                         .as_ref()
-                                        .expect("correlated compaction flight disappeared")
-                                        .operation_id
-                                        .0,
+                                        .map(|flight| flight.operation_id.0.as_str()),
+                                    after_terminal = already_correlated,
+                                    "correlated a backend compaction observation with a requested operation"
                                 );
                                 continue;
                             }
@@ -6992,6 +7009,17 @@ pub(crate) fn spawn_agent_actor(
                             if flight.operation_id != operation_id {
                                 context_compaction = Some(flight);
                                 continue;
+                            }
+                            // Taking the flight above is what breaks the
+                            // correlation the observation handler relies on, so
+                            // name the observation before that matters.
+                            if let Ok(result) = result.as_ref()
+                                && let Some(observation_id) = result.evidence.observation_id()
+                            {
+                                correlated_compaction_observations.push_back(observation_id);
+                                while correlated_compaction_observations.len() > 8 {
+                                    correlated_compaction_observations.pop_front();
+                                }
                             }
                             let session_id = current_session_id
                                 .as_ref()
