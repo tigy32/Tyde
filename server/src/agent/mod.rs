@@ -4280,6 +4280,18 @@ pub(crate) fn spawn_agent_actor(
                         ChatEvent::OperationCancelled(_) => {
                             pending_tool_response_ids.clear();
                             active_agent_await_ids.clear();
+                            // Re-arm, rather than ending the turn here. Arming
+                            // otherwise happens only on typing-true or on
+                            // answering the last pending tool, and a cancelled
+                            // interactive tool produces neither — so without
+                            // this the backend's own idle marker is discarded as
+                            // unarmed, the turn never closes, and every later
+                            // message queues behind it with no cancel able to
+                            // clear it. Ending the turn *here* instead would
+                            // drain that queue before the idle marker the client
+                            // is still owed, starting the next turn's response
+                            // ahead of the previous turn's end.
+                            idle_transition_armed = in_turn;
                             if let Some(compaction) = active_compaction.as_mut() {
                                 compaction.error = Some("compaction summary turn was cancelled".to_owned());
                             }

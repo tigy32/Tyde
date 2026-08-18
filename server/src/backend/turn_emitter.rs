@@ -364,7 +364,10 @@ impl TurnEmitter {
             let foreground_tools = state
                 .open_tool_requests
                 .iter()
-                .filter(|(_, request)| request.execution_mode == ToolExecutionMode::Foreground)
+                .filter(|(_, request)| {
+                    request.execution_mode == ToolExecutionMode::Foreground
+                        && !awaits_user_response(&request.tool_type)
+                })
                 .map(|(tool_call_id, _)| tool_call_id.clone())
                 .collect::<Vec<_>>();
             if let Some(tool_call_id) = foreground_tools.first() {
@@ -1047,6 +1050,21 @@ impl TurnEmitterState {
             self.retired_tool_call_ids.shift_remove_index(0);
         }
     }
+}
+
+/// Is this tool waiting on a human rather than on the machine?
+///
+/// A question or a plan approval is the one kind of foreground tool that is
+/// *supposed* to still be open when the turn goes idle: the turn ends precisely
+/// so the user can act on the card. Treating that as a stuck tool cancels the
+/// card the user was asked to answer, and the answer that arrives afterwards is
+/// then rejected as a completion for an id this emitter has already retired —
+/// leaving the provider blocked on a response that can no longer be sent.
+fn awaits_user_response(tool_type: &ToolRequestType) -> bool {
+    matches!(
+        tool_type,
+        ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
+    )
 }
 
 fn simple_message(sender: protocol::MessageSender, content: &str) -> protocol::ChatMessage {
