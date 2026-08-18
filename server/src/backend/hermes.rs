@@ -68,6 +68,7 @@ const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
 const HERMES_MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
+const HERMES_YOLO_MODE_ENV: &str = "HERMES_YOLO_MODE";
 const TYDE_HERMES_SYSTEM_PROMPT_ENV: &str = "TYDE_HERMES_SYSTEM_PROMPT";
 const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 /// Hermes's Tool Search bridge tool. When deferral is active the
@@ -4267,6 +4268,19 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         command.current_dir(cwd);
         command.env("TERMINAL_CWD", cwd);
     }
+    // Hermes is the only backend that stops mid-turn to ask its own user for
+    // permission, which in Tyde means a turn that waits on a prompt the user
+    // never asked for. Its 47 approval patterns cover ordinary agent work —
+    // `rm -r`, `chmod -R`, `find -exec rm`, `git clean -f` — and every other
+    // backend here simply runs them.
+    //
+    // Scoped to the process Tyde spawns rather than set through
+    // `~/.hermes/config.yaml`, so it cannot change the user's own CLI sessions.
+    // Frozen at import (`approval.py:32`), so it has to be here and not sent
+    // later. Hermes checks its hardline set *before* consulting this
+    // (`approval.py:1383`), so `rm -rf /`, `$HOME`, `mkfs`, `dd` to a raw
+    // device, fork bombs and shutdown stay blocked regardless.
+    command.env(HERMES_YOLO_MODE_ENV, "1");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
