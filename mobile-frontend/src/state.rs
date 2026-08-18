@@ -289,13 +289,15 @@ pub struct PendingSubmission {
     pub target: SubmissionTarget,
     pub text: String,
     pub images: Vec<protocol::ImageData>,
-    /// A typed tool response riding the same `SendMessage` frame — a plan
-    /// approval, or a rejection with feedback.
+    /// A typed tool response riding the same `SendMessage` frame — a question
+    /// answer, a plan approval, or a rejection with feedback.
     ///
     /// It has to be held with the record, not reconstructed: for a plan decision
     /// the payload **is** the decision and `text` is empty, so a resend that
     /// dropped this would put an empty chat message on the wire and leave the
-    /// agent still waiting for an answer it never gets.
+    /// agent still waiting for an answer it never gets. A question answer has
+    /// text, but losing the response is just as fatal — the agent queues it
+    /// behind the turn the question is holding open.
     pub tool_response: Option<protocol::SendMessageToolResponse>,
     pub state: PendingSubmissionState,
 }
@@ -317,10 +319,10 @@ impl PendingSubmission {
     /// Whether the composer could actually hold this submission if the user asked
     /// for it back.
     ///
-    /// A tool response cannot be expressed as chat text — it is a typed decision —
-    /// so there is nothing meaningful to hand back, and handing back its (empty)
-    /// text would just look broken. Recovery for those runs through **Send again**
-    /// or **Discard**.
+    /// A tool response cannot be expressed as chat text. A plan decision has no
+    /// text to hand back at all; a question answer has text, but re-sending it
+    /// from the composer would strip the response and park it in the queue. Both
+    /// recover through **Send again** or **Discard**.
     pub fn is_editable_in_composer(&self) -> bool {
         self.tool_response.is_none()
     }

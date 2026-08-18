@@ -86,6 +86,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                 </div>
                 <AskUserQuestionCard
                     owner_agent_ref=owner_agent_ref.clone()
+                    tool_call_id=entry.request.tool_call_id.clone()
                     questions=questions
                 />
             </div>
@@ -977,6 +978,7 @@ struct QuestionState {
 #[component]
 fn AskUserQuestionCard(
     owner_agent_ref: AgentRef,
+    tool_call_id: String,
     questions: Vec<AskUserQuestion>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1024,6 +1026,7 @@ fn AskUserQuestionCard(
         let states = states.clone();
         let owner = owner_agent_ref.clone();
         let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
         move |_| {
             if submitted.get_untracked().is_some() || sending.get_untracked() {
                 return;
@@ -1062,6 +1065,7 @@ fn AskUserQuestionCard(
                     stream,
                 },
                 status,
+                tool_call_id.clone(),
                 message,
             );
         }
@@ -1423,13 +1427,21 @@ struct ReplyStatus {
     send_error: RwSignal<Option<String>>,
 }
 
-fn send_answer(channel: ReplyChannel, status: ReplyStatus, message: String) {
+fn send_answer(channel: ReplyChannel, status: ReplyStatus, tool_call_id: String, message: String) {
     spawn_local(async move {
+        // The answer has to ride as a typed tool response, not as chat text. The
+        // question keeps its turn open until the tool is answered, and the server
+        // queues every message that is *not* a tool response — so plain text
+        // parks in the queue behind a turn only this answer can end.
+        let tool_response = SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            answer: message.clone(),
+        };
         let payload = SendMessagePayload {
             message: message.clone(),
             images: None,
             origin: None,
-            tool_response: None,
+            tool_response: Some(tool_response.clone()),
         };
         match crate::send::send_frame(
             &channel.host_id,
@@ -1440,7 +1452,13 @@ fn send_answer(channel: ReplyChannel, status: ReplyStatus, message: String) {
         .await
         {
             Ok(accepted) => {
-                let origin = hold_reply(&channel.state, &channel.owner, accepted, message, None);
+                let origin = hold_reply(
+                    &channel.state,
+                    &channel.owner,
+                    accepted,
+                    message,
+                    Some(tool_response),
+                );
                 status.submitted.set(Some(origin));
                 status.send_error.set(None);
             }
@@ -2117,6 +2135,68 @@ mod wasm_tests {
             "sent note appears after send resolves"
         );
         assert_answer_controls_disabled(&container);
+    }
+
+    /// **The answer rides as a typed tool response, not as chat text.**
+    ///
+    /// A question holds its turn open until the tool is answered, and the agent
+    /// queues every message that is *not* a tool response. So a plain-text answer
+    /// parks in the queue behind the one turn only it could have ended: the card
+    /// never closes, the provider waits forever on a `tool_result`, and no cancel
+    /// clears it. This card shipped sending `tool_response: None`, which the plan
+    /// card next door already got right.
+    ///
+    /// The held record is asserted too — dropping the response there degrades
+    /// "Send again" into the same plain-text send.
+    #[wasm_bindgen_test]
+    async fn submit_answers_the_question_as_a_typed_tool_response() {
+        let calls = configure_deferred_web_sends();
+        let (container, state) = mount_card_with_state(ask_entry(false), configure_active_agent);
+        next_tick().await;
+
+        option_buttons(&container)[0].click();
+        next_tick().await;
+        submit_button(&container).click();
+        next_tick().await;
+
+        assert_eq!(calls.length(), 1, "one send for one submit");
+        let payload = last_send_payload(&calls);
+        assert!(
+            payload.contains("AskUserQuestion"),
+            "the frame must carry a typed tool response, or the agent queues it: {payload}"
+        );
+        assert!(
+            payload.contains("toolu_ask"),
+            "the response must name the question it answers: {payload}"
+        );
+        assert!(
+            payload.contains("Rust"),
+            "the response must carry the chosen answer: {payload}"
+        );
+
+        resolve_deferred_send();
+        next_tick().await;
+
+        let record = state
+            .pending_submissions
+            .get_untracked()
+            .values()
+            .next()
+            .cloned()
+            .expect("an admitted answer must be held so a later failure can surface");
+        match record.tool_response.as_ref() {
+            Some(SendMessageToolResponse::AskUserQuestion {
+                tool_call_id,
+                answer,
+            }) => {
+                assert_eq!(tool_call_id, "toolu_ask");
+                assert!(answer.contains("Rust"), "held answer: {answer}");
+            }
+            other => panic!(
+                "the held record must keep the typed response, or Send again degrades into a \
+                 plain message the agent queues: {other:?}"
+            ),
+        }
     }
 
     /// Admission is not delivery, and the card must not claim it is.

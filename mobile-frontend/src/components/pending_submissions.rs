@@ -270,13 +270,20 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
             return;
         }
         let Some(record) = with_record() else { return };
-        // A plan decision is a typed answer, not chat text. Its message body is
-        // empty, so "editing" it would drop nothing into the composer and quietly
-        // lose the decision. Send again re-sends it correctly; Discard drops it.
+        // A card reply is a typed answer, not chat text. Handing it to the composer
+        // would strip the tool response and re-send it as an ordinary message,
+        // which the agent queues behind the very turn this reply exists to end.
+        // Send again re-sends it correctly; Discard drops it.
         if !record.is_editable_in_composer() {
+            let kind = match record.tool_response {
+                Some(protocol::SendMessageToolResponse::AskUserQuestion { .. }) => {
+                    "a question answer"
+                }
+                _ => "a plan decision",
+            };
             shell_error(
                 &edit_state,
-                "This is a plan decision, not a message. Use Send again, or Discard it.".to_owned(),
+                format!("This is {kind}, not a message. Use Send again, or Discard it."),
             );
             return;
         }
