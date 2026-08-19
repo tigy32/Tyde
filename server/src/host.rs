@@ -14275,7 +14275,7 @@ fn spawn_supervisor_compaction_executor(
     host: HostHandle,
     mut requests: mpsc::UnboundedReceiver<SupervisorCompactionRequest>,
 ) {
-    tokio::spawn(async move {
+    let worker = async move {
         while let Some(request) = requests.recv().await {
             let (tx, _rx) = crate::stream::output_channel();
             let stream = Stream::new(
@@ -14307,7 +14307,34 @@ fn spawn_supervisor_compaction_executor(
                 ),
             }
         }
-    });
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("tyde-supervisor-compaction".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "failed to build supervisor-compaction runtime"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(error = %err, "failed to spawn supervisor-compaction thread");
+    }
 }
 
 async fn observe_activity_summary_agents(
