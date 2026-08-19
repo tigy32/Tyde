@@ -2778,6 +2778,13 @@ struct CodexResponseSplitter {
     execution_only_typed_tool_item_ids: HashSet<String>,
     execution_only_typed_tool_owners: HashMap<String, BufferedCodexToolRequest>,
     claimed_raw_tool_calls: HashSet<String>,
+    /// Cards a typed item has taken over, so the raw output for the same call
+    /// stops short of completing them a second time. Unlike
+    /// `claimed_raw_tool_calls` this is written only by
+    /// `observe_typed_item_started` and never cleared, because the raw output
+    /// routinely arrives *after* the typed item has completed and unparked its
+    /// owner.
+    typed_owned_tool_call_ids: HashSet<String>,
     pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
     last_token_usage: Option<Value>,
 }
@@ -2813,6 +2820,7 @@ impl CodexResponseSplitter {
             execution_only_typed_tool_item_ids: HashSet::new(),
             execution_only_typed_tool_owners: HashMap::new(),
             claimed_raw_tool_calls: HashSet::new(),
+            typed_owned_tool_call_ids: HashSet::new(),
             pending_raw_tool_owners: IndexMap::new(),
             last_token_usage: None,
         }
@@ -2892,6 +2900,8 @@ impl CodexResponseSplitter {
                 .flatten()
             });
             if let Some(owner) = owner {
+                self.typed_owned_tool_call_ids
+                    .insert(owner.tool_call_id.clone());
                 self.execution_only_typed_tool_item_ids
                     .insert(item_id.to_owned());
                 self.execution_only_typed_tool_owners
@@ -3316,6 +3326,10 @@ impl CodexResponseSplitter {
 
     fn claim_raw_tool_call(&mut self, tool_call_id: &str) {
         self.claimed_raw_tool_calls.insert(tool_call_id.to_owned());
+    }
+
+    fn typed_item_owns_tool_call(&self, tool_call_id: &str) -> bool {
+        self.typed_owned_tool_call_ids.contains(tool_call_id)
     }
 
     fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
@@ -8466,6 +8480,22 @@ impl CodexInner {
             if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
                 splitter.remove_raw_tool_owner(call_id);
             }
+            return true;
+        }
+        // Codex reports one shell call twice, and only the typed
+        // `commandExecution` carries `exit_code`/`stdout`. Completing the card
+        // from here as well left the rendered outcome decided by whichever of
+        // the two landed first — a millisecond apart on the wire — and a
+        // disagreement surfaced as `conflicting_duplicate_completion`. A card a
+        // typed item has taken belongs to that item alone.
+        if self
+            .state
+            .lock()
+            .await
+            .response_splitters
+            .get(&thread_id)
+            .is_some_and(|splitter| splitter.typed_item_owns_tool_call(&owner.tool_call_id))
+        {
             return true;
         }
         let output = raw_custom_tool_output_text(item);
