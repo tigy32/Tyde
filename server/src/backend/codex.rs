@@ -2784,13 +2784,13 @@ struct CodexResponseSplitter {
     execution_only_typed_tool_item_ids: HashSet<String>,
     execution_only_typed_tool_owners: HashMap<String, BufferedCodexToolRequest>,
     claimed_raw_tool_calls: HashSet<String>,
-    /// Cards a typed item has taken over, so the raw output for the same call
-    /// stops short of completing them a second time. Unlike
-    /// `claimed_raw_tool_calls` this is written only by
-    /// `observe_typed_item_started` and never cleared, because the raw output
-    /// routinely arrives *after* the typed item has completed and unparked its
-    /// owner.
-    typed_owned_tool_call_ids: HashSet<String>,
+    /// Provider `call_id`s a typed item has taken over, so the raw output for
+    /// the same call neither completes the card a second time nor reports its
+    /// missing owner as a loss. Unlike `claimed_raw_tool_calls` this is written
+    /// only by `observe_typed_item_started` and never cleared, because the raw
+    /// output routinely arrives *after* the typed item has completed and
+    /// unparked its owner.
+    typed_owned_call_ids: HashSet<String>,
     pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
     last_token_usage: Option<Value>,
 }
@@ -2826,7 +2826,7 @@ impl CodexResponseSplitter {
             execution_only_typed_tool_item_ids: HashSet::new(),
             execution_only_typed_tool_owners: HashMap::new(),
             claimed_raw_tool_calls: HashSet::new(),
-            typed_owned_tool_call_ids: HashSet::new(),
+            typed_owned_call_ids: HashSet::new(),
             pending_raw_tool_owners: IndexMap::new(),
             last_token_usage: None,
         }
@@ -2906,8 +2906,13 @@ impl CodexResponseSplitter {
                 .flatten()
             });
             if let Some(owner) = owner {
-                self.typed_owned_tool_call_ids
-                    .insert(owner.tool_call_id.clone());
+                // The typed item's own id *is* the provider `call_id` the raw
+                // output will carry, but record the owner's copy too for the
+                // shapes where the two differ.
+                self.typed_owned_call_ids.insert(item_id.to_owned());
+                if let Some(call_id) = owner.provider_call_id.clone() {
+                    self.typed_owned_call_ids.insert(call_id);
+                }
                 self.execution_only_typed_tool_item_ids
                     .insert(item_id.to_owned());
                 self.execution_only_typed_tool_owners
@@ -3334,8 +3339,8 @@ impl CodexResponseSplitter {
         self.claimed_raw_tool_calls.insert(tool_call_id.to_owned());
     }
 
-    fn typed_item_owns_tool_call(&self, tool_call_id: &str) -> bool {
-        self.typed_owned_tool_call_ids.contains(tool_call_id)
+    fn typed_item_owns_call(&self, call_id: &str) -> bool {
+        self.typed_owned_call_ids.contains(call_id)
     }
 
     fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
@@ -8367,14 +8372,26 @@ impl CodexInner {
         else {
             return false;
         };
-        let owner = {
+        let (owner, typed_owns_call) = {
             let state = self.state.lock().await;
-            state
-                .response_splitters
-                .get(&thread_id)
-                .and_then(|splitter| splitter.raw_tool_owner(call_id))
+            let splitter = state.response_splitters.get(&thread_id);
+            (
+                splitter.and_then(|splitter| splitter.raw_tool_owner(call_id)),
+                splitter.is_some_and(|splitter| splitter.typed_item_owns_call(call_id)),
+            )
         };
         let Some(owner) = owner else {
+            if typed_owns_call {
+                // The ordinary path for a shell call: the typed item completed
+                // the card and unparked its owner before this arrived. Reporting
+                // it as a loss put an ERROR in the log for every healthy command.
+                tracing::debug!(
+                    thread_id,
+                    call_id,
+                    "Codex raw tool output followed the typed item that already completed its card"
+                );
+                return false;
+            }
             // No parked owner for this `call_id`, so this raw output cannot be
             // attached to the card the model declared for it. Downstream that
             // shows up as a tool that never completes.
@@ -8495,14 +8512,7 @@ impl CodexInner {
         // the two landed first — a millisecond apart on the wire — and a
         // disagreement surfaced as `conflicting_duplicate_completion`. A card a
         // typed item has taken belongs to that item alone.
-        if self
-            .state
-            .lock()
-            .await
-            .response_splitters
-            .get(&thread_id)
-            .is_some_and(|splitter| splitter.typed_item_owns_tool_call(&owner.tool_call_id))
-        {
+        if typed_owns_call {
             return true;
         }
         let output = raw_custom_tool_output_text(item);
