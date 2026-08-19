@@ -1790,7 +1790,7 @@ impl KiroInner {
         };
 
         let mut start_event: Option<String> = None;
-        let mut should_finalize_current = false;
+        let mut declaration: Option<(ToolUseData, String, Value)> = None;
         {
             let mut state = self.state.lock().await;
             let canonical_id = build_canonical_tool_call_id(
@@ -1864,9 +1864,9 @@ impl KiroInner {
                     .iter()
                     .any(|call| call.tool_call_id == canonical_id);
                 if !already_present {
-                    state.active_stream_tool_calls.push(tool_call_entry);
+                    state.active_stream_tool_calls.push(tool_call_entry.clone());
+                    declaration = Some((tool_call_entry, canonical_id.clone(), tool_type));
                 }
-                should_finalize_current = true;
             }
         };
 
@@ -1877,8 +1877,24 @@ impl KiroInner {
             state.active_response = Some(response);
         }
 
-        if should_finalize_current {
-            self.finalize_active_stream_if_any(None, false).await;
+        // Declare the call on the response that is still open rather than
+        // ending that response to declare it. Kiro delivers every call of a
+        // parallel batch before the first result, so ending here would give
+        // each one its own chat message; declaring keeps the card immediate,
+        // which waiting for the result would not — Kiro sends no in-progress
+        // update, only the completion.
+        if let Some((declaration, canonical_id, tool_type)) = declaration {
+            let response = { self.state.lock().await.active_response.clone() };
+            if let Some(response) = response {
+                self.emitter
+                    .declare_streaming_tools(&response, vec![declaration]);
+                self.emitter
+                    .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
+                let mut state = self.state.lock().await;
+                if let Some(context) = state.active_tool_contexts.get_mut(&canonical_id) {
+                    context.request_emitted = true;
+                }
+            }
         }
     }
 
@@ -1913,6 +1929,11 @@ impl KiroInner {
             return;
         };
         completion.tool_call_id = resolved_tool_call_id;
+
+        // The first result ends the response that issued the calls. Every call
+        // of a batch has arrived by now, so the closing `StreamEnd` carries all
+        // of them and the client can tell they came from one response.
+        self.finalize_active_stream_if_any(None, false).await;
 
         let backfill_after_path = {
             let state = self.state.lock().await;
