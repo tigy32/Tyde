@@ -17,7 +17,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactPayload, AgentErrorPayload, AgentId,
-    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ClientErrorPayload,
+    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ClientErrorPayload,
     ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
     FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
     MessageSender, NewAgentPayload, QueuedMessagesPayload, SendMessagePayload,
@@ -153,6 +153,18 @@ impl Turn {
     pub fn tool_requests(&self) -> impl Iterator<Item = &ToolRequest> {
         self.events.iter().filter_map(|event| match event {
             ChatEvent::ToolRequest(request) => Some(request),
+            _ => None,
+        })
+    }
+
+    /// The assistant messages the client materialized, in stream order.
+    ///
+    /// Each one is supposed to be exactly one provider response, and its
+    /// `tool_calls` are the calls that response issued — the client's only
+    /// handle on which response a tool card belongs to.
+    pub fn assistant_messages(&self) -> impl Iterator<Item = &ChatMessage> {
+        self.events.iter().filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(&end.message),
             _ => None,
         })
     }

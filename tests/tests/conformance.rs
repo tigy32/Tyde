@@ -165,6 +165,51 @@ fn real_conversation_on_resumed_session() {
     });
 }
 
+/// A resumed session must group a response's tool calls exactly like a fresh one.
+///
+/// Both halves run the same prompt and the same oracle on purpose. The fresh
+/// half is the control: it establishes that this backend and this model do
+/// group parallel calls, so a failure in the resumed half is the resume path
+/// and not the model declining to parallelize. Without that control the
+/// resumed assertion cannot distinguish the two.
+///
+/// Codex fails the resumed half today: its app-server sends no `rawResponse*`
+/// on a resumed thread (openai/codex#34353), so the provider-response splitter
+/// is disabled and every tool falls back to a path that emits one message per
+/// call.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_resumed_session_groups_parallel_tool_calls() {
+    run_scenario(&[BackendCapability::ResumeSession], |mut host| async move {
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+
+        let fresh = ask(&mut host, &agent, parallel_tool_prompt()).await;
+        assert_multi_tool_turn(&fresh, host.workspace());
+        assert_response_groups_its_tool_calls(&fresh);
+
+        assert_universal_contract(&[launched, fresh]);
+
+        let session = stored_session(&mut host).await;
+        assert!(
+            session.resumable,
+            "{:?}: session is not resumable, so the rest of this scenario cannot run",
+            host.backend()
+        );
+        assert_clean_close(&mut host, &agent).await;
+
+        let resumed = resume_agent(&mut host, &session.id).await;
+        assert_replayed_history_is_not_empty(&resumed, host.backend());
+
+        let after_resume = ask(&mut host, &resumed, parallel_tool_prompt()).await;
+        assert_multi_tool_turn(&after_resume, host.workspace());
+        assert_response_groups_its_tool_calls(&after_resume);
+        assert_universal_contract(&[after_resume]);
+
+        assert_clean_close(&mut host, &resumed).await;
+    });
+}
+
 /// Compaction, and what a session looks like once it has been compacted.
 ///
 /// Compaction is not just another turn: it rewrites the provider's own session
@@ -608,6 +653,22 @@ fn multi_tool_prompt() -> String {
     )
 }
 
+/// Forces several tool calls out of a *single* provider response.
+///
+/// `multi_tool_prompt` deliberately leaves the model free to work one file at a
+/// time, which is a different shape: three responses of one call each is
+/// correct there. Here the calls must share one response, because that is the
+/// only way a client can observe whether a response's calls stay together.
+fn parallel_tool_prompt() -> String {
+    let [a, b, c] = MULTI_FILES;
+    format!(
+        "Issue all three of these tool calls at once, in a single response, in parallel: create \
+         {a} containing exactly A, create {b} containing exactly B, and create {c} containing \
+         exactly C. Do not wait for one result before issuing the next, and do not combine them \
+         into a single command. Then reply with exactly {MULTI_MARKER} and nothing else."
+    )
+}
+
 fn subagent_prompt(payload: &str) -> String {
     format!(
         "Delegate the following task to a single sub-agent and wait for it to finish: create a \
@@ -858,6 +919,70 @@ fn assert_reported_model_is_pinned(turns: &[Turn]) {
 /// `assert_every_request_completed_exactly_once` can only catch an orphaned card
 /// if the turn actually issued more than one tool call, so without the count
 /// check this passes vacuously whenever a provider batches the work.
+/// One provider response's tool calls must arrive as one chat message.
+///
+/// A chat message is meant to be exactly one provider response, and its
+/// `tool_calls` list is the client's only handle on which response issued a
+/// card. A backend that mints a fresh message per tool still renders every
+/// card, so no other oracle in this suite notices: the turn just silently
+/// becomes N single-tool bubbles with the response's own text stranded in a
+/// message of its own.
+///
+/// Deliberately not "one message for the whole turn" — a turn legitimately
+/// holds several responses. The claim is only that a response does not get
+/// shredded, so it fails when *every* call sits alone and tolerates a model
+/// that splits three calls as 2+1.
+fn assert_response_groups_its_tool_calls(turn: &Turn) {
+    let declarations: Vec<(String, Option<String>)> = turn
+        .tool_requests()
+        .map(|request| {
+            let owner = turn
+                .assistant_messages()
+                .find(|message| {
+                    message
+                        .tool_calls
+                        .iter()
+                        .any(|call| call.tool_call_id == request.tool_call_id)
+                })
+                .and_then(|message| message.message_id.as_ref())
+                .map(|id| id.0.clone());
+            (request.tool_call_id.clone(), owner)
+        })
+        .collect();
+
+    let orphans: Vec<&str> = declarations
+        .iter()
+        .filter(|(_, owner)| owner.is_none())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{}: tool calls {orphans:?} were never declared by any assistant message, so the client \
+         cannot tell which response issued them. Saw messages {:?}",
+        turn.label(),
+        turn.assistant_messages()
+            .map(|message| message.tool_calls.len())
+            .collect::<Vec<_>>()
+    );
+
+    if declarations.len() < 2 {
+        return;
+    }
+    let owners: BTreeSet<&str> = declarations
+        .iter()
+        .filter_map(|(_, owner)| owner.as_deref())
+        .collect();
+    assert!(
+        owners.len() < declarations.len(),
+        "{}: {} tool calls arrived as {} separate chat messages — every call got its own message, \
+         so no provider response kept its calls together. Tools: {:?}",
+        turn.label(),
+        declarations.len(),
+        owners.len(),
+        turn.tool_request_names(),
+    );
+}
+
 fn assert_multi_tool_turn(turn: &Turn, workspace: &Path) {
     let requests = turn.tool_requests().count();
     assert!(
