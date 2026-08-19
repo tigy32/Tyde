@@ -984,7 +984,11 @@ impl TurnEmitterState {
                 outcome: outcome.clone(),
             },
         );
-        self.declared_tools.remove(tool_call_id);
+        // The declaration outlives the completion on purpose. A tool declared on
+        // a still-open response can finish before that response closes, and
+        // `stream_end` has to re-declare it to record the call on the persisted
+        // message. Dropping it here made that re-declaration look like a reused
+        // id, so the message ended up declaring nothing.
         self.send_chat(ChatEvent::ToolExecutionCompleted(
             ToolExecutionCompletedData {
                 tool_call_id: tool_call_id.to_owned(),

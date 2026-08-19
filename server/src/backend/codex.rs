@@ -2735,6 +2735,12 @@ struct BufferedCodexToolRequest {
     tool_name: String,
     arguments: Value,
     tool_type: Value,
+    /// How much of the response's text had arrived when the card was declared.
+    /// `stream_end` re-declares the call and must reuse this, or the two
+    /// declarations disagree and the emitter rejects the pair as conflicting.
+    /// `None` for a request recovered from a raw item, which is never declared
+    /// early and so has no streaming position to preserve.
+    content_offset: Option<u32>,
 }
 
 struct OpenCodexProviderResponse {
@@ -2773,6 +2779,7 @@ struct CodexResponseSplitter {
     execution_only_typed_tool_owners: HashMap<String, BufferedCodexToolRequest>,
     claimed_raw_tool_calls: HashSet<String>,
     pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
+    last_token_usage: Option<Value>,
 }
 
 struct CodexResponseDelta {
@@ -2807,7 +2814,20 @@ impl CodexResponseSplitter {
             execution_only_typed_tool_owners: HashMap::new(),
             claimed_raw_tool_calls: HashSet::new(),
             pending_raw_tool_owners: IndexMap::new(),
+            last_token_usage: None,
         }
+    }
+
+    /// The provider-response boundary for a thread with no raw events. The
+    /// notification itself repeats — a resumed turn sent two consecutive ones
+    /// carrying byte-identical totals — so its arrival means nothing and only
+    /// movement in the reported usage marks a completed request.
+    fn token_usage_boundary_reached(&mut self, usage: Option<&Value>) -> bool {
+        if self.last_token_usage.as_ref() == usage {
+            return false;
+        }
+        self.last_token_usage = usage.cloned();
+        self.open.is_some()
     }
 
     fn ensure_open(
@@ -3124,17 +3144,21 @@ impl CodexResponseSplitter {
         tool_name: &str,
         arguments: Value,
         tool_type: Value,
-    ) -> Option<(Option<CodexProviderResponseIdentity>, ChatMessageId)> {
+    ) -> Option<u32> {
         if !self.enabled {
             return None;
         }
-        let response = self.open.as_mut()?;
+        // Opens the response rather than requiring one: a resumed thread gets no
+        // raw events, so nothing else has opened it, and bailing here is what
+        // sent every tool down the one-card-per-tool path.
+        self.ensure_open(turn_id)?;
+        let response = self.open.as_mut().expect("open Codex response");
         if response.turn_id == "turn"
             && let Some(turn_id) = turn_id
         {
             response.turn_id = turn_id.to_owned();
         }
-        let opened = (None, response.identity.message_id());
+        let content_offset = u32::try_from(response.text.chars().count()).unwrap_or(u32::MAX);
         let provider_item_id = response.pending_typed_tool_item_id.clone();
         let provider_call_id = response.pending_typed_tool_call_id.clone();
         response.raw_tool_requests.retain(|raw| {
@@ -3159,18 +3183,19 @@ impl CodexResponseSplitter {
             existing.tool_name = tool_name.to_owned();
             existing.arguments = arguments;
             existing.tool_type = tool_type;
-        } else {
-            response.tool_requests.push(BufferedCodexToolRequest {
-                turn_id: turn_id.map(str::to_owned),
-                provider_item_id,
-                provider_call_id,
-                tool_call_id: tool_call_id.to_owned(),
-                tool_name: tool_name.to_owned(),
-                arguments,
-                tool_type,
-            });
+            return Some(*existing.content_offset.get_or_insert(content_offset));
         }
-        Some(opened)
+        response.tool_requests.push(BufferedCodexToolRequest {
+            turn_id: turn_id.map(str::to_owned),
+            provider_item_id,
+            provider_call_id,
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments,
+            tool_type,
+            content_offset: Some(content_offset),
+        });
+        Some(content_offset)
     }
 
     fn finalize(
@@ -7502,18 +7527,15 @@ impl CodexInner {
             state.thread_id = resumed_thread_id;
             let resumed_thread_id = state.thread_id.clone();
             state.response_splitters.clear();
-            // Strict splitting stays off for a resumed thread, and this is not
-            // a conservative default — it is what the app-server does. Codex
-            // 0.146.0 accepts `experimentalRawEvents` on `thread/resume` (the
-            // field is in `ThreadResumeParams`) and then emits only typed
-            // `item/*` notifications: measured across a full resumed turn,
-            // zero `rawResponse*` of any kind. Turning the splitter on anyway
-            // makes every resumed turn end in a forced finalize, a failed tool
-            // card and an error card, because the boundary it waits for never
-            // comes.
+            // A resumed thread gets no `rawResponse*` of any kind — Codex
+            // 0.146.0 accepts `experimentalRawEvents` on `thread/resume` and
+            // ignores it (openai/codex#34353). Splitting still runs, because the
+            // boundary it finalizes on is a `thread/tokenUsage/updated` change,
+            // which a resumed thread does emit. Leaving it off is what gave each
+            // tool call its own chat message.
             state.response_splitters.insert(
                 resumed_thread_id.clone(),
-                CodexResponseSplitter::new(&resumed_thread_id, false),
+                CodexResponseSplitter::new(&resumed_thread_id, true),
             );
             state.experimental_raw_events_requested = false;
             if let Some(model) = resumed_model.clone() {
@@ -8699,7 +8721,14 @@ impl CodexInner {
                     .and_then(|stream| stream.active_turn_id.clone())
             }
         };
-        let buffered = {
+        let declaration = ToolUseData {
+            tool_call_id: tool_call_id.to_owned(),
+            name: tool_name.to_owned(),
+            arguments: arguments.clone(),
+            content_offset: None,
+        };
+        let request_type = codex_tool_request_type(tool_type.clone());
+        let content_offset = {
             let mut state = self.state.lock().await;
             state
                 .response_splitters
@@ -8714,12 +8743,27 @@ impl CodexInner {
                     )
                 })
         };
-        let Some((opened, _)) = buffered else {
+        let Some(content_offset) = content_offset else {
             return false;
         };
-        let _ = opened;
-        self.ensure_strict_response_handle(thread_id, emitter.as_ref(), &model, None)
-            .await;
+        let Some(response) = self
+            .ensure_strict_response_handle(thread_id, emitter.as_ref(), &model, None)
+            .await
+        else {
+            return false;
+        };
+        // Declare now rather than at the response boundary. That boundary is a
+        // `tokenUsage` change, which only lands once the tools have finished
+        // running, so waiting for it would leave every card invisible for the
+        // whole duration of the command.
+        emitter.declare_streaming_tools(
+            &response,
+            vec![ToolUseData {
+                content_offset: Some(content_offset),
+                ..declaration
+            }],
+        );
+        emitter.tool_request(tool_call_id, request_type);
         true
     }
 
@@ -8849,7 +8893,7 @@ impl CodexInner {
                 tool_call_id: request.tool_call_id.clone(),
                 name: request.tool_name.clone(),
                 arguments: request.arguments.clone(),
-                content_offset: Some(content_offset),
+                content_offset: Some(request.content_offset.unwrap_or(content_offset)),
             })
             .collect();
         let token_usage = finalized
@@ -8912,6 +8956,31 @@ impl CodexInner {
             "Finalized Codex provider response boundary"
         );
         true
+    }
+
+    /// Closes the open provider response when reported usage moves. On a thread
+    /// with raw events `rawResponse/completed` has already closed it and this
+    /// finds nothing open, so both kinds of thread end a response the same way.
+    async fn finalize_strict_response_at_token_usage(&self, params: &Value) {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let usage = params.pointer("/tokenUsage").cloned();
+        let boundary = {
+            let mut state = self.state.lock().await;
+            state
+                .response_splitters
+                .get_mut(&thread_id)
+                .is_some_and(|splitter| splitter.token_usage_boundary_reached(usage.as_ref()))
+        };
+        if !boundary {
+            return;
+        }
+        let mut params = params.clone();
+        if let Some(last) = params.pointer("/tokenUsage/last").cloned() {
+            params["usage"] = last;
+        }
+        self.finalize_strict_response(&params, false).await;
     }
 
     async fn finalize_incomplete_strict_response(&self, params: &Value, reason: &str) -> bool {
@@ -9448,6 +9517,7 @@ impl CodexInner {
             }
             "thread/tokenUsage/updated" => {
                 self.handle_root_token_usage_updated(params).await;
+                self.finalize_strict_response_at_token_usage(params).await;
             }
             "model/rerouted" => {
                 if let Some(model) = params.get("toModel").and_then(Value::as_str) {
@@ -18611,6 +18681,7 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
         tool_name,
         arguments,
         tool_type,
+        content_offset: None,
     })
 }
 
