@@ -1095,6 +1095,11 @@ struct ClaudeStdoutSummary {
     tool_modify_preview_by_id: HashMap<String, ClaudeModifyPreview>,
     unresolved_tool_requests: HashMap<String, String>,
     auto_closed_tool_requests: HashSet<String>,
+    /// Offset each tool call was declared at while its response was still open.
+    /// The closing `StreamEnd` re-declares the same calls and has to repeat the
+    /// identical offset, or the emitter reads the repeat as a conflicting
+    /// declaration and drops the call from the persisted message.
+    streaming_tool_content_offsets: HashMap<String, u32>,
     tool_io_bytes: u64,
     reasoning_bytes: u64,
     emitted_phase_count: u64,
@@ -4572,10 +4577,11 @@ impl ClaudeInner {
     /// had a tool request to identify it with.
     ///
     /// Ownership is normally resolved at `task_started` by asking the emitter
-    /// for the launching tool request. Tyde only registers that request when
-    /// the response phase closes (`message_stop`, or the close at the top of
-    /// `consume_user_tool_result`), and the CLI does not guarantee the task
-    /// frame arrives after it: once another background task is running, a
+    /// for the launching tool request. Tyde registers that request when the
+    /// response phase closes (`message_stop`) or when a `tool_result` forces
+    /// the call to be declared on the still-open response
+    /// (`declare_open_response_tool_calls`), and the CLI does not guarantee the
+    /// task frame arrives after either: once another background task is running, a
     /// captured 2.1.220 stream puts `task_started` — and the `tool_result` —
     /// ahead of `message_delta`/`message_stop`. An entry that misses its owner
     /// stays unresolved, which costs the tray its row *and* drops the task's
@@ -4791,6 +4797,17 @@ impl ClaudeInner {
             }),
             images: Vec::new(),
         });
+    }
+
+    /// Declare tool calls on the response that is still streaming them, so their
+    /// cards can be requested without ending the message that issued them.
+    fn declare_streaming_tools(&self, message_id: &str, declarations: Vec<ToolUseData>) -> bool {
+        let Some(response) = self.response_handle(message_id, "streaming tool declaration") else {
+            return false;
+        };
+        self.emitter
+            .declare_streaming_tools(&response, declarations);
+        true
     }
 
     fn response_handle(&self, message_id: &str, event: &str) -> Option<ResponseHandle> {
@@ -6031,12 +6048,6 @@ async fn read_claude_stdout_persistent(
         }
 
         let interrupt_requested = inner.active_turn_interrupted(turn_id).await;
-        if value.get("type").and_then(Value::as_str) == Some("user")
-            && phase_has_pending_output(&turn_state.summary, &turn_state.segment)
-        {
-            close_current_phase(&mut turn_state.summary, &mut turn_state.segment, &inner);
-            flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
-        }
         if subagent_emitter.is_some() {
             detect_subagent_completions(&value, &mut subagent_streams).await;
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
@@ -8946,7 +8957,14 @@ fn consume_claude_stream_value_with_interrupt(
             );
         }
         "user" => {
-            consume_user_tool_result(value, summary, segment, inner, interrupt_requested);
+            consume_user_tool_result(
+                value,
+                summary,
+                segment,
+                inner,
+                current_message_id,
+                interrupt_requested,
+            );
         }
         "result" => {
             if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
@@ -9199,6 +9217,7 @@ fn consume_user_tool_result(
     summary: &mut ClaudeStdoutSummary,
     segment: &mut SegmentState,
     inner: &ClaudeInner,
+    current_message_id: &str,
     interrupt_requested: bool,
 ) {
     let Some(message) = value.get("message") else {
@@ -9208,9 +9227,7 @@ fn consume_user_tool_result(
         return;
     };
 
-    if phase_has_pending_output(summary, segment) {
-        close_current_phase(summary, segment, inner);
-    }
+    declare_open_response_tool_calls(summary, segment, inner, current_message_id);
 
     for block in content {
         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
@@ -9286,6 +9303,61 @@ fn consume_user_tool_result(
             completion.tool_result,
             completion.error,
         );
+    }
+}
+
+/// Declare and request the tool calls this response has issued so far, leaving
+/// the response open.
+///
+/// The CLI runs a tool as soon as its content block completes, so a
+/// `tool_result` arrives while the same response is still streaming later
+/// blocks — a response that issues three parallel calls interleaves each result
+/// between them. A tool request must be declared by a response before the
+/// emitter will accept it, and ending the response to declare it would make
+/// every remaining call in that response arrive as its own chat message.
+fn declare_open_response_tool_calls(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    inner: &ClaudeInner,
+    current_message_id: &str,
+) {
+    flush_pending_tool_uses(summary, segment);
+
+    let undeclared = summary
+        .tool_calls
+        .iter()
+        .filter(|tool_call| {
+            !summary
+                .streaming_tool_content_offsets
+                .contains_key(&tool_call.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if undeclared.is_empty() {
+        return;
+    }
+
+    // What the emitter has accumulated for this response: every delta reaches
+    // both, so this is the offset it will validate the declaration against.
+    let content_offset = u32::try_from(summary.streamed_text.chars().count()).unwrap_or(u32::MAX);
+    let declarations = undeclared
+        .iter()
+        .map(|tool_call| ToolUseData {
+            tool_call_id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            content_offset: Some(content_offset),
+        })
+        .collect();
+    if !inner.declare_streaming_tools(current_message_id, declarations) {
+        return;
+    }
+
+    for tool_call in undeclared {
+        summary
+            .streaming_tool_content_offsets
+            .insert(tool_call.id.clone(), content_offset);
+        emit_tool_request_with_tracking(summary, inner, &tool_call);
     }
 }
 
@@ -9394,6 +9466,7 @@ fn reset_phase_state(summary: &mut ClaudeStdoutSummary, segment: &mut SegmentSta
     summary.result_reasoning = None;
     summary.usage = None;
     summary.tool_calls.clear();
+    summary.streaming_tool_content_offsets.clear();
     summary.tool_io_bytes = 0;
     summary.reasoning_bytes = 0;
     segment.has_content = false;
@@ -9433,6 +9506,7 @@ fn close_current_phase_with_turn_usage(
                     "id": tool.id,
                     "name": tool.name,
                     "arguments": tool.arguments,
+                    "content_offset": summary.streaming_tool_content_offsets.get(&tool.id),
                 })
             })
             .collect::<Vec<_>>();
@@ -9449,6 +9523,17 @@ fn close_current_phase_with_turn_usage(
             None,
         );
         for tool_call in &phase.tool_calls {
+            // Requested already, while the response was still open. A second
+            // request would be rebuilt from state the tool has since changed —
+            // a modify preview reads the file at emission time, so re-reading
+            // it after the write reports different executable data and the
+            // emitter rejects the repeat.
+            if summary
+                .streaming_tool_content_offsets
+                .contains_key(&tool_call.id)
+            {
+                continue;
+            }
             emit_tool_request_with_tracking(summary, inner, tool_call);
         }
         reset_phase_state(summary, segment);
