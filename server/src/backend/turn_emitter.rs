@@ -156,6 +156,22 @@ impl TurnEmitter {
         self.lock().stream_end(&response, payload);
     }
 
+    /// Declares tool calls on a response that is still streaming, so their cards
+    /// appear while the tools run rather than when the response closes. A
+    /// backend whose response boundary only arrives *after* its tools have
+    /// finished — Codex, whose boundary is a `tokenUsage` change — would
+    /// otherwise leave every card invisible for the duration of the command.
+    ///
+    /// The same declarations must still be passed to `stream_end`; that is what
+    /// records them on the persisted message.
+    pub fn declare_streaming_tools(
+        &self,
+        response: &ResponseHandle,
+        declarations: Vec<ToolUseData>,
+    ) {
+        self.lock().declare_streaming_tools(response, declarations);
+    }
+
     pub fn tool_request(&self, tool_call_id: &str, tool_type: ToolRequestType) -> bool {
         self.lock().tool_request(tool_call_id, tool_type)
     }
@@ -611,10 +627,27 @@ impl TurnEmitterState {
             .expect("stream response has a presentation id");
         message.tool_calls = self.sanitize_tool_declarations(
             owner,
-            &message.content,
+            message.content.chars().count() as u64,
             std::mem::take(&mut message.tool_calls),
         );
         self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
+    }
+
+    fn declare_streaming_tools(
+        &mut self,
+        response: &ResponseHandle,
+        declarations: Vec<ToolUseData>,
+    ) {
+        if !self.accept_ordered_response_event(response, "streaming_tool_declaration") {
+            return;
+        }
+        let open = self
+            .current_response
+            .as_ref()
+            .expect("validated open response");
+        let owner = open.message_id.clone();
+        let content_len = open.content.chars().count() as u64;
+        self.sanitize_tool_declarations(owner, content_len, declarations);
     }
 
     fn discard_open_response(&mut self, response: &ResponseHandle) {
@@ -694,7 +727,7 @@ impl TurnEmitterState {
         let mut message = self.build_assistant_message(payload, message_id.clone());
         message.tool_calls = self.sanitize_tool_declarations(
             message_id,
-            &message.content,
+            message.content.chars().count() as u64,
             std::mem::take(&mut message.tool_calls),
         );
         self.send_chat(ChatEvent::MessageAdded(message));
@@ -724,10 +757,9 @@ impl TurnEmitterState {
     fn sanitize_tool_declarations(
         &mut self,
         owner: ChatMessageId,
-        content: &str,
+        content_len: u64,
         declarations: Vec<ToolUseData>,
     ) -> Vec<ToolUseData> {
-        let content_len = content.chars().count() as u64;
         let mut accepted = Vec::with_capacity(declarations.len());
         for mut declaration in declarations {
             if declaration.tool_call_id.trim().is_empty() {
@@ -757,6 +789,11 @@ impl TurnEmitterState {
                     && existing.declaration.arguments == declaration.arguments
                     && existing.declaration.content_offset == declaration.content_offset
                 {
+                    // Already registered by `declare_streaming_tools`, which is how
+                    // the card appeared while the tool ran. It still has to reach
+                    // the persisted message, or the call survives only in the live
+                    // view and vanishes when history is replayed.
+                    accepted.push(declaration);
                     continue;
                 }
                 self.violation(
