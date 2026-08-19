@@ -2049,8 +2049,10 @@ impl CodexSession {
             let mut nested_batches = HashMap::<String, CodexNestedGenericBatch>::new();
             while let Some(inbound) = rx.recv().await {
                 if let Some((turn_id, call_count)) = codex_raw_nested_batch_declaration(&inbound) {
-                    eprintln!(
-                        "TYDE CODEX GENERIC BATCH DECLARED turn={turn_id} calls={call_count}"
+                    tracing::debug!(
+                        turn_id,
+                        call_count,
+                        "Codex declared a nested generic tool batch"
                     );
                     assert!(
                         nested_batches
@@ -2077,8 +2079,10 @@ impl CodexSession {
                 };
                 match method {
                     "item/started" => {
-                        eprintln!(
-                            "TYDE CODEX GENERIC BATCH START turn={turn_id} item={item_id} params={params}"
+                        tracing::debug!(
+                            turn_id,
+                            item_id,
+                            "Codex admitted a nested generic tool request"
                         );
                         batch.observe_start(item_id);
                         forward_inner.handle_inbound(inbound).await;
@@ -2093,9 +2097,11 @@ impl CodexSession {
                         if batch.starts_remaining == 0 {
                             forward_inner.handle_inbound(inbound).await;
                         } else {
-                            eprintln!(
-                                "TYDE CODEX GENERIC BATCH BUFFER turn={turn_id} completion={item_id} starts_remaining={}",
-                                batch.starts_remaining
+                            tracing::debug!(
+                                turn_id,
+                                item_id,
+                                starts_remaining = batch.starts_remaining,
+                                "Holding a nested generic completion until every request is admitted"
                             );
                             batch.pending_completions.push(inbound);
                         }
@@ -7254,13 +7260,13 @@ impl CodexInner {
             state.tool_container_images.extend(images);
             state.pending_tool_call_ids.remove(tool_call_id);
             if std::env::var_os("TYDE_CODEX_TRACE_TOOL_STATE").is_some() {
-                eprintln!(
-                    "[codex-tool-state] complete tool={} pending={} container={} active_stream={} images={}",
+                tracing::debug!(
                     tool_call_id,
-                    state.pending_tool_call_ids.len(),
-                    state.tool_container.is_some(),
-                    state.active_stream.is_some(),
-                    state.tool_container_images.len()
+                    pending = state.pending_tool_call_ids.len(),
+                    container = state.tool_container.is_some(),
+                    active_stream = state.active_stream.is_some(),
+                    images = state.tool_container_images.len(),
+                    "Codex tool completed"
                 );
             }
             if state.pending_tool_call_ids.is_empty() {
@@ -8121,13 +8127,14 @@ impl CodexInner {
         }
         match item_type {
             "commandExecution" => {
-                eprintln!(
-                    "TYDE CODEX STRICT COMMAND START thread={thread_id} owner={:?} item={item}",
-                    owner.as_ref().map(|owner| (
+                tracing::debug!(
+                    thread_id,
+                    owner = ?owner.as_ref().map(|owner| (
                         owner.tool_call_id.as_str(),
                         owner.tool_name.as_str(),
                         &owner.tool_type,
-                    ))
+                    )),
+                    "Codex command execution started"
                 );
                 let tool_call_id = if let Some(owner) = owner {
                     owner.tool_call_id
@@ -8541,11 +8548,12 @@ impl CodexInner {
         let provider_item_id = item.get("id").and_then(Value::as_str).unwrap_or("item");
         match item_type {
             "commandExecution" => {
-                eprintln!(
-                    "TYDE CODEX STRICT COMMAND COMPLETE thread={thread_id} owner={:?} item={item}",
-                    owner
+                tracing::debug!(
+                    thread_id,
+                    owner = ?owner
                         .as_ref()
-                        .map(|owner| (owner.tool_call_id.as_str(), owner.tool_name.as_str(),))
+                        .map(|owner| (owner.tool_call_id.as_str(), owner.tool_name.as_str())),
+                    "Codex command execution completed"
                 );
                 if thread_id == self.state.lock().await.thread_id {
                     self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
@@ -8889,11 +8897,11 @@ impl CodexInner {
         let Some(finalized) = finalized else {
             return false;
         };
-        eprintln!(
-            "TYDE CODEX STRICT RESPONSE FINALIZE thread={thread_id} turn={} response_id={:?} tools={:?}",
-            finalized.turn_id,
-            finalized.response_id,
-            finalized
+        tracing::debug!(
+            thread_id,
+            turn_id = finalized.turn_id,
+            response_id = ?finalized.response_id,
+            tools = ?finalized
                 .tool_requests
                 .iter()
                 .map(|request| (
@@ -8901,7 +8909,8 @@ impl CodexInner {
                     request.tool_name.as_str(),
                     &request.tool_type,
                 ))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "Finalizing a Codex provider response"
         );
         let response = finalized
             .response
@@ -9135,7 +9144,6 @@ impl CodexInner {
                 Some("custom_tool_call" | "custom_tool_call_output")
             ) {
                 tracing::debug!(?params, "Codex raw custom tool completion");
-                eprintln!("TYDE CODEX RAW CUSTOM TOOL {params}");
             }
             if !strict_raw_completion {
                 self.handle_raw_modify_completion(params).await;
@@ -13080,7 +13088,7 @@ impl CodexInner {
                 .await;
             }
             "webSearch" => {
-                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=webSearch item={item}");
+                tracing::debug!(?item, "Codex started a native webSearch item");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "web_search")
                     .await;
@@ -13100,7 +13108,7 @@ impl CodexInner {
                 .await;
             }
             "imageView" => {
-                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=imageView item={item}");
+                tracing::debug!(?item, "Codex started a native imageView item");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "view_image")
                     .await;
@@ -13120,7 +13128,7 @@ impl CodexInner {
                 .await;
             }
             "sleep" => {
-                eprintln!("TYDE CODEX NATIVE TOOL ITEM type=sleep item={item}");
+                tracing::debug!(?item, "Codex started a native sleep item");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "sleep")
                     .await;
