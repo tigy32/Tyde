@@ -273,6 +273,81 @@ pub struct Host {
     workspace: PathBuf,
 }
 
+/// `git worktree add` is the only way to reach the CLI's session relocation, and
+/// it needs a repository with a commit behind it. Every workspace gets one so
+/// the worktree scenario does not need a differently-shaped fixture.
+fn init_workspace_repo(workspace: &Path) {
+    for args in [
+        ["init", "-q", "-b", "main"].as_slice(),
+        ["config", "user.email", "conformance@tyde.test"].as_slice(),
+        ["config", "user.name", "Tyde Conformance"].as_slice(),
+        ["add", "-A"].as_slice(),
+        ["commit", "-q", "-m", "conformance workspace"].as_slice(),
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .unwrap_or_else(|err| panic!("run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed seeding the conformance workspace: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Add a worktree the agent can be asked to enter, and hand back its path.
+pub fn add_worktree(host: &Host, name: &str) -> PathBuf {
+    let path = host.workspace().join(".claude/worktrees").join(name);
+    let output = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            &path.to_string_lossy(),
+            "-b",
+            name,
+            "HEAD",
+        ])
+        .current_dir(host.workspace())
+        .output()
+        .expect("run git worktree add");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    path
+}
+
+/// Where Claude keeps a session for a given working directory, mirroring
+/// `claude.rs`'s `claude_session_file_path`: canonicalize, then collapse
+/// separators, dots and underscores to `-`.
+///
+/// The scenario needs this because the relocation is invisible from the event
+/// stream — the file simply stops being under one directory and starts being
+/// under another.
+pub fn claude_session_file(cwd: &Path, session_id: &SessionId) -> PathBuf {
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let encoded: String = canonical
+        .to_string_lossy()
+        .trim()
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':' | '.' | '_') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    PathBuf::from(std::env::var("HOME").expect("HOME must be set to locate Claude sessions"))
+        .join(".claude")
+        .join("projects")
+        .join(encoded)
+        .join(format!("{}.jsonl", session_id.0))
+}
+
 impl Host {
     async fn new(backend_kind: BackendKind, store: &Path, workspace: &Path) -> Self {
         std::fs::write(workspace.join("README.txt"), "tyde conformance workspace")
@@ -284,6 +359,7 @@ impl Host {
         std::fs::create_dir_all(workspace.join(SCRATCH_DIR)).expect("seed scratch directory");
         std::fs::write(workspace.join(SCRATCH_DIR).join("notes.txt"), "scratch")
             .expect("seed scratch file");
+        init_workspace_repo(workspace);
 
         let settings_path = store.join("settings.json");
         std::fs::write(

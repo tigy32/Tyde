@@ -33,7 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, ToolExecutionOutcome,
+    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, SessionId, ToolExecutionOutcome,
 };
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
@@ -47,6 +47,7 @@ const BG_MARKER: &str = "TYDE_BG";
 const WAITED_MARKER: &str = "TYDE_WAITED";
 const DELETED_MARKER: &str = "TYDE_DELETED";
 const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
+const MEMORIZED_MARKER: &str = "TYDE_MEMORIZED";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
 
@@ -162,7 +163,100 @@ fn real_conversation_on_resumed_session() {
         );
 
         assert_clean_close(&mut host, &resumed).await;
+
+        // Last, because if this guarantee ever breaks the agent's working
+        // directory moves for good, and anything after it would be asserting
+        // against a directory the session has left.
+        assert_a_session_cannot_move_out_from_under_tyde(&mut host, &session.id).await;
     });
+}
+
+/// A session's provider file must stay where Tyde derives it.
+///
+/// Claude names its session directory after the cwd it is running in.
+/// `EnterWorktree` switches the *session's* working directory, and the CLI moves
+/// the session file into the new directory's project folder — recording it only
+/// in the file itself:
+///
+/// ```text
+/// {"type":"relocated","sessionId":"…","relocatedCwd":"…/.claude/worktrees/…"}
+/// ```
+///
+/// Nothing announces it on the stream (measured: no such event exists, and only
+/// the `system/init` frame carries a cwd), so Tyde has no way to learn the
+/// session moved. Its derived path is then permanently wrong. On 2026-08-19 a
+/// resume a day later looked in the old directory, found nothing, and started a
+/// *new* CLI session at the same id — reporting success over an empty context
+/// while the real 29,502-line conversation sat intact in the worktree's
+/// directory.
+///
+/// The codeword is the only oracle that can see this. Bootstrap replay comes
+/// from Tyde's own transcript, so the reopened agent looks fully populated
+/// either way; nothing in the event stream distinguishes the two.
+async fn assert_a_session_cannot_move_out_from_under_tyde(host: &mut Host, session_id: &SessionId) {
+    let backend = host.backend();
+    if backend != BackendKind::Claude {
+        eprintln!(
+            "COVERAGE: {backend:?} has no known session-relocating tool; the worktree shape \
+             asserts nothing for it"
+        );
+        return;
+    }
+
+    let worktree = add_worktree(host, "relocated");
+    let derived = claude_session_file(host.workspace(), session_id);
+    let relocated = claude_session_file(&worktree, session_id);
+    assert!(
+        derived.exists(),
+        "{backend:?}: expected the live session at {} before asking for a worktree",
+        derived.display()
+    );
+
+    let reopened = resume_agent(host, session_id).await;
+    let secret = unique_payload();
+    let memorized = ask(host, &reopened, remember_prompt(&secret)).await;
+    assert_final_text_contains(&memorized, MEMORIZED_MARKER);
+
+    let attempt = ask(host, &reopened, enter_worktree_prompt(&worktree)).await;
+
+    // The model reaches this tool through `ToolSearch`, so the search is
+    // evidence it tried whether or not the tool was available to it. Without
+    // this, a model that ignored the prompt would sail through every assertion
+    // below having exercised nothing.
+    assert!(
+        attempt
+            .assistant_messages()
+            .flat_map(|message| message.tool_calls.iter())
+            .any(|call| call.name == "EnterWorktree"
+                || (call.name == "ToolSearch"
+                    && call.arguments.to_string().contains("EnterWorktree"))),
+        "{}: never reached for EnterWorktree at all, so nothing below is exercising the \
+         guarantee",
+        attempt.label()
+    );
+
+    assert!(
+        derived.exists() && !relocated.exists(),
+        "{backend:?}: the session left the directory Tyde derives for it — {} (exists={}) vs {} \
+         (exists={}). Tyde cannot see this move, so every later resume looks in the wrong place.",
+        derived.display(),
+        derived.exists(),
+        relocated.display(),
+        relocated.exists()
+    );
+
+    assert_clean_close(host, &reopened).await;
+
+    // The move is only half the defect; this is the half the user feels.
+    let after = resume_agent(host, session_id).await;
+    let recalled = ask(host, &after, recall_prompt()).await;
+    assert!(
+        recalled.final_text().contains(&secret),
+        "{backend:?}: resuming after the worktree attempt came back without the conversation — \
+         the model answered {:?} instead of the codeword {secret}.",
+        recalled.final_text()
+    );
+    assert_clean_close(host, &after).await;
 }
 
 /// A resumed session must group a response's tool calls exactly like a fresh one.
@@ -573,6 +667,33 @@ fn read_prompt() -> String {
     format!(
         "Read the file {HELLO_FILE} from the workspace root and reply with exactly its contents \
          and nothing else."
+    )
+}
+
+/// Deliberately un-writable. A codeword held only in the conversation is the one
+/// thing a model that has lost its context cannot answer; every file-backed
+/// oracle in this suite it still answers correctly.
+fn remember_prompt(secret: &str) -> String {
+    format!(
+        "Remember this codeword for the rest of our conversation: {secret}. Do not write it to a \
+         file and do not use any tools. Reply with exactly {MEMORIZED_MARKER} and nothing else."
+    )
+}
+
+fn recall_prompt() -> String {
+    "Reply with exactly the codeword I asked you to remember earlier, and nothing else. Do not \
+     use any tools and do not read any files."
+        .to_owned()
+}
+
+/// Names the tool outright rather than describing a goal, unlike the rest of the
+/// suite: the point of this turn is the CLI-side session move that this specific
+/// tool performs, not whatever a model might choose to reach a worktree with.
+fn enter_worktree_prompt(worktree: &Path) -> String {
+    format!(
+        "Work in a worktree from now on: enter the existing git worktree at {} with the \
+         EnterWorktree tool. Then tell me whether you succeeded.",
+        worktree.display()
     )
 }
 

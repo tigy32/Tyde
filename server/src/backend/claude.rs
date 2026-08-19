@@ -122,6 +122,9 @@ const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(18);
 const CLAUDE_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
+/// The one CLI tool that moves a live session's working directory, and with it
+/// the session file Tyde resumes from. See `build_claude_cli_args`.
+const SESSION_RELOCATING_TOOL: &str = "EnterWorktree";
 const TYDE_CLAUDE_BIN_ENV: &str = "TYDE_CLAUDE_BIN";
 
 static CLAUDE_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -505,7 +508,6 @@ impl ClaudeSession {
                 ssh_host: resolved_ssh_host,
                 session_id: None,
                 fork_from_session_id: mode.fork_from_session_id,
-                start_session_fresh: false,
                 resume_bootstrap_required: true,
                 ephemeral: mode.no_session_persistence,
                 model: None,
@@ -722,7 +724,6 @@ struct ClaudeState {
     ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
-    start_session_fresh: bool,
     resume_bootstrap_required: bool,
     ephemeral: bool,
     model: Option<String>,
@@ -785,7 +786,6 @@ impl Default for ClaudeState {
             ssh_host: None,
             session_id: None,
             fork_from_session_id: None,
-            start_session_fresh: false,
             resume_bootstrap_required: true,
             ephemeral: false,
             model: None,
@@ -1631,10 +1631,6 @@ impl ClaudeSessionHistoryError {
     fn other(message: impl Into<String>) -> Self {
         Self::Other(message.into())
     }
-
-    fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing { .. })
-    }
 }
 
 impl std::fmt::Display for ClaudeSessionHistoryError {
@@ -1682,7 +1678,6 @@ struct ClaudeProcessSpawnConfig {
     ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
-    resume_existing_session: bool,
     ephemeral: bool,
     model: Option<String>,
     effort: Option<ClaudeEffort>,
@@ -3118,7 +3113,6 @@ impl ClaudeInner {
                 } else {
                     state.fork_from_session_id.clone()
                 },
-                resume_existing_session: !state.start_session_fresh,
                 ephemeral: state.ephemeral,
                 model: state.model.clone(),
                 effort: state.effort,
@@ -3136,9 +3130,7 @@ impl ClaudeInner {
                     .map(|plugin| plugin.root().to_string_lossy().into_owned()),
             };
             let requires_resume_bootstrap = config.fork_from_session_id.is_some()
-                || (config.resume_existing_session
-                    && config.session_id.is_some()
-                    && state.resume_bootstrap_required);
+                || (config.session_id.is_some() && state.resume_bootstrap_required);
             if requires_resume_bootstrap {
                 state.resume_bootstrap = Some(ClaudeResumeBootstrap {
                     generation: process_generation,
@@ -4372,7 +4364,6 @@ impl ClaudeInner {
         match &state.session_id {
             Some(existing) if existing == &session_id => {
                 state.fork_from_session_id = None;
-                state.start_session_fresh = false;
                 state.resume_bootstrap_required = true;
             }
             Some(existing) => {
@@ -4386,7 +4377,6 @@ impl ClaudeInner {
             None => {
                 state.session_id = Some(session_id);
                 state.fork_from_session_id = None;
-                state.start_session_fresh = false;
                 state.resume_bootstrap_required = true;
             }
         }
@@ -4441,7 +4431,6 @@ impl ClaudeInner {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
             state.fork_from_session_id = None;
-            state.start_session_fresh = false;
             state.cumulative_usage = None;
             state.cumulative_usage_complete = true;
             state.conversation_bytes_total = 0;
@@ -4460,11 +4449,12 @@ impl ClaudeInner {
             load_claude_session_history(&workspace_root, &normalized).await
         } {
             Ok(replay) => replay,
-            Err(err) if err.is_missing() => {
-                self.recover_missing_session_history(&normalized, &workspace_root, &err)
-                    .await;
-                return Ok(());
-            }
+            // A missing session file used to start a fresh CLI session under the
+            // same id, which reported a successful resume while `--session-id`
+            // wrote a new conversation over that path. The CLI refuses this case
+            // itself (`No conversation found with session ID`); Tyde inventing
+            // one was Tyde's own behaviour, and it is what turns a session Tyde
+            // cannot find into a session nobody can.
             Err(err) => return Err(err.to_string()),
         };
         let resume_bootstrap_required = claude_replay_requires_resume_bootstrap(&replay.items);
@@ -4496,35 +4486,8 @@ impl ClaudeInner {
         state.cumulative_usage = replay.cumulative_usage;
         state.cumulative_usage_complete = replay.cumulative_usage_complete;
         state.conversation_bytes_total = replay.conversation_bytes_total;
-        state.start_session_fresh = false;
         state.resume_bootstrap_required = resume_bootstrap_required;
         Ok(())
-    }
-
-    async fn recover_missing_session_history(
-        &self,
-        session_id: &str,
-        workspace_root: &str,
-        error: &ClaudeSessionHistoryError,
-    ) {
-        tracing::warn!(
-            session_id = %session_id,
-            workspace_root = %workspace_root,
-            error = %error,
-            "Claude session history is missing; starting a fresh Claude CLI session with the same id"
-        );
-        {
-            let mut state = self.state.lock().await;
-            state.session_id = Some(session_id.to_string());
-            state.fork_from_session_id = None;
-            state.start_session_fresh = true;
-            state.cumulative_usage = None;
-            state.cumulative_usage_complete = true;
-            state.conversation_bytes_total = 0;
-        }
-        self.emitter.warning_message(&format!(
-            "Claude session history for '{session_id}' is no longer available. Starting a fresh Claude session."
-        ));
     }
 
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
@@ -4535,7 +4498,6 @@ impl ClaudeInner {
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
                 state.fork_from_session_id = None;
-                state.start_session_fresh = false;
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
                 state.conversation_bytes_total = 0;
@@ -5274,15 +5236,33 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         cli_args.push(mcp_config_json);
     }
 
+    // Refused regardless of policy, because this is not a permission question.
+    // Tyde locates a session's provider file from the workspace root it spawned
+    // with; `EnterWorktree` switches the *session's* working directory, and the
+    // CLI moves the session file to the new directory's project folder. Nothing
+    // announces that on the stream, so from then on Tyde looks in a directory
+    // the session has left. `ExitWorktree` is deliberately left alone: it can
+    // only move a session back toward where Tyde expects it.
     match &config.tool_policy {
-        ToolPolicy::Unrestricted => {}
+        ToolPolicy::Unrestricted => {
+            cli_args.push("--disallowedTools".to_string());
+            cli_args.push(SESSION_RELOCATING_TOOL.to_string());
+        }
         ToolPolicy::AllowList { tools } => {
             cli_args.push("--allowedTools".to_string());
-            cli_args.extend(tools.iter().cloned());
+            cli_args.extend(
+                tools
+                    .iter()
+                    .filter(|tool| tool.as_str() != SESSION_RELOCATING_TOOL)
+                    .cloned(),
+            );
         }
         ToolPolicy::DenyList { tools } => {
             cli_args.push("--disallowedTools".to_string());
             cli_args.extend(tools.iter().cloned());
+            if !tools.iter().any(|tool| tool == SESSION_RELOCATING_TOOL) {
+                cli_args.push(SESSION_RELOCATING_TOOL.to_string());
+            }
         }
     }
 
@@ -5320,11 +5300,10 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     } else if !config.ephemeral
         && let Some(existing_session) = config.session_id.as_deref().and_then(normalize_nonempty)
     {
-        if config.resume_existing_session {
-            cli_args.push("--resume".to_string());
-        } else {
-            cli_args.push("--session-id".to_string());
-        }
+        // Always `--resume`. `--session-id` on an id that already exists does
+        // not reattach: it starts a new conversation at that path, destroying
+        // the session it was reaching for.
+        cli_args.push("--resume".to_string());
         cli_args.push(existing_session);
     } else {
         cli_args.push("--session-id".to_string());
