@@ -39,20 +39,6 @@ pub fn resolve_tool_file_path(file_path: &str, workspace_root: &str) -> String {
         .to_string()
 }
 
-/// Line-count delta between two versions of a file.
-pub fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
-    if before == after {
-        return (0, 0);
-    }
-    let before_lines = before.lines().count() as i64;
-    let after_lines = after.lines().count() as i64;
-    if after_lines >= before_lines {
-        ((after_lines - before_lines) as u64, 0)
-    } else {
-        (0, (before_lines - after_lines) as u64)
-    }
-}
-
 /// Collect the file paths an ACP `read` call refers to.
 ///
 /// Handles the latest batched `operations` form and common single-path forms;

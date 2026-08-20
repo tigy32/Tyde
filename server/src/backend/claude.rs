@@ -11099,42 +11099,6 @@ fn enrich_exit_plan_mode_tool_calls(summary: &mut ClaudeStdoutSummary) {
     }
 }
 
-fn estimate_line_delta(before: &str, after: &str) -> (u64, u64) {
-    let before_lines = if before.is_empty() {
-        Vec::new()
-    } else {
-        before.lines().collect::<Vec<_>>()
-    };
-    let after_lines = if after.is_empty() {
-        Vec::new()
-    } else {
-        after.lines().collect::<Vec<_>>()
-    };
-
-    let mut start = 0usize;
-    while start < before_lines.len()
-        && start < after_lines.len()
-        && before_lines[start] == after_lines[start]
-    {
-        start += 1;
-    }
-
-    let mut end_before = before_lines.len();
-    let mut end_after = after_lines.len();
-    while end_before > start
-        && end_after > start
-        && before_lines[end_before - 1] == after_lines[end_after - 1]
-    {
-        end_before -= 1;
-        end_after -= 1;
-    }
-
-    (
-        (end_after.saturating_sub(start)) as u64,
-        (end_before.saturating_sub(start)) as u64,
-    )
-}
-
 fn parse_edit_pair(arguments: &Value) -> Option<(String, String)> {
     let before = claude_argument_string(arguments, &["old_string", "old_text", "oldText", "old"])
         .unwrap_or_default();
@@ -11195,7 +11159,7 @@ fn claude_modify_preview(tool_name: &str, arguments: &Value) -> Option<ClaudeMod
         _ => return None,
     };
 
-    let (lines_added, lines_removed) = estimate_line_delta(&before, &after);
+    let (lines_added, lines_removed) = crate::backend::estimate_line_delta(&before, &after);
     Some(ClaudeModifyPreview {
         file_path,
         before,

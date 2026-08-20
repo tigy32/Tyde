@@ -1612,3 +1612,50 @@ fn session_setting_value_to_json(value: &SessionSettingValue) -> Value {
         SessionSettingValue::Null => Value::Null,
     }
 }
+
+/// Lines added and removed between two versions of a file.
+///
+/// Trims the common prefix and suffix first, so replacing one line of three
+/// reports `+1 -1` rather than `+3 -3`. Backends feed this into
+/// `ToolExecutionResult::ModifyFile`, which is what a finished diff card shows
+/// in its `+A -B` footer.
+///
+/// Shared because it was copied: claude.rs and acp/backend.rs held
+/// byte-identical implementations, and acp/tools.rs held a third that reported
+/// `(0, 0)` whenever the two versions had the same number of lines — a one-line
+/// edit, the most common kind. That one had no callers and is gone.
+pub(crate) fn estimate_line_delta(before: &str, after: &str) -> (u64, u64) {
+    let before_lines = if before.is_empty() {
+        Vec::new()
+    } else {
+        before.lines().collect::<Vec<_>>()
+    };
+    let after_lines = if after.is_empty() {
+        Vec::new()
+    } else {
+        after.lines().collect::<Vec<_>>()
+    };
+
+    let mut start = 0usize;
+    while start < before_lines.len()
+        && start < after_lines.len()
+        && before_lines[start] == after_lines[start]
+    {
+        start += 1;
+    }
+
+    let mut end_before = before_lines.len();
+    let mut end_after = after_lines.len();
+    while end_before > start
+        && end_after > start
+        && before_lines[end_before - 1] == after_lines[end_after - 1]
+    {
+        end_before -= 1;
+        end_after -= 1;
+    }
+
+    (
+        end_after.saturating_sub(start) as u64,
+        end_before.saturating_sub(start) as u64,
+    )
+}

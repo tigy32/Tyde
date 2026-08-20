@@ -2764,7 +2764,7 @@ pub(crate) fn map_tool_completion_result(
                 .and_then(|payload| payload.get("after"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let (lines_added, lines_removed) = estimate_line_diff_counts(before, after);
+            let (lines_added, lines_removed) = crate::backend::estimate_line_delta(before, after);
             json!({
                 "kind": "ModifyFile",
                 "lines_added": lines_added,
@@ -2834,39 +2834,6 @@ fn extract_first_item_json(value: &Value) -> Option<&Value> {
         .and_then(Value::as_array)
         .and_then(|items| items.first())
         .and_then(|item| item.get("Json"))
-}
-
-fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
-    let before_lines = if before.is_empty() {
-        Vec::new()
-    } else {
-        before.lines().collect::<Vec<_>>()
-    };
-    let after_lines = if after.is_empty() {
-        Vec::new()
-    } else {
-        after.lines().collect::<Vec<_>>()
-    };
-    let mut start = 0usize;
-    while start < before_lines.len()
-        && start < after_lines.len()
-        && before_lines[start] == after_lines[start]
-    {
-        start += 1;
-    }
-    let mut end_before = before_lines.len();
-    let mut end_after = after_lines.len();
-    while end_before > start
-        && end_after > start
-        && before_lines[end_before - 1] == after_lines[end_after - 1]
-    {
-        end_before -= 1;
-        end_after -= 1;
-    }
-    (
-        end_after.saturating_sub(start) as u64,
-        end_before.saturating_sub(start) as u64,
-    )
 }
 
 fn extract_first_string(value: &Value, keys: &[&str]) -> Option<String> {
