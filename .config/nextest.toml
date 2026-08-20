@@ -71,3 +71,29 @@ filter = "all()"
 platform = 'cfg(target_os = "macos")'
 list-wrapper = "macos-test-binary"
 run-wrapper = "macos-test-binary"
+
+# The paid conformance suite (`TYDE_RUN_REAL_AI_TESTS=1`). Not part of
+# `./dev.sh check` — these are `#[ignore]`d and drive real providers over the
+# network, so the default profile's rule that "crossing five minutes is a test
+# failure" does not apply to them and actively breaks them: one scenario alone
+# runs past 100s, and the default 5m cap silently truncates the run. It reports
+# `SIGTERM` on whatever was mid-flight plus "N tests were not run", which reads
+# like a backend failure rather than a clock.
+[profile.conformance]
+global-timeout = "45m"
+# Warn only. A real provider taking two minutes is information, not a verdict.
+slow-timeout = "120s"
+# A paid run costs money to repeat: never retry silently, and never let one red
+# scenario hide the state of the others.
+retries = 0
+fail-fast = false
+status-level = "slow"
+final-status-level = "slow"
+success-output = "never"
+failure-output = "final"
+
+[[profile.conformance.scripts]]
+filter = "all()"
+platform = 'cfg(target_os = "macos")'
+list-wrapper = "macos-test-binary"
+run-wrapper = "macos-test-binary"
