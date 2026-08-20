@@ -855,11 +855,21 @@ fn mapping_command_prompt(token: &str) -> String {
 
 /// Goal-only, because Tyde has no `DeleteFile` request type: a delete arrives as
 /// whatever the provider reached for, and this turn exists to check that it is
-/// still a card a human can read.
+/// still a card a human can read. `delete_prompt` names a recursive shell
+/// command instead, which pins the answer to `RunCommand` and would tell this
+/// turn nothing.
+///
+/// Authorizing the delete in the prompt is what keeps the choice open. Kiro
+/// refuses a bare "delete this file" outright — measured, it replied "this is a
+/// destructive operation… I require explicit user confirmation" and ran nothing
+/// — so without this the turn stalls on a safety gate rather than reporting a
+/// mapping. That gate is real behaviour and is worth testing, but
+/// `assert_deleted_directory` in `real_conversation` already covers it.
 fn mapping_delete_prompt() -> String {
     format!(
-        "Delete the file {MAPPING_FILE} from the workspace root. Then reply with exactly \
-         {MAPPED_DELETE_MARKER} and nothing else."
+        "Delete the file {MAPPING_FILE} from the workspace root. I am explicitly authorizing this \
+         deletion now, so do not ask me to confirm it — go ahead and delete it. Then reply with \
+         exactly {MAPPED_DELETE_MARKER} and nothing else."
     )
 }
 
