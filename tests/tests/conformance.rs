@@ -139,37 +139,69 @@ fn real_tool_type_mappings() {
         let created = unique_payload();
         let edited = unique_payload();
         let token = unique_payload();
+        let diffs = host.declares(BackendCapability::GenericModifyFile);
+        let reads = host.declares(BackendCapability::GenericReadFiles);
 
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
         assert_final_text_contains(&launched, READY_MARKER);
 
+        if !diffs {
+            eprintln!(
+                "COVERAGE: {:?} does not declare GenericModifyFile, so this run asserts nothing \
+                 about diff cards",
+                host.backend()
+            );
+        }
+
+        // The file the later turns operate on has to exist however this backend
+        // makes files, so the write turns run everywhere; only the diff-card
+        // assertions are gated. Each is checked before the next turn runs — both
+        // read the file to decide whether the work happened, and the edit turn
+        // overwrites what the create turn is judged against.
         let create = ask(&mut host, &agent, mapping_create_prompt(&created)).await;
-        assert_create_maps_to_a_diff(&create, host.workspace(), &created);
         assert_final_text_contains(&create, MAPPED_CREATE_MARKER);
+        if diffs {
+            assert_create_maps_to_a_diff(&create, host.workspace(), &created);
+        }
 
         let edit = ask(&mut host, &agent, mapping_edit_prompt(&created, &edited)).await;
-        assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
         assert_final_text_contains(&edit, MAPPED_EDIT_MARKER);
+        if diffs {
+            assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
+        }
 
-        let unseen = unique_payload();
-        std::fs::write(
-            host.workspace().join(MAPPING_FILE),
-            format!("alpha\n{unseen}\nomega\n"),
-        )
-        .expect("rewrite mapping.txt out of band");
-        let read = ask(&mut host, &agent, mapping_read_prompt()).await;
-        assert_read_maps_to_read_files(&read, host.workspace(), &unseen);
+        let mut turns = vec![launched, create, edit];
+
+        if reads {
+            let unseen = unique_payload();
+            std::fs::write(
+                host.workspace().join(MAPPING_FILE),
+                format!("alpha\n{unseen}\nomega\n"),
+            )
+            .expect("rewrite mapping.txt out of band");
+            let read = ask(&mut host, &agent, mapping_read_prompt()).await;
+            assert_read_maps_to_read_files(&read, host.workspace(), &unseen);
+            turns.push(read);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare GenericReadFiles, so this run asserts nothing \
+                 about read cards",
+                host.backend()
+            );
+        }
 
         let ran = ask(&mut host, &agent, mapping_command_prompt(&token)).await;
         assert_command_maps_to_run_command(&ran, host.workspace(), &token);
         assert_final_text_contains(&ran, MAPPED_RUN_MARKER);
+        turns.push(ran);
 
         let deleted = ask(&mut host, &agent, mapping_delete_prompt()).await;
         assert_delete_is_not_an_opaque_card(&deleted, host.workspace());
         assert_final_text_contains(&deleted, MAPPED_DELETE_MARKER);
+        turns.push(deleted);
 
-        assert_universal_contract(&[launched, create, edit, read, ran, deleted]);
+        assert_universal_contract(&turns);
         assert_clean_close(&mut host, &agent).await;
     });
 }
@@ -1567,14 +1599,22 @@ fn assert_command_maps_to_run_command(turn: &Turn, workspace: &Path, token: &str
         })
         .collect();
 
+    // Contained rather than equal, because the wrapper is part of the truth.
+    // Codex runs commands through a login shell and reports what it really
+    // executed — `/bin/zsh -lc 'echo TYDE_…'` — while Claude's Bash tool reports
+    // the bare line it was handed. Both cards are honest about the process that
+    // ran, and a card that hid the wrapper would be less so. The whole
+    // `echo <token>` phrase still has to be there, so this rejects a card
+    // carrying only the provider's raw arguments.
     let wanted = format!("echo {token}");
-    let Some((tool_call_id, _, working_directory)) =
-        commands.iter().find(|(_, command, _)| **command == wanted)
+    let Some((tool_call_id, _, working_directory)) = commands
+        .iter()
+        .find(|(_, command, _)| command.contains(&wanted))
     else {
         panic!(
-            "{}: running `{wanted}` emitted no RunCommand card carrying exactly that command \
-             line. The card shows the user the command that is about to run, verbatim; any other \
-             mapping shows the provider's raw arguments instead. Requests seen: {:?}, commands \
+            "{}: running `{wanted}` emitted no RunCommand card carrying that command line. The \
+             card shows the user the command that is about to run; any other mapping shows the \
+             provider's raw arguments instead. Requests seen: {:?}, commands \
              seen: {:?}",
             turn.label(),
             turn.tool_request_names(),
@@ -1659,6 +1699,32 @@ fn assert_delete_is_not_an_opaque_card(turn: &Turn, workspace: &Path) {
         turn.label(),
         turn.tool_request_names()
     );
+
+    // A backend that renders the delete as a diff has to render a diff that
+    // removes the file. `Other` is not the only way a delete card can say
+    // nothing: Codex reports a delete as a `fileChange` carrying the removed
+    // file's content, which read as a diff put every line on both sides and
+    // produced a card claiming an edit with no lines in it. Matched on the file
+    // name because the file is gone by now and no path resolves.
+    for request in turn.tool_requests() {
+        if let ToolRequestType::ModifyFile {
+            file_path,
+            before,
+            after,
+        } = &request.tool_type
+            && Path::new(file_path)
+                .file_name()
+                .is_some_and(|name| name == MAPPING_FILE)
+        {
+            assert!(
+                !before.is_empty() && after.is_empty(),
+                "{}: the delete is rendered as a diff card with before {before:?} and after \
+                 {after:?}. Removing a file is every line leaving it, so `before` is the file and \
+                 `after` is empty; anything else renders a deletion the user cannot see.",
+                turn.label()
+            );
+        }
+    }
 }
 
 /// The directory is gone, and the model says so.

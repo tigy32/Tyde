@@ -407,6 +407,18 @@ impl Host {
         &self.workspace
     }
 
+    /// Whether this backend claims a capability, for scenarios that gate a
+    /// single turn rather than the whole run.
+    ///
+    /// `run_scenario` gates entire scenarios the same way. A scenario that
+    /// walks several tools needs the finer grain: Codex has no file-reading
+    /// tool and does not declare `GenericReadFiles` — it reads through the
+    /// shell — so a read turn is a question it cannot answer, while every other
+    /// turn around it is still worth asserting.
+    pub fn declares(&self, capability: BackendCapability) -> bool {
+        server::backend::capabilities_for_backend_kind(self.backend_kind).contains(capability)
+    }
+
     pub fn workspace_roots(&self) -> Vec<String> {
         vec![self.workspace.to_string_lossy().into_owned()]
     }
