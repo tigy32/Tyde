@@ -757,6 +757,205 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
     }
 }
 
+/// One agent-control spawn: the parent's turn, and the child the host made
+/// while it ran.
+pub struct Delegation {
+    parent: Turn,
+    child: Turn,
+    child_agent: NewAgentPayload,
+}
+
+impl Delegation {
+    pub fn parent(&self) -> &Turn {
+        &self.parent
+    }
+
+    pub fn child(&self) -> &Turn {
+        &self.child
+    }
+
+    /// What the *host* recorded about the child, which is what makes it usable
+    /// as an oracle: it is written by the registry when the agent is created,
+    /// independent of anything the parent's cards claim happened.
+    pub fn child_agent(&self) -> &NewAgentPayload {
+        &self.child_agent
+    }
+
+    /// Every message the child was handed. The only place the prompt that
+    /// actually reached the child can be read.
+    pub fn child_inputs(&self) -> Vec<&str> {
+        self.child
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User) =>
+                {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Both turns, for the checks that run over a whole conversation. A child's
+    /// stream is an agent's stream like any other and owes the same guarantees.
+    pub fn into_turns(self) -> [Turn; 2] {
+        [self.parent, self.child]
+    }
+}
+
+/// A child boots a second provider process and runs a turn while the parent is
+/// still finishing its own, so this covers two turns and a process launch.
+const DELEGATION_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// Send `prompt` and follow both sides of the delegation it should produce.
+///
+/// Two streams advance at once: the child's first turn overlaps whatever the
+/// parent does after the spawn tool returns, and either can finish first, so
+/// this cannot be [`collect_turn`] run twice.
+///
+/// The child is identified by the host's own `NewAgent` frame rather than by
+/// anything the parent's cards say about it. That is the whole point — a card
+/// naming an agent that was never created, or a child created with arguments
+/// the card never showed, is exactly what this is for.
+///
+/// `child_prompt` only labels the child's turn; what the child was actually
+/// given is read back off its stream.
+pub async fn delegate(
+    host: &mut Host,
+    parent: &Agent,
+    prompt: &str,
+    child_prompt: &str,
+) -> Delegation {
+    let backend = host.backend_kind;
+    let label = backend_label(backend);
+    send_prompt(host, parent, prompt).await;
+
+    let mut parent_events = Vec::new();
+    let mut saw_echo = false;
+    let mut saw_stream_end = false;
+    let mut parent_idle = false;
+
+    let mut child_agent: Option<NewAgentPayload> = None;
+    let mut child_events = Vec::new();
+    let mut child_stream_end = false;
+    let mut child_idle = false;
+
+    let deadline = tokio::time::Instant::now() + DELEGATION_TIMEOUT;
+    while !(parent_idle && child_idle) {
+        // Rebuilt each iteration so a timeout names the half that is missing.
+        // "Timed out waiting for a delegation" would leave the reader unable to
+        // tell a child that was never created from one that never answered.
+        let context = format!(
+            "{label} delegation for prompt {prompt:?} (parent idle: {parent_idle}, child created: \
+             {}, child idle: {child_idle})",
+            child_agent.is_some()
+        );
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "{context}: gave up");
+        let envelope = host.next_envelope(remaining, &context).await;
+        fail_on_agent_error(&envelope, &context);
+
+        if envelope.kind == FrameKind::NewAgent {
+            let payload: NewAgentPayload = envelope.parse_payload().expect("parse NewAgent");
+            if payload.parent_agent_id.as_ref() == Some(&parent.agent_id) {
+                assert!(
+                    child_agent.replace(payload).is_none(),
+                    "{context}: the host created a second child for this parent"
+                );
+            }
+            continue;
+        }
+
+        if envelope.stream == parent.stream {
+            // Anything after the turn went idle belongs to a later turn, not
+            // this one. Shutdown-time violations are `assert_clean_close`'s.
+            if parent_idle {
+                continue;
+            }
+            for event in chat_events_in(&envelope) {
+                eprintln!("{label} parent {event:?}");
+                if let ChatEvent::MessageAdded(message) = &event
+                    && matches!(message.sender, MessageSender::User)
+                    && message.content.contains(prompt)
+                {
+                    saw_echo = true;
+                }
+                if !saw_echo {
+                    continue;
+                }
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    saw_stream_end = true;
+                }
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                parent_events.push(event);
+                if idle {
+                    assert!(
+                        saw_stream_end,
+                        "{context}: the parent went idle without producing any assistant response"
+                    );
+                    parent_idle = true;
+                }
+            }
+            continue;
+        }
+
+        let Some(agent) = child_agent.as_ref() else {
+            continue;
+        };
+        if envelope.stream != agent.instance_stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            eprintln!("{label} child {event:?}");
+            if matches!(event, ChatEvent::StreamEnd(_)) {
+                child_stream_end = true;
+            }
+            // Idle counts only once the child has answered: a stream that has
+            // not started yet also reports not-typing, and taking that as the
+            // end of the turn would collect an empty child.
+            let idle = child_stream_end && matches!(event, ChatEvent::TypingStatusChanged(false));
+            child_events.push(event);
+            if idle {
+                child_idle = true;
+            }
+        }
+    }
+
+    Delegation {
+        parent: Turn {
+            backend,
+            prompt: prompt.to_owned(),
+            events: parent_events,
+        },
+        child: Turn {
+            backend,
+            prompt: child_prompt.to_owned(),
+            events: child_events,
+        },
+        // `child_idle` cannot be set before the child exists.
+        child_agent: child_agent.expect("a child that ran a turn was created"),
+    }
+}
+
+/// The `backend_kind` spelling `tyde_spawn_agent` accepts.
+///
+/// Not the protocol's own: the tool publishes its own schema enum, where the ACP
+/// backend is `kiro` (`agent_control_mcp.rs:301`). Spelled out separately from
+/// [`backend_label`] so that a schema rename is a compile-time decision here
+/// rather than something a logging label quietly decides.
+pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
+    match backend_kind {
+        BackendKind::Claude => "claude",
+        BackendKind::Codex => "codex",
+        BackendKind::Acp => "kiro",
+        BackendKind::Hermes => "hermes",
+        BackendKind::Tycode => "tycode",
+        BackendKind::Antigravity => "antigravity",
+    }
+}
+
 fn chat_events_in(envelope: &Envelope) -> Vec<ChatEvent> {
     match envelope.kind {
         FrameKind::ChatEvent => vec![envelope.parse_payload().expect("parse ChatEvent")],
