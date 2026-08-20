@@ -1615,6 +1615,7 @@ fn assert_universal_contract(turns: &[Turn]) {
         assert_no_error_message(&turn.label(), turn.events());
         assert_streams_are_balanced(turn);
         assert_every_request_was_declared(turn);
+        assert_declarations_carry_provider_arguments(turn);
         assert_every_request_completed_exactly_once(turn);
         assert_no_completion_without_request(turn);
         assert_reached_idle(turn);
@@ -1711,6 +1712,49 @@ fn assert_every_request_was_declared(turn: &Turn) {
          tool request, so the card was promised and never arrived; requested ids: {requested:?}",
         turn.label()
     );
+}
+
+/// A declaration must carry the provider's own arguments, not a second copy of
+/// Tyde's normalized form.
+///
+/// `ToolRequest.tool_type` already holds the normalized form. `ToolUseData` is
+/// the only place the provider's name and raw arguments survive — `types.rs:7313`
+/// defines it as exactly that — so a backend that serializes its
+/// `ToolRequestType` into both leaves *nothing* in the stream holding what the
+/// model actually passed.
+///
+/// Stated as "not a verbatim copy of the normalized type" rather than by
+/// checking for a particular shape, because the correct arguments are whatever
+/// the provider sent and the suite has no independent way to know them. Real
+/// tool arguments colliding with the serialized envelope is not a thing that
+/// happens; the envelope is Tyde's own tagged representation.
+///
+/// Measured on Codex, whose MCP card declared `{"kind":"Other","args":{…}}`
+/// while Claude, Kiro, Hermes and Tycode all declared the flat `{"value":…}`.
+fn assert_declarations_carry_provider_arguments(turn: &Turn) {
+    for request in turn.tool_requests() {
+        // A request with no declaration is `assert_every_request_was_declared`'s
+        // failure to report, and it runs first.
+        let Some(declared) = turn
+            .tool_declarations()
+            .find(|call| call.tool_call_id == request.tool_call_id)
+        else {
+            continue;
+        };
+        let normalized =
+            serde_json::to_value(&request.tool_type).expect("serialize normalized tool type");
+        assert_ne!(
+            declared.arguments,
+            normalized,
+            "{}: tool {:?} ({}) declared its arguments as a verbatim copy of the normalized tool \
+             type. The normalized form already rides on the request, so duplicating it here \
+             discards the arguments the model actually passed and leaves nothing in the stream \
+             holding them.",
+            turn.label(),
+            declared.name,
+            tool_kind(request)
+        );
+    }
 }
 
 fn assert_every_request_completed_exactly_once(turn: &Turn) {
