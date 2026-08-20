@@ -33,7 +33,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, SessionId, ToolExecutionOutcome,
+    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, SessionId,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
@@ -50,6 +51,11 @@ const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
 const MEMORIZED_MARKER: &str = "TYDE_MEMORIZED";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
+const MAPPING_FILE: &str = "mapping.txt";
+const MAPPED_CREATE_MARKER: &str = "TYDE_MAPPED_CREATE";
+const MAPPED_EDIT_MARKER: &str = "TYDE_MAPPED_EDIT";
+const MAPPED_RUN_MARKER: &str = "TYDE_MAPPED_RUN";
+const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
 
 /// Three files via three tool calls. Single-tool turns miss a whole class of
 /// defect: Codex joins a `commandExecution` back to its declaration through
@@ -107,6 +113,58 @@ fn real_conversation() {
             host.backend()
         );
 
+        assert_clean_close(&mut host, &agent).await;
+    });
+}
+
+/// What the tool cards are made of, not just that they exist.
+///
+/// Every other scenario in this suite counts tool requests and consults the
+/// filesystem, so all of them pass unchanged if a backend maps every provider
+/// tool to `ToolRequestType::Other { args }`. `Other` is a real card — it just
+/// renders as a JSON blob with no diff, no file name, no exit code and no
+/// output. The whole point of Tyde's normalized tool types is that a write
+/// becomes a diff and a command becomes a terminal, and nothing paid checks that
+/// the mapping happens. Five backends build these types independently, each from
+/// its own provider's argument shapes.
+///
+/// The prompts here name the tool *category*, unlike the rest of the suite. That
+/// is deliberate and it is what makes the assertions mean anything: a model that
+/// satisfies "create a file" by shelling out to `printf >` produces a perfectly
+/// correct `RunCommand` and says nothing at all about the diff card.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_tool_type_mappings() {
+    run_scenario(&[], |mut host| async move {
+        let created = unique_payload();
+        let edited = unique_payload();
+        let token = unique_payload();
+
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        assert_final_text_contains(&launched, READY_MARKER);
+
+        let create = ask(&mut host, &agent, mapping_create_prompt(&created)).await;
+        assert_create_maps_to_a_diff(&create, host.workspace(), &created);
+        assert_final_text_contains(&create, MAPPED_CREATE_MARKER);
+
+        let edit = ask(&mut host, &agent, mapping_edit_prompt(&created, &edited)).await;
+        assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
+        assert_final_text_contains(&edit, MAPPED_EDIT_MARKER);
+
+        let read = ask(&mut host, &agent, mapping_read_prompt()).await;
+        assert_read_maps_to_read_files(&read, host.workspace());
+        assert_final_text_contains(&read, &edited);
+
+        let ran = ask(&mut host, &agent, mapping_command_prompt(&token)).await;
+        assert_command_maps_to_run_command(&ran, host.workspace(), &token);
+        assert_final_text_contains(&ran, MAPPED_RUN_MARKER);
+
+        let deleted = ask(&mut host, &agent, mapping_delete_prompt()).await;
+        assert_delete_is_not_an_opaque_card(&deleted, host.workspace());
+        assert_final_text_contains(&deleted, MAPPED_DELETE_MARKER);
+
+        assert_universal_contract(&[launched, create, edit, read, ran, deleted]);
         assert_clean_close(&mut host, &agent).await;
     });
 }
@@ -705,6 +763,59 @@ fn reread_prompt() -> String {
     )
 }
 
+/// Three lines, because the edit that follows has to change one of them and
+/// leave the others as diff context. A one-line file cannot tell a targeted edit
+/// from a whole-file rewrite.
+fn mapping_create_prompt(payload: &str) -> String {
+    format!(
+        "Use your file-editing tool — not the shell — to create {MAPPING_FILE} in the workspace \
+         root with exactly these three lines:\nalpha\n{payload}\nomega\nThen reply with exactly \
+         {MAPPED_CREATE_MARKER} and nothing else."
+    )
+}
+
+/// One line of three, changed in place.
+///
+/// A whole-file rewrite is a legitimate way to satisfy this and still produces a
+/// truthful card, so the assertion accepts either. What it does not accept is a
+/// card whose `before` and `after` are equal — the UI computes its diff from
+/// exactly those two strings (`modify_file.rs:92`), so a card that carries the
+/// same text twice renders an edit with no lines in it.
+fn mapping_edit_prompt(old: &str, new: &str) -> String {
+    format!(
+        "Use your file-editing tool — not the shell — to change the middle line of \
+         {MAPPING_FILE} in the workspace root from {old} to {new}. Leave the alpha and omega \
+         lines exactly as they are. Then reply with exactly {MAPPED_EDIT_MARKER} and nothing else."
+    )
+}
+
+fn mapping_read_prompt() -> String {
+    format!(
+        "Use your file-reading tool — not the shell — to read {MAPPING_FILE} from the workspace \
+         root, then reply with exactly its middle line and nothing else."
+    )
+}
+
+/// Echoes a token the conversation has never seen, so the completion's `stdout`
+/// has to come from a real process rather than from the request being replayed
+/// back as its own result.
+fn mapping_command_prompt(token: &str) -> String {
+    format!(
+        "Run this exact shell command in the workspace root: echo {token}\nThen reply with \
+         exactly {MAPPED_RUN_MARKER} and nothing else."
+    )
+}
+
+/// Goal-only, because Tyde has no `DeleteFile` request type: a delete arrives as
+/// whatever the provider reached for, and this turn exists to check that it is
+/// still a card a human can read.
+fn mapping_delete_prompt() -> String {
+    format!(
+        "Delete the file {MAPPING_FILE} from the workspace root. Then reply with exactly \
+         {MAPPED_DELETE_MARKER} and nothing else."
+    )
+}
+
 /// Deliberately un-writable. A codeword held only in the conversation is the one
 /// thing a model that has lost its context cannot answer; every file-backed
 /// oracle in this suite it still answers correctly.
@@ -1201,6 +1312,308 @@ fn assert_wrote_file(turn: &Turn, workspace: &Path, payload: &str) {
         "{}: {} was written but the turn emitted zero tool requests",
         turn.label(),
         path.display()
+    );
+}
+
+/// Whether a path a card reports names the file the card is about.
+///
+/// Backends report the path however their provider gave it — absolute for some,
+/// workspace-relative for others — and both are correct. The card's path is what
+/// the header shows and what opening the file uses, so what has to hold is that
+/// it resolves to the real file. Canonicalized on both sides because a macOS
+/// tempdir is reached through a symlink and a sandboxed provider reports the
+/// resolved form.
+fn resolves_to(reported: &str, workspace: &Path, file: &str) -> bool {
+    let reported = Path::new(reported);
+    let resolved = if reported.is_absolute() {
+        reported.to_path_buf()
+    } else {
+        workspace.join(reported)
+    };
+    match (resolved.canonicalize(), workspace.join(file).canonicalize()) {
+        (Ok(reported), Ok(expected)) => reported == expected,
+        _ => false,
+    }
+}
+
+/// Every `ModifyFile` request in the turn that names `MAPPING_FILE`, with the
+/// request id so its completion can be found.
+fn diff_cards<'a>(
+    turn: &'a Turn,
+    workspace: &Path,
+) -> Vec<(&'a str, &'a String, &'a String, &'a String)> {
+    turn.tool_requests()
+        .filter_map(|request| match &request.tool_type {
+            ToolRequestType::ModifyFile {
+                file_path,
+                before,
+                after,
+            } => Some((request.tool_call_id.as_str(), file_path, before, after)),
+            _ => None,
+        })
+        .filter(|(_, file_path, _, _)| resolves_to(file_path, workspace, MAPPING_FILE))
+        .collect()
+}
+
+/// The result the client received for one request, by id.
+fn result_for<'a>(turn: &'a Turn, tool_call_id: &str) -> Option<&'a ToolExecutionResult> {
+    turn.tool_completions()
+        .find(|completion| completion.tool_call_id == tool_call_id)
+        .and_then(|completion| match &completion.outcome {
+            ToolExecutionOutcome::Succeeded { result } => Some(result),
+            _ => None,
+        })
+}
+
+/// Creating a file produces a diff card whose `after` is the new file.
+fn assert_create_maps_to_a_diff(turn: &Turn, workspace: &Path, payload: &str) {
+    let path = workspace.join(MAPPING_FILE);
+    let contents = std::fs::read_to_string(&path).ok();
+    assert!(
+        contents
+            .as_deref()
+            .is_some_and(|contents| contents.contains(payload)),
+        "{}: {} does not contain {payload:?} (contents: {contents:?}), so nothing below this line \
+         is about how a write is mapped. The turn emitted {:?} and replied {:?}.",
+        turn.label(),
+        path.display(),
+        turn.tool_request_names(),
+        turn.final_text()
+    );
+
+    let cards = diff_cards(turn, workspace);
+    let [(tool_call_id, _, before, after)] = cards.as_slice() else {
+        panic!(
+            "{}: writing {MAPPING_FILE} produced {} ModifyFile card(s) naming it, expected exactly \
+             one. The file was written, so a tool ran — every other mapping renders the write as \
+             something that is not a diff. Requests seen: {:?}",
+            turn.label(),
+            cards.len(),
+            turn.tool_request_names()
+        );
+    };
+
+    assert!(
+        after.contains(payload),
+        "{}: the diff card for {MAPPING_FILE} does not show the content that was written. \
+         `after` is {after:?} and the file now holds {payload:?}. The card is what the user reads \
+         instead of the file.",
+        turn.label()
+    );
+    assert!(
+        before.is_empty(),
+        "{}: the diff card for a file that did not exist reports `before` as {before:?}. The UI \
+         diffs `before` against `after` verbatim, so a created file renders as a modification of \
+         text that was never there.",
+        turn.label()
+    );
+
+    let result = result_for(turn, tool_call_id);
+    assert!(
+        matches!(result, Some(ToolExecutionResult::ModifyFile { lines_added, .. }) if *lines_added > 0),
+        "{}: the completed write reported {result:?}. The card's footer shows `+A -B` from \
+         ModifyFile's line counts; anything else leaves a finished edit with no summary of what \
+         it did.",
+        turn.label()
+    );
+}
+
+/// Editing a file produces a diff card with something in it.
+///
+/// The one shape that is always wrong is `before == after`: the UI builds its
+/// diff from those two strings with `TextDiff::from_lines`, so equal strings
+/// render a card that claims an edit and shows zero lines. Whether they hold the
+/// whole file or just the replaced hunk is the provider's choice and both render
+/// correctly, so this asserts on the change being visible rather than on which
+/// of the two conventions the backend follows.
+fn assert_edit_maps_to_a_non_empty_diff(turn: &Turn, workspace: &Path, old: &str, new: &str) {
+    let path = workspace.join(MAPPING_FILE);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        contents.contains(new) && !contents.contains(old),
+        "{}: {} still reads {contents:?}, so the edit never happened and nothing below this line \
+         is about how an edit is mapped. The turn emitted {:?} and replied {:?}.",
+        turn.label(),
+        path.display(),
+        turn.tool_request_names(),
+        turn.final_text()
+    );
+
+    let cards = diff_cards(turn, workspace);
+    assert!(
+        !cards.is_empty(),
+        "{}: {MAPPING_FILE} was edited on disk but the turn emitted no ModifyFile card naming it. \
+         Requests seen: {:?}",
+        turn.label(),
+        turn.tool_request_names()
+    );
+
+    for (tool_call_id, _, before, after) in &cards {
+        assert!(
+            before != after,
+            "{}: the edit card for {MAPPING_FILE} carries the same text as `before` and `after` \
+             ({before:?}). The UI diffs them verbatim, so this renders as an edit with no lines \
+             in it.",
+            turn.label()
+        );
+        assert!(
+            before.contains(old),
+            "{}: the edit card's `before` is {before:?}, which does not contain the text that was \
+             replaced ({old:?}). The removed side of the diff is not what the file actually held.",
+            turn.label()
+        );
+        assert!(
+            after.contains(new),
+            "{}: the edit card's `after` is {after:?}, which does not contain the text that was \
+             written ({new:?}). The added side of the diff is not what the file now holds.",
+            turn.label()
+        );
+
+        let result = result_for(turn, tool_call_id);
+        assert!(
+            matches!(
+                result,
+                Some(ToolExecutionResult::ModifyFile { lines_added, lines_removed })
+                    if *lines_added > 0 && *lines_removed > 0
+            ),
+            "{}: the completed edit reported {result:?}. A replaced line is one added and one \
+             removed; the card's `+A -B` footer comes from these counts.",
+            turn.label()
+        );
+    }
+}
+
+/// A read produces a `ReadFiles` card naming the file, and a result listing it.
+fn assert_read_maps_to_read_files(turn: &Turn, workspace: &Path) {
+    let reads: Vec<_> = turn
+        .tool_requests()
+        .filter_map(|request| match &request.tool_type {
+            ToolRequestType::ReadFiles { file_paths } => {
+                Some((request.tool_call_id.as_str(), file_paths))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let named = reads.iter().find(|(_, file_paths)| {
+        file_paths
+            .iter()
+            .any(|path| resolves_to(path, workspace, MAPPING_FILE))
+    });
+    let Some((tool_call_id, _)) = named else {
+        panic!(
+            "{}: reading {MAPPING_FILE} emitted no ReadFiles card naming it. The card lists the \
+             files it opened; without the mapping the user sees a JSON blob. Requests seen: {:?}, \
+             ReadFiles paths seen: {:?}",
+            turn.label(),
+            turn.tool_request_names(),
+            reads.iter().map(|(_, paths)| paths).collect::<Vec<_>>()
+        );
+    };
+
+    let result = result_for(turn, tool_call_id);
+    assert!(
+        matches!(result, Some(ToolExecutionResult::ReadFiles { files }) if !files.is_empty()),
+        "{}: the completed read reported {result:?}. The card lists each file and its size from \
+         this result.",
+        turn.label()
+    );
+}
+
+/// A shell command produces a terminal card: the command, where it ran, and what
+/// it printed.
+fn assert_command_maps_to_run_command(turn: &Turn, workspace: &Path, token: &str) {
+    let commands: Vec<_> = turn
+        .tool_requests()
+        .filter_map(|request| match &request.tool_type {
+            ToolRequestType::RunCommand {
+                command,
+                working_directory,
+            } => Some((request.tool_call_id.as_str(), command, working_directory)),
+            _ => None,
+        })
+        .collect();
+
+    let Some((tool_call_id, _, working_directory)) = commands
+        .iter()
+        .find(|(_, command, _)| command.contains(token))
+    else {
+        panic!(
+            "{}: running `echo {token}` emitted no RunCommand card carrying that command. The \
+             card shows the command line the user is about to run; any other mapping shows the \
+             provider's raw arguments. Requests seen: {:?}, commands seen: {:?}",
+            turn.label(),
+            turn.tool_request_names(),
+            commands
+                .iter()
+                .map(|(_, command, _)| command)
+                .collect::<Vec<_>>()
+        );
+    };
+
+    let reported = Path::new(working_directory.as_str()).canonicalize().ok();
+    assert_eq!(
+        reported,
+        workspace.canonicalize().ok(),
+        "{}: the terminal card says the command ran in {working_directory:?}, but the agent's \
+         workspace is {}. The card's directory is how a user tells one agent's shell from \
+         another's.",
+        turn.label(),
+        workspace.display()
+    );
+
+    let result = result_for(turn, tool_call_id);
+    assert!(
+        matches!(
+            result,
+            Some(ToolExecutionResult::RunCommand { exit_code, stdout, .. })
+                if *exit_code == 0 && stdout.contains(token)
+        ),
+        "{}: the completed command reported {result:?}. The card renders the exit code and the \
+         captured output from this result, and the token proves the output came from the process \
+         rather than from the request echoed back.",
+        turn.label()
+    );
+}
+
+/// A delete still reaches the user as a card they can read.
+///
+/// Tyde has no `DeleteFile` request type, so there is no single correct mapping
+/// here — a provider that shells out gives `RunCommand`, one with a native file
+/// tool gives `ModifyFile` emptying the file. Both are legible. `Other` is not:
+/// it renders the provider's raw arguments and never names the file. This asserts
+/// the floor rather than a specific type.
+fn assert_delete_is_not_an_opaque_card(turn: &Turn, workspace: &Path) {
+    let path = workspace.join(MAPPING_FILE);
+    assert!(
+        !path.exists(),
+        "{}: {} still exists after a turn asked to delete it, so nothing below this line is about \
+         how a delete is mapped. The turn emitted {:?} and replied {:?}.",
+        turn.label(),
+        path.display(),
+        turn.tool_request_names(),
+        turn.final_text()
+    );
+
+    let requests = turn.tool_requests().count();
+    assert!(
+        requests > 0,
+        "{}: {} was deleted but the turn emitted zero tool requests",
+        turn.label(),
+        path.display()
+    );
+
+    let opaque = turn
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::Other { .. }))
+        .count();
+    assert_eq!(
+        opaque,
+        0,
+        "{}: {opaque} of {requests} cards in the delete turn are ToolRequestType::Other, which \
+         renders the provider's raw arguments with no file name and no diff. Requests seen: {:?}",
+        turn.label(),
+        turn.tool_request_names()
     );
 }
 
