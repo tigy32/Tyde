@@ -8147,14 +8147,17 @@ impl CodexInner {
                         &thread_id,
                         &tool_call_id,
                         "run_command",
-                        json!({
-                            "kind": "RunCommand",
-                            "command": codex_command_text(item).unwrap_or_default(),
-                            "working_directory": item
-                                .get("cwd")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        }),
+                        CodexToolRequest::from_item(
+                            item,
+                            json!({
+                                "kind": "RunCommand",
+                                "command": codex_command_text(item).unwrap_or_default(),
+                                "working_directory": item
+                                    .get("cwd")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            }),
+                        ),
                     )
                     .await;
                     tool_call_id
@@ -8179,7 +8182,7 @@ impl CodexInner {
                         &thread_id,
                         &item_id,
                         tool_name,
-                        codex_public_tool_request_type(tool_name, item),
+                        codex_public_tool_request(tool_name, item),
                     )
                     .await;
                     item_id
@@ -11048,8 +11051,13 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         "generate_image",
-                        serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
+                        CodexToolRequest::from_item(
+                            item,
+                            serde_json::to_value(protocol::ToolRequestType::GenerateImage {
+                                prompt,
+                            })
                             .expect("serialize Codex image generation request"),
+                        ),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11066,8 +11074,11 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         "web_search",
-                        serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
-                            .expect("serialize Codex web search request"),
+                        CodexToolRequest::from_item(
+                            item,
+                            serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
+                                .expect("serialize Codex web search request"),
+                        ),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11084,8 +11095,11 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         "view_image",
-                        serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
-                            .expect("serialize Codex image view request"),
+                        CodexToolRequest::from_item(
+                            item,
+                            serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
+                                .expect("serialize Codex image view request"),
+                        ),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11098,8 +11112,11 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         "sleep",
-                        serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
-                            .expect("serialize Codex sleep request"),
+                        CodexToolRequest::from_item(
+                            item,
+                            serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
+                                .expect("serialize Codex sleep request"),
+                        ),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11121,11 +11138,14 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         "run_command",
-                        json!({
-                            "kind": "RunCommand",
-                            "command": command,
-                            "working_directory": cwd
-                        }),
+                        CodexToolRequest::from_item(
+                            item,
+                            json!({
+                                "kind": "RunCommand",
+                                "command": command,
+                                "working_directory": cwd
+                            }),
+                        ),
                     )
                     .await;
                 // Children background processes exactly like the root thread,
@@ -11158,12 +11178,15 @@ impl CodexInner {
                             emitter,
                             &call_id,
                             "modify_file",
-                            json!({
-                                "kind": "ModifyFile",
-                                "file_path": change.path,
-                                "before": change.before,
-                                "after": change.after,
-                            }),
+                            CodexToolRequest::from_item(
+                                item,
+                                json!({
+                                    "kind": "ModifyFile",
+                                    "file_path": change.path,
+                                    "before": change.before,
+                                    "after": change.after,
+                                }),
+                            ),
                         )
                         .await
                         .or(container);
@@ -11183,7 +11206,7 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         &tool_name,
-                        codex_public_tool_request_type(&tool_name, item),
+                        codex_public_tool_request(&tool_name, item),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11200,10 +11223,7 @@ impl CodexInner {
                         emitter,
                         &item_id,
                         &tool_name,
-                        json!({
-                            "kind": "Other",
-                            "args": codex_generic_tool_arguments(item)
-                        }),
+                        CodexToolRequest::other(json!(codex_generic_tool_arguments(item))),
                     )
                     .await;
                 (container, vec![item_id])
@@ -11218,15 +11238,15 @@ impl CodexInner {
         emitter: &TurnEmitter,
         tool_call_id: &str,
         tool_name: &str,
-        tool_type: Value,
+        request: CodexToolRequest,
     ) -> Option<ChatMessageId> {
         if self
             .buffer_strict_tool_request(
                 stream_key,
                 tool_call_id,
                 tool_name,
-                tool_type.clone(),
-                tool_type.clone(),
+                request.arguments.clone(),
+                request.tool_type.clone(),
             )
             .await
         {
@@ -11247,13 +11267,13 @@ impl CodexInner {
                     tool_calls: vec![ToolUseData {
                         tool_call_id: tool_call_id.to_owned(),
                         name: tool_name.to_owned(),
-                        arguments: tool_type.clone(),
+                        arguments: request.arguments,
                         content_offset: Some(0),
                     }],
                     ..StreamEndPayload::default()
                 },
             );
-            emitter.tool_request(tool_call_id, codex_tool_request_type(tool_type));
+            emitter.tool_request(tool_call_id, codex_tool_request_type(request.tool_type));
             None
         }
     }
@@ -12543,13 +12563,10 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     "ask_user_question",
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "question": question,
-                            "type": "command_approval"
-                        }
-                    }),
+                    CodexToolRequest::other(json!({
+                        "question": question,
+                        "type": "command_approval"
+                    })),
                 )
                 .await;
             }
@@ -12584,13 +12601,10 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     "ask_user_question",
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "question": question,
-                            "type": "file_change_approval"
-                        }
-                    }),
+                    CodexToolRequest::other(json!({
+                        "question": question,
+                        "type": "file_change_approval"
+                    })),
                 )
                 .await;
             }
@@ -12643,13 +12657,10 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     "ask_user_question",
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "question": question,
-                            "type": "command_approval"
-                        }
-                    }),
+                    CodexToolRequest::other(json!({
+                        "question": question,
+                        "type": "command_approval"
+                    })),
                 )
                 .await;
             }
@@ -12684,13 +12695,10 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     "ask_user_question",
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "question": question,
-                            "type": "file_change_approval"
-                        }
-                    }),
+                    CodexToolRequest::other(json!({
+                        "question": question,
+                        "type": "file_change_approval"
+                    })),
                 )
                 .await;
             }
@@ -12731,13 +12739,10 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     "ask_user_question",
-                    json!({
-                        "kind": "Other",
-                        "args": {
-                            "questions": questions,
-                            "type": "request_user_input"
-                        }
-                    }),
+                    CodexToolRequest::other(json!({
+                        "questions": questions,
+                        "type": "request_user_input"
+                    })),
                 )
                 .await;
             }
@@ -12886,10 +12891,9 @@ impl CodexInner {
                 self.emit_tool_request(
                     &call_id,
                     tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": params.get("arguments").cloned().unwrap_or(Value::Null)
-                    }),
+                    CodexToolRequest::other(json!(
+                        params.get("arguments").cloned().unwrap_or(Value::Null)
+                    )),
                 )
                 .await;
 
@@ -13105,8 +13109,11 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     "generate_image",
-                    serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
-                        .expect("serialize Codex image generation request"),
+                    CodexToolRequest::from_item(
+                        item,
+                        serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
+                            .expect("serialize Codex image generation request"),
+                    ),
                 )
                 .await;
             }
@@ -13125,8 +13132,11 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     "web_search",
-                    serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
-                        .expect("serialize Codex web search request"),
+                    CodexToolRequest::from_item(
+                        item,
+                        serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
+                            .expect("serialize Codex web search request"),
+                    ),
                 )
                 .await;
             }
@@ -13145,8 +13155,11 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     "view_image",
-                    serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
-                        .expect("serialize Codex image view request"),
+                    CodexToolRequest::from_item(
+                        item,
+                        serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
+                            .expect("serialize Codex image view request"),
+                    ),
                 )
                 .await;
             }
@@ -13161,8 +13174,11 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     "sleep",
-                    serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
-                        .expect("serialize Codex sleep request"),
+                    CodexToolRequest::from_item(
+                        item,
+                        serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
+                            .expect("serialize Codex sleep request"),
+                    ),
                 )
                 .await;
             }
@@ -13186,11 +13202,14 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     "run_command",
-                    json!({
-                        "kind": "RunCommand",
-                        "command": command,
-                        "working_directory": cwd
-                    }),
+                    CodexToolRequest::from_item(
+                        item,
+                        json!({
+                            "kind": "RunCommand",
+                            "command": command,
+                            "working_directory": cwd
+                        }),
+                    ),
                 )
                 .await;
                 self.track_command_execution(params, provider_item_id, &item_id, item)
@@ -13244,7 +13263,7 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     &tool_name,
-                    codex_public_tool_request_type(&tool_name, item),
+                    codex_public_tool_request(&tool_name, item),
                 )
                 .await;
                 if is_tyde_agent_control_spawn_tool_name(&tool_name)
@@ -13282,7 +13301,7 @@ impl CodexInner {
                 self.emit_tool_request(
                     &item_id,
                     &tool_name,
-                    codex_public_tool_request_type(&tool_name, item),
+                    codex_public_tool_request(&tool_name, item),
                 )
                 .await;
                 if is_tyde_agent_control_spawn_tool_name(&tool_name)
@@ -13310,7 +13329,7 @@ impl CodexInner {
                 self.emit_tool_request(
                     &tool_call_id,
                     unmapped,
-                    json!({ "kind": "Other", "args": item }),
+                    CodexToolRequest::other(json!(item)),
                 )
                 .await;
             }
@@ -14149,12 +14168,15 @@ impl CodexInner {
             self.emit_tool_request(
                 &synthetic_tool_call_id,
                 &spawn_tool_name,
-                serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
-                    prompt: spawn_prompt.clone(),
-                    name: Some(activity.agent_path.clone()),
-                    execution_mode: protocol::AgentExecutionMode::Background,
-                })
-                .expect("serialize native Codex agent spawn"),
+                CodexToolRequest::from_item(
+                    item,
+                    serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+                        prompt: spawn_prompt.clone(),
+                        name: Some(activity.agent_path.clone()),
+                        execution_mode: protocol::AgentExecutionMode::Background,
+                    })
+                    .expect("serialize native Codex agent spawn"),
+                ),
             )
             .await;
             synthetic_tool_call_id
@@ -14860,9 +14882,14 @@ impl CodexInner {
         });
     }
 
-    async fn emit_tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
+    async fn emit_tool_request(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        request: CodexToolRequest,
+    ) {
         let thread_id = self.state.lock().await.thread_id.clone();
-        self.emit_tool_request_for_thread(&thread_id, tool_call_id, tool_name, tool_type)
+        self.emit_tool_request_for_thread(&thread_id, tool_call_id, tool_name, request)
             .await;
     }
 
@@ -14871,15 +14898,15 @@ impl CodexInner {
         thread_id: &str,
         tool_call_id: &str,
         tool_name: &str,
-        tool_type: Value,
+        request: CodexToolRequest,
     ) {
         if self
             .buffer_strict_tool_request(
                 thread_id,
                 tool_call_id,
                 tool_name,
-                tool_type.clone(),
-                tool_type.clone(),
+                request.arguments.clone(),
+                request.tool_type.clone(),
             )
             .await
         {
@@ -14911,13 +14938,13 @@ impl CodexInner {
                 tool_calls: vec![ToolUseData {
                     tool_call_id: tool_call_id.to_owned(),
                     name: tool_name.to_owned(),
-                    arguments: tool_type.clone(),
+                    arguments: request.arguments,
                     content_offset: Some(0),
                 }],
                 ..StreamEndPayload::default()
             },
         );
-        emitter.tool_request(tool_call_id, codex_tool_request_type(tool_type));
+        emitter.tool_request(tool_call_id, codex_tool_request_type(request.tool_type));
     }
 
     async fn emit_modify_file_request(
@@ -14930,12 +14957,24 @@ impl CodexInner {
         self.emit_tool_request(
             tool_call_id,
             "modify_file",
-            json!({
-                "kind": "ModifyFile",
-                "file_path": file_path,
-                "before": before,
-                "after": after
-            }),
+            // Spelled out rather than taken off a provider item, because there
+            // is no item to take it off: `fileChange` is an outcome Codex
+            // reports, not a tool call with an argument object, and all three
+            // callers reach here holding an already-parsed change. The flat
+            // fields are what this card's arguments actually are.
+            CodexToolRequest::typed(
+                json!({
+                    "file_path": file_path,
+                    "before": before,
+                    "after": after
+                }),
+                json!({
+                    "kind": "ModifyFile",
+                    "file_path": file_path,
+                    "before": before,
+                    "after": after
+                }),
+            ),
         )
         .await;
     }
@@ -15598,6 +15637,57 @@ fn reasoning_data(text: String) -> ReasoningData {
 
 fn codex_tool_request_type(value: Value) -> ToolRequestType {
     serde_json::from_value(value.clone()).unwrap_or(ToolRequestType::Other { args: value })
+}
+
+/// One Codex tool call, as both things the stream has to carry: the arguments
+/// the model passed, and Tyde's normalized reading of them.
+///
+/// A struct rather than two adjacent `Value` parameters because two adjacent
+/// `Value`s are precisely how this went wrong. `buffer_strict_tool_request`
+/// already took separate `arguments` and `tool_type`, and both of its call
+/// sites passed the normalized type for both, so every Codex `ToolUseData`
+/// carried Tyde's own `{"kind":...}` envelope instead of what the model passed
+/// -- while `protocol::ToolRequest` documents `ToolUseData` as the one place a
+/// provider's name and arguments survive. Pairing them at construction means a
+/// caller cannot supply one without having decided the other.
+#[derive(Clone, Debug)]
+struct CodexToolRequest {
+    /// What the provider reported the model passed, untouched.
+    arguments: Value,
+    /// A serialized [`ToolRequestType`].
+    tool_type: Value,
+}
+
+impl CodexToolRequest {
+    /// A tool Tyde has no typed card for. The normalized form wraps the very
+    /// same arguments, so there is one source for both.
+    fn other(arguments: Value) -> Self {
+        Self {
+            tool_type: json!({ "kind": "Other", "args": arguments.clone() }),
+            arguments,
+        }
+    }
+
+    /// A tool Tyde normalizes into a typed card. `arguments` stays the
+    /// provider's own; `tool_type` is Tyde's reading of it, and the two are
+    /// deliberately not derived from each other.
+    fn typed(arguments: Value, tool_type: Value) -> Self {
+        Self {
+            arguments,
+            tool_type,
+        }
+    }
+
+    /// The common case: a provider item Tyde reads into a typed card. The
+    /// arguments come off the item itself, so no call site restates them.
+    fn from_item(item: &Value, tool_type: Value) -> Self {
+        Self::typed(codex_generic_tool_arguments(item), tool_type)
+    }
+}
+
+/// [`codex_public_tool_request_type`] paired with the arguments it read.
+fn codex_public_tool_request(tool_name: &str, item: &Value) -> CodexToolRequest {
+    CodexToolRequest::from_item(item, codex_public_tool_request_type(tool_name, item))
 }
 
 fn codex_token_usage(value: &Value) -> Option<TokenUsage> {
