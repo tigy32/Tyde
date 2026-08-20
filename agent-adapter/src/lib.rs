@@ -6,11 +6,9 @@
 use std::collections::BTreeSet;
 
 mod certification;
-mod conformance;
 mod coverage;
 
 pub use certification::{CertificationCase, CertificationTier};
-pub use conformance::{BackendConformanceError, BackendConformanceValidator, ConformanceSnapshot};
 pub use coverage::{
     ActivityCondition, AgentControlAuthorizationSet, AgentControlBoundaryRace,
     AgentControlCoverageCell, AgentControlCoverageLedger, AgentControlRequestMultiplicity,

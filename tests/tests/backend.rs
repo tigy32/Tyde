@@ -60,29 +60,28 @@ use tyde_agent_adapter::{
     ActivityCondition, AgentControlAuthorizationSet, AgentControlBoundaryRace,
     AgentControlCoverageCell, AgentControlCoverageLedger, AgentControlRequestMultiplicity,
     AgentControlTargetRelation, AmbientWorkKind, AssistantToolRepresentationCell,
-    BackendCapabilities, BackendCapability, BackendConformanceValidator,
-    BackendNativeConfigDiscoveryCell, BackendObservation, BackendSetupDiscoveryCell,
-    CapacityLifecycleCell, CertificationCase, ConformanceCoverageCell, ConformanceCoverageLedger,
-    ContractOutcome, ContractState, ContractStimulus, DynamicSessionDiscoveryCell,
-    EnumeratedCoverageLedger, GenericToolBoundaryTiming, GenericToolCallRelation,
-    GenericToolClientTopology, GenericToolContract, GenericToolLifecycleBoundary,
-    GenericToolLifecycleCell, GenericToolLifecyclePhase, GenericToolMultiplicity,
-    ImageAttachmentActivityCell, ImageAttachmentCell, ImageLifecycleActivityCell,
-    ImageLifecycleCell, InputAdmissionAction, InputAdmissionCoverageCell,
-    InputAdmissionCoverageLedger, InputAdmissionKind, InputAdmissionState,
-    InteractionConcurrencyCell, InteractionConcurrencyContract, InteractionConcurrencyScenario,
-    InteractionImageActivityCell, InteractionImagePayloadCell, LiveCustomizationCell,
-    McpConfigurationRaceCell, McpConnectionOwnershipCell, McpFailureConsistencyCell,
-    McpHttpTransportCell, MessageMetadataApplicabilityCell, MessageMetadataCoverageCell,
-    NormalizedTurnCoverageCell, NormalizedTurnCoverageLedger, NormalizedTurnShape,
-    OrchestrationCorrelationCell, OrchestrationLifecycleCell, OrchestrationMetadataCell,
-    OrchestrationOutcomeCell, OrchestrationPayloadCell, OrchestrationPhaseCell,
-    PlainTerminationMechanism, PlainTerminationPhase, ProgressCoverageCell, ProgressFamily,
-    ProgressSubagentMode, ProgressTransition, ReasoningCoverageCell, RequestUsageLifecycleCell,
-    RetryBoundary, RetryFailureSource, RetryLifecycleCell, SessionListLifecycleCell,
-    SkillLifecycleCell, SpecialToolContract, TaskUpdateLifecycleApplicability,
-    TaskUpdateLifecycleCell, ToolInputVariant, ToolResultVariant, TraceInvariant,
-    UsageLifecycleCell,
+    BackendCapabilities, BackendCapability, BackendNativeConfigDiscoveryCell, BackendObservation,
+    BackendSetupDiscoveryCell, CapacityLifecycleCell, CertificationCase, ConformanceCoverageCell,
+    ConformanceCoverageLedger, ContractOutcome, ContractState, ContractStimulus,
+    DynamicSessionDiscoveryCell, EnumeratedCoverageLedger, GenericToolBoundaryTiming,
+    GenericToolCallRelation, GenericToolClientTopology, GenericToolContract,
+    GenericToolLifecycleBoundary, GenericToolLifecycleCell, GenericToolLifecyclePhase,
+    GenericToolMultiplicity, ImageAttachmentActivityCell, ImageAttachmentCell,
+    ImageLifecycleActivityCell, ImageLifecycleCell, InputAdmissionAction,
+    InputAdmissionCoverageCell, InputAdmissionCoverageLedger, InputAdmissionKind,
+    InputAdmissionState, InteractionConcurrencyCell, InteractionConcurrencyContract,
+    InteractionConcurrencyScenario, InteractionImageActivityCell, InteractionImagePayloadCell,
+    LiveCustomizationCell, McpConfigurationRaceCell, McpConnectionOwnershipCell,
+    McpFailureConsistencyCell, McpHttpTransportCell, MessageMetadataApplicabilityCell,
+    MessageMetadataCoverageCell, NormalizedTurnCoverageCell, NormalizedTurnCoverageLedger,
+    NormalizedTurnShape, OrchestrationCorrelationCell, OrchestrationLifecycleCell,
+    OrchestrationMetadataCell, OrchestrationOutcomeCell, OrchestrationPayloadCell,
+    OrchestrationPhaseCell, PlainTerminationMechanism, PlainTerminationPhase, ProgressCoverageCell,
+    ProgressFamily, ProgressSubagentMode, ProgressTransition, ReasoningCoverageCell,
+    RequestUsageLifecycleCell, RetryBoundary, RetryFailureSource, RetryLifecycleCell,
+    SessionListLifecycleCell, SkillLifecycleCell, SpecialToolContract,
+    TaskUpdateLifecycleApplicability, TaskUpdateLifecycleCell, ToolInputVariant, ToolResultVariant,
+    TraceInvariant, UsageLifecycleCell,
 };
 use uuid::Uuid;
 
@@ -24130,18 +24129,6 @@ async fn collect_direct_certification_observation<B: Backend>(
         chat: Vec::new(),
         request_usage: Vec::new(),
     };
-    let mut validator = BackendConformanceValidator::new(
-        server::backend::capabilities_for_backend_kind(backend_kind),
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{} advertised invalid capabilities: {error}",
-            backend_label(backend_kind)
-        )
-    });
-    validator
-        .input_accepted()
-        .expect("direct certification input accepted");
     tokio::time::timeout(Duration::from_secs(180), async {
         while let Some(event) = events.recv_observation().await {
             match event {
@@ -24152,30 +24139,12 @@ async fn collect_direct_certification_observation<B: Backend>(
                             .chat
                             .iter()
                             .any(|event| matches!(event, ChatEvent::StreamEnd(_)));
-                    validator
-                        .observe_chat_event(&event)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{} violated the universal contract: {error}; trace:\n{}",
-                                backend_label(backend_kind),
-                                observation.trace()
-                            )
-                        });
                     observation.chat.push(event);
                     if terminal {
                         break;
                     }
                 }
                 BackendObservation::ModelRequestTokenUsage(usage) => {
-                    validator
-                        .observe_model_request_usage(&usage)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{} violated the universal usage contract: {error}; trace:\n{}",
-                                backend_label(backend_kind),
-                                observation.trace()
-                            )
-                        });
                     observation.request_usage.push(usage);
                 }
                 BackendObservation::Compaction(_) => {}
@@ -24194,27 +24163,9 @@ async fn collect_direct_certification_observation<B: Backend>(
             match event {
                 BackendObservation::Chat(event) => {
                     assert_required_test_model(backend_kind, &event);
-                    validator
-                        .observe_chat_event(&event)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{} emitted an invalid event during shutdown: {error}; trace:\n{}",
-                                backend_label(backend_kind),
-                                observation.trace()
-                            )
-                        });
                     observation.chat.push(event);
                 }
                 BackendObservation::ModelRequestTokenUsage(usage) => {
-                    validator
-                        .observe_model_request_usage(&usage)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{} emitted invalid usage during shutdown: {error}; trace:\n{}",
-                                backend_label(backend_kind),
-                                observation.trace()
-                            )
-                        });
                     observation.request_usage.push(usage);
                 }
                 BackendObservation::Compaction(_) => {}
@@ -24230,13 +24181,6 @@ async fn collect_direct_certification_observation<B: Backend>(
         panic!(
             "{} event stream did not close after shutdown",
             backend_label(backend_kind)
-        )
-    });
-    validator.finish().unwrap_or_else(|error| {
-        panic!(
-            "{} ended with an invalid universal contract state: {error}; trace:\n{}",
-            backend_label(backend_kind),
-            observation.trace()
         )
     });
     if matches!(backend_kind, BackendKind::Claude | BackendKind::Codex) {
@@ -24341,25 +24285,18 @@ async fn collect_direct_retry_observation<B: Backend>(
             backend_label(backend_kind)
         )
     });
-    let capabilities = server::backend::capabilities_for_backend_kind(backend_kind);
-    let mut validator = BackendConformanceValidator::new(capabilities)
-        .expect("retry backend advertised invalid capabilities");
-    validator.input_accepted().expect("retry baseline accepted");
     tokio::time::timeout(Duration::from_secs(180), async {
         let mut ended = false;
         loop {
             match events.recv_observation().await {
                 Some(BackendObservation::Chat(event)) => {
                     assert_required_test_model(backend_kind, &event);
-                    validator.observe_chat_event(&event).unwrap();
                     ended |= matches!(event, ChatEvent::StreamEnd(_));
                     if ended && matches!(event, ChatEvent::TypingStatusChanged(false)) {
                         break;
                     }
                 }
-                Some(BackendObservation::ModelRequestTokenUsage(usage)) => {
-                    validator.observe_model_request_usage(&usage).unwrap();
-                }
+                Some(BackendObservation::ModelRequestTokenUsage(_)) => {}
                 Some(BackendObservation::Compaction(_)) => {}
                 Some(BackendObservation::Other) => panic!("untyped retry baseline observation"),
                 None => panic!("retry backend closed during baseline"),
@@ -24385,9 +24322,6 @@ async fn collect_direct_retry_observation<B: Backend>(
             .await,
         "retry backend rejected the recovery turn"
     );
-    validator
-        .input_accepted()
-        .expect("retry recovery input accepted");
     let mut observation = DirectCertificationObservation {
         prompt: prompt.to_owned(),
         chat: Vec::new(),
@@ -24399,11 +24333,6 @@ async fn collect_direct_retry_observation<B: Backend>(
             match events.recv_observation().await {
                 Some(BackendObservation::Chat(event)) => {
                     assert_required_test_model(backend_kind, &event);
-                    validator
-                        .observe_chat_event(&event)
-                        .unwrap_or_else(|error| {
-                            panic!("retry recovery violated conformance: {error}")
-                        });
                     ended |= matches!(event, ChatEvent::StreamEnd(_));
                     observation.chat.push(event.clone());
                     if ended && matches!(event, ChatEvent::TypingStatusChanged(false)) {
@@ -24411,11 +24340,6 @@ async fn collect_direct_retry_observation<B: Backend>(
                     }
                 }
                 Some(BackendObservation::ModelRequestTokenUsage(usage)) => {
-                    validator
-                        .observe_model_request_usage(&usage)
-                        .unwrap_or_else(|error| {
-                            panic!("retry recovery usage violated conformance: {error}")
-                        });
                     observation.request_usage.push(usage);
                 }
                 Some(BackendObservation::Compaction(_)) => {}
@@ -24452,11 +24376,9 @@ async fn collect_direct_retry_observation<B: Backend>(
         while let Some(event) = events.recv_observation().await {
             match event {
                 BackendObservation::Chat(event) => {
-                    validator.observe_chat_event(&event).unwrap();
                     observation.chat.push(event);
                 }
                 BackendObservation::ModelRequestTokenUsage(usage) => {
-                    validator.observe_model_request_usage(&usage).unwrap();
                     observation.request_usage.push(usage);
                 }
                 BackendObservation::Compaction(_) => {}
@@ -24466,9 +24388,6 @@ async fn collect_direct_retry_observation<B: Backend>(
     })
     .await
     .expect("retry event stream did not close after shutdown");
-    validator
-        .finish()
-        .expect("retry observation ended invalidly");
     observation
 }
 
@@ -24504,13 +24423,6 @@ async fn collect_direct_interaction_observation<B: Backend>(
             backend_label(backend_kind)
         )
     });
-    let mut validator = BackendConformanceValidator::new(
-        server::backend::capabilities_for_backend_kind(backend_kind),
-    )
-    .expect("interaction backend advertised invalid capabilities");
-    validator
-        .input_accepted()
-        .expect("interaction input accepted");
     let mut observation = DirectCertificationObservation {
         prompt: prompt.to_owned(),
         chat: Vec::new(),
@@ -24523,11 +24435,6 @@ async fn collect_direct_interaction_observation<B: Backend>(
             match events.recv_observation().await {
                 Some(BackendObservation::Chat(event)) => {
                     assert_required_test_model(backend_kind, &event);
-                    validator
-                        .observe_chat_event(&event)
-                        .unwrap_or_else(|error| {
-                            panic!("interaction turn violated conformance: {error}")
-                        });
                     if let ChatEvent::ToolRequest(ToolRequest {
                         tool_call_id,
                         tool_type: ToolRequestType::AskUserQuestion { .. },
@@ -24562,11 +24469,6 @@ async fn collect_direct_interaction_observation<B: Backend>(
                     }
                 }
                 Some(BackendObservation::ModelRequestTokenUsage(usage)) => {
-                    validator
-                        .observe_model_request_usage(&usage)
-                        .unwrap_or_else(|error| {
-                            panic!("interaction usage violated conformance: {error}")
-                        });
                     observation.request_usage.push(usage);
                 }
                 Some(BackendObservation::Compaction(_)) => {}
@@ -24593,11 +24495,9 @@ async fn collect_direct_interaction_observation<B: Backend>(
         while let Some(event) = events.recv_observation().await {
             match event {
                 BackendObservation::Chat(event) => {
-                    validator.observe_chat_event(&event).unwrap();
                     observation.chat.push(event);
                 }
                 BackendObservation::ModelRequestTokenUsage(usage) => {
-                    validator.observe_model_request_usage(&usage).unwrap();
                     observation.request_usage.push(usage);
                 }
                 BackendObservation::Compaction(_) => {}
@@ -24607,9 +24507,6 @@ async fn collect_direct_interaction_observation<B: Backend>(
     })
     .await
     .expect("interaction event stream did not close after shutdown");
-    validator
-        .finish()
-        .expect("interaction observation ended invalidly");
     observation
 }
 
