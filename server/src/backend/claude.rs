@@ -4527,18 +4527,23 @@ impl ClaudeInner {
         Ok(())
     }
 
-    fn emit_tool_request(&self, tool_call: &ClaudeToolCall) -> bool {
-        self.emit_tool_request_with_ownership(tool_call, true)
+    fn emit_tool_request(
+        &self,
+        tool_call: &ClaudeToolCall,
+        preview: Option<&ClaudeModifyPreview>,
+    ) -> bool {
+        self.emit_tool_request_with_ownership(tool_call, true, preview)
     }
 
     fn emit_replay_tool_request(&self, tool_call: &ClaudeToolCall) {
-        let _ = self.emit_tool_request_with_ownership(tool_call, false);
+        let _ = self.emit_tool_request_with_ownership(tool_call, false, None);
     }
 
     fn emit_tool_request_with_ownership(
         &self,
         tool_call: &ClaudeToolCall,
         require_declared_response: bool,
+        preview: Option<&ClaudeModifyPreview>,
     ) -> bool {
         let task_update = self
             .task_tracker
@@ -4548,7 +4553,7 @@ impl ClaudeInner {
         if let Some(tasks) = task_update {
             self.emitter.task_update(&tasks);
         }
-        let tool_type = claude_tool_request_type(&tool_call.name, &tool_call.arguments);
+        let tool_type = claude_tool_request_type(&tool_call.name, &tool_call.arguments, preview);
         let tool_type = serde_json::from_value(tool_type.clone())
             .unwrap_or(ToolRequestType::Other { args: tool_type });
         let emitted = self.emitter.tool_request(&tool_call.id, tool_type);
@@ -6567,7 +6572,7 @@ fn ensure_ask_user_question_tool_request_emitted(
             })],
             None,
         );
-        let _ = inner.emit_tool_request(&tool_call);
+        let _ = inner.emit_tool_request(&tool_call, None);
     }
 
     tool_call
@@ -6649,7 +6654,7 @@ fn ensure_exit_plan_mode_tool_request_emitted(
             })],
             None,
         );
-        let _ = inner.emit_tool_request(&tool_call);
+        let _ = inner.emit_tool_request(&tool_call, None);
     }
 
     tool_call
@@ -9559,7 +9564,11 @@ fn emit_tool_request_with_tracking(
     inner: &ClaudeInner,
     tool_call: &ClaudeToolCall,
 ) {
-    if inner.emit_tool_request(tool_call) {
+    let preview = summary
+        .tool_modify_preview_by_id
+        .get(&tool_call.id)
+        .cloned();
+    if inner.emit_tool_request(tool_call, preview.as_ref()) {
         summary
             .unresolved_tool_requests
             .insert(tool_call.id.clone(), tool_call.name.clone());
@@ -11265,7 +11274,23 @@ fn claude_argument_bool(arguments: &Value, keys: &[&str]) -> Option<bool> {
     None
 }
 
-fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
+/// `preview` is the snapshot `register_tool_call` took when the tool call was
+/// first seen. It is the authoritative one and must be preferred wherever it
+/// exists: a `Write` preview's `before` is the file as it stood *before* the
+/// tool ran, and the only way to learn that is to read the file, so recomputing
+/// it here reads whatever is on disk at emission time instead.
+///
+/// Emission is not ordered against execution. When a `tool_result` arrives
+/// while the response is still streaming, the request is emitted from
+/// `consume_user_tool_result` — after the CLI has already written the file — and
+/// a recomputed `before` comes back equal to `after`. Measured on ~30% of
+/// creations: the card renders an edit with no lines in it, because the UI
+/// diffs those two strings verbatim.
+fn claude_tool_request_type(
+    tool_name: &str,
+    arguments: &Value,
+    preview: Option<&ClaudeModifyPreview>,
+) -> Value {
     if is_subagent_tool_name(tool_name) {
         let prompt = claude_argument_string(arguments, &["prompt"])
             .or_else(|| claude_argument_string(arguments, &["description"]));
@@ -11285,7 +11310,19 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
         .expect("serialize Claude agent spawn request");
     }
 
-    if let Some(preview) = claude_modify_preview(tool_name, arguments) {
+    // Recomputed only for the callers that have no snapshot: the replay builder,
+    // and the two permission-flow sites that rewrite a tool call's arguments
+    // after it was registered and so cannot reuse a snapshot taken from the old
+    // ones. Neither runs a `Write` against a file the CLI has already touched.
+    let recomputed;
+    let preview = match preview {
+        Some(preview) => Some(preview),
+        None => {
+            recomputed = claude_modify_preview(tool_name, arguments);
+            recomputed.as_ref()
+        }
+    };
+    if let Some(preview) = preview {
         return json!({
             "kind": "ModifyFile",
             "file_path": preview.file_path,
