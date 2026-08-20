@@ -33,8 +33,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, SessionId,
-    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
+    BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, MessageTokenUsage, SessionId,
+    TaskStatus, TokenUsage, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
@@ -59,6 +59,29 @@ const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
 const COUNTED_MARKER: &str = "TYDE_COUNTED";
 const RAN_MARKER: &str = "TYDE_RAN";
 const INTERRUPT_PROOF_FILE: &str = "interrupt_proof.txt";
+const USAGE_MARKER: &str = "TYDE_USAGE";
+const PLANNED_MARKER: &str = "TYDE_PLANNED";
+const ADVANCED_MARKER: &str = "TYDE_ADVANCED";
+const CLEARED_MARKER: &str = "TYDE_CLEARED";
+
+/// Lines of filler the planted-payload turn carries, and the token floor that
+/// block has to move the reported input by.
+///
+/// Each line is seven short words plus its own index, so it cannot be collapsed
+/// by a tokenizer that folds repeats. The floor is under half a token per line —
+/// far below what any real tokenizer produces for English words — because the
+/// assertion is meant to catch a count that ignored the payload, not to pin a
+/// particular tokenizer's rate.
+const USAGE_PROBE_LINES: usize = 300;
+const USAGE_PROBE_TOKEN_FLOOR: u64 = 600;
+
+/// Dictated verbatim in `plan_prompt` and asserted verbatim in the task list, so
+/// the assertion has a payload to check rather than only a shape.
+const PLAN_TASKS: [&str; 3] = [
+    "survey the tyde conformance fixtures",
+    "draft the usage accounting notes",
+    "publish the reviewed summary",
+];
 
 /// Three files via three tool calls. Single-tool turns miss a whole class of
 /// defect: Codex joins a `commandExecution` back to its declaration through
@@ -874,8 +897,222 @@ fn real_native_workflow() {
     );
 }
 
+/// What the reported numbers *say*, not whether they were sent.
+///
+/// Presence is already covered, live, on every run: `require_turn_evidence`
+/// (`agent-adapter/src/conformance.rs:668`) fails any turn where a backend
+/// declared a usage capability and emitted nothing. So this scenario deliberately
+/// asserts nothing about presence.
+///
+/// The values are covered nowhere. Every certification case that reads them —
+/// `TurnUsagePresent`, `TurnInputTokensPositive`, `TurnTotalConsistent`,
+/// `CumulativeUsageGrows`, `RequestUsagePositive` — is a presence, positivity, or
+/// internal-consistency check, and a wrong-but-well-formed number satisfies all
+/// of them. This project has shipped exactly that: a backend returning
+/// session-cumulative totals in the per-turn slot, which the footer rendered as
+/// several times the true cost. Fourteen certification cases were green
+/// throughout.
+///
+/// So the oracles here are all *outside* the numbers being checked:
+///
+/// * **A planted payload.** A prompt carrying a known block of text has to move
+///   the reported input by a floor derived from that block's size. A zero, a
+///   stuck value, and a count that ignores the message all fail; the floor is
+///   set well under one token per line so no tokenizer can fail it honestly.
+/// * **Turn against cumulative.** From the second turn on, these must *differ*.
+///   Reporting cumulative totals in the turn slot makes them equal — and
+///   `CumulativeUsageGrows` passes on that, because cumulative totals do grow.
+/// * **Requests summing to their turn.** Where a backend reports both scopes,
+///   the per-request numbers within a turn have to add up to the turn's own.
+///
+/// The turn scope is the gate because it is the one every backend but Kiro
+/// declares; the request-scope assertions gate themselves.
+///
+/// Context usage is *not* covered here, and cannot be from a [`Turn`]: the
+/// evidence behind `ContextUsageReported` is `current_context_usage` on a
+/// `ModelRequestTokenUsage` backend observation, which never reaches the chat
+/// event stream. `ContextBreakdown` does ride on `ChatMessage`, but no backend
+/// declares `ContextBreakdownReported`, so asserting on it would be a check that
+/// passes by being empty. It needs a fixture that can see backend observations.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_usage_accounting() {
+    run_scenario(
+        &[BackendCapability::TurnUsageReported],
+        |mut host| async move {
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&launched, READY_MARKER);
+
+            // Deliberately the second turn, not the first: the baseline has to be
+            // a turn that already paid for the system prompt, or the jump being
+            // measured is a first-turn fixed cost rather than the payload.
+            let baseline = ask(&mut host, &agent, usage_baseline_prompt()).await;
+            assert_final_text_contains(&baseline, USAGE_MARKER);
+
+            let planted = ask(&mut host, &agent, usage_probe_prompt()).await;
+            assert_final_text_contains(&planted, USAGE_MARKER);
+
+            assert_usage_moved_with_the_payload(&baseline, &planted);
+            assert_turn_is_not_the_running_total(&baseline);
+            assert_turn_is_not_the_running_total(&planted);
+
+            let turns = vec![launched, baseline, planted];
+            for turn in &turns {
+                assert_no_well_formed_zeros(turn);
+                assert_requests_sum_to_their_turn(turn);
+            }
+            assert_cumulative_never_shrinks(&turns);
+
+            assert_universal_contract(&turns);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
+/// The model's own plan, as a strongly-typed `TaskUpdate`.
+///
+/// Ungated on purpose, unlike every other capability-sensitive scenario here. A
+/// gate would let a backend excuse itself from the test by not declaring, and
+/// that is not hypothetical: Codex declares no task capability at all while
+/// `codex.rs:15073` maps `update_plan` into a `protocol::TaskList` and
+/// `codex.rs:14395` emits it. Gating on `TaskUpdates` would skip Codex entirely
+/// and report a pass.
+///
+/// So the check runs both ways. Declared-but-silent is the direction the adapter
+/// validator already owns for usage; the direction that matters here is
+/// **emitted-but-undeclared**, which nothing checks. Its cost is not a broken
+/// render — no consumer outside the backends reads these capabilities today —
+/// it is that the backend silently removes itself from every capability-gated
+/// test of the behaviour, which is the same false-coverage failure the module
+/// header warns about.
+///
+/// The prompt dictates the three task descriptions verbatim, so the assertion has
+/// something outside Tyde to check against: a list that arrives with the model's
+/// own paraphrase is a mapping that dropped the payload, and a count check alone
+/// would pass on it.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_task_list() {
+    run_scenario(&[], |mut host| async move {
+        let declares_updates = host.declares(BackendCapability::TaskUpdates);
+        let declares_replacement = host.declares(BackendCapability::TaskListReplacement);
+        let declares_clear = host.declares(BackendCapability::TaskListClear);
+
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        assert_final_text_contains(&launched, READY_MARKER);
+
+        let planned = ask(&mut host, &agent, plan_prompt()).await;
+        assert_final_text_contains(&planned, PLANNED_MARKER);
+        assert_task_capability_matches_behaviour(&planned, declares_updates);
+        if declares_updates {
+            assert_plan_carries_the_dictated_tasks(&planned);
+        }
+
+        let advanced = ask(&mut host, &agent, advance_plan_prompt()).await;
+        assert_final_text_contains(&advanced, ADVANCED_MARKER);
+        if declares_replacement {
+            assert_update_replaced_rather_than_appended(&advanced);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare TaskListReplacement, so this run asserts \
+                 nothing about how the second update composes with the first",
+                host.backend()
+            );
+        }
+
+        let mut turns = vec![launched, planned, advanced];
+
+        if declares_clear {
+            let cleared = ask(&mut host, &agent, clear_plan_prompt()).await;
+            assert_final_text_contains(&cleared, CLEARED_MARKER);
+            assert_plan_was_cleared(&cleared);
+            turns.push(cleared);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare TaskListClear, so this run asserts nothing \
+                 about clearing a list",
+                host.backend()
+            );
+        }
+
+        for turn in &turns {
+            assert_task_lists_are_well_formed(turn);
+        }
+
+        assert_universal_contract(&turns);
+        assert_clean_close(&mut host, &agent).await;
+    });
+}
+
 fn launch_prompt() -> String {
     format!("Reply with exactly {READY_MARKER} and nothing else. Do not use any tools.")
+}
+
+/// The turn the planted-payload turn is measured against. Deliberately as small
+/// as a turn can be, so the difference between the two is almost entirely the
+/// payload rather than anything either prompt says.
+fn usage_baseline_prompt() -> String {
+    format!("Reply with exactly {USAGE_MARKER} and nothing else. Do not use any tools.")
+}
+
+/// Carries [`USAGE_PROBE_LINES`] lines the model is told to ignore.
+///
+/// The instruction to ignore them is what keeps the *output* small while the
+/// *input* jumps: this turn is measured on its input tokens, and a model that
+/// answered by quoting the block back would move both and prove neither.
+fn usage_probe_prompt() -> String {
+    format!(
+        "Here is a block of reference material. Do not read it, summarize it, quote it, or use \
+         any tools.\n\n{}\n\nIgnore all of the above and reply with exactly {USAGE_MARKER} and \
+         nothing else.",
+        usage_probe_payload()
+    )
+}
+
+fn usage_probe_payload() -> String {
+    (0..USAGE_PROBE_LINES)
+        .map(|line| format!("line {line:04} tyde usage probe reference material row\n"))
+        .collect()
+}
+
+/// Names the *category* — a task list — without naming any provider's tool, the
+/// same convention as the mapping prompts and for the same reason: a prompt that
+/// said "TodoWrite" would test whether Claude can follow an instruction, not
+/// whether Tyde maps whatever tool the model picked.
+///
+/// The descriptions are dictated verbatim so the mapping has a payload to carry.
+fn plan_prompt() -> String {
+    let tasks = PLAN_TASKS
+        .iter()
+        .map(|task| format!("- {task}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Record a task list tracking exactly these three steps, using each description word for \
+         word and leaving all three not started:\n{tasks}\n\nDo not carry out the steps. Once the \
+         list is recorded, reply with exactly {PLANNED_MARKER} and nothing else."
+    )
+}
+
+/// Marks one task done and touches nothing else, which is what makes the
+/// replacement assertion meaningful: the list has to come back the same length
+/// with one status moved, not one entry longer.
+fn advance_plan_prompt() -> String {
+    format!(
+        "Update the task list so that only \"{}\" is completed. Leave the other two exactly as \
+         they are and do not add, remove, or reword any task. Then reply with exactly \
+         {ADVANCED_MARKER} and nothing else.",
+        PLAN_TASKS[0]
+    )
+}
+
+fn clear_plan_prompt() -> String {
+    format!(
+        "Clear the task list completely so that no tasks remain. Then reply with exactly \
+         {CLEARED_MARKER} and nothing else."
+    )
 }
 
 /// Two agents, each writing its own file.
@@ -2440,6 +2677,309 @@ fn assert_read_back_payload(turn: &Turn, payload: &str) {
         turn.label(),
         turn.completion_summaries()
     );
+}
+
+/// The usage attached to a turn's last provider response, which is the one
+/// carrying that turn's totals.
+fn final_usage(turn: &Turn) -> Option<MessageTokenUsage> {
+    turn.reported_usage().last().cloned()
+}
+
+/// Everything that had to be sent to produce this response, cached or not.
+///
+/// `input_tokens` alone is not that number on any provider with prompt caching:
+/// it is only the uncached remainder, so a 300-line payload that lands entirely
+/// in a cache write moves it by zero. Tyde already states this rule for itself —
+/// `estimate_context_breakdown` (`claude.rs:12664`) sums the same three fields
+/// under the comment "Context utilization should reflect the full prompt
+/// footprint, including cache hits/writes" — and the assertions below are about
+/// what was sent, so they use the same definition.
+fn prompt_footprint(usage: &TokenUsage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0))
+}
+
+/// The planted-payload oracle: a block of known size has to show up in the count.
+///
+/// Measured as a delta between two turns rather than against an absolute, so the
+/// system prompt, the tool schemas, and whatever else a backend prepends all
+/// cancel out and only the payload is left.
+fn assert_usage_moved_with_the_payload(baseline: &Turn, planted: &Turn) {
+    let before_usage = final_usage(baseline);
+    let after_usage = final_usage(planted);
+    let (Some(before), Some(after)) = (
+        before_usage
+            .as_ref()
+            .and_then(|usage| usage.turn.known_usage()),
+        after_usage
+            .as_ref()
+            .and_then(|usage| usage.turn.known_usage()),
+    ) else {
+        panic!(
+            "{}: declares TurnUsageReported but one of the two measured turns reported no turn \
+             usage, so the payload could not be weighed",
+            planted.label()
+        );
+    };
+
+    let grew = prompt_footprint(after).saturating_sub(prompt_footprint(before));
+    assert!(
+        grew >= USAGE_PROBE_TOKEN_FLOOR,
+        "{}: a {USAGE_PROBE_LINES}-line payload moved the reported prompt footprint by {grew} \
+         ({} -> {}), under the floor of {USAGE_PROBE_TOKEN_FLOOR}. The floor is well under one \
+         token per line, so this is not a tokenizer difference: the reported input is not \
+         tracking what was actually sent. Baseline was {before:?}; planted was {after:?}.",
+        planted.label(),
+        prompt_footprint(before),
+        prompt_footprint(after)
+    );
+}
+
+/// The scope-confusion oracle, and the sharpest check here.
+///
+/// This turn is never the first in its conversation, so earlier turns have
+/// already spent tokens and the session's running total must exceed this turn's
+/// own. Equality means the backend put the running total in the per-turn slot —
+/// the defect that renders as a multiplied cost, and the one `CumulativeUsageGrows`
+/// cannot see, because a running total does grow.
+fn assert_turn_is_not_the_running_total(turn: &Turn) {
+    let usage = final_usage(turn);
+    let (Some(scoped), Some(cumulative)) = (
+        usage.as_ref().and_then(|usage| usage.turn.known_usage()),
+        usage
+            .as_ref()
+            .and_then(|usage| usage.cumulative.known_usage()),
+    ) else {
+        eprintln!(
+            "COVERAGE: {} reported no cumulative usage, so this run asserts nothing about the \
+             turn scope carrying a running total",
+            turn.label()
+        );
+        return;
+    };
+
+    assert!(
+        scoped.total_tokens < cumulative.total_tokens,
+        "{}: this turn's total ({}) is not below the session running total ({}), but earlier \
+         turns in this conversation already spent tokens. The two can only meet if the per-turn \
+         slot is carrying the running total.",
+        turn.label(),
+        scoped.total_tokens,
+        cumulative.total_tokens
+    );
+}
+
+fn assert_cumulative_never_shrinks(turns: &[Turn]) {
+    let mut highest = 0u64;
+    for turn in turns {
+        let usage = final_usage(turn);
+        let Some(cumulative) = usage
+            .as_ref()
+            .and_then(|usage| usage.cumulative.known_usage())
+        else {
+            continue;
+        };
+        assert!(
+            cumulative.total_tokens >= highest,
+            "{}: session running total fell from {highest} to {}; a running total that drops has \
+             been reset or rescoped mid-conversation",
+            turn.label(),
+            cumulative.total_tokens
+        );
+        highest = cumulative.total_tokens;
+    }
+}
+
+/// A `Known` scope reading zero is the failure mode the positivity cases were
+/// written for and still miss: they run per-scope on the scopes that happen to
+/// be populated, so a backend reporting a well-formed zero satisfies them.
+///
+/// Every turn here sends a prompt and gets text back, so there is no honest way
+/// for any populated scope to total zero.
+fn assert_no_well_formed_zeros(turn: &Turn) {
+    for usage in turn.reported_usage() {
+        for (scope, reported) in [
+            ("request", &usage.request),
+            ("turn", &usage.turn),
+            ("cumulative", &usage.cumulative),
+        ] {
+            let Some(reported) = reported.known_usage() else {
+                continue;
+            };
+            assert!(
+                reported.total_tokens > 0 && prompt_footprint(reported) > 0,
+                "{}: reported {scope} usage as Known with a prompt footprint of {} and a total \
+                 of {}. This turn sent a prompt and received text, so a zero here is a reported \
+                 number that is simply wrong — Unavailable is the honest value when a backend \
+                 has none. Full usage: {reported:?}",
+                turn.label(),
+                prompt_footprint(reported),
+                reported.total_tokens
+            );
+        }
+    }
+}
+
+/// Where a backend reports both scopes, the requests inside a turn have to add
+/// up to the turn. Off-by-a-request is how a multi-request turn under-bills.
+fn assert_requests_sum_to_their_turn(turn: &Turn) {
+    let usages = turn.reported_usage();
+    let Some(last) = usages.last() else {
+        return;
+    };
+    let Some(turn_total) = last.turn.known_usage() else {
+        return;
+    };
+
+    let mut summed = 0u64;
+    for usage in &usages {
+        let Some(request) = usage.request.known_usage() else {
+            return;
+        };
+        summed += request.total_tokens;
+    }
+
+    assert_eq!(
+        summed,
+        turn_total.total_tokens,
+        "{}: {} request(s) totalling {summed} tokens against a turn total of {}",
+        turn.label(),
+        usages.len(),
+        turn_total.total_tokens
+    );
+}
+
+/// Both directions of the task capability, because only one of them is covered
+/// elsewhere.
+fn assert_task_capability_matches_behaviour(turn: &Turn, declared: bool) {
+    let updates = turn.task_updates().count();
+    if declared {
+        assert!(
+            updates > 0,
+            "{}: declares TaskUpdates and the prompt asked for a task list, but none was pushed. \
+             Either the mapping dropped it, or the model answered without recording a list — the \
+             turn's tool calls were {:?}",
+            turn.label(),
+            turn.tool_request_names()
+        );
+    } else {
+        assert_eq!(
+            updates,
+            0,
+            "{}: pushed {updates} task list(s) while declaring no task capability. Nothing \
+             outside the backends reads that capability today, so this does not break a render: \
+             it silently excludes this backend from every capability-gated test of task \
+             behaviour, and those tests then report a pass.",
+            turn.label()
+        );
+    }
+}
+
+fn assert_plan_carries_the_dictated_tasks(turn: &Turn) {
+    let Some(list) = turn.task_updates().last() else {
+        panic!("{}: pushed no task list to check", turn.label());
+    };
+    let described = list
+        .tasks
+        .iter()
+        .map(|task| task.description.to_lowercase())
+        .collect::<Vec<_>>();
+
+    for wanted in PLAN_TASKS {
+        assert!(
+            described
+                .iter()
+                .any(|description| description.contains(&wanted.to_lowercase())),
+            "{}: task list {described:?} does not carry {wanted:?}. The prompt dictated the \
+             description word for word, so a list that arrives without it is carrying a shape \
+             the payload did not survive.",
+            turn.label()
+        );
+    }
+}
+
+/// The second update must land as a replacement, not an append.
+///
+/// A list that grows by three every time the model touches it renders as an
+/// ever-lengthening pile of duplicates, and every count-free assertion passes
+/// on it.
+fn assert_update_replaced_rather_than_appended(turn: &Turn) {
+    let Some(list) = turn.task_updates().last() else {
+        panic!(
+            "{}: declares TaskListReplacement but pushed no task list on the update turn",
+            turn.label()
+        );
+    };
+
+    assert_eq!(
+        list.tasks.len(),
+        PLAN_TASKS.len(),
+        "{}: the list holds {} tasks after an update that changed one status of {}; the update \
+         composed with the previous list instead of replacing it",
+        turn.label(),
+        list.tasks.len(),
+        PLAN_TASKS.len()
+    );
+
+    let completed = list
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Completed))
+        .count();
+    assert_eq!(
+        completed,
+        1,
+        "{}: {completed} tasks are completed after marking exactly one done; statuses are {:?}",
+        turn.label(),
+        list.tasks
+            .iter()
+            .map(|task| (&task.description, &task.status))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn assert_plan_was_cleared(turn: &Turn) {
+    let Some(list) = turn.task_updates().last() else {
+        panic!(
+            "{}: declares TaskListClear but pushed no task list on the clearing turn, so the \
+             client was never told the list is gone",
+            turn.label()
+        );
+    };
+    assert!(
+        list.tasks.is_empty(),
+        "{}: {} task(s) remain after a clear: {:?}",
+        turn.label(),
+        list.tasks.len(),
+        list.tasks
+            .iter()
+            .map(|task| task.description.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A list the UI can render at all: ids address a row, so duplicates make two
+/// rows indistinguishable, and an empty description renders as a blank one.
+fn assert_task_lists_are_well_formed(turn: &Turn) {
+    for list in turn.task_updates() {
+        let mut seen = BTreeSet::new();
+        for task in &list.tasks {
+            assert!(
+                seen.insert(task.id),
+                "{}: task list repeats id {}; ids are how a row is addressed",
+                turn.label(),
+                task.id
+            );
+            assert!(
+                !task.description.trim().is_empty(),
+                "{}: task {} has an empty description and renders as a blank row",
+                turn.label(),
+                task.id
+            );
+        }
+    }
 }
 
 fn assert_final_text_contains(turn: &Turn, needle: &str) {

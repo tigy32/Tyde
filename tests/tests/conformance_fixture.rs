@@ -17,14 +17,14 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactPayload, AgentErrorPayload, AgentId,
-    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ClientErrorPayload,
-    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
+    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
+    ClientErrorPayload, ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
     FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
-    MessageSender, NewAgentPayload, QueuedMessagesPayload, SendMessagePayload,
-    SendMessageToolResponse, SessionHistoryPayload, SessionId, SessionListPayload,
-    SessionSettingValue, SessionSettingsValues, SessionSummary, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData, ToolExecutionOutcome,
-    ToolExecutionResult, ToolRequest,
+    MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
+    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
+    SessionId, SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TaskList,
+    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -240,6 +240,59 @@ impl Turn {
             }
         }
         last_final
+    }
+
+    /// Late metadata applied on top of what `StreamEnd` carried, one entry per
+    /// response that ended up with a value.
+    ///
+    /// Reading `StreamEnd` alone would miss every backend that reports usage
+    /// after the response is assembled, which is the ordinary case rather than
+    /// the exception: a provider knows its output count once the request
+    /// finishes, not while it is still streaming.
+    fn merged_metadata<T: Clone>(
+        &self,
+        on_message: impl Fn(&ChatMessage) -> Option<&T>,
+        on_update: impl Fn(&MessageMetadataUpdateData) -> Option<&T>,
+    ) -> Vec<T> {
+        let mut responses: Vec<(Option<ChatMessageId>, Option<T>)> = Vec::new();
+        for event in &self.events {
+            match event {
+                ChatEvent::StreamEnd(end) => responses.push((
+                    end.message.message_id.clone(),
+                    on_message(&end.message).cloned(),
+                )),
+                ChatEvent::MessageMetadataUpdated(update) => {
+                    if let Some(value) = on_update(update)
+                        && let Some(slot) = responses
+                            .iter_mut()
+                            .find(|(id, _)| id.as_ref() == Some(&update.message_id))
+                    {
+                        slot.1 = Some(value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        responses
+            .into_iter()
+            .filter_map(|(_, value)| value)
+            .collect()
+    }
+
+    /// Token usage per provider response, as the client finally holds it.
+    pub fn reported_usage(&self) -> Vec<MessageTokenUsage> {
+        self.merged_metadata(
+            |message| message.token_usage.as_ref(),
+            |update| update.token_usage.as_ref(),
+        )
+    }
+
+    /// Every task list this turn pushed, in order.
+    pub fn task_updates(&self) -> impl Iterator<Item = &TaskList> {
+        self.events.iter().filter_map(|event| match event {
+            ChatEvent::TaskUpdate(list) => Some(list),
+            _ => None,
+        })
     }
 }
 
