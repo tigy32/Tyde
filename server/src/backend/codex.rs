@@ -2775,7 +2775,6 @@ struct ClosedCodexProviderResponse {
 
 struct CodexResponseSplitter {
     enabled: bool,
-    thread_id: String,
     stream_epoch: u64,
     next_ordinal: u64,
     open: Option<OpenCodexProviderResponse>,
@@ -2817,7 +2816,6 @@ impl CodexResponseSplitter {
     fn new(thread_id: &str, enabled: bool) -> Self {
         Self {
             enabled,
-            thread_id: thread_id.to_owned(),
             stream_epoch: codex_generated_identity_epoch(thread_id),
             next_ordinal: 1,
             open: None,
@@ -2897,14 +2895,7 @@ impl CodexResponseSplitter {
         let tool_item = is_codex_provider_tool_item_type(item_type);
         if tool_item {
             let item_id = item_id.filter(|item_id| !item_id.trim().is_empty())?;
-            let owner = self.claim_raw_tool_owner(item_id, call_id).or_else(|| {
-                matches!(
-                    item_type,
-                    "commandExecution" | "collabToolCall" | "collabAgentToolCall"
-                )
-                .then(|| self.claim_unambiguous_raw_exec_owner_for_turn(turn_id))
-                .flatten()
-            });
+            let owner = self.claim_raw_tool_owner(item_id, call_id);
             if let Some(owner) = owner {
                 // The typed item's own id *is* the provider `call_id` the raw
                 // output will carry, but record the owner's copy too for the
@@ -2983,58 +2974,6 @@ impl CodexResponseSplitter {
         Some(owner)
     }
 
-    fn claim_unambiguous_raw_exec_owner_for_turn(
-        &mut self,
-        turn_id: Option<&str>,
-    ) -> Option<BufferedCodexToolRequest> {
-        let turn_id = turn_id?;
-        let mut owners = self
-            .open
-            .as_ref()
-            .into_iter()
-            .flat_map(|response| response.raw_tool_requests.iter())
-            .chain(self.pending_raw_tool_owners.values())
-            .filter(|owner| owner.turn_id.as_deref() == Some(turn_id))
-            .filter(|owner| is_codex_shell_tool_name(&owner.tool_name))
-            .filter(|owner| !self.claimed_raw_tool_calls.contains(&owner.tool_call_id))
-            .cloned();
-        let owner = owners.next()?;
-        if owners.next().is_some() {
-            return None;
-        }
-        self.claimed_raw_tool_calls
-            .insert(owner.tool_call_id.clone());
-        Some(owner)
-    }
-
-    fn unambiguous_raw_exec_owner_for_turn(
-        &self,
-        turn_id: Option<&str>,
-    ) -> Option<BufferedCodexToolRequest> {
-        let turn_id = turn_id?;
-        let mut owner = None;
-        for candidate in self
-            .open
-            .as_ref()
-            .into_iter()
-            .flat_map(|response| response.raw_tool_requests.iter())
-            .chain(self.pending_raw_tool_owners.values())
-            .filter(|candidate| candidate.turn_id.as_deref() == Some(turn_id))
-            .filter(|candidate| is_codex_shell_tool_name(&candidate.tool_name))
-        {
-            if owner
-                .as_ref()
-                .is_some_and(|owner: &BufferedCodexToolRequest| {
-                    owner.tool_call_id != candidate.tool_call_id
-                })
-            {
-                return None;
-            }
-            owner = Some(candidate.clone());
-        }
-        owner
-    }
-
     fn observe_raw_item(
         &mut self,
         turn_id: Option<&str>,
@@ -3063,12 +3002,17 @@ impl CodexResponseSplitter {
         {
             response.raw_call_ids.insert(call_id.to_owned());
         }
-        if let Some(mut request) = raw_codex_tool_request(item_id, item) {
-            if let Some(turn_id) = turn_id {
-                request.turn_id = Some(turn_id.to_owned());
-                request.tool_call_id = format!("codex:{}:{turn_id}:{item_id}", self.thread_id);
+        // Raw declarations no longer own cards. Every tool Codex runs is also
+        // reported as a typed item, which carries the execution's own identity,
+        // status and result; keeping a second owner here is what required
+        // matching two id spaces that share no key. The call ids are recorded as
+        // typed-owned so the raw output that answers them is known to belong to
+        // the typed item's card rather than being reported as a lost result.
+        if let Some(request) = raw_codex_tool_request(item_id, item) {
+            self.typed_owned_call_ids.insert(item_id.to_owned());
+            if let Some(call_id) = request.provider_call_id {
+                self.typed_owned_call_ids.insert(call_id);
             }
-            response.raw_tool_requests.push(request);
         }
         Some(opened)
     }
@@ -8100,19 +8044,6 @@ impl CodexInner {
             .take_execution_only_typed_tool_owner(item_id)
     }
 
-    async fn strict_shared_raw_exec_owner(
-        &self,
-        params: &Value,
-    ) -> Option<BufferedCodexToolRequest> {
-        let thread_id = extract_notification_thread_id(params)?;
-        let turn_id = extract_turn_id(params)?;
-        let state = self.state.lock().await;
-        state
-            .response_splitters
-            .get(&thread_id)?
-            .unambiguous_raw_exec_owner_for_turn(Some(&turn_id))
-    }
-
     async fn handle_strict_execution_only_tool_started(self: &Arc<Self>, params: &Value) {
         let Some(item) = params.get("item") else {
             return;
@@ -8124,12 +8055,7 @@ impl CodexInner {
             .unwrap_or("tool-call");
         let thread_id =
             extract_notification_thread_id(params).unwrap_or_else(|| "<unknown-thread>".to_owned());
-        let mut owner = self.strict_execution_only_tool_owner(params).await;
-        if owner.is_none()
-            && item.get("source").and_then(Value::as_str) == Some("unifiedExecStartup")
-        {
-            owner = self.strict_shared_raw_exec_owner(params).await;
-        }
+        let owner = self.strict_execution_only_tool_owner(params).await;
         match item_type {
             "commandExecution" => {
                 tracing::debug!(
@@ -12946,12 +12872,19 @@ impl CodexInner {
         let (strict_response, provider_tool) =
             self.observe_strict_response_item_started(params).await;
         if strict_response && matches!(item_type, "agentMessage" | "reasoning") {
+            // The response beginning while a command is still running is what
+            // makes that command a background one, and it is true whether or
+            // not the splitter owns this message. The `agentMessage` arm below
+            // is unreachable for a strict response, so promoting there alone
+            // left a still-running command marked foreground until the turn
+            // went idle underneath it.
+            if item_type == "agentMessage" {
+                self.promote_root_commands_before_agent_response(params)
+                    .await;
+            }
             return;
         }
-        if strict_response && is_codex_provider_tool_item_type(item_type) && !provider_tool {
-            self.handle_strict_execution_only_tool_started(params).await;
-            return;
-        }
+        let _ = provider_tool;
 
         match item_type {
             "agentMessage" => {
@@ -13284,6 +13217,23 @@ impl CodexInner {
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
             }
+            // A tool item this build has no mapping for. It still ran, so it
+            // still gets a card, carrying the provider's own JSON: the
+            // alternative is a tool the user never sees, and a card left open
+            // for the idle sweep to cancel.
+            unmapped if is_codex_provider_tool_item_type(unmapped) => {
+                let tool_call_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), unmapped)
+                    .await;
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
+                self.emit_tool_request(
+                    &tool_call_id,
+                    unmapped,
+                    json!({ "kind": "Other", "args": item }),
+                )
+                .await;
+            }
             _ => {}
         }
     }
@@ -13295,13 +13245,9 @@ impl CodexInner {
 
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         let item_id = item.get("id").and_then(Value::as_str);
-        if let Some((provider_owned, owner)) = self.finish_strict_typed_tool(params).await
-            && !provider_owned
-        {
-            self.handle_strict_execution_only_tool_completed(params, owner)
-                .await;
-            return;
-        }
+        // Clears the splitter's per-item bookkeeping; the card itself is
+        // completed by the typed handler below, which owns it.
+        let _ = self.finish_strict_typed_tool(params).await;
         if self.handle_strict_response_item_completed(params).await {
             return;
         }
@@ -13827,6 +13773,30 @@ impl CodexInner {
                     Some(&item_id),
                     Some(params),
                     item,
+                )
+                .await;
+            }
+            // Completes the card the unmapped arm above opened. `status` is the
+            // one field every typed item carries, so it decides the outcome.
+            unmapped if is_codex_provider_tool_item_type(unmapped) => {
+                let tool_call_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), unmapped)
+                    .await;
+                let failed = item.get("status").and_then(Value::as_str) == Some("failed");
+                self.emit_tool_execution_completed(
+                    &tool_call_id,
+                    unmapped,
+                    !failed,
+                    if failed {
+                        json!({
+                            "kind": "Error",
+                            "short_message": format!("{unmapped} failed"),
+                            "detailed_message": item.to_string(),
+                        })
+                    } else {
+                        json!({ "kind": "Other", "result": item })
+                    },
+                    failed.then(|| format!("{unmapped} failed")),
                 )
                 .await;
             }
@@ -18731,18 +18701,6 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
         tool_type,
         content_offset: None,
     })
-}
-
-/// Names Codex uses for "run a shell command", across its two tool shapes.
-///
-/// `exec` is the `custom_tool_call` form whose arguments are a JavaScript
-/// source string; `exec_command` is the plain `function_call` form. Only the
-/// former was recognised here, so the by-name fallbacks that exist to recover
-/// an owner when the exact `call_id` join fails could never match a
-/// `function_call` — the safety net for the bug fixed in
-/// `CodexResponseSplitter::finalize` was itself dead code.
-fn is_codex_shell_tool_name(tool_name: &str) -> bool {
-    tool_name.eq_ignore_ascii_case("exec") || tool_name.eq_ignore_ascii_case("exec_command")
 }
 
 fn raw_codex_tool_request_type(tool_name: &str, arguments: &Value) -> Option<Value> {
