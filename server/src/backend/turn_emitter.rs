@@ -251,6 +251,20 @@ impl TurnEmitter {
         true
     }
 
+    /// The foreground cards a cancel is about to report as `Cancelled`.
+    ///
+    /// A backend that can actually stop the work behind a card kills exactly
+    /// this set, so the card and the process cannot disagree. Reporting a card
+    /// cancelled while its process runs on is the bug this exists to prevent.
+    pub fn open_foreground_tool_ids(&self) -> Vec<String> {
+        self.lock()
+            .open_tool_requests
+            .iter()
+            .filter(|(_, request)| request.execution_mode == ToolExecutionMode::Foreground)
+            .map(|(tool_call_id, _)| tool_call_id.clone())
+            .collect()
+    }
+
     pub fn cancel_pending_foreground_tools(&self, message: &str) {
         let mut state = self.lock();
         let pending = state

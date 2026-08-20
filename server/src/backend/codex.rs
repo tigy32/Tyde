@@ -5356,6 +5356,69 @@ impl CodexInner {
         });
     }
 
+    /// Stop the processes behind the foreground cards a user interrupt is
+    /// about to report as cancelled.
+    ///
+    /// Interrupt is the soft operation: detached work outlives it by design
+    /// (`ChatEvent`, "Cancellation ordering"), so this targets exactly the open
+    /// *foreground* cards and leaves `background_commands` alone — which is why
+    /// it cannot reuse `terminate_background_terminals`, whose whole job is to
+    /// take everything down at shutdown.
+    ///
+    /// A command Codex never gave a `processId` for has no handle to kill, and
+    /// per the chosen semantics that case stays quiet rather than reporting a
+    /// stop Tyde cannot perform.
+    async fn terminate_foreground_commands(&self) {
+        let foreground = self
+            .emitter
+            .open_foreground_tool_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if foreground.is_empty() {
+            return;
+        }
+        let targets = {
+            let state = self.state.lock().await;
+            state
+                .outstanding_command_executions
+                .iter()
+                .filter(|(_, command)| foreground.contains(&command.tool_call_id))
+                .filter_map(|((thread_id, _), command)| {
+                    command.process_id.as_ref().map(|process_id| {
+                        (
+                            thread_id.clone(),
+                            process_id.clone(),
+                            command.tool_call_id.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (thread_id, process_id, tool_call_id) in targets {
+            tracing::debug!(
+                thread_id,
+                process_id,
+                tool_call_id,
+                "terminating a Codex foreground command for a user interrupt"
+            );
+            self.rpc.spawn_request(
+                "thread/backgroundTerminals/terminate",
+                json!({ "threadId": thread_id, "processId": process_id }),
+            );
+            // Measured: killing the process makes Codex report the exec as
+            // `Failed { "Command failed with exit code -1" }`, and that real
+            // completion closes the card first — blaming the tool for what the
+            // user did. Close it as cancelled here and record the id so
+            // `suppress_cancelled_tool_completion` drops the late failure,
+            // which leaves exactly one completion and the right one.
+            self.emitter
+                .cancel_pending_tool(&tool_call_id, "Tool execution was cancelled by user");
+            let mut state = self.state.lock().await;
+            state.pending_tool_call_ids.remove(&tool_call_id);
+            state.cancelled_tool_call_ids.insert(tool_call_id);
+        }
+    }
+
     async fn terminate_background_terminals(&self) {
         let terminals =
             {
@@ -7354,6 +7417,11 @@ impl CodexInner {
                     self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
+                // Before the interrupt, so the kill goes out while Codex still
+                // tracks the process. The cards for these commands are marked
+                // cancelled when the interrupted turn completes; killing here
+                // is what makes that report true.
+                self.terminate_foreground_commands().await;
                 self.rpc.spawn_request(
                     "turn/interrupt",
                     json!({
