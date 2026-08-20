@@ -36,6 +36,7 @@ use protocol::{
     BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, MessageTokenUsage, SessionId,
     TaskStatus, TokenUsage, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
+use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
 
@@ -63,6 +64,20 @@ const USAGE_MARKER: &str = "TYDE_USAGE";
 const PLANNED_MARKER: &str = "TYDE_PLANNED";
 const ADVANCED_MARKER: &str = "TYDE_ADVANCED";
 const CLEARED_MARKER: &str = "TYDE_CLEARED";
+
+/// The MCP probe server, its one tool, and the prefix it echoes back.
+///
+/// The tool name is matched as a substring rather than compared, because every
+/// backend decorates MCP tool names with its own server prefix — Claude reports
+/// `mcp__tyde_conformance_probe__record_probe`, and the others differ again.
+/// Pinning the decorated form would assert each provider's naming convention
+/// instead of the call.
+const MCP_SERVER_NAME: &str = "tyde_conformance_probe";
+const MCP_TOOL_NAME: &str = "record_probe";
+const MCP_RESULT_PREFIX: &str = "MCP_OK:";
+/// Kept out of the workspace root, where the model is asked to work, so a turn
+/// that lists or globs its files has no reason to touch the oracle.
+const MCP_PROBE_DIR: &str = ".mcp-probe";
 
 /// Lines of filler the planted-payload turn carries, and the token floor that
 /// block has to move the reported input by.
@@ -1046,6 +1061,92 @@ fn real_task_list() {
     });
 }
 
+/// A third-party MCP tool, from the model's call to the card the UI renders.
+///
+/// Every scenario in this file already runs MCP — `host_settings` enables the
+/// agent-control toolset on every agent — and none of them assert on it, so the
+/// whole transport is exercised and unmeasured. It is also the one tool surface
+/// where Tyde is not merely normalizing what a provider reports: Tyde
+/// configures the server, the provider connects to it, and the result comes
+/// back out through the provider. Five backends do that independently.
+///
+/// **The server process is the out-of-band oracle**, in the role the filesystem
+/// plays for the write scenarios. The probe appends one line per `tools/call`
+/// it serves, so the journal records how many times the tool really ran and
+/// with which arguments, while the event stream records how many times the UI
+/// was told. Comparing them is the only way to see a *dropped* card: a stream
+/// that never mentions a tool is internally consistent, so every event-only
+/// check passes on it — including `backend.rs`'s `McpExactlyOnce`, which counts
+/// events and therefore reads a two-call turn reported as one card as correct.
+/// The comparison catches the mirror defect too, a card for a call the server
+/// never received.
+///
+/// The second turn calls the tool twice for the reason [`MULTI_FILES`] gives:
+/// one call per turn cannot see an ownership bug that only appears when a turn
+/// holds more than one unclaimed candidate.
+///
+/// Prompts name the tool by its description, not its name, because each backend
+/// decorates MCP tool names with its own prefix; naming it literally would test
+/// whether the model can reproduce a prefix.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_mcp_tool_call() {
+    run_scenario(
+        &[BackendCapability::StartupMcpServers],
+        |mut host| async move {
+            let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+            std::fs::create_dir_all(&probe_dir).expect("create MCP probe directory");
+            let script = probe_dir.join("probe.py");
+            let journal = probe_dir.join("calls.jsonl");
+            std::fs::write(&script, mcp_probe_script()).expect("write MCP probe server");
+
+            // Before the spawn, deliberately: the MCP store is read once while
+            // building the backend's launch configuration, so a server
+            // installed afterwards would reach the next agent and this one
+            // would report a model that simply never saw the tool.
+            install_mcp_server(
+                &mut host,
+                MCP_SERVER_NAME,
+                "python3",
+                vec![
+                    script.to_string_lossy().into_owned(),
+                    journal.to_string_lossy().into_owned(),
+                ],
+            )
+            .await;
+
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            // Also the check that attaching a server did not break startup: a
+            // backend that fails to connect to a configured MCP server tends to
+            // fail here, before any tool is asked for.
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&launched, READY_MARKER);
+
+            // The journal accumulates across the whole conversation, so each
+            // turn is measured against the lines *it* appended. Comparing a
+            // turn's cards to the whole file would let a second turn inherit
+            // the first turn's evidence.
+            let single = unique_payload();
+            let before_single = mcp_journal(&journal).len();
+            let called = ask(&mut host, &agent, mcp_probe_prompt(&single)).await;
+            assert_mcp_calls_reached_the_server(&called, &journal, before_single, &[&single]);
+            assert_mcp_results_came_back(&called, &[&single]);
+            assert_final_text_contains(&called, &format!("{MCP_RESULT_PREFIX}{single}"));
+
+            let (first, second) = (unique_payload(), unique_payload());
+            let before_twice = mcp_journal(&journal).len();
+            let twice = ask(&mut host, &agent, mcp_probe_twice_prompt(&first, &second)).await;
+            assert_mcp_calls_reached_the_server(&twice, &journal, before_twice, &[&first, &second]);
+            assert_mcp_results_came_back(&twice, &[&first, &second]);
+            assert_final_text_contains(&twice, &format!("{MCP_RESULT_PREFIX}{first}"));
+            assert_final_text_contains(&twice, &format!("{MCP_RESULT_PREFIX}{second}"));
+
+            assert_universal_contract(&[launched, called, twice]);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 fn launch_prompt() -> String {
     format!("Reply with exactly {READY_MARKER} and nothing else. Do not use any tools.")
 }
@@ -1112,6 +1213,67 @@ fn clear_plan_prompt() -> String {
     format!(
         "Clear the task list completely so that no tasks remain. Then reply with exactly \
          {CLEARED_MARKER} and nothing else."
+    )
+}
+
+/// A one-tool stdio MCP server that journals every call it serves.
+///
+/// Hand-rolled JSON-RPC rather than an MCP SDK, so the suite depends on nothing
+/// beyond `python3` — the same choice `backend.rs` makes for its probes.
+/// Requests without an `id` are notifications: replying to one is a protocol
+/// error, and some clients drop the connection over it.
+///
+/// The journal line is the arguments exactly as the server received them, which
+/// is what lets the scenario check that what the model passed is what arrived.
+fn mcp_probe_script() -> String {
+    format!(
+        r#"import json, sys
+
+journal = sys.argv[1]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}}}, "serverInfo": {{"name": "{MCP_SERVER_NAME}", "version": "1"}}}}
+    elif method == "tools/list":
+        result = {{"tools": [{{"name": "{MCP_TOOL_NAME}", "description": "Record a value and return {MCP_RESULT_PREFIX} followed by that value", "inputSchema": {{"type": "object", "properties": {{"value": {{"type": "string"}}}}, "required": ["value"], "additionalProperties": False}}}}]}}
+    elif method == "tools/call":
+        arguments = request.get("params", {{}}).get("arguments", {{}})
+        with open(journal, "a") as handle:
+            handle.write(json.dumps(arguments, sort_keys=True) + "\n")
+            handle.flush()
+        result = {{"content": [{{"type": "text", "text": "{MCP_RESULT_PREFIX}" + str(arguments.get("value", ""))}}], "isError": False}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+"#
+    )
+}
+
+/// Names the tool by what its description says, not by its name, for the reason
+/// [`real_mcp_tool_call`] gives: the name the model sees is prefixed per
+/// backend.
+fn mcp_probe_prompt(value: &str) -> String {
+    format!(
+        "Call the MCP tool whose description says it records a value, exactly once, passing \
+         exactly {value} as its `value` argument. Do not use any other tool. Then reply with the \
+         tool's exact text result and nothing else."
+    )
+}
+
+fn mcp_probe_twice_prompt(first: &str, second: &str) -> String {
+    format!(
+        "Call that same MCP tool exactly twice in this turn: once passing {first} as its `value` \
+         argument, and once passing {second}. Use a separate tool call for each — do not combine \
+         them. Do not use any other tool. Then reply with both text results separated by a single \
+         space, and nothing else."
     )
 }
 
@@ -2979,6 +3141,184 @@ fn assert_task_lists_are_well_formed(turn: &Turn) {
                 task.id
             );
         }
+    }
+}
+
+/// Whether a provider tool name refers to the probe, ignoring the per-backend
+/// server prefix wrapped around it.
+fn is_probe_tool(name: &str) -> bool {
+    name.to_ascii_lowercase().contains(MCP_TOOL_NAME)
+}
+
+/// Every `tools/call` the probe server has served so far, oldest first.
+///
+/// A missing file means the server was never called, which is a legitimate
+/// observation for the assertion to make rather than an error to raise here.
+fn mcp_journal(journal: &Path) -> Vec<Value> {
+    let Ok(contents) = std::fs::read_to_string(journal) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse MCP journal line"))
+        .collect()
+}
+
+/// The turn's probe cards against what the server was actually asked to do.
+///
+/// `before` is the journal length captured before the turn ran, so a turn is
+/// judged on the calls it made rather than on every call in the conversation.
+fn assert_mcp_calls_reached_the_server(
+    turn: &Turn,
+    journal: &Path,
+    before: usize,
+    expected: &[&str],
+) {
+    let all_served = mcp_journal(journal);
+    assert!(
+        all_served.len() >= before,
+        "{}: the MCP journal shrank from {before} to {} lines, so the oracle cannot be trusted",
+        turn.label(),
+        all_served.len()
+    );
+    let served = &all_served[before..];
+    let requests: Vec<_> = turn
+        .tool_requests()
+        .filter(|request| {
+            turn.declared_name(&request.tool_call_id)
+                .is_some_and(is_probe_tool)
+        })
+        .collect();
+
+    // The oracle. Every other assertion here reads one side or the other; this
+    // is the only one that can see a call the UI was never told about, or a
+    // card for a call that never reached the server.
+    assert_eq!(
+        requests.len(),
+        served.len(),
+        "{}: the MCP server served {} call(s) but the stream carried {} probe card(s). Fewer \
+         cards than calls means a tool ran invisibly; more means a card was invented. Served: \
+         {served:?}; cards this turn: {:?}",
+        turn.label(),
+        served.len(),
+        requests.len(),
+        turn.tool_request_names()
+    );
+
+    let mut served_values: Vec<String> = served
+        .iter()
+        .map(|call| {
+            call.get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let mut wanted: Vec<String> = expected.iter().map(|value| (*value).to_owned()).collect();
+    served_values.sort();
+    wanted.sort();
+    assert_eq!(
+        served_values,
+        wanted,
+        "{}: the values that arrived at the MCP server are not the ones the prompt dictated. \
+         Either the model passed something else, or Tyde altered the arguments in transit.",
+        turn.label()
+    );
+
+    let mut carded_values = Vec::new();
+    for request in &requests {
+        assert!(
+            matches!(request.tool_type, ToolRequestType::Other { .. }),
+            "{}: the MCP card normalized to {}, but a third-party tool has no typed Tyde form to \
+             normalize into — a typed variant here means the mapping guessed.",
+            turn.label(),
+            tool_kind(request)
+        );
+        let declared = turn
+            .tool_declarations()
+            .find(|call| call.tool_call_id == request.tool_call_id)
+            .expect("a request filtered by its declaration has one");
+        carded_values.push(
+            declared
+                .arguments
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+    carded_values.sort();
+
+    // Compared as a multiset rather than per card, so two cards showing the
+    // same value cannot pass by each finding *a* matching call: that is exactly
+    // what one card's arguments copied onto its sibling looks like, and it is
+    // the shape a reader would trust the rendered card over the truth on.
+    assert_eq!(
+        carded_values,
+        served_values,
+        "{}: the values the cards render are not the values the server received. The UI is \
+         showing calls that did not happen as they were drawn.",
+        turn.label()
+    );
+}
+
+/// The server's payload as it comes back out through the provider.
+fn assert_mcp_results_came_back(turn: &Turn, expected: &[&str]) {
+    let completions: Vec<_> = turn
+        .tool_completions()
+        .filter(|completion| {
+            turn.declared_name(&completion.tool_call_id)
+                .is_some_and(is_probe_tool)
+        })
+        .collect();
+    assert_eq!(
+        completions.len(),
+        expected.len(),
+        "{}: expected {} probe completion(s), found {}: {:?}",
+        turn.label(),
+        expected.len(),
+        completions.len(),
+        turn.completion_summaries()
+    );
+    let mut rendered = Vec::new();
+    for completion in completions {
+        let ToolExecutionOutcome::Succeeded { result } = &completion.outcome else {
+            panic!(
+                "{}: MCP call {:?} did not succeed: {:?}",
+                turn.label(),
+                completion.tool_call_id,
+                completion.outcome
+            )
+        };
+        let ToolExecutionResult::Other { result } = result else {
+            panic!(
+                "{}: the MCP result was normalized into a typed variant that a third-party tool \
+                 has no meaning for: {result:?}",
+                turn.label()
+            )
+        };
+        rendered.push(result.to_string());
+    }
+
+    // Each expected payload has to appear behind exactly one card, not merely
+    // somewhere. Asking only whether every card carries *some* expected value
+    // passes a turn whose two cards both render the same result, which is what
+    // copying one completion's payload onto its sibling would look like.
+    for value in expected {
+        let carrying = rendered
+            .iter()
+            .filter(|result| result.contains(&format!("{MCP_RESULT_PREFIX}{value}")))
+            .count();
+        assert_eq!(
+            carrying,
+            1,
+            "{}: {} card(s) carry {MCP_RESULT_PREFIX}{value}, expected exactly 1. Zero means the \
+             canonical result lost the server's own payload; more than one means a payload was \
+             copied across cards. Results: {rendered:?}",
+            turn.label(),
+            carrying
+        );
     }
 }
 

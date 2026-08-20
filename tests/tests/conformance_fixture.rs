@@ -9,6 +9,7 @@
 // test binary with no tests in it, where every item is unreachable.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -20,11 +21,13 @@ use protocol::{
     AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
     ClientErrorPayload, ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
     FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
+    McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
     QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
     SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TaskList,
     ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+    ToolUseData,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -174,6 +177,34 @@ impl Turn {
             ChatEvent::ToolExecutionCompleted(completion) => Some(completion),
             _ => None,
         })
+    }
+
+    /// Every tool call an assistant response declared, in stream order.
+    ///
+    /// [`Turn::tool_requests`] carries Tyde's *normalized* executable form,
+    /// which deliberately drops the provider's own tool name — a `ToolRequest`
+    /// says "run this command", not "the model called `mcp__probe__record`".
+    /// The declaration is the only place the provider name and the raw
+    /// arguments survive, so anything asserting on which tool the model picked
+    /// or what it passed has to read them from here.
+    pub fn tool_declarations(&self) -> impl Iterator<Item = &ToolUseData> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamEnd(end) => Some(&end.message.tool_calls),
+                ChatEvent::MessageAdded(message) => Some(&message.tool_calls),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// The provider tool name behind a request, or `None` if no response in the
+    /// turn declared it. `assert_every_request_was_declared` is what turns that
+    /// `None` into a failure; callers here can assume a declared request.
+    pub fn declared_name(&self, tool_call_id: &str) -> Option<&str> {
+        self.tool_declarations()
+            .find(|call| call.tool_call_id == tool_call_id)
+            .map(|call| call.name.as_str())
     }
 
     /// Failure-message material. Nothing asserts on it.
@@ -502,6 +533,45 @@ impl Host {
                 "{backend_kind:?} timed out after {}s waiting for {context}",
                 timeout.as_secs()
             ),
+        }
+    }
+}
+
+/// Register a stdio MCP server with the host, and wait for it to be stored.
+///
+/// Call this *before* spawning the agent that should see it. `resolve_spawn_config`
+/// reads the MCP store once, at spawn, to build the backend's launch
+/// configuration (`host.rs:4260`), so a server registered afterwards reaches the
+/// next agent rather than this one.
+///
+/// Waits for the resulting `McpServerNotify` rather than returning once the
+/// frame is written: `mcp_server_upsert` is a one-way send, and a rejected
+/// upsert — a reserved name, a store failure — would otherwise show up much
+/// later as a model that never called the tool.
+pub async fn install_mcp_server(host: &mut Host, name: &str, command: &str, args: Vec<String>) {
+    host.client
+        .mcp_server_upsert(McpServerUpsertPayload {
+            mcp_server: McpServerConfig {
+                id: McpServerId(format!("conformance-{name}")),
+                name: name.to_owned(),
+                // False so that whether the calls arrive together is decided by
+                // the model and the backend, not by a hint each backend
+                // translates differently.
+                supports_parallel_tool_calls: false,
+                transport: McpTransportConfig::Stdio {
+                    command: command.to_owned(),
+                    args,
+                    env: HashMap::new(),
+                },
+            },
+        })
+        .await
+        .expect("mcp_server_upsert failed");
+    loop {
+        let envelope = host.next_envelope(CONTROL_TIMEOUT, "McpServerNotify").await;
+        fail_on_client_error(&envelope, "install_mcp_server");
+        if envelope.kind == FrameKind::McpServerNotify {
+            break;
         }
     }
 }
