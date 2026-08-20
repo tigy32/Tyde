@@ -1858,6 +1858,12 @@ impl Backend for TycodeBackend {
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::TaskUpdates,
+            tyde_agent_adapter::BackendCapability::TaskListReplacement,
+            // No TaskListClear: `manage_task_list` rejects an empty list with
+            // "Error: Task list cannot be empty", so Tycode has no way to
+            // represent a cleared list. Measured, not assumed — declaring it
+            // turns `real_task_list` red on the clearing turn.
             tyde_agent_adapter::BackendCapability::OrchestrationEvents,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,

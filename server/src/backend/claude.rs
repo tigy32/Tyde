@@ -13827,6 +13827,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
+            tyde_agent_adapter::BackendCapability::TaskListReplacement,
             tyde_agent_adapter::BackendCapability::WorkflowProgress,
             tyde_agent_adapter::BackendCapability::UserQuestionRequests,
             tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
