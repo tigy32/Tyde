@@ -282,9 +282,10 @@ fn real_interruption() {
         // model at all" is the more fundamental question, and a stop that is
         // queued until the answer completes fails *here* with a message saying
         // so — where checking the contract first reports whatever the backend
-        // emitted afterwards and sends the reader somewhere else. Codex on
-        // gpt-5.6-luna does exactly that: it reports a protocol violation on
-        // every interrupt, which was masking this check entirely.
+        // emitted afterwards and sends the reader somewhere else. Codex proved
+        // the point: it used to report a protocol violation on every interrupt
+        // — fixed in `incomplete_turn_response_error` — and while it did, the
+        // contract check ran first and masked this assertion entirely.
         assert_the_answer_was_cut_short(&mid_stream);
         assert_cancellation_contract(&mid_stream);
         assert_any_partial_message_is_what_was_streamed(&mid_stream);
