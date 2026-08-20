@@ -2322,7 +2322,7 @@ fn decode_semantic_occurrences(
     let mut out = Vec::new();
     let mut line = 0u32;
     let mut start_char = 0u32;
-    for chunk in items.chunks_exact(5) {
+    for chunk in items.as_chunks::<5>().0 {
         let delta_line = chunk[0].as_u64().unwrap_or(0) as u32;
         let delta_start = chunk[1].as_u64().unwrap_or(0) as u32;
         let length = chunk[2].as_u64().unwrap_or(0) as u32;

@@ -64,7 +64,7 @@ impl OutboundPlaintext {
         if self.buffer.is_empty() {
             return None;
         }
-        Some(self.buffer.drain(..).collect())
+        Some(std::mem::take(&mut self.buffer))
     }
 }
 

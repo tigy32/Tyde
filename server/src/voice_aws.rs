@@ -499,8 +499,10 @@ impl Parser {
             return vec![NovaOutput::Audio24Khz {
                 output_generation: generation,
                 samples: bytes
-                    .chunks_exact(2)
-                    .map(|v| i16::from_le_bytes([v[0], v[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|v| i16::from_le_bytes(*v))
                     .collect(),
             }];
         }

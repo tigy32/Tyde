@@ -266,7 +266,13 @@ fn assert_history_page(
         "unexpected SessionHistory event count: {:?}",
         page.events
     );
-    for (response, expected) in page.events.chunks_exact(3).zip(expected_newest_first) {
+    for (response, expected) in page
+        .events
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(expected_newest_first)
+    {
         let [
             ChatEvent::StreamEnd(end),
             ChatEvent::StreamDelta(delta),
