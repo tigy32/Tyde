@@ -15889,7 +15889,49 @@ fn parse_codex_file_changes(item: &Value) -> Vec<CodexFileChange> {
             .get("diff")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (before, after, lines_added, lines_removed) = parse_unified_diff_preview(diff);
+
+        // `diff` only holds a diff when the change is an update. Measured
+        // against codex-cli 0.146.0, whose `FileChange` kinds are exactly
+        // add/delete/update: an add carries the new file's whole content
+        // ("alpha\nbeta\nomega\n"), a delete carries the removed file's content,
+        // and only an update carries a hunk ("@@ -1,3 +1,3 @@\n alpha\n-beta\n
+        // +gamma\n omega\n"). Reading content as a diff put every line on both
+        // sides, because unprefixed lines are context lines — so creating a file
+        // rendered a card with no lines in it and a `+0 -0` footer, and deleting
+        // one did the same.
+        let kind = change
+            .get("kind")
+            .and_then(|kind| kind.get("type"))
+            .and_then(Value::as_str);
+        let (before, after, lines_added, lines_removed) = match kind {
+            Some("add") => (
+                String::new(),
+                diff.to_owned(),
+                diff.lines().count() as u64,
+                0,
+            ),
+            Some("delete") => (
+                diff.to_owned(),
+                String::new(),
+                0,
+                diff.lines().count() as u64,
+            ),
+            Some("update") => parse_unified_diff_preview(diff),
+            // Also the shape with no `kind` at all, which is what the history
+            // and replay paths hand this function. Warned rather than dropped: a
+            // fourth kind would be a Codex schema change we want to hear about,
+            // and a missing card is the failure mode this whole area exists to
+            // avoid.
+            other => {
+                if other.is_some() {
+                    tracing::warn!(
+                        kind = other,
+                        "unknown Codex file change kind; reading its diff field as a unified diff"
+                    );
+                }
+                parse_unified_diff_preview(diff)
+            }
+        };
 
         parsed.push(CodexFileChange {
             path,
