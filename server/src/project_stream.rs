@@ -100,6 +100,40 @@ pub(crate) struct FileVersionChange {
     pub version: ProjectFileVersion,
 }
 
+/// Whether a connection tracks project files. Desktop renders a file browser
+/// and code intelligence, so it needs the bootstrap listing plus every
+/// refresh and change event. Mobile has no file browser: it discarded
+/// `ProjectFileList`, `CodeIntelOverview` and `FilesChanged` on arrival while
+/// the listing alone ran ~150 KB per project (1211 files in Tyde), which
+/// dominated the mobile connect payload and starved the transport's
+/// receiver-credit window until it killed the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectFileDelivery {
+    /// Bootstrap listing, refresh fan-outs, code intel, and change events.
+    Full,
+    /// None of them. The bootstrap still carries project metadata, git status
+    /// and review summaries, which mobile does render.
+    Off,
+}
+
+impl ProjectFileDelivery {
+    /// Frames that exist only to drive a file browser or code intelligence.
+    fn wants_frame(self, kind: FrameKind) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Off => !matches!(
+                kind,
+                FrameKind::ProjectFileList | FrameKind::CodeIntelOverview
+            ),
+        }
+    }
+}
+
+struct ProjectSubscriber {
+    stream: Stream,
+    file_delivery: ProjectFileDelivery,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectStreamHandle {
     tx: mpsc::UnboundedSender<ProjectStreamCommand>,
@@ -110,6 +144,7 @@ enum ProjectStreamCommand {
         host_path: StreamPath,
         stream: Stream,
         review_summaries: Vec<ReviewSummary>,
+        file_delivery: ProjectFileDelivery,
         reply: oneshot::Sender<Result<(), String>>,
     },
     RemoveSubscriber {
@@ -194,6 +229,7 @@ impl ProjectStreamHandle {
         host_path: StreamPath,
         stream: Stream,
         review_summaries: Vec<ReviewSummary>,
+        file_delivery: ProjectFileDelivery,
     ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -201,6 +237,7 @@ impl ProjectStreamHandle {
                 host_path,
                 stream,
                 review_summaries,
+                file_delivery,
                 reply,
             })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
@@ -441,7 +478,7 @@ async fn run_project_subscription(
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
     review_registry: ReviewRegistryHandle,
 ) {
-    let mut subscribers = HashMap::<StreamPath, Stream>::new();
+    let mut subscribers = HashMap::<StreamPath, ProjectSubscriber>::new();
     // Centralized per-file version counter. The single bump point
     // (`bump_file_version`) is funneled here from every source: file reads,
     // filesystem-watcher changes, and (transitively, via the watcher) agent
@@ -474,19 +511,19 @@ async fn run_project_subscription(
                     return;
                 };
                 match command {
-                    ProjectStreamCommand::AddSubscriber { host_path, stream, review_summaries, reply } => {
+                    ProjectStreamCommand::AddSubscriber { host_path, stream, review_summaries, file_delivery, reply } => {
                         use std::collections::hash_map::Entry;
                         match subscribers.entry(host_path.clone()) {
                             Entry::Occupied(mut e) => {
-                                e.insert(stream);
+                                e.insert(ProjectSubscriber { stream, file_delivery });
                                 let _ = reply.send(Ok(()));
                                 continue;
                             }
                             Entry::Vacant(e) => {
-                                e.insert(stream.clone());
+                                e.insert(ProjectSubscriber { stream: stream.clone(), file_delivery });
                             }
                         }
-                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, review_summaries).await;
+                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, review_summaries, file_delivery).await;
                         if result.is_err() {
                             subscribers.remove(&host_path);
                             snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
@@ -790,7 +827,7 @@ async fn refresh_full(
     watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     review_registry: &ReviewRegistryHandle,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
@@ -827,7 +864,7 @@ async fn refresh_full_unwatched(
     project_id: &ProjectId,
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     review_registry: &ReviewRegistryHandle,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
@@ -866,7 +903,7 @@ async fn refresh_incremental(
     watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     review_registry: &ReviewRegistryHandle,
     files_changed: bool,
     git_changed: bool,
@@ -1419,8 +1456,17 @@ async fn emit_snapshot_to_stream(
     project: &Project,
     snapshot: &ProjectSnapshotState,
     review_summaries: Vec<ReviewSummary>,
+    file_delivery: ProjectFileDelivery,
 ) -> Result<(), String> {
-    let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
+    // Skipped rather than computed-then-discarded: walking every root of every
+    // project is host work, not just wire bytes.
+    let file_list = match file_delivery {
+        ProjectFileDelivery::Full => full_file_list_from_raw(project, &snapshot.file_entries),
+        ProjectFileDelivery::Off => protocol::ProjectFileListPayload {
+            incremental: false,
+            roots: Vec::new(),
+        },
+    };
     let Some(git_status) = snapshot.git_status.clone() else {
         return Err("project git status snapshot was not initialized".to_owned());
     };
@@ -1433,6 +1479,9 @@ async fn emit_snapshot_to_stream(
         review_summaries,
     };
     send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap).await?;
+    if !file_delivery.wants_frame(FrameKind::CodeIntelOverview) {
+        return Ok(());
+    }
     send_payload(
         stream,
         FrameKind::CodeIntelOverview,
@@ -1442,7 +1491,7 @@ async fn emit_snapshot_to_stream(
 }
 
 async fn fan_out_payload<T: serde::Serialize>(
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
@@ -1453,13 +1502,16 @@ async fn fan_out_payload<T: serde::Serialize>(
 }
 
 async fn fan_out_value(
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     kind: FrameKind,
     payload: Value,
 ) {
     let mut dead = Vec::new();
-    for (host_path, stream) in subscribers.iter() {
-        if stream.send_value(kind, payload.clone()).is_err() {
+    for (host_path, subscriber) in subscribers.iter() {
+        if !subscriber.file_delivery.wants_frame(kind) {
+            continue;
+        }
+        if subscriber.stream.send_value(kind, payload.clone()).is_err() {
             dead.push(host_path.clone());
         }
     }
@@ -1469,14 +1521,22 @@ async fn fan_out_value(
 }
 
 async fn broadcast_project_event(
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     payload: &ProjectEventPayload,
 ) -> Result<(), String> {
+    // `FilesChanged` only exists so a client can re-read files it has open;
+    // it is not distinguishable by frame kind, so it is filtered here rather
+    // than in `ProjectFileDelivery::wants_frame`.
+    let files_only = matches!(payload, ProjectEventPayload::FilesChanged { .. });
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("failed to serialize ProjectEvent payload: {error}"))?;
     let mut dead = Vec::new();
-    for (host_path, stream) in subscribers.iter() {
-        if stream
+    for (host_path, subscriber) in subscribers.iter() {
+        if files_only && subscriber.file_delivery == ProjectFileDelivery::Off {
+            continue;
+        }
+        if subscriber
+            .stream
             .send_value(FrameKind::ProjectEvent, payload.clone())
             .is_err()
         {
@@ -1492,7 +1552,7 @@ async fn broadcast_project_event(
 async fn refresh_remembered_diffs(
     project: &Project,
     snapshot: &ProjectSnapshotState,
-    subscribers: &HashMap<StreamPath, Stream>,
+    subscribers: &HashMap<StreamPath, ProjectSubscriber>,
 ) {
     let mut remembered = snapshot
         .diff_context_modes
@@ -1509,7 +1569,7 @@ async fn refresh_remembered_diffs(
     });
 
     for (host_path, key, context_mode) in remembered {
-        let Some(stream) = subscribers.get(&host_path) else {
+        let Some(stream) = subscribers.get(&host_path).map(|s| &s.stream) else {
             continue;
         };
         let payload = ProjectReadDiffPayload {
@@ -1557,11 +1617,14 @@ async fn send_payload<T: serde::Serialize>(
 }
 
 async fn emit_fatal_project_stream_error(
-    subscribers: &mut HashMap<StreamPath, Stream>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     operation: &str,
     message: String,
 ) {
-    let streams = subscribers.values().cloned().collect::<Vec<_>>();
+    let streams = subscribers
+        .values()
+        .map(|subscriber| subscriber.stream.clone())
+        .collect::<Vec<_>>();
     for stream in streams {
         emit_project_command_error(
             &stream,

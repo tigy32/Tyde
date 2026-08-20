@@ -127,8 +127,8 @@ use crate::mobile_access::{
     MobileAccessCommand, MobileAccessHandle, MobileAccessInit, spawn_mobile_access_actor,
 };
 use crate::project_stream::{
-    ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, SearchSummary,
-    build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff,
+    ProjectDiffRequestKey, ProjectFileDelivery, ProjectStreamHandle, ProjectStreamSubscription,
+    SearchSummary, build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff,
     search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
@@ -219,6 +219,7 @@ use crate::workflows::watch::{WorkflowCatalogSignal, WorkflowWatcherHandle};
 struct HostSubscriber {
     stream: Stream,
     voice_desktop: Option<bool>,
+    project_files: ProjectFileDelivery,
     bootstrapped: bool,
     agent_replay: AgentReplayMode,
     session_list_replay: SessionListReplayMode,
@@ -2306,8 +2307,9 @@ impl HostHandle {
         host_stream: Stream,
         agent_replay: AgentReplayMode,
         desktop: bool,
+        project_files: ProjectFileDelivery,
     ) -> Vec<DeferredAgentAttachment> {
-        self.register_host_stream_inner(host_stream, agent_replay, Some(desktop))
+        self.register_host_stream_inner(host_stream, agent_replay, Some(desktop), project_files)
             .await
     }
 
@@ -2316,6 +2318,7 @@ impl HostHandle {
         host_stream: Stream,
         agent_replay: AgentReplayMode,
         voice_desktop: Option<bool>,
+        project_files: ProjectFileDelivery,
     ) -> Vec<DeferredAgentAttachment> {
         let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
@@ -2327,6 +2330,7 @@ impl HostHandle {
             HostSubscriber {
                 stream: host_stream,
                 voice_desktop,
+                project_files,
                 bootstrapped: false,
                 agent_replay,
                 session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
@@ -11402,6 +11406,19 @@ impl HostHandle {
         operation: &'static str,
     ) -> AppResult<ProjectStreamHandle> {
         let mut state = self.state.lock().await;
+        // Read the delivery policy off the registered host stream rather than
+        // assuming one: guessing `Full` would ship file listings to a client
+        // that opted out, and guessing `Off` would blank the desktop browser.
+        let project_files = state
+            .host_streams
+            .get(connection_host_stream)
+            .map(|subscriber| subscriber.project_files)
+            .ok_or_else(|| {
+                project_command_error(
+                    operation,
+                    format!("host stream {connection_host_stream} is not registered"),
+                )
+            })?;
         let summaries = state
             .review_registry
             .summaries(project_id.clone())
@@ -11415,6 +11432,7 @@ impl HostHandle {
                 connection_host_stream.clone(),
                 project_output_stream.clone(),
                 summaries,
+                project_files,
             )
             .await
             .map_err(|error| project_command_error(operation, error))?;
@@ -17289,10 +17307,16 @@ async fn subscribe_host_to_project(
     let project_output_stream = subscriber
         .stream
         .with_path(project_stream_path(&project_id));
+    let project_files = subscriber.project_files;
     let summaries = state.review_registry.summaries(project_id.clone()).await?;
     let handle = ensure_project_actor(state, project_id).await?;
     handle
-        .add_subscriber(host_path.clone(), project_output_stream, summaries)
+        .add_subscriber(
+            host_path.clone(),
+            project_output_stream,
+            summaries,
+            project_files,
+        )
         .await
 }
 

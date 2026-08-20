@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Connection;
 use crate::error::AppError;
 use crate::host::{AgentReplayMode, HostHandle};
+use crate::project_stream::ProjectFileDelivery;
 use crate::router::route_client_envelope;
 use crate::stream::{OutputLane, OutputQueue, QueuedOutput, SchedulerToken, Stream};
 
@@ -172,11 +173,20 @@ async fn run_connection_with_origin(
         ConnectionOrigin::Desktop => AgentReplayMode::Eager,
         ConnectionOrigin::Mobile => AgentReplayMode::Lazy,
     };
+    // Mobile has no file browser and no code intelligence, so it never reads a
+    // project file listing. Sending one anyway cost ~1.1 MB per connect across
+    // all projects and repeatedly exhausted the transport's receiver-credit
+    // window, which kills the connection outright.
+    let project_files = match origin {
+        ConnectionOrigin::Desktop => ProjectFileDelivery::Full,
+        ConnectionOrigin::Mobile => ProjectFileDelivery::Off,
+    };
     let deferred_attachments = host
         .register_connection_host_stream(
             host_output_stream.clone(),
             agent_replay,
             origin == ConnectionOrigin::Desktop,
+            project_files,
         )
         .await;
     let host_for_attachments = host.clone();

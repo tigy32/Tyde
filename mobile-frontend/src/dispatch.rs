@@ -17,14 +17,14 @@ use protocol::{
     Envelope, FrameKind, HeartbeatPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
-    RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
-    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
-    TeamCompactNotifyPayload, TeamCompactStatus, TeamContextCompactionNotifyPayload,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    ProjectFileContentsPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
+    ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
+    TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload,
 };
 
 use crate::bridge;
@@ -673,9 +673,6 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         state.projects.update(|projects| {
                             projects.retain(|e| !(e.local_host_id == *host && e.project.id == pid));
                         });
-                        state.file_tree.update(|m| {
-                            m.remove(&(host.clone(), project.id.clone()));
-                        });
                         state.git_status.update(|m| {
                             m.remove(&(host.clone(), project.id));
                         });
@@ -696,15 +693,10 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 }
             }
         }
-        FrameKind::ProjectFileList => {
-            if let Some(project_id) = resolve_project_id(&envelope.stream)
-                && let Ok(payload) = envelope.parse_payload::<ProjectFileListPayload>()
-            {
-                state.file_tree.update(|file_tree| {
-                    apply_project_file_list(file_tree, host, project_id, payload);
-                });
-            }
-        }
+        // Mobile has no file browser; the host does not send these to mobile
+        // connections, but a frame in flight across a reconnect must not be a
+        // protocol violation.
+        FrameKind::ProjectFileList => {}
         FrameKind::ProjectGitStatus => {
             if let Some(project_id) = resolve_project_id(&envelope.stream)
                 && let Ok(payload) = envelope.parse_payload::<ProjectGitStatusPayload>()
@@ -1401,58 +1393,6 @@ fn apply_review_event(
                 errors.insert(key, error);
             });
         }
-    }
-}
-
-fn apply_project_file_list(
-    file_tree: &mut HashMap<(LocalHostId, ProjectId), Vec<protocol::ProjectRootListing>>,
-    host: &LocalHostId,
-    project_id: ProjectId,
-    payload: ProjectFileListPayload,
-) {
-    let key = (host.clone(), project_id);
-    let existing_roots = file_tree.entry(key).or_default();
-    for incoming_root in payload.roots {
-        let root_index = existing_roots
-            .iter()
-            .position(|existing| existing.root == incoming_root.root)
-            .unwrap_or_else(|| {
-                existing_roots.push(protocol::ProjectRootListing {
-                    root: incoming_root.root.clone(),
-                    entries: Vec::new(),
-                });
-                existing_roots.len() - 1
-            });
-        let existing_root = &mut existing_roots[root_index];
-
-        let mut existing_paths: HashSet<String> = existing_root
-            .entries
-            .iter()
-            .map(|entry| entry.relative_path.clone())
-            .collect();
-        let mut removed_paths = HashSet::new();
-        for entry in incoming_root.entries {
-            match entry.op {
-                protocol::FileEntryOp::Add => {
-                    if existing_paths.insert(entry.relative_path.clone()) {
-                        removed_paths.remove(&entry.relative_path);
-                        existing_root.entries.push(entry);
-                    }
-                }
-                protocol::FileEntryOp::Remove => {
-                    existing_paths.remove(&entry.relative_path);
-                    removed_paths.insert(entry.relative_path);
-                }
-            }
-        }
-        if !removed_paths.is_empty() {
-            existing_root
-                .entries
-                .retain(|existing| !removed_paths.contains(&existing.relative_path));
-        }
-        existing_root
-            .entries
-            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     }
 }
 
@@ -2998,12 +2938,9 @@ fn apply_project_bootstrap(
             sort_project_infos(projects);
         }
     });
-    // The bootstrap file_list is a full snapshot — drop any prior entries
-    // for this project before re-applying so we don't merge stale paths.
-    state.file_tree.update(|file_tree| {
-        file_tree.remove(&(host.clone(), project_id.clone()));
-        apply_project_file_list(file_tree, host, project_id.clone(), payload.file_list);
-    });
+    // `payload.file_list` is intentionally unread: mobile has no file browser,
+    // and the host sends an empty listing to mobile connections.
+    let _ = payload.file_list;
     state.git_status.update(|git_status| {
         git_status.insert((host.clone(), project_id.clone()), payload.git_status.roots);
     });
@@ -3360,7 +3297,7 @@ mod wasm_tests {
                         },
                         sort_order: 0,
                     },
-                    file_list: ProjectFileListPayload {
+                    file_list: protocol::ProjectFileListPayload {
                         incremental: false,
                         roots: Vec::new(),
                     },

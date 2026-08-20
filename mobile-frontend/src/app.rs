@@ -1078,9 +1078,6 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.session_lists_by_host.update(|m| {
         m.remove(host);
     });
-    state.file_tree.update(|m| {
-        m.retain(|(h, _), _| h != host);
-    });
     state.git_status.update(|m| {
         m.retain(|(h, _), _| h != host);
     });

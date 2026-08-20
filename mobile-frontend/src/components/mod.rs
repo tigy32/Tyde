@@ -7,7 +7,6 @@ pub mod chat_view;
 mod connection_banner;
 mod diff_viewer;
 mod error_banner;
-mod file_viewer;
 mod home_view;
 mod host_browser;
 mod onboarding_view;

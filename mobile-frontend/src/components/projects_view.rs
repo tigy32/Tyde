@@ -1,25 +1,20 @@
 use leptos::prelude::*;
 
 use crate::components::diff_viewer::DiffViewer;
-use crate::components::file_viewer::FileViewer;
 use crate::components::ui::{Card, EmptyState, Pill, PillTone, StatusDot, StatusTone};
 use crate::state::{ActiveProjectRef, AppState};
 
-/// Per-host project list with read-only file tree once a project is
+/// Per-host project list, with each root's diff reachable once a project is
 /// selected. Git state surfaces as a `Pill` (branch name) plus a
 /// `StatusDot` for clean/dirty so users get the information without
-/// having to open the project. File contents and diff are intentionally
-/// out of scope until the dispatch can request them.
-/// Local UI state for the active project's detail pane. Either a file
-/// (path + root) is pinned, a diff (root + scope + optional file
-/// filter) is open, or nothing is selected.
+/// having to open the project. There is deliberately no file browser: mobile
+/// never rendered one usefully, and the listing that fed it dominated the
+/// connect payload.
+/// Local UI state for the active project's detail pane. Either a diff
+/// (root + scope + optional file filter) is open, or nothing is selected.
 #[derive(Clone, Debug, PartialEq)]
 enum ProjectDetail {
     None,
-    File {
-        root: protocol::ProjectRootPath,
-        relative_path: String,
-    },
     Diff {
         root: protocol::ProjectRootPath,
         scope: protocol::ProjectDiffScope,
@@ -30,10 +25,9 @@ enum ProjectDetail {
 #[component]
 pub fn ProjectsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
-    // Detail pane is local UI state — tapping a file pins the file
-    // viewer, tapping a "view diff" affordance pins the diff viewer.
-    // Cleared when the active project changes via the `Effect` below
-    // so a stale path from a previous project doesn't linger.
+    // Detail pane is local UI state — tapping a "view diff" affordance pins
+    // the diff viewer. Cleared when the active project changes via the
+    // `Effect` below so a stale root from a previous project doesn't linger.
     let detail: RwSignal<ProjectDetail> = RwSignal::new(ProjectDetail::None);
 
     {
@@ -222,21 +216,27 @@ pub fn ProjectsView() -> impl IntoView {
                             }).collect::<Vec<_>>()}
                         </div>
                         {move || {
-                            // Show file tree of the active project (if any) right
-                            // below the project list. Read-only — the dispatcher
-                            // doesn't yet handle ProjectFileContents/ProjectGitDiff.
+                            // Per-root entry points for the active project.
+                            // Mobile has no file browser, so roots come from
+                            // project metadata rather than a file listing.
                             let active = state.active_project.get();
                             let Some(active) = active else { return view! { <div></div> }.into_any(); };
                             let key = (active.local_host_id.clone(), active.project_id.clone());
-                            let listings = state.file_tree.with(|m| m.get(&key).cloned()).unwrap_or_default();
-                            if listings.is_empty() {
+                            let roots = state.projects.with(|projects| {
+                                projects
+                                    .iter()
+                                    .find(|p| p.local_host_id == key.0 && p.project.id == key.1)
+                                    .map(|p| p.project.root_paths())
+                                    .unwrap_or_default()
+                            });
+                            if roots.is_empty() {
                                 return view! {
-                                    <div class="project-detail" data-mobile-test="project-file-tree-empty">
+                                    <div class="project-detail" data-mobile-test="project-roots-empty">
                                         <EmptyState
-                                            title="No files indexed yet"
-                                            body="Your host hasn't pushed a file listing for this project. The list updates automatically as changes flow in."
-                                            icon="\u{1F4C4}"
-                                            data_mobile_test="projects-files-empty"
+                                            title="No roots configured"
+                                            body="This project has no roots on the host, so there is nothing to diff yet."
+                                            icon="\u{1F4C1}"
+                                            data_mobile_test="projects-roots-empty"
                                         />
                                     </div>
                                 }.into_any();
@@ -247,24 +247,14 @@ pub fn ProjectsView() -> impl IntoView {
                             // per-root "View diff" surface (`DiffViewer`),
                             // not in a separate reviews modal.
                             view! {
-                                <div class="project-detail" data-mobile-test="project-file-tree">
-                                    {listings.into_iter().map(|listing| {
-                                        let root_path = listing.root.clone();
-                                        let root_label = listing
-                                            .root
+                                <div class="project-detail" data-mobile-test="project-roots">
+                                    {roots.into_iter().map(|root_path| {
+                                        let root_label = root_path
                                             .0
                                             .rsplit('/')
                                             .find(|s| !s.is_empty())
-                                            .unwrap_or(&listing.root.0)
+                                            .unwrap_or(&root_path.0)
                                             .to_string();
-                                        let mut entries = listing.entries.clone();
-                                        entries.sort_by(|a, b| {
-                                            // Directories first, then by name.
-                                            let a_dir = matches!(a.kind, protocol::ProjectFileKind::Directory);
-                                            let b_dir = matches!(b.kind, protocol::ProjectFileKind::Directory);
-                                            b_dir.cmp(&a_dir).then_with(|| a.relative_path.cmp(&b.relative_path))
-                                        });
-                                        let count = entries.len();
                                         let diff_root = root_path.clone();
                                         let on_view_diff = Callback::new(move |_: ()| {
                                             detail.set(ProjectDetail::Diff {
@@ -274,15 +264,10 @@ pub fn ProjectsView() -> impl IntoView {
                                             });
                                         });
                                         view! {
-                                            <div data-mobile-test="project-file-tree-root">
+                                            <div data-mobile-test="project-root-row">
                                                 <div class="section-heading">
                                                     <span>{root_label.clone()}</span>
                                                     <span class="section-heading-trailing">
-                                                        <Pill
-                                                            label=format!("{count}")
-                                                            tone=PillTone::Neutral
-                                                            data_mobile_test="project-file-tree-count"
-                                                        />
                                                         <crate::components::ui::Button
                                                             label="View diff"
                                                             variant=crate::components::ui::ButtonVariant::Ghost
@@ -293,36 +278,6 @@ pub fn ProjectsView() -> impl IntoView {
                                                         />
                                                     </span>
                                                 </div>
-                                                <div class="project-file-tree">
-                                                    {entries.into_iter().map(|entry| {
-                                                        let is_dir = matches!(entry.kind, protocol::ProjectFileKind::Directory);
-                                                        let icon = if is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-                                                        let class = if is_dir { "project-file-row is-dir" } else { "project-file-row" };
-                                                        let test = if is_dir { "project-file-row-dir" } else { "project-file-row-file" };
-                                                        let row_root = root_path.clone();
-                                                        let rel_path = entry.relative_path.clone();
-                                                        let on_click = move |_| {
-                                                            if !is_dir {
-                                                                detail.set(ProjectDetail::File {
-                                                                    root: row_root.clone(),
-                                                                    relative_path: rel_path.clone(),
-                                                                });
-                                                            }
-                                                        };
-                                                        view! {
-                                                            <div
-                                                                class=class
-                                                                data-mobile-test=test
-                                                                role=if is_dir { "group" } else { "button" }
-                                                                tabindex=if is_dir { "-1" } else { "0" }
-                                                                on:click=on_click
-                                                            >
-                                                                <span class="project-file-row-icon" aria-hidden="true">{icon}</span>
-                                                                <span class="project-file-row-name">{entry.relative_path}</span>
-                                                            </div>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
                                             </div>
                                         }
                                     }).collect::<Vec<_>>()}
@@ -332,19 +287,6 @@ pub fn ProjectsView() -> impl IntoView {
                                             let on_clear = Callback::new(move |_: ()| detail.set(ProjectDetail::None));
                                             match detail.get() {
                                                 ProjectDetail::None => view! { <div></div> }.into_any(),
-                                                ProjectDetail::File { root, relative_path } => {
-                                                    let path = protocol::ProjectPath {
-                                                        root,
-                                                        relative_path,
-                                                    };
-                                                    view! {
-                                                        <FileViewer
-                                                            project=active_for_detail.clone()
-                                                            path=path
-                                                            on_close=on_clear
-                                                        />
-                                                    }.into_any()
-                                                }
                                                 ProjectDetail::Diff { root, scope, path } => {
                                                     view! {
                                                         <DiffViewer
@@ -375,8 +317,8 @@ mod wasm_tests {
     use crate::state::{AppState, LocalHostId, ProjectInfo};
     use leptos::mount::mount_to;
     use protocol::{
-        FileEntryOp, Project, ProjectFileEntry, ProjectFileKind, ProjectGitFileStatus, ProjectId,
-        ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSource,
+        Project, ProjectGitFileStatus, ProjectId, ProjectRootGitStatus, ProjectRootPath,
+        ProjectSource,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -554,167 +496,63 @@ mod wasm_tests {
         );
     }
 
-    /// Selecting a project surfaces its file tree below. Directory
-    /// entries get a dir selector, file entries get a file selector.
+    /// Selecting a project surfaces one row per configured root, each with a
+    /// reachable "View diff". Mobile has no file browser, so roots come from
+    /// project metadata; this pins the guarantee the old file-tree block also
+    /// carried, since the diff entry point lived inside it.
     #[wasm_bindgen_test]
-    async fn projects_active_project_shows_file_tree() {
+    async fn projects_active_project_shows_roots_with_diff_access() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.active_local_host_id.set(Some(host_clone.clone()));
-            state
-                .projects
-                .set(vec![make_project(&host_clone, "p-1", "Active", vec!["/x"])]);
+            state.projects.set(vec![make_project(
+                &host_clone,
+                "p-1",
+                "Active",
+                vec!["/x", "/y"],
+            )]);
             state.active_project.set(Some(ActiveProjectRef {
                 local_host_id: host_clone.clone(),
                 project_id: ProjectId("p-1".to_owned()),
             }));
-            state.file_tree.update(|m| {
-                m.insert(
-                    (host_clone.clone(), ProjectId("p-1".to_owned())),
-                    vec![ProjectRootListing {
-                        root: ProjectRootPath("/x".to_owned()),
-                        entries: vec![
-                            ProjectFileEntry {
-                                relative_path: "src".to_owned(),
-                                kind: ProjectFileKind::Directory,
-                                op: FileEntryOp::Add,
-                            },
-                            ProjectFileEntry {
-                                relative_path: "README.md".to_owned(),
-                                kind: ProjectFileKind::File,
-                                op: FileEntryOp::Add,
-                            },
-                        ],
-                    }],
-                );
-            });
             provide_context(state);
             view! { <ProjectsView /> }
         });
         next_tick().await;
-        assert!(
+        assert_eq!(
             container
-                .query_selector("[data-mobile-test='project-file-tree']")
+                .query_selector_all("[data-mobile-test='project-root-row']")
                 .unwrap()
-                .is_some(),
-            "file tree container must render"
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='project-file-row-dir']")
-                .unwrap()
-                .is_some(),
-            "directory entry must use directory selector"
+                .length(),
+            2,
+            "one row must render per configured project root"
         );
         assert!(
             container
                 .query_selector("[data-mobile-test='project-file-row-file']")
                 .unwrap()
+                .is_none(),
+            "mobile must not render a file browser"
+        );
+
+        // The diff viewer must still be reachable from a root row.
+        let view_diff: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='project-view-diff']")
+            .unwrap()
+            .expect("each root must expose a View diff control")
+            .dyn_into()
+            .unwrap();
+        view_diff.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='project-diff-viewer']")
+                .unwrap()
                 .is_some(),
-            "file entry must use file selector"
-        );
-    }
-
-    /// Tapping a file row pins the file-viewer placeholder with the
-    /// selected path. Tapping a directory row must NOT open the viewer
-    /// — directories are pure structure.
-    #[wasm_bindgen_test]
-    async fn projects_file_tap_opens_viewer_placeholder_with_path() {
-        let host = LocalHostId("host-1".to_owned());
-        let host_clone = host.clone();
-        let container = make_container();
-        let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state
-                .projects
-                .set(vec![make_project(&host_clone, "p-1", "Active", vec!["/x"])]);
-            state.active_project.set(Some(ActiveProjectRef {
-                local_host_id: host_clone.clone(),
-                project_id: ProjectId("p-1".to_owned()),
-            }));
-            state.file_tree.update(|m| {
-                m.insert(
-                    (host_clone.clone(), ProjectId("p-1".to_owned())),
-                    vec![ProjectRootListing {
-                        root: ProjectRootPath("/x".to_owned()),
-                        entries: vec![
-                            ProjectFileEntry {
-                                relative_path: "src".to_owned(),
-                                kind: ProjectFileKind::Directory,
-                                op: FileEntryOp::Add,
-                            },
-                            ProjectFileEntry {
-                                relative_path: "README.md".to_owned(),
-                                kind: ProjectFileKind::File,
-                                op: FileEntryOp::Add,
-                            },
-                        ],
-                    }],
-                );
-            });
-            provide_context(state);
-            view! { <ProjectsView /> }
-        });
-        next_tick().await;
-
-        // Tap a directory: no viewer should appear.
-        let dir: web_sys::HtmlElement = container
-            .query_selector("[data-mobile-test='project-file-row-dir']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        dir.click();
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-mobile-test='project-file-viewer']")
-                .unwrap()
-                .is_none(),
-            "tapping a directory must not open the viewer"
-        );
-
-        // Tap a file: viewer appears with the file path.
-        let file: web_sys::HtmlElement = container
-            .query_selector("[data-mobile-test='project-file-row-file']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        file.click();
-        next_tick().await;
-        let viewer = container
-            .query_selector("[data-mobile-test='project-file-viewer']")
-            .unwrap()
-            .expect("viewer placeholder must appear after tapping a file");
-        let path = viewer
-            .query_selector("[data-mobile-test='project-file-viewer-path']")
-            .unwrap()
-            .expect("viewer must expose the selected path");
-        assert_eq!(
-            path.text_content().unwrap_or_default().trim(),
-            "README.md",
-            "viewer must show the selected file's path"
-        );
-        // Closing the viewer clears the placeholder.
-        let close: web_sys::HtmlElement = viewer
-            .query_selector("[data-mobile-test='project-file-viewer-close']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        close.click();
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-mobile-test='project-file-viewer']")
-                .unwrap()
-                .is_none(),
-            "viewer must close after tapping Close"
+            "tapping View diff must open the diff viewer"
         );
     }
 }

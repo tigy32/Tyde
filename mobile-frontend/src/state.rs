@@ -16,9 +16,9 @@ use protocol::{
     DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, McpServerConfig, McpServerId, MessageMetadataUpdateData,
     MobileAccessErrorCode, Project, ProjectDiffScope, ProjectFileContentsPayload,
-    ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId, ReviewSummary,
-    SessionId, SessionListCursor, SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry,
+    ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootPath,
+    QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId,
+    SessionListCursor, SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry,
     SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
     TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
     TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
@@ -897,7 +897,6 @@ pub struct AppState {
     // Projects
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
-    pub file_tree: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ProjectRootGitStatus>>>,
     pub project_file_contents: RwSignal<HashMap<ProjectFileRef, ProjectFileState>>,
     pub project_diffs: RwSignal<HashMap<ProjectDiffRef, ProjectDiffState>>,
@@ -1065,7 +1064,6 @@ impl AppState {
 
             projects: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
-            file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
             project_file_contents: RwSignal::new(HashMap::new()),
             project_diffs: RwSignal::new(HashMap::new()),
@@ -1725,9 +1723,6 @@ impl AppState {
             m.remove(host);
         });
 
-        self.file_tree.update(|m| {
-            m.retain(|(h, _), _| h != host);
-        });
         self.git_status.update(|m| {
             m.retain(|(h, _), _| h != host);
         });
