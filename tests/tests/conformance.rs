@@ -144,14 +144,32 @@ fn real_conversation_on_resumed_session() {
             host.backend()
         );
 
+        // Rewritten out of band, because the payload the conversation asked for
+        // is *in* that conversation: replayed history is part of the resumed
+        // model's context, so "read the file and reply with its contents" was
+        // answerable from memory. Measured — minimax answered
+        // `TYDE_PAYLOAD_14DBFFFAFA4F` in 1.4s with no tool call at all, and the
+        // check below then read as a dropped card. This payload has never
+        // appeared in the conversation, so reporting it requires actually
+        // reading the file, and the tool-card assertion becomes a real test of
+        // whether cards survive a resume instead of a bet on how eagerly a
+        // given model reaches for tools.
+        let after_resume_payload = unique_payload();
+        std::fs::write(
+            host.workspace().join(HELLO_FILE),
+            format!("{after_resume_payload}\n"),
+        )
+        .expect("rewrite hello.txt out of band");
+
         // Resumed sessions rendering blank is one bug; resumed sessions
         // silently losing every subsequent tool card is a worse one.
-        let follow_up = ask(&mut host, &resumed, read_prompt()).await;
-        assert_read_back_payload(&follow_up, &payload);
+        let follow_up = ask(&mut host, &resumed, reread_prompt()).await;
+        assert_read_back_payload(&follow_up, &after_resume_payload);
         assert!(
             follow_up.tool_requests().next().is_some(),
-            "{}: a new turn on a resumed session emitted zero tool requests while reading \
-                 {HELLO_FILE}; the model answered from a tool whose card never reached the client",
+            "{}: a new turn on a resumed session reported the rewritten contents of \
+                 {HELLO_FILE} but emitted zero tool requests, so the read that produced them \
+                 never reached the client as a card",
             follow_up.label()
         );
         assert_universal_contract(&[follow_up]);
@@ -667,6 +685,23 @@ fn read_prompt() -> String {
     format!(
         "Read the file {HELLO_FILE} from the workspace root and reply with exactly its contents \
          and nothing else."
+    )
+}
+
+/// The read a resumed session is asked for, after the file has been rewritten
+/// out of band.
+///
+/// Still names a goal rather than a tool, but it has to say the file changed:
+/// the conversation itself dictated the old contents, so a resumed model holding
+/// that history can answer `read_prompt` from memory — measured, minimax replied
+/// with the superseded payload and ran nothing. Saying so is what makes the
+/// turn's tool cards the thing under test rather than how eagerly a given model
+/// reaches for a tool.
+fn reread_prompt() -> String {
+    format!(
+        "The contents of {HELLO_FILE} in the workspace root changed on disk after your last \
+         message. Read it again now and reply with exactly its current contents and nothing \
+         else. Do not answer from earlier in this conversation."
     )
 }
 
