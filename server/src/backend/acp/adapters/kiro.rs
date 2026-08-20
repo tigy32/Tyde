@@ -268,17 +268,15 @@ impl AcpAgentAdapter for KiroAdapter {
         })
     }
 
-    fn map_tool_request<'a>(
-        &'a self,
-        kind: &'a str,
-        args: &'a Value,
-        workspace_root: &'a str,
-    ) -> BoxFuture<'a, Value> {
-        Box::pin(async move {
-            let params = serde_json::json!({ "kind": kind });
-            kiro_impl::map_tool_request_type(&params, args, workspace_root).await
-        })
-    }
+    // `map_tool_request` is deliberately not overridden. Kiro's rawInput uses
+    // the ordinary ACP spellings, so the shared default already reads them —
+    // and reads more of them than the override did. The override named only
+    // `newStr`/`file_text` for an edit's replacement text, while Kiro sends a
+    // create as `{"command":"create","content":…,"path":…}`; `content` is in
+    // the default's key list and was not in the override's, so every file Kiro
+    // wrote produced a diff card empty on both sides. The result mapping below
+    // stays, because parsing `exit_status`/`stdout`/`stderr` out of Kiro's
+    // rawOutput really is Kiro-specific knowledge.
 
     fn map_tool_result(
         &self,

@@ -18,7 +18,6 @@ use crate::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpRequestCtx,
     AcpSessionKind, adapter_for_spec,
 };
-use crate::acp::tools::read_paths;
 use crate::acp::{
     AcpBridge, AcpInbound, acp_mcp_servers_json, extract_message_id, extract_text_from_update,
     extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
@@ -2622,86 +2621,6 @@ fn is_stream_artifact_char(ch: char) -> bool {
 }
 
 /// Maps Kiro ACP tool_call params to Tyde's internal tool type representation.
-/// Uses the ACP `kind` field directly: "execute" → RunCommand, "edit" → ModifyFile, "read" → ReadFiles.
-pub(crate) async fn map_tool_request_type(
-    params: &Value,
-    args: &Value,
-    workspace_root: &str,
-) -> Value {
-    let acp_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
-
-    match acp_kind {
-        "execute" => {
-            let command = args
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let working_directory = args
-                .get("working_dir")
-                .and_then(Value::as_str)
-                .unwrap_or(workspace_root)
-                .to_string();
-            json!({
-                "kind": "RunCommand",
-                "command": command,
-                "working_directory": working_directory,
-            })
-        }
-        "edit" => {
-            let file_path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let mut before = args
-                .get("oldStr")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let after = args
-                .get("newStr")
-                .or_else(|| args.get("file_text"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-
-            let resolved_file_path = resolve_tool_file_path(&file_path, workspace_root);
-            if before.is_empty()
-                && !resolved_file_path.is_empty()
-                && Path::new(&resolved_file_path).exists()
-                && let Ok(contents) = tokio::fs::read_to_string(&resolved_file_path).await
-            {
-                before = contents;
-            }
-
-            json!({
-                "kind": "ModifyFile",
-                "file_path": file_path,
-                "before": before,
-                "after": after,
-            })
-        }
-        "read" => {
-            let file_paths = read_paths(args);
-            if file_paths.is_empty() {
-                return json!({
-                    "kind": "Other",
-                    "args": args,
-                });
-            }
-            json!({
-                "kind": "ReadFiles",
-                "file_paths": file_paths,
-            })
-        }
-        _ => json!({
-            "kind": "Other",
-            "args": public_acp_tool_arguments(args),
-        }),
-    }
-}
-
 fn public_acp_tool_arguments(args: &Value) -> Value {
     let mut arguments = args.clone();
     if let Some(arguments) = arguments.as_object_mut() {
