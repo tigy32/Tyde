@@ -43,6 +43,11 @@ pub enum MqttTransportError {
     #[error("timed out waiting for MQTT PUBACK for token {token} after {timeout_ms}ms")]
     PublishAckTimeout { token: u64, timeout_ms: u64 },
 
+    #[error(
+        "peer sent nothing for {timeout_ms}ms while owing receiver credit at data counter {data_counter}"
+    )]
+    PeerSilenceTimeout { data_counter: u64, timeout_ms: u64 },
+
     #[error("transport framing error: {0}")]
     Framing(#[from] FramingError),
 
@@ -82,6 +87,7 @@ impl MqttTransportError {
             | Self::SubscribeRejected { .. }
             | Self::Publish { .. }
             | Self::PublishAckTimeout { .. }
+            | Self::PeerSilenceTimeout { .. }
             | Self::BrokerDisconnected { .. }
             | Self::ManagedSessionExpired
             | Self::ActorClosed => true,

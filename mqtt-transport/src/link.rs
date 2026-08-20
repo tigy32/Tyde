@@ -15,7 +15,10 @@ use crate::error::MqttTransportError;
 /// Receiver-credit window for Tyde data counters. A peer may publish data
 /// counters below `peer_credit_next_expected + DATA_CREDIT_WINDOW`; broker
 /// PUBACKs never advance this credit.
-pub(crate) const DATA_CREDIT_WINDOW: usize = 16;
+///
+/// Sized so a connect burst clears without the sender ever parking on credit:
+/// at 16 the burst hit the window boundary and stalled at counters 16/17.
+pub(crate) const DATA_CREDIT_WINDOW: usize = 64;
 
 /// Maximum Tyde data publishes the driver will keep in broker flight before
 /// their PUBACK. Broker PUBACK frees this broker slot and completes the local

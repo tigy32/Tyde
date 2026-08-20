@@ -8,7 +8,7 @@ use sha2::Sha256;
 use crate::config::ParticipantRole;
 use crate::error::{CounterViolation, CryptoError};
 use crate::framing::{AEAD_KEY_LEN, AEAD_NONCE_LEN, SESSION_SALT_LEN};
-use crate::link::{DATA_CREDIT_WINDOW, MQTT_QOS1_WINDOW};
+use crate::link::DATA_CREDIT_WINDOW;
 use crate::types::{PreSharedKey, RoomId};
 
 pub const HKDF_INFO: &[u8] = b"tyde-mqtt-v1";
@@ -19,7 +19,12 @@ pub const HKDF_INFO: &[u8] = b"tyde-mqtt-v1";
 /// delivery can still reorder within the MQTT receive headroom. Future frames
 /// are buffered only after AEAD succeeds; a gap beyond this bounded headroom is
 /// still a fatal transport invariant violation.
-pub(crate) const RECEIVE_REORDER_WINDOW: u64 = MQTT_QOS1_WINDOW as u64;
+///
+/// Derived from the credit window rather than [`MQTT_QOS1_WINDOW`], which also
+/// sets the broker-facing `receive_maximum` and must stay inside AWS IoT's
+/// QoS-1 in-flight cap. Credit is what bounds how far a sender may run ahead,
+/// so the buffer only has to cover that plus reordering headroom.
+pub(crate) const RECEIVE_REORDER_WINDOW: u64 = (DATA_CREDIT_WINDOW * 2) as u64;
 const CREDIT_PLAINTEXT_LEN: usize = 8;
 const _: () = assert!(DATA_CREDIT_WINDOW as u64 <= RECEIVE_REORDER_WINDOW);
 

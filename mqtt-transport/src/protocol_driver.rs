@@ -72,7 +72,23 @@ const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RENDEZVOUS_CANDIDATES: usize = 3;
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
 const CREDIT_DEBOUNCE: Duration = Duration::from_millis(25);
-const CREDIT_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a sender waits while the receiver makes *no* progress at all
+/// before giving up. Blocking on credit is normal backpressure — only a
+/// receiver that has been alive but completely stalled this long is broken.
+/// The deadline resets on every credit advance, so an arbitrarily slow but
+/// progressing peer is never killed.
+const CREDIT_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How long a blocked sender waits to hear anything at all from the peer.
+/// Only armed while blocked on credit, where the peer owes us a frame; a
+/// live peer emits [`CREDIT_HEARTBEAT_INTERVAL`] credits even while stalled,
+/// so silence this long means the peer is gone.
+const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How often a receiver re-publishes its current credit even when it has not
+/// advanced. This is what makes "slow" distinguishable from "dead".
+const CREDIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Drives the Tyde transport protocol over an [`MqttLink`]. Field-for-field the
 /// former `MqttActor`, with the rumqttc `client`/`eventloop` pair replaced by a
@@ -284,7 +300,9 @@ impl<L: MqttLink> ProtocolDriver<L> {
         let mut deferred_outbound: Option<OutboundChunk> = None;
         let mut in_flight = InflightPublishes::new();
         let mut outbound_closed = false;
-        let mut credit_blocked_since: Option<Instant> = None;
+        let mut credit_stalled_since: Option<Instant> = None;
+        let mut last_peer_credit = cipher.peer_credit_next_expected();
+        let mut last_peer_frame_at = Instant::now();
         let mut last_publish_ack_at: Option<Instant> = None;
         let session_renewal_timer = sleep(
             self.session_renewal_after
@@ -305,7 +323,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 && self.outbound_budget.is_ready()
                 && let Some(outbound) = deferred_outbound.take()
             {
-                credit_blocked_since = None;
+                credit_stalled_since = None;
                 let batch = self.boxcar_outbound(outbound, &mut deferred_outbound);
                 if let Err(failure) = self
                     .publish_boxcar_batch(&mut cipher, batch, &mut in_flight)
@@ -325,23 +343,51 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 return;
             }
 
+            // Any credit advance is progress, however small: the receiver is
+            // draining. Only a receiver that moves nothing at all is stalled.
+            let peer_credit = cipher.peer_credit_next_expected();
+            if peer_credit > last_peer_credit {
+                last_peer_credit = peer_credit;
+                credit_stalled_since = None;
+            }
             let receiver_credit_blocked =
                 deferred_outbound.is_some() && !has_receiver_credit(&cipher);
-            match (receiver_credit_blocked, credit_blocked_since) {
-                (true, None) => credit_blocked_since = Some(Instant::now()),
-                (false, Some(_)) => credit_blocked_since = None,
+            match (receiver_credit_blocked, credit_stalled_since) {
+                (true, None) => credit_stalled_since = Some(Instant::now()),
+                (false, Some(_)) => credit_stalled_since = None,
                 _ => {}
             }
-            let credit_block_delay = credit_blocked_since.map(|since| {
-                CREDIT_BLOCK_TIMEOUT
+            let credit_stall_delay = credit_stalled_since.map(|since| {
+                CREDIT_STALL_TIMEOUT
                     .checked_sub(Instant::now().duration_since(since))
                     .unwrap_or(Duration::ZERO)
             });
-            let credit_block_timer = sleep(credit_block_delay.unwrap_or(CREDIT_BLOCK_TIMEOUT));
-            tokio::pin!(credit_block_timer);
+            let credit_stall_timer = sleep(credit_stall_delay.unwrap_or(CREDIT_STALL_TIMEOUT));
+            tokio::pin!(credit_stall_timer);
 
-            let credit_debounce_delay = credit.next_publish_delay();
-            let credit_debounce_timer = sleep(credit_debounce_delay.unwrap_or(CREDIT_DEBOUNCE));
+            // Silence is only evidence of a dead peer while we are waiting on
+            // it for credit; an idle link is expected to be quiet.
+            let peer_silence_delay = credit_stalled_since.map(|_| {
+                PEER_SILENCE_TIMEOUT
+                    .checked_sub(Instant::now().duration_since(last_peer_frame_at))
+                    .unwrap_or(Duration::ZERO)
+            });
+            let peer_silence_timer = sleep(peer_silence_delay.unwrap_or(PEER_SILENCE_TIMEOUT));
+            tokio::pin!(peer_silence_timer);
+
+            // A due credit is already published at the top of the loop, so a
+            // zero delay here means publishing was refused (no broker
+            // capacity). Back off instead of spinning on an expired timer.
+            let credit_debounce_delay = credit
+                .next_publish_delay()
+                .map_or(credit.heartbeat_delay(), |delay| {
+                    delay.min(credit.heartbeat_delay())
+                });
+            let credit_debounce_timer = sleep(if credit_debounce_delay.is_zero() {
+                CREDIT_DEBOUNCE
+            } else {
+                credit_debounce_delay
+            });
             tokio::pin!(credit_debounce_timer);
 
             let publish_ack_delay = in_flight.next_ack_timeout_delay(last_publish_ack_at);
@@ -371,16 +417,25 @@ impl<L: MqttLink> ProtocolDriver<L> {
                     self.fail_stream(&mut in_flight, error).await;
                     return;
                 }
-                _ = &mut credit_block_timer, if credit_block_delay.is_some() => {
+                _ = &mut credit_stall_timer, if credit_stall_delay.is_some() => {
                     let error = MqttTransportError::ReceiverCreditTimeout {
                         data_counter: cipher.next_send_data_counter(),
-                        timeout_ms: CREDIT_BLOCK_TIMEOUT.as_millis() as u64,
+                        timeout_ms: CREDIT_STALL_TIMEOUT.as_millis() as u64,
                     };
                     ack_deferred_outbound(&mut deferred_outbound, &error);
                     self.fail_stream(&mut in_flight, error).await;
                     return;
                 }
-                _ = &mut credit_debounce_timer, if credit_debounce_delay.is_some() => {
+                _ = &mut peer_silence_timer, if peer_silence_delay.is_some() => {
+                    let error = MqttTransportError::PeerSilenceTimeout {
+                        data_counter: cipher.next_send_data_counter(),
+                        timeout_ms: PEER_SILENCE_TIMEOUT.as_millis() as u64,
+                    };
+                    ack_deferred_outbound(&mut deferred_outbound, &error);
+                    self.fail_stream(&mut in_flight, error).await;
+                    return;
+                }
+                _ = &mut credit_debounce_timer => {
                     continue;
                 }
                 _ = &mut publish_ack_timer, if publish_ack_delay.is_some() => {
@@ -400,6 +455,13 @@ impl<L: MqttLink> ProtocolDriver<L> {
                         Ok(event) => {
                             if matches!(event, LinkEvent::PubAck(_)) {
                                 last_publish_ack_at = Some(Instant::now());
+                            }
+                            // A publish on our inbound topic is the peer
+                            // itself, unlike a PUBACK, which is only the
+                            // broker. Credit heartbeats keep this fresh even
+                            // when the peer has no progress to report.
+                            if matches!(event, LinkEvent::Publish(_)) {
+                                last_peer_frame_at = Instant::now();
                             }
                             if let Err(error) = self.handle_stream_event(
                                 event,
@@ -553,7 +615,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         in_flight: &mut InflightPublishes,
         credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
-        let Some(next_expected) = credit.due_credit() else {
+        let Some(next_expected) = credit.due_credit().or_else(|| credit.due_heartbeat()) else {
             return Ok(());
         };
         if !in_flight.has_broker_capacity() {
@@ -1109,6 +1171,7 @@ struct ReceiverCreditState {
     last_published_next_expected: u64,
     pending_next_expected: Option<u64>,
     publish_after: Option<Instant>,
+    last_published_at: Instant,
 }
 
 impl ReceiverCreditState {
@@ -1117,7 +1180,24 @@ impl ReceiverCreditState {
             last_published_next_expected: 0,
             pending_next_expected: None,
             publish_after: None,
+            // Starts the heartbeat clock at session start, so a receiver that
+            // has not delivered anything yet still proves it is alive.
+            last_published_at: Instant::now(),
         }
+    }
+
+    /// How long until the next heartbeat is owed.
+    fn heartbeat_delay(&self) -> Duration {
+        CREDIT_HEARTBEAT_INTERVAL
+            .checked_sub(Instant::now().duration_since(self.last_published_at))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// A credit repeating the last published counter. Carries no new
+    /// information, so a peer treats it as a no-op; it exists purely so the
+    /// sender can tell a slow receiver from a dead one.
+    fn due_heartbeat(&self) -> Option<u64> {
+        (self.heartbeat_delay() == Duration::ZERO).then_some(self.last_published_next_expected)
     }
 
     fn note_delivered(&mut self, next_expected: u64) {
@@ -1159,6 +1239,7 @@ impl ReceiverCreditState {
 
     fn mark_published(&mut self, next_expected: u64) {
         self.last_published_next_expected = self.last_published_next_expected.max(next_expected);
+        self.last_published_at = Instant::now();
         if self.pending_next_expected == Some(next_expected) {
             self.pending_next_expected = None;
             self.publish_after = None;

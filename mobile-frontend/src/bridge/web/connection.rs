@@ -1572,6 +1572,7 @@ fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {
         | MqttTransportError::Subscribe { .. }
         | MqttTransportError::SubscribeRejected { .. }
         | MqttTransportError::BrokerDisconnected { .. }
+        | MqttTransportError::PeerSilenceTimeout { .. }
         | MqttTransportError::ManagedSessionExpired => {
             MobileAccessErrorCode::BrokerConnectionFailed
         }
