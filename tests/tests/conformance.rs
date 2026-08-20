@@ -152,9 +152,14 @@ fn real_tool_type_mappings() {
         assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
         assert_final_text_contains(&edit, MAPPED_EDIT_MARKER);
 
+        let unseen = unique_payload();
+        std::fs::write(
+            host.workspace().join(MAPPING_FILE),
+            format!("alpha\n{unseen}\nomega\n"),
+        )
+        .expect("rewrite mapping.txt out of band");
         let read = ask(&mut host, &agent, mapping_read_prompt()).await;
-        assert_read_maps_to_read_files(&read, host.workspace());
-        assert_final_text_contains(&read, &edited);
+        assert_read_maps_to_read_files(&read, host.workspace(), &unseen);
 
         let ran = ask(&mut host, &agent, mapping_command_prompt(&token)).await;
         assert_command_maps_to_run_command(&ran, host.workspace(), &token);
@@ -789,10 +794,20 @@ fn mapping_edit_prompt(old: &str, new: &str) -> String {
     )
 }
 
+/// Has to say the file changed, and the caller has to actually change it.
+///
+/// The edit turn dictated the middle line in its own prompt, so a model holding
+/// that history can answer this without opening anything — measured, tycode
+/// replied with the correct payload in one turn having emitted zero tool
+/// requests, and the ReadFiles assertion then read as a dropped card. Reading a
+/// line the conversation has never mentioned is the only version of this turn
+/// that tests the mapping rather than the model's appetite for tools.
 fn mapping_read_prompt() -> String {
     format!(
-        "Use your file-reading tool — not the shell — to read {MAPPING_FILE} from the workspace \
-         root, then reply with exactly its middle line and nothing else."
+        "The contents of {MAPPING_FILE} in the workspace root changed on disk after your last \
+         message. Use your file-reading tool — not the shell — to read it again now, then reply \
+         with exactly its middle line and nothing else. Do not answer from earlier in this \
+         conversation."
     )
 }
 
@@ -1484,7 +1499,25 @@ fn assert_edit_maps_to_a_non_empty_diff(turn: &Turn, workspace: &Path, old: &str
 }
 
 /// A read produces a `ReadFiles` card naming the file, and a result listing it.
-fn assert_read_maps_to_read_files(turn: &Turn, workspace: &Path) {
+///
+/// `payload` is on disk and nowhere in the conversation, so quoting it back is
+/// proof the file was opened. Checked before the card, because the two failures
+/// are different problems wearing the same symptom: a model that answered from
+/// history emits no card and neither does a backend that dropped one, and only
+/// the reply tells them apart. Measured — tycode answers this turn with the
+/// payload its own earlier prompt dictated, having run nothing.
+fn assert_read_maps_to_read_files(turn: &Turn, workspace: &Path, payload: &str) {
+    let answer = turn.final_text();
+    assert!(
+        answer.contains(payload),
+        "{}: the reply is {answer:?}, which does not contain {payload:?} — the payload written to \
+         {MAPPING_FILE} out of band and never mentioned in this conversation. The model answered \
+         from history instead of opening the file, so this turn ran no read to map. It emitted \
+         {:?}.",
+        turn.label(),
+        turn.tool_request_names()
+    );
+
     let reads: Vec<_> = turn
         .tool_requests()
         .filter_map(|request| match &request.tool_type {
@@ -1534,14 +1567,15 @@ fn assert_command_maps_to_run_command(turn: &Turn, workspace: &Path, token: &str
         })
         .collect();
 
-    let Some((tool_call_id, _, working_directory)) = commands
-        .iter()
-        .find(|(_, command, _)| command.contains(token))
+    let wanted = format!("echo {token}");
+    let Some((tool_call_id, _, working_directory)) =
+        commands.iter().find(|(_, command, _)| **command == wanted)
     else {
         panic!(
-            "{}: running `echo {token}` emitted no RunCommand card carrying that command. The \
-             card shows the command line the user is about to run; any other mapping shows the \
-             provider's raw arguments. Requests seen: {:?}, commands seen: {:?}",
+            "{}: running `{wanted}` emitted no RunCommand card carrying exactly that command \
+             line. The card shows the user the command that is about to run, verbatim; any other \
+             mapping shows the provider's raw arguments instead. Requests seen: {:?}, commands \
+             seen: {:?}",
             turn.label(),
             turn.tool_request_names(),
             commands
@@ -1551,16 +1585,26 @@ fn assert_command_maps_to_run_command(turn: &Turn, workspace: &Path, token: &str
         );
     };
 
-    let reported = Path::new(working_directory.as_str()).canonicalize().ok();
-    assert_eq!(
-        reported,
-        workspace.canonicalize().ok(),
-        "{}: the terminal card says the command ran in {working_directory:?}, but the agent's \
-         workspace is {}. The card's directory is how a user tells one agent's shell from \
-         another's.",
-        turn.label(),
-        workspace.display()
-    );
+    // Asserted only when the card reports one. Claude's `Bash` tool takes no
+    // working-directory argument, and `claude_tool_request_type` reads this
+    // field straight out of the provider's arguments (`claude.rs:11304`), so it
+    // is structurally always empty there — and the card renders that correctly,
+    // hiding the row behind `cwd_present` (`run_command.rs:58`) rather than
+    // showing a blank. Filling in the workspace root would be worse than empty:
+    // that shell carries `cd` state between calls, so the root is a guess about
+    // where the command ran, and a card that guesses is the thing this scenario
+    // exists to catch. What has to hold is that a reported directory is true.
+    if !working_directory.is_empty() {
+        assert_eq!(
+            Path::new(working_directory.as_str()).canonicalize().ok(),
+            workspace.canonicalize().ok(),
+            "{}: the terminal card says the command ran in {working_directory:?}, but the agent's \
+             workspace is {}. The card's directory is how a user tells one agent's shell from \
+             another's.",
+            turn.label(),
+            workspace.display()
+        );
+    }
 
     let result = result_for(turn, tool_call_id);
     assert!(
