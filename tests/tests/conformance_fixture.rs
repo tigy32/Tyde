@@ -201,6 +201,22 @@ impl Turn {
             .collect()
     }
 
+    /// Everything the turn streamed, whether or not it became a message.
+    ///
+    /// [`Turn::final_text`] reads the assembled `StreamEnd`, which a cancelled
+    /// turn is required *not* to produce: the partial deltas of an aborted
+    /// response never become a message. This is the only view of what the user
+    /// actually watched appear.
+    pub fn streamed_text(&self) -> String {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamDelta(delta) => Some(delta.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The text the user ends up looking at. Falls back to accumulated deltas
     /// for backends whose `StreamEnd` omits the assembled content.
     pub fn final_text(&self) -> String {
@@ -809,7 +825,8 @@ pub async fn answer_question(
 /// not a chat message, so it never produces one.
 pub async fn collect_until_idle(host: &mut Host, agent: &Agent, label: &str) -> Turn {
     let backend = host.backend_kind;
-    let context = format!("{} {label}", backend_label(backend));
+    let trace = backend_label(backend);
+    let context = format!("{trace} {label}");
     let mut events = Vec::new();
     loop {
         let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
@@ -819,6 +836,12 @@ pub async fn collect_until_idle(host: &mut Host, agent: &Agent, label: &str) -> 
             continue;
         }
         for event in chat_events_in(&envelope) {
+            // Traced like `collect_turn`. Without this a turn collected here
+            // leaves nothing in a paid run's log, and a failure such as "final
+            // response was empty" cannot be told from "the collector stopped on
+            // a stale idle signal left over from the previous turn" — the two
+            // have identical assertion output and different causes.
+            eprintln!("{trace} {event:?}");
             let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
             events.push(event);
             if idle {
@@ -838,6 +861,182 @@ pub async fn cancel_turn(host: &mut Host, agent: &Agent) -> Vec<ChatEvent> {
         .await
         .expect("interrupt failed");
     drain_events_for(host, Duration::from_secs(10)).await
+}
+
+/// When to send the interrupt.
+///
+/// The moment is the whole experiment. Interrupting an idle agent, or one that
+/// has already finished, exercises nothing; the two states below are the two
+/// the protocol's cancellation ordering actually describes.
+pub enum InterruptTrigger {
+    /// Once the model has streamed this many text deltas, which is proof a
+    /// response is open and still being written. Kept small because a backend
+    /// that batches its deltas would never reach a larger count, and the
+    /// evidence that the answer was cut short is the missing end-marker rather
+    /// than the delta count.
+    AfterTextDeltas(usize),
+    /// Once a tool card has opened, plus [`TOOL_STARTUP_GRACE`].
+    AfterToolRequest,
+}
+
+/// How long the client waits for an interrupted turn to report idle.
+///
+/// Generous next to the sub-second cancellations backends manage today, and far
+/// shorter than the ordinary 240s turn budget: a turn that simply runs to
+/// completion has to fail here rather than pass four minutes later.
+const INTERRUPT_DEADLINE: Duration = Duration::from_secs(45);
+
+/// A tool card opens when the request is emitted, which is before the process
+/// behind it has done anything. Interrupting in that window can be satisfied by
+/// a backend that had nothing to stop yet, so the command is given a moment to
+/// really be running.
+const TOOL_STARTUP_GRACE: Duration = Duration::from_secs(3);
+
+/// A turn that was interrupted, and where the interrupt falls in it.
+pub struct Interrupted {
+    turn: Turn,
+    /// How long between sending the interrupt and the turn reporting idle.
+    /// `None` when it never did within [`INTERRUPT_DEADLINE`] — deciding
+    /// whether that is a defect belongs to `conformance.rs`.
+    settled_in: Option<Duration>,
+}
+
+impl Interrupted {
+    /// The turn itself, for the assertions that do not care that it was cut
+    /// short.
+    pub fn turn(&self) -> &Turn {
+        &self.turn
+    }
+
+    pub fn label(&self) -> String {
+        self.turn.label()
+    }
+
+    pub fn events(&self) -> &[ChatEvent] {
+        self.turn.events()
+    }
+
+    pub fn settled_in(&self) -> Option<Duration> {
+        self.settled_in
+    }
+
+    pub fn deadline(&self) -> Duration {
+        INTERRUPT_DEADLINE
+    }
+}
+
+/// Run a prompt, interrupt it at `trigger`, and collect until the turn reports
+/// idle or [`INTERRUPT_DEADLINE`] expires.
+///
+/// Panics when the turn ends before the trigger fires: there is then no
+/// interrupted turn to hand back, and reporting that as a passing cancellation
+/// would be the most misleading thing this harness could do.
+pub async fn interrupt_turn(
+    host: &mut Host,
+    agent: &Agent,
+    prompt: &str,
+    trigger: InterruptTrigger,
+) -> Interrupted {
+    let backend = host.backend_kind;
+    let label = backend_label(backend);
+    let context = format!("{label} interrupted turn for prompt {prompt:?}");
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+
+    let mut events = Vec::new();
+    let mut saw_echo = false;
+    let mut deltas = 0usize;
+    let mut fire = false;
+    while !fire {
+        let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            eprintln!("{label} {event:?}");
+            if let ChatEvent::MessageAdded(message) = &event
+                && matches!(message.sender, MessageSender::User)
+                && message.content.contains(prompt)
+            {
+                saw_echo = true;
+            }
+            if !saw_echo {
+                continue;
+            }
+            match (&event, &trigger) {
+                (ChatEvent::StreamDelta(_), InterruptTrigger::AfterTextDeltas(wanted)) => {
+                    deltas += 1;
+                    fire |= deltas >= *wanted;
+                }
+                (ChatEvent::ToolRequest(_), InterruptTrigger::AfterToolRequest) => fire = true,
+                (ChatEvent::TypingStatusChanged(false), _) => panic!(
+                    "{context}: the turn went idle before there was anything to interrupt \
+                     ({deltas} text delta(s), {} tool request(s) seen). The prompt has to keep \
+                     the backend busy long enough for an interrupt to land, or this asserts \
+                     nothing.",
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
+                        .count()
+                ),
+                _ => {}
+            }
+            events.push(event);
+        }
+    }
+
+    if matches!(trigger, InterruptTrigger::AfterToolRequest) {
+        tokio::time::sleep(TOOL_STARTUP_GRACE).await;
+    }
+
+    let sent_at = tokio::time::Instant::now();
+    host.client
+        .interrupt(&agent.stream)
+        .await
+        .expect("interrupt failed");
+
+    let deadline = sent_at + INTERRUPT_DEADLINE;
+    let mut settled_in = None;
+    'settle: loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, host.client.next_event()).await {
+            Ok(Ok(Some(envelope))) => {
+                fail_on_agent_error(&envelope, &context);
+                fail_on_client_error(&envelope, &context);
+                if envelope.stream != agent.stream {
+                    continue;
+                }
+                for event in chat_events_in(&envelope) {
+                    eprintln!("{label} {event:?}");
+                    let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                    events.push(event);
+                    if idle {
+                        settled_in = Some(sent_at.elapsed());
+                        break 'settle;
+                    }
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => panic!("{context}: next_event failed: {error:?}"),
+            Err(_) => break,
+        }
+    }
+
+    Interrupted {
+        turn: Turn {
+            backend,
+            prompt: prompt.to_owned(),
+            events,
+        },
+        settled_in,
+    }
 }
 
 /// Send an ordinary message and fail fast if the server parks it in the queue.
@@ -873,7 +1072,11 @@ pub async fn ask_expecting_delivery(host: &mut Host, agent: &Agent, prompt: &str
         if envelope.stream != agent.stream {
             continue;
         }
-        if chat_events_in(&envelope).iter().any(|event| {
+        let events = chat_events_in(&envelope);
+        for event in &events {
+            eprintln!("{} {event:?}", backend_label(backend));
+        }
+        if events.iter().any(|event| {
             matches!(event, ChatEvent::MessageAdded(message)
                 if matches!(message.sender, MessageSender::User)
                     && message.content.contains(prompt))

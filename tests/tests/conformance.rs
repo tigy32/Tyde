@@ -56,6 +56,9 @@ const MAPPED_CREATE_MARKER: &str = "TYDE_MAPPED_CREATE";
 const MAPPED_EDIT_MARKER: &str = "TYDE_MAPPED_EDIT";
 const MAPPED_RUN_MARKER: &str = "TYDE_MAPPED_RUN";
 const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
+const COUNTED_MARKER: &str = "TYDE_COUNTED";
+const RAN_MARKER: &str = "TYDE_RAN";
+const INTERRUPT_PROOF_FILE: &str = "interrupt_proof.txt";
 
 /// Three files via three tool calls. Single-tool turns miss a whole class of
 /// defect: Codex joins a `commandExecution` back to its declaration through
@@ -64,9 +67,27 @@ const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
 /// two or more shell calls orphans every one of them.
 const MULTI_FILES: [&str; 3] = ["multi_a.txt", "multi_b.txt", "multi_c.txt"];
 
-/// A 20s command plus whatever polling interval the backend uses to notice it
-/// finished.
+/// The longest background command either scenario starts, plus whatever polling
+/// interval the backend uses to notice it finished.
 const BG_SETTLE: Duration = Duration::from_secs(60);
+
+/// How long the background command in `real_background_task_outlives_its_turn`
+/// runs. Only has to outlive its own turn.
+const BG_SECONDS: u64 = 20;
+
+/// The same command in `real_interruption`, which has to still be running
+/// several turns later when a *different* turn is interrupted. A command that
+/// finished first would make the whole background half of that scenario vacuous
+/// without failing anything.
+const BG_SECONDS_FOR_INTERRUPT: u64 = 45;
+
+/// How long the command in `slow_command_prompt` sleeps before it would write
+/// its proof file, and how long the client waits before concluding it never
+/// did. The settle has to outlast the sleep: a command that was reported
+/// cancelled but never actually killed writes the file late, and checking too
+/// early cannot tell that from a command that really died.
+const SLOW_COMMAND_SECONDS: u64 = 25;
+const KILL_SETTLE: Duration = Duration::from_secs(30);
 
 /// Long enough for a replay that has already finished to flush whatever it
 /// recorded, short enough that a clean resume does not pay for it.
@@ -200,6 +221,132 @@ fn real_tool_type_mappings() {
         assert_delete_is_not_an_opaque_card(&deleted, host.workspace());
         assert_final_text_contains(&deleted, MAPPED_DELETE_MARKER);
         turns.push(deleted);
+
+        assert_universal_contract(&turns);
+        assert_clean_close(&mut host, &agent).await;
+    });
+}
+
+/// Stopping the agent, in the three states there are to stop it in.
+///
+/// The protocol writes this contract down (`types.rs`, "Cancellation ordering")
+/// and nothing paid checks it. `backend.rs` has four certification cases for
+/// interrupt — `InterruptEmitsCancellation`, `InterruptReturnsIdle`,
+/// `InterruptStopsCommand`, `FollowUpAfterInterrupt` — and all four dispatch to
+/// the same function (`backend.rs:45019`), which interrupts a command and never
+/// touches a streaming response. Four case ids, one shape.
+///
+/// The three states are genuinely different code:
+///
+/// * **Mid-stream.** A response is open and being written. The one rule is that
+///   its partial deltas must not become a message — the user asked for the
+///   answer to stop, not for a truncated answer to be recorded as one.
+/// * **Mid-tool.** A foreground tool is running. Stopping has to reach the
+///   process, not just the card: a card reading "cancelled" over a command that
+///   ran to completion is worse than no card at all.
+/// * **With background work in flight.** The same protocol paragraph says calls
+///   already moved to `Background` continue independently, so this is the one
+///   interrupt that must *not* stop something.
+///
+/// Each is followed by an ordinary turn, because the failure that costs the most
+/// is not a missed event: it is an agent that accepts the next message and never
+/// runs it. `ask_expecting_delivery` fails on the queue snapshot rather than
+/// waiting out a timeout, so a wedge names itself.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_interruption() {
+    run_scenario(&[BackendCapability::Interrupt], |mut host| async move {
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        assert_final_text_contains(&launched, READY_MARKER);
+        assert_universal_contract(&[launched]);
+
+        // Two deltas rather than a comfortable dozen: a backend that batches
+        // its stream would never reach a larger count, and the evidence that
+        // the answer was cut short is the missing end-marker, not how much of
+        // it arrived first.
+        let mid_stream = interrupt_turn(
+            &mut host,
+            &agent,
+            &long_answer_prompt(),
+            InterruptTrigger::AfterTextDeltas(2),
+        )
+        .await;
+        assert_cancellation_contract(&mid_stream);
+        assert_the_answer_was_cut_short(&mid_stream);
+        assert_any_partial_message_is_what_was_streamed(&mid_stream);
+        let after_stream = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+        assert_final_text_contains(&after_stream, READY_MARKER);
+
+        let proof = host.workspace().join(INTERRUPT_PROOF_FILE);
+        let mid_tool = interrupt_turn(
+            &mut host,
+            &agent,
+            &slow_command_prompt(&proof),
+            InterruptTrigger::AfterToolRequest,
+        )
+        .await;
+        assert_cancellation_contract(&mid_tool);
+        assert_open_tool_was_cancelled(&mid_tool);
+        let killed = drain_events_for(&mut host, KILL_SETTLE).await;
+        assert_no_error_message(&format!("{:?} kill settle", host.backend()), &killed);
+        assert_cancelled_command_really_stopped(&mid_tool, &proof);
+        let after_tool = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+        assert_final_text_contains(&after_tool, READY_MARKER);
+
+        let mut turns = vec![after_stream, after_tool];
+
+        if host.declares(BackendCapability::BackgroundTasks) {
+            let bg_prompt = background_prompt(host.backend(), BG_SECONDS_FOR_INTERRUPT);
+            let started = ask(&mut host, &agent, &bg_prompt).await;
+            assert_final_text_contains(&started, BG_MARKER);
+            assert_background_task_is_still_open(&started);
+
+            let during_background = interrupt_turn(
+                &mut host,
+                &agent,
+                &long_answer_prompt(),
+                InterruptTrigger::AfterTextDeltas(2),
+            )
+            .await;
+            assert_cancellation_contract(&during_background);
+            assert_the_answer_was_cut_short(&during_background);
+            assert_any_partial_message_is_what_was_streamed(&during_background);
+
+            let settled = drain_events_for(&mut host, BG_SETTLE).await;
+            assert_no_error_message(&format!("{:?} background settle", host.backend()), &settled);
+            assert_background_task_survived_the_interrupt(
+                &started,
+                &during_background,
+                &settled,
+                host.workspace(),
+            );
+
+            let after_background =
+                ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+            assert_final_text_contains(&after_background, READY_MARKER);
+
+            // `started` deliberately skips `assert_universal_contract`, whose
+            // `assert_every_request_completed_exactly_once` requires every card
+            // to be closed by the end of its turn. A backgrounded command is
+            // the one shape where an open card at turn end is correct —
+            // `assert_background_task_is_still_open` above asserts it *must* be
+            // open — so the full contract contradicts the scenario it is
+            // applied to. Measured: Claude's background `run_command` card had
+            // 0 completions and read as a dropped card.
+            // `real_background_task_outlives_its_turn` excludes it for the same
+            // reason; the rest of the contract still holds and is asserted.
+            assert_no_error_message(&started.label(), started.events());
+            assert_streams_are_balanced(&started);
+            assert_reached_idle(&started);
+            turns.push(after_background);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare BackgroundTasks, so this run asserts nothing \
+                 about interrupting a turn while detached work is in flight",
+                host.backend()
+            );
+        }
 
         assert_universal_contract(&turns);
         assert_clean_close(&mut host, &agent).await;
@@ -564,7 +711,7 @@ fn real_background_task_outlives_its_turn() {
     run_scenario(
         &[BackendCapability::BackgroundTasks],
         |mut host| async move {
-            let prompt = background_prompt(host.backend());
+            let prompt = background_prompt(host.backend(), BG_SECONDS);
             let bg_path = host.workspace().join(BG_FILE);
             let agent = spawn_agent(&mut host, &prompt).await;
             let started = collect_turn(&mut host, &agent, &prompt).await;
@@ -907,20 +1054,55 @@ fn enter_worktree_prompt(worktree: &Path) -> String {
 /// generically, spark ran `/bin/zsh -lc '(sleep 20; echo DONE > f) &'`, whose
 /// outer shell exits immediately and whose subshell the sandbox reaps: nothing
 /// was promoted and the file was never written.
-fn background_prompt(backend_kind: BackendKind) -> String {
+fn background_prompt(backend_kind: BackendKind, seconds: u64) -> String {
     let launch = match backend_kind {
         BackendKind::Codex => format!(
-            "Run this exact shell command: sleep 20; echo DONE > {BG_FILE}. Run it as an \
+            "Run this exact shell command: sleep {seconds}; echo DONE > {BG_FILE}. Run it as an \
              ordinary foreground command in the workspace root — do not append `&`, and do \
              not use `nohup`, `disown`, or a detached subshell. Do not wait for its output."
         ),
         _ => format!(
-            "Start a shell command that sleeps for 20 seconds and then writes the word DONE \
-             into a file named {BG_FILE} in the workspace root. Run it in the background and \
+            "Start a shell command that sleeps for {seconds} seconds and then writes the word \
+             DONE into a file named {BG_FILE} in the workspace root. Run it in the background and \
              do not wait for it to finish."
         ),
     };
     format!("{launch} As soon as it is started, reply with exactly {BG_MARKER} and nothing else.")
+}
+
+/// A long answer with an identifiable end.
+///
+/// Counting rather than composing: a small pinned model asked to write an essay
+/// may decline, hedge, or produce three sentences, and a turn that ends on its
+/// own is a turn there was nothing to interrupt. Counting is cheap, it is
+/// unambiguously long, and its *end* is a fixed string — so the marker's absence
+/// is proof the answer was cut off rather than finished.
+fn long_answer_prompt() -> String {
+    format!(
+        "Count from 1 to 400, writing each number on its own line with no other text. Do not use \
+         any tools, do not abbreviate, and do not skip ahead — write out every number. When you \
+         have written 400, finish with exactly {COUNTED_MARKER} on its own final line. Do not \
+         write {COUNTED_MARKER} anywhere else."
+    )
+}
+
+/// A command slow enough to interrupt, whose completion leaves a trace.
+///
+/// The path is absolute because this file is the oracle for whether the process
+/// really died, and a card's working directory is not guaranteed — a relative
+/// path would make "the file is missing" mean "the command was killed" or
+/// "it wrote somewhere else", which is no oracle at all.
+///
+/// Wrapped in `python3` rather than written as `sleep`, matching `wait_prompt`:
+/// Claude's Bash tool blocks long leading sleeps outright, which would end the
+/// turn with nothing running.
+fn slow_command_prompt(proof: &Path) -> String {
+    format!(
+        "Run this exact shell command in the foreground and wait for it to finish — do not run it \
+         in the background: python3 -c \"import time; time.sleep({SLOW_COMMAND_SECONDS}); \
+         open('{}', 'w').write('proof')\"\nThen reply with exactly {RAN_MARKER} and nothing else.",
+        proof.display()
+    )
 }
 
 /// Wrapped in an interpreter rather than phrased as a bare `sleep`: Claude's
@@ -1734,6 +1916,352 @@ fn assert_delete_is_not_an_opaque_card(turn: &Turn, workspace: &Path) {
                 turn.label()
             );
         }
+    }
+}
+
+/// Longer than any cancellation observed today, short enough that a user would
+/// still call it "stopped". The deadline in the harness is nearly three times
+/// this: a turn that never goes idle and one that takes half a minute are
+/// different defects and should not share a failure message.
+const INTERRUPT_BUDGET: Duration = Duration::from_secs(20);
+
+/// The cancellation sequence the protocol requires, in order.
+///
+/// Written down verbatim at `protocol/src/types.rs` under "Cancellation
+/// ordering": abort the open response without turning its partial deltas into a
+/// message, complete each open foreground tool as cancelled, emit exactly one
+/// `OperationCancelled`, then emit `TypingStatusChanged(false)`.
+///
+/// The trailing check is ordered against `OperationCancelled` rather than
+/// against the moment the client sent the interrupt, on purpose. An event
+/// already in flight when `interrupt` is called legitimately arrives after it,
+/// so a check keyed on send time would be a race. `OperationCancelled` is
+/// emitted by the abort itself, so anything following it is unambiguously work
+/// the backend did *after* deciding the turn was over.
+fn assert_cancellation_contract(interrupted: &Interrupted) {
+    let turn = interrupted.turn();
+    assert_no_error_message(&turn.label(), turn.events());
+
+    let Some(settled_in) = interrupted.settled_in() else {
+        panic!(
+            "{}: never reported going idle in the {}s after the interrupt. The stop button leaves \
+             a turn that is still running as far as the client can tell, and nothing later can \
+             clear it. Events after the interrupt: {:?}",
+            turn.label(),
+            interrupted.deadline().as_secs(),
+            turn.events()
+                .iter()
+                .rev()
+                .take(8)
+                .map(describe_event)
+                .collect::<Vec<_>>()
+        )
+    };
+    assert!(
+        settled_in <= INTERRUPT_BUDGET,
+        "{}: took {:.1}s to stop. Cancelling is the one thing a user does when they already \
+         believe the agent is doing the wrong thing, so a stop that takes this long reads as one \
+         that did not work.",
+        turn.label(),
+        settled_in.as_secs_f64()
+    );
+
+    let cancellations: Vec<usize> = event_positions(turn, |event| {
+        matches!(event, ChatEvent::OperationCancelled(_))
+    });
+    assert_eq!(
+        cancellations.len(),
+        1,
+        "{}: one interrupt produced {} OperationCancelled event(s). Zero leaves the user with a \
+         turn that stopped for no stated reason; more than one is the same cancellation reported \
+         twice.",
+        turn.label(),
+        cancellations.len()
+    );
+    let idles: Vec<usize> = event_positions(turn, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    });
+    assert_eq!(
+        idles.len(),
+        1,
+        "{}: one interrupt produced {} idle signal(s); the composer enables and disables itself \
+         once per turn.",
+        turn.label(),
+        idles.len()
+    );
+
+    let cancelled_at = cancellations[0];
+    let idle_at = idles[0];
+    assert!(
+        cancelled_at < idle_at,
+        "{}: reported idle at event {idle_at} before cancelling at event {cancelled_at}. The turn \
+         goes quiet and only then explains itself, so the reason arrives after the user has \
+         already started typing again.",
+        turn.label()
+    );
+
+    let trailing: Vec<String> = turn.events()[cancelled_at + 1..]
+        .iter()
+        .filter(|event| !matches!(event, ChatEvent::TypingStatusChanged(false)))
+        .map(describe_event)
+        .collect();
+    assert!(
+        trailing.is_empty(),
+        "{}: kept producing {trailing:?} after announcing the cancellation. Everything after \
+         OperationCancelled is work the backend did on a turn it had already told the user was \
+         over.",
+        turn.label()
+    );
+}
+
+fn event_positions(turn: &Turn, predicate: impl Fn(&ChatEvent) -> bool) -> Vec<usize> {
+    turn.events()
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| predicate(event))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Failure-message material. `Debug` on a `ChatEvent` prints whole message
+/// bodies, which buries the one thing a reader needs — which kind of event it
+/// was.
+fn describe_event(event: &ChatEvent) -> String {
+    match event {
+        ChatEvent::MessageAdded(message) => format!("MessageAdded({:?})", message.sender),
+        ChatEvent::MessageMetadataUpdated(_) => "MessageMetadataUpdated".to_owned(),
+        ChatEvent::TypingStatusChanged(active) => format!("TypingStatusChanged({active})"),
+        ChatEvent::StreamStart(_) => "StreamStart".to_owned(),
+        ChatEvent::StreamDelta(_) => "StreamDelta".to_owned(),
+        ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta".to_owned(),
+        ChatEvent::StreamEnd(_) => "StreamEnd".to_owned(),
+        ChatEvent::ToolRequest(request) => format!("ToolRequest({})", request.tool_call_id),
+        ChatEvent::ToolProgress(progress) => format!("ToolProgress({})", progress.tool_call_id),
+        ChatEvent::ToolExecutionCompleted(completion) => {
+            format!("ToolExecutionCompleted({})", completion.tool_call_id)
+        }
+        ChatEvent::TaskUpdate(_) => "TaskUpdate".to_owned(),
+        ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
+        ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),
+        ChatEvent::Orchestration(_) => "Orchestration".to_owned(),
+        ChatEvent::ContextCompaction(_) => "ContextCompaction".to_owned(),
+    }
+}
+
+/// The interrupt reached the model, not just the client.
+///
+/// Without this the scenario is vacuous in the worst way: a backend that
+/// forwards nothing and lets the model finish still emits a tidy cancellation
+/// afterwards and satisfies every ordering check above. The marker is the last
+/// thing the answer contains, so its absence is the proof — and the streamed
+/// text has to be non-empty, or nothing was interrupted either.
+fn assert_the_answer_was_cut_short(interrupted: &Interrupted) {
+    let turn = interrupted.turn();
+    let streamed = turn.streamed_text();
+    assert!(
+        !streamed.trim().is_empty(),
+        "{}: the turn streamed no text at all before the interrupt, so there was no answer in \
+         progress to cut short. Events: {:?}",
+        turn.label(),
+        turn.events().iter().map(describe_event).collect::<Vec<_>>()
+    );
+    let finished = streamed.contains(COUNTED_MARKER)
+        || turn
+            .assistant_messages()
+            .any(|message| message.content.contains(COUNTED_MARKER));
+    assert!(
+        !finished,
+        "{}: the answer reached {COUNTED_MARKER}, which the prompt puts on its final line, so the \
+         model finished before the interrupt reached it. Everything else in this scenario is \
+         asserting over a turn that was never actually interrupted. {} character(s) streamed.",
+        turn.label(),
+        streamed.len()
+    );
+}
+
+/// Step one of the cancellation sequence: whatever the transcript keeps of an
+/// interrupted answer is text the user actually watched arrive.
+///
+/// The protocol's wording is that `OperationCancelled` aborts the open response
+/// "without fabricating a partial assistant message". This asserted the literal
+/// shape — no `StreamEnd` for the aborted response — and that reads the rule
+/// wider than it is. Measured 2026-08-19, three of the four backends reachable
+/// that day close the response with the partial text, and in each case the
+/// partial is real rather than fabricated:
+///
+/// * Claude records it in the CLI's own session file as an ordinary assistant
+///   row, followed by a synthetic `[Request interrupted by user]` user row.
+///   Suppressing it in Tyde would leave the transcript missing a turn the model
+///   genuinely has in its context, and a later resume would replay text the
+///   live stream never showed.
+/// * Hermes says so outright: its completion payload is
+///   `{"status": "interrupted", "text": "1\n2\n…20"}`. The provider is reporting
+///   a truncated answer, not Tyde inventing one.
+/// * Tycode behaves the same way. Kiro is the one that discards it.
+///
+/// So the guarantee worth holding is not "no message" but "no *invented*
+/// message", which is narrower than the count check and catches something it
+/// could not: a backend that closes the response with text the user never saw —
+/// padding it back to a whole answer, or substituting a re-request's output — is
+/// caught here and was invisible before, because it produces exactly the one
+/// `StreamStart`/one `StreamEnd` pair the old assertion demanded.
+///
+/// Compared as a prefix rather than for equality: a provider cuts its own text
+/// at a token boundary while the stream carries whatever deltas were already in
+/// flight, so the message is a truncation of what was streamed. Growing past the
+/// stream is the direction that would mean invention.
+/// Scoped to messages that claim to be the model's answer. Tycode closes an
+/// interrupted response with a `StreamEnd` whose message is
+/// `sender: Error, content: "Operation cancelled"` — a notice about the turn
+/// rather than a fabricated answer, and not what this is hunting. (That notice
+/// is worth a second look on its own: it renders a cancel the user asked for as
+/// an error, and it slips past `assert_no_error_message`, which only inspects
+/// `MessageAdded`.)
+fn assert_any_partial_message_is_what_was_streamed(interrupted: &Interrupted) {
+    let turn = interrupted.turn();
+    let streamed = turn.streamed_text();
+    for message in turn
+        .assistant_messages()
+        .filter(|message| matches!(message.sender, MessageSender::Assistant { .. }))
+    {
+        let kept = message.content.trim();
+        assert!(
+            streamed.trim().starts_with(kept),
+            "{}: the interrupted turn kept an assistant message the stream never produced. The \
+             message holds {kept:?} and the user watched {:?} arrive. A cancelled answer may be \
+             recorded as far as it got and no further.",
+            turn.label(),
+            streamed.trim()
+        );
+    }
+}
+
+/// Step two: each open foreground tool completes as cancelled.
+///
+/// A tool left open is the card that spins forever — `TurnEmitter` has already
+/// retired the turn, so nothing later can close it. Completing it as *succeeded*
+/// is worse: the card claims the command finished normally.
+fn assert_open_tool_was_cancelled(interrupted: &Interrupted) {
+    let turn = interrupted.turn();
+    let requests: Vec<&str> = turn
+        .tool_requests()
+        .map(|request| request.tool_call_id.as_str())
+        .collect();
+    assert!(
+        !requests.is_empty(),
+        "{}: emitted no tool request, so no tool was running when the interrupt arrived and this \
+         asserted nothing about cancelling one. The turn replied {:?}.",
+        turn.label(),
+        turn.final_text()
+    );
+
+    for tool_call_id in &requests {
+        let outcomes: Vec<&ToolExecutionOutcome> = turn
+            .tool_completions()
+            .filter(|completion| &completion.tool_call_id == tool_call_id)
+            .map(|completion| &completion.outcome)
+            .collect();
+        let [outcome] = outcomes.as_slice() else {
+            panic!(
+                "{}: the interrupted tool {tool_call_id:?} has {} completions, expected exactly \
+                 one. None leaves the card spinning on a turn that is already over; more than one \
+                 means the cancellation and the real result both closed it.",
+                turn.label(),
+                outcomes.len()
+            );
+        };
+        assert!(
+            matches!(outcome, ToolExecutionOutcome::Cancelled { .. }),
+            "{}: the interrupted tool {tool_call_id:?} completed as {outcome:?}. The protocol asks \
+             for a cancelled completion; a succeeded one tells the user the command finished, and \
+             a failed one blames the tool for something the user did.",
+            turn.label()
+        );
+    }
+}
+
+/// The process died, not just the card.
+///
+/// This is the assertion the whole mid-tool half exists for. Every event-stream
+/// check above passes for a backend that closes the card and lets the command
+/// run to completion, and that is the dangerous version of the bug: the user is
+/// told the thing they stopped was stopped. The file is written only if the
+/// command survived, and [`KILL_SETTLE`] outlasts the sleep, so a surviving
+/// process has had its chance.
+fn assert_cancelled_command_really_stopped(interrupted: &Interrupted, proof: &Path) {
+    assert!(
+        !proof.exists(),
+        "{}: {} was written, so the command ran to completion after the turn was reported \
+         cancelled. The card says the user stopped it and the work happened anyway.",
+        interrupted.label(),
+        proof.display()
+    );
+}
+
+/// The background command was still running when the next turn began.
+///
+/// Same discriminator as `real_background_task_outlives_its_turn`: a completed
+/// card means the command finished inside its own turn, and the interrupt that
+/// follows would then have nothing detached to leave alone.
+fn assert_background_task_is_still_open(turn: &Turn) {
+    let requests = turn.tool_requests().count();
+    let completions = turn.tool_completions().count();
+    assert!(
+        requests > completions,
+        "{}: all {requests} tool request(s) completed inside the turn that started them, so no \
+         background work was in flight for the next interrupt to spare.",
+        turn.label()
+    );
+}
+
+/// Step two's exception: calls already moved to `Background` continue
+/// independently.
+///
+/// Interrupting is a foreground gesture — the user is stopping the answer in
+/// front of them, not the job they deliberately detached. A backend that kills
+/// detached work here silently loses it, and the only place that shows up is the
+/// file the command was going to write.
+fn assert_background_task_survived_the_interrupt(
+    started: &Turn,
+    interrupted: &Interrupted,
+    settled: &[ChatEvent],
+    workspace: &Path,
+) {
+    let bg_path = workspace.join(BG_FILE);
+    assert!(
+        bg_path.is_file(),
+        "{}: {} was never written. The background command was still running when a *different* \
+         turn was interrupted, and interrupting the foreground took it down with it.",
+        interrupted.label(),
+        bg_path.display()
+    );
+
+    let open: BTreeSet<&str> = started
+        .tool_requests()
+        .map(|request| request.tool_call_id.as_str())
+        .filter(|tool_call_id| {
+            !started
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == *tool_call_id)
+        })
+        .collect();
+    for tool_call_id in open {
+        let completions = interrupted
+            .events()
+            .iter()
+            .chain(settled)
+            .filter(|event| {
+                matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == tool_call_id)
+            })
+            .count();
+        assert!(
+            completions <= 1,
+            "{}: the background tool {tool_call_id:?} was completed {completions} times across the \
+             interrupt and the wait that followed. The cancellation closed a card the real result \
+             then closed again.",
+            interrupted.label()
+        );
     }
 }
 
