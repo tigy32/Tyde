@@ -906,6 +906,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::TaskListClear,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
+            tyde_agent_adapter::BackendCapability::GenericModifyFile,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::OpaqueToolProgress,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
@@ -4861,6 +4862,7 @@ impl HermesEventMapper {
                         },
                     )
                 })
+                .or_else(|| hermes_native_tool_result(&tool_name, &arguments, &result))
                 .unwrap_or_else(|| ToolExecutionResult::Other {
                     result: result.clone(),
                 });
@@ -5484,7 +5486,96 @@ fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option
             execution_mode: protocol::AgentExecutionMode::Background,
         });
     }
-    None
+
+    // Hermes's file toolset is `read_file`, `write_file`, `patch` and
+    // `search_files` (`hermes-agent/model_tools.py:241`), and its arguments
+    // reach Tyde under the tool function's own parameter names. Only the two
+    // that change a file are mapped; a search has no Tyde request type that
+    // means the same thing, and `SearchTypes` is an LSP type lookup, not a text
+    // search.
+    match normalized.as_str() {
+        "writefile" => {
+            let file_path = non_empty_value_string(arguments, &["path"])?;
+            let after = arguments.get("content")?.as_str()?.to_owned();
+            // `before` is empty rather than read off disk. Hermes emits
+            // `tool.start` as it begins running the tool in its own process, so
+            // a read here races the write and can return the text that was just
+            // written — which renders as a diff with no lines in it, the exact
+            // defect this area keeps producing. An overwrite therefore shows as
+            // an all-added file: it overstates what changed, but it never
+            // claims a change that did not happen, and `patch` is the tool
+            // Hermes reaches for when editing rather than replacing.
+            Some(ToolRequestType::ModifyFile {
+                file_path,
+                before: String::new(),
+                after,
+            })
+        }
+        "patch" => {
+            // `patch_tool`'s `mode` defaults to "replace"
+            // (`hermes-agent/tools/file_tools.py:1499`), whose `old_string` and
+            // `new_string` are exactly the two sides of the card and need no
+            // filesystem access at all. The other mode is V4A, whose patch text
+            // can carry several files and has no single `ModifyFile` to become.
+            let mode = arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("replace");
+            if mode != "replace" {
+                return None;
+            }
+            let file_path = non_empty_value_string(arguments, &["path"])?;
+            let before = arguments.get("old_string")?.as_str()?.to_owned();
+            let after = arguments.get("new_string")?.as_str()?.to_owned();
+            Some(ToolRequestType::ModifyFile {
+                file_path,
+                before,
+                after,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The result for a tool whose request Tyde mapped to a Tyde type.
+///
+/// Keyed off `hermes_native_tool_request_type` so a card's footer cannot end up
+/// describing a different tool than its body.
+fn hermes_native_tool_result(
+    tool_name: &str,
+    arguments: &Value,
+    result: &Value,
+) -> Option<ToolExecutionResult> {
+    match hermes_native_tool_request_type(tool_name, arguments)? {
+        // From the request's own arguments, not the result: Hermes reports
+        // `resolved_path` and `files_modified` back, but nothing about what the
+        // file held before.
+        ToolRequestType::ModifyFile { before, after, .. } => {
+            let (lines_added, lines_removed) = crate::backend::estimate_line_delta(&before, &after);
+            Some(ToolExecutionResult::ModifyFile {
+                lines_added,
+                lines_removed,
+            })
+        }
+        // `terminal_tool` returns "JSON string with output, exit_code, and error
+        // fields" (`hermes-agent/tools/terminal_tool.py:2019`). Only the success
+        // path reaches here — `hermes_tool_error` turns a populated `error` into
+        // a failed outcome — so `error` is null and there is no stderr to carry.
+        ToolRequestType::RunCommand { .. } => {
+            let exit_code = result.get("exit_code").and_then(Value::as_i64)? as i32;
+            let stdout = result
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Some(ToolExecutionResult::RunCommand {
+                exit_code,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn normalized_hermes_tool_name(tool_name: &str) -> String {
