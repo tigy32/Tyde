@@ -89,6 +89,16 @@ const BG_SECONDS_FOR_INTERRUPT: u64 = 45;
 const SLOW_COMMAND_SECONDS: u64 = 25;
 const KILL_SETTLE: Duration = Duration::from_secs(30);
 
+/// How far into the answer the stop lands.
+///
+/// `long_answer_prompt` asks for 1..400, which is 1,492 characters; 200 of them
+/// is around the number 70. Deliberately deep rather than at the first delta:
+/// the reported failure is a stop that arrives while a long message is already
+/// streaming and is held until the model finishes writing it, and a stop sent a
+/// second in — before the provider has committed to a long response — is the
+/// easy case. Well short of the whole answer, so there is plenty left to cut.
+const MID_ANSWER_CHARS: usize = 200;
+
 /// Long enough for a replay that has already finished to flush whatever it
 /// recorded, short enough that a clean resume does not pay for it.
 const RESUME_SETTLE: Duration = Duration::from_secs(5);
@@ -261,19 +271,22 @@ fn real_interruption() {
         assert_final_text_contains(&launched, READY_MARKER);
         assert_universal_contract(&[launched]);
 
-        // Two deltas rather than a comfortable dozen: a backend that batches
-        // its stream would never reach a larger count, and the evidence that
-        // the answer was cut short is the missing end-marker, not how much of
-        // it arrived first.
         let mid_stream = interrupt_turn(
             &mut host,
             &agent,
             &long_answer_prompt(),
-            InterruptTrigger::AfterTextDeltas(2),
+            InterruptTrigger::AfterStreamedChars(MID_ANSWER_CHARS),
         )
         .await;
-        assert_cancellation_contract(&mid_stream);
+        // Before the contract, deliberately. "Did the interrupt reach the
+        // model at all" is the more fundamental question, and a stop that is
+        // queued until the answer completes fails *here* with a message saying
+        // so — where checking the contract first reports whatever the backend
+        // emitted afterwards and sends the reader somewhere else. Codex on
+        // gpt-5.6-luna does exactly that: it reports a protocol violation on
+        // every interrupt, which was masking this check entirely.
         assert_the_answer_was_cut_short(&mid_stream);
+        assert_cancellation_contract(&mid_stream);
         assert_any_partial_message_is_what_was_streamed(&mid_stream);
         let after_stream = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
         assert_final_text_contains(&after_stream, READY_MARKER);
@@ -306,11 +319,11 @@ fn real_interruption() {
                 &mut host,
                 &agent,
                 &long_answer_prompt(),
-                InterruptTrigger::AfterTextDeltas(2),
+                InterruptTrigger::AfterStreamedChars(MID_ANSWER_CHARS),
             )
             .await;
-            assert_cancellation_contract(&during_background);
             assert_the_answer_was_cut_short(&during_background);
+            assert_cancellation_contract(&during_background);
             assert_any_partial_message_is_what_was_streamed(&during_background);
 
             let settled = drain_events_for(&mut host, BG_SETTLE).await;

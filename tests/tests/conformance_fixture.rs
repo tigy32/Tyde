@@ -869,12 +869,23 @@ pub async fn cancel_turn(host: &mut Host, agent: &Agent) -> Vec<ChatEvent> {
 /// has already finished, exercises nothing; the two states below are the two
 /// the protocol's cancellation ordering actually describes.
 pub enum InterruptTrigger {
-    /// Once the model has streamed this many text deltas, which is proof a
-    /// response is open and still being written. Kept small because a backend
-    /// that batches its deltas would never reach a larger count, and the
-    /// evidence that the answer was cut short is the missing end-marker rather
-    /// than the delta count.
-    AfterTextDeltas(usize),
+    /// Once the model has streamed this many characters of text, which is both
+    /// proof a response is open and a measure of how far into it the stop
+    /// lands.
+    ///
+    /// How deep matters: a stop sent at the first delta arrives before the
+    /// provider has committed to a long answer and is the easy case, while the
+    /// failure users report is a stop that lands well inside a long message and
+    /// is held until the model finishes writing it.
+    ///
+    /// Counted in characters rather than deltas because a delta count measures
+    /// the transport's chunking, not progress through the answer. Measured on
+    /// the same prompt, Claude put 5 numbers in a delta on one run and 24 on
+    /// another, and Hermes emits 2 characters at a time — so any delta
+    /// threshold deep enough to be interesting for one backend is unreachable
+    /// for another, and "unreachable" here means the turn ends before the
+    /// interrupt is ever sent.
+    AfterStreamedChars(usize),
     /// Once a tool card has opened, plus [`TOOL_STARTUP_GRACE`].
     AfterToolRequest,
 }
@@ -947,7 +958,7 @@ pub async fn interrupt_turn(
 
     let mut events = Vec::new();
     let mut saw_echo = false;
-    let mut deltas = 0usize;
+    let mut streamed = 0usize;
     let mut fire = false;
     while !fire {
         let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
@@ -968,16 +979,16 @@ pub async fn interrupt_turn(
                 continue;
             }
             match (&event, &trigger) {
-                (ChatEvent::StreamDelta(_), InterruptTrigger::AfterTextDeltas(wanted)) => {
-                    deltas += 1;
-                    fire |= deltas >= *wanted;
+                (ChatEvent::StreamDelta(delta), InterruptTrigger::AfterStreamedChars(wanted)) => {
+                    streamed += delta.text.chars().count();
+                    fire |= streamed >= *wanted;
                 }
                 (ChatEvent::ToolRequest(_), InterruptTrigger::AfterToolRequest) => fire = true,
                 (ChatEvent::TypingStatusChanged(false), _) => panic!(
                     "{context}: the turn went idle before there was anything to interrupt \
-                     ({deltas} text delta(s), {} tool request(s) seen). The prompt has to keep \
-                     the backend busy long enough for an interrupt to land, or this asserts \
-                     nothing.",
+                     ({streamed} character(s) streamed, {} tool request(s) seen). The prompt has \
+                     to keep the backend busy long enough for an interrupt to land, or this \
+                     asserts nothing.",
                     events
                         .iter()
                         .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
