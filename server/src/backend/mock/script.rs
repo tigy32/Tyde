@@ -122,6 +122,22 @@ impl MockTurn {
         ))
     }
 
+    /// One delta per character, the way Codex actually streams.
+    ///
+    /// The provider's chunking is not a detail the client should inherit: a
+    /// 1,500-character answer arrives from Codex as ~1,000 events and from
+    /// Claude as ~34, and it is the event count — not the text — that decides
+    /// whether a client can keep up with the server it is rendering.
+    pub fn text_streamed_per_character(text: impl Into<String>) -> Self {
+        Self::done(text_steps(
+            text.into(),
+            TextShape {
+                per_character: true,
+                ..TextShape::default()
+            },
+        ))
+    }
+
     pub fn text_without_usage(text: impl Into<String>) -> Self {
         Self::done(text_steps(
             text.into(),
@@ -434,6 +450,9 @@ struct TextShape {
     /// the gate and the trailing idle — i.e. while the turn is still busy.
     busy_native_child: Option<MockNativeChild>,
     gate: Option<MockGate>,
+    /// Emit the text one character per delta instead of all at once, which is
+    /// how Codex really streams (measured: 1.44 characters per delta).
+    per_character: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -449,8 +468,15 @@ fn text_steps(text: String, shape: TextShape) -> Vec<MockStep> {
     let mut steps = vec![
         MockStep::emit(emit::typing(true)),
         MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
-        MockStep::emit(emit::stream_delta(text.clone())),
     ];
+    if shape.per_character {
+        steps.extend(
+            text.chars()
+                .map(|ch| MockStep::emit(emit::stream_delta(ch.to_string()))),
+        );
+    } else {
+        steps.push(MockStep::emit(emit::stream_delta(text.clone())));
+    }
     if let Some(diagnostic) = &shape.mid_turn_error {
         steps.push(MockStep::emit(emit::error_card(diagnostic)));
     }

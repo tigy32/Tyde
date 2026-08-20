@@ -8778,3 +8778,57 @@ fn project_roots(project: &Project) -> Vec<String> {
         .map(|root| root.0)
         .collect()
 }
+
+/// A provider that streams one character at a time must not put one frame per
+/// character on the wire.
+///
+/// Every event the server emits becomes an envelope, a transport frame, a Tauri
+/// IPC message and a wasm dispatch. Measured on one 1,492-character answer,
+/// Codex sends 1.44 characters per delta and Claude sends 44 — so the same
+/// answer is ~1,000 events from one and ~34 from the other, and the client
+/// inherits whichever the provider happened to choose. A client that cannot
+/// keep up renders a turn the server has already finished, and acts on it: the
+/// user presses stop against text that is already history, and the cancel
+/// arrives after the turn it was meant for.
+///
+/// The text must survive exactly. Fewer events carrying different text would be
+/// a worse bug than the one this fixes.
+#[tokio::test]
+async fn per_character_streaming_reaches_the_client_coalesced() {
+    const ANSWER: &str = "The quick brown fox jumps over the lazy dog, and then keeps going for a \
+                          while longer so that this answer is comfortably past one coalescing \
+                          window in length.";
+
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "coalescing-agent",
+            MockScript::one(MockTurn::text_streamed_per_character(ANSWER)),
+        )
+        .await;
+
+    let mut streamed = String::new();
+    let mut deltas = 0usize;
+    loop {
+        let env = expect_chat_event_on_stream(&mut fixture.client, &agent.stream, "delta").await;
+        match env.parse_payload().expect("parse ChatEvent") {
+            ChatEvent::StreamDelta(delta) => {
+                streamed.push_str(&delta.text);
+                deltas += 1;
+            }
+            ChatEvent::StreamEnd(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        streamed, ANSWER,
+        "coalescing changed the text: the client assembled {streamed:?}"
+    );
+    assert!(
+        deltas < ANSWER.chars().count(),
+        "{} characters arrived as {deltas} delta(s), so every character still became its own \
+         event and the client pays one frame, one IPC hop and one dispatch per character",
+        ANSWER.chars().count()
+    );
+}

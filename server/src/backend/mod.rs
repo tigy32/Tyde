@@ -438,11 +438,57 @@ enum EventStreamReceiver {
     Backend(mpsc::UnboundedReceiver<BackendEvent>),
 }
 
+/// The longest a run of text deltas is held before it goes out as one event.
+///
+/// Providers disagree wildly about delta size. Measured on one 1,492-character
+/// answer: Codex sends 1.44 characters per delta, Hermes 2.5, Claude 44. So the
+/// same answer is roughly 1,000 events from Codex and 34 from Claude, and each
+/// event becomes an envelope, a transport frame, a Tauri IPC message and a wasm
+/// dispatch. The flood is what puts a client behind the server it is rendering,
+/// and a client that is behind acts on a turn that has already moved on — it
+/// cancels a turn that already ended, and the cancel then lands on whatever
+/// comes next.
+///
+/// 100ms is 10 emissions a second, which bounds the event rate by wall time
+/// rather than by whatever the provider chose. It is chosen for the ceiling on
+/// client work, not for how the text looks: mid-stream text is read as it
+/// lands, so the difference between 10 and 20 updates a second is not worth
+/// halving the headroom that keeps the client level with the server.
+const STREAM_DELTA_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `StreamTextDeltaData` carries only its text, so taking a delta apart and
+/// putting it back together loses nothing.
+fn rebuild_delta(reasoning: bool, text: String) -> BackendEvent {
+    let data = protocol::StreamTextDeltaData { text };
+    BackendEvent::Chat(if reasoning {
+        ChatEvent::StreamReasoningDelta(data)
+    } else {
+        ChatEvent::StreamDelta(data)
+    })
+}
+
+/// Text deltas held back, waiting to go out as one event.
+struct PendingDelta {
+    /// Which kind of delta is buffered. Text and reasoning never coalesce into
+    /// each other: they are separate events whose relative order is meaningful,
+    /// so a delta of the other kind flushes this one first.
+    reasoning: bool,
+    text: String,
+    deadline: tokio::time::Instant,
+}
+
 pub struct EventStream {
     rx: EventStreamReceiver,
     buffered: VecDeque<BackendEvent>,
     resume_replay_complete: Option<oneshot::Receiver<()>>,
     transcript_metadata_projector: Option<BackendTranscriptMetadataProjector>,
+    pending_delta: Option<PendingDelta>,
+    /// Whether the open response has already had a delta emitted.
+    ///
+    /// The first one always goes out immediately. What a reader notices is the
+    /// answer *starting*; holding that back to fill a window would trade a
+    /// visible regression for the fix. Only the flood after it is batched.
+    response_started_streaming: bool,
 }
 
 impl EventStream {
@@ -450,6 +496,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Chat(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -459,6 +507,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -471,6 +521,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: None,
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -483,6 +535,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Chat(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -495,6 +549,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -508,6 +564,8 @@ impl EventStream {
         Self {
             rx: EventStreamReceiver::Backend(rx),
             buffered: VecDeque::new(),
+            pending_delta: None,
+            response_started_streaming: false,
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -565,17 +623,112 @@ impl EventStream {
         }
     }
 
+    /// Cancel-safe: every await here is cancel-safe on its own, and a received
+    /// event is folded into `self` by a synchronous step before the next one.
+    /// The caller selects on this future, so anything held only in a local
+    /// would be lost when another branch wins.
     pub(crate) async fn recv_backend(&mut self) -> Option<BackendEvent> {
-        if let Some(event) = self.buffered.pop_front() {
-            return Some(event);
+        loop {
+            if let Some(event) = self.buffered.pop_front() {
+                return Some(event);
+            }
+            let deadline = self.pending_delta.as_ref().map(|pending| pending.deadline);
+            let incoming = match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        incoming = Self::recv_raw(&mut self.rx) => incoming,
+                        _ = tokio::time::sleep_until(deadline) => return self.take_pending_delta(),
+                    }
+                }
+                None => Self::recv_raw(&mut self.rx).await,
+            };
+            let Some(event) = incoming else {
+                // The backend is gone. Whatever was held back is still text the
+                // model produced, so it goes out before the stream ends rather
+                // than disappearing with it.
+                return self.take_pending_delta();
+            };
+            if let Some(ready) = self.absorb(event) {
+                return Some(ready);
+            }
         }
-        match &mut self.rx {
+    }
+
+    async fn recv_raw(rx: &mut EventStreamReceiver) -> Option<BackendEvent> {
+        match rx {
             EventStreamReceiver::Chat(rx) => rx.recv().await.map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.recv().await,
         }
     }
 
+    /// Fold one event into the coalescer, returning what the caller should emit
+    /// now. `None` means the event was held back to be merged with the deltas
+    /// that follow it.
+    fn absorb(&mut self, event: BackendEvent) -> Option<BackendEvent> {
+        // Taken apart rather than inspected, so the text can be moved into the
+        // buffer without cloning it and without a helper that has to invent a
+        // value for the events that carry no text.
+        let (reasoning, text) = match event {
+            BackendEvent::Chat(ChatEvent::StreamDelta(data)) => (false, data.text),
+            BackendEvent::Chat(ChatEvent::StreamReasoningDelta(data)) => (true, data.text),
+            other => {
+                // Ordering is the whole contract: a tool card, the end of a
+                // response or a cancellation must never overtake the text that
+                // preceded it. Anything that is not a delta flushes first and
+                // waits its turn in `buffered`, which the loop above drains
+                // before it receives again.
+                if let Some(pending) = self.take_pending_delta() {
+                    self.buffered.push_back(other);
+                    return Some(pending);
+                }
+                if matches!(other, BackendEvent::Chat(ChatEvent::StreamStart(_))) {
+                    self.response_started_streaming = false;
+                }
+                return Some(other);
+            }
+        };
+
+        if !self.response_started_streaming {
+            self.response_started_streaming = true;
+            return Some(rebuild_delta(reasoning, text));
+        }
+
+        match &mut self.pending_delta {
+            Some(pending) if pending.reasoning == reasoning => {
+                pending.text.push_str(&text);
+                None
+            }
+            // A delta of the other kind cannot merge into this one, so the
+            // buffered run goes out and the new kind starts its own.
+            Some(_) => {
+                let flushed = self.take_pending_delta();
+                self.buffered.push_back(rebuild_delta(reasoning, text));
+                flushed
+            }
+            None => {
+                self.pending_delta = Some(PendingDelta {
+                    reasoning,
+                    text,
+                    deadline: tokio::time::Instant::now() + STREAM_DELTA_COALESCE_WINDOW,
+                });
+                None
+            }
+        }
+    }
+
+    fn take_pending_delta(&mut self) -> Option<BackendEvent> {
+        let pending = self.pending_delta.take()?;
+        Some(rebuild_delta(pending.reasoning, pending.text))
+    }
+
     pub(crate) fn try_recv_backend(&mut self) -> Result<BackendEvent, mpsc::error::TryRecvError> {
+        // Held-back text first, for the same ordering reason as the async path:
+        // a caller draining this stream must not see a later event before the
+        // deltas that came before it.
+        if let Some(pending) = self.take_pending_delta() {
+            return Ok(pending);
+        }
         if let Some(event) = self.buffered.pop_front() {
             return Ok(event);
         }
