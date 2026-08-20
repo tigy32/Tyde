@@ -8958,7 +8958,17 @@ impl CodexInner {
         self.finalize_strict_response(&params, false).await;
     }
 
-    async fn finalize_incomplete_strict_response(&self, params: &Value, reason: &str) -> bool {
+    /// Close a response the turn left open, reporting `reason` unless it is
+    /// `None`.
+    ///
+    /// `None` is for the turns that end this way by construction rather than by
+    /// fault — see [`incomplete_turn_response_error`]. Those still close the
+    /// response and still drop its held completions; they just say nothing.
+    async fn finalize_incomplete_strict_response(
+        &self,
+        params: &Value,
+        reason: Option<&str>,
+    ) -> bool {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return false;
         };
@@ -8966,11 +8976,13 @@ impl CodexInner {
         if !self.finalize_strict_response(params, true).await {
             return false;
         }
-        if let Some((emitter, _)) = target {
+        if let Some((emitter, _)) = target
+            && let Some(reason) = reason
+        {
             emitter.backend_error(reason);
         }
-        // The response failed, so it declared nothing; anything still held for
-        // this thread has lost its only chance at a card.
+        // The response never completed, so it declared nothing; anything still
+        // held for this thread has lost its only chance at a card.
         self.discard_deferred_tool_completions(&thread_id).await;
         true
     }
@@ -8992,7 +9004,7 @@ impl CodexInner {
         for (thread_id, turn_id) in open_responses {
             self.finalize_incomplete_strict_response(
                 &json!({ "threadId": thread_id, "turnId": turn_id }),
-                reason,
+                Some(reason),
             )
             .await;
         }
@@ -9101,7 +9113,7 @@ impl CodexInner {
         if method == "turn/completed" {
             self.finalize_incomplete_strict_response(
                 params,
-                "Codex turn ended before rawResponse/completed",
+                incomplete_turn_response_error(params),
             )
             .await;
         }
@@ -14872,6 +14884,30 @@ impl CodexInner {
         });
         self.emitter.user_message(content, image_payload);
     }
+}
+
+/// What to report when `turn/completed` arrives with a response still open.
+///
+/// An interrupted turn ends without `rawResponse/completed` by construction:
+/// the response was cut off mid-flight, not lost, so there is nothing to
+/// report. Codex says which happened in `turn.status` — the same field
+/// `handle_turn_completed` already reads to decide whether the open item needs
+/// terminating and whether to attach a context breakdown. Reading it here too
+/// is what keeps a cancel from putting an error card on every interrupted
+/// turn.
+///
+/// Every other status still reports: a response left open by anything but a
+/// cancel is a real violation, and staying silent about it would hide the bug
+/// this check exists to catch.
+fn incomplete_turn_response_error(params: &Value) -> Option<&'static str> {
+    let status = params
+        .get("turn")
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str);
+    if status == Some("interrupted") {
+        return None;
+    }
+    Some("Codex turn ended before rawResponse/completed")
 }
 
 fn extract_notification_thread_id(params: &Value) -> Option<String> {
