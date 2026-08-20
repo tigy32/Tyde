@@ -4411,6 +4411,23 @@ kbd {
     background: var(--surface-base);
 }
 
+/* MathML rendered from LaTeX. The engine lays the formula out; these rules only
+   place it. A display formula is its own block and can be much wider than the
+   chat column, so it scrolls rather than pushing the column open. */
+math[display="block"] {
+    display: block;
+    margin: 0.7em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+/* Invalid LaTeX renders as <merror>. Make it read as a problem rather than as
+   a formula that happens to look odd. */
+math merror {
+    border-bottom: 1px dotted var(--error);
+    color: var(--error);
+}
+
 .md-code-header {
     display: flex;
     align-items: center;

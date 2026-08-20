@@ -1,4 +1,9 @@
+use std::ops::Range;
+
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd, html};
+use pulldown_latex::{
+    Parser as LatexParser, RenderConfig, Storage, config::DisplayMode, mathml::push_mathml,
+};
 
 use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 
@@ -21,6 +26,9 @@ use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 ///   and a copy button; the inner `<code>` body is pre-tokenized by syntect
 ///   into colored `<span>`s emitted directly into the HTML, so no client-side
 ///   DOM mutation is needed.
+/// - **LaTeX math is rendered to MathML**: `\(…\)` inline, `\[…\]` and `$$…$$`
+///   as display. See [`rewrite_math_delimiters`] for which delimiters are
+///   honored and why a lone `$` is not.
 pub fn render_markdown(input: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -28,7 +36,13 @@ pub fn render_markdown(input: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
 
-    let parser = Parser::new_ext(input, options);
+    // Math delimiters are normalized against the plain-CommonMark reading of
+    // the input, then the result is parsed again with the math extension on.
+    let source = rewrite_math_delimiters(input, options);
+    let mut math_options = options;
+    math_options.insert(Options::ENABLE_MATH);
+
+    let parser = Parser::new_ext(&source, math_options);
 
     let mut in_code: Option<(String, String)> = None;
     // Stacks tracking whether the enclosing link / image was suppressed (unsafe
@@ -112,6 +126,15 @@ pub fn render_markdown(input: &str) -> String {
                 Some(Event::End(TagEnd::Image))
             }
         }
+        // MathML is laid out natively by every engine Tyde ships on (WKWebView
+        // on desktop and mobile, Chromium under test), so a formula costs no
+        // client-side pass and no math font — unlike a JS typesetter.
+        Event::InlineMath(latex) => Some(Event::InlineHtml(CowStr::Boxed(
+            render_math(&latex, DisplayMode::Inline).into_boxed_str(),
+        ))),
+        Event::DisplayMath(latex) => Some(Event::InlineHtml(CowStr::Boxed(
+            render_math(&latex, DisplayMode::Block).into_boxed_str(),
+        ))),
         Event::Html(s) => Some(Event::Text(s)),
         Event::InlineHtml(s) => Some(Event::Text(s)),
         other => Some(other),
@@ -157,6 +180,110 @@ pub fn render_markdown(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 2);
     html::push_html(&mut out, linked.into_iter());
     out
+}
+
+/// Rewrite LaTeX's `\(…\)` and `\[…\]` delimiters into the `$…$` / `$$…$$`
+/// forms pulldown-cmark's math extension recognizes, and neutralize every
+/// other `$` so it can never open a math span.
+///
+/// **Why a source rewrite and not an event filter.** CommonMark treats `\(` as
+/// a backslash escape of ASCII punctuation, so the parser eats the delimiter
+/// and hands back a bare `(` that is indistinguishable from one the author
+/// typed. A model writing `\(h_y\)` reached the reader as `(h_y)`. By the time
+/// events exist the information is gone, so the rewrite has to precede the
+/// parse.
+///
+/// **Why a lone `$` is disarmed rather than honored.** This is a coding tool:
+/// `$HOME … $PATH` and `it costs $5 … $10` are ordinary prose here, and inline
+/// `$…$` math would silently swallow the span between them, names and all.
+/// `\(…\)` covers inline math, and a doubled `$$` is rare enough by accident to
+/// keep. Rewriting the lone `$` to `\$` renders the same literal character.
+///
+/// Code is exempt. The regions to skip come from a real parse rather than
+/// hand-rolled fence tracking, so indented blocks, tilde fences, and nested
+/// backtick runs are all classified by the same parser that reads the result.
+fn rewrite_math_delimiters(input: &str, options: Options) -> String {
+    if !input.contains('\\') && !input.contains('$') {
+        return input.to_owned();
+    }
+
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut cursor = 0;
+    for code in code_spans(input, options) {
+        if code.start > cursor {
+            rewrite_prose(&input[cursor..code.start], &mut out);
+        }
+        if code.end > cursor {
+            out.push_str(&input[cursor.max(code.start)..code.end]);
+            cursor = code.end;
+        }
+    }
+    if cursor < input.len() {
+        rewrite_prose(&input[cursor..], &mut out);
+    }
+    out
+}
+
+/// Byte ranges of the input that are code — inline spans and whole code blocks,
+/// fence lines included. A code block's `Start` range already covers its body,
+/// and code cannot nest, so the ranges come out disjoint and in document order.
+fn code_spans(input: &str, options: Options) -> Vec<Range<usize>> {
+    Parser::new_ext(input, options)
+        .into_offset_iter()
+        .filter_map(|(ev, range)| match ev {
+            Event::Start(Tag::CodeBlock(_)) | Event::Code(_) => Some(range),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Normalize math delimiters in a run of the input already known to be prose.
+fn rewrite_prose(chunk: &str, out: &mut String) {
+    let mut chars = chunk.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('(' | ')') => out.push('$'),
+                Some('[' | ']') => out.push_str("$$"),
+                // A backslash escape consumes whatever follows it, so `\\(`
+                // stays a literal backslash plus `(` instead of the second
+                // backslash pairing with the paren to open math.
+                Some(escaped) => {
+                    out.push('\\');
+                    out.push(escaped);
+                }
+                None => out.push('\\'),
+            },
+            '$' if chars.peek() == Some(&'$') => {
+                out.push_str("$$");
+                chars.next();
+            }
+            '$' => out.push_str("\\$"),
+            c => out.push(c),
+        }
+    }
+}
+
+/// Render one LaTeX formula to MathML.
+///
+/// Invalid LaTeX is not an error path: pulldown-latex emits an inline
+/// `<merror>` node carrying the offending source, so a typo shows up on screen
+/// instead of blanking the formula.
+fn render_math(latex: &str, display_mode: DisplayMode) -> String {
+    let storage = Storage::new();
+    let config = RenderConfig {
+        display_mode,
+        ..RenderConfig::default()
+    };
+
+    let mut mathml = String::new();
+    match push_mathml(&mut mathml, LatexParser::new(latex, &storage), config) {
+        Ok(()) => mathml,
+        // Only reachable if writing into a String fails, which it cannot. A
+        // partial write would be unbalanced markup, so show the source rather
+        // than emit it — the formula stays readable either way.
+        Err(_) => format!("<code>{}</code>", escape_html(latex)),
+    }
 }
 
 /// Whether a link/image destination is safe to emit into `inner_html`. Allows
@@ -327,4 +454,165 @@ fn escape_html(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Render `input` into a real element so assertions read what a reader
+    /// actually sees. `inner_html` is the production sink for this function, so
+    /// parsing through it is what the browser does anyway — and it is the only
+    /// way to observe MathML, which the HTML parser builds into real
+    /// MathML-namespace nodes rather than plain markup.
+    fn rendered(input: &str) -> HtmlElement {
+        let document = web_sys::window()
+            .expect("window")
+            .document()
+            .expect("document");
+        let host = document.create_element("div").expect("create host");
+        host.set_inner_html(&render_markdown(input));
+        host.dyn_into::<HtmlElement>().expect("host is an element")
+    }
+
+    fn text_of(host: &HtmlElement) -> String {
+        host.text_content().unwrap_or_default()
+    }
+
+    /// Models write math with LaTeX's `\(…\)` and `\[…\]` delimiters. Those are
+    /// backslash escapes of ASCII punctuation under CommonMark, so the parser
+    /// ate the delimiters and left the body as prose: the reader saw `(h_y)`,
+    /// a literal `\Lambda`, and `[ L_y=(1-h_y)D(\Lambda) ]` instead of a
+    /// formula.
+    #[wasm_bindgen_test]
+    fn latex_delimiters_render_as_math_not_mangled_prose() {
+        let host = rendered(
+            "Let \\(h_y\\) be the cache-hit rate and \\(\\Lambda\\) the miss rate:\n\n\
+             \\[ L_y = (1 - h_y) D(\\Lambda) \\]\n",
+        );
+        let text = text_of(&host);
+
+        assert!(
+            !text.contains('\\'),
+            "raw LaTeX leaked into the rendered text: {text:?}"
+        );
+        assert!(
+            text.contains('Λ'),
+            "\\Lambda did not become a symbol: {text:?}"
+        );
+        assert!(
+            !text.contains("(h_y)") && !text.contains("[ L_y"),
+            "delimiters were stripped to literal brackets: {text:?}"
+        );
+
+        let math = host.query_selector_all("math").expect("query math");
+        assert_eq!(
+            math.length(),
+            3,
+            "expected two inline formulas and one display formula, got {}: {text:?}",
+            math.length()
+        );
+
+        // The `\[…\]` form is display math: it renders as its own centered
+        // block, not inline with the sentence.
+        let display = host
+            .query_selector_all("math[display=\"block\"]")
+            .expect("query display math");
+        assert_eq!(
+            display.length(),
+            1,
+            "`\\[…\\]` did not render as display math"
+        );
+    }
+
+    /// `$$…$$` is the other delimiter models reach for, and it is unambiguous
+    /// enough to support. Single `$` deliberately is not — see
+    /// [`prose_dollars_are_never_math`].
+    #[wasm_bindgen_test]
+    fn double_dollar_renders_as_display_math() {
+        let host = rendered("$$ E = mc^2 $$\n");
+
+        let display = host
+            .query_selector_all("math[display=\"block\"]")
+            .expect("query display math");
+        assert_eq!(
+            display.length(),
+            1,
+            "`$$…$$` did not render as display math"
+        );
+        assert!(
+            !text_of(&host).contains('$'),
+            "delimiters survived into the text: {:?}",
+            text_of(&host)
+        );
+    }
+
+    /// A single `$` is money or a shell variable far more often than it is
+    /// math, and this is a coding tool. Enabling inline `$…$` would turn
+    /// `$HOME … $PATH` into a formula and eat both names.
+    #[wasm_bindgen_test]
+    fn prose_dollars_are_never_math() {
+        let host = rendered("Set $HOME before $PATH, and it costs $5 not $10.\n");
+        let text = text_of(&host);
+
+        assert_eq!(
+            text.trim(),
+            "Set $HOME before $PATH, and it costs $5 not $10.",
+            "prose dollars were rewritten"
+        );
+        assert_eq!(
+            host.query_selector_all("math")
+                .expect("query math")
+                .length(),
+            0,
+            "prose dollars produced a formula"
+        );
+    }
+
+    /// Math delimiters are prose syntax. Inside a fence or an inline code span
+    /// the same bytes are the code the user asked to see, verbatim.
+    #[wasm_bindgen_test]
+    fn code_keeps_its_backslashes_and_dollars() {
+        let host = rendered(
+            "Inline `\\(not math\\)` and `$PATH`:\n\n\
+             ```sh\n\
+             echo \"\\[literal\\]\" $HOME $$\n\
+             ```\n",
+        );
+        let text = text_of(&host);
+
+        assert!(
+            text.contains("\\(not math\\)") && text.contains("$PATH"),
+            "inline code was rewritten: {text:?}"
+        );
+        assert!(
+            text.contains("echo \"\\[literal\\]\" $HOME $$"),
+            "fenced code was rewritten: {text:?}"
+        );
+        assert_eq!(
+            host.query_selector_all("math")
+                .expect("query math")
+                .length(),
+            0,
+            "code produced a formula"
+        );
+    }
+
+    /// Invalid LaTeX must stay visible. Dropping it would lose content the
+    /// model meant to communicate, with nothing on screen to say so.
+    #[wasm_bindgen_test]
+    fn invalid_latex_stays_visible() {
+        let host = rendered("Broken: \\(\\frobnicate{x}\\)\n");
+        let text = text_of(&host);
+
+        assert!(
+            text.contains("frobnicate"),
+            "invalid LaTeX rendered as nothing: {text:?}"
+        );
+    }
 }
