@@ -72,13 +72,6 @@ fn pop_pending_agent_event(
     fixture::pop_pending_frame_matching_on(client, |env| env.stream == *stream && env.kind == kind)
 }
 
-fn pop_front_pending_agent_event(
-    client: &client::Connection,
-    stream: &StreamPath,
-) -> Option<Envelope> {
-    fixture::pop_pending_frame_matching_on(client, |env| env.stream == *stream)
-}
-
 fn push_pending_agent_event(client: &client::Connection, env: Envelope) {
     if !env.stream.0.starts_with("/agent/") && env.kind != FrameKind::NewAgent {
         return;
@@ -1327,7 +1320,10 @@ async fn expect_agent_control_child_initial_turn_on_stream(
                 stream,
                 message.content
             );
-            drain_pending_agent_control_child_initial_turn_trailer(client, stream, expected_text);
+            if drain_pending_agent_control_child_initial_turn_trailer(client, stream, expected_text)
+            {
+                expect_typing_false_on_stream(client, stream).await;
+            }
         }
         other => {
             panic!("expected agent-control child initial turn on {stream}, got {other:?}");
@@ -1359,11 +1355,13 @@ async fn expect_agent_control_child_replayed_stream_tail(
                     saw_expected_text,
                     "agent-control child stream on {stream} ended without expected text {expected_text:?}"
                 );
-                drain_pending_agent_control_child_initial_turn_trailer(
+                if drain_pending_agent_control_child_initial_turn_trailer(
                     client,
                     stream,
                     expected_text,
-                );
+                ) {
+                    expect_typing_false_on_stream(client, stream).await;
+                }
                 return;
             }
             ChatEvent::StreamReasoningDelta(_)
@@ -1377,23 +1375,39 @@ async fn expect_agent_control_child_replayed_stream_tail(
     }
 }
 
+/// Consumes the initial turn's buffered trailer, reporting whether the replay
+/// ended while the agent was still marked as typing.
+///
+/// An `AgentBootstrap` snapshot taken between the turn's `StreamEnd` and its
+/// `TypingStatusChanged(false)` truthfully replays "still typing" — the turn had
+/// not ended yet — because replayed history strips typing events while the
+/// active-stream tail re-appends `TypingStatusChanged(true)`. Left queued, that
+/// marker outlives the turn it belongs to and is later mistaken for the *next*
+/// turn's `TypingStatusChanged(true)`, so that turn's `StreamStart` assertion
+/// instead sees this turn's trailing `TypingStatusChanged(false)`. Draining
+/// stops at it so the caller can require the still-owed `TypingStatusChanged`
+/// rather than let it leak forward.
+///
+/// Scans for the stream's `ChatEvent` frames specifically: a bootstrap also
+/// queues `AgentActivityStats`/`SessionSettings`/`QueuedMessages` ahead of the
+/// trailer, and bailing at the first non-chat frame left the trailer buried.
 fn drain_pending_agent_control_child_initial_turn_trailer(
     client: &client::Connection,
     stream: &StreamPath,
     expected_text: &str,
-) {
-    while let Some(env) = pop_front_pending_agent_event(client, stream) {
-        if env.kind != FrameKind::ChatEvent {
-            push_front_pending_agent_event(client, env);
-            return;
-        }
+) -> bool {
+    while let Some(env) = pop_pending_agent_event(client, stream, FrameKind::ChatEvent) {
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if matches!(event, ChatEvent::TypingStatusChanged(true)) {
+            return true;
+        }
         if is_agent_control_child_initial_turn_trailer(&event, expected_text) {
             continue;
         }
         push_front_pending_agent_event(client, env);
-        return;
+        return false;
     }
+    false
 }
 
 fn is_agent_control_child_initial_turn_trailer(event: &ChatEvent, expected_text: &str) -> bool {
