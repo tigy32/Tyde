@@ -17,6 +17,14 @@
     --nav-height: 52px;
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+    /* The home-indicator inset only needs clearing while it is actually on
+       screen. With the keyboard up the keyboard covers it, so reserving it
+       again would float the composer above a dead band. */
+    --active-safe-area-bottom: var(--safe-area-bottom);
+}
+
+html[data-keyboard-open] {
+    --active-safe-area-bottom: 0px;
 }
 
 [data-theme="dark"] {
@@ -116,14 +124,29 @@ input, textarea, select {
        real visible viewport, stranding the bottom nav above a dead band.
        The app measures the visual viewport at mount and publishes it as
        --app-height (main.rs install_app_height_probe); max() lets that
-       measurement recover the missing height, while keyboard-driven
-       visual-viewport shrinkage can never squeeze the shell below 100dvh.
+       measurement recover the missing height.
        Viewport units only — percentage heights have no resolvable chain in
        the production loader page, which drops the bundle's index.html. */
     height: max(100dvh, var(--app-height, 0px));
     min-height: 0;
     overflow: hidden;
     padding-top: var(--safe-area-top);
+}
+
+/* Software keyboard up. iOS WebKit ignores interactive-widget=resizes-content
+   (that key is a Chromium-only mitigation): it leaves the layout viewport — and
+   therefore 100dvh — at full screen height and shrinks only the VISUAL
+   viewport. The max() floor above would then hold the composer underneath the
+   keyboard, and WebKit pans the entire app off screen to reach the caret. With
+   the keyboard up the measurement is the truth rather than a floor, so the
+   shell ends exactly at the keyboard and the transcript stays the only
+   scroller.
+
+   main.rs sets data-keyboard-open only on a >100px drop from the tallest
+   viewport seen at the current width, so a short standalone-launch reading is
+   never mistaken for a keyboard and still takes the max() path above. */
+html[data-keyboard-open] .mobile-app {
+    height: var(--app-height, 100dvh);
 }
 
 /* ── Mobile Shell Error Banner ──────────────────────────────────────── */
@@ -361,8 +384,8 @@ input, textarea, select {
 .bottom-nav {
     display: flex;
     align-items: stretch;
-    height: calc(var(--nav-height) + var(--safe-area-bottom));
-    padding-bottom: var(--safe-area-bottom);
+    height: calc(var(--nav-height) + var(--active-safe-area-bottom));
+    padding-bottom: var(--active-safe-area-bottom);
     flex-shrink: 0;
     background: var(--bg-surface);
     border-top: 1px solid var(--border-default);
@@ -1898,7 +1921,7 @@ input, textarea, select {
 
 .chat-input-container {
     flex-shrink: 0;
-    padding: var(--space-2) var(--space-3) max(var(--space-2), var(--safe-area-bottom));
+    padding: var(--space-2) var(--space-3) max(var(--space-2), var(--active-safe-area-bottom));
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
 }
@@ -4116,9 +4139,10 @@ input, textarea, select {
  * The app shell is a fixed-height flex column (`.mobile-app`, 100dvh), so this
  * surface MUST be `flex-shrink: 0` — otherwise it gets crushed to nothing — and
  * it MUST cap its own height, or a handful of failed messages squeeze the
- * content (or the composer) off the screen entirely. `100dvh` shrinks when the
- * software keyboard opens, so the cap is what keeps the composer reachable with
- * the keyboard up.
+ * content (or the composer) off the screen entirely. The shell shrinks to the
+ * visible viewport when the software keyboard opens (`html[data-keyboard-open]`
+ * above — NOT `100dvh`, which iOS WebKit leaves at full height), so the cap is
+ * what keeps the composer reachable with the keyboard up.
  */
 .pending-submissions {
     flex-shrink: 0;

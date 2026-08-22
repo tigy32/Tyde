@@ -38,7 +38,13 @@ const cloudfrontSetup = readFileSync(
   "utf8",
 );
 
-test("both mobile entrypoints resize layout for the keyboard", () => {
+// NOTE: this key is honoured by Chromium only. iOS WebKit ignores it and keeps
+// the default `resizes-visual`, so the layout viewport (and 100dvh) does NOT
+// shrink there. Keeping it is still correct — it gives Chromium the cheaper
+// path — but it is NOT what makes the keyboard work. The shell's own
+// measurement is (mobile-frontend/src/main.rs install_app_height_probe →
+// html[data-keyboard-open]); do not delete that on the strength of this tag.
+test("both mobile entrypoints declare the Chromium keyboard resize hint", () => {
   for (const [entrypoint, source] of [
     ["deployed loader", html],
     ["standalone mobile app", standaloneMobileHtml],
@@ -50,7 +56,7 @@ test("both mobile entrypoints resize layout for the keyboard", () => {
     assert.match(
       viewport[1],
       /(?:^|,\s*)interactive-widget=resizes-content(?:\s*,|$)/,
-      `${entrypoint} must shrink the layout viewport when the keyboard opens`,
+      `${entrypoint} must keep the Chromium layout-viewport resize hint`,
     );
   }
 });

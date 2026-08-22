@@ -140,3 +140,100 @@ test("chat composer ignores a stale visual viewport height", async ({ page }) =>
     )
     .toBeLessThanOrEqual(1);
 });
+
+// Reproduces what iOS WebKit actually does when the software keyboard opens:
+// `interactive-widget=resizes-content` is a Chromium-only mitigation, so WebKit
+// leaves the layout viewport (window.innerHeight, and therefore 100dvh) at full
+// screen height and shrinks ONLY the visual viewport. Before the fix the shell
+// stayed 852px tall while 336px of it was behind the keyboard, putting the
+// composer out of reach and forcing the browser to pan the whole app off screen
+// to reveal the caret.
+const KEYBOARD_INSET = 336;
+
+async function installVirtualKeyboard(page) {
+  await page.addInitScript(() => {
+    window.__KB_INSET__ = 0;
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const height = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(viewport),
+      "height",
+    );
+    Object.defineProperty(viewport, "height", {
+      configurable: true,
+      get: () => height.get.call(viewport) - (window.__KB_INSET__ || 0),
+    });
+  });
+}
+
+const setKeyboard = (page, inset) =>
+  page.evaluate((value) => {
+    window.__KB_INSET__ = value;
+    window.visualViewport.dispatchEvent(new Event("resize"));
+  }, inset);
+
+const geometry = (page) =>
+  page.evaluate(() => {
+    const rect = (selector) => {
+      const el = document.querySelector(selector);
+      return el ? el.getBoundingClientRect() : null;
+    };
+    const composer = rect("[data-mobile-test='chat-input-container']");
+    const shell = rect(".mobile-app");
+    return {
+      innerHeight: window.innerHeight,
+      composerBottom: composer ? composer.bottom : null,
+      shellHeight: shell ? shell.height : null,
+      messagesHeight: rect(".chat-messages")?.height ?? null,
+    };
+  });
+
+test("the composer stays above the software keyboard", async ({ page }) => {
+  await installVirtualKeyboard(page);
+  await openFixture(page, "chat");
+
+  const closed = await geometry(page);
+  expect(closed.composerBottom).toBeCloseTo(closed.innerHeight, 0);
+
+  await setKeyboard(page, KEYBOARD_INSET);
+  const open = await geometry(page);
+
+  // The layout viewport is untouched — that is the whole point of the case.
+  expect(open.innerHeight).toBe(closed.innerHeight);
+
+  const visibleBottom = closed.innerHeight - KEYBOARD_INSET;
+  expect(open.composerBottom).toBeLessThanOrEqual(visibleBottom + 1);
+  expect(open.shellHeight).toBeLessThanOrEqual(visibleBottom + 1);
+
+  // The transcript absorbs the loss, so the composer is not merely pushed off
+  // the top: it is still on screen with history above it.
+  expect(open.messagesHeight).toBeLessThan(closed.messagesHeight);
+  expect(open.messagesHeight).toBeGreaterThan(0);
+});
+
+test("closing the software keyboard restores the shell", async ({ page }) => {
+  await installVirtualKeyboard(page);
+  await openFixture(page, "chat");
+
+  const closed = await geometry(page);
+  await setKeyboard(page, KEYBOARD_INSET);
+  await setKeyboard(page, 0);
+  const restored = await geometry(page);
+
+  expect(restored.shellHeight).toBeCloseTo(closed.shellHeight, 0);
+  expect(restored.composerBottom).toBeCloseTo(closed.composerBottom, 0);
+});
+
+test("the document itself never scrolls", async ({ page }) => {
+  await installVirtualKeyboard(page);
+  await openFixture(page, "chat");
+  await setKeyboard(page, KEYBOARD_INSET);
+
+  // Only the transcript may scroll. If the document has scrollable overflow the
+  // browser can pan the header off screen, which is the reported symptom.
+  const overflow = await page.evaluate(() => {
+    const scroller = document.scrollingElement;
+    return scroller.scrollHeight - scroller.clientHeight;
+  });
+  expect(overflow).toBeLessThanOrEqual(1);
+});
