@@ -75,6 +75,7 @@ pub struct MockBackend {
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     control: MockControl,
     scripted_busy_self_turn: bool,
+    shutdown_gate: Option<gate::MockGate>,
     resume_replay_guard: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -109,6 +110,7 @@ impl MockBackend {
             }
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let shutdown_gate = launch_script.shutdown_gate.clone();
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
@@ -178,6 +180,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                shutdown_gate: shutdown_gate.clone(),
                 resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
@@ -199,6 +202,7 @@ impl MockBackend {
             Some(MockLaunch::CloseBeforeResumeBarrier) => (default_mock_script(), true),
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let shutdown_gate = launch_script.shutdown_gate.clone();
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let resolved_spawn_config = config.resolved_spawn_config.clone();
@@ -253,6 +257,7 @@ impl MockBackend {
                     compaction_capability,
                     control,
                     scripted_busy_self_turn,
+                    shutdown_gate: shutdown_gate.clone(),
                     resume_replay_guard: Some(resume_replay_complete_tx),
                 },
                 EventStream::new_backend_with_resume_replay_barrier(
@@ -296,6 +301,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                shutdown_gate: shutdown_gate.clone(),
                 resume_replay_guard: None,
             },
             EventStream::new_backend_with_resume_replay_barrier(
@@ -324,6 +330,7 @@ impl MockBackend {
             }
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let shutdown_gate = launch_script.shutdown_gate.clone();
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
@@ -399,6 +406,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                shutdown_gate: shutdown_gate.clone(),
                 resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
@@ -659,6 +667,9 @@ impl Backend for MockBackend {
     }
 
     async fn shutdown(mut self) {
+        if let Some(gate) = self.shutdown_gate.take() {
+            gate.wait().await;
+        }
         drop(self.resume_replay_guard.take());
     }
 }

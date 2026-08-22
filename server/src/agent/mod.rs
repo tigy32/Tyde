@@ -63,7 +63,6 @@ use self::registry::{
 };
 
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
-const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a close waits for an interrupted turn to reach idle before it
 /// tears the actor down anyway.
@@ -1753,7 +1752,6 @@ async fn wait_for_resume_queue_dispatch_test_gate(_agent_name: &str) {}
 #[cfg(feature = "test-support")]
 async fn hold_resume_queue_dispatch_boundary(
     agent_name: &str,
-    agent_id: &AgentId,
     backend: &mut Option<BackendHandle>,
     actor_tx: &mpsc::UnboundedSender<AgentCommand>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -1769,7 +1767,7 @@ async fn hold_resume_queue_dispatch_boundary(
                 match command {
                     Some(AgentCommand::ForceBackendShutdownForConformance { reply }) => {
                         let closed = if let Some(live_backend) = backend.take() {
-                            shutdown_backend_with_timeout(live_backend, agent_id).await;
+                            live_backend.shutdown().await;
                             forced_closed = true;
                             true
                         } else {
@@ -1793,7 +1791,6 @@ async fn hold_resume_queue_dispatch_boundary(
 #[cfg(not(feature = "test-support"))]
 async fn hold_resume_queue_dispatch_boundary(
     _agent_name: &str,
-    _agent_id: &AgentId,
     _backend: &mut Option<BackendHandle>,
     _actor_tx: &mpsc::UnboundedSender<AgentCommand>,
     _rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -3995,7 +3992,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             if let Some(backend) = backend.take() {
-                                shutdown_backend_with_timeout(backend, &current_start.agent_id)
+                                backend.shutdown()
                                     .await;
                             }
                             park_terminal_agent(
@@ -4019,7 +4016,7 @@ pub(crate) fn spawn_agent_actor(
                                 .take()
                                 .expect("close requested without pending close reply");
                             if let Some(backend) = backend.take() {
-                                shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                                backend.shutdown().await;
                             }
                             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             terminalize_live_activity(
@@ -4658,7 +4655,7 @@ pub(crate) fn spawn_agent_actor(
                         let backend = backend
                             .take()
                             .expect("backend must exist while closing a live actor");
-                        shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                        backend.shutdown().await;
                         abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                         terminalize_live_activity(
                             LiveActivityTerminalContext {
@@ -5120,7 +5117,6 @@ pub(crate) fn spawn_agent_actor(
                                         let forced_closed =
                                             hold_resume_queue_dispatch_boundary(
                                                 &current_start.name,
-                                                &current_start.agent_id,
                                                 &mut backend,
                                                 &actor_tx,
                                                 &mut rx,
@@ -5310,10 +5306,7 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
                                     if let Some(backend) = backend.take() {
-                                        shutdown_backend_with_timeout(
-                                            backend,
-                                            &current_start.agent_id,
-                                        )
+                                        backend.shutdown()
                                         .await;
                                     }
                                     park_terminal_agent(
@@ -6859,10 +6852,7 @@ pub(crate) fn spawn_agent_actor(
                             )
                             .await
                             {
-                                shutdown_backend_with_timeout(
-                                    prepared_backend,
-                                    &current_start.agent_id,
-                                )
+                                prepared_backend.shutdown()
                                 .await;
                                 let _ = actor_tx.send(
                                     AgentCommand::ContextCompactionTerminal {
@@ -6929,10 +6919,7 @@ pub(crate) fn spawn_agent_actor(
                                 Some(&mut activity_event_seq),
                             )
                             .await;
-                            shutdown_backend_with_timeout(
-                                old_backend,
-                                &current_start.agent_id,
-                            )
+                            old_backend.shutdown()
                             .await;
                             let dispatch = release_context_compaction_barrier(
                                 backend
@@ -7716,7 +7703,7 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(false);
                                 continue;
                             };
-                            shutdown_backend_with_timeout(live_backend, &current_start.agent_id)
+                            live_backend.shutdown()
                                 .await;
                             terminalize_live_activity(
                                 LiveActivityTerminalContext {
@@ -7849,7 +7836,7 @@ pub(crate) fn spawn_agent_actor(
                                 let backend = backend
                                     .take()
                                     .expect("backend must exist while closing a live actor");
-                                shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                                backend.shutdown().await;
                                 abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                                 terminalize_live_activity(
                                     LiveActivityTerminalContext {
@@ -7929,7 +7916,7 @@ pub(crate) fn spawn_agent_actor(
                         "agent turn did not settle after close interrupt; forcing shutdown"
                     );
                     if let Some(backend) = backend.take() {
-                        shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                        backend.shutdown().await;
                     }
                     abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                     terminalize_live_activity(
@@ -8781,19 +8768,6 @@ async fn close_grace_elapsed(deadline: &Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(*deadline).await,
         None => std::future::pending().await,
-    }
-}
-
-async fn shutdown_backend_with_timeout(backend: BackendHandle, agent_id: &AgentId) {
-    if tokio::time::timeout(BACKEND_SHUTDOWN_TIMEOUT, backend.shutdown())
-        .await
-        .is_err()
-    {
-        tracing::error!(
-            agent_id = %agent_id,
-            timeout_ms = BACKEND_SHUTDOWN_TIMEOUT.as_millis(),
-            "timed out shutting down backend"
-        );
     }
 }
 

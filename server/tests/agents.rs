@@ -3518,6 +3518,65 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
     );
 }
 
+/// A close runs the backend's teardown to completion; it is never put on a clock.
+///
+/// Teardown used to run under a 3s `BACKEND_SHUTDOWN_TIMEOUT`. Cancelling a
+/// shutdown future mid-flight abandons whatever release work it had left, and
+/// the timeout could not distinguish a backend that was wedged from one that was
+/// simply still working — so it fired on healthy closes and reported an error
+/// for them. Park the backend inside `shutdown` and the close must not finish:
+/// the only thing that may end that wait is the backend actually returning.
+///
+/// The 4s window is deliberately longer than the timeout that used to be here,
+/// so reintroducing any clock around backend shutdown turns this red.
+#[tokio::test]
+async fn close_agent_waits_for_backend_shutdown_instead_of_timing_it_out() {
+    let mut fixture = Fixture::new().await;
+    let shutdown_gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "close-waits-for-shutdown",
+            MockScript::one(MockTurn::text("close waits for shutdown"))
+                .with_shutdown_gate(&shutdown_gate),
+        )
+        .await;
+
+    let event = fixture
+        .next_chat_event_matching(&agent, "opening turn settles", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close_agent failed");
+
+    // Happens-before edge: the backend is now parked inside `shutdown`, so any
+    // AgentClosed after this point would mean the close abandoned teardown.
+    shutdown_gate.wait_until_entered().await;
+
+    fixture::assert_no_interesting_frame_on(
+        &mut fixture.client,
+        Duration::from_secs(4),
+        "AgentClosed while the backend is still shutting down",
+        |env| env.kind != FrameKind::AgentClosed,
+    )
+    .await;
+
+    shutdown_gate.release_one();
+
+    let env = fixture
+        .next_frame_matching("close-waits-for-shutdown AgentClosed", |env| {
+            env.kind == FrameKind::AgentClosed
+        })
+        .await;
+    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+    assert_eq!(closed.agent_id, agent.new_agent.agent_id);
+}
+
 #[tokio::test]
 async fn agent_control_end_to_end_flow_uses_full_stack() {
     let mut fixture = Fixture::new().await;

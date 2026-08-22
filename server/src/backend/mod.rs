@@ -962,6 +962,18 @@ pub trait Backend: Send + Sync + 'static {
     fn interrupt(&self) -> impl std::future::Future<Output = bool> + Send;
 
     /// Shut down the live backend session and release any subprocess resources.
+    ///
+    /// **Must not block on the provider.** Teardown may close pipes, signal
+    /// process groups, and drop handles — all local, none able to fail — but it
+    /// must never wait on a reply from the process it is tearing down. A provider
+    /// that has already exited and one that is wedged are indistinguishable from
+    /// this side, so such a wait cannot terminate on its own and the caller has
+    /// no way to tell the two apart.
+    ///
+    /// Callers await this directly. There is deliberately no timeout around it:
+    /// a timeout here would be a clock standing in for a liveness signal, and it
+    /// would cancel the teardown mid-flight, which is strictly worse than the
+    /// hang it was meant to bound.
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;

@@ -930,50 +930,26 @@ struct ClaudeProcessRuntime {
 type ClaudeControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 
 impl ClaudeProcessRuntime {
-    async fn shutdown(mut self) {
-        if let Err(err) = self.stdin.lock().await.shutdown().await {
-            tracing::warn!("Failed to close Claude stdin for graceful shutdown: {err}");
-        }
-        let mut child = self.child.lock().await;
-        if let Some(process) = child.as_mut() {
-            let graceful = tokio::time::timeout(Duration::from_secs(5), process.wait()).await;
-            eprintln!(
-                "TYDE CLAUDE CLEANUP process_group_final_kill graceful_wait={:?}",
-                graceful
-                    .as_ref()
-                    .map(|result| result.as_ref().map(|status| status.code()))
-            );
-            // `claude` may exit after closing stdin while a provider-owned
-            // background command remains in its process group. Always signal
-            // the group after the graceful wait so no descendant survives a
-            // session shutdown, including a task_started frame that raced the
-            // stop_task snapshot.
-            let _ = process.kill().await;
-        }
-        *child = None;
-        drop(child);
-        if tokio::time::timeout(Duration::from_secs(2), &mut self.stdout_task)
-            .await
-            .is_err()
-        {
-            self.stdout_task.abort();
-        }
-        self.stderr_task.abort();
-    }
-
-    async fn kill(mut self) {
+    /// Tear the process down.
+    ///
+    /// Every step is local and cannot fail: signalling the group is unblockable,
+    /// and aborting a reader task is immediate. Nothing here waits for the CLI to
+    /// agree to anything. A CLI that has already exited and one that is wedged are
+    /// indistinguishable from this side — both are silent — so waiting to tell
+    /// them apart can only ever cost time, and the response to either is this
+    /// same kill.
+    ///
+    /// The group, not just the child: `claude` can exit while a provider-owned
+    /// background command it spawned is still in its process group, so signalling
+    /// the group is what actually guarantees no descendant survives the session.
+    async fn kill(self) {
         let mut child = self.child.lock().await;
         if let Some(child) = child.as_mut() {
             let _ = child.kill().await;
         }
         *child = None;
         drop(child);
-        if tokio::time::timeout(Duration::from_secs(2), &mut self.stdout_task)
-            .await
-            .is_err()
-        {
-            self.stdout_task.abort();
-        }
+        self.stdout_task.abort();
         self.stderr_task.abort();
     }
 
@@ -4088,46 +4064,17 @@ impl ClaudeInner {
         }
     }
 
-    async fn shutdown_process_gracefully(&self) {
-        let mut task_ids = self
-            .background_tasks
-            .lock()
-            .expect("Claude background task mutex poisoned")
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.state.status == BackgroundTaskStatus::Running)
-            .map(|(task_id, _)| task_id.clone())
-            .collect::<Vec<_>>();
-        task_ids.extend(
-            self.native_subagent_tasks
-                .lock()
-                .expect("Claude native subagent task mutex poisoned")
-                .iter()
-                .cloned(),
-        );
-        task_ids.sort();
-        task_ids.dedup();
-        eprintln!("TYDE CLAUDE CLEANUP native_and_background_tasks={task_ids:?}");
-        for task_id in task_ids {
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let request = json!({
-                "type": "control_request",
-                "request_id": request_id,
-                "request": { "subtype": "stop_task", "task_id": task_id },
-            });
-            match self
-                .send_control_request_value(request_id, request, CLAUDE_CONTROL_RESPONSE_TIMEOUT)
-                .await
-            {
-                Ok(response) => {
-                    eprintln!("TYDE CLAUDE CLEANUP stop_task task_id={task_id} response={response}")
-                }
-                Err(err) => tracing::warn!(task_id, "Failed to stop Claude background task: {err}"),
-            }
-        }
+    /// Close the CLI process and forget the work it owned.
+    ///
+    /// Teardown does not ask the CLI to stop its background tasks first. That was
+    /// a control request per task, each waiting on a reply from a process we are
+    /// about to kill, and killing the process group stops those tasks anyway —
+    /// which is precisely why the group is signalled rather than the child alone.
+    /// The requests could therefore only delay the kill, never change its result.
+    async fn close_process(&self) {
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {
-            runtime.shutdown().await;
+            runtime.kill().await;
         }
         self.drain_background_tasks();
         self.native_subagent_tasks
@@ -4147,6 +4094,10 @@ impl ClaudeInner {
 
     async fn mark_process_exited(&self) {
         self.drain_background_tasks();
+        // Callers that know the real outcome (exited mid-turn, exited during a
+        // compaction) have already delivered it and left `outcome_tx` empty, so
+        // this is almost always just releasing the quiesce waiters.
+        self.release_active_turn().await;
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {
             let mut child = runtime.child.lock().await;
@@ -4339,6 +4290,27 @@ impl ClaudeInner {
             );
             self.shutdown_process().await;
         }
+    }
+
+    /// Terminally resolve the active turn without asking the CLI for anything.
+    ///
+    /// A turn cannot outlive the process running it, so once that process is gone
+    /// nothing may still be waiting on one. Neither existing path covers this:
+    /// `clear_active_turn` only runs when the CLI reports a result, and
+    /// `complete_active_turn_with_outcome` takes just the outcome sender and
+    /// leaves `active_turn` in place. So a process exit left `quiesced_waiters`
+    /// parked with no sender able to fire, making a dead CLI look exactly like a
+    /// wedged one until a timeout expired.
+    async fn release_active_turn(&self) {
+        let Some(active) = self.state.lock().await.active_turn.take() else {
+            return;
+        };
+        if let Some(outcome_tx) = active.outcome_tx {
+            let _ = outcome_tx.send(TurnOutcome::Cancelled {
+                summary: ClaudeStdoutSummary::default(),
+            });
+        }
+        notify_turn_quiesced(active.quiesced_waiters);
     }
 
     async fn clear_active_turn(&self, turn_id: u64) -> Vec<oneshot::Sender<()>> {
@@ -4688,10 +4660,12 @@ impl ClaudeInner {
         tracing::info!("Claude shutdown starting");
         self.state.lock().await.closing = true;
         self.cancel_skill_watchdog().await;
-        if self.state.lock().await.active_turn.is_some() {
-            self.cancel_active_turn().await;
-        }
-        self.shutdown_process_gracefully().await;
+        // Resolve the turn here instead of interrupting the CLI and waiting for
+        // it to confirm quiescence. The process is about to be killed, so its
+        // answer cannot change the outcome, and waiting for one it may never
+        // send is the entire reason this path used to need a timeout.
+        self.release_active_turn().await;
+        self.close_process().await;
         tracing::info!("Claude process shutdown completed");
         // Unlink the session plugin root once the CLI that was reading it is
         // gone. Dropping the last `Arc` would do this anyway, but a session can

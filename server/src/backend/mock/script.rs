@@ -17,6 +17,7 @@ pub struct MockScript {
     pub(super) unbounded_echo: bool,
     pub(super) user_bubbles: bool,
     pub(super) busy_self_turn_once: bool,
+    pub(super) shutdown_gate: Option<MockGate>,
 }
 
 impl MockScript {
@@ -48,6 +49,13 @@ impl MockScript {
 
     pub fn with_busy_self_turn_once(mut self) -> Self {
         self.busy_self_turn_once = true;
+        self
+    }
+
+    /// Park the backend inside `Backend::shutdown` until the gate is released,
+    /// so a test can observe what a close does while teardown is still running.
+    pub fn with_shutdown_gate(mut self, gate: &MockGateHandle) -> Self {
+        self.shutdown_gate = Some(gate.gate());
         self
     }
 }
