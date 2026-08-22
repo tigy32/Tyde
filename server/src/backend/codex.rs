@@ -57,8 +57,6 @@ use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
-const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_AGENT_NAME: &str = "codex";
 const CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
 // The entire GPT-5 family (gpt-5, gpt-5.x, their -codex and -mini variants)
@@ -18055,13 +18053,8 @@ impl CodexRpc {
                 None => None,
             };
 
-            let mut pending = stdout_pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Err(CodexRpcError::transport(
-                    "Codex app-server exited before response",
-                )));
-            }
-            drop(pending);
+            fail_pending_codex_requests(&stdout_pending, "Codex app-server exited before response")
+                .await;
 
             let _ = stdout_inbound.send(CodexInbound::Closed { exit_code });
         });
@@ -18118,15 +18111,17 @@ impl CodexRpc {
         }
         observe_codex_request_sent(method);
 
-        match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(CodexRpcError::transport("Codex response channel closed")),
-            Err(_) => {
-                let _ = self.pending.lock().await.remove(&id);
-                Err(CodexRpcError::transport(format!(
-                    "Codex request timed out for method '{method}'"
-                )))
-            }
+        // No deadline. A request to the local app-server ends exactly two ways:
+        // it is answered, or the process can no longer answer it — and both are
+        // signalled here, by the stdout reader on EOF and by teardown, so a
+        // clock could only ever pre-empt a healthy request. It used to: codex
+        // does heavy sqlite work under CODEX_HOME on startup, and a home
+        // directory slow enough to push `initialize` past the old bound turned
+        // a working CLI into a failed one. Worse, the timeout also removed the
+        // pending entry, so the answer that did arrive was dropped unmatched.
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(CodexRpcError::transport("Codex response channel closed")),
         }
     }
 
@@ -18161,15 +18156,9 @@ impl CodexRpc {
                 return;
             }
             observe_codex_request_sent(method);
-            let result = match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(CodexRpcError::transport("Codex response channel closed")),
-                Err(_) => {
-                    pending.lock().await.remove(&id);
-                    Err(CodexRpcError::transport(format!(
-                        "Codex request timed out for method '{method}'"
-                    )))
-                }
+            let result = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(CodexRpcError::transport("Codex response channel closed")),
             };
             if let Err(error) = &result {
                 tracing::warn!(
@@ -18199,21 +18188,25 @@ impl CodexRpc {
             .map_err(|e| format!("Failed to write to Codex stdin: {e}"))
     }
 
+    /// Tear the app-server down.
+    ///
+    /// Nothing here asks the CLI to leave — no stdin close, no shutdown RPC —
+    /// so the old "wait 2s in case it exits on its own, then kill" could only
+    /// return early for a process that had *already* exited, and otherwise
+    /// bought two seconds of nothing before doing the kill regardless. Signal
+    /// first and reap; after SIGKILL, `wait` is a local reap that cannot hang.
     async fn shutdown(&self) {
         let mut child_guard = self.child.lock().await;
-        let Some(mut child) = child_guard.take() else {
-            return;
-        };
-
-        match tokio::time::timeout(CODEX_SHUTDOWN_TIMEOUT, child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = child.kill().await;
-            }
+        if let Some(mut child) = child_guard.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
+        drop(child_guard);
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
         // parent-side stdio pipe fds are released even if EOF hasn't propagated.
         self.abort_readers();
+        self.fail_pending("Codex app-server was shut down before responding")
+            .await;
     }
 
     async fn terminate(&self) -> Result<(), String> {
@@ -18222,9 +18215,20 @@ impl CodexRpc {
             Some(mut child) => terminate_codex_child(&mut child).await,
             None => Ok(()),
         };
-        self.stdout_task.abort();
-        self.stderr_task.abort();
+        self.abort_readers();
+        self.fail_pending("Codex app-server was terminated before responding")
+            .await;
         result
+    }
+
+    /// Resolve every in-flight request the app-server can no longer answer.
+    ///
+    /// The stdout reader does this on EOF, but teardown aborts that reader, so
+    /// without this a request in flight when the session closes would wait on a
+    /// sender nobody is left to fire. That wait is unbounded now, so this is
+    /// what keeps "no deadline" from meaning "no way out".
+    async fn fail_pending(&self, reason: &'static str) {
+        fail_pending_codex_requests(&self.pending, reason).await;
     }
 
     /// Reap the app-server after it exited on its own (stdout EOF → `Closed`).
@@ -18251,11 +18255,23 @@ async fn terminate_codex_child(child: &mut AsyncGroupChild) -> Result<(), String
         .start_kill()
         .err()
         .map(|err| format!("failed to kill Codex app-server process group: {err}"));
-    let wait_error = wait_for_codex_child_exit(child.wait(), CODEX_SHUTDOWN_TIMEOUT)
+    // Unbounded on purpose: this reaps a process group we have just signalled,
+    // which is a local operation with no peer to cooperate. A clock here could
+    // only ever report a slow machine as a failed cleanup.
+    let wait_error = child
+        .wait()
         .await
-        .err();
+        .err()
+        .map(|err| format!("failed to reap Codex app-server process group: {err}"));
 
     codex_terminate_outcome(kill_error, wait_error)
+}
+
+/// Fail every in-flight request because the app-server can no longer answer it.
+async fn fail_pending_codex_requests(pending: &PendingRpcMap, reason: &'static str) {
+    for (_, tx) in pending.lock().await.drain() {
+        let _ = tx.send(Err(CodexRpcError::transport(reason)));
+    }
 }
 
 fn codex_terminate_outcome(
@@ -18271,23 +18287,6 @@ fn codex_terminate_outcome(
         (None, Some(error)) => Err(error),
         (Some(kill_error), Some(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
     }
-}
-
-async fn wait_for_codex_child_exit(
-    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
-    timeout: Duration,
-) -> Result<(), String> {
-    match tokio::time::timeout(timeout, wait).await {
-        Ok(Ok(_)) => None,
-        Ok(Err(err)) => Some(format!(
-            "failed to reap Codex app-server process group: {err}"
-        )),
-        Err(_) => Some(format!(
-            "timed out after {}s reaping Codex app-server process group",
-            timeout.as_secs_f64()
-        )),
-    }
-    .map_or(Ok(()), Err)
 }
 
 impl Drop for CodexRpc {
