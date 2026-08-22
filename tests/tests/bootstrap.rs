@@ -549,6 +549,92 @@ async fn codex_schema_reports_an_app_server_that_dies_without_answering() {
     );
 }
 
+/// A fake app-server that records having been allowed to exit on its own.
+///
+/// The marker is written after the read loop ends, and stdin EOF is the only
+/// thing that can end it — so the file exists if and only if Tyde closed stdin
+/// and waited, and never if the app-server's first news of teardown is SIGKILL.
+fn write_graceful_fake_codex_model_probe_program(
+    dir: &tempfile::TempDir,
+    marker: &std::path::Path,
+) -> std::path::PathBuf {
+    let binary = dir.path().join("graceful-fake-codex-model-probe.py");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+MARKER = {}
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "model/list":
+        send({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{"data": [{{
+                "model": "gpt-5.6",
+                "isDefault": True,
+                "supportedReasoningEfforts": [{{"reasoningEffort": "low"}}]
+            }}]}}
+        }})
+
+with open(MARKER, "w", encoding="utf-8") as marker:
+    marker.write("closed by stdin EOF")
+"#,
+        serde_json::to_string(&marker.to_string_lossy()).expect("marker path JSON")
+    );
+    install_fake_program(&binary, &script);
+    binary
+}
+
+/// Teardown must ask the app-server to leave before it kills it.
+///
+/// `codex app-server` exposes no shutdown request, so closing stdin is the only
+/// way to say so; it answers by exiting 0 and closing sqlite databases that
+/// SIGKILL would leave open with their `-wal`/`-shm` files stranded. Tyde used
+/// to open teardown with SIGKILL, so it never asked.
+#[tokio::test]
+async fn codex_teardown_lets_the_app_server_close_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    write_enabled_backends_settings(&settings_path, &[BackendKind::Codex]);
+    let marker = dir.path().join("graceful-exit-marker");
+    let fake_codex = write_graceful_fake_codex_model_probe_program(&dir, &marker);
+    let host = spawn_host_with_codex_probe_program(&dir, settings_path, &fake_codex);
+    let mut client = connect_raw(host).await;
+
+    let schemas_env = next_kind_within(
+        &mut client,
+        FrameKind::SessionSchemas,
+        Duration::from_secs(30),
+        "Codex model schema before teardown",
+    )
+    .await;
+    let schemas: SessionSchemasPayload = schemas_env
+        .parse_payload()
+        .expect("graceful Codex SessionSchemas");
+    let [protocol::SessionSchemaEntry::Ready { .. }] = schemas.schemas.as_slice() else {
+        panic!("the probe must have succeeded for its teardown to mean anything: {schemas:?}");
+    };
+
+    // No polling: the probe tears the app-server down and waits for it to exit
+    // before it can produce the schema above, so the marker is already on disk.
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("closed by stdin EOF"),
+        "teardown must close stdin and let the app-server exit, not open with SIGKILL"
+    );
+}
+
 #[tokio::test]
 async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
     let dir = tempfile::tempdir().expect("tempdir");

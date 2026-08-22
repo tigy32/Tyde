@@ -17899,7 +17899,10 @@ fn cache_codex_manual_trigger_absent(
 }
 
 struct CodexRpc {
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// `None` once teardown has closed it. Closing stdin is how we ask the
+    /// app-server to leave, so the handle has to be droppable, not just
+    /// writable.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: PendingRpcMap,
     next_id: AtomicU64,
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
@@ -18069,7 +18072,7 @@ impl CodexRpc {
 
         Ok((
             Self {
-                stdin: Arc::new(Mutex::new(stdin)),
+                stdin: Arc::new(Mutex::new(Some(stdin))),
                 pending,
                 next_id: AtomicU64::new(1),
                 child: child_ref,
@@ -18138,14 +18141,7 @@ impl CodexRpc {
             });
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(id, tx);
-            let send_result = {
-                let mut stdin = stdin.lock().await;
-                let line = format!("{payload}\n");
-                stdin
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|error| format!("Failed to write to Codex stdin: {error}"))
-            };
+            let send_result = write_codex_stdin_line(&stdin, &format!("{payload}\n")).await;
             if let Err(error) = send_result {
                 pending.lock().await.remove(&id);
                 tracing::warn!(
@@ -18180,26 +18176,24 @@ impl CodexRpc {
     }
 
     async fn send_json(&self, value: &Value) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().await;
-        let line = format!("{value}\n");
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to Codex stdin: {e}"))
+        write_codex_stdin_line(&self.stdin, &format!("{value}\n")).await
+    }
+
+    /// Close our end of the app-server's stdin, which is how we ask it to exit.
+    ///
+    /// The protocol has no shutdown request — none of its client methods ends
+    /// the process — so EOF is the only way to say "we're done" short of a
+    /// signal. `codex app-server` answers it by exiting 0.
+    async fn close_stdin(&self) {
+        drop(self.stdin.lock().await.take());
     }
 
     /// Tear the app-server down.
-    ///
-    /// Nothing here asks the CLI to leave — no stdin close, no shutdown RPC —
-    /// so the old "wait 2s in case it exits on its own, then kill" could only
-    /// return early for a process that had *already* exited, and otherwise
-    /// bought two seconds of nothing before doing the kill regardless. Signal
-    /// first and reap; after SIGKILL, `wait` is a local reap that cannot hang.
     async fn shutdown(&self) {
+        self.close_stdin().await;
         let mut child_guard = self.child.lock().await;
         if let Some(mut child) = child_guard.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = shut_down_codex_child(&mut child).await;
         }
         drop(child_guard);
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
@@ -18210,9 +18204,10 @@ impl CodexRpc {
     }
 
     async fn terminate(&self) -> Result<(), String> {
+        self.close_stdin().await;
         let child = self.child.lock().await.take();
         let result = match child {
-            Some(mut child) => terminate_codex_child(&mut child).await,
+            Some(mut child) => shut_down_codex_child(&mut child).await,
             None => Ok(()),
         };
         self.abort_readers();
@@ -18250,7 +18245,31 @@ impl CodexRpc {
     }
 }
 
-async fn terminate_codex_child(child: &mut AsyncGroupChild) -> Result<(), String> {
+/// Let the app-server exit on its own, then make sure nothing it spawned outlives it.
+///
+/// Callers close stdin first. `codex app-server` has no shutdown request — none
+/// of its client methods ends the process — so that EOF is the only way to tell
+/// it we are done short of a signal, and it answers by exiting 0. What it does
+/// on the way out is the point: it closes sqlite databases under `CODEX_HOME`
+/// that SIGKILL leaves open, so an unasked teardown strands their `-wal`/`-shm`
+/// files for the next start to recover. Not a correctness fix — the rollout
+/// transcript survives SIGKILL intact — but recovery is the work that needs the
+/// POSIX locks a networked `CODEX_HOME` cannot serve.
+///
+/// The graceful wait is on the leader *alone*. `AsyncGroupChild::wait` reaps the
+/// whole group, so using it here would let a descendant that outlives codex hold
+/// the wait open long after the process we asked to leave had gone.
+///
+/// The group kill after it is unconditional and unchanged: codex exiting cleanly
+/// is not a promise that everything it spawned did, and this is what guarantees
+/// teardown terminates.
+async fn shut_down_codex_child(child: &mut AsyncGroupChild) -> Result<(), String> {
+    // No deadline. This ends when the process ends, which is the same liveness
+    // signal the stdout reader watches. A clock could only pre-empt the flush
+    // this wait exists to allow — and if some future codex stopped exiting on
+    // EOF, hanging is the honest report of that, where a deadline would hide it.
+    let _ = child.inner().wait().await;
+
     let kill_error = child
         .start_kill()
         .err()
@@ -18265,6 +18284,20 @@ async fn terminate_codex_child(child: &mut AsyncGroupChild) -> Result<(), String
         .map(|err| format!("failed to reap Codex app-server process group: {err}"));
 
     codex_terminate_outcome(kill_error, wait_error)
+}
+
+/// Write one line to the app-server's stdin, or report that teardown closed it.
+async fn write_codex_stdin_line(
+    stdin: &Mutex<Option<ChildStdin>>,
+    line: &str,
+) -> Result<(), String> {
+    match stdin.lock().await.as_mut() {
+        Some(stdin) => stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|error| format!("Failed to write to Codex stdin: {error}")),
+        None => Err("Codex app-server stdin is closed".to_string()),
+    }
 }
 
 /// Fail every in-flight request because the app-server can no longer answer it.
