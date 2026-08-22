@@ -1730,6 +1730,7 @@ fn assert_universal_contract(turns: &[Turn]) {
         assert_declarations_carry_provider_arguments(turn);
         assert_every_request_completed_exactly_once(turn);
         assert_no_completion_without_request(turn);
+        assert_one_message_per_provider_request(turn);
         assert_reached_idle(turn);
     }
     assert_text_was_streamed(turns);
@@ -1746,6 +1747,40 @@ fn assert_no_error_message(label: &str, events: &[ChatEvent]) {
         {
             panic!("{label}: emitted an Error message: {:?}", message.content);
         }
+    }
+}
+
+/// One provider request, one chat message — the splitting counterpart to
+/// `assert_streams_are_balanced`, which only catches the conflating direction.
+///
+/// Request-scoped usage names the provider request a response came from, and
+/// inside a single turn it cannot repeat: every later request carries the
+/// earlier requests' output in its prompt, so its input count is strictly
+/// larger. Two messages reporting byte-identical request usage therefore means
+/// one response was cut in half, and the client renders that one request's
+/// tokens under both halves.
+fn assert_one_message_per_provider_request(turn: &Turn) {
+    let usages = turn.reported_usage();
+    let mut seen: Vec<&TokenUsage> = Vec::new();
+    for usage in &usages {
+        let Some(request) = usage.request.known_usage() else {
+            continue;
+        };
+        assert!(
+            !seen.contains(&request),
+            "{}: two of this turn's {} assistant messages both reported request usage \
+             {request:?}. One provider request cannot bill twice, so this is one response \
+             split across two chat messages — the client shows the same token footer under \
+             each half and cannot tell which message issued the tools. All reported request \
+             usage: {:?}",
+            turn.label(),
+            usages.len(),
+            usages
+                .iter()
+                .map(|usage| usage.request.known_usage())
+                .collect::<Vec<_>>(),
+        );
+        seen.push(request);
     }
 }
 

@@ -2750,6 +2750,10 @@ struct BufferedCodexToolRequest {
 struct OpenCodexProviderResponse {
     identity: CodexProviderResponseIdentity,
     turn_id: String,
+    /// The provider's own id for this response, taken from
+    /// `rawResponse/completed`. Absent on a resumed thread, which gets no raw
+    /// events at all.
+    response_id: Option<String>,
     text: String,
     reasoning: String,
     item_text: HashMap<String, String>,
@@ -2857,6 +2861,7 @@ impl CodexResponseSplitter {
             self.open = Some(OpenCodexProviderResponse {
                 identity: identity.clone(),
                 turn_id: turn_id.unwrap_or("turn").to_owned(),
+                response_id: None,
                 text: String::new(),
                 reasoning: String::new(),
                 item_text: HashMap::new(),
@@ -3015,6 +3020,27 @@ impl CodexResponseSplitter {
         Some(opened)
     }
 
+    /// Take the provider's id for the response now open.
+    ///
+    /// `rawResponse/completed` is the only event that carries it — and it is
+    /// *not* the end of the response. Codex reports the typed item for every
+    /// tool the response called after it: measured against 0.146.0, 73ms later
+    /// for an instant command and 202ms for one that sleeps 8s, and the same
+    /// for a file edit. Closing here left nothing open when the tool arrived,
+    /// so `buffer_tool_request` opened a second, id-less response for it and
+    /// every tool became its own chat message — billed a second time with the
+    /// request usage its other half already reported.
+    ///
+    /// The response ends at `thread/tokenUsage/updated`, which lands after the
+    /// last of those items, and which is the boundary a resumed thread already
+    /// used for want of any raw events.
+    fn observe_raw_response_completed(&mut self, turn_id: Option<&str>, response_id: String) {
+        if self.ensure_open(turn_id).is_none() {
+            return;
+        }
+        self.open.as_mut().expect("open Codex response").response_id = Some(response_id);
+    }
+
     fn observe_delta(
         &mut self,
         turn_id: Option<&str>,
@@ -3164,7 +3190,6 @@ impl CodexResponseSplitter {
     fn finalize(
         &mut self,
         turn_id: Option<&str>,
-        response_id: Option<String>,
         usage: Option<Value>,
         failed: bool,
     ) -> Option<FinalizedCodexProviderResponse> {
@@ -3173,6 +3198,9 @@ impl CodexResponseSplitter {
         }
         self.ensure_open(turn_id)?;
         let response = self.open.take().expect("open Codex response");
+        // Off the response, not the closing event: only `rawResponse/completed`
+        // ever carries an id, and that is no longer the event that closes it.
+        let response_id = response.response_id;
         let mut tool_requests = response.tool_requests;
         for raw in response.raw_tool_requests {
             if !tool_requests.iter().any(|request| {
@@ -8881,11 +8909,6 @@ impl CodexInner {
         let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
             return false;
         };
-        let response_id = params
-            .get("responseId")
-            .or_else(|| params.get("response_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let usage = params.get("usage").and_then(|usage| {
             normalize_token_usage_with_envelope(usage, Some(params), Some(&model))
         });
@@ -8895,9 +8918,7 @@ impl CodexInner {
             state
                 .response_splitters
                 .get_mut(&thread_id)
-                .and_then(|splitter| {
-                    splitter.finalize(turn_id.as_deref(), response_id, usage, failed)
-                })
+                .and_then(|splitter| splitter.finalize(turn_id.as_deref(), usage, failed))
         };
         let Some(finalized) = finalized else {
             return false;
@@ -9002,9 +9023,36 @@ impl CodexInner {
         true
     }
 
-    /// Closes the open provider response when reported usage moves. On a thread
-    /// with raw events `rawResponse/completed` has already closed it and this
-    /// finds nothing open, so both kinds of thread end a response the same way.
+    /// Record the provider's id for the open response. See
+    /// [`CodexResponseSplitter::observe_raw_response_completed`] for why this
+    /// notification names a response without ending it.
+    async fn observe_raw_response_completed(&self, params: &Value) {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let Some(response_id) = params
+            .get("responseId")
+            .or_else(|| params.get("response_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let turn_id = extract_turn_id(params);
+        let mut state = self.state.lock().await;
+        if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+            splitter.observe_raw_response_completed(turn_id.as_deref(), response_id);
+        }
+    }
+
+    /// Closes the open provider response when reported usage moves — the single
+    /// boundary, for threads with raw events and without.
+    ///
+    /// It is the only notification that arrives after *everything* the response
+    /// produced, including the typed items for the tools it called, which is
+    /// why `rawResponse/completed` cannot serve. Measured on 0.146.0, its
+    /// `last` is byte-identical to that event's `usage` on every response, so
+    /// nothing is lost by reading the number here instead.
     async fn finalize_strict_response_at_token_usage(&self, params: &Value) {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return;
@@ -9120,7 +9168,7 @@ impl CodexInner {
         self.trace_agent_message_identity_event(method, params)
             .await;
         if method == "rawResponse/completed" {
-            self.finalize_strict_response(params, false).await;
+            self.observe_raw_response_completed(params).await;
             return;
         }
         if method == "rawResponseItem/completed" {
