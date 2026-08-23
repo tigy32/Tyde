@@ -1849,13 +1849,14 @@ fn assert_no_error_message(label: &str, events: &[ChatEvent]) {
 /// reasoning, no tool calls and no images renders as an empty bubble in the
 /// transcript. `assert_streams_are_balanced` cannot catch this — an empty
 /// response is perfectly balanced, which is exactly why it went unnoticed:
-/// 128 of 374 responses (34%) in a real Codex session were a `StreamStart`
-/// whose very next event was `StreamEnd`.
+/// 139 of 470 responses (29.6%) in a real Codex session were a `StreamStart`
+/// whose very next event was `StreamEnd`. 137 of them billed real output
+/// tokens, 126 of those with usage no other response reported.
 ///
-/// Codex opens responses purely so it can close them:
-/// `CodexResponseSplitter::finalize` calls `ensure_open`, and `codex.rs` then
-/// mints an emitter handle at two finalize sites. The check is universal
-/// rather than Codex-only because nothing about "don't publish an empty
+/// The mechanism is unproven — this does not reproduce here, and the provider
+/// events that would settle whether content was lost or never sent are gone.
+/// So this guards the property rather than a suspected cause, and universally
+/// rather than Codex-only, because nothing about "don't publish an empty
 /// message" is backend-specific.
 fn assert_no_empty_response(turn: &Turn) {
     let responses = turn
