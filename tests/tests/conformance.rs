@@ -46,6 +46,7 @@ const READY_MARKER: &str = "TYDE_READY";
 const WROTE_MARKER: &str = "TYDE_WROTE";
 const MULTI_MARKER: &str = "TYDE_MULTI";
 const BG_MARKER: &str = "TYDE_BG";
+const WATCHED_MARKER: &str = "TYDE_WATCHED";
 const WAITED_MARKER: &str = "TYDE_WAITED";
 const DELETED_MARKER: &str = "TYDE_DELETED";
 const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
@@ -135,6 +136,8 @@ const BG_SETTLE: Duration = Duration::from_secs(60);
 /// How long the background command in `real_background_task_outlives_its_turn`
 /// runs. Only has to outlive its own turn.
 const BG_SECONDS: u64 = 20;
+/// Long enough that the provider yields the command back mid-run.
+const WATCHED_SECONDS: u64 = 25;
 
 /// The same command in `real_interruption`, which has to still be running
 /// several turns later when a *different* turn is interrupted. A command that
@@ -815,6 +818,50 @@ fn real_user_question() {
 /// command legitimately outlives its turn. It asserts that the turn ending does
 /// not corrupt the stream, which is the ground on which a still-open tool gets
 /// cancelled or its late completion rejected.
+/// Every action the model takes owes the user a card, including the ones it
+/// takes *while* a command is running.
+///
+/// Measured against codex-cli 0.146.0: a turn that started one command and then
+/// watched it made five raw tool calls — one `tools.exec_command` and four
+/// `tools.write_stdin` — and produced exactly one typed item. Tyde renders the
+/// typed item, so the four polls rendered nowhere, and a response whose only
+/// act was a poll published a message with no text, no reasoning and no card.
+///
+/// Asserted as the user-visible contract, not the Codex shape: a turn that
+/// starts a command and watches it to completion performed at least two
+/// actions, so it owes at least two cards. Any backend that watches a command
+/// this way owes the same.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_watched_command_shows_every_interaction() {
+    run_scenario(
+        &[BackendCapability::BackgroundTasks],
+        |mut host| async move {
+            let prompt = watched_command_prompt(host.backend());
+            let agent = spawn_agent(&mut host, &prompt).await;
+            let turn = collect_turn(&mut host, &agent, &prompt).await;
+
+            // A backend that never ran the command finishes fast and satisfies
+            // every structural assertion below, so establish it did the work
+            // before reading anything into the card count.
+            assert_final_text_contains(&turn, WATCHED_MARKER);
+
+            let requests = turn.tool_requests().count();
+            assert!(
+                requests >= 2,
+                "{}: the model started a command and watched it to completion but only {requests} \
+                 tool card(s) were rendered, so at least one thing it did is invisible to the \
+                 user. Cards: {:?}",
+                turn.label(),
+                turn.tool_request_names(),
+            );
+
+            assert_universal_contract(&[turn]);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_background_task_outlives_its_turn() {
@@ -1680,6 +1727,37 @@ fn background_prompt(workspace: &Path, backend_kind: BackendKind, seconds: u64) 
         ),
     };
     format!("{launch} As soon as it is started, reply with exactly {BG_MARKER} and nothing else.")
+}
+
+/// Make the model watch a command it started, rather than fire and forget.
+///
+/// The command has to run long enough that the provider yields it back and the
+/// model has to ask again, because that second ask is the interaction whose
+/// card went missing. A command that finishes inside the first call never
+/// produces one.
+fn watched_command_prompt(backend_kind: BackendKind) -> String {
+    let run = match backend_kind {
+        BackendKind::Codex => format!(
+            "Run this exact shell command as an ordinary foreground command: for i in $(seq 1 \
+             {WATCHED_SECONDS}); do echo tick $i; sleep 1; done; echo {WATCHED_MARKER}. It takes \
+             about {WATCHED_SECONDS} seconds, so it will not finish in one go — keep checking on \
+             it until it is done."
+        ),
+        // Claude reaches for a background monitor and ends the turn on "I'll
+        // wait for the notifications", which finishes the turn before the
+        // command does. Make staying until it finishes, and checking on it more
+        // than once, part of the instruction.
+        _ => format!(
+            "Start a shell command that prints a line every second for about {WATCHED_SECONDS} \
+             seconds and then prints {WATCHED_MARKER}. Do not end your turn until it has \
+             finished: check on its output at least twice while it is still running, waiting in \
+             between, and only then report the last line it printed."
+        ),
+    };
+    format!(
+        "{run} When it has finished, reply with the last line it printed, which will be exactly \
+         {WATCHED_MARKER}."
+    )
 }
 
 /// A long answer with an identifiable end.

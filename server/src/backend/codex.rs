@@ -3000,16 +3000,35 @@ impl CodexResponseSplitter {
         {
             response.raw_call_ids.insert(call_id.to_owned());
         }
-        // Raw declarations no longer own cards. Every tool Codex runs is also
-        // reported as a typed item, which carries the execution's own identity,
-        // status and result; keeping a second owner here is what required
-        // matching two id spaces that share no key. The call ids are recorded as
-        // typed-owned so the raw output that answers them is known to belong to
-        // the typed item's card rather than being reported as a lost result.
+        // A raw declaration owns a card only when nothing else renders the
+        // call. Where a typed item exists it stays the owner — it carries the
+        // status, exit code and output, and matching the two id spaces (which
+        // share no key) is the guesswork this avoids. The call ids are recorded
+        // as typed-owned so the raw output answering them is known to belong to
+        // the typed item's card rather than reported as a lost result.
+        //
+        // Where no typed item exists the raw declaration is all there is, and
+        // discarding it dropped the call outright — see
+        // `codex_raw_call_is_rendered_elsewhere`.
         if let Some(request) = raw_codex_tool_request(item_id, item) {
-            self.typed_owned_call_ids.insert(item_id.to_owned());
-            if let Some(call_id) = request.provider_call_id {
-                self.typed_owned_call_ids.insert(call_id);
+            if codex_raw_call_is_rendered_elsewhere(&request.arguments) {
+                self.typed_owned_call_ids.insert(item_id.to_owned());
+                if let Some(call_id) = request.provider_call_id {
+                    self.typed_owned_call_ids.insert(call_id);
+                }
+            } else {
+                let request = BufferedCodexToolRequest {
+                    turn_id: turn_id.map(str::to_owned),
+                    ..request
+                };
+                let response = self.open.as_mut().expect("open Codex response");
+                if !response
+                    .raw_tool_requests
+                    .iter()
+                    .any(|existing| existing.tool_call_id == request.tool_call_id)
+                {
+                    response.raw_tool_requests.push(request);
+                }
             }
         }
         Some(opened)
@@ -3285,6 +3304,30 @@ impl CodexResponseSplitter {
 
     fn raw_tool_owner(&self, call_id: &str) -> Option<BufferedCodexToolRequest> {
         self.pending_raw_tool_owners.get(call_id).cloned()
+    }
+
+    /// The card a raw output belongs to, including one the open response has
+    /// declared but not yet published.
+    ///
+    /// Only for completing that output. A `write_stdin` output arrives about
+    /// 2ms *before* the `thread/tokenUsage/updated` that closes the response,
+    /// so its owner is not parked yet and the card would stay open until the
+    /// idle sweep cancelled it. Deliberately not folded into
+    /// [`Self::raw_tool_owner`]: that one also answers "which command execution
+    /// yielded this session", and an interaction with a running process is not
+    /// a command execution — widening it there made the yielded-session
+    /// correlation ambiguous and reported every poll as an uncorrelated
+    /// session.
+    fn raw_tool_owner_for_completion(&self, call_id: &str) -> Option<BufferedCodexToolRequest> {
+        self.raw_tool_owner(call_id).or_else(|| {
+            self.open.as_ref().and_then(|response| {
+                response
+                    .raw_tool_requests
+                    .iter()
+                    .find(|owner| owner.provider_call_id.as_deref() == Some(call_id))
+                    .cloned()
+            })
+        })
     }
 
     fn pending_raw_owner_count_for_turn(&self, turn_id: &str) -> usize {
@@ -4438,6 +4481,15 @@ impl CodexInner {
         let Some(owner) = owner else {
             return Vec::new();
         };
+        // Which *command execution* yielded this session. An interaction with an
+        // already-running process is not one: it reports the session its target
+        // yielded, which belongs to the execution's card, not to the
+        // interaction's. Before interactions owned cards at all they had no
+        // owner and fell out one line above; without this they reach the
+        // correlation and report every poll as an uncorrelated session.
+        if !codex_raw_call_is_rendered_elsewhere(&owner.arguments) {
+            return Vec::new();
+        }
         let session_ids = if declared_session_ids.is_empty() {
             state
                 .outstanding_command_executions
@@ -8371,7 +8423,7 @@ impl CodexInner {
             let state = self.state.lock().await;
             let splitter = state.response_splitters.get(&thread_id);
             (
-                splitter.and_then(|splitter| splitter.raw_tool_owner(call_id)),
+                splitter.and_then(|splitter| splitter.raw_tool_owner_for_completion(call_id)),
                 splitter.is_some_and(|splitter| splitter.typed_item_owns_call(call_id)),
             )
         };
@@ -8406,7 +8458,16 @@ impl CodexInner {
             );
             return false;
         };
-        if !emitter.has_pending_tool_request(&owner.tool_call_id) {
+        // Nothing to do only when the emitter *knows* the card and it is no
+        // longer pending — it was declared and already completed. A card the
+        // emitter has never heard of is the opposite case: a raw output can
+        // outrun its declaration, because the output lands about 2ms before the
+        // `thread/tokenUsage/updated` that closes the response and declares the
+        // cards. Treating that as "already handled" swallowed the outcome and
+        // left the card open until the idle sweep cancelled it.
+        if !emitter.has_pending_tool_request(&owner.tool_call_id)
+            && emitter.has_known_tool_request(&owner.tool_call_id)
+        {
             if let Some(splitter) = self
                 .state
                 .lock()
@@ -8522,10 +8583,13 @@ impl CodexInner {
                 "detailed_message": output,
             })
         };
-        emitter.tool_completed(
+        self.emit_or_defer_tool_completion(
+            &thread_id,
+            &emitter,
             &owner.tool_call_id,
             codex_tool_execution_outcome(tool_result, success, error, None),
-        );
+        )
+        .await;
         if let Some(splitter) = self
             .state
             .lock()
@@ -18989,6 +19053,42 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
         tool_type,
         content_offset: None,
     })
+}
+
+/// Whether some other path already renders this raw call, so recording it here
+/// would duplicate the card rather than rescue it.
+///
+/// Codex reports most tools twice — a raw `custom_tool_call` and a typed item —
+/// and the typed item owns the card because it carries the execution's status,
+/// exit code and output. The two ids share no key, so which raw call a typed
+/// item belongs to is not knowable; the tool the model invoked is.
+///
+/// Measured against codex-cli 0.146.0: a turn that started one command and
+/// watched it made one `tools.exec_command` and four `tools.write_stdin` calls
+/// and produced exactly *one* typed item. `write_stdin` gets none, so under
+/// "the typed item owns everything" it was dropped outright.
+///
+/// Listed the way round that fails safe. An unrecognised tool falls through to
+/// a card carrying its JSON: if it turns out to have a typed item too the user
+/// sees it twice, which is visible and fixable, rather than not at all.
+fn codex_raw_call_is_rendered_elsewhere(arguments: &Value) -> bool {
+    let Some(source) = arguments.as_str() else {
+        return false;
+    };
+    let Some(function) = source.split_once("tools.").map(|(_, rest)| {
+        rest.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .next()
+            .unwrap_or_default()
+    }) else {
+        return false;
+    };
+    // Each of these reaches the user through a typed item (`commandExecution`,
+    // `fileChange`, `webSearch`, `imageView`, `sleep`, `mcpToolCall`) or, for
+    // `update_plan`, through the task list rather than a card.
+    matches!(
+        function,
+        "exec_command" | "apply_patch" | "web__run" | "view_image" | "sleep" | "update_plan"
+    ) || function.starts_with("mcp__")
 }
 
 fn raw_codex_tool_request_type(tool_name: &str, arguments: &Value) -> Option<Value> {
