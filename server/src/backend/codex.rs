@@ -2726,7 +2726,6 @@ struct ActiveStreamState {
     reasoning: String,
     reasoning_only: bool,
     stream_published: bool,
-    response: Option<ResponseHandle>,
     images: Vec<ImageData>,
 }
 
@@ -2765,7 +2764,6 @@ struct OpenCodexProviderResponse {
     pending_typed_tool_call_id: Option<String>,
     tool_requests: Vec<BufferedCodexToolRequest>,
     raw_tool_requests: Vec<BufferedCodexToolRequest>,
-    response: Option<ResponseHandle>,
 }
 
 struct ClosedCodexProviderResponse {
@@ -2797,12 +2795,10 @@ struct CodexResponseSplitter {
 }
 
 struct CodexResponseDelta {
-    response: Option<ResponseHandle>,
     delta: String,
 }
 
 struct FinalizedCodexProviderResponse {
-    response: Option<ResponseHandle>,
     message_id: ChatMessageId,
     turn_id: String,
     content: String,
@@ -2873,7 +2869,6 @@ impl CodexResponseSplitter {
                 pending_typed_tool_call_id: None,
                 tool_requests: Vec::new(),
                 raw_tool_requests: Vec::new(),
-                response: None,
             });
             Some(identity)
         } else {
@@ -3074,7 +3069,6 @@ impl CodexResponseSplitter {
             response.text.push_str(delta);
         }
         Some(CodexResponseDelta {
-            response: response.response.clone(),
             delta: delta.to_owned(),
         })
     }
@@ -3110,7 +3104,6 @@ impl CodexResponseSplitter {
             .to_owned();
         if missing.is_empty() {
             return Some(CodexResponseDelta {
-                response: response.response.clone(),
                 delta: String::new(),
             });
         }
@@ -3120,10 +3113,7 @@ impl CodexResponseSplitter {
         } else {
             response.text.push_str(&missing);
         }
-        Some(CodexResponseDelta {
-            response: response.response.clone(),
-            delta: missing,
-        })
+        Some(CodexResponseDelta { delta: missing })
     }
 
     fn buffer_tool_request(
@@ -3260,7 +3250,6 @@ impl CodexResponseSplitter {
             );
         }
         Some(FinalizedCodexProviderResponse {
-            response: response.response,
             message_id,
             turn_id: response.turn_id,
             content: response.text,
@@ -5992,7 +5981,6 @@ impl CodexInner {
                     reasoning: String::new(),
                     reasoning_only: false,
                     stream_published: false,
-                    response: None,
                     images,
                 });
                 return CodexAgentMessageOpen::Superseded(Box::new(previous));
@@ -6012,7 +6000,6 @@ impl CodexInner {
             reasoning: String::new(),
             reasoning_only: false,
             stream_published: false,
-            response: None,
             images,
         });
         CodexAgentMessageOpen::Open
@@ -6101,7 +6088,6 @@ impl CodexInner {
                     reasoning: String::new(),
                     reasoning_only: true,
                     stream_published: false,
-                    response: None,
                     images,
                 });
                 return CodexAgentMessageOpen::Superseded(Box::new(previous));
@@ -6139,7 +6125,6 @@ impl CodexInner {
             reasoning: String::new(),
             reasoning_only: true,
             stream_published: false,
-            response: None,
             images,
         });
         CodexAgentMessageOpen::Open
@@ -6147,7 +6132,7 @@ impl CodexInner {
 
     async fn finalize_root_provider_stream(
         &self,
-        mut stream: ActiveStreamState,
+        stream: ActiveStreamState,
         finalization: CodexProviderStreamFinalization,
     ) -> FinalizedCodexProviderItem {
         let kind = if stream.reasoning_only {
@@ -6229,22 +6214,18 @@ impl CodexInner {
                 .get(&stream.turn_id)
                 .cloned()
                 .unwrap_or_default();
-            if renderable && stream.response.is_none() {
-                stream.response = Some(self.emitter.stream_start(Some(&model)));
+            if renderable && self.emitter.open_response().is_none() {
+                let response = self.emitter.ensure_open_response(Some(&model));
                 if let Some(reasoning) = reasoning.as_deref() {
-                    self.emitter.stream_reasoning_delta(
-                        stream.response.as_ref().expect("response"),
-                        reasoning,
-                    );
+                    self.emitter.stream_reasoning_delta(&response, reasoning);
                 }
             }
             let metadata = match kind {
                 CodexProviderItemKind::AgentMessage if renderable => {
                     metadata_target_for_visible_message(
                         stream.turn_id.clone(),
-                        stream
-                            .response
-                            .as_ref()
+                        self.emitter
+                            .open_response()
                             .expect("renderable response")
                             .message_id(),
                         &content,
@@ -6256,9 +6237,8 @@ impl CodexInner {
                 CodexProviderItemKind::Reasoning => reasoning.as_ref().and_then(|_| {
                     metadata_target_for_visible_message(
                         stream.turn_id.clone(),
-                        stream
-                            .response
-                            .as_ref()
+                        self.emitter
+                            .open_response()
                             .expect("renderable response")
                             .message_id(),
                         "",
@@ -6330,7 +6310,9 @@ impl CodexInner {
         self.trace_terminal_emission("stream_end", Some(&stream.message_id.0))
             .await;
         self.emitter.stream_end(
-            stream.response.take().expect("renderable Codex response"),
+            self.emitter
+                .open_response()
+                .expect("renderable Codex response"),
             StreamEndPayload {
                 content: content.clone(),
                 model_info: Some(ModelInfo { model }),
@@ -7034,10 +7016,7 @@ impl CodexInner {
         } else {
             stream.text.clone()
         };
-        let response = stream
-            .response
-            .get_or_insert_with(|| self.emitter.stream_start(Some(&model)))
-            .clone();
+        let response = self.emitter.ensure_open_response(Some(&model));
         Some((response, emitted))
     }
 
@@ -7217,10 +7196,7 @@ impl CodexInner {
                         stream.stream_published = true;
                     }
                     let emission = stream.stream_published.then(|| {
-                        let response = stream
-                            .response
-                            .get_or_insert_with(|| self.emitter.stream_start(Some(&model)))
-                            .clone();
+                        let response = self.emitter.ensure_open_response(Some(&model));
                         let reasoning = if was_published {
                             reasoning.to_string()
                         } else {
@@ -8056,22 +8032,18 @@ impl CodexInner {
         thread_id: &str,
         emitter: &TurnEmitter,
         model: &str,
-        observed: Option<ResponseHandle>,
     ) -> Option<ResponseHandle> {
-        if observed.is_some() {
-            return observed;
-        }
-        let mut state = self.state.lock().await;
-        let open = state
+        // The splitter answers *whether* a provider response is open; the
+        // emitter answers which chat response that is. A second copy of the
+        // handle here could only ever disagree with the emitter, which retires
+        // its response at `stream_end` and drops it if the turn goes idle —
+        // neither of which is observable from the splitter.
+        let state = self.state.lock().await;
+        state
             .response_splitters
-            .get_mut(thread_id)
-            .and_then(|splitter| splitter.open.as_mut())?;
-        if let Some(response) = open.response.clone() {
-            return Some(response);
-        }
-        let response = emitter.stream_start(Some(model));
-        open.response = Some(response.clone());
-        Some(response)
+            .get(thread_id)
+            .and_then(|splitter| splitter.open.as_ref())?;
+        Some(emitter.ensure_open_response(Some(model)))
     }
 
     async fn observe_strict_response_item_started(&self, params: &Value) -> (bool, bool) {
@@ -8120,7 +8092,7 @@ impl CodexInner {
             })
         };
         let _ = opened;
-        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model, None)
+        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
             .await;
         (true, provider_tool)
     }
@@ -8271,7 +8243,7 @@ impl CodexInner {
             return false;
         };
         let Some(response) = self
-            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model, emission.response)
+            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
             .await
         else {
             return false;
@@ -8336,7 +8308,7 @@ impl CodexInner {
             return false;
         };
         let Some(response) = self
-            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model, emission.response)
+            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
             .await
         else {
             return false;
@@ -8766,7 +8738,7 @@ impl CodexInner {
                 .and_then(|(opened, _)| opened)
         };
         let _ = opened;
-        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model, None)
+        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
             .await;
     }
 
@@ -8818,7 +8790,7 @@ impl CodexInner {
             return false;
         };
         let Some(response) = self
-            .ensure_strict_response_handle(thread_id, emitter.as_ref(), &model, None)
+            .ensure_strict_response_handle(thread_id, emitter.as_ref(), &model)
             .await
         else {
             return false;
@@ -8938,10 +8910,7 @@ impl CodexInner {
                 .collect::<Vec<_>>(),
             "Finalizing a Codex provider response"
         );
-        let response = finalized
-            .response
-            .clone()
-            .unwrap_or_else(|| emitter.stream_start(Some(&model)));
+        let response = emitter.ensure_open_response(Some(&model));
         let images = self
             .prepare_strict_response_bookkeeping(
                 &thread_id,
@@ -13490,7 +13459,6 @@ impl CodexInner {
                                 reasoning: String::new(),
                                 reasoning_only: false,
                                 stream_published: false,
-                                response: None,
                                 images,
                             },
                             true,
@@ -13639,7 +13607,6 @@ impl CodexInner {
                                 reasoning: String::new(),
                                 reasoning_only: true,
                                 stream_published: false,
-                                response: None,
                                 images,
                             },
                             true,
@@ -14589,7 +14556,7 @@ impl CodexInner {
                 let open_stream = has_open_stream
                     .then(|| state.active_stream.take())
                     .flatten();
-                if let Some(mut stream) = open_stream {
+                if let Some(stream) = open_stream {
                     state.pending_message_metadata = None;
                     open_item_published = stream.stream_published;
                     let reasoning = contains_non_whitespace(&stream.reasoning)
@@ -14606,7 +14573,10 @@ impl CodexInner {
                             },
                         );
                         interrupted_published_stream = Some(InterruptedPublishedStream {
-                            response: stream.response.take().expect("published Codex response"),
+                            response: self
+                                .emitter
+                                .open_response()
+                                .expect("published Codex response"),
                             content,
                             reasoning,
                             images: stream.images,
@@ -14629,7 +14599,9 @@ impl CodexInner {
                                 },
                             );
                             partial_idless_reasoning = Some((
-                                stream.response.take().expect("published Codex reasoning"),
+                                self.emitter
+                                    .open_response()
+                                    .expect("published Codex reasoning"),
                                 reasoning,
                             ));
                         } else {

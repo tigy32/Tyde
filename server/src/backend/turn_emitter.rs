@@ -80,6 +80,11 @@ struct OpenResponse {
     model: Option<String>,
     content: String,
     reasoning: String,
+    /// Where `stream_start` was called. A response left open at the end of a
+    /// turn is reported to the user, and until this was recorded the report
+    /// named no call site at all — `codex.rs` alone opens responses from eleven
+    /// of them, so the report could not be acted on.
+    opened_at: &'static std::panic::Location<'static>,
 }
 
 #[derive(Default)]
@@ -374,21 +379,32 @@ impl TurnEmitter {
         }));
     }
 
+    #[track_caller]
     pub fn typing_status_changed(&self, typing: bool) {
+        let idle_caller = std::panic::Location::caller();
         let mut state = self.lock();
         if typing == state.typing_active {
             return;
         }
         if !typing {
-            if let Some(response) = state
-                .current_response
-                .as_ref()
-                .map(|response| response.handle.clone())
-            {
-                state.violation(
-                    "idle_with_open_response",
-                    "typing ended before the open response reached StreamEnd",
-                );
+            // Both ends of the report matter: which terminal path declared the
+            // turn over, and which `stream_start` opened the response it walked
+            // away from. The volume says whether the user lost real output or
+            // only an empty shell.
+            let abandoned = state.current_response.as_ref().map(|open| {
+                (
+                    open.handle.clone(),
+                    format!(
+                        "typing ended at {idle_caller} before the response opened at {} reached \
+                         StreamEnd, discarding {} characters of content and {} of reasoning",
+                        open.opened_at,
+                        open.content.chars().count(),
+                        open.reasoning.chars().count(),
+                    ),
+                )
+            });
+            if let Some((response, detail)) = abandoned {
+                state.violation("idle_with_open_response", detail);
                 state.discard_open_response(&response);
             }
             let foreground_tools = state
@@ -511,6 +527,39 @@ impl TurnEmitter {
         self.lock().current_response.is_some()
     }
 
+    /// The response this turn is streaming into, opening one if none is.
+    ///
+    /// Response lifetime belongs to the emitter: it retires the open response at
+    /// `stream_end`, and drops it if the turn goes idle while it is still open.
+    /// A backend that keeps its own `Option<ResponseHandle>` is caching state it
+    /// does not own, and every write through a copy the emitter has since
+    /// retired is rejected without the backend being told. Measured on Codex: a
+    /// turn went idle with a response still open, and the next turn's entire
+    /// answer arrived as 71 rejected deltas and a rejected `stream_end` — the
+    /// user got an error banner where their reply should have been. Ask the
+    /// owner rather than keeping a copy of what it owns.
+    #[track_caller]
+    pub fn ensure_open_response(&self, model: Option<&str>) -> ResponseHandle {
+        let caller = std::panic::Location::caller();
+        let mut state = self.lock();
+        if let Some(open) = state.current_response.as_ref() {
+            return open.handle.clone();
+        }
+        state.stream_start(model, caller)
+    }
+
+    /// The response this turn is streaming into, or `None` if none is open.
+    ///
+    /// The read for a caller that is about to *close* a response. Unlike
+    /// [`Self::ensure_open_response`] it never mints one, because opening a
+    /// response only to end it publishes an empty message to the user.
+    pub fn open_response(&self) -> Option<ResponseHandle> {
+        self.lock()
+            .current_response
+            .as_ref()
+            .map(|open| open.handle.clone())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnEmitterState> {
         self.inner.lock().expect("TurnEmitter mutex poisoned")
     }
@@ -548,11 +597,28 @@ impl TurnEmitterState {
             return;
         }
         let violations = std::mem::take(&mut self.violations);
+        let total = violations.len();
+        // A wedged response repeats one violation per delta — 71 identical lines
+        // in a real report. The count is the information; the repetition only
+        // buries the other entries, which are the ones that say what happened.
+        let mut runs: Vec<(String, usize)> = Vec::new();
+        for violation in violations {
+            match runs.last_mut() {
+                Some((seen, count)) if *seen == violation => *count += 1,
+                _ => runs.push((violation, 1)),
+            }
+        }
+        let reported = runs
+            .into_iter()
+            .map(|(violation, count)| match count {
+                1 => violation,
+                count => format!("{violation} (x{count})"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let content = format!(
-            "The backend sent {} malformed event(s) during this turn, so the conversation above \
-             may be missing tool cards or responses:\n{}",
-            violations.len(),
-            violations.join("\n")
+            "The backend sent {total} malformed event(s) during this turn, so the conversation \
+             above may be missing tool cards or responses:\n{reported}"
         );
         self.send_chat(ChatEvent::MessageAdded(simple_message(
             protocol::MessageSender::Error,
@@ -565,15 +631,16 @@ impl TurnEmitterState {
         model: Option<&str>,
         caller: &'static std::panic::Location<'static>,
     ) -> ResponseHandle {
-        if let Some(response) = self
+        if let Some((response, previous_caller)) = self
             .current_response
             .as_ref()
-            .map(|response| response.handle.clone())
+            .map(|response| (response.handle.clone(), response.opened_at))
         {
             self.violation(
                 "overlapping_response",
                 format!(
-                    "a response started at {caller} while the previous response was still open"
+                    "a response started at {caller} while the response opened at \
+                     {previous_caller} was still open"
                 ),
             );
             self.discard_open_response(&response);
@@ -590,6 +657,7 @@ impl TurnEmitterState {
             model: model.map(str::to_owned),
             content: String::new(),
             reasoning: String::new(),
+            opened_at: caller,
         });
         self.send_chat(ChatEvent::StreamStart(StreamStartData {
             agent: self.agent.clone(),
@@ -1150,4 +1218,158 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn emitter() -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (TurnEmitter::new(tx), rx)
+    }
+
+    /// The violation report the user actually sees, drained from the wire.
+    fn reports(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        let mut reports = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
+                && let Some(content) = event.pointer("/data/content").and_then(Value::as_str)
+                && content.starts_with("The backend sent")
+            {
+                reports.push(content.to_owned());
+            }
+        }
+        reports
+    }
+
+    #[test]
+    fn an_abandoned_response_names_where_it_opened_where_it_ended_and_what_was_lost() {
+        let (emitter, mut rx) = emitter();
+        emitter.typing_status_changed(true);
+        let opened_at = line!() + 1;
+        let response = emitter.stream_start(Some("test-model"));
+        emitter.stream_delta(&response, "twelve chars");
+        emitter.stream_reasoning_delta(&response, "abc");
+        let ended_at = line!() + 1;
+        emitter.typing_status_changed(false);
+
+        let reports = reports(&mut rx);
+        assert_eq!(reports.len(), 1, "expected one report, got {reports:?}");
+        let report = &reports[0];
+        assert!(
+            report.contains("[idle_with_open_response]"),
+            "report lost its violation code: {report}"
+        );
+        assert!(
+            report.contains(&format!("turn_emitter.rs:{opened_at}:")),
+            "report does not name the stream_start call site: {report}"
+        );
+        assert!(
+            report.contains(&format!("turn_emitter.rs:{ended_at}:")),
+            "report does not name the terminal call site: {report}"
+        );
+        assert!(
+            report.contains("discarding 12 characters of content and 3 of reasoning"),
+            "report does not say how much was thrown away: {report}"
+        );
+    }
+
+    /// The wedge, stated as the property that makes it impossible: after a turn
+    /// abandons a response, the next turn asking the owner where to stream must
+    /// never be handed the abandoned one. Writing there is rejected event by
+    /// event, which is how a real session lost an entire answer.
+    #[test]
+    fn the_turn_after_an_abandoned_response_streams_into_a_fresh_one() {
+        let (emitter, mut rx) = emitter();
+        emitter.typing_status_changed(true);
+        let abandoned = emitter.stream_start(Some("test-model"));
+        emitter.typing_status_changed(false);
+
+        emitter.typing_status_changed(true);
+        let next = emitter.ensure_open_response(Some("test-model"));
+        assert_ne!(
+            next, abandoned,
+            "the owner handed back a response it had already thrown away"
+        );
+        emitter.stream_delta(&next, "the answer");
+        emitter.stream_end(next, StreamEndPayload::default());
+        emitter.typing_status_changed(false);
+
+        let reports = reports(&mut rx);
+        assert!(
+            reports
+                .iter()
+                .all(|report| !report.contains("[response_delta]")),
+            "the next turn's content was rejected instead of reaching the user: {reports:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_response_is_never_handed_back_for_more_content() {
+        let (emitter, _rx) = emitter();
+        emitter.typing_status_changed(true);
+        let closed = emitter.stream_start(Some("test-model"));
+        emitter.stream_end(closed.clone(), StreamEndPayload::default());
+        assert_ne!(
+            emitter.ensure_open_response(Some("test-model")),
+            closed,
+            "a closed response rejects every further delta"
+        );
+    }
+
+    /// A caller about to *end* a response must not be able to mint one, or a
+    /// turn with nothing to say publishes an empty message to the user.
+    #[test]
+    fn asking_for_the_open_response_never_opens_one() {
+        let (emitter, mut rx) = emitter();
+        emitter.typing_status_changed(true);
+        assert!(emitter.open_response().is_none());
+        emitter.typing_status_changed(false);
+        assert!(
+            reports(&mut rx).is_empty(),
+            "asking for the open response opened one, then abandoned it"
+        );
+    }
+
+    /// The shape a real Codex session produced: a turn abandoned a response,
+    /// the backend kept its handle, and the next turn's whole answer arrived
+    /// through it. Every event is still counted and the one-off entries stay
+    /// legible instead of being buried under the repeats.
+    #[test]
+    fn a_wedged_response_reports_every_event_without_repeating_itself() {
+        let (emitter, mut rx) = emitter();
+        emitter.typing_status_changed(true);
+        let stale = emitter.stream_start(Some("test-model"));
+        emitter.typing_status_changed(false);
+        let _ = reports(&mut rx);
+
+        emitter.typing_status_changed(true);
+        for _ in 0..71 {
+            emitter.stream_delta(&stale, "x");
+        }
+        emitter.stream_end(stale, StreamEndPayload::default());
+        emitter.typing_status_changed(false);
+
+        let reports = reports(&mut rx);
+        assert_eq!(reports.len(), 1, "expected one report, got {reports:?}");
+        let report = &reports[0];
+        assert!(
+            report.starts_with("The backend sent 72 malformed event(s)"),
+            "the total must survive collapsing: {report}"
+        );
+        assert!(
+            report.contains("(x71)"),
+            "the repeated delta rejection must carry its count: {report}"
+        );
+        assert!(
+            report.contains("[response_end]"),
+            "the single end rejection must not be buried: {report}"
+        );
+        assert_eq!(
+            report.lines().count(),
+            3,
+            "expected a header and two distinct entries: {report}"
+        );
+    }
 }
