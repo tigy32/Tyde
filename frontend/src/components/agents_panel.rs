@@ -13,8 +13,7 @@ use protocol::{
 use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, TransientEvent,
-    sort_project_infos,
+    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, sort_project_infos,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -158,9 +157,9 @@ pub(crate) enum DerivedAgentState {
     /// The last turn ended because the user cancelled it. Distinct from `Idle`:
     /// a cancelled turn is *not* a completed one, and rendering it with the
     /// success check told users their interrupt had produced a finished result.
-    /// Cleared by the next turn, since `OperationCancelled` lives in
-    /// `transient_events`, which the reducer drops on the next
-    /// `TypingStatusChanged(true)`.
+    /// Cleared by the next turn: the reducer drops the agent from
+    /// `last_turn_cancelled` on the next `TypingStatusChanged(true)` or
+    /// `StreamStart`.
     Cancelled,
     /// The server owns a compaction request but is waiting for a safe point.
     /// Distinct from `Compacting`: "queued behind the current turn" is the
@@ -176,7 +175,7 @@ pub(crate) fn derive_agent_state(
     turn_active: &HashMap<AgentId, bool>,
     compaction: &HashMap<AgentId, CompactionOldInfo>,
     context_compaction: &HashMap<AgentId, ContextCompactionUiState>,
-    transient: &HashMap<AgentId, Vec<TransientEvent>>,
+    last_turn_cancelled: &HashSet<AgentId>,
     interrupt_pending: &HashSet<AgentId>,
 ) -> DerivedAgentState {
     if agent.fatal_error.is_some() {
@@ -214,12 +213,7 @@ pub(crate) fn derive_agent_state(
     // Not running. Distinguish "finished" from "was stopped": the terminal
     // outcome is a separate question from whether work is in flight, and only
     // the former deserves a success affordance.
-    let cancelled = transient.get(&agent.agent_id).is_some_and(|events| {
-        events
-            .iter()
-            .any(|event| matches!(event, TransientEvent::OperationCancelled { .. }))
-    });
-    if cancelled {
+    if last_turn_cancelled.contains(&agent.agent_id) {
         DerivedAgentState::Cancelled
     } else {
         DerivedAgentState::Idle
@@ -1635,14 +1629,14 @@ fn agent_card(
         let turn_active = state.agent_turn_active;
         let compaction = state.compaction_in_progress;
         let context_compaction = state.context_compactions;
-        let transient = state.transient_events;
+        let cancelled = state.last_turn_cancelled;
         let interrupt_pending = state.interrupt_pending;
         move || {
             compaction.with(|compaction| {
                 context_compaction.with(|context_compaction| {
                     turn_active.with(|turn_active| {
                         streaming.with(|streaming| {
-                            transient.with(|transient| {
+                            cancelled.with(|cancelled| {
                                 interrupt_pending.with(|interrupt_pending| {
                                     derive_agent_state(
                                         &agent_for_derived,
@@ -1650,7 +1644,7 @@ fn agent_card(
                                         turn_active,
                                         compaction,
                                         context_compaction,
-                                        transient,
+                                        cancelled,
                                         interrupt_pending,
                                     )
                                 })
@@ -2504,20 +2498,17 @@ mod wasm_tests {
             card.text_content()
         );
 
-        // The backend answers.
-        state.interrupt_pending.update(|pending| {
-            pending.remove(&agent_id);
-        });
-        state.agent_turn_active.update(|map| {
-            map.remove(&agent_id);
-        });
-        state.transient_events.update(|events| {
-            events.entry(agent_id.clone()).or_default().push(
-                crate::state::TransientEvent::OperationCancelled {
-                    message: "Operation cancelled".to_owned(),
-                },
-            );
-        });
+        // The backend answers. Driven through the real reducer rather than by
+        // poking state: the cancelled outcome is now its own record, and the
+        // thing worth guarding is that the event actually sets it.
+        crate::dispatch::apply_chat_event(
+            &state,
+            "local",
+            &agent_id,
+            protocol::ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                message: "Operation cancelled".to_owned(),
+            }),
+        );
         for _ in 0..3 {
             next_tick().await;
         }
@@ -2541,13 +2532,13 @@ mod wasm_tests {
             "a cancelled turn must not show the success check, got: {text:?}"
         );
 
-        // The next turn clears the outcome.
-        state.transient_events.update(|events| {
-            events.remove(&agent_id);
-        });
-        state.agent_turn_active.update(|map| {
-            map.insert(agent_id.clone(), true);
-        });
+        // The next turn clears the outcome, again through the reducer.
+        crate::dispatch::apply_chat_event(
+            &state,
+            "local",
+            &agent_id,
+            protocol::ChatEvent::TypingStatusChanged(true),
+        );
         for _ in 0..3 {
             next_tick().await;
         }

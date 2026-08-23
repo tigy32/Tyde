@@ -2794,15 +2794,6 @@ kbd {
     opacity: 0.8;
 }
 
-.chat-card-compacting-failed {
-    background: rgba(232, 197, 106, 0.06);
-    border-color: rgba(232, 197, 106, 0.28);
-}
-
-.chat-card-compacting-failed .compacting-card-icon {
-    animation: none;
-}
-
 @keyframes compacting-spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }

@@ -970,7 +970,7 @@ pub fn AgentMonitorView() -> impl IntoView {
                         let mut pinned_rows: Vec<AgentMonitorRow> = Vec::new();
                         let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
                         for agent in agents.iter() {
-                            let status = rows_state.transient_events.with(|transient| {
+                            let status = rows_state.last_turn_cancelled.with(|cancelled| {
                                 rows_state.interrupt_pending.with(|interrupt_pending| {
                                     derive_agent_state(
                                         agent,
@@ -978,7 +978,7 @@ pub fn AgentMonitorView() -> impl IntoView {
                                         turn_active,
                                         compaction,
                                         context_compaction,
-                                        transient,
+                                        cancelled,
                                         interrupt_pending,
                                     )
                                 })

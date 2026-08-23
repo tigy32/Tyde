@@ -18,9 +18,8 @@ use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ChatRowContent, ChatRowHandle, ChatRowId,
+    ActiveAgentRef, AgentInfo, AppState, ChatNotice, ChatRowContent, ChatRowHandle, ChatRowId,
     ContextCompactionUiState, PendingHistoryRequest, TabId, TabScrollState, ToolOutputMode,
-    TransientEvent,
 };
 
 use protocol::{
@@ -283,11 +282,6 @@ pub fn ChatView(
                 .orchestration
                 .with(|m| m.get(&agent_id).cloned().unwrap_or_default())
         });
-
-    let transient_events = move || {
-        let agent_id = agent_ref.get()?.agent_id;
-        state.transient_events.with(|m| m.get(&agent_id).cloned())
-    };
 
     // Centralised lookup of the AgentInfo for this view's agent_ref.
     // The previous code did `state.agents.get()` (clones the full Vec)
@@ -1056,43 +1050,6 @@ pub fn ChatView(
                         // disappears the moment the operation ends.
                         <ContextCompactionBanner agent_ref=agent_ref />
 
-                        // Transient events (retry, cancel) rendered as cards
-                        {move || {
-                            transient_events().map(|events| {
-                                events.into_iter().map(|ev| {
-                                    match ev {
-                                        TransientEvent::OperationCancelled { message } => {
-                                            view! {
-                                                <div class="chat-card chat-card-system chat-card-cancelled">
-                                                    <div class="chat-card-header">
-                                                        <span class="chat-card-sender">"Cancelled"</span>
-                                                    </div>
-                                                    <div class="chat-card-body">
-                                                        <p class="md-paragraph">{message}</p>
-                                                    </div>
-                                                </div>
-                                            }.into_any()
-                                        }
-                                        TransientEvent::RetryAttempt { attempt, max_retries, error, backoff_ms } => {
-                                            view! {
-                                                <div class="chat-card chat-card-retry">
-                                                    <div class="retry-card-header">
-                                                        <span class="retry-card-icon">"⏳"</span>
-                                                        <span class="retry-card-title">"Rate Limited"</span>
-                                                        <span class="retry-card-attempt">{format!("Attempt {attempt} of {max_retries}")}</span>
-                                                    </div>
-                                                    <div class="retry-card-body">
-                                                        <p class="retry-card-error">{error}</p>
-                                                        <p class="retry-card-countdown">{format!("Retrying in {backoff_ms}ms\u{2026}")}</p>
-                                                    </div>
-                                                </div>
-                                            }.into_any()
-                                        }
-                                    }
-                                }).collect::<Vec<_>>()
-                            })
-                        }}
-
                         <OrchestrationView records=orchestration_records />
 
                         {move || {
@@ -1275,6 +1232,9 @@ fn MeasuredRow(
                 }
                 ChatRowContent::ContextCompaction(event) => {
                     view! { <ContextCompactionMarker event=event /> }.into_any()
+                }
+                ChatRowContent::Notice(notice) => {
+                    view! { <ChatNoticeView notice=notice /> }.into_any()
                 }
             }}
         </div>
@@ -1505,6 +1465,49 @@ fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> imp
     }
 }
 
+/// A retry or cancellation, rendered where it happened.
+///
+/// A row, not a floating card, for the same reason the compaction marker is
+/// (see [`ChatRowContent`]): it describes one specific turn, so it has to keep
+/// that turn's position when later turns arrive. It is also not a live region
+/// — the virtualizer mounts and unmounts it on every scroll pass, and bootstrap
+/// re-mounts it wholesale, so live-region semantics would replay an old
+/// rate-limit warning as news.
+#[component]
+fn ChatNoticeView(notice: ArcRwSignal<ChatNotice>) -> impl IntoView {
+    view! {
+        {move || match notice.get() {
+            ChatNotice::OperationCancelled { message } => view! {
+                <div class="chat-card chat-card-system chat-card-cancelled" data-test="chat-notice-cancelled">
+                    <div class="chat-card-header">
+                        <span class="chat-card-sender">"Cancelled"</span>
+                    </div>
+                    <div class="chat-card-body">
+                        <p class="md-paragraph">{message}</p>
+                    </div>
+                </div>
+            }.into_any(),
+            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms } => view! {
+                <div class="chat-card chat-card-retry" data-test="chat-notice-retry">
+                    <div class="retry-card-header">
+                        <span class="retry-card-icon">"\u{23f3}"</span>
+                        <span class="retry-card-title">"Rate Limited"</span>
+                        <span class="retry-card-attempt">
+                            {format!("Attempt {attempt} of {max_retries}")}
+                        </span>
+                    </div>
+                    <div class="retry-card-body">
+                        <p class="retry-card-error">{error}</p>
+                        <p class="retry-card-countdown">
+                            {format!("Retried after {backoff_ms}ms")}
+                        </p>
+                    </div>
+                </div>
+            }.into_any(),
+        }}
+    }
+}
+
 fn compaction_stage_text(stage: CompactionStage) -> &'static str {
     match stage {
         CompactionStage::WaitingForIdle => "Waiting for the current turn to finish.",
@@ -1520,13 +1523,19 @@ fn compaction_stage_text(stage: CompactionStage) -> &'static str {
 /// list so it stays visible wherever the user has scrolled, and it disappears
 /// the moment the operation ends.
 ///
+/// Sitting outside the list is what makes "in flight only" load-bearing rather
+/// than cosmetic. A card with no row has no position in the conversation, so
+/// anything retained here after the operation ends stays welded to the tip
+/// while later turns render above it. The outcome belongs to the durable marker
+/// row, which is anchored where the compaction actually happened.
+///
 /// Live-region behaviour is deliberately narrow. Inserting a node into an
 /// `aria-live` region *is* an announcement, so a banner reconstructed from
 /// `AgentBootstrap` renders with `aria-live="off"` — visible, but silent —
-/// until a genuinely live frame updates it. And the retained failure banner is
-/// never an `alert`: the single assertive announcement for a failure is made
-/// once, at the live transition, through the shared live region, so a remount
-/// or a route change cannot replay it.
+/// until a genuinely live frame updates it. It is never an `alert`: the single
+/// assertive announcement for a terminal outcome is made once, at the live
+/// transition, through the shared live region, so a remount or a route change
+/// cannot replay it.
 #[component]
 fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1593,11 +1602,10 @@ fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
     view! {
         {move || {
             let operation = operation.get()?;
-            let (title, detail, failed) = match &operation {
+            let (title, detail) = match &operation {
                 ContextCompactionUiState::Requesting => (
                     "Compacting context\u{2026}".to_owned(),
                     "Requesting.".to_owned(),
-                    false,
                 ),
                 ContextCompactionUiState::Active { payload, .. } => {
                     let detail = match &payload.status {
@@ -1622,40 +1630,22 @@ fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
                     } else {
                         "Compacting context\u{2026}".to_owned()
                     };
-                    (title, detail, false)
-                }
-                ContextCompactionUiState::Failed(payload) => {
-                    let mutation = match payload.status {
-                        ContextCompactionStatus::Failed { mutation, .. } => mutation,
-                        _ => CompactionMutation::MayHaveMutated,
-                    };
-                    let mut detail = payload
-                        .message
-                        .clone()
-                        .unwrap_or_else(|| "Compaction failed.".to_owned());
-                    detail.push(' ');
-                    detail.push_str(crate::dispatch::compaction_mutation_sentence(mutation));
-                    ("Compaction failed".to_owned(), detail, true)
+                    (title, detail)
                 }
             };
 
             let announces = operation.announces();
             let in_flight = operation.is_in_flight();
-            let class = if failed {
-                "chat-card chat-card-compacting chat-card-compacting-failed"
-            } else {
-                "chat-card chat-card-compacting"
-            };
             Some(view! {
                 <div
-                    class=class
+                    class="chat-card chat-card-compacting"
                     // Always `status`, never `alert`. See the doc comment: the
                     // one assertive announcement is made by the reducer at the
-                    // live transition, not by this element, so retained failure
-                    // state cannot re-announce when the view remounts.
+                    // live transition, not by this element, so a remount cannot
+                    // re-announce.
                     role="status"
-                    // Silent when reconstructed from bootstrap or when holding
-                    // retained terminal state; polite once genuinely live.
+                    // Silent when reconstructed from bootstrap; polite once
+                    // genuinely live.
                     aria-live=move || if announces { "polite" } else { "off" }
                     // Atomic because the parts change independently: a stage
                     // change alone ("Finalizing.") is meaningless read on its own.
@@ -3565,7 +3555,7 @@ mod wasm_tests {
                     agent_id_mount.clone(),
                     ContextCompactionUiState::Active {
                         live: true,
-                        payload: protocol::ContextCompactionNotifyPayload {
+                        payload: Box::new(protocol::ContextCompactionNotifyPayload {
                             operation_id: protocol::CompactionOperationId("op-1".to_owned()),
                             agent_id: agent_id_mount.clone(),
                             logical_session_id: protocol::SessionId("s".to_owned()),
@@ -3578,7 +3568,7 @@ mod wasm_tests {
                             provider_version: None,
                             metrics: protocol::CompactionMetrics::default(),
                             message: None,
-                        },
+                        }),
                     },
                 );
             });
@@ -3640,7 +3630,7 @@ mod wasm_tests {
                     ContextCompactionUiState::Active {
                         // As restored by bootstrap.
                         live: false,
-                        payload: protocol::ContextCompactionNotifyPayload {
+                        payload: Box::new(protocol::ContextCompactionNotifyPayload {
                             operation_id: protocol::CompactionOperationId("op-boot".to_owned()),
                             agent_id: agent_id_mount.clone(),
                             logical_session_id: protocol::SessionId("s".to_owned()),
@@ -3653,7 +3643,7 @@ mod wasm_tests {
                             provider_version: None,
                             metrics: protocol::CompactionMetrics::default(),
                             message: None,
-                        },
+                        }),
                     },
                 );
             });
@@ -3681,11 +3671,24 @@ mod wasm_tests {
         );
     }
 
-    /// Retained failure state is never an alert. The one assertive
+    /// A terminal failure is explained by the durable marker row, never by a
+    /// retained banner — and the row is never an alert. The one assertive
     /// announcement happens at the live transition; alert semantics here would
     /// replay it on every remount and route change.
+    ///
+    /// Corrected assertion. Evidence: the previous version constructed
+    /// `ContextCompactionUiState::Failed` by hand and asserted the *banner*
+    /// carried the explanation. The banner is mounted outside the windowed list
+    /// (see `ContextCompactionBanner`), so a card retained there has no row and
+    /// therefore no position — it stayed pinned to the end of the transcript
+    /// while later turns rendered above it, which is the reported bug. The
+    /// contract being reached for was "a failure stays explained on screen,
+    /// says what failed and what it means for the user's context, and never
+    /// re-announces". All three are preserved and re-pointed at the surface
+    /// that actually owns the outcome, plus the anchoring guarantee the old
+    /// assertion could not express.
     #[wasm_bindgen_test]
-    async fn retained_failure_banner_does_not_reacquire_alert_semantics() {
+    async fn terminal_failure_is_explained_by_the_marker_row_not_a_retained_banner() {
         ensure_styles_loaded();
         let agent_id = AgentId("agent-failbanner".to_owned());
         let host_id = "host-failbanner".to_owned();
@@ -3698,26 +3701,36 @@ mod wasm_tests {
                 host_id: host_id_mount.clone(),
                 agent_id: agent_id_mount.clone(),
             };
-            state.context_compactions.update(|map| {
-                map.insert(
-                    agent_id_mount.clone(),
-                    ContextCompactionUiState::Failed(protocol::ContextCompactionNotifyPayload {
-                        operation_id: protocol::CompactionOperationId("op-failed".to_owned()),
-                        agent_id: agent_id_mount.clone(),
-                        logical_session_id: protocol::SessionId("s".to_owned()),
-                        backend_kind: BackendKind::Claude,
-                        trigger: CompactionTrigger::UserRequested,
-                        method: Some(CompactionMethod::NativeTextCommand),
-                        status: ContextCompactionStatus::Failed {
-                            accepted: true,
-                            mutation: CompactionMutation::MayHaveMutated,
-                        },
-                        provider_version: None,
-                        metrics: protocol::CompactionMetrics::default(),
-                        message: Some("summarizer timed out".to_owned()),
-                    }),
-                );
-            });
+            // The server's frozen ordering for a terminal compaction: durable
+            // marker, then terminal notify. Drive both through the real
+            // reducers rather than hand-building UI state.
+            let mut marker = compaction_marker_event(
+                "operation:op-failed",
+                ContextCompactionTimelineStatus::Failed,
+                CompactionMutation::MayHaveMutated,
+                protocol::CompactionMetrics::default(),
+            );
+            marker.message = Some("summarizer timed out".to_owned());
+            state.push_compaction_marker(agent_id_mount.clone(), marker);
+            state.apply_context_compaction_notify(
+                &agent_id_mount,
+                protocol::ContextCompactionNotifyPayload {
+                    operation_id: protocol::CompactionOperationId("op-failed".to_owned()),
+                    agent_id: agent_id_mount.clone(),
+                    logical_session_id: protocol::SessionId("s".to_owned()),
+                    backend_kind: BackendKind::Claude,
+                    trigger: CompactionTrigger::UserRequested,
+                    method: Some(CompactionMethod::NativeTextCommand),
+                    status: ContextCompactionStatus::Failed {
+                        accepted: true,
+                        mutation: CompactionMutation::MayHaveMutated,
+                    },
+                    provider_version: None,
+                    metrics: protocol::CompactionMetrics::default(),
+                    message: Some("summarizer timed out".to_owned()),
+                },
+                true,
+            );
             provide_context(state);
             let agent_ref = Signal::derive(move || Some(bound.clone()));
             let is_active: Signal<bool> = Signal::derive(|| true);
@@ -3726,23 +3739,249 @@ mod wasm_tests {
         .forget();
         next_tick().await;
 
-        let banner = query(&container, "[data-test='context-compaction-banner']")
+        let marker = query(&container, "[data-test='context-compaction-marker']")
             .expect("the failure stays explained on screen");
-        assert_eq!(
-            banner.get_attribute("role").as_deref(),
-            Some("status"),
-            "retained failure presentation is never an alert"
-        );
-        assert_eq!(
-            banner.get_attribute("aria-live").as_deref(),
-            Some("off"),
-            "and is not a live region at all, so a remount cannot replay it"
-        );
-        let text = banner.text_content().unwrap_or_default();
+        let text = marker.text_content().unwrap_or_default();
         assert!(
             text.contains("summarizer timed out") && text.contains("may have changed"),
-            "while still saying what failed and what it means: {text}"
+            "saying what failed and what it means: {text}"
         );
+        assert!(
+            marker.get_attribute("role").is_none(),
+            "a historical row carries no live-region role, so a remount cannot replay it"
+        );
+        assert!(
+            marker.get_attribute("aria-live").is_none(),
+            "and is not a live region at all"
+        );
+        assert!(
+            query(&container, "[data-test='context-compaction-banner']").is_none(),
+            "and no banner is left behind: a banner has no row, so it would sit \
+             at the tip of the transcript for the rest of the session"
+        );
+    }
+
+    /// The reported bug, as geometry. A compaction that failed at one point in
+    /// the conversation must stay at that point: turns that arrive afterwards
+    /// render *below* it. Before the fix the failure lived in a banner mounted
+    /// after the windowed list, so every later turn appeared above it and the
+    /// card drifted to the end of the transcript.
+    #[wasm_bindgen_test]
+    async fn a_failed_compaction_stays_where_it_happened_when_later_turns_arrive() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-anchor".to_owned());
+        let host_id = "host-anchor".to_owned();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let setup_handle = state_handle.clone();
+
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.chat_rows.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    vec![ChatRowHandle::new(mk_user_msg("continue"))],
+                );
+            });
+            let mut marker = compaction_marker_event(
+                "operation:op-anchor",
+                ContextCompactionTimelineStatus::Failed,
+                CompactionMutation::NotObserved,
+                protocol::CompactionMetrics::default(),
+            );
+            marker.message = Some("OAuth session expired".to_owned());
+            state.push_compaction_marker(agent_id_mount.clone(), marker);
+            state.apply_context_compaction_notify(
+                &agent_id_mount,
+                protocol::ContextCompactionNotifyPayload {
+                    operation_id: protocol::CompactionOperationId("op-anchor".to_owned()),
+                    agent_id: agent_id_mount.clone(),
+                    logical_session_id: protocol::SessionId("s".to_owned()),
+                    backend_kind: BackendKind::Claude,
+                    trigger: CompactionTrigger::UserRequested,
+                    method: Some(CompactionMethod::NativeTextCommand),
+                    status: ContextCompactionStatus::Failed {
+                        accepted: false,
+                        mutation: CompactionMutation::NotObserved,
+                    },
+                    provider_version: None,
+                    metrics: protocol::CompactionMetrics::default(),
+                    message: Some("OAuth session expired".to_owned()),
+                },
+                true,
+            );
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_007) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        // Two turns land after the failure, exactly as in the report.
+        let state = state_handle.borrow().clone().expect("state was captured");
+        state.chat_rows.update(|map| {
+            let rows = map.get_mut(&agent_id).expect("transcript exists");
+            rows.push(ChatRowHandle::new(mk_user_msg("later turn one")));
+            rows.push(ChatRowHandle::new(mk_user_msg("later turn two")));
+        });
+        next_tick().await;
+
+        // One failure, one surface. The defect was a *second* rendering of the
+        // same failure, so the count of surfaces is the assertion — not the
+        // count of words: the marker deliberately carries its reason twice,
+        // once visibly and once in a `visually-hidden` sentence, and
+        // `text_content` does not honour `aria-hidden`.
+        let surfaces = container
+            .query_selector_all(
+                "[data-test='context-compaction-marker'], \
+                 [data-test='context-compaction-banner']",
+            )
+            .unwrap()
+            .length();
+        assert_eq!(
+            surfaces, 1,
+            "a failed compaction is reported exactly once; a second copy has no \
+             transcript row and so cannot stay at the turn it describes"
+        );
+
+        let marker = query(&container, "[data-test='context-compaction-marker']")
+            .expect("the failure is still on screen after later turns arrive");
+        let marker_bottom = marker.get_bounding_client_rect().bottom();
+        let rows = message_rows(&container);
+        let later = rows
+            .iter()
+            .filter(|row| {
+                let text = row.text_content().unwrap_or_default();
+                text.contains("later turn one") || text.contains("later turn two")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(later.len(), 2, "both later turns rendered");
+        for row in later {
+            let text = row.text_content().unwrap_or_default();
+            assert!(
+                row.get_bounding_client_rect().top() >= marker_bottom,
+                "a turn that happened after the compaction failure must render \
+                 below it, not above; {text:?} rendered at {} with the failure \
+                 ending at {marker_bottom}",
+                row.get_bounding_client_rect().top(),
+            );
+        }
+    }
+
+    /// A rate-limit retry is about one specific turn, so it belongs at that
+    /// turn. Two failures before the fix, both visible here: the notice lived
+    /// in a card rendered after the windowed list, so later turns appeared
+    /// above it and it drifted to the end of the transcript; and it was cleared
+    /// wholesale at the next `StreamStart`, so recovering from the rate limit
+    /// erased the record that it had ever happened.
+    #[wasm_bindgen_test]
+    async fn a_retry_notice_stays_at_its_turn_when_the_stream_recovers() {
+        ensure_styles_loaded();
+        let agent_id = AgentId("agent-retry".to_owned());
+        let host_id = "host-retry".to_owned();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let setup_handle = state_handle.clone();
+
+        let container = make_container();
+        let agent_id_mount = agent_id.clone();
+        let host_id_mount = host_id.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_mount.clone(),
+                agent_id: agent_id_mount.clone(),
+            };
+            state.chat_rows.update(|map| {
+                map.insert(
+                    agent_id_mount.clone(),
+                    vec![ChatRowHandle::new(mk_user_msg("continue"))],
+                );
+            });
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let is_active: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_008) agent_ref=agent_ref is_active=is_active /> }
+        })
+        .forget();
+        next_tick().await;
+
+        let state = state_handle.borrow().clone().expect("state was captured");
+        crate::dispatch::apply_chat_event(
+            &state,
+            &host_id,
+            &agent_id,
+            ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                attempt: 1,
+                max_retries: 3,
+                error: "429 Too Many Requests".to_owned(),
+                backoff_ms: 4_000,
+            }),
+        );
+        next_tick().await;
+
+        // The provider recovers and the turn continues.
+        crate::dispatch::apply_chat_event(
+            &state,
+            &host_id,
+            &agent_id,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: Some("claude-opus-5".to_owned()),
+            }),
+        );
+        state.chat_rows.update(|map| {
+            let rows = map.get_mut(&agent_id).expect("transcript exists");
+            rows.push(ChatRowHandle::new(mk_user_msg("later turn one")));
+            rows.push(ChatRowHandle::new(mk_user_msg("later turn two")));
+        });
+        next_tick().await;
+
+        // Selector-independent: recovering from the rate limit used to clear the
+        // notice outright, so the provider's own error text is what proves the
+        // record survived.
+        let transcript = container.text_content().unwrap_or_default();
+        assert!(
+            transcript.contains("429 Too Many Requests"),
+            "recovering from a rate limit must not erase the record of it: {transcript}"
+        );
+
+        let notice = query(&container, "[data-test='chat-notice-retry']")
+            .expect("the surviving record renders as a retry notice");
+        let text = notice.text_content().unwrap_or_default();
+        assert!(
+            text.contains("429 Too Many Requests") && text.contains("Attempt 1 of 3"),
+            "the notice still says what happened and which attempt: {text}"
+        );
+
+        let notice_bottom = notice.get_bounding_client_rect().bottom();
+        let later = message_rows(&container)
+            .into_iter()
+            .filter(|row| {
+                let text = row.text_content().unwrap_or_default();
+                text.contains("later turn one") || text.contains("later turn two")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(later.len(), 2, "both later turns rendered");
+        for row in later {
+            let top = row.get_bounding_client_rect().top();
+            assert!(
+                top >= notice_bottom,
+                "a turn that happened after the retry must render below it, not \
+                 above; {:?} rendered at {top} with the notice ending at {notice_bottom}",
+                row.text_content().unwrap_or_default(),
+            );
+        }
     }
 
     /// A deferred operation is waiting for a safe point, not hung. Saying so
@@ -3766,7 +4005,7 @@ mod wasm_tests {
                     agent_id_mount.clone(),
                     ContextCompactionUiState::Active {
                         live: true,
-                        payload: protocol::ContextCompactionNotifyPayload {
+                        payload: Box::new(protocol::ContextCompactionNotifyPayload {
                             operation_id: protocol::CompactionOperationId("op-2".to_owned()),
                             agent_id: agent_id_mount.clone(),
                             logical_session_id: protocol::SessionId("s".to_owned()),
@@ -3779,7 +4018,7 @@ mod wasm_tests {
                             provider_version: None,
                             metrics: protocol::CompactionMetrics::default(),
                             message: None,
-                        },
+                        }),
                     },
                 );
             });

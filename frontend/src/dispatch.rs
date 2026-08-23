@@ -36,11 +36,11 @@ use protocol::{
 use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, CenterZoneState,
-    ChatMessageEntry, CodeIntelKey, ConnectionStatus, FileResourceKey, NativeSettingsSaveState,
-    OpenFile, OrchestrationRecord, PaneId, PendingFileOpen, ProjectInfo, ProjectReferencesMode,
-    ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState,
-    StreamingToolRequest, TabContent, TabId, TerminalInfo, ToolCallId, ToolRequestEntry,
-    TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
+    ChatMessageEntry, ChatNotice, CodeIntelKey, ConnectionStatus, FileResourceKey,
+    NativeSettingsSaveState, OpenFile, OrchestrationRecord, PaneId, PendingFileOpen, ProjectInfo,
+    ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState,
+    SessionInfo, StreamingState, StreamingToolRequest, TabContent, TabId, TerminalInfo, ToolCallId,
+    ToolRequestEntry, WorkflowPanelError, reduce_diff_response, root_display_name,
     sort_project_infos,
 };
 use settings_model::{HostBootstrapPayload, HostSettingsPayload};
@@ -4477,10 +4477,10 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
     });
-    state.transient_events.update(|map| {
-        map.remove(&agent_id);
-    });
     state.interrupt_pending.update(|set| {
+        set.remove(&agent_id);
+    });
+    state.last_turn_cancelled.update(|set| {
         set.remove(&agent_id);
     });
     state.task_lists.update(|map| {
@@ -4533,8 +4533,8 @@ fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
     state.interrupt_pending.update(|pending| {
         pending.remove(agent_id);
     });
-    state.transient_events.update(|events| {
-        events.remove(agent_id);
+    state.last_turn_cancelled.update(|set| {
+        set.remove(agent_id);
     });
     state.orchestration.update(|map| {
         if let Some(log) = map.get_mut(agent_id)
@@ -5321,9 +5321,27 @@ impl HistoryReplay {
             | ChatEvent::StreamDelta(_)
             | ChatEvent::StreamReasoningDelta(_)
             | ChatEvent::TaskUpdate(_)
-            | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
+            // A retry or cancellation inside this page, in stream order, for
+            // the same reason as the compaction marker below: the notice is
+            // about a specific turn and is meaningless detached from it.
+            ChatEvent::OperationCancelled(data) => {
+                self.rows.push(crate::state::ChatRowHandle::notice(
+                    crate::state::ChatNotice::OperationCancelled {
+                        message: data.message,
+                    },
+                ));
+            }
+            ChatEvent::RetryAttempt(data) => {
+                self.rows.push(crate::state::ChatRowHandle::notice(
+                    crate::state::ChatNotice::RetryAttempt {
+                        attempt: data.attempt,
+                        max_retries: data.max_retries,
+                        error: data.error,
+                        backoff_ms: data.backoff_ms,
+                    },
+                ));
+            }
             // A compaction that happened inside this page. Placement among the
             // message rows matters — the marker's whole job is to say *where*
             // in the conversation the model's context was rewritten — so it is
@@ -5406,8 +5424,11 @@ pub fn apply_chat_event_from(
                 typing
             );
             if typing {
-                state.transient_events.update(|events| {
-                    events.remove(&agent_id);
+                // A new turn is under way, so the previous turn's cancellation
+                // no longer describes the agent. The transcript notice for it
+                // stays where it is — that is history, this is status.
+                state.last_turn_cancelled.update(|set| {
+                    set.remove(&agent_id);
                 });
             }
             state.agent_turn_active.update(|map| {
@@ -5483,8 +5504,12 @@ pub fn apply_chat_event_from(
                 agent_id,
                 data.model
             );
-            state.transient_events.update(|events| {
-                events.remove(&agent_id);
+            // A response is being produced, so whatever cancelled the previous
+            // turn is no longer the agent's current outcome. Some backends open
+            // a stream without a preceding typing transition, so this is not
+            // redundant with the `TypingStatusChanged(true)` arm above.
+            state.last_turn_cancelled.update(|set| {
+                set.remove(&agent_id);
             });
             let streaming = StreamingState {
                 agent_name: data.agent,
@@ -5737,13 +5762,15 @@ pub fn apply_chat_event_from(
                     log.push(OrchestrationRecord::Cancelled);
                 }
             });
-            state.transient_events.update(|events| {
-                events.entry(agent_id.clone()).or_default().push(
-                    TransientEvent::OperationCancelled {
-                        message: data.message,
-                    },
-                );
+            state.last_turn_cancelled.update(|set| {
+                set.insert(agent_id.clone());
             });
+            state.push_chat_notice(
+                agent_id.clone(),
+                ChatNotice::OperationCancelled {
+                    message: data.message,
+                },
+            );
         }
         ChatEvent::RetryAttempt(data) => {
             log::warn!(
@@ -5755,17 +5782,15 @@ pub fn apply_chat_event_from(
                 data.backoff_ms,
                 data.error
             );
-            state.transient_events.update(|events| {
-                events
-                    .entry(agent_id)
-                    .or_default()
-                    .push(TransientEvent::RetryAttempt {
-                        attempt: data.attempt,
-                        max_retries: data.max_retries,
-                        error: data.error,
-                        backoff_ms: data.backoff_ms,
-                    });
-            });
+            state.push_chat_notice(
+                agent_id,
+                ChatNotice::RetryAttempt {
+                    attempt: data.attempt,
+                    max_retries: data.max_retries,
+                    error: data.error,
+                    backoff_ms: data.backoff_ms,
+                },
+            );
         }
         ChatEvent::Orchestration(data) => {
             log::trace!(
@@ -6545,10 +6570,10 @@ fn apply_agent_bootstrap(
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
     });
-    state.transient_events.update(|map| {
-        map.remove(&agent_id);
-    });
     state.interrupt_pending.update(|set| {
+        set.remove(&agent_id);
+    });
+    state.last_turn_cancelled.update(|set| {
         set.remove(&agent_id);
     });
     state.task_lists.update(|map| {

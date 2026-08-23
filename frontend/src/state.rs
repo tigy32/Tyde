@@ -2308,6 +2308,9 @@ pub enum ChatRowContent {
     /// a later, richer sighting of the same marker — would otherwise keep
     /// rendering the value captured when it mounted.
     ContextCompaction(ArcRwSignal<ContextCompactionTimelineEvent>),
+    /// A retry or cancellation notice, at the point in the conversation where
+    /// it happened. See [`ChatNotice`] for why this is a row.
+    Notice(ArcRwSignal<ChatNotice>),
 }
 
 #[derive(Clone, Debug)]
@@ -2337,6 +2340,13 @@ impl ChatRowHandle {
         }
     }
 
+    pub fn notice(notice: ChatNotice) -> Self {
+        Self {
+            id: next_chat_row_id(),
+            content: ChatRowContent::Notice(ArcRwSignal::new(notice)),
+        }
+    }
+
     /// The row's message payload, or `None` for a non-message row.
     ///
     /// Every caller that walks the transcript looking for messages — tool-call
@@ -2345,14 +2355,14 @@ impl ChatRowHandle {
     pub fn message_entry(&self) -> Option<&ArcRwSignal<ChatMessageEntry>> {
         match &self.content {
             ChatRowContent::Message(entry) => Some(entry),
-            ChatRowContent::ContextCompaction(_) => None,
+            ChatRowContent::ContextCompaction(_) | ChatRowContent::Notice(_) => None,
         }
     }
 
     pub fn compaction_marker(&self) -> Option<&ArcRwSignal<ContextCompactionTimelineEvent>> {
         match &self.content {
             ChatRowContent::ContextCompaction(event) => Some(event),
-            ChatRowContent::Message(_) => None,
+            ChatRowContent::Message(_) | ChatRowContent::Notice(_) => None,
         }
     }
 }
@@ -2413,6 +2423,15 @@ pub struct PendingHistoryRequest {
 /// server frame. Without it, two controls (header button and agent card) can
 /// both submit before either sees an operation id, and the server admits two
 /// requests for one user intent.
+///
+/// Every variant here describes work that is *outstanding*, which is what
+/// earns the banner its place at the tip of the transcript. There is
+/// deliberately no terminal variant: a finished compaction — succeeded or
+/// failed — is recorded by the durable marker row at the point in the
+/// conversation where it happened, and its error text by `compaction_errors`
+/// for the agent card. A retained terminal banner was a third copy that,
+/// being rendered outside the windowed list, stayed welded to the end of the
+/// conversation while new turns appeared above it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContextCompactionUiState {
     /// Sent, no server frame yet. No operation id exists.
@@ -2424,17 +2443,14 @@ pub enum ContextCompactionUiState {
     /// a node into an `aria-live` region is itself an announcement, so
     /// suppressing the explicit announce call is not enough to make a
     /// reconnect silent. The first genuinely live update flips it.
+    ///
+    /// Boxed because the payload dwarfs `Requesting`, and every holder of this
+    /// enum — the per-agent map, and the `Memo` the banner reads — would
+    /// otherwise pay the full payload size for the common empty case.
     Active {
-        payload: ContextCompactionNotifyPayload,
+        payload: Box<ContextCompactionNotifyPayload>,
         live: bool,
     },
-    /// Terminal failure, retained so the agent card can explain it. Cleared
-    /// when the user asks again.
-    ///
-    /// Never renders as an alert: the one assertive announcement is made once,
-    /// at the moment of the live transition, through the shared live region.
-    /// Alert semantics on retained state would re-fire on every remount.
-    Failed(ContextCompactionNotifyPayload),
 }
 
 impl ContextCompactionUiState {
@@ -2444,7 +2460,6 @@ impl ContextCompactionUiState {
         match self {
             Self::Requesting => true,
             Self::Active { payload, .. } => !payload.status.is_terminal(),
-            Self::Failed(_) => false,
         }
     }
 
@@ -2462,7 +2477,7 @@ impl ContextCompactionUiState {
     pub fn operation_id(&self) -> Option<&CompactionOperationId> {
         match self {
             Self::Requesting => None,
-            Self::Active { payload, .. } | Self::Failed(payload) => Some(&payload.operation_id),
+            Self::Active { payload, .. } => Some(&payload.operation_id),
         }
     }
 
@@ -2472,8 +2487,6 @@ impl ContextCompactionUiState {
         match self {
             Self::Requesting => true,
             Self::Active { live, .. } => *live,
-            // Retained failure presentation is never a live region (see above).
-            Self::Failed(_) => false,
         }
     }
 }
@@ -2988,8 +3001,17 @@ pub struct TerminalInfo {
     pub exit_signal: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub enum TransientEvent {
+/// Something that happened to the *turn* rather than in it: the provider
+/// backed off and retried, or the turn was cancelled.
+///
+/// These are transcript rows, not floating cards. They were floating cards,
+/// rendered after the windowed list and cleared wholesale at the next turn —
+/// which meant a retry from one point in the conversation rendered below every
+/// message that arrived after it, and repeated attempts stacked. They arrive
+/// in the server's ordered event stream like any other chat event, so the
+/// honest projection is a row at the point they occurred.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatNotice {
     OperationCancelled {
         message: String,
     },
@@ -3591,7 +3613,6 @@ pub struct AppState {
     pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
-    pub transient_events: RwSignal<HashMap<AgentId, Vec<TransientEvent>>>,
     /// Agents whose interrupt has been sent but not yet acknowledged by a
     /// terminal event. Cancelling is a real phase of the turn lifecycle, not an
     /// instant: without it the Cancel control stays armed while the request is
@@ -3599,6 +3620,16 @@ pub struct AppState {
     /// gets no sign the first one was heard. Cleared by `OperationCancelled`, by
     /// any typing transition, and by agent teardown.
     pub interrupt_pending: RwSignal<HashSet<AgentId>>,
+    /// Agents whose most recent turn ended in cancellation rather than
+    /// completion, so the agent card can withhold the success affordance.
+    ///
+    /// Per-*turn* state, deliberately separate from the transcript row the same
+    /// `OperationCancelled` event produces. The two were one record, which
+    /// forced the visible notice to be dropped wholesale at the next turn in
+    /// order to reset this flag — and that is what left the notice with no
+    /// position of its own. Cleared by the next `TypingStatusChanged(true)` or
+    /// `StreamStart`, by bootstrap, and by teardown.
+    pub last_turn_cancelled: RwSignal<HashSet<AgentId>>,
     pub browse_dialog: RwSignal<Option<BrowseDialogState>>,
     /// Per-project snapshots of center-zone state. Updated whenever the user
     /// switches away from a project; consulted on switch-in to restore.
@@ -4072,8 +4103,8 @@ impl AppState {
             diff_contents: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
-            transient_events: RwSignal::new(HashMap::new()),
             interrupt_pending: RwSignal::new(HashSet::new()),
+            last_turn_cancelled: RwSignal::new(HashSet::new()),
             browse_dialog: RwSignal::new(None),
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
@@ -4497,8 +4528,14 @@ impl AppState {
                 self.compaction_errors.update(|map| {
                     map.insert(agent_id.clone(), message);
                 });
+                // Symmetrical with `Completed`, and for the same reason: the
+                // durable marker row is the record of what happened, in the
+                // place it happened. `compaction_errors` carries the provider's
+                // prose to the agent card. Retaining an operation here as well
+                // left a banner pinned to the end of the transcript for the
+                // rest of the session.
                 self.context_compactions.update(|map| {
-                    map.insert(agent_id.clone(), ContextCompactionUiState::Failed(payload));
+                    map.remove(agent_id);
                 });
             }
             ContextCompactionStatus::Completed => {
@@ -4521,7 +4558,10 @@ impl AppState {
                 self.context_compactions.update(|map| {
                     map.insert(
                         agent_id.clone(),
-                        ContextCompactionUiState::Active { payload, live },
+                        ContextCompactionUiState::Active {
+                            payload: Box::new(payload),
+                            live,
+                        },
                     );
                 });
             }
@@ -4647,10 +4687,10 @@ impl AppState {
         self.agent_turn_active.update(|map| {
             map.remove(agent_id);
         });
-        self.transient_events.update(|map| {
-            map.remove(agent_id);
-        });
         self.interrupt_pending.update(|set| {
+            set.remove(agent_id);
+        });
+        self.last_turn_cancelled.update(|set| {
             set.remove(agent_id);
         });
         self.task_lists.update(|map| {
@@ -4971,6 +5011,21 @@ impl AppState {
             map.entry(agent_id).or_default().insert(marker_id, row_id);
         });
         true
+    }
+
+    /// Append a retry/cancel notice as a transcript row.
+    ///
+    /// No dedup index, unlike compaction markers: a notice has no id and is
+    /// never seen twice from different sources. It reaches this client only
+    /// through the server's ordered event stream — live, bootstrap replay, or a
+    /// strictly-older history page — so stream position is its identity, and a
+    /// second `RetryAttempt` is a second attempt rather than a re-sighting.
+    pub fn push_chat_notice(&self, agent_id: AgentId, notice: ChatNotice) {
+        self.chat_rows.update(|rows| {
+            rows.entry(agent_id)
+                .or_default()
+                .push(ChatRowHandle::notice(notice));
+        });
     }
 
     /// Prepend a history page, funnelling its markers through the same
@@ -6338,10 +6393,10 @@ impl AppState {
             self.orchestration.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
-            self.transient_events.update(|map| {
-                map.retain(|id, _| !drop_set.contains(id));
-            });
             self.interrupt_pending.update(|set| {
+                set.retain(|id| !drop_set.contains(id));
+            });
+            self.last_turn_cancelled.update(|set| {
                 set.retain(|id| !drop_set.contains(id));
             });
             self.agent_message_queue.update(|map| {

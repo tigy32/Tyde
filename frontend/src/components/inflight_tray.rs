@@ -127,7 +127,7 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
         state.context_compactions.with(|context_compaction| {
             state.agent_turn_active.with(|turn_active| {
                 state.streaming_text.with(|streaming| {
-                    state.transient_events.with(|transient| {
+                    state.last_turn_cancelled.with(|cancelled| {
                         state.interrupt_pending.with(|interrupt_pending| {
                             derive_agent_state(
                                 agent,
@@ -135,7 +135,7 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
                                 turn_active,
                                 compaction,
                                 context_compaction,
-                                transient,
+                                cancelled,
                                 interrupt_pending,
                             )
                         })
