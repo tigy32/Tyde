@@ -1818,6 +1818,7 @@ fn assert_universal_contract(turns: &[Turn]) {
     for turn in turns {
         assert_no_error_message(&turn.label(), turn.events());
         assert_streams_are_balanced(turn);
+        assert_no_empty_response(turn);
         assert_every_request_was_declared(turn);
         assert_declarations_carry_provider_arguments(turn);
         assert_every_request_completed_exactly_once(turn);
@@ -1840,6 +1841,57 @@ fn assert_no_error_message(label: &str, events: &[ChatEvent]) {
             panic!("{label}: emitted an Error message: {:?}", message.content);
         }
     }
+}
+
+/// A response the user can see nothing in.
+///
+/// `StreamEnd` publishes a chat message, so a response carrying no content, no
+/// reasoning, no tool calls and no images renders as an empty bubble in the
+/// transcript. `assert_streams_are_balanced` cannot catch this — an empty
+/// response is perfectly balanced, which is exactly why it went unnoticed:
+/// 128 of 374 responses (34%) in a real Codex session were a `StreamStart`
+/// whose very next event was `StreamEnd`.
+///
+/// Codex opens responses purely so it can close them:
+/// `CodexResponseSplitter::finalize` calls `ensure_open`, and `codex.rs` then
+/// mints an emitter handle at two finalize sites. The check is universal
+/// rather than Codex-only because nothing about "don't publish an empty
+/// message" is backend-specific.
+fn assert_no_empty_response(turn: &Turn) {
+    let responses = turn
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(&end.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let empty = responses
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.content.trim().is_empty()
+                && message
+                    .reasoning
+                    .as_ref()
+                    .is_none_or(|reasoning| reasoning.text.trim().is_empty())
+                && message.tool_calls.is_empty()
+                && message
+                    .images
+                    .as_ref()
+                    .is_none_or(|images| images.is_empty())
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(
+        empty.is_empty(),
+        "{}: published {} empty assistant message(s) at response index {:?} of {} — \
+         each renders as an empty bubble with nothing in it",
+        turn.label(),
+        empty.len(),
+        empty,
+        responses.len(),
+    );
 }
 
 /// One provider request, one chat message — the splitting counterpart to
