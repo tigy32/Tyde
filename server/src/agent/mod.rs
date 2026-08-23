@@ -3594,6 +3594,7 @@ pub(crate) fn spawn_agent_actor(
                 supervisor_settings.settings,
                 &event_log,
                 active_compaction.is_some() || context_compaction.is_some(),
+                !replay_state.active_background_progress.is_empty(),
                 Instant::now(),
             );
             let supervisor_deadline = supervisor_state

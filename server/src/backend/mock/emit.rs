@@ -415,6 +415,43 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
     ]
 }
 
+/// A background tool call that is running and has not been collected: the
+/// request, then a background-mode progress snapshot with no completion. This
+/// is the shape a background `Bash` leaves behind — the task keeps running
+/// while the agent itself goes idle, so nothing further arrives on the stream
+/// until it finishes.
+pub(super) fn background_task_started_frames(tool_call_id: &str) -> Vec<BackendEvent> {
+    vec![
+        tool_request(ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_type: ToolRequestType::RunCommand {
+                command: "mock background command".to_owned(),
+                working_directory: "/tmp/test".to_owned(),
+            },
+        }),
+        tool_progress(ToolProgressData {
+            tool_call_id: tool_call_id.to_owned(),
+            execution_mode: protocol::ToolExecutionMode::Background,
+            update: protocol::ToolProgressUpdate::Other {
+                payload: json!({ "status": "running" }),
+            },
+        }),
+    ]
+}
+
+pub(super) fn background_task_finished_frames(tool_call_id: &str) -> Vec<BackendEvent> {
+    vec![tool_completed(ToolExecutionCompletedData {
+        tool_call_id: tool_call_id.to_owned(),
+        outcome: ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "mock background command finished".to_owned(),
+                stderr: String::new(),
+            },
+        },
+    })]
+}
+
 pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<BackendEvent> {
     vec![
         typing(true),

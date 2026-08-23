@@ -385,6 +385,29 @@ impl MockTurn {
         })])
     }
 
+    /// Leave a background tool call in flight once the turn has gone idle, and
+    /// drain it when `drain` is released. An agent parked like this reads as
+    /// inactive — no turn, no output, nothing on the stream — while still
+    /// owing the background task's result a place in this context.
+    pub fn with_background_task_until(
+        self,
+        tool_call_id: impl Into<String>,
+        drain: &MockGateHandle,
+    ) -> Self {
+        let tool_call_id = tool_call_id.into();
+        let mut steps: Vec<MockStep> = emit::background_task_started_frames(&tool_call_id)
+            .into_iter()
+            .map(MockStep::emit)
+            .collect();
+        steps.push(MockStep::Gate(drain.gate()));
+        steps.extend(
+            emit::background_task_finished_frames(&tool_call_id)
+                .into_iter()
+                .map(MockStep::emit),
+        );
+        self.with_appended_steps(steps)
+    }
+
     fn with_appended_steps(mut self, extra: Vec<MockStep>) -> Self {
         match &mut self.body {
             MockTurnBody::Steps(steps) => steps.extend(extra),

@@ -364,6 +364,24 @@ pub(crate) enum SupervisorAction {
     RequestCompaction,
 }
 
+/// Background tool work the agent launched and has not yet collected.
+///
+/// An agent waiting on a background task is not inactive: it has outstanding
+/// work whose result still has to land in this context, and the CLI wakes the
+/// model to act on that result. Compacting underneath it would drop the
+/// context the result belongs to, so the auto-compaction clock does not run
+/// while any background task is in flight and restarts from the moment the
+/// last one drains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundWork {
+    /// Nothing in flight. `settled_at` is when the last task drained, or
+    /// `None` when none has run in this phase.
+    Idle {
+        settled_at: Option<Instant>,
+    },
+    Active,
+}
+
 /// Supervisor scheduling state, owned by the agent actor.
 ///
 /// This used to be one host-side scheduler over every agent, which meant every
@@ -376,6 +394,7 @@ pub(crate) enum SupervisorAction {
 pub(crate) struct SupervisorState {
     phase: Phase,
     last_activity: u64,
+    background: BackgroundWork,
 }
 
 impl SupervisorState {
@@ -387,6 +406,7 @@ impl SupervisorState {
         Self {
             phase: Self::fresh_phase(status, settings, now),
             last_activity: status.activity_counter,
+            background: BackgroundWork::Idle { settled_at: None },
         }
     }
 
@@ -447,8 +467,16 @@ impl SupervisorState {
         settings: settings_model::SupervisorSettings,
         event_log: &[Envelope],
         compaction_in_progress: bool,
+        background_work_in_flight: bool,
         now: Instant,
     ) {
+        self.background = match (background_work_in_flight, self.background) {
+            (true, _) => BackgroundWork::Active,
+            (false, BackgroundWork::Active) => BackgroundWork::Idle {
+                settled_at: Some(now),
+            },
+            (false, idle) => idle,
+        };
         let activity_changed = self.last_activity != status.activity_counter;
         self.last_activity = status.activity_counter;
         match &self.phase {
@@ -512,8 +540,16 @@ impl SupervisorState {
         }
         if let Some(compaction_epoch) = self.compaction_epoch() {
             if settings.auto_compact_on_success && compaction_epoch != Some(epoch) {
-                return self
-                    .idle_since()?
+                // Waiting on a background task is not inactivity, and the
+                // deadline stays unset rather than merely unmet so a task that
+                // is silent for the whole window cannot age into one.
+                let settled_at = match self.background {
+                    BackgroundWork::Active => return None,
+                    BackgroundWork::Idle { settled_at } => settled_at,
+                };
+                let idle_since = self.idle_since()?;
+                return settled_at
+                    .map_or(idle_since, |settled_at| idle_since.max(settled_at))
                     .checked_add(Duration::from_secs(u64::from(
                         settings.auto_compact_inactivity_delay_seconds,
                     )));

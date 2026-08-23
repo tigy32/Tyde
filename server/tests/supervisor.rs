@@ -13,7 +13,7 @@ use protocol::{
     SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload, SettingsWriteResultPayload,
     SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
-use server::backend::mock::{MockScript, MockTurn};
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 use settings_model::HostSettingsPayload;
 use std::time::Duration;
 
@@ -277,13 +277,27 @@ async fn spawn_supervised_agent_with_verdict(
     report_context: bool,
     verdict_sentinel: &str,
 ) -> NewAgentPayload {
+    spawn_supervised_agent_with_turn(fixture, name, verdict_sentinel, |response| {
+        if report_context {
+            MockTurn::text_with_context_250k(response)
+        } else {
+            MockTurn::text(response)
+        }
+    })
+    .await
+}
+
+/// Spawns a supervised agent whose first turn is whatever `build_turn` makes
+/// of the mock's response text, so a test can decorate that turn without
+/// restating the whole bootstrap handshake below.
+async fn spawn_supervised_agent_with_turn(
+    fixture: &mut Fixture,
+    name: &str,
+    verdict_sentinel: &str,
+    build_turn: impl FnOnce(String) -> MockTurn,
+) -> NewAgentPayload {
     let prompt = format!("hello {verdict_sentinel}");
-    let response = format!("mock backend response to: {prompt}");
-    let turn = if report_context {
-        MockTurn::text_with_context_250k(response)
-    } else {
-        MockTurn::text(response)
-    };
+    let turn = build_turn(format!("mock backend response to: {prompt}"));
     let reservation = fixture
         .reserve_next_mock_launch(
             name,
@@ -380,6 +394,20 @@ async fn spawn_supervised_agent_with_verdict(
     drop(reservation);
     new_agent.session_id = logical_session_id;
     new_agent
+}
+
+/// A background task the agent launched and has not collected yet. The agent
+/// is idle over the compaction threshold the whole time it runs.
+async fn spawn_supervised_agent_with_background_task(
+    fixture: &mut Fixture,
+    name: &str,
+    tool_call_id: &str,
+    drain: &MockGateHandle,
+) -> NewAgentPayload {
+    spawn_supervised_agent_with_turn(fixture, name, MOCK_SUPERVISOR_DONE, |response| {
+        MockTurn::text_with_context_250k(response).with_background_task_until(tool_call_id, drain)
+    })
+    .await
 }
 
 async fn auto_compaction_fixture(threshold: u64) -> Fixture {
@@ -1469,4 +1497,45 @@ async fn invalid_supervisor_stall_timeout_returns_pointer_error() {
         !payload.settings.supervisor.stall_timeout_enabled,
         "the window and the opt-in must not switch interrupting on by themselves"
     );
+}
+
+/// Waiting on a background task is not inactivity: the task's result still has
+/// to land in this context, and compacting underneath it drops the context the
+/// result belongs to. The auto-compaction inactivity clock therefore does not
+/// run until every background task has drained, and then measures its full
+/// window from the drain. The idle kick is deliberately not gated this way.
+#[tokio::test]
+async fn auto_compaction_waits_for_background_tasks_to_drain() {
+    let mut fixture = auto_compaction_fixture(200_000).await;
+    let drain = MockGateHandle::new();
+    let agent = spawn_supervised_agent_with_background_task(
+        &mut fixture,
+        "supervised-background-task-agent",
+        "mock-background-task",
+        &drain,
+    )
+    .await;
+
+    // The turn has ended, the context is over the threshold, and the one-second
+    // inactivity delay expires many times over inside this window. The only
+    // thing holding compaction back is the running background task: before the
+    // fix the supervisor compacted here, well inside `QUIET_WAIT`.
+    drain.wait_until_entered().await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "auto-compaction while a background task was still running",
+        |env| is_compaction_lifecycle_on(env, &agent),
+    )
+    .await;
+
+    drain.release_one();
+
+    wait_for_native_supervisor_compaction(
+        &mut fixture.client,
+        &agent,
+        SUPERVISION_WAIT,
+        "native auto-compaction once the background task drained",
+    )
+    .await;
 }
