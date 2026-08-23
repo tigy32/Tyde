@@ -4528,10 +4528,36 @@ impl HermesEventMapper {
         Ok(events)
     }
 
+    /// Whether a delta that found no open message is the cancelled turn's
+    /// provider stream still draining.
+    ///
+    /// `cancel_events` closes the message but deliberately leaves
+    /// `current_turn_generation` set, while a turn that ends normally clears it
+    /// through `clear_turn_state` (see the `status != "interrupted"` guard in
+    /// `map_message_complete`). So a generation still in hand with no open
+    /// message can only mean the user cancelled and Hermes has not finished
+    /// unwinding. Measured 5/5 on `real_interruption`: Hermes emits a trailing
+    /// `thinking.delta` after Tyde has already reported the turn interrupted,
+    /// and no `message.start` ever follows it.
+    ///
+    /// `interrupted_turn_generations` cannot answer this — `map_message_complete`
+    /// removes the generation from that list while handling the interrupted
+    /// completion, so it is already empty by the time the straggler lands.
+    fn belongs_to_a_cancelled_turn(&self) -> bool {
+        self.current_message_id.is_none() && self.current_turn_generation.is_some()
+    }
+
     fn map_message_delta(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "message.delta")?;
         let text = required_raw_string(&payload, &["text"], "message.delta")?;
         if self.current_message_id.is_none() {
+            if self.belongs_to_a_cancelled_turn() {
+                tracing::warn!(
+                    generation = ?self.current_turn_generation,
+                    "dropped a Hermes message.delta that arrived after its turn was cancelled"
+                );
+                return Ok(Vec::new());
+            }
             return Err("Hermes emitted message.delta before message.start".to_string());
         }
         if text.is_empty() {
@@ -4549,6 +4575,14 @@ impl HermesEventMapper {
         let payload = required_payload(payload, event_type)?;
         let text = required_raw_string(&payload, &["text"], event_type)?;
         if self.current_message_id.is_none() {
+            if self.belongs_to_a_cancelled_turn() {
+                tracing::warn!(
+                    generation = ?self.current_turn_generation,
+                    event_type,
+                    "dropped a Hermes reasoning delta that arrived after its turn was cancelled"
+                );
+                return Ok(Vec::new());
+            }
             return Err(format!("Hermes emitted {event_type} before message.start"));
         };
         if text.is_empty() {
@@ -7608,4 +7642,93 @@ fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `MessageSender::Error` the mapper produced, by content.
+    fn error_texts(events: &[ChatEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error) =>
+                {
+                    Some(message.content.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drive one streaming turn up to the point the user interrupts it.
+    fn interrupted_turn() -> HermesEventMapper {
+        let mut mapper = HermesEventMapper::default();
+        mapper.map_event("message.start", Some(json!({"_tyde_turn_generation": 7})));
+        mapper.map_event("message.delta", Some(json!({"text": "1\n2\n3"})));
+        mapper.cancel_events("Operation cancelled");
+        mapper.map_event(
+            "message.complete",
+            Some(json!({
+                "_tyde_turn_generation": 7,
+                "status": "interrupted",
+                "text": "1\n2\n3",
+            })),
+        );
+        mapper
+    }
+
+    /// Measured 5/5 on `real_interruption`: after the user cancels, Hermeses
+    /// provider stream keeps draining and fires one more `thinking.delta`. It
+    /// belongs to a turn Tyde has already reported as interrupted, so it is
+    /// debris rather than a protocol violation -- and turning it into an Error
+    /// message ends the turn and strands the agent.
+    #[test]
+    fn a_delta_trailing_a_cancelled_turn_is_not_a_violation() {
+        for (event_type, payload) in [
+            ("thinking.delta", json!({"text": ""})),
+            ("thinking.delta", json!({"text": "(o_o) computing..."})),
+            ("message.delta", json!({"text": "4"})),
+        ] {
+            let mut mapper = interrupted_turn();
+            let events = mapper.map_event(event_type, Some(payload.clone()));
+            assert!(
+                error_texts(&events).is_empty(),
+                "{event_type} {payload} trailing a cancelled turn reported {:?}; a straggler from \
+                 an interrupted turn is expected debris, not a malformed stream",
+                error_texts(&events)
+            );
+        }
+    }
+
+    /// The other direction, and the reason the fix keys on the turn generation
+    /// rather than simply tolerating a closed stream: once a turn ends
+    /// *normally* `clear_turn_state` drops the generation, so a delta arriving
+    /// afterwards really is out of order and must still be reported.
+    #[test]
+    fn a_delta_after_a_completed_turn_is_still_a_violation() {
+        let mut mapper = HermesEventMapper::default();
+        mapper.map_event("message.start", Some(json!({"_tyde_turn_generation": 7})));
+        mapper.map_event("message.delta", Some(json!({"text": "done"})));
+        mapper.map_event(
+            "message.complete",
+            Some(json!({
+                "_tyde_turn_generation": 7,
+                "status": "complete",
+                "text": "done",
+            })),
+        );
+
+        let events = mapper.map_event("thinking.delta", Some(json!({"text": "late"})));
+        assert!(
+            error_texts(&events)
+                .iter()
+                .any(|text| text.contains("thinking.delta before message.start")),
+            "a reasoning delta after a normally completed turn reported {:?}; the ordering \
+             contract has to survive the interrupted-turn exemption",
+            error_texts(&events)
+        );
+    }
 }

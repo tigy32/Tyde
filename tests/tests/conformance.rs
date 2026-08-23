@@ -117,6 +117,17 @@ const PLAN_TASKS: [&str; 3] = [
 /// two or more shell calls orphans every one of them.
 const MULTI_FILES: [&str; 3] = ["multi_a.txt", "multi_b.txt", "multi_c.txt"];
 
+/// A second, untouched triple for the half of a scenario that runs *after* a
+/// resume.
+///
+/// Asking for [`MULTI_FILES`] again would ask for work the replayed history
+/// shows is already done, and a model that answers "they already exist" without
+/// calling a tool is right. Measured on Hermes/deepseek: 2 of 4 runs, the
+/// post-resume turn emitted 0 tool requests and the multi-tool assertions had
+/// nothing to inspect. Same trap `mapping_read_prompt` documents — a turn only
+/// tests the mapping when the conversation cannot already answer it.
+const MULTI_FILES_AFTER_RESUME: [&str; 3] = ["multi_d.txt", "multi_e.txt", "multi_f.txt"];
+
 /// The longest background command either scenario starts, plus whatever polling
 /// interval the backend uses to notice it finished.
 const BG_SETTLE: Duration = Duration::from_secs(60);
@@ -157,6 +168,7 @@ const RESUME_SETTLE: Duration = Duration::from_secs(5);
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_conversation() {
     run_scenario(&[], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
         let payload = unique_payload();
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
 
@@ -164,19 +176,19 @@ fn real_conversation() {
         // the end, matching the newer scenarios: a failure then names the turn
         // that caused it instead of one four turns later.
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&launched, READY_MARKER);
+        assert_ready_handshake(&launched);
 
-        let wrote = ask(&mut host, &agent, write_prompt(&payload)).await;
+        let wrote = ask(&mut host, &agent, write_prompt(&workspace, &payload)).await;
         assert_wrote_file(&wrote, host.workspace(), &payload);
         assert_final_text_contains(&wrote, WROTE_MARKER);
 
-        let read_back = ask(&mut host, &agent, read_prompt()).await;
+        let read_back = ask(&mut host, &agent, read_prompt(&workspace)).await;
         assert_read_back_payload(&read_back, &payload);
 
-        let multi = ask(&mut host, &agent, multi_tool_prompt()).await;
-        assert_multi_tool_turn(&multi, host.workspace());
+        let multi = ask(&mut host, &agent, multi_tool_prompt(&workspace)).await;
+        assert_multi_tool_turn(&multi, host.workspace(), MULTI_FILES);
 
-        let deleted = ask(&mut host, &agent, delete_prompt()).await;
+        let deleted = ask(&mut host, &agent, delete_prompt(&workspace)).await;
         assert_deleted_directory(&deleted, host.workspace());
 
         assert_universal_contract(&[launched, wrote, read_back, multi, deleted]);
@@ -217,6 +229,7 @@ fn real_conversation() {
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_tool_type_mappings() {
     run_scenario(&[], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
         let created = unique_payload();
         let edited = unique_payload();
         let token = unique_payload();
@@ -225,7 +238,7 @@ fn real_tool_type_mappings() {
 
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&launched, READY_MARKER);
+        assert_ready_handshake(&launched);
 
         if !diffs {
             eprintln!(
@@ -240,13 +253,23 @@ fn real_tool_type_mappings() {
         // assertions are gated. Each is checked before the next turn runs — both
         // read the file to decide whether the work happened, and the edit turn
         // overwrites what the create turn is judged against.
-        let create = ask(&mut host, &agent, mapping_create_prompt(&created)).await;
+        let create = ask(
+            &mut host,
+            &agent,
+            mapping_create_prompt(&workspace, &created),
+        )
+        .await;
         assert_final_text_contains(&create, MAPPED_CREATE_MARKER);
         if diffs {
             assert_create_maps_to_a_diff(&create, host.workspace(), &created);
         }
 
-        let edit = ask(&mut host, &agent, mapping_edit_prompt(&created, &edited)).await;
+        let edit = ask(
+            &mut host,
+            &agent,
+            mapping_edit_prompt(&workspace, &created, &edited),
+        )
+        .await;
         assert_final_text_contains(&edit, MAPPED_EDIT_MARKER);
         if diffs {
             assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
@@ -261,7 +284,7 @@ fn real_tool_type_mappings() {
                 format!("alpha\n{unseen}\nomega\n"),
             )
             .expect("rewrite mapping.txt out of band");
-            let read = ask(&mut host, &agent, mapping_read_prompt()).await;
+            let read = ask(&mut host, &agent, mapping_read_prompt(&workspace)).await;
             assert_read_maps_to_read_files(&read, host.workspace(), &unseen);
             turns.push(read);
         } else {
@@ -272,12 +295,17 @@ fn real_tool_type_mappings() {
             );
         }
 
-        let ran = ask(&mut host, &agent, mapping_command_prompt(&token)).await;
+        let ran = ask(
+            &mut host,
+            &agent,
+            mapping_command_prompt(&workspace, &token),
+        )
+        .await;
         assert_command_maps_to_run_command(&ran, host.workspace(), &token);
         assert_final_text_contains(&ran, MAPPED_RUN_MARKER);
         turns.push(ran);
 
-        let deleted = ask(&mut host, &agent, mapping_delete_prompt()).await;
+        let deleted = ask(&mut host, &agent, mapping_delete_prompt(&workspace)).await;
         assert_delete_is_not_an_opaque_card(&deleted, host.workspace());
         assert_final_text_contains(&deleted, MAPPED_DELETE_MARKER);
         turns.push(deleted);
@@ -316,9 +344,10 @@ fn real_tool_type_mappings() {
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_interruption() {
     run_scenario(&[BackendCapability::Interrupt], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&launched, READY_MARKER);
+        assert_ready_handshake(&launched);
         assert_universal_contract(&[launched]);
 
         let mid_stream = interrupt_turn(
@@ -340,7 +369,7 @@ fn real_interruption() {
         assert_cancellation_contract(&mid_stream);
         assert_any_partial_message_is_what_was_streamed(&mid_stream);
         let after_stream = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&after_stream, READY_MARKER);
+        assert_ready_handshake(&after_stream);
 
         let proof = host.workspace().join(INTERRUPT_PROOF_FILE);
         let mid_tool = interrupt_turn(
@@ -356,12 +385,12 @@ fn real_interruption() {
         assert_no_error_message(&format!("{:?} kill settle", host.backend()), &killed);
         assert_cancelled_command_really_stopped(&mid_tool, &proof);
         let after_tool = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&after_tool, READY_MARKER);
+        assert_ready_handshake(&after_tool);
 
         let mut turns = vec![after_stream, after_tool];
 
         if host.declares(BackendCapability::BackgroundTasks) {
-            let bg_prompt = background_prompt(host.backend(), BG_SECONDS_FOR_INTERRUPT);
+            let bg_prompt = background_prompt(&workspace, host.backend(), BG_SECONDS_FOR_INTERRUPT);
             let started = ask(&mut host, &agent, &bg_prompt).await;
             assert_final_text_contains(&started, BG_MARKER);
             assert_background_task_is_still_open(&started);
@@ -388,7 +417,7 @@ fn real_interruption() {
 
             let after_background =
                 ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&after_background, READY_MARKER);
+            assert_ready_handshake(&after_background);
 
             // `started` deliberately skips `assert_universal_contract`, whose
             // `assert_every_request_completed_exactly_once` requires every card
@@ -421,11 +450,12 @@ fn real_interruption() {
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_conversation_on_resumed_session() {
     run_scenario(&[BackendCapability::ResumeSession], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
         let payload = unique_payload();
 
         let source = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &source, &launch_prompt()).await;
-        let wrote = ask(&mut host, &source, write_prompt(&payload)).await;
+        let wrote = ask(&mut host, &source, write_prompt(&workspace, &payload)).await;
         assert_wrote_file(&wrote, host.workspace(), &payload);
         assert_final_text_contains(&wrote, WROTE_MARKER);
         assert_universal_contract(&[launched, wrote]);
@@ -469,7 +499,7 @@ fn real_conversation_on_resumed_session() {
 
         // Resumed sessions rendering blank is one bug; resumed sessions
         // silently losing every subsequent tool card is a worse one.
-        let follow_up = ask(&mut host, &resumed, reread_prompt()).await;
+        let follow_up = ask(&mut host, &resumed, reread_prompt(&workspace)).await;
         assert_read_back_payload(&follow_up, &after_resume_payload);
         assert!(
             follow_up.tool_requests().next().is_some(),
@@ -483,7 +513,7 @@ fn real_conversation_on_resumed_session() {
         assert_replay_has_no_duplicates(
             &resumed,
             host.backend(),
-            &[launch_prompt(), write_prompt(&payload)],
+            &[launch_prompt(), write_prompt(&workspace, &payload)],
         );
 
         assert_clean_close(&mut host, &resumed).await;
@@ -599,11 +629,17 @@ async fn assert_a_session_cannot_move_out_from_under_tyde(host: &mut Host, sessi
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_resumed_session_groups_parallel_tool_calls() {
     run_scenario(&[BackendCapability::ResumeSession], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
 
-        let fresh = ask(&mut host, &agent, parallel_tool_prompt()).await;
-        assert_multi_tool_turn(&fresh, host.workspace());
+        let fresh = ask(
+            &mut host,
+            &agent,
+            parallel_tool_prompt(&workspace, MULTI_FILES),
+        )
+        .await;
+        assert_multi_tool_turn(&fresh, host.workspace(), MULTI_FILES);
         assert_response_groups_its_tool_calls(&fresh);
 
         assert_universal_contract(&[launched, fresh]);
@@ -619,8 +655,13 @@ fn real_resumed_session_groups_parallel_tool_calls() {
         let resumed = resume_agent(&mut host, &session.id).await;
         assert_replayed_history_is_not_empty(&resumed, host.backend());
 
-        let after_resume = ask(&mut host, &resumed, parallel_tool_prompt()).await;
-        assert_multi_tool_turn(&after_resume, host.workspace());
+        let after_resume = ask(
+            &mut host,
+            &resumed,
+            parallel_tool_prompt(&workspace, MULTI_FILES_AFTER_RESUME),
+        )
+        .await;
+        assert_multi_tool_turn(&after_resume, host.workspace(), MULTI_FILES_AFTER_RESUME);
         assert_response_groups_its_tool_calls(&after_resume);
         assert_universal_contract(&[after_resume]);
 
@@ -642,6 +683,7 @@ fn real_compaction_and_resume() {
             BackendCapability::ResumeSession,
         ],
         |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
             let payload = unique_payload();
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
@@ -650,7 +692,7 @@ fn real_compaction_and_resume() {
             // scenario covers are carried by tool declarations: a conversation
             // of plain text compacts and resumes cleanly while still being
             // wrong.
-            let wrote = ask(&mut host, &agent, write_prompt(&payload)).await;
+            let wrote = ask(&mut host, &agent, write_prompt(&workspace, &payload)).await;
             assert_wrote_file(&wrote, host.workspace(), &payload);
             let from_idle = compact(&mut host, &agent).await;
 
@@ -661,7 +703,7 @@ fn real_compaction_and_resume() {
             // puts the operation's terminal result and the backend's own
             // observation of the compaction in a position to arrive out of
             // order, and correlating them is what keeps it to one row.
-            send_prompt(&mut host, &agent, &multi_tool_prompt()).await;
+            send_prompt(&mut host, &agent, &multi_tool_prompt(&workspace)).await;
             let mid_turn = compact(&mut host, &agent).await;
 
             assert_compaction_left_one_marker(&from_idle);
@@ -683,7 +725,11 @@ fn real_compaction_and_resume() {
             assert_replay_has_no_duplicates(
                 &resumed,
                 host.backend(),
-                &[launch_prompt(), write_prompt(&payload), multi_tool_prompt()],
+                &[
+                    launch_prompt(),
+                    write_prompt(&workspace, &payload),
+                    multi_tool_prompt(&workspace),
+                ],
             );
 
             // `TurnEmitter` batches the protocol violations it caught into one
@@ -698,7 +744,7 @@ fn real_compaction_and_resume() {
 
             // A compacted session that resumes into a broken turn is the same
             // failure as one that resumes blank, one step later.
-            let follow_up = ask(&mut host, &resumed, read_prompt()).await;
+            let follow_up = ask(&mut host, &resumed, read_prompt(&workspace)).await;
             assert_read_back_payload(&follow_up, &payload);
             assert_universal_contract(&[follow_up]);
 
@@ -727,7 +773,7 @@ fn real_user_question() {
         |mut host| async move {
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&launched, READY_MARKER);
+            assert_ready_handshake(&launched);
 
             let asked = ask_question(&mut host, &agent, &question_prompt()).await;
             assert_question_shape(&asked);
@@ -754,7 +800,7 @@ fn real_user_question() {
             // agent that still works. A latched turn queues every later message
             // instead of running it, and no further cancel can clear it.
             let recovered = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&recovered, READY_MARKER);
+            assert_ready_handshake(&recovered);
 
             assert_universal_contract(&[launched, recovered]);
 
@@ -775,7 +821,8 @@ fn real_background_task_outlives_its_turn() {
     run_scenario(
         &[BackendCapability::BackgroundTasks],
         |mut host| async move {
-            let prompt = background_prompt(host.backend(), BG_SECONDS);
+            let workspace = host.workspace().to_path_buf();
+            let prompt = background_prompt(&workspace, host.backend(), BG_SECONDS);
             let bg_path = host.workspace().join(BG_FILE);
             let agent = spawn_agent(&mut host, &prompt).await;
             let started = collect_turn(&mut host, &agent, &prompt).await;
@@ -852,8 +899,9 @@ fn real_conversation_in_native_subagent() {
     run_scenario(
         &[BackendCapability::ForegroundSubagents],
         |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
             let payload = unique_payload();
-            let prompt = subagent_prompt(&payload);
+            let prompt = subagent_prompt(&workspace, &payload);
             let agent = spawn_agent(&mut host, &prompt).await;
             let delegated = collect_turn(&mut host, &agent, &prompt).await;
 
@@ -900,11 +948,12 @@ fn real_native_workflow() {
     run_scenario(
         &[BackendCapability::WorkflowProgress],
         |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&launched, READY_MARKER);
+            assert_ready_handshake(&launched);
 
-            let prompt = workflow_prompt(host.backend());
+            let prompt = workflow_prompt(&workspace, host.backend());
             let workflow = run_workflow(&mut host, &agent, &prompt).await;
 
             // The filesystem first: it separates "the run never happened" from
@@ -969,7 +1018,7 @@ fn real_usage_accounting() {
         |mut host| async move {
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&launched, READY_MARKER);
+            assert_ready_handshake(&launched);
 
             // Deliberately the second turn, not the first: the baseline has to be
             // a turn that already paid for the system prompt, or the jump being
@@ -1028,7 +1077,7 @@ fn real_task_list() {
 
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-        assert_final_text_contains(&launched, READY_MARKER);
+        assert_ready_handshake(&launched);
 
         let planned = ask(&mut host, &agent, plan_prompt()).await;
         assert_final_text_contains(&planned, PLANNED_MARKER);
@@ -1132,7 +1181,7 @@ fn real_mcp_tool_call() {
             // backend that fails to connect to a configured MCP server tends to
             // fail here, before any tool is asked for.
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&launched, READY_MARKER);
+            assert_ready_handshake(&launched);
 
             // The journal accumulates across the whole conversation, so each
             // turn is measured against the lines *it* appended. Comparing a
@@ -1176,12 +1225,13 @@ fn real_tyde_agent_spawn() {
     run_scenario(
         &[BackendCapability::AgentControlTools],
         |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_final_text_contains(&launched, READY_MARKER);
+            assert_ready_handshake(&launched);
 
             let payload = unique_payload();
-            let child_prompt = child_prompt(&payload);
+            let child_prompt = child_prompt(&workspace, &payload);
             let prompt = spawn_child_prompt(host.backend(), &host.workspace_roots(), &child_prompt);
             let delegation = delegate(&mut host, &agent, &prompt, &child_prompt).await;
 
@@ -1312,23 +1362,35 @@ for line in sys.stdin:
     )
 }
 
-/// Names the tool by what its description says, not by its name, for the reason
-/// [`real_mcp_tool_call`] gives: the name the model sees is prefixed per
-/// backend.
+/// Names the tool by the suffix every backend preserves, rather than by a
+/// paraphrase of its description.
+///
+/// The name the model sees is prefixed per backend (Hermes shows
+/// `mcp_tyde_record_probe`), so the full name cannot be hardcoded — but the
+/// suffix survives every prefixing scheme, which the description paraphrase
+/// does not survive contact with. Measured 2026-08-22: "the MCP tool whose
+/// description says it records a value" put Hermes at 0/3, and sent Codex to
+/// its own built-in `create_goal` — a native tool that also records a value —
+/// which failed with "goal budgets must be positive when provided". The
+/// paraphrase had quietly made tool *selection* part of what this scenario
+/// tests, when what it exists to check is that the argument the model passes is
+/// the argument that reaches the server.
 fn mcp_probe_prompt(value: &str) -> String {
     format!(
-        "Call the MCP tool whose description says it records a value, exactly once, passing \
-         exactly {value} as its `value` argument. Do not use any other tool. Then reply with the \
-         tool's exact text result and nothing else."
+        "Call the MCP tool whose name ends in `{MCP_TOOL_NAME}`, exactly once, passing \
+         exactly {value} as its `value` argument. Do not use any other tool, and do not answer \
+         from memory — the call must actually be made. Then reply with the tool's exact text \
+         result and nothing else."
     )
 }
 
 fn mcp_probe_twice_prompt(first: &str, second: &str) -> String {
     format!(
-        "Call that same MCP tool exactly twice in this turn: once passing {first} as its `value` \
-         argument, and once passing {second}. Use a separate tool call for each — do not combine \
-         them. Do not use any other tool. Then reply with both text results separated by a single \
-         space, and nothing else."
+        "Call the MCP tool whose name ends in `{MCP_TOOL_NAME}` exactly twice in this turn: once \
+         passing {first} as its `value` argument, and once passing {second}. Use a separate tool \
+         call for each — do not combine them. Do not use any other tool, and do not answer from \
+         memory — both calls must actually be made. Then reply with both text results separated \
+         by a single space, and nothing else."
     )
 }
 
@@ -1360,11 +1422,24 @@ fn mcp_probe_twice_prompt(first: &str, second: &str) -> String {
 /// Tycode's `gemini-flash` child answered a bare "create a file" with a plan
 /// ending "Do you approve this plan?" and went idle — and nobody is watching a
 /// spawned child to approve anything.
-fn child_prompt(payload: &str) -> String {
+/// The workspace root, spelled out rather than left to the model to infer.
+///
+/// These prompts used to say only "the workspace root", which quietly made the
+/// model's path inference part of what every file scenario tests. Measured on
+/// Hermes/minimax-m3 with the workspace under `/tmp`: it wrote to
+/// `/Users/mike/mapping.txt` and `/tmp/multi_a.txt` instead, and
+/// [`assert_wrote_file`] then failed having proved nothing about the card
+/// mapping it exists to check. The fixture knows the path, so it says it.
+fn workspace_root(workspace: &Path) -> String {
+    format!("the workspace root ({})", workspace.display())
+}
+
+fn child_prompt(workspace: &Path, payload: &str) -> String {
     format!(
-        "Create a file named {payload}.txt in the workspace root whose entire contents are \
+        "Create a file named {payload}.txt in {} whose entire contents are \
          exactly hello followed by a newline. Then reply with exactly {CHILD_DONE_MARKER} and \
-         nothing else."
+         nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1405,34 +1480,37 @@ const WORKFLOW_FILES: [&str; 2] = ["workflow_a.txt", "workflow_b.txt"];
 /// exact shape of the defect this scenario hunts. Handing over the script keeps
 /// the subject Tyde's handling of a workflow rather than the model's ability to
 /// write one.
-fn workflow_script() -> String {
+fn workflow_script(workspace: &Path) -> String {
     let [a, b] = WORKFLOW_FILES;
+    let root = workspace_root(workspace);
     format!(
         "export const meta = {{ name: 'tyde_conformance', description: 'conformance probe', \
          phases: [{{ title: 'Probe' }}] }}\n\
          phase('Probe')\n\
          await parallel([\n\
-         () => agent('Create a file named {a} in the workspace root whose contents are exactly \
+         () => agent('Create a file named {a} in {root} whose contents are exactly \
          A, then reply DONE.'),\n\
-         () => agent('Create a file named {b} in the workspace root whose contents are exactly \
+         () => agent('Create a file named {b} in {root} whose contents are exactly \
          B, then reply DONE.'),\n\
          ])\n\
          return 'ok'"
     )
 }
 
-fn workflow_prompt(backend_kind: BackendKind) -> String {
+fn workflow_prompt(workspace: &Path, backend_kind: BackendKind) -> String {
     let launch = match backend_kind {
         BackendKind::Claude => format!(
             "Call the Workflow tool exactly once, passing this script verbatim as its `script` \
              parameter and changing nothing in it:\n\n{}\n",
-            workflow_script()
+            workflow_script(workspace)
         ),
         _ => format!(
             "Use your native workflow tool exactly once to run two agents in parallel: one \
-             creating a file named {} in the workspace root whose contents are exactly A, the \
+             creating a file named {} in {} whose contents are exactly A, the \
              other creating {} whose contents are exactly B.",
-            WORKFLOW_FILES[0], WORKFLOW_FILES[1]
+            WORKFLOW_FILES[0],
+            workspace_root(workspace),
+            WORKFLOW_FILES[1]
         ),
     };
     format!(
@@ -1441,17 +1519,19 @@ fn workflow_prompt(backend_kind: BackendKind) -> String {
     )
 }
 
-fn write_prompt(payload: &str) -> String {
+fn write_prompt(workspace: &Path, payload: &str) -> String {
     format!(
-        "Create a file named {HELLO_FILE} in the workspace root whose entire contents are exactly \
-         {payload} followed by a newline. Then reply with exactly {WROTE_MARKER} and nothing else."
+        "Create a file named {HELLO_FILE} in {} whose entire contents are exactly \
+         {payload} followed by a newline. Then reply with exactly {WROTE_MARKER} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
-fn read_prompt() -> String {
+fn read_prompt(workspace: &Path) -> String {
     format!(
-        "Read the file {HELLO_FILE} from the workspace root and reply with exactly its contents \
-         and nothing else."
+        "Read the file {HELLO_FILE} from {} and reply with exactly its contents \
+         and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1464,22 +1544,24 @@ fn read_prompt() -> String {
 /// with the superseded payload and ran nothing. Saying so is what makes the
 /// turn's tool cards the thing under test rather than how eagerly a given model
 /// reaches for a tool.
-fn reread_prompt() -> String {
+fn reread_prompt(workspace: &Path) -> String {
     format!(
-        "The contents of {HELLO_FILE} in the workspace root changed on disk after your last \
+        "The contents of {HELLO_FILE} in {} changed on disk after your last \
          message. Read it again now and reply with exactly its current contents and nothing \
-         else. Do not answer from earlier in this conversation."
+         else. Do not answer from earlier in this conversation.",
+        workspace_root(workspace)
     )
 }
 
 /// Three lines, because the edit that follows has to change one of them and
 /// leave the others as diff context. A one-line file cannot tell a targeted edit
 /// from a whole-file rewrite.
-fn mapping_create_prompt(payload: &str) -> String {
+fn mapping_create_prompt(workspace: &Path, payload: &str) -> String {
     format!(
-        "Use your file-editing tool — not the shell — to create {MAPPING_FILE} in the workspace \
-         root with exactly these three lines:\nalpha\n{payload}\nomega\nThen reply with exactly \
-         {MAPPED_CREATE_MARKER} and nothing else."
+        "Use your file-editing tool — not the shell — to create {MAPPING_FILE} in {} \
+         with exactly these three lines:\nalpha\n{payload}\nomega\nThen reply with exactly \
+         {MAPPED_CREATE_MARKER} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1490,11 +1572,12 @@ fn mapping_create_prompt(payload: &str) -> String {
 /// card whose `before` and `after` are equal — the UI computes its diff from
 /// exactly those two strings (`modify_file.rs:92`), so a card that carries the
 /// same text twice renders an edit with no lines in it.
-fn mapping_edit_prompt(old: &str, new: &str) -> String {
+fn mapping_edit_prompt(workspace: &Path, old: &str, new: &str) -> String {
     format!(
         "Use your file-editing tool — not the shell — to change the middle line of \
-         {MAPPING_FILE} in the workspace root from {old} to {new}. Leave the alpha and omega \
-         lines exactly as they are. Then reply with exactly {MAPPED_EDIT_MARKER} and nothing else."
+         {MAPPING_FILE} in {} from {old} to {new}. Leave the alpha and omega \
+         lines exactly as they are. Then reply with exactly {MAPPED_EDIT_MARKER} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1506,22 +1589,24 @@ fn mapping_edit_prompt(old: &str, new: &str) -> String {
 /// requests, and the ReadFiles assertion then read as a dropped card. Reading a
 /// line the conversation has never mentioned is the only version of this turn
 /// that tests the mapping rather than the model's appetite for tools.
-fn mapping_read_prompt() -> String {
+fn mapping_read_prompt(workspace: &Path) -> String {
     format!(
-        "The contents of {MAPPING_FILE} in the workspace root changed on disk after your last \
+        "The contents of {MAPPING_FILE} in {} changed on disk after your last \
          message. Use your file-reading tool — not the shell — to read it again now, then reply \
          with exactly its middle line and nothing else. Do not answer from earlier in this \
-         conversation."
+         conversation.",
+        workspace_root(workspace)
     )
 }
 
 /// Echoes a token the conversation has never seen, so the completion's `stdout`
 /// has to come from a real process rather than from the request being replayed
 /// back as its own result.
-fn mapping_command_prompt(token: &str) -> String {
+fn mapping_command_prompt(workspace: &Path, token: &str) -> String {
     format!(
-        "Run this exact shell command in the workspace root: echo {token}\nThen reply with \
-         exactly {MAPPED_RUN_MARKER} and nothing else."
+        "Run this exact shell command in {}: echo {token}\nThen reply with \
+         exactly {MAPPED_RUN_MARKER} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1537,11 +1622,12 @@ fn mapping_command_prompt(token: &str) -> String {
 /// — so without this the turn stalls on a safety gate rather than reporting a
 /// mapping. That gate is real behaviour and is worth testing, but
 /// `assert_deleted_directory` in `real_conversation` already covers it.
-fn mapping_delete_prompt() -> String {
+fn mapping_delete_prompt(workspace: &Path) -> String {
     format!(
-        "Delete the file {MAPPING_FILE} from the workspace root. I am explicitly authorizing this \
+        "Delete the file {MAPPING_FILE} from {}. I am explicitly authorizing this \
          deletion now, so do not ask me to confirm it — go ahead and delete it. Then reply with \
-         exactly {MAPPED_DELETE_MARKER} and nothing else."
+         exactly {MAPPED_DELETE_MARKER} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1579,16 +1665,17 @@ fn enter_worktree_prompt(worktree: &Path) -> String {
 /// generically, spark ran `/bin/zsh -lc '(sleep 20; echo DONE > f) &'`, whose
 /// outer shell exits immediately and whose subshell the sandbox reaps: nothing
 /// was promoted and the file was never written.
-fn background_prompt(backend_kind: BackendKind, seconds: u64) -> String {
+fn background_prompt(workspace: &Path, backend_kind: BackendKind, seconds: u64) -> String {
+    let root = workspace_root(workspace);
     let launch = match backend_kind {
         BackendKind::Codex => format!(
             "Run this exact shell command: sleep {seconds}; echo DONE > {BG_FILE}. Run it as an \
-             ordinary foreground command in the workspace root — do not append `&`, and do \
+             ordinary foreground command in {root} — do not append `&`, and do \
              not use `nohup`, `disown`, or a detached subshell. Do not wait for its output."
         ),
         _ => format!(
             "Start a shell command that sleeps for {seconds} seconds and then writes the word \
-             DONE into a file named {BG_FILE} in the workspace root. Run it in the background and \
+             DONE into a file named {BG_FILE} in {root}. Run it in the background and \
              do not wait for it to finish."
         ),
     };
@@ -1656,11 +1743,12 @@ fn wait_prompt() -> String {
 ///
 /// The target is a directory this scenario seeded inside its own temporary
 /// workspace, which is the whole of what the agent can reach.
-fn delete_prompt() -> String {
+fn delete_prompt(workspace: &Path) -> String {
     format!(
-        "Delete the directory {SCRATCH_DIR} and everything in it from the workspace root, by \
+        "Delete the directory {SCRATCH_DIR} and everything in it from {}, by \
          running a single recursive shell command. Then reply with exactly {DELETED_MARKER} and \
-         nothing else."
+         nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1674,13 +1762,14 @@ fn question_prompt() -> String {
         .to_owned()
 }
 
-fn multi_tool_prompt() -> String {
+fn multi_tool_prompt(workspace: &Path) -> String {
     let [a, b, c] = MULTI_FILES;
     format!(
-        "Create three files in the workspace root: {a} containing exactly A, {b} containing \
+        "Create three files in {}: {a} containing exactly A, {b} containing \
          exactly B, and {c} containing exactly C. Use a separate tool call for each file — do not \
          combine them into a single command. Then reply with exactly {MULTI_MARKER} and nothing \
-         else."
+         else.",
+        workspace_root(workspace)
     )
 }
 
@@ -1690,22 +1779,25 @@ fn multi_tool_prompt() -> String {
 /// time, which is a different shape: three responses of one call each is
 /// correct there. Here the calls must share one response, because that is the
 /// only way a client can observe whether a response's calls stay together.
-fn parallel_tool_prompt() -> String {
-    let [a, b, c] = MULTI_FILES;
+fn parallel_tool_prompt(workspace: &Path, files: [&str; 3]) -> String {
+    let [a, b, c] = files;
     format!(
-        "Issue all three of these tool calls at once, in a single response, in parallel: create \
-         {a} containing exactly A, create {b} containing exactly B, and create {c} containing \
-         exactly C. Do not wait for one result before issuing the next, and do not combine them \
-         into a single command. Then reply with exactly {MULTI_MARKER} and nothing else."
+        "Issue all three of these tool calls at once, in a single response, in parallel: in {}, \
+         create {a} containing exactly A, create {b} containing exactly B, and create {c} \
+         containing exactly C. Do not wait for one result before issuing the next, and do not \
+         combine them into a single command. Then reply with exactly {MULTI_MARKER} and nothing \
+         else.",
+        workspace_root(workspace)
     )
 }
 
-fn subagent_prompt(payload: &str) -> String {
+fn subagent_prompt(workspace: &Path, payload: &str) -> String {
     format!(
         "Delegate the following task to a single sub-agent and wait for it to finish: create a \
-         file named {HELLO_FILE} in the workspace root whose entire contents are exactly \
+         file named {HELLO_FILE} in {} whose entire contents are exactly \
          {payload} followed by a newline, then read that file back. When the sub-agent is done, \
-         reply with exactly the contents of {HELLO_FILE} and nothing else."
+         reply with exactly the contents of {HELLO_FILE} and nothing else.",
+        workspace_root(workspace)
     )
 }
 
@@ -2093,18 +2185,20 @@ fn assert_response_groups_its_tool_calls(turn: &Turn) {
     );
 }
 
-fn assert_multi_tool_turn(turn: &Turn, workspace: &Path) {
+fn assert_multi_tool_turn(turn: &Turn, workspace: &Path, files: [&str; 3]) {
     let requests = turn.tool_requests().count();
     assert!(
         requests >= 2,
-        "{}: asked for three files via separate tool calls but the turn emitted {requests} tool \
+        "{}: asked for {files:?} via separate tool calls but the turn emitted {requests} tool \
          request(s) {:?}; this turn exists to exercise multi-tool turns and asserts nothing if \
-         the provider batches them",
+         the provider batches them. If the count is 0, check that the files were not already \
+         written earlier in this scenario — a model that declines to redo finished work is right, \
+         and the prompt is what is wrong.",
         turn.label(),
         turn.tool_request_names()
     );
 
-    let missing: Vec<_> = MULTI_FILES
+    let missing: Vec<_> = files
         .iter()
         .filter(|name| !workspace.join(name).is_file())
         .collect();
@@ -3397,6 +3491,24 @@ fn assert_mcp_calls_reached_the_server(
         turn.tool_request_names()
     );
 
+    // `served` and `requests` are both empty when the model simply never called
+    // the tool, which the oracle above reads as agreement. Falling through to the
+    // value comparison then reports `left: []` under a message offering only "the
+    // model passed something else" or "Tyde altered the arguments" — neither of
+    // which happened, and the second sent this session hunting Tyde's MCP
+    // plumbing for a call that was never made. Measured on Hermes: the probe tool
+    // was provably exposed (its bridge logged `listed 1 tools` for
+    // `tyde_conformance_probe` two seconds before the turn) and the model
+    // fabricated the result text instead of calling it.
+    assert!(
+        expected.is_empty() || !served.is_empty(),
+        "{}: the MCP server was never called, so nothing arrived to compare against {expected:?}. \
+         The tool call did not happen — this is not an argument-marshalling failure. Check whether \
+         the model declined to call an exposed tool before suspecting Tyde. Cards this turn: {:?}",
+        turn.label(),
+        turn.tool_request_names()
+    );
+
     let mut served_values: Vec<String> = served
         .iter()
         .map(|call| {
@@ -3684,6 +3796,34 @@ fn assert_final_text_contains(turn: &Turn, needle: &str) {
         final_text.contains(needle),
         "{}: final response {final_text:?} does not contain {needle:?}",
         turn.label()
+    );
+}
+
+/// The opening `TYDE_READY` exchange, asserted apart from the scenario body.
+///
+/// Every scenario opens with this handshake, so a backend that mangles it fails
+/// a scenario that never got to exercise its own subject. Measured 2026-08-22
+/// over three identical Hermes runs: `TYDE_READY` arrived as `_READY` — the
+/// leading token dropped — already truncated in the `MESSAGE COMPLETE RAW`
+/// payload Tyde receives, so upstream of Tyde. It took down
+/// `real_tool_type_mappings`, `real_usage_accounting` and
+/// `real_tyde_agent_spawn` on turns that had nothing to do with tool mappings,
+/// usage, or spawning, and through [`assert_final_text_contains`] the panic was
+/// word-for-word what a real marker failure looks like.
+///
+/// Same requirement, named failure class: this still demands the exact marker,
+/// and deliberately does not retry — a retry would paper over a live upstream
+/// defect. It only stops the handshake from testifying against the scenario.
+fn assert_ready_handshake(turn: &Turn) {
+    let final_text = turn.final_text();
+    assert!(
+        final_text.contains(READY_MARKER),
+        "{}: the opening handshake came back as {final_text:?}, which does not contain \
+         {READY_MARKER:?}. The backend mangled the handshake itself — this says nothing about \
+         whatever this scenario went on to assert. A leading-token drop ({:?}) is a known Hermes \
+         shape; an empty response means the turn produced no text at all.",
+        turn.label(),
+        READY_MARKER.trim_start_matches("TYDE")
     );
 }
 

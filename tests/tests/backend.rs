@@ -186,7 +186,10 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 const DEFAULT_HERMES_TEST_PYTHON: &str = "/Users/mike/.hermes/hermes-agent/venv/bin/python";
 const DEFAULT_HERMES_TEST_PROVIDER: &str = "openrouter";
-const DEFAULT_HERMES_TEST_MODEL: &str = "minimax/minimax-m3";
+// Kept in step with `conformance_fixture.rs` deliberately: minimax-m3 mangles
+// the leading token of a response, and a second, divergent pin here is how the
+// suite went blind to that once already.
+const DEFAULT_HERMES_TEST_MODEL: &str = "deepseek/deepseek-v4-flash";
 const UNIVERSAL_CLAUDE_MODEL: &str = "haiku";
 const REQUIRED_CLAUDE_REPORTED_MODEL: &str = "claude-haiku-4-5-20251001";
 const UNIVERSAL_CLAUDE_EFFORT: &str = "low";

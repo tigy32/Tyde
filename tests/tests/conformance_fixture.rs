@@ -65,9 +65,18 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
 /// `hermes.rs:5893`), so the older `"<model> --provider <provider>"` spelling
 /// that `backend.rs:22322` still builds is rejected at startup, before its own
 /// legacy parser ever sees it.
+///
+/// The model is not an arbitrary cheap pick. `minimax/minimax-m3` splits the
+/// reasoning and content channels one token late, so the opening
+/// `Reply with exactly TYDE_READY` handshake came back as `_READY` (or empty)
+/// at random — measured against the pre-scrub stream, with `TYDE` sitting at
+/// the tail of the *reasoning* channel. Every scenario opens with that
+/// handshake, so the slip killed a different unrelated scenario each run and
+/// read as per-scenario flake. `deepseek/deepseek-v4-flash` dropped 0 of 28
+/// handshakes over two full runs and costs a sixth as much.
 fn hermes_session_settings() -> SessionSettingsValues {
     let provider = env_or("TYDE_HERMES_TEST_PROVIDER", "openrouter");
-    let model = env_or("TYDE_HERMES_TEST_MODEL", "minimax/minimax-m3");
+    let model = env_or("TYDE_HERMES_TEST_MODEL", "deepseek/deepseek-v4-flash");
     let mut values = SessionSettingsValues::default();
     values.0.insert(
         "model".to_owned(),
@@ -1743,6 +1752,26 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
     settings
 }
 
+/// Where conformance scratch directories are created.
+///
+/// Deliberately not `$TMPDIR`, which is what `tempfile::tempdir()` honours. On
+/// macOS that is `/var/folders/…`, and `/var` resolves to `/private/var` —
+/// which Hermes's file tools refuse to write to, matching the realpath against
+/// `_SENSITIVE_PATH_PREFIXES` in `hermes-agent/tools/file_tools.py`. Every
+/// scenario that asked Hermes to create a file therefore died on Hermes's own
+/// guard before reaching a Tyde assertion. `/tmp` resolves to `/private/tmp`,
+/// which is not on that list, and is closer to where a real workspace lives.
+const SCRATCH_ROOT: &str = "/tmp";
+
+/// A scratch directory under [`SCRATCH_ROOT`] that a backend's file tools will
+/// actually write to.
+fn scratch_dir(purpose: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("tyde-conformance-{purpose}-"))
+        .tempdir_in(SCRATCH_ROOT)
+        .unwrap_or_else(|error| panic!("create {purpose} dir under {SCRATCH_ROOT}: {error}"))
+}
+
 /// Run `scenario` against each backend in turn, on a thread with a stack deep
 /// enough for the recursion real backends hit while decoding JSON.
 ///
@@ -1780,8 +1809,8 @@ where
                 .expect("build runtime")
                 .block_on(async move {
                     for backend_kind in backends {
-                        let store = tempfile::tempdir().expect("create store tempdir");
-                        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+                        let store = scratch_dir("store");
+                        let workspace = scratch_dir("workspace");
                         let host = Host::new(backend_kind, store.path(), workspace.path()).await;
                         let handle = host.handle.clone();
 
