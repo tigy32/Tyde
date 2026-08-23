@@ -6,7 +6,7 @@
 
 mod connection;
 mod events;
-mod idb;
+pub(crate) mod idb;
 mod qr;
 mod service;
 mod store;

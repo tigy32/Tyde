@@ -1112,6 +1112,8 @@ pub enum FrameKind {
     MobilePairingCancel,
     MobileDeviceRevoke,
     MobileDeviceRename,
+    MobilePushSubscribe,
+    MobilePushUnsubscribe,
     ClientError,
     Heartbeat,
     VoiceStart,
@@ -1304,6 +1306,8 @@ impl fmt::Display for FrameKind {
             Self::MobilePairingCancel => f.write_str("mobile_pairing_cancel"),
             Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
+            Self::MobilePushSubscribe => f.write_str("mobile_push_subscribe"),
+            Self::MobilePushUnsubscribe => f.write_str("mobile_push_unsubscribe"),
             Self::ClientError => f.write_str("client_error"),
             Self::Heartbeat => f.write_str("heartbeat"),
             Self::VoiceStart => f.write_str("voice_start"),
@@ -2955,6 +2959,118 @@ pub struct MobileDeviceRenamePayload {
     pub label: String,
 }
 
+/// Web Push endpoint minted by the device's push service. Holding it together
+/// with the matching VAPID private key is sufficient to deliver a notification
+/// to that device, so it is redacted from `Debug` like any other capability.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PushEndpointUrl(pub String);
+
+impl fmt::Debug for PushEndpointUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PushEndpointUrl(<redacted>)")
+    }
+}
+
+/// Device's P-256 public key (`p256dh`), base64url, uncompressed SEC1 point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PushPublicKey(pub String);
+
+/// Device's 16-byte `auth` secret, base64url. Input to the RFC 8291 key
+/// derivation, so it is a secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PushAuthSecret(pub String);
+
+impl fmt::Debug for PushAuthSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PushAuthSecret(<redacted>)")
+    }
+}
+
+/// VAPID application-server P-256 public key, base64url, uncompressed SEC1.
+/// The device passes this to `pushManager.subscribe`, which binds the
+/// subscription to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VapidPublicKey(pub String);
+
+/// VAPID P-256 private scalar, base64url. The device generates the pair and
+/// shares the private half with every host it is paired to, so one push
+/// subscription serves all of them; a browser allows only one subscription per
+/// service worker registration, bound to a single application server key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VapidPrivateKey(pub String);
+
+impl fmt::Debug for VapidPrivateKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VapidPrivateKey(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePushSubscription {
+    pub endpoint: PushEndpointUrl,
+    pub p256dh: PushPublicKey,
+    pub auth: PushAuthSecret,
+    pub vapid_public_key: VapidPublicKey,
+    pub vapid_private_key: VapidPrivateKey,
+}
+
+impl fmt::Debug for MobilePushSubscription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MobilePushSubscription")
+            .field("endpoint", &self.endpoint)
+            .field("p256dh", &self.p256dh)
+            .field("auth", &self.auth)
+            .field("vapid_public_key", &self.vapid_public_key)
+            .field("vapid_private_key", &self.vapid_private_key)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePushSubscribePayload {
+    pub subscription: MobilePushSubscription,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePushUnsubscribePayload {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobilePushState {
+    /// No subscription registered for this device.
+    Disabled,
+    /// A subscription is registered and has not been rejected.
+    Enabled,
+    /// The push service reported the subscription gone. The device re-subscribes
+    /// on its next connect; until then it receives nothing.
+    Expired,
+}
+
+/// Body of a push message, encrypted by the host under the subscription's own
+/// keys and decrypted by the browser before the service worker sees it. The
+/// push service relays ciphertext it cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePushNotification {
+    pub agent_id: AgentId,
+    pub agent_name: String,
+    pub host_label: String,
+    pub reason: MobilePushReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobilePushReason {
+    TurnComplete,
+    QuestionPending,
+    PlanApproval,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileAccessStatePayload {
     pub broker_status: MobileBrokerStatus,
@@ -3153,6 +3269,7 @@ pub struct MobileDeviceSummary {
     pub created_at_ms: u64,
     pub last_seen_at_ms: Option<u64>,
     pub state: MobileDeviceState,
+    pub push: MobilePushState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

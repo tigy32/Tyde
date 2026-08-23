@@ -118,9 +118,13 @@ async fn voice_settings_refresh_capabilities_for_every_live_connection() {
         let connection = server::accept(&server::ServerConfig::current(), observer_server_io)
             .await
             .unwrap();
-        server::run_mobile_connection(connection, observer_host)
-            .await
-            .unwrap();
+        server::run_mobile_connection(
+            connection,
+            observer_host,
+            protocol::MobileDeviceId("native-voice-observer".to_owned()),
+        )
+        .await
+        .unwrap();
     });
     let mut observer = client::connect(&client::ClientConfig::current(), observer_io)
         .await

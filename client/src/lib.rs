@@ -372,6 +372,25 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    /// Registers this device's Web Push subscription with the host. Valid only
+    /// on a mobile connection: the host binds it to the device the transport
+    /// authenticated as, ignoring anything the client might claim.
+    pub async fn mobile_push_subscribe(
+        &mut self,
+        payload: protocol::MobilePushSubscribePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::MobilePushSubscribe, &payload)
+            .await
+    }
+
+    pub async fn mobile_push_unsubscribe(
+        &mut self,
+        payload: protocol::MobilePushUnsubscribePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::MobilePushUnsubscribe, &payload)
+            .await
+    }
+
     pub async fn list_sessions(&mut self, payload: ListSessionsPayload) -> Result<(), FrameError> {
         let host_stream = self.host_stream();
         let seq = self

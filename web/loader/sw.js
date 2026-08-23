@@ -17,7 +17,7 @@
 //
 // Bump LOADER_CACHE when the precache list or shell logic changes.
 
-const LOADER_CACHE = "tyde-loader-v7";
+const LOADER_CACHE = "tyde-loader-v8";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with loader.js
 
 // Paths are relative to the SW scope (`/tyde/`).
@@ -121,3 +121,93 @@ async function networkFirst(request, cacheName) {
     throw err;
   }
 }
+
+// --- Push notifications ----------------------------------------------------
+//
+// The host encrypts each message under this subscription's own keys, so the
+// push service relays ciphertext; the browser decrypts it and what arrives here
+// is already plaintext. The body is `protocol::MobilePushNotification` as JSON —
+// that Rust type is the source of truth for this shape.
+//
+// The subscription is created with `userVisibleOnly: true`, which obliges us to
+// show a notification for every push we receive. A malformed payload therefore
+// still surfaces, saying so, rather than being dropped silently.
+
+function notificationFor(payload) {
+  const host = payload.host_label || "Tyde";
+  switch (payload.reason) {
+    case "question_pending":
+      return {
+        title: payload.agent_name,
+        body: `Waiting for your answer \u00b7 ${host}`,
+      };
+    case "plan_approval":
+      return {
+        title: payload.agent_name,
+        body: `Waiting for plan approval \u00b7 ${host}`,
+      };
+    case "turn_complete":
+      return { title: payload.agent_name, body: `Finished \u00b7 ${host}` };
+    default:
+      return {
+        title: payload.agent_name || "Tyde",
+        body: `Idle \u00b7 ${host}`,
+      };
+  }
+}
+
+self.addEventListener("push", (event) => {
+  let payload = null;
+  if (event.data) {
+    try {
+      payload = event.data.json();
+    } catch (error) {
+      payload = null;
+    }
+  }
+
+  if (!payload || typeof payload !== "object") {
+    event.waitUntil(
+      self.registration.showNotification("Tyde", {
+        body: "An agent went idle, but its notification could not be read.",
+        icon: "./icons/icon-192.png",
+      }),
+    );
+    return;
+  }
+
+  const { title, body } = notificationFor(payload);
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body,
+      icon: "./icons/icon-192.png",
+      badge: "./icons/icon-192.png",
+      // One live notification per agent: a later update replaces the earlier
+      // one instead of stacking.
+      tag: payload.agent_id || "tyde-agent",
+      renotify: true,
+      data: { agentId: payload.agent_id || null },
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const scope = new URL("./", self.location.href).href;
+  const agentId = event.notification.data && event.notification.data.agentId;
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clients) => {
+        for (const client of clients) {
+          if (client.url.startsWith(scope)) {
+            // Carried so the app can select the agent once it routes by id;
+            // today it is ignored and the window is simply focused.
+            client.postMessage({ kind: "tyde-notification-click", agentId });
+            return client.focus();
+          }
+        }
+        return self.clients.openWindow(scope);
+      }),
+  );
+});

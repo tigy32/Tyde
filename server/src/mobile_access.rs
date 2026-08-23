@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::agent::registry::{AgentStatusTransition, PendingUserResponseKind};
 use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -17,19 +18,19 @@ use mqtt_transport::{
     ParticipantRole, PreSharedKey, RoomId, validate_broker_url,
 };
 use protocol::{
-    BrokerUrl, FrameKind, ManagedBrokerAuthorizerName, ManagedBrokerClientId,
-    ManagedBrokerConnectAuth, ManagedBrokerCredentialScope, ManagedBrokerCredentials,
-    ManagedBrokerEndpoint, ManagedBrokerGrantId, ManagedBrokerProvider, ManagedBrokerRegion,
-    ManagedBrokerRole, ManagedBrokerTopicNamespace, MobileAccessErrorCode,
+    AgentControlStatus, AgentOrigin, BrokerUrl, FrameKind, ManagedBrokerAuthorizerName,
+    ManagedBrokerClientId, ManagedBrokerConnectAuth, ManagedBrokerCredentialScope,
+    ManagedBrokerCredentials, ManagedBrokerEndpoint, ManagedBrokerGrantId, ManagedBrokerProvider,
+    ManagedBrokerRegion, ManagedBrokerRole, ManagedBrokerTopicNamespace, MobileAccessErrorCode,
     MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceId, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobileDeviceState, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingOfferPayload, MobilePairingQrUri, MobilePairingState, PROTOCOL_VERSION,
-    StreamPath,
+    MobilePairingOfferPayload, MobilePairingQrUri, MobilePairingState, MobilePushNotification,
+    MobilePushReason, MobilePushSubscription, PROTOCOL_VERSION, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use settings_model::HostSettings;
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -39,8 +40,9 @@ use crate::accept;
 use crate::connection::run_mobile_connection;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
+use crate::mobile_push::{PushSendError, send_push};
 use crate::store::mobile_pairings::{
-    ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential,
+    ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential, DevicePushRegistration,
     ManagedMobilePairingCredential, ManagedMobilePairingHandoff, ManagedMobilePairingRecordInsert,
     MobilePairingRecord, MobilePairings, MobilePairingsStore, PendingManagedMobileHandoffAck,
     key_fingerprint,
@@ -57,6 +59,9 @@ const PAIRING_HMAC_PREFIX: &str = "TYCODE-PAIRING-HMAC-V1";
 const OFFER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HANDOFF_ACK_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const HANDOFF_ACK_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Shown on the pairing QR and in push notifications, so both name the same
+/// host to the user.
+pub(crate) const HOST_LABEL: &str = "Tyde Host";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -153,6 +158,60 @@ impl MobileAccessHandle {
         }
     }
 
+    /// `device_id` is the identity the connection authenticated as, never a
+    /// value the client asserted, so one paired device cannot register a
+    /// subscription against another.
+    pub(crate) async fn register_push(
+        &self,
+        device_id: MobileDeviceId,
+        subscription: MobilePushSubscription,
+    ) -> AppResult<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(MobileAccessCommand::RegisterPush {
+                device_id,
+                subscription: Box::new(subscription),
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                AppError::internal(
+                    "mobile_push_subscribe",
+                    anyhow!("mobile access actor stopped"),
+                )
+            })?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into_app_error("mobile_push_subscribe")),
+            Err(_) => Err(AppError::internal(
+                "mobile_push_subscribe",
+                anyhow!("mobile access actor dropped push subscribe reply"),
+            )),
+        }
+    }
+
+    pub(crate) async fn unregister_push(&self, device_id: MobileDeviceId) -> AppResult<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(MobileAccessCommand::UnregisterPush {
+                device_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                AppError::internal(
+                    "mobile_push_unsubscribe",
+                    anyhow!("mobile access actor stopped"),
+                )
+            })?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into_app_error("mobile_push_unsubscribe")),
+            Err(_) => Err(AppError::internal(
+                "mobile_push_unsubscribe",
+                anyhow!("mobile access actor dropped push unsubscribe reply"),
+            )),
+        }
+    }
+
     pub(crate) async fn rename_device(&self, payload: MobileDeviceRenamePayload) -> AppResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -179,6 +238,9 @@ impl MobileAccessHandle {
 }
 
 pub(crate) struct MobileAccessInit {
+    /// Handed in rather than subscribed to from the actor: at actor-spawn time
+    /// the host is still being assembled and asserts its state lock is free.
+    pub(crate) agent_status_transitions: broadcast::Receiver<AgentStatusTransition>,
     pub(crate) pairings_store: MobilePairingsStore,
     pub(crate) initial_settings: HostSettings,
     pub(crate) pairing_ttl: Duration,
@@ -225,6 +287,24 @@ pub(crate) enum MobileAccessCommand {
         device_id: MobileDeviceId,
         label: String,
         reply: oneshot::Sender<Result<(), MobileAccessCommandFailure>>,
+    },
+    RegisterPush {
+        device_id: MobileDeviceId,
+        subscription: Box<MobilePushSubscription>,
+        reply: oneshot::Sender<Result<(), MobileAccessCommandFailure>>,
+    },
+    UnregisterPush {
+        device_id: MobileDeviceId,
+        reply: oneshot::Sender<Result<(), MobileAccessCommandFailure>>,
+    },
+    /// An agent finished a turn and has nothing queued behind it.
+    NotifyAgentIdle {
+        notification: Box<MobilePushNotification>,
+    },
+    /// A push service reported a stored subscription gone. Recorded so the
+    /// device list can say so rather than silently delivering nothing.
+    PushSubscriptionGone {
+        device_id: MobileDeviceId,
     },
     PairingTransportConnected {
         offer_id: MobilePairingOfferId,
@@ -352,6 +432,9 @@ pub(crate) struct MobileAccessActor {
     handoff_ack_retry_task: Option<JoinHandle<()>>,
     next_connection_instance_id: u64,
     mobile_pairings_lease: Option<MobilePairingsLease>,
+    push_client: reqwest::Client,
+    agent_status_transitions: Option<broadcast::Receiver<AgentStatusTransition>>,
+    idle_notifier_task: Option<JoinHandle<()>>,
 }
 
 struct ConnectedMobileTask {
@@ -1259,10 +1342,14 @@ impl MobileAccessActor {
             handoff_ack_retry_task: None,
             next_connection_instance_id: 0,
             mobile_pairings_lease: None,
+            push_client: reqwest::Client::new(),
+            agent_status_transitions: Some(init.agent_status_transitions),
+            idle_notifier_task: None,
         })
     }
 
     async fn run(mut self) {
+        self.spawn_idle_notifier();
         if self.settings.enable_mobile_connections {
             self.enable_mobile_access().await;
         }
@@ -1295,6 +1382,24 @@ impl MobileAccessActor {
                 MobileAccessCommand::RevokeDevice { device_id, reply } => {
                     let result = self.revoke_device(&device_id).await;
                     let _ = reply.send(result);
+                }
+                MobileAccessCommand::RegisterPush {
+                    device_id,
+                    subscription,
+                    reply,
+                } => {
+                    let result = self.register_push(&device_id, *subscription).await;
+                    let _ = reply.send(result);
+                }
+                MobileAccessCommand::UnregisterPush { device_id, reply } => {
+                    let result = self.unregister_push(&device_id).await;
+                    let _ = reply.send(result);
+                }
+                MobileAccessCommand::NotifyAgentIdle { notification } => {
+                    self.notify_agent_idle(*notification).await;
+                }
+                MobileAccessCommand::PushSubscriptionGone { device_id } => {
+                    self.mark_push_expired(&device_id).await;
                 }
                 MobileAccessCommand::RenameDevice {
                     device_id,
@@ -1682,7 +1787,7 @@ impl MobileAccessActor {
                 return;
             }
         };
-        let host_label = "Tyde Host".to_owned();
+        let host_label = HOST_LABEL.to_owned();
         let host_release_version = match host_release_version_for_qr() {
             Ok(version) => version,
             Err(message) => {
@@ -1952,6 +2057,219 @@ impl MobileAccessActor {
         Ok(())
     }
 
+    /// Watches agent status edges and turns "finished a turn with nothing
+    /// queued" into a notification command. Lives in its own task so the host
+    /// lookups it needs cannot block the actor loop.
+    fn spawn_idle_notifier(&mut self) {
+        let Some(mut transitions) = self.agent_status_transitions.take() else {
+            return;
+        };
+        let host = self.host.clone();
+        let tx = self.tx.clone();
+        self.idle_notifier_task = Some(tokio::spawn(async move {
+            loop {
+                let transition = match transitions.recv().await {
+                    Ok(transition) => transition,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::error!(
+                            missed,
+                            "mobile push notifier fell behind agent status transitions; \
+                             notifications for those turns were not delivered"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+
+                if transition.from != AgentControlStatus::Thinking
+                    || transition.to != AgentControlStatus::Idle
+                {
+                    continue;
+                }
+                // Another message is already queued behind this turn, so the
+                // agent resumes immediately and is not really idle.
+                if transition.has_queued_messages {
+                    continue;
+                }
+                // Reopening a saved session lands on Idle without the agent
+                // having done anything.
+                if transition.restored_without_live_turn {
+                    continue;
+                }
+
+                let reason = match transition.pending_user_response {
+                    Some(PendingUserResponseKind::UserQuestion) => {
+                        MobilePushReason::QuestionPending
+                    }
+                    Some(PendingUserResponseKind::PlanApproval) => MobilePushReason::PlanApproval,
+                    None => MobilePushReason::TurnComplete,
+                };
+                let Some(start) = host.agent_start_snapshot(&transition.agent_id).await else {
+                    // The agent was removed between the edge and this lookup.
+                    continue;
+                };
+                // Only agents the user is personally waiting on. Orchestrated,
+                // team, workflow, and backend-native sub-agents have a parent
+                // agent waiting on them instead, and a workflow fanning out to
+                // a dozen of them would otherwise buzz the phone a dozen times.
+                match start.origin {
+                    AgentOrigin::User | AgentOrigin::SideQuestion => {}
+                    AgentOrigin::AgentControl
+                    | AgentOrigin::BackendNative
+                    | AgentOrigin::TeamMember
+                    | AgentOrigin::Workflow => continue,
+                }
+
+                let _ = tx.send(MobileAccessCommand::NotifyAgentIdle {
+                    notification: Box::new(MobilePushNotification {
+                        agent_id: transition.agent_id,
+                        agent_name: start.name,
+                        host_label: HOST_LABEL.to_owned(),
+                        reason,
+                    }),
+                });
+            }
+        }));
+    }
+
+    async fn register_push(
+        &mut self,
+        device_id: &MobileDeviceId,
+        subscription: MobilePushSubscription,
+    ) -> Result<(), MobileAccessCommandFailure> {
+        let now = now_ms().map_err(|message| {
+            MobileAccessCommandFailure::new(MobileAccessErrorCode::Internal, message)
+        })?;
+        let Some(record) = self
+            .pairings
+            .devices
+            .iter_mut()
+            .find(|record| &record.device_id == device_id)
+        else {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::UnknownDevice,
+                format!("unknown mobile device {device_id}"),
+            ));
+        };
+        // Re-registering clears `expired`: the device just proved it holds a
+        // live subscription, which is exactly what the flag denies.
+        record.push = Some(DevicePushRegistration {
+            subscription,
+            registered_at_ms: now,
+            expired: false,
+        });
+        self.pairings_store
+            .save(&self.pairings)
+            .map_err(|message| {
+                MobileAccessCommandFailure::new(MobileAccessErrorCode::StoreLoadFailed, message)
+            })?;
+        self.fan_out_state().await;
+        Ok(())
+    }
+
+    async fn unregister_push(
+        &mut self,
+        device_id: &MobileDeviceId,
+    ) -> Result<(), MobileAccessCommandFailure> {
+        let Some(record) = self
+            .pairings
+            .devices
+            .iter_mut()
+            .find(|record| &record.device_id == device_id)
+        else {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::UnknownDevice,
+                format!("unknown mobile device {device_id}"),
+            ));
+        };
+        record.push = None;
+        self.pairings_store
+            .save(&self.pairings)
+            .map_err(|message| {
+                MobileAccessCommandFailure::new(MobileAccessErrorCode::StoreLoadFailed, message)
+            })?;
+        self.fan_out_state().await;
+        Ok(())
+    }
+
+    async fn mark_push_expired(&mut self, device_id: &MobileDeviceId) {
+        let Some(record) = self
+            .pairings
+            .devices
+            .iter_mut()
+            .find(|record| &record.device_id == device_id)
+        else {
+            return;
+        };
+        let Some(push) = record.push.as_mut() else {
+            return;
+        };
+        if push.expired {
+            return;
+        }
+        push.expired = true;
+        if let Err(message) = self.pairings_store.save(&self.pairings) {
+            tracing::error!(
+                %device_id,
+                %message,
+                "failed to persist expired push subscription"
+            );
+        }
+        self.fan_out_state().await;
+    }
+
+    /// Fans a notification out to every paired device that is not currently
+    /// connected. A connected device has the app open and already shows the
+    /// agent, so buzzing it would be noise.
+    async fn notify_agent_idle(&mut self, notification: MobilePushNotification) {
+        // Mobile access off means no device can connect, so a notification
+        // would open an app that cannot reach this host.
+        if !self.settings.enable_mobile_connections {
+            return;
+        }
+        let now_secs = match now_ms() {
+            Ok(millis) => millis / 1000,
+            Err(message) => {
+                tracing::error!(%message, "cannot sign push notification without a usable clock");
+                return;
+            }
+        };
+        let targets: Vec<(MobileDeviceId, MobilePushSubscription)> = self
+            .pairings
+            .devices
+            .iter()
+            .filter(|record| record.state != MobileDeviceState::Revoked)
+            .filter(|record| !self.connected_tasks.contains_key(&record.device_id))
+            .filter_map(|record| {
+                let push = record.push.as_ref()?;
+                (!push.expired).then(|| (record.device_id.clone(), push.subscription.clone()))
+            })
+            .collect();
+
+        for (device_id, subscription) in targets {
+            let client = self.push_client.clone();
+            let tx = self.tx.clone();
+            let notification = notification.clone();
+            // Delivery is a network round trip to a third-party push service;
+            // holding the actor loop for it would stall every other command.
+            tokio::spawn(async move {
+                match send_push(&client, &subscription, &notification, now_secs).await {
+                    Ok(()) => {}
+                    Err(PushSendError::SubscriptionGone) => {
+                        let _ = tx.send(MobileAccessCommand::PushSubscriptionGone { device_id });
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %device_id,
+                            %error,
+                            "failed to deliver mobile push notification"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     async fn pairing_transport_connected(
         &mut self,
         offer_id: &MobilePairingOfferId,
@@ -2003,6 +2321,7 @@ impl MobileAccessActor {
                     last_seen_at_ms: handoff.device_last_seen_at_ms.or(Some(now)),
                     state: MobileDeviceState::Connected,
                     key_fingerprint: active.key_fingerprint.clone(),
+                    push: None,
                     managed: Some(ManagedMobilePairingCredential {
                         pairing_id: handoff.pairing_id.clone(),
                         host_pairing_secret: handoff.host_pairing_secret.clone(),
@@ -2033,6 +2352,7 @@ impl MobileAccessActor {
             last_seen_at_ms: Some(now),
             state: MobileDeviceState::Connected,
             key_fingerprint: active.key_fingerprint,
+            push: None,
             managed: None,
         };
         let (device_id, record) = managed_record.unwrap_or((device_id, record));
@@ -2126,6 +2446,7 @@ impl MobileAccessActor {
             last_seen_at_ms: handoff.device_last_seen_at_ms,
             state: MobileDeviceState::Paired,
             key_fingerprint: active.key_fingerprint.clone(),
+            push: None,
             managed: Some(ManagedMobilePairingCredential {
                 pairing_id: pairing_id.clone(),
                 host_pairing_secret: handoff.host_pairing_secret,
@@ -2799,6 +3120,9 @@ impl MobileAccessActor {
         if let Some(task) = self.handoff_ack_retry_task.take() {
             task.abort();
         }
+        if let Some(task) = self.idle_notifier_task.take() {
+            task.abort();
+        }
     }
 
     fn state_payload(&self) -> MobileAccessStatePayload {
@@ -3202,7 +3526,7 @@ async fn bridge_authenticated_mobile(
 ) {
     match accept(&ServerConfig::current(), stream).await {
         Ok(connection) => {
-            if let Err(err) = run_mobile_connection(connection, host).await {
+            if let Err(err) = run_mobile_connection(connection, host, device_id.clone()).await {
                 tracing::warn!(device_id = %device_id, error = ?err, "mobile Tyde connection ended with frame error");
             }
         }

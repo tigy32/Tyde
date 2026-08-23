@@ -40,7 +40,13 @@ async fn connect_mobile_raw(host: server::HostHandle) -> client::Connection {
         let conn = server::accept(&server_config, server_stream)
             .await
             .expect("server handshake");
-        if let Err(err) = server::run_mobile_connection(conn, host).await {
+        if let Err(err) = server::run_mobile_connection(
+            conn,
+            host,
+            protocol::MobileDeviceId("bootstrap-mobile".to_owned()),
+        )
+        .await
+        {
             eprintln!("server mobile connection failed: {err:?}");
         }
     });

@@ -2522,6 +2522,18 @@ fn apply_host_bootstrap(
     // mobile-frontend has no mobile_access state of its own (it IS the
     // mobile client) — the field is intentionally unused.
     let _ = payload.mobile_access;
+
+    // Re-deliver the browser's current push subscription on every connect. Push
+    // services rotate subscriptions and iOS does not reliably fire
+    // `pushsubscriptionchange`, so this is what keeps the host's copy live; it
+    // is a no-op when the device has no subscription.
+    {
+        let state = state.clone();
+        let host = host.clone();
+        leptos::task::spawn_local(async move {
+            crate::actions::deliver_push_subscription(&state, host).await;
+        });
+    }
     state.backend_setup_by_host.update(|map| {
         map.insert(host.clone(), payload.backend_setup.backends);
     });

@@ -6,6 +6,7 @@ mod dispatch;
 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
 mod fixtures;
 mod markdown;
+mod push;
 mod send;
 pub mod state;
 mod voice;

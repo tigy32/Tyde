@@ -1620,6 +1620,22 @@ impl AppState {
         )
     }
 
+    pub fn set_command_error(&self, host: &LocalHostId, message: String) {
+        self.command_errors_by_host.update(|map| {
+            map.insert(host.clone(), message);
+        });
+    }
+
+    /// Hosts whose bootstrap has been applied, so a frame sent now has a stream
+    /// to travel on.
+    pub fn bootstrapped_host_ids_untracked(&self) -> Vec<LocalHostId> {
+        self.bootstrapped_host_streams
+            .get_untracked()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn active_host_command_error(&self) -> Option<String> {
         let host = self.active_local_host_id.get()?;
         self.command_errors_by_host.get().get(&host).cloned()

@@ -18,7 +18,7 @@ use protocol::{
     CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileId,
     McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
     MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
+    MobilePushState, ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering,
     SteeringId, SteeringScope, ToolPolicy,
@@ -5734,6 +5734,14 @@ fn MobileTab() -> impl IntoView {
                                     }
                                 };
                                 let state_class = format!("settings-mobile-pairing-device-state settings-mobile-pairing-device-state-{state_slug}");
+                                // Expired must be visible: the device keeps
+                                // believing it is subscribed until it next
+                                // connects and re-registers.
+                                let push_label = match device.push {
+                                    MobilePushState::Enabled => Some("notifications on"),
+                                    MobilePushState::Expired => Some("notifications expired"),
+                                    MobilePushState::Disabled => None,
+                                };
                                 let device_label = device.label.clone();
                                 let device_id = device.device_id.clone();
                                 let state_for_remove = state.clone();
@@ -5743,6 +5751,9 @@ fn MobileTab() -> impl IntoView {
                                         <div class="settings-mobile-pairing-device-main">
                                             <span class="settings-mobile-pairing-device-label">{device_label.clone()}</span>
                                             <span class=state_class>{state_label}</span>
+                                            {push_label.map(|label| view! {
+                                                <span class="settings-mobile-pairing-device-push">{label}</span>
+                                            })}
                                         </div>
                                         <button
                                             type="button"
@@ -9248,6 +9259,7 @@ mod wasm_tests {
                             created_at_ms: 1,
                             last_seen_at_ms: None,
                             state: MobileDeviceState::Paired,
+                            push: MobilePushState::Disabled,
                         }],
                     },
                 );

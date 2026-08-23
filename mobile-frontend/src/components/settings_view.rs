@@ -6,6 +6,7 @@ use crate::bridge;
 use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::host_browser::HostBrowser;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, ConfirmModal, EmptyState};
+use crate::push::PushAvailability;
 use crate::state::{AppState, PairedHostSummary, ToolOutputMode};
 
 const STORAGE_TOOL_OUTPUT_MODE: &str = "tyde-mobile-tool-output-mode";
@@ -60,6 +61,118 @@ pub fn restore_appearance(state: &AppState) {
     }
 }
 
+/// Whether the browser will deliver notifications is a browser-local fact the
+/// host cannot observe, so unlike the rest of this app it is read from the
+/// platform rather than from server state. What the *host* knows — that it holds
+/// a live subscription for a device — is rendered in the desktop device list.
+#[component]
+fn NotificationsSection() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let availability = RwSignal::new(PushAvailability::Unsupported);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(Option::<String>::None);
+
+    // Read once on mount, then after every action, so the row always reflects
+    // the permission the browser actually holds.
+    availability.set(crate::push::availability());
+
+    let refresh = move || availability.set(crate::push::availability());
+
+    let enable = {
+        let state = state.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            busy.set(true);
+            error.set(None);
+            let state = state.clone();
+            spawn_local(async move {
+                if let Err(message) = crate::actions::enable_push_notifications(&state).await {
+                    error.set(Some(message));
+                }
+                busy.set(false);
+                refresh();
+            });
+        }
+    };
+
+    let disable = {
+        let state = state.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            busy.set(true);
+            error.set(None);
+            let state = state.clone();
+            spawn_local(async move {
+                if let Err(message) = crate::actions::disable_push_notifications(&state).await {
+                    error.set(Some(message));
+                }
+                busy.set(false);
+                refresh();
+            });
+        }
+    };
+
+    view! {
+        <div class="settings-section" data-mobile-test="settings-notifications">
+            <h2 class="settings-section-title">"Notifications"</h2>
+            <div class="settings-info">
+                {move || match availability.get() {
+                    PushAvailability::Unsupported => view! {
+                        <span class="settings-muted">
+                            "This browser cannot receive notifications. On iPhone, add Tyde to your Home Screen and open it from there."
+                        </span>
+                    }.into_any(),
+                    PushAvailability::Denied => view! {
+                        <span class="settings-muted">
+                            "Notifications are blocked for this site. Re-enable them in your browser settings."
+                        </span>
+                    }.into_any(),
+                    PushAvailability::Prompt => view! {
+                        <>
+                            <span class="settings-muted">
+                                "Get notified when an agent finishes a turn or asks you something."
+                            </span>
+                            <Button
+                                label="Enable notifications"
+                                size=ButtonSize::Compact
+                                variant=ButtonVariant::Primary
+                                data_mobile_test="settings-notifications-enable"
+                                disabled=Signal::derive(move || busy.get())
+                                on_click=Callback::new(enable.clone())
+                            />
+                        </>
+                    }.into_any(),
+                    PushAvailability::Granted => view! {
+                        <>
+                            <div class="settings-row">
+                                <span class="settings-label">"Agent idle alerts"</span>
+                                <span class="settings-value">"On"</span>
+                            </div>
+                            <Button
+                                label="Turn off"
+                                size=ButtonSize::Compact
+                                variant=ButtonVariant::Secondary
+                                data_mobile_test="settings-notifications-disable"
+                                disabled=Signal::derive(move || busy.get())
+                                on_click=Callback::new(disable.clone())
+                            />
+                        </>
+                    }.into_any(),
+                }}
+                {move || error.get().map(|message| view! {
+                    <span class="settings-error" data-mobile-test="settings-notifications-error">
+                        {message}
+                    </span>
+                })}
+            </div>
+        </div>
+    }
+}
+
 #[component]
 pub fn SettingsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -110,6 +223,8 @@ pub fn SettingsView() -> impl IntoView {
                 </div>
 
                 <PairedHostSection />
+
+                <NotificationsSection />
 
                 <div class="settings-section">
                     <h2 class="settings-section-title">"Host"</h2>
@@ -871,5 +986,66 @@ mod wasm_tests {
                 .is_some(),
             "Skills empty selector must render"
         );
+    }
+
+    /// Notifications must never render as a silently dead toggle. Whatever the
+    /// browser's capability, the section says what the user can do about it:
+    /// an actionable control when a prompt is possible, and a plain explanation
+    /// when it is not. A section that rendered nothing would leave the user
+    /// tapping a control that can never work.
+    #[wasm_bindgen_test]
+    async fn notifications_section_always_explains_what_the_user_can_do() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(AppState::new());
+            view! { <NotificationsSection /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Notifications"),
+            "the notifications section must be titled, got {text:?}"
+        );
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let enable = document
+            .query_selector("[data-mobile-test=\"settings-notifications-enable\"]")
+            .unwrap();
+
+        match crate::push::availability() {
+            PushAvailability::Prompt => {
+                assert!(
+                    enable.is_some(),
+                    "a browser that can be asked for permission must offer the control; got {text:?}"
+                );
+                assert!(
+                    text.contains("finishes a turn") || text.contains("asks you something"),
+                    "the prompt state must say what the notifications are for, got {text:?}"
+                );
+            }
+            PushAvailability::Unsupported => {
+                assert!(
+                    enable.is_none(),
+                    "a browser without the Push API must not offer a control that cannot work"
+                );
+                assert!(
+                    text.contains("Home Screen"),
+                    "an unsupported browser must be told how to make it work, got {text:?}"
+                );
+            }
+            PushAvailability::Denied => {
+                assert!(
+                    text.contains("blocked"),
+                    "a blocked site must say so rather than offering a dead toggle, got {text:?}"
+                );
+            }
+            PushAvailability::Granted => {
+                assert!(
+                    text.contains("On"),
+                    "a granted browser must show notifications as on, got {text:?}"
+                );
+            }
+        }
     }
 }

@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, ProtocolFrame, encode_frame,
+    EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, MobileDeviceId, ProtocolFrame,
+    encode_frame,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
@@ -15,10 +16,23 @@ use crate::project_stream::ProjectFileDelivery;
 use crate::router::route_client_envelope;
 use crate::stream::{OutputLane, OutputQueue, QueuedOutput, SchedulerToken, Stream};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConnectionOrigin {
+/// Which client is on the other end. The mobile variant carries the device the
+/// transport authenticated as, so frames that act on a device act on *that*
+/// device rather than one the client named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionOrigin {
     Desktop,
-    Mobile,
+    Mobile { device_id: MobileDeviceId },
+}
+
+impl ConnectionOrigin {
+    fn is_mobile(&self) -> bool {
+        matches!(self, Self::Mobile { .. })
+    }
+
+    fn is_desktop(&self) -> bool {
+        matches!(self, Self::Desktop)
+    }
 }
 
 const BOOTSTRAP_REPLAY_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
@@ -26,8 +40,8 @@ const MOBILE_CLIENT_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration:
 static INBOUND_AUDIO_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static OUTBOUND_AUDIO_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
-fn has_peer_liveness_deadline(origin: ConnectionOrigin) -> bool {
-    origin == ConnectionOrigin::Mobile
+fn has_peer_liveness_deadline(origin: &ConnectionOrigin) -> bool {
+    origin.is_mobile()
 }
 
 struct AppLoopResources {
@@ -120,11 +134,12 @@ pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<
 pub async fn run_mobile_connection(
     connection: Connection,
     host: HostHandle,
+    device_id: MobileDeviceId,
 ) -> Result<(), FrameError> {
     run_connection_with_origin(
         connection,
         host,
-        ConnectionOrigin::Mobile,
+        ConnectionOrigin::Mobile { device_id },
         Arc::new(crate::voice_aws::AwsNovaProvider),
     )
     .await
@@ -171,7 +186,7 @@ async fn run_connection_with_origin(
 
     let agent_replay = match origin {
         ConnectionOrigin::Desktop => AgentReplayMode::Eager,
-        ConnectionOrigin::Mobile => AgentReplayMode::Lazy,
+        ConnectionOrigin::Mobile { .. } => AgentReplayMode::Lazy,
     };
     // Mobile has no file browser and no code intelligence, so it never reads a
     // project file listing. Sending one anyway cost ~1.1 MB per connect across
@@ -179,13 +194,13 @@ async fn run_connection_with_origin(
     // window, which kills the connection outright.
     let project_files = match origin {
         ConnectionOrigin::Desktop => ProjectFileDelivery::Full,
-        ConnectionOrigin::Mobile => ProjectFileDelivery::Off,
+        ConnectionOrigin::Mobile { .. } => ProjectFileDelivery::Off,
     };
     let deferred_attachments = host
         .register_connection_host_stream(
             host_output_stream.clone(),
             agent_replay,
-            origin == ConnectionOrigin::Desktop,
+            origin.is_desktop(),
             project_files,
         )
         .await;
@@ -623,7 +638,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = tokio::time::sleep(MOBILE_CLIENT_LIVENESS_TIMEOUT),
-                if has_peer_liveness_deadline(origin) =>
+                if has_peer_liveness_deadline(&origin) =>
             {
                 tracing::warn!(
                     stream = %host_stream,
@@ -699,8 +714,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
 
                 let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
-                if origin == ConnectionOrigin::Mobile
-                    && is_terminal_control_command(request_kind)
+                if origin.is_mobile() && is_terminal_control_command(request_kind)
                 {
                     let error = AppError::invalid(
                         "mobile_terminal_command",
@@ -717,7 +731,13 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                 }
 
                 let route_result =
-                    route_client_envelope(&host, &host_stream, &host_output_stream, envelope)
+                    route_client_envelope(
+                        &host,
+                        &host_stream,
+                        &host_output_stream,
+                        &origin,
+                        envelope,
+                    )
                         .await;
                 if let Err(error) = route_result {
                     emit_command_error(

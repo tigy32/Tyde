@@ -14,8 +14,9 @@ use protocol::{
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
     FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, InvokeSettingsActionPayload, ListSessionsPayload,
-    LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
+    LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceId,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingStartPayload, MobilePushSubscribePayload, MobilePushUnsubscribePayload,
     ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
     ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
@@ -39,14 +40,28 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::agent::InterruptOutcome;
+use crate::connection::ConnectionOrigin;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
 use crate::stream::Stream;
+
+/// Frames that act on the calling device are valid only from a mobile
+/// connection, whose transport already authenticated which device it is.
+fn mobile_device(origin: &ConnectionOrigin, command: &'static str) -> AppResult<MobileDeviceId> {
+    match origin {
+        ConnectionOrigin::Mobile { device_id } => Ok(device_id.clone()),
+        ConnectionOrigin::Desktop => Err(AppError::invalid(
+            command,
+            "this command is only valid from a paired mobile device",
+        )),
+    }
+}
 
 pub(crate) async fn route_client_envelope(
     host: &HostHandle,
     connection_host_stream: &StreamPath,
     host_output_stream: &Stream,
+    origin: &ConnectionOrigin,
     envelope: Envelope,
 ) -> AppResult<()> {
     if envelope.stream == *connection_host_stream {
@@ -141,6 +156,44 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 ensure_non_empty("mobile_device_rename", "label", payload.label.as_str())?;
                 host.rename_mobile_device(payload).await?;
+            }
+            FrameKind::MobilePushSubscribe => {
+                let payload: MobilePushSubscribePayload =
+                    parse_payload(&envelope, "mobile_push_subscribe")?;
+                let device_id = mobile_device(origin, "mobile_push_subscribe")?;
+                let subscription = payload.subscription;
+                ensure_non_empty(
+                    "mobile_push_subscribe",
+                    "endpoint",
+                    subscription.endpoint.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "mobile_push_subscribe",
+                    "p256dh",
+                    subscription.p256dh.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "mobile_push_subscribe",
+                    "auth",
+                    subscription.auth.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "mobile_push_subscribe",
+                    "vapid_public_key",
+                    subscription.vapid_public_key.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "mobile_push_subscribe",
+                    "vapid_private_key",
+                    subscription.vapid_private_key.0.as_str(),
+                )?;
+                host.register_mobile_push(device_id, subscription).await?;
+            }
+            FrameKind::MobilePushUnsubscribe => {
+                let _: MobilePushUnsubscribePayload =
+                    parse_payload(&envelope, "mobile_push_unsubscribe")?;
+                let device_id = mobile_device(origin, "mobile_push_unsubscribe")?;
+                host.unregister_mobile_push(device_id).await?;
             }
             FrameKind::ClientError => {
                 let payload: ClientErrorPayload = parse_payload(&envelope, "client_error")?;

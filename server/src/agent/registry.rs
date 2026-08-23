@@ -8,7 +8,7 @@ use protocol::{
     SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
     TeamId, TeamMemberId,
 };
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{Mutex, broadcast, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
@@ -25,10 +25,29 @@ use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 
+/// Bounded so a stalled consumer cannot grow the queue without limit. A
+/// consumer that overruns it sees `Lagged` and reports the gap.
+const AGENT_STATUS_TRANSITION_CAPACITY: usize = 256;
+
 pub(crate) struct AgentRegistry {
     agents: HashMap<AgentId, AgentEntry>,
     status_change_tx: watch::Sender<u64>,
     status_change_counter: Arc<AtomicU64>,
+    transition_tx: broadcast::Sender<AgentStatusTransition>,
+}
+
+/// An agent crossing from one `AgentControlStatus` to another. The registry
+/// owns the status, so it computes the edge where the status is mutated;
+/// consumers that need edges rather than levels subscribe here instead of
+/// mirroring every agent's last known status.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentStatusTransition {
+    pub agent_id: AgentId,
+    pub from: AgentControlStatus,
+    pub to: AgentControlStatus,
+    pub pending_user_response: Option<PendingUserResponseKind>,
+    pub has_queued_messages: bool,
+    pub restored_without_live_turn: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +64,10 @@ pub(crate) struct AgentStatus {
     /// alone until the agent actually works, unless the host opts into
     /// supervising restored agents.
     pub restored_without_live_turn: bool,
+    /// The agent has messages queued behind the current turn, so reaching
+    /// `Idle` means "between turns", not "finished". Maintained wherever the
+    /// queue snapshot is published.
+    pub has_queued_messages: bool,
     /// When the current or most recent live turn started. The supervisor's
     /// stall clock starts here, so a turn whose backend never emits anything is
     /// still measured from the moment it began rather than from an older event.
@@ -81,20 +104,26 @@ impl AgentStatus {
 
 #[derive(Clone)]
 pub(crate) struct AgentStatusHandle {
+    agent_id: AgentId,
     status: Arc<Mutex<AgentStatus>>,
     status_change_tx: watch::Sender<u64>,
     status_change_counter: Arc<AtomicU64>,
+    transition_tx: broadcast::Sender<AgentStatusTransition>,
 }
 
 impl AgentStatusHandle {
     fn with_notifier(
+        agent_id: AgentId,
         status_change_tx: watch::Sender<u64>,
         status_change_counter: Arc<AtomicU64>,
+        transition_tx: broadcast::Sender<AgentStatusTransition>,
     ) -> Self {
         Self {
+            agent_id,
             status: Arc::new(Mutex::new(AgentStatus::default())),
             status_change_tx,
             status_change_counter,
+            transition_tx,
         }
     }
 
@@ -103,8 +132,27 @@ impl AgentStatusHandle {
         F: FnOnce(&mut AgentStatus),
     {
         let mut status = self.status.lock().await;
+        let from = status.status();
         update(&mut status);
+        let to = status.status();
+        let pending_user_response = status.pending_user_response;
+        let has_queued_messages = status.has_queued_messages;
+        let restored_without_live_turn = status.restored_without_live_turn;
         drop(status);
+
+        if from != to {
+            // A send fails only with no live receivers, which is the normal
+            // state; a receiver that falls behind learns about it from its own
+            // `Lagged` error rather than from here.
+            let _ = self.transition_tx.send(AgentStatusTransition {
+                agent_id: self.agent_id.clone(),
+                from,
+                to,
+                pending_user_response,
+                has_queued_messages,
+                restored_without_live_turn,
+            });
+        }
 
         let next = self.status_change_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.status_change_tx.send(next);
@@ -224,10 +272,12 @@ struct AgentEntry {
 impl AgentRegistry {
     pub fn new() -> Self {
         let (status_change_tx, _status_change_rx) = watch::channel(0);
+        let (transition_tx, _transition_rx) = broadcast::channel(AGENT_STATUS_TRANSITION_CAPACITY);
         Self {
             agents: HashMap::new(),
             status_change_tx,
             status_change_counter: Arc::new(AtomicU64::new(0)),
+            transition_tx,
         }
     }
 
@@ -284,7 +334,7 @@ impl AgentRegistry {
         };
 
         let access_mode = request.resolved_spawn_config.access_mode;
-        let status_handle = self.next_status_handle();
+        let status_handle = self.next_status_handle(agent_id.clone());
         let (handle, startup_rx) = spawn_agent_actor(
             agent_id.clone(),
             start.clone(),
@@ -338,7 +388,7 @@ impl AgentRegistry {
             created_at_ms: now_ms(),
         };
 
-        let status_handle = self.next_status_handle();
+        let status_handle = self.next_status_handle(agent_id.clone());
         let handle = spawn_relay_agent_actor(
             agent_id.clone(),
             start.clone(),
@@ -444,10 +494,16 @@ impl AgentRegistry {
         self.status_change_tx.subscribe()
     }
 
-    fn next_status_handle(&self) -> AgentStatusHandle {
+    pub fn subscribe_status_transitions(&self) -> broadcast::Receiver<AgentStatusTransition> {
+        self.transition_tx.subscribe()
+    }
+
+    fn next_status_handle(&self, agent_id: AgentId) -> AgentStatusHandle {
         AgentStatusHandle::with_notifier(
+            agent_id,
             self.status_change_tx.clone(),
             Arc::clone(&self.status_change_counter),
+            self.transition_tx.clone(),
         )
     }
 }

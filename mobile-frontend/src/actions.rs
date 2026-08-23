@@ -779,3 +779,78 @@ pub async fn close_host_browse(
     });
     Ok(())
 }
+
+/// Hands this device's current push subscription to `host`.
+///
+/// Called on every connect, not just when the user first enables
+/// notifications: push services rotate subscriptions, and `pushsubscriptionchange`
+/// is not reliably delivered on iOS, so re-sending what the browser currently
+/// holds is what keeps the host's copy correct.
+pub async fn deliver_push_subscription(state: &AppState, host: LocalHostId) {
+    let subscription = match crate::push::current_subscription().await {
+        Ok(Some(subscription)) => subscription,
+        Ok(None) => return,
+        Err(message) => {
+            log::error!("failed to read push subscription: {message}");
+            state.set_command_error(&host, format!("Notifications unavailable: {message}"));
+            return;
+        }
+    };
+    send_push_subscribe(state, &host, subscription).await;
+}
+
+async fn send_push_subscribe(
+    state: &AppState,
+    host: &LocalHostId,
+    subscription: protocol::MobilePushSubscription,
+) {
+    let Some(host_stream) = state.host_stream_untracked(host) else {
+        return;
+    };
+    let payload = protocol::MobilePushSubscribePayload { subscription };
+    if let Err(error) = send_frame(
+        host,
+        host_stream,
+        protocol::FrameKind::MobilePushSubscribe,
+        &payload,
+    )
+    .await
+    {
+        log::error!("failed to register push subscription with host: {error}");
+        state.set_command_error(host, format!("Could not enable notifications: {error}"));
+    }
+}
+
+/// Subscribes this device and registers it with every connected host. Must run
+/// from a user gesture so the permission prompt is allowed.
+pub async fn enable_push_notifications(state: &AppState) -> Result<(), String> {
+    let subscription = crate::push::enable().await?;
+    let hosts = state.bootstrapped_host_ids_untracked();
+    if hosts.is_empty() {
+        return Err("Connect to a host before enabling notifications.".to_owned());
+    }
+    for host in hosts {
+        send_push_subscribe(state, &host, subscription.clone()).await;
+    }
+    Ok(())
+}
+
+/// Unsubscribes locally and tells every connected host to forget this device.
+pub async fn disable_push_notifications(state: &AppState) -> Result<(), String> {
+    for host in state.bootstrapped_host_ids_untracked() {
+        let Some(host_stream) = state.host_stream_untracked(&host) else {
+            continue;
+        };
+        if let Err(error) = send_frame(
+            &host,
+            host_stream,
+            protocol::FrameKind::MobilePushUnsubscribe,
+            &protocol::MobilePushUnsubscribePayload {},
+        )
+        .await
+        {
+            log::error!("failed to unregister push subscription with host: {error}");
+        }
+    }
+    crate::push::disable().await
+}

@@ -764,6 +764,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::MobilePairingCancel
         | FrameKind::MobileDeviceRevoke
         | FrameKind::MobileDeviceRename
+        | FrameKind::MobilePushSubscribe
+        | FrameKind::MobilePushUnsubscribe
         | FrameKind::ClientError
         | FrameKind::Heartbeat
         | FrameKind::VoiceStart

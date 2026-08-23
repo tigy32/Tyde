@@ -11,6 +11,7 @@ pub(crate) mod error;
 pub mod hermes_mcp_bridge;
 pub(crate) mod host;
 pub(crate) mod mobile_access;
+pub(crate) mod mobile_push;
 pub mod paths;
 pub(crate) mod process_env;
 pub(crate) mod project_stream;

@@ -8402,6 +8402,23 @@ impl HostHandle {
         mobile_access.rename_device(payload).await
     }
 
+    pub(crate) async fn register_mobile_push(
+        &self,
+        device_id: protocol::MobileDeviceId,
+        subscription: protocol::MobilePushSubscription,
+    ) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.register_push(device_id, subscription).await
+    }
+
+    pub(crate) async fn unregister_mobile_push(
+        &self,
+        device_id: protocol::MobileDeviceId,
+    ) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.unregister_push(device_id).await
+    }
+
     pub(crate) async fn fan_out_backend_setup(&self) {
         let payload = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
@@ -9530,6 +9547,14 @@ impl HostHandle {
 
     pub(crate) async fn subscribe_agent_status_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.state.lock().await.registry.subscribe_status_changes()
+    }
+
+    pub(crate) async fn agent_start_snapshot(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<protocol::AgentStartPayload> {
+        let handle = self.state.lock().await.registry.agent_handle(agent_id)?;
+        Some(handle.snapshot())
     }
 
     pub(crate) async fn read_settings(&self) -> Result<settings_model::HostSettings, String> {
@@ -13926,11 +13951,19 @@ fn spawn_host_inner(
         .lock()
         .expect("spawn operation worker mutex poisoned") = Some(spawn_operation_worker);
 
+    let agent_status_transitions = host
+        .state
+        .try_lock()
+        .expect("newly created host state must be unlocked")
+        .registry
+        .subscribe_status_transitions();
+
     spawn_mobile_access_actor(
         host.clone(),
         mobile_access_tx,
         mobile_access_rx,
         MobileAccessInit {
+            agent_status_transitions,
             pairings_store: mobile_pairings_store,
             initial_settings: initial_mobile_settings,
             pairing_ttl: runtime_config

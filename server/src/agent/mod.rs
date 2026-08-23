@@ -3506,6 +3506,7 @@ pub(crate) fn spawn_agent_actor(
             &mut subscribers,
             &queue,
             &session_store,
+            &status_handle,
         )
         .await;
         if !resume_replay_gate_pending {
@@ -4756,6 +4757,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut subscribers,
                             &queue,
                             &session_store,
+                            &status_handle,
                         )
                         .await;
                         in_turn = true;
@@ -4785,6 +4787,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut subscribers,
                                     &queue,
                                     &session_store,
+                                    &status_handle,
                                 )
                                 .await;
                             }
@@ -5569,6 +5572,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut subscribers,
                                             &queue,
                                             &session_store,
+                                            &status_handle,
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
@@ -5632,6 +5636,7 @@ pub(crate) fn spawn_agent_actor(
                                                         &mut subscribers,
                                                         &queue,
                                                         &session_store,
+                                                        &status_handle,
                                                     )
                                                     .await;
                                                     if let Some(reply) = delivery_ack.take() {
@@ -5945,6 +5950,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut subscribers,
                                         &queue,
                                         &session_store,
+                                        &status_handle,
                                     )
                                     .await;
                                 }
@@ -5973,6 +5979,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut subscribers,
                                         &queue,
                                         &session_store,
+                                        &status_handle,
                                     )
                                     .await;
                                 }
@@ -6017,6 +6024,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut subscribers,
                                         &queue,
                                         &session_store,
+                                        &status_handle,
                                     )
                                     .await;
 
@@ -6076,6 +6084,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut subscribers,
                                         &queue,
                                         &session_store,
+                                        &status_handle,
                                     )
                                     .await;
                                     in_turn = true;
@@ -6101,6 +6110,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut subscribers,
                                                 &queue,
                                                 &session_store,
+                                                &status_handle,
                                             )
                                             .await;
                                         }
@@ -7823,6 +7833,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut subscribers,
                                     &queue,
                                     &session_store,
+                                    &status_handle,
                                 )
                                 .await;
                             }
@@ -8978,6 +8989,7 @@ async fn enter_terminal_failure(
         context.subscribers,
         context.queue,
         context.session_store,
+        context.status_handle,
     )
     .await;
     append_event(
@@ -10358,6 +10370,7 @@ async fn send_initial_follow_up_or_park(
                     context.subscribers,
                     context.queue,
                     context.session_store,
+                    context.status_handle,
                 )
                 .await;
             } else {
@@ -11215,7 +11228,14 @@ async fn update_queued_messages_snapshot(
     subscribers: &mut Vec<Stream>,
     queue: &VecDeque<SequencedQueuedMessage>,
     session_store: &Arc<Mutex<SessionStore>>,
+    status_handle: &registry::AgentStatusHandle,
 ) {
+    // The single funnel for queue changes, so the status flag cannot drift from
+    // the queue it describes.
+    let queued = !queue.is_empty();
+    status_handle
+        .update(|status| status.has_queued_messages = queued)
+        .await;
     let payload = QueuedMessagesPayload {
         messages: queue.iter().map(|queued| queued.entry.clone()).collect(),
     };
@@ -11509,6 +11529,7 @@ async fn dispatch_queued_message(
         context.subscribers,
         context.queue,
         context.session_store,
+        context.status_handle,
     )
     .await;
     *context.in_turn = true;
@@ -11550,6 +11571,7 @@ async fn dispatch_queued_message(
                 context.subscribers,
                 context.queue,
                 context.session_store,
+                context.status_handle,
             )
             .await;
             mark_agent_turn_active(context.status_handle).await;

@@ -6,7 +6,7 @@ use blake2::{Blake2s256, Digest};
 use mqtt_transport::{BrokerEndpoint, PreSharedKey, RoomId, validate_broker_url};
 use protocol::{
     ManagedBrokerCredentials, ManagedBrokerEndpoint, MobileDeviceId, MobileDeviceState,
-    MobileDeviceSummary, MobilePairingOfferId,
+    MobileDeviceSummary, MobilePairingOfferId, MobilePushState, MobilePushSubscription,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,29 @@ pub struct MobilePairingRecord {
     pub key_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedMobilePairingCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<DevicePushRegistration>,
+}
+
+/// A device's Web Push subscription plus whether the push service has since
+/// rejected it. `Expired` is kept rather than dropped so the device list can
+/// say the subscription died instead of silently showing nothing.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct DevicePushRegistration {
+    pub subscription: MobilePushSubscription,
+    pub registered_at_ms: u64,
+    #[serde(default)]
+    pub expired: bool,
+}
+
+impl DevicePushRegistration {
+    pub fn state(&self) -> MobilePushState {
+        if self.expired {
+            MobilePushState::Expired
+        } else {
+            MobilePushState::Enabled
+        }
+    }
 }
 
 impl fmt::Debug for MobilePairingRecord {
@@ -82,6 +105,7 @@ impl fmt::Debug for MobilePairingRecord {
             .field("state", &self.state)
             .field("key_fingerprint", &self.key_fingerprint)
             .field("managed", &self.managed)
+            .field("push", &self.push)
             .finish()
     }
 }
@@ -219,6 +243,10 @@ impl MobilePairings {
                 created_at_ms: record.created_at_ms,
                 last_seen_at_ms: record.last_seen_at_ms,
                 state: record.state,
+                push: record
+                    .push
+                    .as_ref()
+                    .map_or(MobilePushState::Disabled, DevicePushRegistration::state),
             })
             .collect()
     }

@@ -24,6 +24,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 uuid = { version = "1", features = ["v4", "js"] }
 sha2 = "0.11.0"
+p256 = "0.13"
 base64 = { workspace = true }
 web-sys = { version = "0.3", features = [
     "Clipboard",
@@ -63,6 +64,16 @@ web-sys = { version = "0.3", features = [
     "HtmlScriptElement",
     "Navigator",
     "Node",
+    "Notification",
+    "NotificationPermission",
+    "PushEncryptionKeyName",
+    "PushManager",
+    "PushSubscription",
+    "PushSubscriptionOptions",
+    "PushSubscriptionOptionsInit",
+    "ServiceWorker",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
     "NodeList",
     "Screen",
     "Storage",
