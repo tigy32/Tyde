@@ -100,6 +100,14 @@ exhaustive_capabilities! {
     ForegroundSubagents,
     BackgroundSubagents,
     BackgroundTasks,
+    // The runtime hands a long-running *foreground* command back to the model
+    // before it finishes, so continuing to run it is itself a tool call.
+    // Measured on codex-cli 0.146.0: one turn running a 25-second foreground
+    // command made five tool calls (one exec_command, four write_stdin) where a
+    // blocking runtime makes one. Distinct from BackgroundTasks — Claude and
+    // Hermes background work and check on it, but a foreground command blocks
+    // them, so "continuing a command is a second action" asserts nothing there.
+    YieldsRunningCommands,
     AgentInitiatedTurns,
     MidTurnSteering,
     ReasoningDeltas,

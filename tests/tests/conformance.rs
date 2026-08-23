@@ -829,13 +829,22 @@ fn real_user_question() {
 ///
 /// Asserted as the user-visible contract, not the Codex shape: a turn that
 /// starts a command and watches it to completion performed at least two
-/// actions, so it owes at least two cards. Any backend that watches a command
-/// this way owes the same.
+/// actions, so it owes at least two cards.
+///
+/// Gated on `YieldsRunningCommands` rather than run everywhere, because the
+/// second action only exists where the runtime hands a running command back.
+/// Claude and Hermes block on a foreground command — one call, one card, and
+/// nothing dropped — so asserting two cards there fails on model behaviour
+/// rather than on a defect. Measured while trying to avoid this gate: rewritten
+/// to poll a *background* command instead, Claude ends the turn on "Waiting for
+/// the command to complete..." and Codex stops polling altogether, because
+/// backgrounding it removes the yield this depends on. No single prompt
+/// provokes the behaviour on both.
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_watched_command_shows_every_interaction() {
     run_scenario(
-        &[BackendCapability::BackgroundTasks],
+        &[BackendCapability::YieldsRunningCommands],
         |mut host| async move {
             let prompt = watched_command_prompt(host.backend());
             let agent = spawn_agent(&mut host, &prompt).await;

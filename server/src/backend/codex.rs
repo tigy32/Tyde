@@ -8511,7 +8511,13 @@ impl CodexInner {
         if correlated_background {
             return true;
         }
-        if !yielded_session_ids.is_empty() {
+        // Only a command execution can yield its session to the background.
+        // An interaction with an already-running process reports the session it
+        // polled, which belongs to that process's own card — running it through
+        // the background correlation below reports a healthy foreground poll as
+        // an uncorrelated yield and puts an Error card in front of the user.
+        if !yielded_session_ids.is_empty() && codex_raw_call_is_rendered_elsewhere(&owner.arguments)
+        {
             let correlated = {
                 let mut state = self.state.lock().await;
                 let correlated = yielded_session_ids.iter().all(|session_id| {
@@ -19082,12 +19088,17 @@ fn codex_raw_call_is_rendered_elsewhere(arguments: &Value) -> bool {
     }) else {
         return false;
     };
-    // Each of these reaches the user through a typed item (`commandExecution`,
-    // `fileChange`, `webSearch`, `imageView`, `sleep`, `mcpToolCall`) or, for
-    // `update_plan`, through the task list rather than a card.
+    // Each of these reaches the user through a typed item: `commandExecution`,
+    // `fileChange`, `webSearch`, `imageView`, `sleep`, `mcpToolCall`.
+    //
+    // `update_plan` is deliberately absent. Its effect does show up, in the task
+    // list, but it is still a tool the model called and it gets a card like any
+    // other — without one, a response whose only act was a plan update
+    // published a message with nothing in it, which is what
+    // `real_task_list` was failing on.
     matches!(
         function,
-        "exec_command" | "apply_patch" | "web__run" | "view_image" | "sleep" | "update_plan"
+        "exec_command" | "apply_patch" | "web__run" | "view_image" | "sleep"
     ) || function.starts_with("mcp__")
 }
 
@@ -19700,6 +19711,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,

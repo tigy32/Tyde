@@ -22366,6 +22366,9 @@ fn capability_witness_case(capability: BackendCapability) -> CertificationCase {
             CertificationCase::BackgroundSubagentContractMatrix
         }
         BackendCapability::BackgroundTasks => CertificationCase::BackgroundCommandContractMatrix,
+        BackendCapability::YieldsRunningCommands => {
+            CertificationCase::ForegroundCommandContractMatrix
+        }
         BackendCapability::AgentInitiatedTurns => CertificationCase::AgentInitiatedResultDelivered,
         BackendCapability::MidTurnSteering => CertificationCase::MidTurnSteeringDelivered,
         BackendCapability::ReasoningDeltas => CertificationCase::ReasoningDeltaReported,
@@ -22450,6 +22453,9 @@ fn capability_reachability_prompt(
         }
         BackendCapability::BackgroundTasks => {
             "Use your native command tool exactly once to run `sleep 1` as detached background work. Do not run it in the foreground."
+        }
+        BackendCapability::YieldsRunningCommands => {
+            "Use your native command tool to run `sleep 20` in the foreground, and report whether the tool returned before the command had finished."
         }
         BackendCapability::ForegroundSubagents => {
             "Use your native subagent tool exactly once to start a foreground child that replies CAPABILITY_CHILD_OK. Wait for it."
@@ -22543,6 +22549,7 @@ fn capability_uses_model_reachability(capability: BackendCapability) -> bool {
             | BackendCapability::ForegroundSubagents
             | BackendCapability::BackgroundSubagents
             | BackendCapability::BackgroundTasks
+            | BackendCapability::YieldsRunningCommands
             | BackendCapability::AgentInitiatedTurns
             | BackendCapability::MidTurnSteering
             | BackendCapability::ReasoningDeltas
