@@ -1,6 +1,7 @@
 pub mod agent_teams;
 pub mod agents_view_preferences;
 pub mod custom_agents;
+pub(crate) mod legacy_agent_origin;
 pub(crate) mod legacy_backend_kind;
 pub mod mcp_servers;
 pub mod mobile_pairings;

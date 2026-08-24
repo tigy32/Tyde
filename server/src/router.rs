@@ -1181,10 +1181,10 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
             images,
             ..
         } => {
-            if payload.parent_agent_id.is_none() {
+            if payload.parent_agent_id.is_some() {
                 return Err(AppError::invalid(
                     "spawn_agent",
-                    "fork requires parent_agent_id",
+                    "fork must not specify parent_agent_id",
                 ));
             }
             ensure_non_empty("spawn_agent", "from_session_id", from_session_id.0.as_str())?;

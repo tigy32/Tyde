@@ -2113,7 +2113,7 @@ impl MobileAccessActor {
                 // agent waiting on them instead, and a workflow fanning out to
                 // a dozen of them would otherwise buzz the phone a dozen times.
                 match start.origin {
-                    AgentOrigin::User | AgentOrigin::SideQuestion => {}
+                    AgentOrigin::User => {}
                     AgentOrigin::AgentControl
                     | AgentOrigin::BackendNative
                     | AgentOrigin::TeamMember

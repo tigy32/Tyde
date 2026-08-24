@@ -1426,7 +1426,6 @@ fn agent_card(
     let agent_id = agent.agent_id.clone();
     let name = agent.name.clone();
     let backend = agent.backend_kind;
-    let is_side_question = matches!(agent.origin, protocol::AgentOrigin::SideQuestion);
     let workflow_badge_title = agent
         .workflow
         .as_ref()
@@ -1989,14 +1988,6 @@ fn agent_card(
                     view! {
                         <span class="agent-card-custom-agent" title=title>{n}</span>
                     }
-                })}
-                {is_side_question.then(|| view! {
-                    <span
-                        class="agent-card-side-question-badge"
-                        title="Fork + send — forked from another agent's session"
-                    >
-                        "Aside"
-                    </span>
                 })}
                 {workflow_badge_title.map(|title| view! {
                     <span class="agent-card-workflow-badge" title=title>"Workflow"</span>
@@ -3048,30 +3039,63 @@ mod wasm_tests {
         );
     }
 
-    /// A side-question agent renders a compact "Aside" badge so the user
-    /// can tell it apart from ordinary agents in the sidebar.
+    /// A BTW fork is a stand-alone top-level chat: the agent it was forked
+    /// from does not own it, so the sidebar must not nest it as a child or
+    /// count it against that agent. The owned agent in the same fixture is
+    /// the control — it proves the panel still nests when there really is a
+    /// parent, so this is not passing for want of nesting support.
     #[wasm_bindgen_test]
-    async fn side_question_agent_shows_aside_badge() {
+    async fn forked_agent_renders_as_top_level_row() {
         let container = make_container();
         let state = make_app_state("h");
-        push_agent(&state, "h", "a-btw", "Side question", true);
-        state.agents.update(|agents| {
-            if let Some(agent) = agents.iter_mut().find(|a| a.agent_id.0 == "a-btw") {
-                agent.origin = AgentOrigin::SideQuestion;
-            }
-        });
+        push_agent(&state, "h", "a-source", "Source", true);
+        push_agent_with_scope(
+            &state,
+            "h",
+            "a-owned",
+            "Owned",
+            true,
+            None,
+            Some("a-source"),
+        );
+        push_agent(&state, "h", "a-btw", "BTW: why is this slow?", true);
         let _handle = mount_panel(&container, state);
         for _ in 0..4 {
             next_tick().await;
         }
-        let badge = container
-            .query_selector(".agent-card-side-question-badge")
+
+        let child_names = container
+            .query_selector_all(".agent-card-child")
             .unwrap()
-            .expect("side-question agent must render an Aside badge");
+            .length();
         assert_eq!(
-            badge.text_content().unwrap_or_default().trim(),
-            "Aside",
-            "side-question badge text must read Aside"
+            child_names, 1,
+            "only the genuinely owned agent may render as a nested child row"
+        );
+        let nested = container
+            .query_selector(".agent-card-child")
+            .unwrap()
+            .expect("the owned agent renders nested, proving nesting is live")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            nested.contains("Owned"),
+            "the nested row must be the owned agent, not the fork; got {nested:?}"
+        );
+        assert!(
+            !nested.contains("BTW"),
+            "the fork must never render inside another agent's child list; got {nested:?}"
+        );
+        let counted = container
+            .query_selector(".agent-child-count")
+            .unwrap()
+            .expect("the owning agent still shows its child count")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(
+            counted.trim(),
+            "1",
+            "the fork must not be counted as a child of the agent it forked from"
         );
     }
 

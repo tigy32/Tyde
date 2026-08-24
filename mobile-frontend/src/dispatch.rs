@@ -505,9 +505,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     agents.push(info);
                 });
 
-                // User and SideQuestion (BTW) agents auto-open into the chat
-                // view — a side question is something the user just asked for.
-                if matches!(origin, AgentOrigin::User | AgentOrigin::SideQuestion)
+                // User-origin agents auto-open into the chat view — the user
+                // just asked for this one. BTW forks are User-origin too.
+                if matches!(origin, AgentOrigin::User)
                     && !has_compaction_in_progress_for_host(state, host)
                 {
                     state.active_agent.set(Some(ActiveAgentRef {

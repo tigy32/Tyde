@@ -404,6 +404,10 @@ impl AgentsViewPreferencesStore {
         // the legacy `"kiro"` spelling outright — without this rename the whole
         // store reads as corrupt and the user loses every saved view.
         crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value);
+        // Same failure mode for the origin filter: `Vec<AgentOrigin>` rejects
+        // the removed `"side_question"` spelling and takes every saved view
+        // down with it.
+        crate::store::legacy_agent_origin::drop_legacy_side_question_origins(&mut value);
         let version = value
             .get("version")
             .and_then(Value::as_u64)
@@ -937,10 +941,9 @@ fn canonicalize_origins(mut origins: Vec<AgentOrigin>) -> Vec<AgentOrigin> {
     origins.sort_by_key(|origin| match *origin {
         AgentOrigin::User => 0,
         AgentOrigin::AgentControl => 1,
-        AgentOrigin::SideQuestion => 2,
-        AgentOrigin::BackendNative => 3,
-        AgentOrigin::TeamMember => 4,
-        AgentOrigin::Workflow => 5,
+        AgentOrigin::BackendNative => 2,
+        AgentOrigin::TeamMember => 3,
+        AgentOrigin::Workflow => 4,
     });
     origins.dedup();
     origins

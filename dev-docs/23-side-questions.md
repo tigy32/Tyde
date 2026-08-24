@@ -2,12 +2,23 @@
 
 Side questions are first-class Tyde agents created from an existing backend
 session without mutating that source session. They are for "BTW" questions that
-need the parent's context but should not add turns to the parent's transcript.
+need the source chat's context but should not add turns to its transcript.
+
+A fork is **stand-alone**. It is not owned by the agent it forked from and is
+not distinguishable from a chat the user started themselves: it carries
+`AgentOrigin::User`, no `parent_agent_id`, and no session `parent_id`. That is
+what makes it a top-level chat — it is not nested in the sidebar, not hidden by
+the hide-sub-agents filter, not counted in another agent's descendant usage,
+not torn down when that agent closes, and not pushed a level deeper into the
+sub-agent depth limit (which at the cap silently strips the agent-control
+tools). Its session is a root session, so it appears in the ordinary session
+list.
 
 ## Protocol
 
-`AgentOrigin::SideQuestion` identifies an interactive side-question agent. It is
-not a backend-native relay and it accepts normal `SendMessage` input.
+A fork is an ordinary interactive agent. Nothing in the protocol marks it as
+having been forked once it is running; the only fork-specific surface is the
+spawn request.
 
 Clients request a fork with `SpawnAgentParams::Fork`:
 
@@ -20,11 +31,15 @@ SpawnAgentParams::Fork {
 }
 ```
 
-The outer `SpawnAgentPayload.parent_agent_id` is required. Side questions are
-owned by a parent Tyde agent even though their backend session is a fork of
-`from_session_id`.
+The outer `SpawnAgentPayload.parent_agent_id` must be **absent**. A fork is
+defined solely by `from_session_id`; naming an owning parent is rejected as
+`InvalidInput` rather than ignored, because silently accepting it is how a fork
+becomes a sub-agent that dies with its owner.
 
-Clients learn the correct `from_session_id` from the parent agent's optional
+Nothing about the source agent has to be live. A fork needs a session id, not a
+running agent, so a session whose agent has been closed is still forkable.
+
+Clients learn the correct `from_session_id` from the source agent's optional
 `session_id` on `AgentStartPayload` or `NewAgentPayload`. A freshly emitted
 `NewAgent` may omit `session_id` until backend startup finishes, but the
 subsequent `AgentStart` includes it once the live backend session is known.
@@ -36,10 +51,11 @@ image-only allowance as new spawns: a blank prompt is accepted only when images
 are attached.
 
 The host resolves `from_session_id` from the session store and inherits the
-parent session's backend kind, workspace roots, project, custom agent, and stored
-session settings. The new agent's `AgentStart` / `NewAgent` payload keeps the
-required parent agent link. The persisted child `SessionRecord.parent_id` is
-always `from_session_id`.
+source session's backend kind, workspace roots, project, custom agent, and
+stored session settings. It inherits nothing else: the new agent's `AgentStart`
+/ `NewAgent` payload carries no parent agent link, and the persisted
+`SessionRecord.parent_id` is `None` so the forked session lists as a root
+session.
 
 Forks default to `BackendAccessMode::Unrestricted`, matching ordinary new
 sessions. A caller may set `access_mode: Some(BackendAccessMode::ReadOnly)` when
@@ -52,7 +68,8 @@ A true fork means:
 - the child receives a fresh backend-native `SessionId`;
 - the source session is not resumed, appended to, copied on disk, or otherwise
   mutated by Tyde;
-- the child starts as a normal interactive agent, not as a backend-native relay;
+- the child starts as a normal interactive agent, not as a backend-native relay,
+  and outlives the agent it was forked from;
 - unsupported backends fail with `AgentErrorCode::Unsupported` and no child
   `SessionRecord` is persisted.
 
@@ -63,7 +80,8 @@ Tyde reports unsupported behavior instead.
 ## Backend matrix
 
 - **Mock**: supported. The mock backend clones its in-memory session record under
-  a new UUID and runs the child with the requested prompt. Tests use this for
+  a new UUID and runs the child with the requested prompt. The store is
+  process-global, so a session stays forkable after its agent closes. Tests use this for
   deterministic assertions that history was copied and the parent was not
   mutated.
 - **Claude**: supported through Claude Code's native
@@ -99,12 +117,17 @@ Tyde reports unsupported behavior instead.
 
 Native tests must cover at least:
 
-1. Mock end-to-end fork creates an `AgentOrigin::SideQuestion` child.
-2. The child has a distinct `SessionId` and persisted `parent_id` lineage.
+1. Mock end-to-end fork creates a top-level `AgentOrigin::User` agent with no
+   `parent_agent_id`.
+2. The child has a distinct `SessionId` and no persisted `parent_id`, so it is
+   a root session.
 3. Mock history is cloned into the child, child follow-up input works, and the
-   parent history remains unchanged.
-4. Unsupported backend fork emits a typed unsupported error and leaves the
-   parent session record untouched.
+   source history remains unchanged.
+4. Closing the source agent leaves the fork running, and its session is still
+   forkable afterwards.
+5. A fork request naming a `parent_agent_id` is rejected as `InvalidInput`.
+6. Unsupported backend fork emits a typed unsupported error and leaves the
+   source session record untouched.
 
 Real-AI backend tests are only needed when changing that backend's fork behavior.
 For Claude, target only the Claude-specific tests needed to verify the

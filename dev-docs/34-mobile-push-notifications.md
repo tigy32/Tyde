@@ -69,8 +69,8 @@ phone.
 ### 3a. Only agents the user started
 
 `AgentOrigin` decides, as a `match` so a new variant forces the question:
-`User` and `SideQuestion` notify; `AgentControl`, `BackendNative`, `TeamMember`,
-and `Workflow` do not. Those have a parent agent waiting on them, not a human —
+`User` notifies (which includes BTW session forks); `AgentControl`,
+`BackendNative`, `TeamMember`, and `Workflow` do not. Those have a parent agent waiting on them, not a human —
 a workflow fanning out to a dozen sub-agents would otherwise buzz the phone a
 dozen times.
 

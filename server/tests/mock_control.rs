@@ -613,7 +613,7 @@ async fn reserved_script_governs_forked_session() {
         .spawn_with(SpawnAgentPayload {
             name: Some("fork-scripted".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(seed.new_agent.agent_id.clone()),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: session_id,

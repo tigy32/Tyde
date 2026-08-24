@@ -105,11 +105,13 @@ pub async fn spawn_new_chat(
     Ok(accepted)
 }
 
-/// Spawn a BTW / side question fork from the currently active agent. Mirrors
-/// the desktop `spawn_side_question`: the child is a first-class interactive
-/// `AgentOrigin::SideQuestion` agent whose backend session forks the parent's,
-/// leaving the parent transcript untouched. `access_mode` is left `None` so
-/// the server applies the normal unrestricted default.
+/// Spawn a BTW / side question fork of the active agent's session. Mirrors
+/// the desktop `spawn_side_question`: the result is an ordinary top-level
+/// `AgentOrigin::User` agent that starts from a copy of that session's
+/// history, leaving the source transcript untouched. It carries no
+/// `parent_agent_id` — the server rejects a fork that names one.
+/// `access_mode` is left `None` so the server applies the normal unrestricted
+/// default.
 pub async fn spawn_side_question(
     state: &AppState,
     prompt: String,
@@ -148,7 +150,7 @@ pub async fn spawn_side_question(
     let payload = protocol::SpawnAgentPayload {
         name: None,
         custom_agent_id: None,
-        parent_agent_id: Some(agent_info.agent_id.clone()),
+        parent_agent_id: None,
         project_id: agent_info.project_id.clone(),
         params: protocol::SpawnAgentParams::Fork {
             from_session_id,

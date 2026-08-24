@@ -7163,7 +7163,7 @@ async fn held_resume_does_not_block_later_connection_request() {
 #[tokio::test]
 async fn held_fork_does_not_block_later_connection_request() {
     let mut fixture = Fixture::new().await;
-    let (parent, session_id) =
+    let (_source, session_id) =
         spawn_named_session(&mut fixture, "Fork HOL Source", BackendKind::Claude).await;
     let startup_gate = fixture
         .host_for_test()
@@ -7173,7 +7173,7 @@ async fn held_fork_does_not_block_later_connection_request() {
         .spawn_agent(SpawnAgentPayload {
             name: Some("Held Fork".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(parent.agent_id.clone()),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: session_id,

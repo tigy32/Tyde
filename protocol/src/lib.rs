@@ -178,6 +178,7 @@ pub use types::{
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).
 pub use types::{
-    ACP_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_KIRO_BACKEND, LOCAL_HOST_ID, TydeReleaseVersion,
+    ACP_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_KIRO_BACKEND, LEGACY_SIDE_QUESTION_ORIGIN,
+    LOCAL_HOST_ID, TydeReleaseVersion,
 };
 pub use validator::{ObservedFrame, ProtocolValidator, ProtocolViolation};

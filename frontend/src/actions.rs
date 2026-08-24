@@ -9,16 +9,15 @@ use crate::state::{
 };
 
 use protocol::{
-    AgentId, BackendKind, ByteRange, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CompactionAvailabilityReason,
-    CustomAgentId, FrameKind, GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
-    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
-    RequestedCompactionAvailability, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload,
-    WorkbenchRemovePayload,
+    BackendKind, ByteRange, CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload,
+    CodeIntelHoverPayload, CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload,
+    CodeIntelSubscribeFilePayload, CompactionAvailabilityReason, CustomAgentId, FrameKind,
+    GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchPayload, RequestedCompactionAvailability, SessionId,
+    SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -428,12 +427,12 @@ pub fn spawn_new_chat(
 /// Build the spawn payload for a BTW / side-question fork. Kept pure (no
 /// signals, no IO) so the payload shape can be asserted directly in tests.
 ///
-/// A side question is owned by the current agent (`parent_agent_id`) and
-/// forks that agent's backend session (`from_session_id`) without mutating
-/// it. `access_mode` is left `None` so the server applies the normal
-/// unrestricted default.
+/// A fork is defined solely by the session it branches from
+/// (`from_session_id`), which it does not mutate. It is a stand-alone
+/// top-level agent, so it carries no `parent_agent_id` — the server rejects
+/// a fork that names one. `access_mode` is left `None` so the server applies
+/// the normal unrestricted default.
 pub fn fork_payload(
-    parent_agent_id: AgentId,
     from_session_id: SessionId,
     project_id: Option<ProjectId>,
     prompt: String,
@@ -442,7 +441,7 @@ pub fn fork_payload(
     SpawnAgentPayload {
         name: None,
         custom_agent_id: None,
-        parent_agent_id: Some(parent_agent_id),
+        parent_agent_id: None,
         project_id,
         params: SpawnAgentParams::Fork {
             from_session_id,
@@ -453,11 +452,12 @@ pub fn fork_payload(
     }
 }
 
-/// Spawn a BTW / side-question fork from the currently active agent. The
-/// child is a first-class interactive agent (`AgentOrigin::SideQuestion`)
-/// whose backend session forks the parent's, so the parent transcript is
-/// left untouched. No-ops (with a logged reason) when there is no active
-/// agent or when its backend session id hasn't been reported yet.
+/// Spawn a BTW / side-question fork of the currently active agent's session.
+/// The result is an ordinary top-level agent (`AgentOrigin::User`) that
+/// happens to start from a copy of that session's history, so the source
+/// transcript is left untouched and the new chat outlives it. No-ops (with a
+/// logged reason) when there is no active agent or when its backend session
+/// id hasn't been reported yet.
 /// Fork `target`'s session and send `prompt` to the fork.
 ///
 /// `target` is passed in rather than read from `active_agent`: every chat pane
@@ -503,7 +503,6 @@ pub fn spawn_side_question(
 
     let host_id = active_agent.host_id;
     let payload = fork_payload(
-        agent_info.agent_id.clone(),
         from_session_id,
         agent_info.project_id.clone(),
         prompt,
@@ -1574,28 +1573,26 @@ pub fn send_set_session_settings(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use protocol::LaunchProfileId;
+    use protocol::{AgentId, LaunchProfileId};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// A BTW fork must be owned by the parent agent, fork the parent's
-    /// backend session, and leave `access_mode` unset so the server applies
-    /// the normal unrestricted default.
+    /// A BTW fork must branch from the source session, claim no owning
+    /// parent (the server rejects a fork that names one, and a parent would
+    /// make the new chat a sub-agent that dies with its owner), and leave
+    /// `access_mode` unset so the server applies the normal unrestricted
+    /// default.
     #[wasm_bindgen_test]
-    fn fork_payload_targets_parent_and_source_session_read_only() {
+    fn fork_payload_targets_source_session_and_claims_no_parent() {
         let payload = fork_payload(
-            AgentId("agent-parent".to_owned()),
             SessionId("session-parent".to_owned()),
             Some(ProjectId("proj-1".to_owned())),
             "why is this slow?".to_owned(),
             None,
         );
 
-        assert_eq!(
-            payload.parent_agent_id,
-            Some(AgentId("agent-parent".to_owned()))
-        );
+        assert!(payload.parent_agent_id.is_none());
         assert_eq!(payload.project_id, Some(ProjectId("proj-1".to_owned())));
         assert!(payload.custom_agent_id.is_none());
 

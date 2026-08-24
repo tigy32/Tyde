@@ -4153,13 +4153,13 @@ impl HostHandle {
                     } else if let Some(handle) = state.registry.agent_handle(agent_id) {
                         handle.snapshot().session_id.ok_or_else(|| {
                             AgentStartupFailure::internal(format!(
-                                "fork parent_agent_id {} has no known session_id",
+                                "parent_agent_id {} has no known session_id",
                                 agent_id
                             ))
                         })
                     } else {
                         Err(AgentStartupFailure::internal(format!(
-                            "fork parent_agent_id {} is not running",
+                            "parent_agent_id {} is not running",
                             agent_id
                         )))
                     }
@@ -4171,10 +4171,17 @@ impl HostHandle {
                 state.antigravity_conversations_dir.clone(),
             )
         };
-        let (parent_session_id, parent_session_lookup_failure) = match parent_session_id {
-            Some(Ok(session_id)) => (Some(session_id), None),
-            Some(Err(err)) => (None, Some(err)),
-            None => (None, None),
+        let parent_session_id = match parent_session_id {
+            Some(Ok(session_id)) => Some(session_id),
+            Some(Err(err)) => {
+                tracing::warn!(
+                    parent_agent_id = ?payload.parent_agent_id,
+                    error = %err.message,
+                    "spawn could not resolve the parent session; child records no lineage"
+                );
+                None
+            }
+            None => None,
         };
         let host_settings = settings_store
             .lock()
@@ -4698,10 +4705,6 @@ impl HostHandle {
                 images,
                 access_mode,
             } => {
-                assert!(
-                    payload.parent_agent_id.is_some(),
-                    "fork spawn requires parent_agent_id"
-                );
                 let record = session_store.lock().await.get(&from_session_id);
                 let Some(record) = record else {
                     let resolved_name = payload.name.clone().unwrap_or_else(|| {
@@ -4723,13 +4726,13 @@ impl HostHandle {
                     return Ok(self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
-                            origin: AgentOrigin::SideQuestion,
+                            origin: AgentOrigin::User,
                             custom_agent_id: payload.custom_agent_id,
                             team_id: None,
                             team_member_id: None,
                             workflow: None,
-                            parent_agent_id: payload.parent_agent_id,
-                            parent_session_id: Some(from_session_id.clone()),
+                            parent_agent_id: None,
+                            parent_session_id: None,
                             project_id: payload.project_id,
                             backend_kind: protocol::BackendKind::Claude,
                             launch_profile_id: None,
@@ -4760,21 +4763,9 @@ impl HostHandle {
                         })
                         .await);
                 };
-                let parent_agent_mismatch_failure = match parent_session_id.as_ref() {
-                    Some(session_id) if session_id != &from_session_id => {
-                        Some(AgentStartupFailure::internal(format!(
-                            "fork parent_agent_id maps to session {}, not from_session_id {}",
-                            session_id, from_session_id
-                        )))
-                    }
-                    Some(_) => None,
-                    None => parent_session_lookup_failure.clone(),
-                };
                 tracing::warn!(
                     from_session_id = %from_session_id,
-                    parent_agent_id = ?payload.parent_agent_id,
-                    parent_lookup_failed = parent_agent_mismatch_failure.is_some(),
-                    "diagnostic: side-question fork loaded source session and resolved parent"
+                    "diagnostic: side-question fork loaded source session"
                 );
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
@@ -4913,34 +4904,6 @@ impl HostHandle {
                 resolved_spawn_config.access_mode = access_mode.unwrap_or(record.access_mode);
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
-                let (session_settings_schema, schema_failure) =
-                    if parent_agent_mismatch_failure.is_some() {
-                        let state = self.state.lock().await;
-                        (
-                            session_schema_for_backend(
-                                &state,
-                                backend_kind,
-                                record.launch_profile_id.as_ref(),
-                            ),
-                            None,
-                        )
-                    } else {
-                        match self
-                            .resolve_session_schema_for_spawn(
-                                backend_kind,
-                                record.launch_profile_id.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(schema) => (schema, None),
-                            Err(failure) => (None, Some(failure)),
-                        }
-                    };
-                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
-                    backend_kind,
-                    session_settings_schema.as_ref(),
-                    record.session_settings.clone(),
-                );
                 let backend_support_failure = (!use_mock_backend
                     && !matches!(
                         backend_kind,
@@ -4960,8 +4923,41 @@ impl HostHandle {
                             ))
                         },
                     );
+                // Resolving the schema can probe the backend, which is wasted
+                // work for a fork that is already doomed — and the doomed case
+                // is exactly the one whose backend may not be installed. Fall
+                // back to the cached schema when the fork cannot start.
+                let fork_is_doomed = startup_failure.is_some()
+                    || non_resumable_failure.is_some()
+                    || backend_support_failure.is_some();
+                let (session_settings_schema, schema_failure) = if fork_is_doomed {
+                    let state = self.state.lock().await;
+                    (
+                        session_schema_for_backend(
+                            &state,
+                            backend_kind,
+                            record.launch_profile_id.as_ref(),
+                        ),
+                        None,
+                    )
+                } else {
+                    match self
+                        .resolve_session_schema_for_spawn(
+                            backend_kind,
+                            record.launch_profile_id.as_ref(),
+                        )
+                        .await
+                    {
+                        Ok(schema) => (schema, None),
+                        Err(failure) => (None, Some(failure)),
+                    }
+                };
+                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
+                    backend_kind,
+                    session_settings_schema.as_ref(),
+                    record.session_settings.clone(),
+                );
                 let startup_failure = startup_failure
-                    .or(parent_agent_mismatch_failure)
                     .or(non_resumable_failure)
                     .or(backend_support_failure)
                     .or(schema_failure)
@@ -4993,13 +4989,13 @@ impl HostHandle {
                 };
                 ResolvedSpawnRequest {
                     name: resolved_name,
-                    origin: AgentOrigin::SideQuestion,
+                    origin: AgentOrigin::User,
                     custom_agent_id: effective_custom_agent_id,
                     team_id: None,
                     team_member_id: None,
                     workflow: None,
-                    parent_agent_id: payload.parent_agent_id,
-                    parent_session_id: Some(from_session_id.clone()),
+                    parent_agent_id: None,
+                    parent_session_id: None,
                     project_id,
                     backend_kind,
                     launch_profile_id: None,
@@ -5033,7 +5029,7 @@ impl HostHandle {
 
         let request = self.apply_complexity_tier_settings(request).await;
         let request = self.resolve_acp_agent(request).await;
-        let diagnose_side_question_fanout = matches!(&request.origin, AgentOrigin::SideQuestion);
+        let diagnose_side_question_fanout = request.fork_from_session_id.is_some();
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
@@ -5057,8 +5053,6 @@ impl HostHandle {
                         ));
                     }
                     Some(_) => {}
-                    None if request.fork_from_session_id.is_some()
-                        && parent_session_lookup_failure.is_some() => {}
                     None => {
                         return Err(AppError::conflict(
                             "spawn_agent",
@@ -15981,10 +15975,6 @@ fn origin_system_tag(origin: AgentOrigin) -> (AgentSystemTagId, String) {
         AgentOrigin::AgentControl => (
             AgentSystemTagId("system:origin:agent-control".to_owned()),
             "Agent control".to_owned(),
-        ),
-        AgentOrigin::SideQuestion => (
-            AgentSystemTagId("system:origin:side-quest".to_owned()),
-            "Side quest".to_owned(),
         ),
         AgentOrigin::BackendNative => (
             AgentSystemTagId("system:origin:sub-agent".to_owned()),

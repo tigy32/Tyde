@@ -34,15 +34,6 @@ fn is_noise(env: &Envelope) -> bool {
         )
 }
 
-async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
-    loop {
-        let env = expect_event(client, context).await;
-        if env.kind == FrameKind::NewAgent {
-            return env.parse_payload().expect("parse NewAgentPayload");
-        }
-    }
-}
-
 async fn expect_new_agent_with_diagnostics(
     client: &mut client::Connection,
     host: &server::HostHandle,
@@ -211,8 +202,13 @@ async fn wait_for_session_count(store_dir: &std::path::Path, count: usize) -> Ve
     }
 }
 
+/// A BTW fork is a stand-alone top-level agent: it owns a fresh session, gets
+/// the source session's history, and is not a child of the agent it forked
+/// from — no owning `parent_agent_id`, no `parent_id` lineage on its session
+/// record (which is what keeps it out of the root session list), and no
+/// mutation of the source transcript.
 #[tokio::test]
-async fn mock_fork_creates_interactive_side_question_with_lineage() {
+async fn mock_fork_creates_standalone_top_level_agent() {
     let mut fixture = Fixture::new().await;
     let (parent, parent_start) = fixture
         .spawn_with(SpawnAgentPayload {
@@ -262,7 +258,7 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
         .spawn_with(SpawnAgentPayload {
             name: Some("BTW".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(parent.new_agent.agent_id.clone()),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: parent_session_id.clone(),
@@ -273,15 +269,15 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
         })
         .await;
 
-    assert_eq!(child.new_agent.origin, AgentOrigin::SideQuestion);
+    assert_eq!(child.new_agent.origin, AgentOrigin::User);
     assert_eq!(
-        child.new_agent.parent_agent_id,
-        Some(parent.new_agent.agent_id.clone())
+        child.new_agent.parent_agent_id, None,
+        "a fork must not be announced as a child of the agent it forked from"
     );
-    assert_eq!(child_start.origin, AgentOrigin::SideQuestion);
+    assert_eq!(child_start.origin, AgentOrigin::User);
     assert_eq!(
-        child_start.parent_agent_id,
-        Some(parent.new_agent.agent_id.clone())
+        child_start.parent_agent_id, None,
+        "a fork must not start as a child of the agent it forked from"
     );
     let child_start_session_id = child_start
         .session_id
@@ -310,11 +306,14 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
     let sessions = wait_for_session_count(fixture.store_dir(), 2).await;
     let child_session = sessions
         .iter()
-        .find(|record| record.parent_id.as_ref() == Some(&parent_session_id))
-        .expect("child session with parent_id lineage");
+        .find(|record| record.id == child_start_session_id)
+        .expect("forked session record");
     assert_ne!(child_session.id, parent_session_id);
-    assert_eq!(child_session.id, child_start_session_id);
     assert_eq!(child_session.backend_kind, BackendKind::Claude);
+    assert_eq!(
+        child_session.parent_id, None,
+        "a fork is a root session; parent_id lineage would hide it from the          default session list"
+    );
 
     fixture
         .mock(&child)
@@ -352,8 +351,11 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
     );
 }
 
+/// A fork is defined solely by its source session. Naming an owning parent is
+/// rejected outright rather than ignored: silently accepting it is how a fork
+/// becomes a sub-agent that dies with its owner.
 #[tokio::test]
-async fn server_rejects_fork_without_parent_or_source_session() {
+async fn server_rejects_fork_with_parent_or_without_source_session() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -361,7 +363,7 @@ async fn server_rejects_fork_without_parent_or_source_session() {
         .spawn_agent(SpawnAgentPayload {
             name: Some("invalid fork".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: Some(AgentId("parent-agent".to_owned())),
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: SessionId("parent-session".to_owned()),
@@ -371,8 +373,8 @@ async fn server_rejects_fork_without_parent_or_source_session() {
             },
         })
         .await
-        .expect("send fork without parent");
-    let error = expect_command_error(&mut fixture.client, "fork without parent error").await;
+        .expect("send fork naming a parent");
+    let error = expect_command_error(&mut fixture.client, "fork with parent error").await;
     assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(error.message.contains("parent_agent_id"));
 
@@ -381,7 +383,7 @@ async fn server_rejects_fork_without_parent_or_source_session() {
         .spawn_agent(SpawnAgentPayload {
             name: Some("invalid fork".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(AgentId("parent-agent".to_owned())),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: SessionId(String::new()),
@@ -405,7 +407,7 @@ async fn stale_fork_source_session_fails_as_agent_error() {
         .spawn_with(SpawnAgentPayload {
             name: Some("Stale BTW".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(AgentId("missing-parent-agent".to_owned())),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
                 from_session_id: SessionId("stale-source-session".to_owned()),
@@ -416,28 +418,143 @@ async fn stale_fork_source_session_fails_as_agent_error() {
         })
         .await;
 
-    assert_eq!(child.new_agent.origin, AgentOrigin::SideQuestion);
+    assert_eq!(child.new_agent.origin, AgentOrigin::User);
     let error = expect_agent_error(&mut fixture.client, &child.stream, "stale fork error").await;
     assert_eq!(error.code, AgentErrorCode::Internal);
     assert!(error.message.contains("cannot fork missing session"));
 }
 
+/// The whole point of a stand-alone fork: closing the agent it was forked
+/// from must not take it down with it, and that agent's session stays
+/// forkable afterwards — a fork needs a session id, not a live agent. Both
+/// were impossible while a fork was a child of its source.
 #[tokio::test]
-async fn fork_rejects_orphan_parent_even_when_source_session_exists() {
+async fn fork_outlives_the_agent_it_forked_from() {
+    let mut fixture = Fixture::new().await;
+    let (source, source_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("Source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "source prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    let _ = collect_turn_delta_text(&mut fixture.client, &source.stream, "source turn").await;
+    let source_session_id = source_start
+        .session_id
+        .clone()
+        .expect("source AgentStart should include live session_id");
+
+    let (child, _child_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("BTW".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: source_session_id.clone(),
+                prompt: "child prompt".to_owned(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await;
+    let _ = collect_turn_delta_text(&mut fixture.client, &child.stream, "child turn").await;
+
+    fixture
+        .client
+        .close_agent(&source.stream)
+        .await
+        .expect("close source agent");
+    let closed = loop {
+        let env = expect_event(&mut fixture.client, "source AgentClosed").await;
+        if env.kind == FrameKind::AgentClosed {
+            break env;
+        }
+    };
+    let closed: protocol::AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
+    assert_eq!(
+        closed.agent_id, source.new_agent.agent_id,
+        "only the source agent may close; the fork is not part of its subtree"
+    );
+
+    fixture
+        .client
+        .send_message(&child.stream, "still alive".to_owned())
+        .await
+        .expect("send to fork after source closed");
+    let after_close =
+        collect_turn_delta_text(&mut fixture.client, &child.stream, "fork turn after close").await;
+    assert!(
+        after_close.contains("mock backend response to: still alive"),
+        "the fork must keep taking turns after its source closed: {after_close:?}"
+    );
+
+    let (second, second_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("BTW again".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: source_session_id.clone(),
+                prompt: "second child prompt".to_owned(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await;
+    assert_eq!(second.new_agent.origin, AgentOrigin::User);
+    let second_session_id = second_start
+        .session_id
+        .clone()
+        .expect("second fork AgentStart should include forked session_id");
+    assert_ne!(
+        second_session_id, source_session_id,
+        "forking a closed session must still mint a fresh session"
+    );
+    let second_turn =
+        collect_turn_delta_text(&mut fixture.client, &second.stream, "second fork turn").await;
+    assert!(
+        second_turn.contains("mock backend response to: second child prompt"),
+        "a session with no running agent must still be forkable: {second_turn:?}"
+    );
+}
+
+/// Forking a backend that has no native fork must fail as a typed
+/// `Unsupported` error and leave the source session record untouched — Tyde
+/// never fakes a fork by copying session files.
+///
+/// This case previously named a dead parent agent and so failed on the
+/// parent-liveness guard before it ever reached the backend, leaving the
+/// unsupported-fork contract in dev-docs/23 unverified. With that guard gone
+/// it now exercises the contract it was written for.
+#[tokio::test]
+async fn unsupported_backend_fork_fails_without_touching_source_session() {
     fixture::init_tracing();
     let dir = tempfile::tempdir().expect("tempdir");
     let session_path = dir.path().join("sessions.json");
     let project_path = dir.path().join("projects.json");
     let settings_path = dir.path().join("settings.json");
-    let parent_session_id = SessionId("source-session".to_owned());
+    let source_session_id = SessionId("tycode-source-session".to_owned());
     let store = SessionStore::load(session_path.clone()).expect("load session store");
     store
         .upsert_backend_session(
             &BackendSession {
-                id: parent_session_id.clone(),
-                backend_kind: BackendKind::Claude,
+                id: source_session_id.clone(),
+                backend_kind: BackendKind::Tycode,
                 workspace_roots: vec!["/tmp".to_owned()],
-                title: Some("Source".to_owned()),
+                title: Some("Tycode source".to_owned()),
                 token_count: None,
                 created_at_ms: Some(100),
                 updated_at_ms: Some(100),
@@ -449,63 +566,6 @@ async fn fork_rejects_orphan_parent_even_when_source_session_exists() {
             None,
         )
         .expect("insert source session");
-
-    let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
-        .expect("spawn host");
-    let (mut client, _bootstrap) = fixture::connect_host(host).await;
-
-    client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("Orphan BTW".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: Some(AgentId("orphan-parent-agent".to_owned())),
-            project_id: None,
-            params: SpawnAgentParams::Fork {
-                from_session_id: parent_session_id,
-                prompt: "side question".to_owned(),
-                images: None,
-                access_mode: None,
-            },
-        })
-        .await
-        .expect("send orphan-parent fork spawn");
-
-    let child = expect_new_agent(&mut client, "orphan fork NewAgent").await;
-    assert_eq!(child.origin, AgentOrigin::SideQuestion);
-    let _ = expect_agent_start(&mut client, &child.instance_stream, "orphan fork start").await;
-    let error = expect_agent_error(&mut client, &child.instance_stream, "orphan fork error").await;
-    assert_eq!(error.code, AgentErrorCode::Internal);
-    assert!(error.message.contains("parent_agent_id"));
-    assert!(error.message.contains("is not running"));
-}
-
-#[tokio::test]
-async fn stale_parent_fork_fails_without_touching_source_session() {
-    fixture::init_tracing();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let session_path = dir.path().join("sessions.json");
-    let project_path = dir.path().join("projects.json");
-    let settings_path = dir.path().join("settings.json");
-    let parent_session_id = SessionId("codex-parent-session".to_owned());
-    let store = SessionStore::load(session_path.clone()).expect("load session store");
-    store
-        .upsert_backend_session(
-            &BackendSession {
-                id: parent_session_id.clone(),
-                backend_kind: BackendKind::Codex,
-                workspace_roots: vec!["/tmp".to_owned()],
-                title: Some("Codex parent".to_owned()),
-                token_count: None,
-                created_at_ms: Some(100),
-                updated_at_ms: Some(100),
-                resumable: true,
-            },
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("insert parent session");
     let before = load_sessions(dir.path());
 
     let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
@@ -516,36 +576,36 @@ async fn stale_parent_fork_fails_without_touching_source_session() {
         .spawn_agent(SpawnAgentPayload {
             name: Some("Unsupported BTW".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(AgentId("codex-parent-agent".to_owned())),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Fork {
-                from_session_id: parent_session_id.clone(),
+                from_session_id: source_session_id.clone(),
                 prompt: "side question".to_owned(),
                 images: None,
                 access_mode: None,
             },
         })
         .await
-        .expect("send stale-parent fork spawn");
+        .expect("send unsupported-backend fork spawn");
 
     let child =
-        expect_new_agent_with_diagnostics(&mut client, &host, "stale-parent child NewAgent").await;
-    assert_eq!(child.origin, AgentOrigin::SideQuestion);
-    assert_eq!(child.backend_kind, BackendKind::Codex);
-    assert_eq!(
-        child.parent_agent_id,
-        Some(AgentId("codex-parent-agent".to_owned()))
-    );
+        expect_new_agent_with_diagnostics(&mut client, &host, "unsupported fork NewAgent").await;
+    assert_eq!(child.origin, AgentOrigin::User);
+    assert_eq!(child.backend_kind, BackendKind::Tycode);
+    assert_eq!(child.parent_agent_id, None);
     let _ = expect_agent_start(&mut client, &child.instance_stream, "failed child start").await;
     let error = expect_agent_error(
         &mut client,
         &child.instance_stream,
-        "fork stale-parent error",
+        "unsupported fork error",
     )
     .await;
-    assert_eq!(error.code, AgentErrorCode::Internal);
-    assert!(error.message.contains("parent_agent_id"));
-    assert!(error.message.contains("is not running"));
+    assert_eq!(error.code, AgentErrorCode::Unsupported);
+    assert!(
+        error.message.contains("does not support session fork"),
+        "unexpected unsupported-fork message: {}",
+        error.message
+    );
 
     let after = load_sessions(dir.path());
     assert_eq!(after.len(), 1);

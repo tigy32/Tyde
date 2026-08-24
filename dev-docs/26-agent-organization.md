@@ -662,7 +662,7 @@ Each row/card shows:
 - project label or "No project",
 - origin label,
 - age / created time,
-- optional custom-agent/team/workflow/side-question badges where already
+- optional custom-agent/team/workflow badges where already
   available,
 - manual and system tag chips after Phase 2b,
 - pin toggle after Phase 2b,

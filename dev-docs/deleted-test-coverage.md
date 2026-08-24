@@ -1022,9 +1022,7 @@ test files and ~230 test-only plumbing items (gates, hooks, cfg twins).
   - [ ] `accepts_workflow_origin_with_metadata`
   - [ ] `rejects_workflow_origin_without_metadata`
   - [ ] `rejects_non_workflow_origin_with_workflow_metadata`
-  - [ ] `rejects_side_question_origin_without_parent`
-  - [ ] `accepts_side_question_origin_with_parent`
-  - [ ] `rejects_fork_spawn_without_parent_agent_id`
+  - [ ] `rejects_fork_spawn_with_parent_agent_id`
   - [ ] `rejects_fork_spawn_without_from_session_id`
   - [ ] `accepts_turn_with_tools_after_stream_end`
   - [ ] `warning_during_stream_does_not_close_assistant_turn`

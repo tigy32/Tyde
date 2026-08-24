@@ -479,7 +479,6 @@ fn origin_label(origin: AgentOrigin) -> &'static str {
     match origin {
         AgentOrigin::User => "User",
         AgentOrigin::AgentControl => "Agent control",
-        AgentOrigin::SideQuestion => "Aside",
         AgentOrigin::BackendNative => "Native",
         AgentOrigin::TeamMember => "Team",
         AgentOrigin::Workflow => "Workflow",
@@ -601,10 +600,9 @@ const BACKENDS: [BackendKind; 6] = [
     BackendKind::Hermes,
 ];
 
-const ORIGINS: [AgentOrigin; 6] = [
+const ORIGINS: [AgentOrigin; 5] = [
     AgentOrigin::User,
     AgentOrigin::AgentControl,
-    AgentOrigin::SideQuestion,
     AgentOrigin::BackendNative,
     AgentOrigin::TeamMember,
     AgentOrigin::Workflow,

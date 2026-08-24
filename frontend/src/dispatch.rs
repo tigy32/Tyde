@@ -1024,11 +1024,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 };
                 let project_id = info.project_id.clone();
                 let agent_name_for_upgrade = info.name.clone();
-                // User-origin and SideQuestion agents may resolve an exact
-                // draft intent. Programmatic agents only appear in state and
-                // never create or select a tab from a server event.
-                let is_programmatic =
-                    !matches!(origin, AgentOrigin::User | AgentOrigin::SideQuestion);
+                // User-origin agents (which now includes session forks) may
+                // resolve an exact draft intent. Programmatic agents only
+                // appear in state and never create or select a tab from a
+                // server event.
+                let is_programmatic = !matches!(origin, AgentOrigin::User);
                 state.agents.update(|agents| {
                     agents
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));

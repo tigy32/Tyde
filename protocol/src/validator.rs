@@ -1505,9 +1505,6 @@ fn validate_agent_origin(
         AgentOrigin::BackendNative if parent_agent_id.is_none() => {
             Err("backend_native agents must include parent_agent_id".to_owned())
         }
-        AgentOrigin::SideQuestion if parent_agent_id.is_none() => {
-            Err("side_question agents must include parent_agent_id".to_owned())
-        }
         AgentOrigin::TeamMember if team_id.is_none() || team_member_id.is_none() => {
             Err("team_member agents must include team_id and team_member_id".to_owned())
         }
@@ -1516,7 +1513,6 @@ fn validate_agent_origin(
         }
         AgentOrigin::User
         | AgentOrigin::AgentControl
-        | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
         | AgentOrigin::Workflow
             if team_id.is_some() || team_member_id.is_some() =>
@@ -1525,7 +1521,6 @@ fn validate_agent_origin(
         }
         AgentOrigin::User
         | AgentOrigin::AgentControl
-        | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
         | AgentOrigin::TeamMember
             if workflow.is_some() =>
@@ -1534,7 +1529,6 @@ fn validate_agent_origin(
         }
         AgentOrigin::User
         | AgentOrigin::AgentControl
-        | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
         | AgentOrigin::TeamMember
         | AgentOrigin::Workflow => Ok(()),
@@ -1549,8 +1543,11 @@ fn validate_spawn_agent_payload(payload: &SpawnAgentPayload) -> Result<(), Strin
         ..
     } = &payload.params
     {
-        if payload.parent_agent_id.is_none() {
-            return Err("fork spawn_agent must include parent_agent_id".to_owned());
+        // A fork is defined solely by its source session. It is a top-level
+        // agent, so an owning parent is not merely unnecessary — accepting one
+        // would make the child a sub-agent again.
+        if payload.parent_agent_id.is_some() {
+            return Err("fork spawn_agent must not include parent_agent_id".to_owned());
         }
         if from_session_id.0.trim().is_empty() {
             return Err("fork spawn_agent must include from_session_id".to_owned());

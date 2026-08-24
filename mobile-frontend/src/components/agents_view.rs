@@ -334,7 +334,6 @@ fn agent_row(
     let has_error = agent.fatal_error.is_some();
     let error_msg = agent.fatal_error.clone().unwrap_or_default();
     let is_sub = agent.parent_agent_id.is_some();
-    let is_side_question = matches!(agent.origin, protocol::AgentOrigin::SideQuestion);
     let agent_ref = AgentRef {
         local_host_id: host_id.clone(),
         agent_id: agent_id.clone(),
@@ -428,12 +427,11 @@ fn agent_row(
                             data_mobile_test="agent-row-status-label"
                         />
                         <span style="margin-left: var(--space-2);">{backend}</span>
-                        {(is_side_question || is_sub).then(|| {
-                            let label = if is_side_question { "Aside" } else { "Sub-agent" };
+                        {is_sub.then(|| {
                             view! {
                                 <span style="margin-left: var(--space-2);">
                                     <Pill
-                                        label=label.to_string()
+                                        label="Sub-agent".to_string()
                                         tone=PillTone::Neutral
                                     />
                                 </span>
@@ -565,35 +563,79 @@ mod wasm_tests {
         agent
     }
 
-    /// A side question fork is shown with the compact "Aside" label
-    /// rather than the generic "Sub-agent" tag — both shorter and more
-    /// meaningful on a narrow phone row.
+    /// A BTW fork is a stand-alone top-level chat, so none of the sub-agent
+    /// treatment may reach it. Two things are checked against the same
+    /// fixture, in which "Owned child" is a genuine sub-agent acting as the
+    /// control: the fork survives the hide-sub-agents pref (the failure that
+    /// loses work — the chat vanishes from the phone), and it never renders
+    /// the "Sub-agent" pill that the real child does.
     #[wasm_bindgen_test]
-    async fn agents_side_question_row_shows_aside_label() {
-        set_hide_sub_agents_pref(false);
+    async fn agents_forked_row_is_not_treated_as_a_sub_agent() {
         let host = LocalHostId("host-1".to_owned());
-        let container = make_container();
-        let host_for_mount = host.clone();
-        let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_local_host_id.set(Some(host_for_mount.clone()));
-            let parent = fixture(&host_for_mount, "parent", "Parent agent", None);
-            let mut btw = child_fixture(&host_for_mount, "btw-1", "Side question", "parent");
-            btw.origin = AgentOrigin::SideQuestion;
-            state.agents.set(vec![parent, btw]);
-            provide_context(state);
-            view! { <AgentsView /> }
-        });
+        let mount_fixture = |container: web_sys::HtmlElement, host: LocalHostId| {
+            mount_to(container, move || {
+                let state = AppState::new();
+                state.active_local_host_id.set(Some(host.clone()));
+                let source = fixture(&host, "source", "Source agent", None);
+                let owned = child_fixture(&host, "owned-1", "Owned child", "source");
+                let btw = fixture(&host, "btw-1", "BTW: why is this slow?", None);
+                state.agents.set(vec![source, owned, btw]);
+                provide_context(state);
+                view! { <AgentsView /> }
+            })
+        };
+
+        set_hide_sub_agents_pref(true);
+        let hidden_container = make_container();
+        let _hidden = mount_fixture(hidden_container.clone(), host.clone());
         next_tick().await;
-        let text = container.text_content().unwrap_or_default();
+        let hidden_text = hidden_container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Aside"),
-            "side question row must surface the Aside label: {text}"
+            !hidden_text.contains("Owned child"),
+            "control: hide-sub-agents must be hiding the genuinely owned child: {hidden_text}"
         );
         assert!(
-            !text.contains("Sub-agent"),
-            "side question must prefer Aside over the generic Sub-agent tag: {text}"
+            hidden_text.contains("BTW: why is this slow?"),
+            "a fork must stay visible when sub-agents are hidden: {hidden_text}"
         );
+
+        set_hide_sub_agents_pref(false);
+        let shown_container = make_container();
+        let _shown = mount_fixture(shown_container.clone(), host.clone());
+        next_tick().await;
+        let shown_text = shown_container.text_content().unwrap_or_default();
+        assert!(
+            shown_text.contains("Owned child") && shown_text.contains("BTW: why is this slow?"),
+            "control: both rows must render once sub-agents are shown: {shown_text}"
+        );
+        let pills = shown_container
+            .query_selector_all("[data-mobile-test=\"pill\"]")
+            .unwrap();
+        let mut sub_agent_pills = 0;
+        for index in 0..pills.length() {
+            let pill = pills.item(index).expect("pill node");
+            if pill.text_content().unwrap_or_default().trim() == "Sub-agent" {
+                sub_agent_pills += 1;
+            }
+        }
+        assert_eq!(
+            sub_agent_pills, 1,
+            "exactly one row is a sub-agent — the owned child, never the fork"
+        );
+        let owned_row = shown_container
+            .query_selector_all(".list-row-primary")
+            .unwrap();
+        for index in 0..owned_row.length() {
+            let row = owned_row.item(index).expect("row node");
+            let text = row.text_content().unwrap_or_default();
+            if text.contains("BTW: why is this slow?") {
+                assert!(
+                    !text.contains("Sub-agent"),
+                    "the fork row must not carry the sub-agent tag: {text}"
+                );
+            }
+        }
+        clear_hide_sub_agents_pref();
     }
 
     /// While the host is connected but its snapshot (the source of the

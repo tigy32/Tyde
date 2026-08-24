@@ -657,6 +657,9 @@ impl BackendKind {
 /// Serialized name of the backend kind Kiro had before it became an ACP
 /// launch profile. Only migrations should reference this.
 pub const LEGACY_KIRO_BACKEND: &str = "kiro";
+/// Serialized name of the agent origin session forks carried before they
+/// became ordinary top-level agents. Only migrations should reference this.
+pub const LEGACY_SIDE_QUESTION_ORIGIN: &str = "side_question";
 /// Serialized name of [`BackendKind::Acp`].
 pub const ACP_BACKEND: &str = "acp";
 /// Launch profile id of the built-in Kiro agent. Reserved against
@@ -797,8 +800,6 @@ pub enum AgentOrigin {
     User,
     /// Spawned programmatically through Tyde-owned orchestration (e.g. agent-control MCP).
     AgentControl,
-    /// Spawned as a first-class fork of an existing session for a side question.
-    SideQuestion,
     /// Spawned by the backend's own native sub-agent mechanism (e.g. Claude subagents).
     BackendNative,
     /// Spawned as a persistent member of a server-owned agent team.
