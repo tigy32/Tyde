@@ -46,8 +46,12 @@ const READY_MARKER: &str = "TYDE_READY";
 const WROTE_MARKER: &str = "TYDE_WROTE";
 const MULTI_MARKER: &str = "TYDE_MULTI";
 const BG_MARKER: &str = "TYDE_BG";
+/// Printed on stdout by the background command itself, so the card can be
+/// asked whether it captured what the command actually produced.
+const BG_OUTPUT_MARKER: &str = "TYDE_BG_OUTPUT";
 const WATCHED_MARKER: &str = "TYDE_WATCHED";
 const WAITED_MARKER: &str = "TYDE_WAITED";
+const REPORTED_MARKER: &str = "TYDE_REPORTED";
 const DELETED_MARKER: &str = "TYDE_DELETED";
 const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
 const MEMORIZED_MARKER: &str = "TYDE_MEMORIZED";
@@ -944,6 +948,38 @@ fn real_background_task_outlives_its_turn() {
             );
             assert_no_error_message(&format!("{:?} background settle", host.backend()), &settled);
 
+            // The cards still open when the launching turn ended: one of them
+            // is the background command, and its completion is what has to
+            // carry the command's output.
+            let watched: Vec<String> = started
+                .tool_requests()
+                .map(|request| request.tool_call_id.clone())
+                .filter(|tool_call_id| {
+                    !started
+                        .tool_completions()
+                        .any(|completion| &completion.tool_call_id == tool_call_id)
+                })
+                .collect();
+
+            // A finished background process reaches the agent at a turn
+            // boundary, so on a backend that reports its output that way there
+            // has to be a turn for it to arrive on. Backends that complete the
+            // card earlier are unaffected: the assertion below reads the card,
+            // not this turn.
+            let reported = ask(&mut host, &agent, report_prompt()).await;
+            assert_no_error_message(&reported.label(), reported.events());
+
+            assert_background_output_reached_its_card(
+                &started.label(),
+                &watched,
+                started
+                    .events()
+                    .iter()
+                    .chain(waited.events().iter())
+                    .chain(settled.iter())
+                    .chain(reported.events().iter()),
+            );
+
             assert_clean_close(&mut host, &agent).await;
         },
     );
@@ -1725,14 +1761,16 @@ fn background_prompt(workspace: &Path, backend_kind: BackendKind, seconds: u64) 
     let root = workspace_root(workspace);
     let launch = match backend_kind {
         BackendKind::Codex => format!(
-            "Run this exact shell command: sleep {seconds}; echo DONE > {BG_FILE}. Run it as an \
-             ordinary foreground command in {root} — do not append `&`, and do \
-             not use `nohup`, `disown`, or a detached subshell. Do not wait for its output."
+            "Run this exact shell command: sleep {seconds}; echo DONE > {BG_FILE}; echo \
+             {BG_OUTPUT_MARKER}. Run it as an ordinary foreground command in {root} — do not \
+             append `&`, and do not use `nohup`, `disown`, or a detached subshell. Do not wait \
+             for its output."
         ),
         _ => format!(
-            "Start a shell command that sleeps for {seconds} seconds and then writes the word \
-             DONE into a file named {BG_FILE} in {root}. Run it in the background and \
-             do not wait for it to finish."
+            "Start a shell command that sleeps for {seconds} seconds, then writes the word DONE \
+             into a file named {BG_FILE} in {root}, and finally prints {BG_OUTPUT_MARKER} to \
+             standard output. Run it in the background and do not wait for it to finish, but do \
+             arrange to be told its output once it has finished."
         ),
     };
     format!("{launch} As soon as it is started, reply with exactly {BG_MARKER} and nothing else.")
@@ -1808,6 +1846,16 @@ fn slow_command_prompt(proof: &Path) -> String {
 /// Bash tool refuses a long *leading* sleep ("Long leading `sleep` commands are
 /// blocked"), which made an earlier version of this prompt run nothing at all
 /// and still pass.
+/// Give a backend that reports a finished background process at a turn
+/// boundary a turn for it to arrive on.
+fn report_prompt() -> String {
+    format!(
+        "The shell command you started in the background earlier has finished by now. Say what \
+         it printed. Do not run it again and do not start any new command. Then reply with \
+         exactly {REPORTED_MARKER} and nothing else."
+    )
+}
+
 fn wait_prompt() -> String {
     format!(
         "Run this exact shell command and wait for it to finish — do not run it in the \
@@ -3059,6 +3107,70 @@ fn assert_background_task_is_still_open(turn: &Turn) {
 /// front of them, not the job they deliberately detached. A backend that kills
 /// detached work here silently loses it, and the only place that shows up is the
 /// file the command was going to write.
+/// A finished background card has to carry the output the command produced.
+///
+/// This is the one thing about a background command the user cannot verify any
+/// other way. An empty-but-successful card and a command whose output was
+/// dropped on the floor render identically — green, exit 0, nothing to read —
+/// so every check that stops at "the card completed" passes either way. The
+/// command prints `BG_OUTPUT_MARKER` on stdout, so the marker missing from
+/// every captured result means the output was lost, not that the command was
+/// quiet.
+fn assert_background_output_reached_its_card<'a>(
+    label: &str,
+    card_ids: &[String],
+    events: impl Iterator<Item = &'a ChatEvent>,
+) {
+    let mut observed: Vec<String> = Vec::new();
+    for event in events {
+        let ChatEvent::ToolExecutionCompleted(completion) = event else {
+            continue;
+        };
+        // Only the card the command was started on counts. A backend that
+        // re-ran the command to answer a later question would print the marker
+        // again, and accepting any card would let that stand in for the
+        // reporting this exists to check.
+        if !card_ids.contains(&completion.tool_call_id) {
+            continue;
+        }
+        match &completion.outcome {
+            ToolExecutionOutcome::Succeeded {
+                result:
+                    ToolExecutionResult::RunCommand {
+                        exit_code,
+                        stdout,
+                        stderr,
+                    },
+            } => {
+                if stdout.contains(BG_OUTPUT_MARKER) || stderr.contains(BG_OUTPUT_MARKER) {
+                    return;
+                }
+                observed.push(format!(
+                    "{} ok exit={exit_code} stdout={stdout:?} stderr={stderr:?}",
+                    completion.tool_call_id
+                ));
+            }
+            ToolExecutionOutcome::Succeeded { result } => {
+                observed.push(format!("{} ok {result:?}", completion.tool_call_id));
+            }
+            ToolExecutionOutcome::Failed {
+                message, details, ..
+            } => observed.push(format!(
+                "{} failed {message:?} details={details:?}",
+                completion.tool_call_id
+            )),
+            ToolExecutionOutcome::Cancelled { message } => {
+                observed.push(format!("{} cancelled {message:?}", completion.tool_call_id));
+            }
+        }
+    }
+    panic!(
+        "{label}: the card the background command was started on never carried \
+         {BG_OUTPUT_MARKER}, which that command printed on stdout, so its output never reached \
+         the card the user reads. Cards watched: {card_ids:?}; their completions: {observed:#?}"
+    );
+}
+
 fn assert_background_task_survived_the_interrupt(
     started: &Turn,
     interrupted: &Interrupted,

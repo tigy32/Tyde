@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -7739,66 +7739,112 @@ fn refresh_unresolved_background_tasks(
 
 const BACKGROUND_COMMAND_OUTPUT_LIMIT: u64 = 64 * 1024;
 
+/// The CLI's own trailer on a finished background command's output file, and
+/// the only place that command's exit status is written down.
+const BACKGROUND_COMMAND_EXIT_PREFIX: &str = "[exited with code ";
+
+/// Read what a finished background command actually printed.
+///
+/// The file is plain text: the shell has already merged stdout and stderr into
+/// one stream. It is not JSON and never was — reading it as JSON discarded the
+/// output of every background command Tyde ever ran, and the caller then
+/// reported a fabricated empty success. Measured against Claude Code 2.1.220
+/// on 2026-08-23.
+///
+/// Because the two streams arrive already interleaved, they cannot be split
+/// back apart; the merged text is reported as `stdout`, which is what the
+/// foreground path does with unmarked command text as well.
 fn capture_background_command_output(
-    output_file: Option<&str>,
-) -> Result<ClaudeRunCommandResult, &'static str> {
-    let Some(raw_path) = output_file.map(str::trim).filter(|path| !path.is_empty()) else {
-        return Err("Claude did not provide a structured command output file");
-    };
-    let temp_root = std::fs::canonicalize(std::env::temp_dir())
-        .map_err(|_| "Claude command output file was unavailable")?;
+    output_file: &str,
+    summary: Option<&str>,
+) -> Result<ClaudeRunCommandResult, String> {
+    let raw_path = output_file.trim();
     let path = std::fs::canonicalize(raw_path)
-        .map_err(|_| "Claude command output file was unavailable")?;
-    if !path.starts_with(&temp_root) {
-        return Err("Claude command output path was outside the temporary directory");
-    }
-    let metadata =
-        std::fs::metadata(&path).map_err(|_| "Claude command output file was unavailable")?;
+        .map_err(|error| format!("output file {raw_path} could not be opened: {error}"))?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("output file {raw_path} could not be read: {error}"))?;
     if !metadata.is_file() {
-        return Err("Claude command output file was unavailable");
+        return Err(format!("output path {raw_path} is not a file"));
     }
-    if metadata.len() > BACKGROUND_COMMAND_OUTPUT_LIMIT {
-        return Err("Claude command output exceeded the capture limit");
+
+    // Real runs reach hundreds of kilobytes — a full `./dev.sh check` was
+    // measured at 292 KiB. Refusing to read those lost exactly the output
+    // worth reading, so keep the tail, where whatever failed will be.
+    let mut file = std::fs::File::open(&path)
+        .map_err(|error| format!("output file {raw_path} could not be opened: {error}"))?;
+    let dropped = metadata
+        .len()
+        .saturating_sub(BACKGROUND_COMMAND_OUTPUT_LIMIT);
+    if dropped > 0 {
+        file.seek(SeekFrom::End(-(BACKGROUND_COMMAND_OUTPUT_LIMIT as i64)))
+            .map_err(|error| format!("output file {raw_path} could not be read: {error}"))?;
     }
-    let file =
-        std::fs::File::open(path).map_err(|_| "Claude command output file was unavailable")?;
-    let mut bytes = Vec::with_capacity(BACKGROUND_COMMAND_OUTPUT_LIMIT as usize);
-    file.take(BACKGROUND_COMMAND_OUTPUT_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Claude command output file was unavailable")?;
-    if bytes.len() as u64 > BACKGROUND_COMMAND_OUTPUT_LIMIT {
-        return Err("Claude command output exceeded the capture limit");
-    }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "Claude command output was not structurally available")?;
-    let Value::Object(map) = &value else {
-        return Err("Claude command output was not structurally available");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("output file {raw_path} could not be read: {error}"))?;
+
+    let summary = summary.unwrap_or_default();
+    let Some(exit_code) = parse_summary_exit_code(summary) else {
+        return Err(format!(
+            "notification summary {summary:?} did not state an exit code, so the command's \
+             status is unknown"
+        ));
     };
-    let has_structured_field = [
-        "exit_code",
-        "exitCode",
-        "code",
-        "return_code",
-        "returnCode",
-        "stdout",
-        "output",
-        "std_out",
-        "stderr",
-        "error",
-        "std_err",
-    ]
-    .iter()
-    .any(|key| map.contains_key(*key));
-    if !has_structured_field {
-        return Err("Claude command output was not structurally available");
+
+    let text = String::from_utf8_lossy(&bytes);
+    let body = strip_background_command_exit_trailer(&text);
+    let stdout = if dropped > 0 {
+        format!("[Tyde: dropped the first {dropped} bytes of this output]\n{body}")
+    } else {
+        body.to_owned()
+    };
+    Ok(ClaudeRunCommandResult {
+        exit_code,
+        stdout,
+        stderr: String::new(),
+    })
+}
+
+/// A finished background command's exit status, which the CLI states only in
+/// the notification summary: `… completed (exit code 0)`, `… failed with exit
+/// code 7`.
+///
+/// The output file grows an `[exited with code N]` trailer saying the same
+/// thing, but the CLI appends it *after* sending the notification — measured
+/// 2026-08-23, the file held 15 bytes of command output when the notification
+/// arrived and 37 bytes with the trailer afterwards — so it is never there to
+/// read. Taking the last `exit code` in the summary keeps a command string
+/// that happens to contain those words from being read as the status.
+fn parse_summary_exit_code(summary: &str) -> Option<i32> {
+    let (_, rest) = summary.rsplit_once("exit code ")?;
+    let digits: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// Drop the CLI's `[exited with code N]` trailer when it did land in time.
+///
+/// The trailer is the CLI talking, not the command, so it does not belong in
+/// the output the user reads. Only the last line is considered: command output
+/// that merely mentions an exit code is the command's own.
+fn strip_background_command_exit_trailer(text: &str) -> &str {
+    let trimmed = text.trim_end_matches(['\n', '\r']);
+    let (body, trailer) = match trimmed.rfind('\n') {
+        Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
+        None => ("", trimmed),
+    };
+    let is_trailer = trailer
+        .trim()
+        .strip_prefix(BACKGROUND_COMMAND_EXIT_PREFIX)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|code| code.trim().parse::<i32>().is_ok());
+    if is_trailer {
+        body.trim_end_matches(['\n', '\r'])
+    } else {
+        trimmed
     }
-    Ok(
-        parse_run_command_result_from_value(&value, 0).unwrap_or(ClaudeRunCommandResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        }),
-    )
 }
 
 fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
@@ -7846,12 +7892,20 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
         }
     } else {
         match entry.state.status {
-            BackgroundTaskStatus::Completed => ToolExecutionOutcome::Succeeded {
-                result: ToolExecutionResult::RunCommand {
-                    exit_code: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
+            // Reporting a success here invents an exit code and an empty
+            // stdout for a command whose output was never read, and renders
+            // identically to a command that really did print nothing — which
+            // is how the output of every background command was lost without
+            // anyone ever seeing an error.
+            BackgroundTaskStatus::Completed => match &entry.state.output_unavailable {
+                Some(reason) => ToolExecutionOutcome::Failed {
+                    message: "Tyde could not read this command's output".to_owned(),
+                    details: Some(reason.clone()),
+                    normalization_failure: None,
                 },
+                // Nothing was reported to complete the card with; whoever owns
+                // the result completes it.
+                None => return,
             },
             BackgroundTaskStatus::Stopped => ToolExecutionOutcome::Cancelled {
                 message: entry
@@ -8099,9 +8153,33 @@ fn handle_background_bash_task_frame_with_owners(
                 .as_deref()
                 .or(system.path.as_deref())
                 .or(entry.output_path.as_deref());
-            match capture_background_command_output(output_path) {
-                Ok(output) => entry.output = Some(output),
-                Err(reason) => entry.state.output_unavailable = Some(reason.to_owned()),
+            tracing::debug!(
+                task_id,
+                tool_use_id = entry.tool_use_id,
+                status = ?entry.state.status,
+                summary = entry.state.summary.as_deref().unwrap_or("<none>"),
+                output_path = output_path.unwrap_or("<none>"),
+                "terminal background task notification"
+            );
+            // A long-running foreground `Bash` is mirrored as a task too, and
+            // its terminal notification names no output file because the CLI
+            // is not reporting a command result here — the foreground
+            // `tool_result` is. Only a notification that names a file is
+            // reporting output, and only then is a missing one a defect.
+            if let Some(output_path) = output_path.map(str::trim).filter(|path| !path.is_empty()) {
+                match capture_background_command_output(output_path, entry.state.summary.as_deref())
+                {
+                    Ok(output) => entry.output = Some(output),
+                    Err(reason) => {
+                        tracing::error!(
+                            task_id,
+                            output_path,
+                            reason,
+                            "background command output capture failed"
+                        );
+                        entry.state.output_unavailable = Some(reason);
+                    }
+                }
             }
             entry.terminal_notification_received = true;
             let mut completion_emitted = false;
