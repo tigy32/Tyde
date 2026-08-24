@@ -250,10 +250,10 @@ instance — it does not get written.
 
 Where they live and run:
 
-- **Backend conformance** — registered in the agent-adapter certification
-  registry, implemented in `tests/tests/backend.rs`, opt-in via
-  `TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=<kind>`. Required when a
-  backend changes (§3); run deliberately — think first, run once.
+- **Backend conformance** — implemented as coarse real-provider scenarios in
+  `tests/tests/conformance.rs`, opt-in via `TYDE_RUN_REAL_AI_TESTS=1
+  TYDE_REAL_BACKENDS=<kind>`. Required when a backend changes (§3); run
+  deliberately — think first, run once.
 - **Server sim tests** — `server/tests/`, one file per server feature
   (agents, settings, projects, teams, queue, …), each driving the real server
   through the protocol on the shared fixture (`server/tests/fixture.rs`) with

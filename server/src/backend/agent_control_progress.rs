@@ -31,7 +31,7 @@ pub(crate) fn is_tyde_agent_control_await_tool_name(tool_name: &str) -> bool {
         || normalize_tool_name(tool_name).ends_with("tydeagentawaittydeawaitagents")
 }
 
-fn is_tyde_agent_control_send_message_tool_name(tool_name: &str) -> bool {
+pub(crate) fn is_tyde_agent_control_send_message_tool_name(tool_name: &str) -> bool {
     is_tyde_agent_control_tool_name(tool_name, "tydesendagentmessage")
 }
 

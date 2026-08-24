@@ -980,7 +980,10 @@ impl TurnEmitterState {
             if existing.outcome != outcome {
                 self.violation(
                     "conflicting_duplicate_completion",
-                    format!("tool '{tool_call_id}' completed twice with different outcomes"),
+                    format!(
+                        "tool '{tool_call_id}' completed twice with different outcomes: first={:?}, second={outcome:?}",
+                        existing.outcome
+                    ),
                 );
             }
             return;

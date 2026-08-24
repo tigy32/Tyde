@@ -25,7 +25,8 @@ use uuid::Uuid;
 
 use crate::agent::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::agent_control_progress::{
-    PendingToolNormalizationFailure, await_progress_data_for_tool, normalize_tyde_chat_event,
+    PendingToolNormalizationFailure, await_progress_data_for_tool,
+    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event,
     spawn_progress_data_for_tool_result, terminal_await_progress_data_for_tool,
 };
 use crate::backend::hermes_config::{self, HermesProfileRef};
@@ -119,11 +120,38 @@ _tyde_open_messages = {}
 _tyde_message_generations = {}
 from tools import process_registry as _tyde_process_registry_module
 _tyde_original_format_process_notification = _tyde_process_registry_module.format_process_notification
+_tyde_original_kill_process = _tyde_process_registry_module.process_registry.kill_process
+_tyde_cancelled_process_lock = threading.Lock()
+_tyde_cancelled_processes = set()
 _tyde_background_completion_lock = threading.Lock()
 _tyde_background_completions = {}
 _tyde_background_completions_delivered = set()
 
+def _tyde_kill_process(session_id, *args, **kwargs):
+    process_id = str(session_id or "")
+    if process_id:
+        with _tyde_cancelled_process_lock:
+            _tyde_cancelled_processes.add(process_id)
+    return _tyde_original_kill_process(session_id, *args, **kwargs)
+
+_tyde_process_registry_module.process_registry.kill_process = _tyde_kill_process
+
 def _tyde_format_process_notification(event):
+    if isinstance(event, dict) and event.get("type", "completion") == "completion":
+        process_id = str(event.get("session_id") or "")
+        with _tyde_cancelled_process_lock:
+            was_cancelled = process_id in _tyde_cancelled_processes
+            _tyde_cancelled_processes.discard(process_id)
+    else:
+        process_id = ""
+        was_cancelled = False
+    if was_cancelled:
+        print(
+            f"TYDE HERMES SUPPRESSED CANCELLED PROCESS NOTIFICATION event={event!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
     text = _tyde_original_format_process_notification(event)
     if isinstance(event, dict) and event.get("type", "completion") == "completion" and text:
         process_id = str(event.get("session_id") or "")
@@ -900,6 +928,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::ContextBreakdownReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
@@ -5009,6 +5038,12 @@ impl HermesEventMapper {
         let native_subagent_dispatch = success
             && is_hermes_delegate_tool(&tool_name)
             && optional_string(&result, &["status"]).as_deref() == Some("dispatched");
+        if success
+            && let Some(progress) =
+                spawn_progress_data_for_tool_result(&completion_tool_call_id, &tool_name, &result)
+        {
+            events.push(ChatEvent::ToolProgress(progress));
+        }
         if background_task_id.is_none() && !native_subagent_dispatch {
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
@@ -5070,12 +5105,6 @@ impl HermesEventMapper {
                 "mapped Hermes todo result to typed task state"
             );
             events.push(ChatEvent::TaskUpdate(tasks));
-        }
-        if success
-            && let Some(progress) =
-                spawn_progress_data_for_tool_result(&completion_tool_call_id, &tool_name, &result)
-        {
-            events.push(ChatEvent::ToolProgress(progress));
         }
         Ok(events)
     }
@@ -5586,6 +5615,13 @@ fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+        });
+    }
+    if is_tyde_agent_control_spawn_tool_name(tool_name) {
+        return Some(ToolRequestType::AgentSpawn {
+            prompt: non_empty_value_string(arguments, &["prompt"]),
+            name: non_empty_value_string(arguments, &["name"]),
+            execution_mode: protocol::AgentExecutionMode::Background,
         });
     }
     if is_hermes_delegate_tool(tool_name) {

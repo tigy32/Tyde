@@ -99,10 +99,6 @@ const CLAUDE_AGENT_NAME: &str = "claude";
 const CLAUDE_FREE_TEXT_SENTINEL: &str = "TYDE_FREE_TEXT";
 const CLAUDE_FREE_TEXT_OTHER: &str = "Other";
 
-const CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
-const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
-const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
-const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 /// How long the stdout reader waits for a finished turn's finalizer to hand
 /// off before adopting a CLI wake turn. Bounded because the reader is blocked
@@ -526,7 +522,6 @@ impl ClaudeSession {
                 skill_watchdog: None,
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
-                conversation_bytes_total: 0,
                 active_turn: None,
                 compaction_capability: BackendCompactionCapability::unknown(
                     BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -749,7 +744,6 @@ struct ClaudeState {
     skill_watchdog: Option<JoinHandle<()>>,
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
-    conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
     compaction_capability: BackendCompactionCapability,
     compact_command_advertised: Option<bool>,
@@ -801,7 +795,6 @@ impl Default for ClaudeState {
             skill_watchdog: None,
             cumulative_usage: None,
             cumulative_usage_complete: true,
-            conversation_bytes_total: 0,
             active_turn: None,
             compaction_capability: BackendCompactionCapability::unknown(
                 BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -1061,8 +1054,6 @@ struct ClaudeStdoutSummary {
     /// Sum of distinct API-call usages observed while relaying a native child.
     /// Claude does not consistently correlate a `result` frame to native children.
     accumulated_request_usage: Option<Value>,
-    /// Context window extracted from `result.modelUsage[model].contextWindow`.
-    result_context_window: Option<u64>,
     errors: Vec<String>,
     tool_calls: Vec<ClaudeToolCall>,
     seen_tool_ids: HashSet<String>,
@@ -1076,8 +1067,6 @@ struct ClaudeStdoutSummary {
     /// identical offset, or the emitter reads the repeat as a conflicting
     /// declaration and drops the call from the persisted message.
     streaming_tool_content_offsets: HashMap<String, u32>,
-    tool_io_bytes: u64,
-    reasoning_bytes: u64,
     emitted_phase_count: u64,
     control_event: Option<ClaudeControlEvent>,
 }
@@ -1418,14 +1407,6 @@ impl ClaudeStdoutSummary {
             self.tool_modify_preview_by_id
                 .insert(tool_call.id.clone(), preview);
         }
-        self.tool_io_bytes = self
-            .tool_io_bytes
-            .saturating_add(tool_call.name.len() as u64)
-            .saturating_add(
-                serde_json::to_string(&tool_call.arguments)
-                    .expect("serde_json::Value is always serializable")
-                    .len() as u64,
-            );
         self.tool_calls.push(tool_call);
         true
     }
@@ -1469,8 +1450,6 @@ struct ClaudePhaseEmission {
     model: Option<String>,
     usage: Option<Value>,
     tool_calls: Vec<ClaudeToolCall>,
-    tool_io_bytes: u64,
-    reasoning_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1482,8 +1461,6 @@ struct ClaudeTurnUsage {
 #[derive(Default)]
 struct ClaudeTerminalPhaseOptions {
     turn_id: u64,
-    conversation_history_bytes: u64,
-    known_context_window: Option<u64>,
     model_hint: Option<String>,
     turn_usage: Option<ClaudeTurnUsage>,
     cancelled: bool,
@@ -1592,7 +1569,6 @@ struct ClaudeSessionReplay {
     items: Vec<ClaudeHistoryReplayItem>,
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
-    conversation_bytes_total: u64,
 }
 
 #[derive(Debug)]
@@ -1881,8 +1857,7 @@ impl ClaudeInner {
         images: Option<Vec<ImageAttachment>>,
     ) -> ClaudeSendAdmission {
         let images = images.unwrap_or_default();
-        let input_bytes = estimate_turn_input_bytes(&message, &images);
-        let (turn_id, conversation_history_bytes, model_hint, ephemeral, outcome_rx) = {
+        let (turn_id, model_hint, ephemeral, outcome_rx) = {
             let mut state = self.state.lock().await;
             if state.closing {
                 drop(state);
@@ -1904,16 +1879,7 @@ impl ClaudeInner {
                 pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
-            state.conversation_bytes_total =
-                state.conversation_bytes_total.saturating_add(input_bytes);
-
-            (
-                turn_id,
-                state.conversation_bytes_total,
-                state.model.clone(),
-                state.ephemeral,
-                outcome_rx,
-            )
+            (turn_id, state.model.clone(), state.ephemeral, outcome_rx)
         };
 
         // The user bubble is emitted only once the turn is admitted, so a
@@ -1956,14 +1922,8 @@ impl ClaudeInner {
                 error: "Claude turn ended before returning a result".to_string(),
             });
 
-            self.finalize_turn(
-                turn_id,
-                outcome,
-                ephemeral,
-                conversation_history_bytes,
-                model_hint,
-            )
-            .await;
+            self.finalize_turn(turn_id, outcome, ephemeral, model_hint)
+                .await;
         });
         ClaudeSendAdmission::Handled
     }
@@ -2143,7 +2103,6 @@ impl ClaudeInner {
         turn_id: u64,
         outcome: TurnOutcome,
         ephemeral: bool,
-        conversation_history_bytes: u64,
         model_hint: Option<String>,
     ) {
         let pending_question_failure = match &outcome {
@@ -2173,14 +2132,11 @@ impl ClaudeInner {
                 let turn_usage = self
                     .normalize_usage_for_turn(summary.result_turn_usage.clone())
                     .await;
-                let known_context_window = summary.result_context_window;
                 if !self
                     .emit_terminal_phase_or_placeholder(
                         &mut summary,
                         ClaudeTerminalPhaseOptions {
                             turn_id,
-                            conversation_history_bytes,
-                            known_context_window,
                             model_hint: result_model_hint.or(model_hint),
                             turn_usage,
                             cancelled: false,
@@ -2197,13 +2153,10 @@ impl ClaudeInner {
                 let turn_usage = self
                     .normalize_usage_for_turn(summary.result_turn_usage.clone())
                     .await;
-                let known_context_window = summary.result_context_window;
                 self.emit_terminal_phase_or_placeholder(
                     &mut summary,
                     ClaudeTerminalPhaseOptions {
                         turn_id,
-                        conversation_history_bytes,
-                        known_context_window,
                         model_hint: None,
                         turn_usage,
                         cancelled: true,
@@ -2223,14 +2176,11 @@ impl ClaudeInner {
                 let turn_usage = self
                     .normalize_usage_for_turn(summary.result_turn_usage.take())
                     .await;
-                let known_context_window = summary.result_context_window;
                 let _ = self
                     .emit_terminal_phase_or_placeholder(
                         &mut summary,
                         ClaudeTerminalPhaseOptions {
                             turn_id,
-                            conversation_history_bytes,
-                            known_context_window,
                             model_hint: None,
                             turn_usage,
                             cancelled: false,
@@ -2328,7 +2278,7 @@ impl ClaudeInner {
     /// emits no user bubble. Returns `None` if a turn is somehow already
     /// active, or if the backend is closing.
     async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
-        let (turn_id, ephemeral, conversation_history_bytes, model_hint, outcome_rx) = {
+        let (turn_id, ephemeral, model_hint, outcome_rx) = {
             let mut state = self.state.lock().await;
             if state.closing || state.active_turn.is_some() {
                 return None;
@@ -2344,13 +2294,7 @@ impl ClaudeInner {
                 pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
-            (
-                turn_id,
-                state.ephemeral,
-                state.conversation_bytes_total,
-                state.model.clone(),
-                outcome_rx,
-            )
+            (turn_id, state.ephemeral, state.model.clone(), outcome_rx)
         };
 
         let message_id = format!("claude-msg-{turn_id}");
@@ -2363,14 +2307,8 @@ impl ClaudeInner {
                 summary: ClaudeStdoutSummary::default(),
                 error: "Claude turn ended before returning a result".to_string(),
             });
-            this.finalize_turn(
-                turn_id,
-                outcome,
-                ephemeral,
-                conversation_history_bytes,
-                model_hint,
-            )
-            .await;
+            this.finalize_turn(turn_id, outcome, ephemeral, model_hint)
+                .await;
         });
 
         Some(turn_id)
@@ -4402,14 +4340,6 @@ impl ClaudeInner {
         }
     }
 
-    async fn add_conversation_bytes(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        state.conversation_bytes_total = state.conversation_bytes_total.saturating_add(bytes);
-    }
-
     async fn emit_settings(&self) {
         let (model, effort, permission_mode) = {
             let state = self.state.lock().await;
@@ -4453,7 +4383,6 @@ impl ClaudeInner {
             state.fork_from_session_id = None;
             state.cumulative_usage = None;
             state.cumulative_usage_complete = true;
-            state.conversation_bytes_total = 0;
             (state.workspace_root.clone(), state.ssh_host.clone())
         };
 
@@ -4505,7 +4434,6 @@ impl ClaudeInner {
         let mut state = self.state.lock().await;
         state.cumulative_usage = replay.cumulative_usage;
         state.cumulative_usage_complete = replay.cumulative_usage_complete;
-        state.conversation_bytes_total = replay.conversation_bytes_total;
         state.resume_bootstrap_required = resume_bootstrap_required;
         Ok(())
     }
@@ -4520,7 +4448,6 @@ impl ClaudeInner {
                 state.fork_from_session_id = None;
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
-                state.conversation_bytes_total = 0;
             }
             (state.workspace_root.clone(), state.ssh_host.clone())
         };
@@ -4979,21 +4906,10 @@ impl ClaudeInner {
     ) -> bool {
         let ClaudeTerminalPhaseOptions {
             turn_id,
-            conversation_history_bytes,
-            known_context_window,
             model_hint,
             turn_usage,
             cancelled,
         } = options;
-        // The Context Usage breakdown must reflect the context-window fill — the
-        // last API call's prompt footprint — which lives on `summary.usage`
-        // (per-API-call usage from assistant stream events, bounded by the
-        // window). It is NOT `turn_usage`: that is the per-turn delta of Claude's
-        // session-cumulative counter, i.e. the sum of input tokens across every
-        // API call in the turn, which overflows the window on multi-step turns
-        // (a turn re-sends its growing context on each request). Capture the
-        // per-call value before `take_phase_emission` consumes `summary.usage`.
-        let context_usage = summary.usage.clone();
         if let Some(phase) = take_phase_emission(summary) {
             let text = phase.text;
             let selected_model = phase.model.clone().or(model_hint);
@@ -5008,17 +4924,6 @@ impl ClaudeInner {
                     })
                 })
                 .collect::<Vec<_>>();
-            let context_breakdown = estimate_context_breakdown(
-                context_usage.as_ref(),
-                conversation_history_bytes,
-                phase.tool_io_bytes,
-                phase.reasoning_bytes,
-                known_context_window,
-                selected_model.as_deref(),
-            );
-            if !text.is_empty() {
-                self.add_conversation_bytes(text.len() as u64).await;
-            }
             if !self.emitter.is_stream_open() {
                 self.emit_stream_start(
                     &format!("claude-msg-{turn_id}-terminal"),
@@ -5037,7 +4942,7 @@ impl ClaudeInner {
                 },
                 phase.reasoning,
                 tool_calls,
-                Some(context_breakdown),
+                None,
             );
             for tool_call in &phase.tool_calls {
                 emit_tool_request_with_tracking(summary, self, tool_call);
@@ -5049,14 +4954,6 @@ impl ClaudeInner {
         if let Some(control_event) = summary.control_event {
             if summary.emitted_phase_count == 0 {
                 let selected_model = summary.model.clone().or(model_hint);
-                let context_breakdown = estimate_context_breakdown(
-                    context_usage.as_ref(),
-                    conversation_history_bytes,
-                    summary.tool_io_bytes,
-                    summary.reasoning_bytes,
-                    known_context_window,
-                    selected_model.as_deref(),
-                );
                 match control_event {
                     ClaudeControlEvent::ConversationCompacted => {}
                 }
@@ -5066,11 +4963,7 @@ impl ClaudeInner {
                         selected_model.clone(),
                     );
                 }
-                self.emit_placeholder_stream_end(
-                    selected_model,
-                    turn_usage.clone(),
-                    Some(context_breakdown),
-                );
+                self.emit_placeholder_stream_end(selected_model, turn_usage.clone(), None);
             }
             close_terminal_tool_requests(summary, self, cancelled);
             return true;
@@ -5083,21 +4976,13 @@ impl ClaudeInner {
         // segment that emitted StreamStart without any content before cancel.
         if summary.emitted_phase_count == 0 || self.emitter.is_stream_open() {
             let selected_model = summary.model.clone().or(model_hint);
-            let context_breakdown = estimate_context_breakdown(
-                context_usage.as_ref(),
-                conversation_history_bytes,
-                summary.tool_io_bytes,
-                summary.reasoning_bytes,
-                known_context_window,
-                selected_model.as_deref(),
-            );
             if !self.emitter.is_stream_open() {
                 self.emit_stream_start(
                     &format!("claude-msg-{turn_id}-terminal"),
                     selected_model.clone(),
                 );
             }
-            self.emit_placeholder_stream_end(selected_model, turn_usage, Some(context_breakdown));
+            self.emit_placeholder_stream_end(selected_model, turn_usage, None);
         }
 
         if !summary.unresolved_tool_requests.is_empty() {
@@ -9077,9 +8962,6 @@ fn consume_claude_stream_value_with_interrupt(
                 summary.result_text = Some(text.to_string());
             }
             if let Some(reasoning) = extract_reasoning_from_result(value) {
-                summary.reasoning_bytes = summary
-                    .reasoning_bytes
-                    .max(u64::try_from(reasoning.len()).unwrap_or(u64::MAX));
                 summary.result_reasoning = Some(reasoning);
             }
             // result.usage aggregates the API calls made by this CLI invocation.
@@ -9087,17 +8969,6 @@ fn consume_claude_stream_value_with_interrupt(
             if let Some(usage) = parse_token_usage(value.get("usage")) {
                 summary.result_turn_usage = Some(usage);
             }
-            // Extract contextWindow from result.modelUsage[model].contextWindow.
-            // This is the only place Claude Code reports the actual context window.
-            if let Some(model_usage) = value.get("modelUsage").and_then(Value::as_object) {
-                let preferred_model = value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .or(summary.model.as_deref());
-                summary.result_context_window =
-                    extract_context_window_from_model_usage(model_usage, preferred_model);
-            }
-
             let is_error = value
                 .get("is_error")
                 .and_then(Value::as_bool)
@@ -9294,9 +9165,6 @@ fn consume_assistant_message(
     }
 
     if let Some(reasoning) = next_reasoning {
-        summary.reasoning_bytes = summary
-            .reasoning_bytes
-            .max(u64::try_from(reasoning.len()).unwrap_or(u64::MAX));
         summary.result_reasoning = Some(reasoning);
         segment.has_content = true;
     }
@@ -9326,23 +9194,11 @@ fn consume_user_tool_result(
     let Some(message) = value.get("message") else {
         return;
     };
-    let Some(content) = message.get("content").and_then(Value::as_array) else {
+    if message.get("content").and_then(Value::as_array).is_none() {
         return;
-    };
+    }
 
     declare_open_response_tool_calls(summary, segment, inner, current_message_id);
-
-    for block in content {
-        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-            continue;
-        }
-
-        let result_text = extract_tool_result_content(block);
-        summary.tool_io_bytes = summary
-            .tool_io_bytes
-            .saturating_add(result_text.len() as u64)
-            .saturating_add(serde_json::to_string(block).unwrap_or_default().len() as u64);
-    }
 
     let completions = extract_tool_result_events_from_message(
         message,
@@ -9554,8 +9410,6 @@ fn take_phase_emission(summary: &mut ClaudeStdoutSummary) -> Option<ClaudePhaseE
         model: summary.model.clone(),
         usage: phase_usage_for_emission(summary),
         tool_calls,
-        tool_io_bytes: summary.tool_io_bytes,
-        reasoning_bytes: summary.reasoning_bytes,
     };
     summary.emitted_phase_count += 1;
     Some(emission)
@@ -9570,8 +9424,6 @@ fn reset_phase_state(summary: &mut ClaudeStdoutSummary, segment: &mut SegmentSta
     summary.usage = None;
     summary.tool_calls.clear();
     summary.streaming_tool_content_offsets.clear();
-    summary.tool_io_bytes = 0;
-    summary.reasoning_bytes = 0;
     segment.has_content = false;
 }
 
@@ -10071,7 +9923,6 @@ fn append_reasoning_text(
     if separate_with_newline && !summary.streamed_reasoning.is_empty() {
         summary.streamed_reasoning.push('\n');
     }
-    summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(text.len() as u64);
     summary.streamed_reasoning.push_str(text);
 }
 
@@ -10503,16 +10354,6 @@ fn normalize_claude_permission_mode(value: &Value) -> Option<String> {
         "plan" => Some("plan".to_string()),
         _ => None,
     }
-}
-
-fn estimate_turn_input_bytes(prompt: &str, images: &[ImageAttachment]) -> u64 {
-    let mut total = prompt.len() as u64;
-    for image in images {
-        total = total
-            .saturating_add(image.data.len() as u64)
-            .saturating_add(image.media_type.len() as u64);
-    }
-    total
 }
 
 fn build_stream_json_user_message(prompt: &str, images: &[ImageAttachment]) -> Value {
@@ -11828,7 +11669,6 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
     let mut invocation_usage_complete = true;
     let mut invocation_message_ids = HashSet::new();
     let mut invocation_prompt_id = None::<String>;
-    let mut conversation_bytes_total = 0u64;
     let parsed_values = contents
         .lines()
         .filter_map(|line| {
@@ -12027,8 +11867,6 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
                 &mut pending_tool_requests,
                 &mut auto_closed_tool_requests,
             );
-            conversation_bytes_total = conversation_bytes_total
-                .saturating_add(estimate_message_history_bytes(&text, &images));
             let sender = if role == "assistant" {
                 json!({ "Assistant": { "agent": CLAUDE_AGENT_NAME } })
             } else {
@@ -12153,7 +11991,6 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
         items: restored,
         cumulative_usage,
         cumulative_usage_complete,
-        conversation_bytes_total,
     }
 }
 
@@ -12603,28 +12440,6 @@ fn extract_images_from_content(content: &Value) -> Vec<Value> {
     images
 }
 
-fn estimate_message_history_bytes(text: &str, images: &[Value]) -> u64 {
-    let mut total = text.len() as u64;
-    for image in images {
-        total = total
-            .saturating_add(
-                image
-                    .get("media_type")
-                    .and_then(Value::as_str)
-                    .map(|value| value.len() as u64)
-                    .unwrap_or(0),
-            )
-            .saturating_add(
-                image
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .map(|value| value.len() as u64)
-                    .unwrap_or(0),
-            );
-    }
-    total
-}
-
 fn claude_known_models() -> Vec<Value> {
     // Use the CLI's family aliases rather than pinned model IDs so we always
     // resolve to whatever the installed CLI considers the latest opus/sonnet/
@@ -12647,174 +12462,6 @@ fn claude_known_models() -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn normalize_model_key_for_context_lookup(model: &str) -> String {
-    strip_context_window_suffix(model.trim()).to_ascii_lowercase()
-}
-
-fn strip_context_window_suffix(model: &str) -> &str {
-    model.strip_suffix("[1m]").unwrap_or(model)
-}
-
-fn claude_model_family_hint(model: &str) -> Option<&'static str> {
-    let normalized = normalize_model_key_for_context_lookup(model);
-    if normalized.contains("opus") {
-        return Some("opus");
-    }
-    if normalized.contains("sonnet") {
-        return Some("sonnet");
-    }
-    if normalized.contains("haiku") {
-        return Some("haiku");
-    }
-    None
-}
-
-fn extract_context_window_from_model_usage_entry(entry: &Value) -> Option<u64> {
-    entry
-        .get("contextWindow")
-        .or_else(|| entry.get("context_window"))
-        .and_then(Value::as_u64)
-        .filter(|window| *window > 0)
-}
-
-fn extract_context_window_from_model_usage(
-    model_usage: &serde_json::Map<String, Value>,
-    preferred_model: Option<&str>,
-) -> Option<u64> {
-    let with_window = model_usage
-        .iter()
-        .filter_map(|(model, entry)| {
-            extract_context_window_from_model_usage_entry(entry).map(|window| (model, window))
-        })
-        .collect::<Vec<_>>();
-
-    if with_window.is_empty() {
-        return None;
-    }
-
-    if let Some(model) = preferred_model {
-        let preferred = normalize_model_key_for_context_lookup(model);
-        if let Some((_, window)) = with_window
-            .iter()
-            .copied()
-            .find(|(model_key, _)| normalize_model_key_for_context_lookup(model_key) == preferred)
-        {
-            return Some(window);
-        }
-
-        if let Some(family) = claude_model_family_hint(model)
-            && let Some((_, window)) = with_window.iter().copied().find(|(model_key, _)| {
-                normalize_model_key_for_context_lookup(model_key).contains(family)
-            })
-        {
-            return Some(window);
-        }
-    }
-
-    if with_window.len() == 1 {
-        return Some(with_window[0].1);
-    }
-
-    with_window.first().map(|(_, window)| *window)
-}
-
-fn claude_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
-    let Some(model) = model_hint else {
-        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
-    };
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.ends_with("[1m]") {
-        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M;
-    }
-    // Fable ships a 1M context window by default (no explicit [1m] suffix).
-    if normalized.contains("fable") {
-        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M;
-    }
-    if normalized.contains("haiku") {
-        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
-    }
-    CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT
-}
-
-fn estimate_context_breakdown(
-    token_usage: Option<&Value>,
-    conversation_history_bytes: u64,
-    tool_io_bytes: u64,
-    reasoning_bytes: u64,
-    known_context_window: Option<u64>,
-    model_hint: Option<&str>,
-) -> Value {
-    let base_input_tokens = token_usage
-        .and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let cached_prompt_tokens = token_usage
-        .and_then(|usage| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let cache_creation_input_tokens = token_usage
-        .and_then(|usage| {
-            usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
-    // Context utilization should reflect the full prompt footprint, including cache hits/writes.
-    let mut input_tokens = base_input_tokens
-        .saturating_add(cached_prompt_tokens)
-        .saturating_add(cache_creation_input_tokens);
-    // Use the known context window (from modelUsage), then fall back to the
-    // usage object, then fall back to the hardcoded estimate.
-    let context_window = known_context_window
-        .filter(|w| *w > 0)
-        .or_else(|| {
-            token_usage
-                .and_then(|usage| usage.get("context_window").and_then(Value::as_u64))
-                .filter(|window| *window > 0)
-        })
-        .unwrap_or_else(|| claude_estimated_context_window_for_model(model_hint));
-    let reasoning_from_tokens = token_usage
-        .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64))
-        .unwrap_or(0)
-        .saturating_mul(CLAUDE_ESTIMATED_BYTES_PER_TOKEN);
-
-    let reasoning_est = std::cmp::max(reasoning_bytes, reasoning_from_tokens);
-    let observed_bytes = conversation_history_bytes
-        .saturating_add(tool_io_bytes)
-        .saturating_add(reasoning_est);
-    let mut total_prompt_bytes = input_tokens.saturating_mul(CLAUDE_ESTIMATED_BYTES_PER_TOKEN);
-    if total_prompt_bytes == 0 {
-        total_prompt_bytes = observed_bytes.saturating_add(CLAUDE_MIN_SYSTEM_PROMPT_BYTES);
-        input_tokens = total_prompt_bytes.div_ceil(CLAUDE_ESTIMATED_BYTES_PER_TOKEN);
-    }
-
-    let mut system_prompt_bytes = std::cmp::min(
-        std::cmp::max(CLAUDE_MIN_SYSTEM_PROMPT_BYTES, total_prompt_bytes / 10),
-        total_prompt_bytes,
-    );
-    if total_prompt_bytes == 0 {
-        system_prompt_bytes = 0;
-    }
-
-    let mut remaining = total_prompt_bytes.saturating_sub(system_prompt_bytes);
-    let reasoning_bucket = std::cmp::min(reasoning_est, remaining);
-    remaining = remaining.saturating_sub(reasoning_bucket);
-
-    let tool_bucket = std::cmp::min(tool_io_bytes, remaining);
-    remaining = remaining.saturating_sub(tool_bucket);
-
-    let history_bucket = std::cmp::min(conversation_history_bytes, remaining);
-    remaining = remaining.saturating_sub(history_bucket);
-
-    json!({
-        "system_prompt_bytes": system_prompt_bytes,
-        "tool_io_bytes": tool_bucket,
-        "conversation_history_bytes": history_bucket,
-        "reasoning_bytes": reasoning_bucket,
-        "context_injection_bytes": remaining,
-        "input_tokens": input_tokens,
-        "context_window": context_window,
-    })
 }
 
 fn system_time_to_ms(time: SystemTime) -> u64 {

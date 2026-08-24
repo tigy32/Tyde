@@ -51,9 +51,6 @@ pub const SCRATCH_DIR: &str = "scratch";
 pub fn pinned_models(backend: BackendKind) -> Vec<String> {
     match backend {
         BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
-        // One model, matching `REQUIRED_CODEX_TEST_MODEL` in `backend.rs`, so
-        // both paid suites agree on what Codex conformance means.
-        //
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
         BackendKind::Codex => vec![env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")],
@@ -66,8 +63,7 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
 /// select option — `validate_session_setting` compares `Select` values by
 /// equality. Hermes encodes those options as JSON (`encode_model_option_value`,
 /// `hermes.rs:5893`), so the older `"<model> --provider <provider>"` spelling
-/// that `backend.rs:22322` still builds is rejected at startup, before its own
-/// legacy parser ever sees it.
+/// is rejected at startup, before its legacy parser ever sees it.
 ///
 /// The model is not an arbitrary cheap pick. `minimax/minimax-m3` splits the
 /// reasoning and content channels one token late, so the opening
@@ -102,10 +98,9 @@ fn enabled_backends() -> Vec<BackendKind> {
         "set TYDE_RUN_REAL_AI_TESTS=1 to authorize the paid conformance suite"
     );
     match std::env::var("TYDE_REAL_BACKENDS") {
-        // Antigravity is excluded from real-backend conformance, matching
-        // `backend.rs`. `BackendKind` has no enumeration to derive this from —
-        // the server hand-writes the same list in `backend/mod.rs:1250` and
-        // `host.rs:19689`.
+        // Antigravity is excluded from real-backend conformance. `BackendKind`
+        // has no enumeration to derive this from — the server hand-writes the
+        // same list in `backend/mod.rs:1250` and `host.rs:19689`.
         Err(_) => vec![
             BackendKind::Claude,
             BackendKind::Codex,

@@ -9056,6 +9056,48 @@ enum LiveActivityTerminalStatus {
     Stopped,
 }
 
+fn terminal_progress_for_live_activity(
+    progress: &protocol::ToolProgressData,
+    status: LiveActivityTerminalStatus,
+    message: &str,
+) -> Option<protocol::ToolProgressData> {
+    let mut terminal = progress.clone();
+    terminal.cancellable = false;
+    match &mut terminal.update {
+        protocol::ToolProgressUpdate::SubAgent(state) => {
+            state.completed = true;
+            state.status = match status {
+                LiveActivityTerminalStatus::Failed => protocol::SubAgentProgressStatus::Failed,
+                LiveActivityTerminalStatus::Stopped => protocol::SubAgentProgressStatus::Stopped,
+            };
+        }
+        protocol::ToolProgressUpdate::Workflow(state) => {
+            state.status = protocol::WorkflowRunStatus::Failed;
+            if state.summary.is_none() {
+                state.summary = Some(message.to_owned());
+            }
+            for agent in &mut state.agents {
+                if matches!(
+                    agent.state,
+                    protocol::WorkflowAgentStatus::Queued | protocol::WorkflowAgentStatus::Running
+                ) {
+                    agent.state = protocol::WorkflowAgentStatus::Error;
+                }
+            }
+        }
+        protocol::ToolProgressUpdate::AgentControl(state) => {
+            state.status = match status {
+                LiveActivityTerminalStatus::Failed => protocol::AgentControlProgressStatus::Failed,
+                LiveActivityTerminalStatus::Stopped => {
+                    protocol::AgentControlProgressStatus::Stopped
+                }
+            };
+        }
+        protocol::ToolProgressUpdate::Other { .. } => return None,
+    }
+    Some(terminal)
+}
+
 struct LiveActivityTerminalContext<'a> {
     canonical_stream: &'a str,
     event_log: &'a mut Vec<Envelope>,
@@ -9082,6 +9124,18 @@ async fn terminalize_live_activity(
     let open_tools = open_tool_call_ids.drain().collect::<Vec<_>>();
     for tool_call_id in open_tools {
         pending_tool_response_ids.remove(&tool_call_id);
+        if let Some(progress) = replay_state.active_tool_progress.get(&tool_call_id)
+            && let Some(terminal) = terminal_progress_for_live_activity(progress, status, message)
+        {
+            append_chat_event(
+                canonical_stream,
+                event_log,
+                subscribers,
+                replay_state,
+                &ChatEvent::ToolProgress(terminal),
+            )
+            .await;
+        }
         let outcome = match status {
             LiveActivityTerminalStatus::Failed => ToolExecutionOutcome::Failed {
                 message: message.to_owned(),

@@ -399,10 +399,7 @@ impl BackendCompactionTerminalEvidence {
     /// the observation here is what lets the second sighting be recognized as a
     /// duplicate rather than becoming a second row in the user's transcript.
     ///
-    /// Only Claude is answerable: it is the only backend that reports a
-    /// requested compaction as `BackendObservedManual`, and so the only one
-    /// whose observation can collide with an operation of its own. Codex always
-    /// reports `BackendAutomatic`, and Hermes carries no per-event id at all.
+    /// Hermes carries no per-event id, so it cannot name this correlation.
     pub(crate) fn observation_id(&self) -> Option<CompactionObservationId> {
         match self {
             Self::Claude {
@@ -410,6 +407,16 @@ impl BackendCompactionTerminalEvidence {
                 boundary_uuid: Some(boundary_uuid),
                 ..
             } => Some(stable_observation_id("claude", session_id, boundary_uuid)),
+            Self::Codex {
+                thread_id,
+                turn_id: Some(turn_id),
+                item_id: Some(item_id),
+                ..
+            } => Some(stable_observation_id(
+                "codex",
+                thread_id,
+                &format!("{turn_id}:{item_id}"),
+            )),
             _ => None,
         }
     }

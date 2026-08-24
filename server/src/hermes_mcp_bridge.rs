@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rmcp::model::{
@@ -28,6 +29,7 @@ pub const DESCRIPTOR_ENV: &str = "TYDE_HERMES_MCP_DESCRIPTOR";
 pub const MANAGED_SERVER_NAME: &str = "tyde";
 pub const DESCRIPTOR_FILE_NAME: &str = "tyde-mcp-servers.json";
 pub const READY_FILE_NAME: &str = "tyde-mcp-ready.json";
+static READY_PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BridgeDescriptor {
@@ -96,7 +98,19 @@ impl ServerHandler for HermesMcpBridge {
             };
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Err(error) = std::fs::write(path.as_ref(), status.to_string()) {
+                let sequence = READY_PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let temporary_path = path.with_file_name(format!(
+                    "{READY_FILE_NAME}.{}.{}.tmp",
+                    std::process::id(),
+                    sequence
+                ));
+                eprintln!(
+                    "TYDE HERMES MCP READY PUBLISH sequence={sequence} path={}",
+                    path.display()
+                );
+                let published = std::fs::write(&temporary_path, status.to_string())
+                    .and_then(|_| std::fs::rename(&temporary_path, path.as_ref()));
+                if let Err(error) = published {
                     eprintln!("Tyde Hermes MCP bridge failed to publish readiness: {error}");
                 }
             });

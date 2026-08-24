@@ -29,8 +29,8 @@ use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, BackendAccessMode,
     CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure, CapacityPlanLabel,
     CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
-    CapacityWindow, ChatMessageId, CodexLimitSlot, ContextBreakdown, CurrentContextUsage,
-    ImageData, MessageMetadataUpdateData, MessageTokenUsage, ModelInfo, ModelRequestId,
+    CapacityWindow, ChatMessageId, CodexLimitSlot, CurrentContextUsage, ImageData,
+    MessageMetadataUpdateData, MessageTokenUsage, ModelInfo, ModelRequestId,
     ModelRequestTokenUsage, ModelTurnId, ReasoningData, TokenUsage, TokenUsageScope,
     TokenUsageUnavailableReason, ToolExecutionMode, ToolExecutionNormalizationFailure,
     ToolExecutionOutcome, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
@@ -42,8 +42,10 @@ use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME,
 };
 use crate::backend::agent_control_progress::{
-    PendingToolNormalizationFailure, is_tyde_agent_control_await_tool_name,
-    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event,
+    PendingToolNormalizationFailure, await_progress_data_for_tool,
+    is_tyde_agent_control_await_tool_name, is_tyde_agent_control_send_message_tool_name,
+    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event, parse_await_agent_refs,
+    terminal_await_progress_data_for_tool, tyde_tool_result,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -64,8 +66,6 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
 // the lone exception at 200k. This is only a pre-first-turn fallback — once a
 // turn reports `context_window` in token usage we use that instead.
 const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY: u64 = 400_000;
-const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
-const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
 const CODEX_INFERENCE_APPROVAL_POLICY: &str = "untrusted";
 const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
@@ -121,6 +121,25 @@ impl CodexCommandHandle {
 
     async fn update_runtime_settings(&self, settings: Value) -> Result<(), String> {
         self.inner.update_runtime_settings(settings).await
+    }
+
+    async fn try_reserve_user_turn(&self) -> bool {
+        let mut state = self.inner.state.lock().await;
+        if state.active_turn_id.is_some()
+            || state.awaiting_root_turn_start
+            || state.background_wake_request_in_flight
+        {
+            return false;
+        }
+        state.awaiting_root_turn_start = true;
+        true
+    }
+
+    async fn release_user_turn_reservation(&self) {
+        let mut state = self.inner.state.lock().await;
+        if state.active_turn_id.is_none() {
+            state.awaiting_root_turn_start = false;
+        }
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -2790,6 +2809,11 @@ struct CodexResponseSplitter {
     /// output routinely arrives *after* the typed item has completed and
     /// unparked its owner.
     typed_owned_call_ids: HashSet<String>,
+    /// Raw declarations normally hidden because a richer typed item renders
+    /// the call. The runtime can reject a nested command before creating that
+    /// typed item, so retain the declaration until its raw output proves
+    /// whether the typed owner actually existed.
+    suppressed_raw_tool_requests: IndexMap<String, BufferedCodexToolRequest>,
     pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
     last_token_usage: Option<Value>,
 }
@@ -2823,6 +2847,7 @@ impl CodexResponseSplitter {
             execution_only_typed_tool_owners: HashMap::new(),
             claimed_raw_tool_calls: HashSet::new(),
             typed_owned_call_ids: HashSet::new(),
+            suppressed_raw_tool_requests: IndexMap::new(),
             pending_raw_tool_owners: IndexMap::new(),
             last_token_usage: None,
         }
@@ -3053,12 +3078,23 @@ impl CodexResponseSplitter {
                 typed_owns_call,
                 "PROBE raw declaration"
             );
-            if typed_owns_call
-                || codex_raw_call_is_rendered_elsewhere(&request.tool_name, &request.arguments)
-            {
+            if typed_owns_call {
                 self.typed_owned_call_ids.insert(item_id.to_owned());
                 if let Some(call_id) = request.provider_call_id {
                     self.typed_owned_call_ids.insert(call_id);
+                }
+            } else if codex_raw_call_is_rendered_elsewhere(&request.tool_name, &request.arguments) {
+                if let Some(call_id) = request.provider_call_id.clone() {
+                    self.suppressed_raw_tool_requests.insert(
+                        call_id,
+                        BufferedCodexToolRequest {
+                            turn_id: turn_id.map(str::to_owned),
+                            ..request
+                        },
+                    );
+                    while self.suppressed_raw_tool_requests.len() > 256 {
+                        self.suppressed_raw_tool_requests.shift_remove_index(0);
+                    }
                 }
             } else {
                 let request = BufferedCodexToolRequest {
@@ -3389,6 +3425,17 @@ impl CodexResponseSplitter {
         self.typed_owned_call_ids.contains(call_id)
     }
 
+    fn suppressed_raw_tool_request(&self, call_id: &str) -> Option<BufferedCodexToolRequest> {
+        self.suppressed_raw_tool_requests.get(call_id).cloned()
+    }
+
+    fn remove_suppressed_raw_tool_request(
+        &mut self,
+        call_id: &str,
+    ) -> Option<BufferedCodexToolRequest> {
+        self.suppressed_raw_tool_requests.shift_remove(call_id)
+    }
+
     fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
         let owner = self.pending_raw_tool_owners.shift_remove(call_id);
         if let Some(owner) = owner.as_ref() {
@@ -3680,25 +3727,11 @@ struct CodexProviderNotificationOwner<'a> {
     turn_id: Option<&'a str>,
 }
 
-#[derive(Clone, Default)]
-struct TurnContextEstimate {
-    conversation_history_bytes: u64,
-    tool_io_bytes: u64,
-    reasoning_bytes: u64,
-}
-
-impl TurnContextEstimate {
-    fn has_observed_bytes(&self) -> bool {
-        self.conversation_history_bytes > 0 || self.tool_io_bytes > 0 || self.reasoning_bytes > 0
-    }
-}
-
 #[derive(Clone)]
 struct PendingCodexMessageMetadata {
     turn_id: String,
     message_id: ChatMessageId,
     model: String,
-    turn_context: TurnContextEstimate,
 }
 
 #[derive(Clone, Default)]
@@ -4016,12 +4049,9 @@ struct CodexState {
     completed_message_metadata_by_turn: HashMap<String, PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
-    turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
     pending_raw_modify_calls: HashMap<(String, String), PendingRawCodexModify>,
     pending_request: Option<PendingRequest>,
-    pending_user_input_bytes: u64,
-    conversation_bytes_total: u64,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     capacity_refresh_in_flight: bool,
     pending_subagent_spawns: HashMap<String, CodexSubAgentSpawnInfo>,
@@ -4098,12 +4128,9 @@ fn initial_codex_state(
         completed_message_metadata_by_turn: HashMap::new(),
         token_usage_by_turn: HashMap::new(),
         model_token_usage_by_turn: HashMap::new(),
-        turn_context_by_turn: HashMap::new(),
         file_change_call_ids: HashMap::new(),
         pending_raw_modify_calls: HashMap::new(),
         pending_request: None,
-        pending_user_input_bytes: 0,
-        conversation_bytes_total: 0,
         subagent_emitter,
         capacity_refresh_in_flight: false,
         pending_subagent_spawns: HashMap::new(),
@@ -4290,6 +4317,7 @@ impl Default for CodexDynamicAwaitState {
 
 struct CodexPendingDynamicAwait {
     turn_id: String,
+    arguments: Value,
     cancellation: tokio_util::sync::CancellationToken,
 }
 
@@ -4332,6 +4360,16 @@ impl CodexInner {
                 turn_id = pending.turn_id,
                 "Cancelling direct Codex await MCP call"
             );
+            if self.emitter.has_pending_tool_request(&tool_call_id)
+                && let Some(progress) = terminal_await_progress_data_for_tool(
+                    &tool_call_id,
+                    "tyde_await_agents",
+                    &pending.arguments,
+                    protocol::AgentControlProgressStatus::Stopped,
+                )
+            {
+                self.emitter.tool_progress(&progress);
+            }
             self.emitter
                 .cancel_pending_tool(&tool_call_id, "Tyde await was interrupted");
             let mut state = self.state.lock().await;
@@ -5111,14 +5149,58 @@ impl CodexInner {
             return;
         };
         let thread_id = self.state.lock().await.thread_id.clone();
+        eprintln!(
+            "TYDE CODEX COMPACTION TERMINAL thread_id={thread_id:?} turn_id={:?} item_id={:?} accepted={} item_started={} item_completed={} turn_status={:?}",
+            pending.turn_id,
+            pending.item_id,
+            pending.accepted,
+            pending.item_started,
+            pending.item_completed,
+            pending.turn_status,
+        );
         let completed = pending.accepted
             && pending.item_started
             && pending.item_completed
-            && pending.turn_status.as_deref() == Some("completed");
+            && pending.turn_status.as_deref() == Some("completed")
+            && pending.turn_id.is_some()
+            && pending.item_id.is_some();
         let metrics = CompactionMetrics {
             duration_ms: Some(pending.started_at.elapsed().as_millis() as u64),
             ..CompactionMetrics::default()
         };
+        let observation =
+            completed.then(|| {
+                let turn_id = pending
+                    .turn_id
+                    .as_ref()
+                    .expect("completed Codex compaction has a turn id");
+                let item_id = pending
+                    .item_id
+                    .as_ref()
+                    .expect("completed Codex compaction has an item id");
+                BackendObservedCompaction {
+                    observation_id: super::compaction::stable_observation_id(
+                        "codex",
+                        &thread_id,
+                        &format!("{turn_id}:{item_id}"),
+                    ),
+                    trigger: CompactionTrigger::BackendObservedManual,
+                    method: CompactionMethod::NativeRpc,
+                    provider_session_id: Some(SessionId(thread_id.clone())),
+                    metrics: metrics.clone(),
+                    source: BackendCompactionObservationSource::CodexItem {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item_id: item_id.clone(),
+                    },
+                    user_focus: pending.request.focus.clone().map(|text| {
+                        BackendCompactionUserFocus {
+                            text,
+                            provenance: BackendCompactionUserFocusProvenance::TydeRequest,
+                        }
+                    }),
+                }
+            });
         let result = BackendCompactionResult {
             operation_id: pending.request.operation_id.clone(),
             dispatch: BackendCompactionDispatchState::Accepted,
@@ -5152,6 +5234,10 @@ impl CodexInner {
                 deprecated_notification_seen: pending.deprecated_notification_seen,
             },
         };
+        if let Some(observation) = observation {
+            self.emitter
+                .compaction_event(&BackendCompactionEvent::Observed(Box::new(observation)));
+        }
         if let Some(tx) = pending.terminal_tx.take() {
             let _ = tx.send(result);
         }
@@ -5242,7 +5328,12 @@ impl CodexInner {
                 }
                 if matches!(
                     method,
-                    "turn/started" | "item/started" | "item/completed" | "turn/completed"
+                    "turn/started"
+                        | "item/started"
+                        | "item/completed"
+                        | "rawResponse/completed"
+                        | "thread/tokenUsage/updated"
+                        | "turn/completed"
                 ) && (pending.turn_id.as_ref() == turn_id.as_ref()
                     || item_type == Some("contextCompaction"))
                 {
@@ -5861,10 +5952,6 @@ impl CodexInner {
             };
 
             let notification = codex_background_wake_notification(&wakes);
-            {
-                let mut state = inner.state.lock().await;
-                state.pending_user_input_bytes = notification.len() as u64;
-            }
             let mut params = json!({
                 "threadId": thread_id,
                 "input": [{
@@ -5886,7 +5973,6 @@ impl CodexInner {
             if let Err(error) = inner.rpc.request("turn/start", params).await {
                 let mut state = inner.state.lock().await;
                 state.background_wake_request_in_flight = false;
-                state.pending_user_input_bytes = 0;
                 for wake in wakes.into_iter().rev() {
                     state.pending_background_wakes.push_front(wake);
                 }
@@ -5909,7 +5995,9 @@ impl CodexInner {
             state.background_command_results.clear();
             for command in &commands {
                 state.pending_tool_call_ids.remove(&command.tool_call_id);
-                state.cancelled_tool_call_ids.remove(&command.tool_call_id);
+                state
+                    .cancelled_tool_call_ids
+                    .insert(command.tool_call_id.clone());
             }
             commands
         };
@@ -5918,6 +6006,10 @@ impl CodexInner {
                 continue;
             };
             if emitter.has_pending_tool_request(&command.tool_call_id) {
+                eprintln!(
+                    "TYDE CODEX TOOL TERMINAL source=shutdown-drain thread_id={} tool_call_id={} outcome=cancelled",
+                    command.thread_id, command.tool_call_id
+                );
                 emitter.tool_completed(
                     &command.tool_call_id,
                     ToolExecutionOutcome::Cancelled {
@@ -6362,21 +6454,11 @@ impl CodexInner {
                 if provider_completed {
                     state.foreground_response_completed = true;
                 }
-                if renderable {
-                    state.conversation_bytes_total = state
-                        .conversation_bytes_total
-                        .saturating_add(content.len() as u64);
-                }
             }
             let model = state
                 .effective_model
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
-            let turn_context = state
-                .turn_context_by_turn
-                .get(&stream.turn_id)
-                .cloned()
-                .unwrap_or_default();
             if renderable && self.emitter.open_response().is_none() {
                 let response = self.emitter.ensure_open_response(Some(&model));
                 if let Some(reasoning) = reasoning.as_deref() {
@@ -6394,7 +6476,6 @@ impl CodexInner {
                         &content,
                         reasoning.as_deref(),
                         model.clone(),
-                        turn_context,
                     )
                 }
                 CodexProviderItemKind::Reasoning => reasoning.as_ref().and_then(|_| {
@@ -6407,7 +6488,6 @@ impl CodexInner {
                         "",
                         reasoning.as_deref(),
                         model.clone(),
-                        turn_context,
                     )
                 }),
                 CodexProviderItemKind::AgentMessage => None,
@@ -6801,7 +6881,6 @@ impl CodexInner {
                     turn_id: turn_id.clone(),
                     message_id: presentation_message_id.clone(),
                     model: model.to_string(),
-                    turn_context: TurnContextEstimate::default(),
                 });
                 Some(TokenUsageUnavailableReason::BackendDidNotReport)
             };
@@ -6811,7 +6890,6 @@ impl CodexInner {
                 turn_id: turn_id.clone(),
                 message_id: presentation_message_id,
                 model: model.to_string(),
-                turn_context: TurnContextEstimate::default(),
             });
             (None, None)
         };
@@ -7237,7 +7315,6 @@ impl CodexInner {
             state.close_active_stream_when_tools_idle = false;
             state.pending_request = None;
             state.file_change_call_ids.clear();
-            state.pending_user_input_bytes = 0;
             state.pending_message_metadata = None;
             let root_thread_id = state.thread_id.clone();
             let terminated_background_commands =
@@ -7346,9 +7423,9 @@ impl CodexInner {
                 .effective_model
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
-            let (emission, appended) = if let Some(stream) = state.active_stream.as_mut() {
+            if let Some(stream) = state.active_stream.as_mut() {
                 if stream.reasoning.split('\n').any(|line| line == reasoning) {
-                    (None, false)
+                    None
                 } else {
                     let was_published = stream.stream_published;
                     if !stream.reasoning.is_empty() && !stream.reasoning.ends_with('\n') {
@@ -7358,7 +7435,7 @@ impl CodexInner {
                     if !stream.stream_published && contains_non_whitespace(&stream.reasoning) {
                         stream.stream_published = true;
                     }
-                    let emission = stream.stream_published.then(|| {
+                    stream.stream_published.then(|| {
                         let response = self.emitter.ensure_open_response(Some(&model));
                         let reasoning = if was_published {
                             reasoning.to_string()
@@ -7366,19 +7443,11 @@ impl CodexInner {
                             stream.reasoning.clone()
                         };
                         (response, reasoning)
-                    });
-                    (emission, true)
+                    })
                 }
             } else {
-                (None, true)
-            };
-            if appended && let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
-                let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-                estimate.reasoning_bytes = estimate
-                    .reasoning_bytes
-                    .saturating_add(reasoning.len() as u64);
+                None
             }
-            emission
         };
         if let Some((response, reasoning)) = emission {
             self.emitter.stream_reasoning_delta(&response, &reasoning);
@@ -7487,7 +7556,6 @@ impl CodexInner {
                     // turn start; the next turn/started belongs to it.
                     state.interrupt_next_root_turn = false;
                     state.awaiting_root_turn_start = true;
-                    state.pending_user_input_bytes = message.len() as u64;
                     let (model_override, effort_override) = match state.execution_mode {
                         BackendExecutionMode::Agent => (
                             state.model_override.clone(),
@@ -7540,7 +7608,9 @@ impl CodexInner {
                 params["sandboxPolicy"] =
                     codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
 
-                if let Err(err) = self.rpc.request("turn/start", params).await {
+                let turn_start = self.rpc.request("turn/start", params).await;
+                eprintln!("TYDE CODEX TURN START RESPONSE result={turn_start:?}");
+                if let Err(err) = turn_start {
                     self.state.lock().await.awaiting_root_turn_start = false;
                     self.emitter.typing_status_changed(false);
                     return Err(err);
@@ -7548,17 +7618,62 @@ impl CodexInner {
                 Ok(())
             }
             SessionCommand::CancelConversation => {
-                let (thread_id, turn_id_opt, foreground_ended_with_background_work) = {
+                let compaction_start_pending = {
                     let state = self.state.lock().await;
+                    state.active_turn_id.is_none()
+                        && state
+                            .pending_compaction
+                            .as_ref()
+                            .is_some_and(|pending| pending.turn_id.is_none())
+                };
+                if compaction_start_pending {
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        loop {
+                            let start_resolved = {
+                                let state = self.state.lock().await;
+                                state
+                                    .pending_compaction
+                                    .as_ref()
+                                    .is_none_or(|pending| pending.turn_id.is_some())
+                            };
+                            if start_resolved {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| {
+                        "Codex compaction did not publish a turn to interrupt".to_string()
+                    })?;
+                }
+                let (
+                    thread_id,
+                    turn_id_opt,
+                    interrupting_compaction,
+                    foreground_ended_with_background_work,
+                ) = {
+                    let state = self.state.lock().await;
+                    let active_turn_id = state.active_turn_id.clone();
+                    let compaction_turn_id = state
+                        .pending_compaction
+                        .as_ref()
+                        .and_then(|pending| pending.turn_id.clone());
                     (
                         state.thread_id.clone(),
-                        state.active_turn_id.clone(),
+                        active_turn_id
+                            .clone()
+                            .or_else(|| compaction_turn_id.clone()),
+                        active_turn_id.is_none() && compaction_turn_id.is_some(),
                         (!state.background_commands.is_empty()
                             || !state.subagent_streams.is_empty())
                             && (state.active_turn_id.is_none()
                                 || state.foreground_response_completed),
                     )
                 };
+                eprintln!(
+                    "TYDE CODEX CANCEL STATE turn_id={turn_id_opt:?} interrupting_compaction={interrupting_compaction} compaction_start_pending={compaction_start_pending}"
+                );
                 self.terminalize_dynamic_awaits(turn_id_opt.as_deref())
                     .await;
                 if foreground_ended_with_background_work {
@@ -7587,13 +7702,50 @@ impl CodexInner {
                 // cancelled when the interrupted turn completes; killing here
                 // is what makes that report true.
                 self.terminate_foreground_commands().await;
-                self.rpc.spawn_request(
-                    "turn/interrupt",
-                    json!({
-                        "threadId": thread_id,
-                        "turnId": turn_id
-                    }),
-                );
+                match self
+                    .rpc
+                    .request_typed(
+                        "turn/interrupt",
+                        json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if error.no_active_turn_to_interrupt() => {
+                        eprintln!(
+                            "TYDE CODEX INTERRUPT PROVIDER ALREADY TERMINAL turn_id={turn_id}"
+                        );
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let terminal = {
+                            let state = self.state.lock().await;
+                            if interrupting_compaction {
+                                state
+                                    .pending_compaction
+                                    .as_ref()
+                                    .and_then(|pending| pending.turn_id.as_deref())
+                                    != Some(turn_id.as_str())
+                            } else {
+                                state.active_turn_id.as_deref() != Some(turn_id.as_str())
+                            }
+                        };
+                        if terminal {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| format!("Codex turn {turn_id} did not terminalize after interrupt"))?;
+                if interrupting_compaction {
+                    self.emitter.operation_cancelled("Operation cancelled");
+                }
                 Ok(())
             }
             SessionCommand::CancelBackgroundTask { tool_call_id } => {
@@ -7762,14 +7914,11 @@ impl CodexInner {
             state.pending_message_metadata = None;
             state.token_usage_by_turn.clear();
             state.model_token_usage_by_turn.clear();
-            state.turn_context_by_turn.clear();
             state.file_change_call_ids.clear();
             state.background_command_owner_active = true;
             state.pending_background_wakes.clear();
             state.background_wake_request_in_flight = false;
             state.pending_request = None;
-            state.pending_user_input_bytes = 0;
-            state.conversation_bytes_total = 0;
         }
 
         self.emitter.conversation_cleared();
@@ -7777,10 +7926,7 @@ impl CodexInner {
         self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
-        let restored_bytes = self.emit_resumed_thread_history(&turns, &model).await;
-        let mut state = self.state.lock().await;
-        state.conversation_bytes_total = restored_bytes;
-        drop(state);
+        self.emit_resumed_thread_history(&turns, &model).await;
         if let Some(warning) = saved_await_warning {
             self.emitter.warning_message(&warning);
         }
@@ -7846,9 +7992,7 @@ impl CodexInner {
         Ok(())
     }
 
-    async fn emit_resumed_thread_history(&self, turns: &[Value], model: &str) -> u64 {
-        let mut total_bytes = 0u64;
-
+    async fn emit_resumed_thread_history(&self, turns: &[Value], model: &str) {
         for turn in turns {
             let turn_id = turn
                 .get("id")
@@ -7894,7 +8038,6 @@ impl CodexInner {
                         if text.trim().is_empty() {
                             continue;
                         }
-                        total_bytes = total_bytes.saturating_add(text.len() as u64);
                         self.emitter.user_message(&text, None);
                     }
                     "agentMessage" => {
@@ -7904,7 +8047,6 @@ impl CodexInner {
                         if !codex_message_is_renderable(&text, reasoning.as_deref(), 0, 0) {
                             continue;
                         }
-                        total_bytes = total_bytes.saturating_add(text.len() as u64);
                         self.emitter.replay_assistant_message(
                             crate::backend::turn_emitter::AssistantMessagePayload {
                                 message_id: item
@@ -7953,7 +8095,6 @@ impl CodexInner {
                         let Ok(image) = parse_codex_generated_image(item) else {
                             continue;
                         };
-                        total_bytes = total_bytes.saturating_add(image.data.len() as u64);
                         self.emitter.replay_assistant_message(
                             crate::backend::turn_emitter::AssistantMessagePayload {
                                 message_id: item
@@ -7977,8 +8118,6 @@ impl CodexInner {
                 }
             }
         }
-
-        total_bytes
     }
 
     async fn respond_pending_request(&self, message: &str) -> Result<bool, String> {
@@ -8421,15 +8560,6 @@ impl CodexInner {
             return false;
         };
         if reasoning {
-            let mut state = self.state.lock().await;
-            if thread_id == state.thread_id {
-                let turn_id = turn_id.unwrap_or_else(|| "turn".to_owned());
-                let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-                estimate.reasoning_bytes = estimate
-                    .reasoning_bytes
-                    .saturating_add(emission.delta.len() as u64);
-            }
-            drop(state);
             emitter.stream_reasoning_delta(&response, &emission.delta);
         } else {
             emitter.stream_delta(&response, &emission.delta);
@@ -8487,15 +8617,6 @@ impl CodexInner {
         };
         if !emission.delta.is_empty() {
             if reasoning {
-                let mut state = self.state.lock().await;
-                if thread_id == state.thread_id {
-                    let turn_id = turn_id.unwrap_or_else(|| "turn".to_owned());
-                    let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-                    estimate.reasoning_bytes = estimate
-                        .reasoning_bytes
-                        .saturating_add(emission.delta.len() as u64);
-                }
-                drop(state);
                 emitter.stream_reasoning_delta(&response, &emission.delta);
             } else {
                 emitter.stream_delta(&response, &emission.delta);
@@ -8539,13 +8660,63 @@ impl CodexInner {
         else {
             return false;
         };
-        let (owner, typed_owns_call) = {
+        let (owner, suppressed_owner, typed_owns_call) = {
             let state = self.state.lock().await;
             let splitter = state.response_splitters.get(&thread_id);
             (
                 splitter.and_then(|splitter| splitter.raw_tool_owner_for_completion(call_id)),
+                splitter.and_then(|splitter| splitter.suppressed_raw_tool_request(call_id)),
                 splitter.is_some_and(|splitter| splitter.typed_item_owns_call(call_id)),
             )
+        };
+        let owner = if owner.is_some() {
+            owner
+        } else if let Some(suppressed_owner) = suppressed_owner {
+            let output = raw_custom_tool_output_text(item);
+            let nested_command_never_started = suppressed_owner
+                .tool_type
+                .get("kind")
+                .and_then(Value::as_str)
+                == Some("RunCommand")
+                && output.starts_with("Script failed")
+                && output.contains("exec_command failed");
+            if !nested_command_never_started {
+                if let Some(splitter) = self
+                    .state
+                    .lock()
+                    .await
+                    .response_splitters
+                    .get_mut(&thread_id)
+                {
+                    splitter.remove_suppressed_raw_tool_request(call_id);
+                }
+                return false;
+            }
+            eprintln!(
+                "TYDE CODEX RAW TOOL FALLBACK thread_id={thread_id} call_id={call_id} tool_call_id={}",
+                suppressed_owner.tool_call_id
+            );
+            let buffered = self
+                .buffer_strict_tool_request(
+                    &thread_id,
+                    &suppressed_owner.tool_call_id,
+                    &suppressed_owner.tool_name,
+                    suppressed_owner.arguments.clone(),
+                    suppressed_owner.tool_type.clone(),
+                )
+                .await;
+            if !buffered {
+                tracing::error!(
+                    thread_id,
+                    call_id,
+                    tool_call_id = suppressed_owner.tool_call_id,
+                    "Codex could not declare a rejected nested command"
+                );
+                return false;
+            }
+            Some(suppressed_owner)
+        } else {
+            None
         };
         let Some(owner) = owner else {
             if typed_owns_call {
@@ -8725,6 +8896,7 @@ impl CodexInner {
             .get_mut(&thread_id)
         {
             splitter.remove_raw_tool_owner(call_id);
+            splitter.remove_suppressed_raw_tool_request(call_id);
         }
         true
     }
@@ -8751,10 +8923,6 @@ impl CodexInner {
                         .map(|owner| (owner.tool_call_id.as_str(), owner.tool_name.as_str())),
                     "Codex command execution completed"
                 );
-                if thread_id == self.state.lock().await.thread_id {
-                    self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
-                        .await;
-                }
                 let background_command =
                     self.take_background_command(params, provider_item_id).await;
                 let outstanding_command = self
@@ -8796,6 +8964,12 @@ impl CodexInner {
                     .unwrap_or("")
                     .to_owned();
                 let success = exit_code == 0;
+                eprintln!(
+                    "TYDE CODEX COMMAND TERMINAL thread_id={thread_id} provider_item_id={provider_item_id} exit_code={exit_code} background_owner={} outstanding_owner={} child={} ",
+                    background_command.is_some(),
+                    outstanding_command.is_some(),
+                    thread_id != self.state.lock().await.thread_id,
+                );
                 let outcome = if let Some(command) = background_command.as_ref() {
                     self.complete_background_command_group(&thread_id, command, exit_code, &output)
                         .await
@@ -8824,40 +8998,38 @@ impl CodexInner {
                         self.mark_tool_completed(&tool_call_id).await;
                     }
                 }
-                if let Some(command) = background_command {
-                    if thread_id == self.state.lock().await.thread_id {
+                if thread_id == self.state.lock().await.thread_id {
+                    if let Some(command) = background_command {
                         self.enqueue_background_wake(command, exit_code, output)
                             .await;
-                    } else {
-                        let pending_spawn_terminal =
-                            {
-                                let mut state = self.state.lock().await;
-                                if !success
-                                    && let Some(stream) = state.subagent_streams.get_mut(&thread_id)
-                                {
-                                    stream.background_work_failed = true;
-                                    if stream.pending_spawn_terminal_status.is_some() {
-                                        stream.pending_spawn_terminal_status =
-                                            Some("failed".to_owned());
-                                    }
-                                }
-                                let still_running = state
-                                    .background_commands
-                                    .keys()
-                                    .chain(state.outstanding_command_executions.keys())
-                                    .any(|(owner_thread_id, _)| owner_thread_id == &thread_id);
-                                (!still_running)
-                                    .then(|| {
-                                        state.subagent_streams.get_mut(&thread_id).and_then(
-                                            |stream| stream.pending_spawn_terminal_status.take(),
-                                        )
-                                    })
-                                    .flatten()
-                            };
-                        if let Some(status) = pending_spawn_terminal {
-                            self.terminalize_codex_subagent_spawn(&thread_id, &status)
-                                .await;
+                    }
+                } else {
+                    let pending_spawn_terminal = {
+                        let mut state = self.state.lock().await;
+                        if !success && let Some(stream) = state.subagent_streams.get_mut(&thread_id)
+                        {
+                            stream.background_work_failed = true;
+                            if stream.pending_spawn_terminal_status.is_some() {
+                                stream.pending_spawn_terminal_status = Some("failed".to_owned());
+                            }
                         }
+                        let still_running = state
+                            .background_commands
+                            .keys()
+                            .chain(state.outstanding_command_executions.keys())
+                            .any(|(owner_thread_id, _)| owner_thread_id == &thread_id);
+                        (!still_running)
+                            .then(|| {
+                                state
+                                    .subagent_streams
+                                    .get_mut(&thread_id)
+                                    .and_then(|stream| stream.pending_spawn_terminal_status.take())
+                            })
+                            .flatten()
+                    };
+                    if let Some(status) = pending_spawn_terminal {
+                        self.terminalize_codex_subagent_spawn(&thread_id, &status)
+                            .await;
                     }
                 }
                 if let Some(splitter) = self
@@ -8882,10 +9054,6 @@ impl CodexInner {
                 }
             }
             "collabToolCall" | "collabAgentToolCall" => {
-                if thread_id == self.state.lock().await.thread_id {
-                    self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
-                        .await;
-                }
                 let canonical_item_id = if let Some(owner) = owner.as_ref() {
                     owner.tool_call_id.clone()
                 } else {
@@ -9017,23 +9185,12 @@ impl CodexInner {
                 state.foreground_response_completed = true;
             }
             state.close_active_stream_when_tools_idle = false;
-            if contains_non_whitespace(&finalized.content) {
-                state.conversation_bytes_total = state
-                    .conversation_bytes_total
-                    .saturating_add(finalized.content.len() as u64);
-            }
-            let turn_context = state
-                .turn_context_by_turn
-                .get(&finalized.turn_id)
-                .cloned()
-                .unwrap_or_default();
             if let Some(metadata) = metadata_target_for_visible_message(
                 finalized.turn_id.clone(),
                 presentation_message_id,
                 &finalized.content,
                 finalized.reasoning.as_deref(),
                 model.to_owned(),
-                turn_context,
             ) {
                 state.pending_message_metadata = Some(metadata);
             }
@@ -9052,7 +9209,6 @@ impl CodexInner {
             &finalized.content,
             finalized.reasoning.as_deref(),
             model.to_owned(),
-            TurnContextEstimate::default(),
         ) {
             stream.pending_message_metadata = Some(metadata);
         }
@@ -9289,6 +9445,18 @@ impl CodexInner {
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
         self.observe_codex_notification_contract(method).await;
+        if matches!(method, "turn/started" | "turn/completed" | "error") {
+            let state = self.state.lock().await;
+            eprintln!(
+                "TYDE CODEX ROOT NOTIFICATION method={method} active_turn_id={:?} awaiting_root_turn_start={} interrupt_next_root_turn={} params={params}",
+                state.active_turn_id,
+                state.awaiting_root_turn_start,
+                state.interrupt_next_root_turn,
+            );
+        }
+        if self.state.lock().await.pending_compaction.is_some() {
+            eprintln!("TYDE CODEX COMPACTION NOTIFICATION method={method} params={params}");
+        }
         if self.intercept_compaction_notification(method, params).await {
             return;
         }
@@ -9332,6 +9500,15 @@ impl CodexInner {
             return;
         }
         if method == "rawResponseItem/completed" {
+            if matches!(
+                params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("custom_tool_call" | "custom_tool_call_output")
+            ) {
+                eprintln!("TYDE CODEX RAW TOOL RESPONSE ITEM params={params}");
+            }
             self.observe_strict_raw_response_item(params).await;
             let unlinked_resolution = if !codex_yielded_session_ids(params).is_empty() {
                 let session_ids = self.correlate_yielded_command_owners(params).await;
@@ -9598,19 +9775,6 @@ impl CodexInner {
                     state.tool_container_images.clear();
                     state.close_active_stream_when_tools_idle = false;
                     state.pending_message_metadata = None;
-                    let pending_user_input = state.pending_user_input_bytes;
-                    state.pending_user_input_bytes = 0;
-                    state.conversation_bytes_total = state
-                        .conversation_bytes_total
-                        .saturating_add(pending_user_input);
-                    let history_bytes = state.conversation_bytes_total;
-                    state.turn_context_by_turn.insert(
-                        turn_id.clone(),
-                        TurnContextEstimate {
-                            conversation_history_bytes: history_bytes,
-                            ..TurnContextEstimate::default()
-                        },
-                    );
                     provider_initiated
                 };
                 if provider_initiated {
@@ -9911,9 +10075,9 @@ impl CodexInner {
     ///     -E 'test(=real_conversation)' --no-capture
     /// ```
     ///
-    /// `tests/tests/conformance.rs` and `tests/tests/backend.rs` both install a
-    /// subscriber over `EnvFilter::from_default_env()`, so `RUST_LOG` is all
-    /// that is required — without it the events are compiled in but discarded.
+    /// `tests/tests/conformance.rs` installs a subscriber over
+    /// `EnvFilter::from_default_env()`, so `RUST_LOG` is all that is required —
+    /// without it the events are compiled in but discarded.
     ///
     /// Keep the model on a cheap pin. The suites run `gpt-5.6-luna`; setting
     /// `TYDE_CODEX_TEST_MODEL` to another one is how you tell model-specific
@@ -10026,19 +10190,13 @@ impl CodexInner {
             let model = state.effective_model.clone();
             let model_usage = extract_model_request_token_usage(params, model.as_deref()).and_then(
                 |(turn_id, request, cumulative, context_window)| {
-                    let turn_context = state
-                        .turn_context_by_turn
-                        .get(&turn_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut usage = record_model_request_token_usage(
+                    let usage = record_model_request_token_usage(
                         &mut state.model_token_usage_by_turn,
                         turn_id,
                         request,
                         cumulative,
                         context_window,
                     )?;
-                    attach_estimated_context_breakdown(&mut usage, &turn_context, model.as_deref());
                     Some(usage)
                 },
             );
@@ -10049,13 +10207,8 @@ impl CodexInner {
 
             let metadata_update =
                 if let Some(pending) = state.completed_message_metadata_by_turn.remove(&turn_id) {
-                    let context_breakdown = estimate_context_breakdown(
-                        Some(&token_usage),
-                        &pending.turn_context,
-                        Some(&pending.model),
-                    );
                     let model_token_usage = state.model_token_usage_by_turn.get(&turn_id).cloned();
-                    Some((pending, token_usage, model_token_usage, context_breakdown))
+                    Some((pending, token_usage, model_token_usage, None))
                 } else if state.active_turn_id.as_deref() == Some(turn_id.as_str())
                     || state
                         .active_stream
@@ -10178,6 +10331,24 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        eprintln!(
+            "TYDE CODEX CHILD EVENT thread={stream_key} method={method} turn_id={:?} turn_status={:?} will_retry={:?} message={:?}",
+            extract_turn_id(params),
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str),
+            params
+                .get("willRetry")
+                .or_else(|| params.get("will_retry"))
+                .and_then(Value::as_bool),
+            params.get("message").and_then(Value::as_str).or_else(|| {
+                params
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+            })
+        );
         {
             let suppress_terminated_response = {
                 let state = self.state.lock().await;
@@ -10872,6 +11043,12 @@ impl CodexInner {
                 let message = params
                     .get("message")
                     .and_then(Value::as_str)
+                    .or_else(|| {
+                        params
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                    })
                     .unwrap_or("Codex error")
                     .to_string();
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
@@ -12120,7 +12297,12 @@ impl CodexInner {
         stream_key: &str,
         turn_id: String,
         token_usage: Value,
-    ) -> Option<(Arc<TurnEmitter>, PendingCodexMessageMetadata, Value, Value)> {
+    ) -> Option<(
+        Arc<TurnEmitter>,
+        PendingCodexMessageMetadata,
+        Value,
+        Option<Value>,
+    )> {
         let mut state = self.state.lock().await;
         let stream = state.subagent_streams.get_mut(stream_key)?;
         stream
@@ -12135,17 +12317,7 @@ impl CodexInner {
         }
         let pending = stream.pending_message_metadata.take()?;
         let token_usage = stream.token_usage_by_turn.remove(&turn_id)?;
-        let context_breakdown = estimate_context_breakdown(
-            Some(&token_usage),
-            &pending.turn_context,
-            Some(&pending.model),
-        );
-        Some((
-            Arc::clone(&stream.emitter),
-            pending,
-            token_usage,
-            context_breakdown,
-        ))
+        Some((Arc::clone(&stream.emitter), pending, token_usage, None))
     }
 
     async fn handle_completed_subagent_token_usage(
@@ -12178,7 +12350,12 @@ impl CodexInner {
         stream_key: &str,
         turn_id: String,
         token_usage: Value,
-    ) -> Option<(Arc<TurnEmitter>, PendingCodexMessageMetadata, Value, Value)> {
+    ) -> Option<(
+        Arc<TurnEmitter>,
+        PendingCodexMessageMetadata,
+        Value,
+        Option<Value>,
+    )> {
         let mut state = self.state.lock().await;
         let stream = state.completed_subagent_streams.get_mut(stream_key)?;
         let pending_ready = stream
@@ -12189,17 +12366,7 @@ impl CodexInner {
             return None;
         }
         let pending = stream.pending_message_metadata.take()?;
-        let context_breakdown = estimate_context_breakdown(
-            Some(&token_usage),
-            &pending.turn_context,
-            Some(&pending.model),
-        );
-        Some((
-            Arc::clone(&stream.emitter),
-            pending,
-            token_usage,
-            context_breakdown,
-        ))
+        Some((Arc::clone(&stream.emitter), pending, token_usage, None))
     }
 
     async fn handle_subagent_turn_completed(&self, params: &Value, stream_key: &str, model: &str) {
@@ -12476,6 +12643,13 @@ impl CodexInner {
                 turn_status.as_str()
             }
             .to_owned();
+            eprintln!(
+                "TYDE CODEX CHILD TURN TERMINAL thread_id={stream_key} provider_status={turn_status} background_work_failed={} has_background_work={has_background_work} terminal_status={terminal_status}",
+                state
+                    .subagent_streams
+                    .get(stream_key)
+                    .is_some_and(|stream| stream.background_work_failed),
+            );
             if has_background_work && turn_status == "completed" {
                 if let Some(stream) = state.subagent_streams.get_mut(stream_key) {
                     stream.pending_spawn_terminal_status = Some(terminal_status);
@@ -12530,10 +12704,14 @@ impl CodexInner {
                 .emitter
                 .has_pending_tool_request(&recorded_tool_call_id)
             {
-                recorded_tool_call_id
+                recorded_tool_call_id.clone()
             } else {
                 format!("codex-native-spawn:{recorded_tool_call_id}")
             };
+            eprintln!(
+                "TYDE CODEX CHILD SPAWN TERMINALIZE stream_key={stream_key} recorded_tool_call_id={recorded_tool_call_id} resolved_tool_call_id={tool_call_id} pending={} status={turn_status}",
+                self.emitter.has_pending_tool_request(&tool_call_id),
+            );
             if !self.emitter.has_pending_tool_request(&tool_call_id) {
                 return;
             }
@@ -12543,17 +12721,14 @@ impl CodexInner {
                 status = turn_status,
                 "Terminalizing Codex native background spawn"
             );
-            let tool_name = self
-                .emitter
-                .tool_request_name(&tool_call_id)
-                .unwrap_or_else(|| "spawnAgent".to_owned());
             let success = turn_status == "completed";
-            let status = if success {
-                protocol::SubAgentProgressStatus::Completed
-            } else if matches!(
+            let cancelled = matches!(
                 turn_status,
                 "interrupted" | "cancelled" | "canceled" | "stopped"
-            ) {
+            );
+            let status = if success {
+                protocol::SubAgentProgressStatus::Completed
+            } else if cancelled {
                 protocol::SubAgentProgressStatus::Stopped
             } else {
                 protocol::SubAgentProgressStatus::Failed
@@ -12571,14 +12746,27 @@ impl CodexInner {
                     status,
                 }),
             });
-            self.emit_tool_execution_completed(
-                &tool_call_id,
-                &tool_name,
-                success,
-                json!({ "kind": "Other", "result": { "status": turn_status } }),
-                (!success).then(|| format!("Codex child turn ended with status '{turn_status}'")),
-            )
-            .await;
+            if cancelled {
+                self.emitter.cancel_pending_tool(
+                    &tool_call_id,
+                    "Codex child was cancelled before it completed",
+                );
+                self.mark_tool_completed(&tool_call_id).await;
+            } else {
+                let tool_name = self
+                    .emitter
+                    .tool_request_name(&tool_call_id)
+                    .unwrap_or_else(|| "spawnAgent".to_owned());
+                self.emit_tool_execution_completed(
+                    &tool_call_id,
+                    &tool_name,
+                    success,
+                    json!({ "kind": "Other", "result": { "status": turn_status } }),
+                    (!success)
+                        .then(|| format!("Codex child turn ended with status '{turn_status}'")),
+                )
+                .await;
+            }
         }
     }
 
@@ -12606,20 +12794,13 @@ impl CodexInner {
                             &request,
                             cumulative,
                         );
-                        let turn_context = stream
-                            .pending_message_metadata
-                            .as_ref()
-                            .filter(|pending| pending.turn_id == turn_id)
-                            .map(|pending| pending.turn_context.clone())
-                            .unwrap_or_default();
-                        let mut usage = record_model_request_token_usage(
+                        let usage = record_model_request_token_usage(
                             &mut stream.model_token_usage_by_turn,
                             turn_id,
                             request,
                             cumulative,
                             context_window,
                         )?;
-                        attach_estimated_context_breakdown(&mut usage, &turn_context, Some(model));
                         Some((Arc::clone(&stream.emitter), usage))
                     })
             } else {
@@ -12632,20 +12813,13 @@ impl CodexInner {
                             &request,
                             cumulative,
                         );
-                        let turn_context = stream
-                            .pending_message_metadata
-                            .as_ref()
-                            .filter(|pending| pending.turn_id == turn_id)
-                            .map(|pending| pending.turn_context.clone())
-                            .unwrap_or_default();
-                        let mut usage = record_model_request_token_usage(
+                        let usage = record_model_request_token_usage(
                             &mut stream.model_token_usage_by_turn,
                             turn_id,
                             request,
                             cumulative,
                             context_window,
                         )?;
-                        attach_estimated_context_breakdown(&mut usage, &turn_context, Some(model));
                         Some((Arc::clone(&stream.emitter), usage))
                     })
             }
@@ -12723,7 +12897,6 @@ impl CodexInner {
             let state = self.state.lock().await;
             is_terminal_codex_error_notification(&state, params)
         };
-
         if terminal {
             let active_turn_id = self.state.lock().await.active_turn_id.clone();
             self.terminalize_dynamic_awaits(active_turn_id.as_deref())
@@ -13059,6 +13232,7 @@ impl CodexInner {
                                 call_id.clone(),
                                 CodexPendingDynamicAwait {
                                     turn_id,
+                                    arguments: arguments.clone(),
                                     cancellation: cancellation.clone(),
                                 },
                             );
@@ -13176,18 +13350,6 @@ impl CodexInner {
                     .await;
             }
         }
-    }
-
-    async fn add_active_turn_tool_bytes(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        let Some(turn_id) = state.active_turn_id.as_ref().cloned() else {
-            return;
-        };
-        let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-        estimate.tool_io_bytes = estimate.tool_io_bytes.saturating_add(bytes);
     }
 
     async fn handle_item_started(self: &Arc<Self>, params: &Value) {
@@ -13521,8 +13683,13 @@ impl CodexInner {
                         "Emitted Codex Tyde agent-control request"
                     );
                 }
-                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
-                    .await;
+                self.emit_agent_control_await_progress_if_needed(
+                    &item_id,
+                    &tool_name,
+                    item,
+                    protocol::AgentControlProgressStatus::Running,
+                )
+                .await;
                 self.record_codex_subagent_spawn_metadata_if_needed(
                     Some(&item_id),
                     Some(params),
@@ -13559,8 +13726,13 @@ impl CodexInner {
                         "Emitted Codex Tyde agent-control request"
                     );
                 }
-                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
-                    .await;
+                self.emit_agent_control_await_progress_if_needed(
+                    &item_id,
+                    &tool_name,
+                    item,
+                    protocol::AgentControlProgressStatus::Running,
+                )
+                .await;
             }
             // A tool item this build has no mapping for. It still ran, so it
             // still gets a card, carrying the provider's own JSON: the
@@ -13896,8 +14068,6 @@ impl CodexInner {
                     .forget_command_execution(params, provider_item_id)
                     .await;
                 self.warn_codex_raw_contract_drift_once_if_needed().await;
-                self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
-                    .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
                 let output = item
                     .get("aggregatedOutput")
@@ -13930,8 +14100,6 @@ impl CodexInner {
             "fileChange" => {
                 let item_id = self
                     .tool_call_completed_id(params, item_id.unwrap_or("item"), "file_change")
-                    .await;
-                self.add_active_turn_tool_bytes(estimate_file_change_tool_bytes(item))
                     .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
                 let known_call_ids = {
@@ -14039,8 +14207,6 @@ impl CodexInner {
                 .await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
-                self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
-                    .await;
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -14072,6 +14238,17 @@ impl CodexInner {
                 let error = normalized_mcp
                     .and_then(|normalized| normalized.error)
                     .or_else(|| (!success).then(|| format!("{tool_name} failed")));
+                self.emit_agent_control_await_progress_if_needed(
+                    &item_id,
+                    tool_name,
+                    item,
+                    if success {
+                        protocol::AgentControlProgressStatus::Completed
+                    } else {
+                        protocol::AgentControlProgressStatus::Failed
+                    },
+                )
+                .await;
                 self.emit_tool_execution_completed(&item_id, tool_name, success, result, error)
                     .await;
             }
@@ -14084,8 +14261,6 @@ impl CodexInner {
                     "Codex native collaboration completion"
                 );
                 tracing::info!(item = %item, "Codex native collaboration completion payload");
-                self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
-                    .await;
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -14096,6 +14271,17 @@ impl CodexInner {
                 let success = codex_item_success(item);
                 let native_spawn = !parse_codex_subagent_collabs(item).is_empty();
                 if !native_spawn {
+                    self.emit_agent_control_await_progress_if_needed(
+                        &item_id,
+                        tool_name,
+                        item,
+                        if success {
+                            protocol::AgentControlProgressStatus::Completed
+                        } else {
+                            protocol::AgentControlProgressStatus::Failed
+                        },
+                    )
+                    .await;
                     self.emit_tool_execution_completed(
                         &item_id,
                         tool_name,
@@ -14562,8 +14748,55 @@ impl CodexInner {
     }
 
     async fn complete_all_codex_subagents(&self) {
+        let (stream_keys, native_ids, pending_spawns) = {
+            let state = self.state.lock().await;
+            (
+                state.subagent_streams.keys().cloned().collect::<Vec<_>>(),
+                state
+                    .native_subagent_tool_call_ids
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .pending_subagent_spawns
+                    .iter()
+                    .map(|(thread_id, spawn)| (thread_id.clone(), spawn.item_id.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        eprintln!(
+            "TYDE CODEX CHILD SHUTDOWN stream_keys={stream_keys:?} native_ids={native_ids:?} pending_spawns={pending_spawns:?}"
+        );
+        for stream_key in stream_keys {
+            self.terminalize_codex_subagent_spawn(&stream_key, "cancelled")
+                .await;
+        }
+        let unregistered_spawn_ids = {
+            let mut state = self.state.lock().await;
+            state.pending_subagent_spawns.clear();
+            state.registering_subagent_threads.clear();
+            state
+                .native_subagent_tool_call_ids
+                .drain()
+                .collect::<Vec<_>>()
+        };
+        for recorded_tool_call_id in unregistered_spawn_ids {
+            let tool_call_id = if self
+                .emitter
+                .has_pending_tool_request(&recorded_tool_call_id)
+            {
+                recorded_tool_call_id
+            } else {
+                format!("codex-native-spawn:{recorded_tool_call_id}")
+            };
+            if self.emitter.cancel_pending_tool(
+                &tool_call_id,
+                "Codex child registration ended with its parent",
+            ) {
+                self.mark_tool_completed(&tool_call_id).await;
+            }
+        }
         let mut state = self.state.lock().await;
-        state.native_subagent_tool_call_ids.clear();
         let streams = state.subagent_streams.drain().collect::<Vec<_>>();
         for (item_id, mut stream) in streams {
             let commands = take_codex_commands_for_thread(&mut state, &item_id);
@@ -14679,7 +14912,6 @@ impl CodexInner {
                 {
                     state.token_usage_by_turn.remove(completed_turn_id);
                     state.model_token_usage_by_turn.remove(completed_turn_id);
-                    state.turn_context_by_turn.remove(completed_turn_id);
                     state
                         .completed_message_metadata_by_turn
                         .remove(completed_turn_id);
@@ -14748,25 +14980,13 @@ impl CodexInner {
             }
             let model_usage =
                 model_usage.and_then(|(turn_id, request, cumulative, context_window)| {
-                    let turn_context = state
-                        .turn_context_by_turn
-                        .get(&turn_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut usage = record_model_request_token_usage(
+                    let usage = record_model_request_token_usage(
                         &mut state.model_token_usage_by_turn,
                         turn_id,
                         request,
                         cumulative,
                         context_window,
                     )?;
-                    if turn_status != "interrupted" {
-                        attach_estimated_context_breakdown(
-                            &mut usage,
-                            &turn_context,
-                            model_hint.as_deref(),
-                        );
-                    }
                     Some(usage)
                 });
 
@@ -14853,19 +15073,13 @@ impl CodexInner {
                     && let Some(pending) = state.pending_message_metadata.take()
                 {
                     let token_usage = state.token_usage_by_turn.remove(&turn_id);
-                    let context_breakdown = estimate_context_breakdown(
-                        token_usage.as_ref(),
-                        &pending.turn_context,
-                        Some(&pending.model),
-                    );
                     if token_usage.is_none() {
                         state
                             .completed_message_metadata_by_turn
                             .insert(turn_id.clone(), pending.clone());
                     }
                     let model_token_usage = state.model_token_usage_by_turn.get(&turn_id).cloned();
-                    metadata_update =
-                        Some((pending, token_usage, model_token_usage, context_breakdown));
+                    metadata_update = Some((pending, token_usage, model_token_usage, None));
                 }
                 if turn_status == "interrupted" || partial_idless_reasoning.is_some() {
                     state.pending_message_metadata = None;
@@ -14876,7 +15090,6 @@ impl CodexInner {
                     terminated_background_commands =
                         take_codex_commands_for_turn(&mut state, &root_thread_id, &turn_id);
                 }
-                state.turn_context_by_turn.remove(&turn_id);
                 state.token_usage_by_turn.remove(&turn_id);
                 state.model_token_usage_by_turn.remove(&turn_id);
             }
@@ -14895,7 +15108,6 @@ impl CodexInner {
             state.pending_tool_call_ids.clear();
             state.tool_container_images.clear();
             state.close_active_stream_when_tools_idle = false;
-            state.pending_user_input_bytes = 0;
             (
                 open_item_without_completion,
                 open_item_published,
@@ -15017,10 +15229,16 @@ impl CodexInner {
             tool_result,
             success,
         );
-        self.emitter.tool_completed(
-            tool_call_id,
-            codex_tool_execution_outcome(tool_result, success, error, normalization_failure),
+        let outcome = codex_tool_execution_outcome(
+            tool_result,
+            success && normalization_failure.is_none(),
+            error,
+            normalization_failure,
         );
+        eprintln!(
+            "TYDE CODEX TOOL TERMINAL source=provider tool_call_id={tool_call_id} tool_name={tool_name} outcome={outcome:?}"
+        );
+        self.emitter.tool_completed(tool_call_id, outcome);
         self.mark_tool_completed(tool_call_id).await;
     }
 
@@ -15073,11 +15291,25 @@ impl CodexInner {
         tool_call_id: &str,
         tool_name: &str,
         arguments: &Value,
+        status: protocol::AgentControlProgressStatus,
     ) {
-        if !is_codex_native_wait_tool(tool_name) {
+        if !self.emitter.has_pending_tool_request(tool_call_id) {
             return;
         }
-        if !self.emitter.has_pending_tool_request(tool_call_id) {
+        if is_tyde_agent_control_await_tool_name(tool_name) {
+            let Some(mut progress) =
+                await_progress_data_for_tool(tool_call_id, tool_name, arguments)
+            else {
+                return;
+            };
+            let ToolProgressUpdate::AgentControl(update) = &mut progress.update else {
+                unreachable!()
+            };
+            update.status = status;
+            self.emitter.tool_progress(&progress);
+            return;
+        }
+        if !is_codex_native_wait_tool(tool_name) {
             return;
         }
 
@@ -15128,7 +15360,7 @@ impl CodexInner {
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents,
-                status: protocol::AgentControlProgressStatus::Running,
+                status,
             }),
         });
     }
@@ -15810,7 +16042,6 @@ fn metadata_target_for_visible_message(
     content: &str,
     reasoning: Option<&str>,
     model: String,
-    turn_context: TurnContextEstimate,
 ) -> Option<PendingCodexMessageMetadata> {
     if message_id.0.trim().is_empty() {
         return None;
@@ -15822,7 +16053,6 @@ fn metadata_target_for_visible_message(
         turn_id,
         message_id,
         model,
-        turn_context,
     })
 }
 
@@ -15831,7 +16061,7 @@ fn emit_codex_message_metadata_update(
     pending: PendingCodexMessageMetadata,
     token_usage: Option<Value>,
     model_token_usage: Option<&CodexTurnTokenUsage>,
-    context_breakdown: Value,
+    context_breakdown: Option<Value>,
 ) {
     let token_usage = codex_message_usage(token_usage, model_token_usage);
     emitter.message_metadata_updated(MessageMetadataUpdateData {
@@ -15840,7 +16070,7 @@ fn emit_codex_message_metadata_update(
             model: pending.model,
         }),
         token_usage,
-        context_breakdown: serde_json::from_value(context_breakdown).ok(),
+        context_breakdown: context_breakdown.and_then(|value| serde_json::from_value(value).ok()),
     });
 }
 
@@ -16593,27 +16823,6 @@ fn current_context_usage(request: &TokenUsage, context_window: u64) -> CurrentCo
     }
 }
 
-fn attach_estimated_context_breakdown(
-    usage: &mut ModelRequestTokenUsage,
-    turn_context: &TurnContextEstimate,
-    model_hint: Option<&str>,
-) {
-    let Some(current) = usage.current_context_usage.as_ref() else {
-        return;
-    };
-    let Some((input_tokens, context_window)) = current.known() else {
-        return;
-    };
-    if !turn_context.has_observed_bytes() {
-        return;
-    }
-    let token_usage = serde_json::to_value(&usage.request).expect("TokenUsage must serialize");
-    let mut breakdown = estimate_context_breakdown(Some(&token_usage), turn_context, model_hint);
-    breakdown["input_tokens"] = json!(input_tokens);
-    breakdown["context_window"] = json!(context_window);
-    usage.estimated_context_breakdown = serde_json::from_value::<ContextBreakdown>(breakdown).ok();
-}
-
 fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
@@ -16813,98 +17022,6 @@ fn codex_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
         return CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY;
     }
     CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
-}
-
-fn estimate_context_breakdown(
-    token_usage: Option<&Value>,
-    turn_context: &TurnContextEstimate,
-    model_hint: Option<&str>,
-) -> Value {
-    let base_input_tokens = token_usage
-        .and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let cached_prompt_tokens = token_usage
-        .and_then(|usage| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let cache_creation_input_tokens = token_usage
-        .and_then(|usage| {
-            usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
-    // Context utilization should reflect the full prompt footprint, including cache hits/writes.
-    let mut input_tokens = base_input_tokens
-        .saturating_add(cached_prompt_tokens)
-        .saturating_add(cache_creation_input_tokens);
-    let context_window = token_usage
-        .and_then(|usage| usage.get("context_window").and_then(Value::as_u64))
-        .filter(|window| *window > 0)
-        .unwrap_or_else(|| {
-            let model_estimate = codex_estimated_context_window_for_model(model_hint);
-            std::cmp::max(model_estimate, input_tokens.max(1))
-        });
-
-    let reasoning_from_tokens = token_usage
-        .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64))
-        .unwrap_or(0)
-        .saturating_mul(CODEX_ESTIMATED_BYTES_PER_TOKEN);
-
-    let reasoning_est = std::cmp::max(turn_context.reasoning_bytes, reasoning_from_tokens);
-    let tools_est = turn_context.tool_io_bytes;
-    let history_est = turn_context.conversation_history_bytes;
-    let observed_bytes = reasoning_est
-        .saturating_add(tools_est)
-        .saturating_add(history_est);
-
-    let mut total_prompt_bytes = input_tokens.saturating_mul(CODEX_ESTIMATED_BYTES_PER_TOKEN);
-    if total_prompt_bytes == 0 {
-        let system_floor = if observed_bytes > 0 {
-            CODEX_MIN_SYSTEM_PROMPT_BYTES
-        } else {
-            0
-        };
-        total_prompt_bytes = observed_bytes.saturating_add(system_floor);
-        if total_prompt_bytes > 0 {
-            input_tokens = total_prompt_bytes.div_ceil(CODEX_ESTIMATED_BYTES_PER_TOKEN);
-        }
-    }
-
-    let mut system_prompt_bytes = if total_prompt_bytes == 0 {
-        0
-    } else {
-        let target = total_prompt_bytes / 10;
-        std::cmp::max(CODEX_MIN_SYSTEM_PROMPT_BYTES, target)
-    };
-    system_prompt_bytes = std::cmp::min(system_prompt_bytes, total_prompt_bytes);
-
-    let mut remaining = total_prompt_bytes.saturating_sub(system_prompt_bytes);
-    let reasoning_bytes = std::cmp::min(reasoning_est, remaining);
-    remaining = remaining.saturating_sub(reasoning_bytes);
-
-    let tool_io_bytes = std::cmp::min(tools_est, remaining);
-    remaining = remaining.saturating_sub(tool_io_bytes);
-
-    let conversation_history_bytes = std::cmp::min(history_est, remaining);
-    remaining = remaining.saturating_sub(conversation_history_bytes);
-
-    let context_injection_bytes = remaining;
-
-    json!({
-        "system_prompt_bytes": system_prompt_bytes,
-        "tool_io_bytes": tool_io_bytes,
-        "conversation_history_bytes": conversation_history_bytes,
-        "reasoning_bytes": reasoning_bytes,
-        "context_injection_bytes": context_injection_bytes,
-        "input_tokens": input_tokens,
-        "context_window": context_window
-    })
-}
-
-fn estimate_command_execution_tool_bytes(item: &Value) -> u64 {
-    value_str_len(item, "command")
-        .saturating_add(value_str_len(item, "cwd"))
-        .saturating_add(value_str_len(item, "aggregatedOutput"))
 }
 
 fn codex_process_id(item: &Value) -> Option<String> {
@@ -17238,36 +17355,6 @@ fn codex_background_wake_notification(wakes: &[CodexBackgroundWake]) -> String {
         ));
     }
     notification
-}
-
-fn estimate_file_change_tool_bytes(item: &Value) -> u64 {
-    let mut total = 0u64;
-    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
-        for change in changes {
-            total = total
-                .saturating_add(value_str_len(change, "path"))
-                .saturating_add(value_str_len(change, "diff"));
-        }
-    }
-    if total > 0 {
-        return total;
-    }
-    estimate_generic_tool_bytes(item)
-}
-
-fn estimate_generic_tool_bytes(item: &Value) -> u64 {
-    let bytes = serde_json::to_vec(item)
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
-    std::cmp::min(bytes, 128_000)
-}
-
-fn value_str_len(value: &Value, key: &str) -> u64 {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|v| v.len() as u64)
-        .unwrap_or(0)
 }
 
 fn codex_mcp_elicitation_result(params: &Value) -> Value {
@@ -18108,6 +18195,14 @@ impl CodexRpcError {
             || (self.code == Some(-32600)
                 && self.message.trim_start().starts_with("Invalid request:"))
     }
+
+    fn no_active_turn_to_interrupt(&self) -> bool {
+        self.code == Some(-32600)
+            && self
+                .message
+                .trim()
+                .eq_ignore_ascii_case("no active turn to interrupt")
+    }
 }
 
 impl std::fmt::Display for CodexRpcError {
@@ -18517,11 +18612,19 @@ impl CodexRpc {
 /// is not a promise that everything it spawned did, and this is what guarantees
 /// teardown terminates.
 async fn shut_down_codex_child(child: &mut AsyncGroupChild) -> Result<(), String> {
+    eprintln!(
+        "TYDE CODEX PROCESS SHUTDOWN waiting_for_eof_exit pid={:?}",
+        child.inner().id()
+    );
     // No deadline. This ends when the process ends, which is the same liveness
     // signal the stdout reader watches. A clock could only pre-empt the flush
     // this wait exists to allow — and if some future codex stopped exiting on
     // EOF, hanging is the honest report of that, where a deadline would hide it.
     let _ = child.inner().wait().await;
+    eprintln!(
+        "TYDE CODEX PROCESS SHUTDOWN eof_exit_observed pid={:?}",
+        child.inner().id()
+    );
 
     let kill_error = child
         .start_kill()
@@ -18611,16 +18714,17 @@ use super::{
     BackendCompactionMutationState, BackendCompactionObservationSource, BackendCompactionProgress,
     BackendCompactionRequest, BackendCompactionResult, BackendCompactionStart,
     BackendCompactionSuccess, BackendCompactionTerminalEvidence,
-    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendEvent,
-    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendTranscriptEventMetadata,
-    EventStream, PostCompactionTokenCount, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    BackendCompactionUnavailableReason, BackendCompactionUnknownReason, BackendCompactionUserFocus,
+    BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
+    BackendSpawnConfig, BackendTranscriptEventMetadata, EventStream, PostCompactionTokenCount,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 pub struct CodexBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
-    interrupt_tx: mpsc::UnboundedSender<()>,
+    interrupt_tx: mpsc::UnboundedSender<CodexInterrupt>,
     cancel_task_tx: mpsc::UnboundedSender<CodexCancelBackgroundTask>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
@@ -18634,6 +18738,10 @@ struct CodexSettingsUpdate {
 
 struct CodexCancelBackgroundTask {
     tool_call_id: String,
+    reply: oneshot::Sender<bool>,
+}
+
+struct CodexInterrupt {
     reply: oneshot::Sender<bool>,
 }
 
@@ -18672,7 +18780,7 @@ impl CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(initial_emitter.clone());
@@ -18785,7 +18893,7 @@ impl CodexBackend {
                     tokio::select! {
                         biased;
                         interrupt = interrupt_rx.recv() => {
-                            let Some(()) = interrupt else {
+                            let Some(interrupt) = interrupt else {
                                 break StartupSettingsPhase::Terminated;
                             };
                             if !pending_initial_input_cancelled {
@@ -18801,9 +18909,10 @@ impl CodexBackend {
                                 let _ = events_tx
                                     .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
                             }
+                            let _ = interrupt.reply.send(true);
                         }
                         result = &mut settings_request => {
-                            while interrupt_rx.try_recv().is_ok() {
+                            while let Ok(interrupt) = interrupt_rx.try_recv() {
                                 if !pending_initial_input_cancelled {
                                     pending_initial_input_cancelled = true;
                                     let _ = events_tx.send(BackendEvent::Chat(
@@ -18816,6 +18925,7 @@ impl CodexBackend {
                                     let _ = events_tx
                                         .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
                                 }
+                                let _ = interrupt.reply.send(true);
                             }
                             break match result {
                                 Ok(()) => StartupSettingsPhase::Configured,
@@ -18929,11 +19039,19 @@ impl CodexBackend {
                         let Some(input) = input else { break; };
                         match input {
                             AgentInput::SendMessage(payload) => {
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP DEQUEUE mode=spawn message={:?}",
+                                    payload.message.chars().take(96).collect::<String>()
+                                );
                                 let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle.execute(SessionCommand::SendMessage {
+                                let result = handle.execute(SessionCommand::SendMessage {
                                     message: payload.message,
                                     images,
-                                }).await {
+                                }).await;
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP RPC mode=spawn result={result:?}"
+                                );
+                                if let Err(err) = result {
                                     tracing::error!(%err, "Failed to send Codex follow-up");
                                     break;
                                 }
@@ -18965,8 +19083,13 @@ impl CodexBackend {
                         let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else { break; };
-                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                        let Some(interrupt) = interrupt else { break; };
+                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=spawn");
+                        let result = handle.execute(SessionCommand::CancelConversation).await;
+                        eprintln!("TYDE CODEX INTERRUPT RPC mode=spawn result={result:?}");
+                        let accepted = result.is_ok();
+                        let _ = interrupt.reply.send(accepted);
+                        if let Err(err) = result {
                             tracing::error!(%err, "Failed to interrupt Codex turn");
                             break;
                         }
@@ -19260,6 +19383,19 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
 /// a card carrying its JSON: if it turns out to have a typed item too the user
 /// sees it twice, which is visible and fixable, rather than not at all.
 fn codex_raw_call_is_rendered_elsewhere(tool_name: &str, arguments: &Value) -> bool {
+    // Code-mode `wait` does not start new work. It only resumes a yielded
+    // `exec` cell whose underlying typed item owns the user-visible card. For
+    // image generation Codex 0.146.0 emits the completed imageGeneration item,
+    // then this raw continuation with only a cell id; showing both makes one
+    // image request look like two independent tools.
+    if tool_name == "wait"
+        && arguments
+            .get("cell_id")
+            .and_then(Value::as_str)
+            .is_some_and(|cell_id| !cell_id.trim().is_empty())
+    {
+        return true;
+    }
     // The same call reaches Tyde in two shapes, and which one the model picks
     // varies run to run: `exec_command` called directly, with JSON arguments,
     // and `exec` called with a source string that calls it. Reading only the
@@ -19284,7 +19420,7 @@ fn codex_raw_call_is_rendered_elsewhere(tool_name: &str, arguments: &Value) -> b
 
 /// Whether this Codex tool already reaches the user through a typed item:
 /// `commandExecution`, `fileChange`, `webSearch`, `imageView`, `sleep`,
-/// `mcpToolCall`.
+/// `mcpToolCall`, or native collaboration spawn.
 ///
 /// `write_stdin` is deliberately absent — it gets no typed item, so the raw
 /// declaration is the only record of it and suppressing it drops the call
@@ -19300,6 +19436,9 @@ fn codex_function_is_rendered_elsewhere(function: &str) -> bool {
         function,
         "exec_command" | "apply_patch" | "web__run" | "view_image" | "sleep"
     ) || function.starts_with("mcp__")
+        || is_tyde_agent_control_spawn_tool_name(function)
+        || is_tyde_agent_control_await_tool_name(function)
+        || is_tyde_agent_control_send_message_tool_name(function)
 }
 
 fn raw_codex_tool_request_type(tool_name: &str, arguments: &Value) -> Option<Value> {
@@ -19359,6 +19498,27 @@ fn javascript_object_string_field(source: &str, field: &str) -> Option<String> {
 }
 
 fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
+    let public_arguments = codex_generic_tool_arguments(arguments);
+    if is_tyde_agent_control_await_tool_name(tool_name) {
+        let agent_ids = parse_await_agent_refs(&public_arguments)
+            .into_iter()
+            .map(|agent| agent.agent_id)
+            .collect();
+        return serde_json::to_value(protocol::ToolRequestType::TydeAwaitAgents { agent_ids })
+            .expect("serialize Codex Tyde await request");
+    }
+    if is_tyde_agent_control_send_message_tool_name(tool_name)
+        && let (Some(agent_id), Some(message)) = (
+            public_arguments.get("agent_id").and_then(Value::as_str),
+            public_arguments.get("message").and_then(Value::as_str),
+        )
+    {
+        return serde_json::to_value(protocol::ToolRequestType::TydeSendAgentMessage {
+            agent_id: protocol::AgentId(agent_id.to_owned()),
+            message: message.to_owned(),
+        })
+        .expect("serialize Codex Tyde send-message request");
+    }
     if tool_name.eq_ignore_ascii_case("spawnAgent") {
         return serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
             prompt: arguments
@@ -19449,6 +19609,27 @@ fn normalize_codex_tool_result(
     tool_result: Value,
     success: bool,
 ) -> (Value, Option<ToolExecutionNormalizationFailure>) {
+    if success {
+        match tyde_tool_result(tool_name, &tool_result) {
+            Ok(Some(result)) => {
+                return (
+                    serde_json::to_value(result).expect("serialize normalized Tyde tool result"),
+                    None,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return (
+                    json!({
+                        "kind": "Error",
+                        "short_message": format!("{tool_name} returned a malformed result"),
+                        "detailed_message": error.to_string(),
+                    }),
+                    Some(error.normalization_failure),
+                );
+            }
+        }
+    }
     if let Some(item) = tool_result
         .get("result")
         .filter(|item| codex_is_collaboration_item(item))
@@ -19914,6 +20095,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+            tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
             tyde_agent_adapter::BackendCapability::TaskListClear,
@@ -19951,7 +20133,7 @@ impl Backend for CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
@@ -20092,14 +20274,21 @@ impl Backend for CodexBackend {
                         };
                         match input {
                             AgentInput::SendMessage(payload) => {
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP DEQUEUE mode=resume message={:?}",
+                                    payload.message.chars().take(96).collect::<String>()
+                                );
                                 let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
+                                let result = handle
                                     .execute(SessionCommand::SendMessage {
                                         message: payload.message,
                                         images,
                                     })
-                                    .await
-                                {
+                                    .await;
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP RPC mode=resume result={result:?}"
+                                );
+                                if let Err(err) = result {
                                     tracing::error!("Failed to send Codex resume follow-up: {err}");
                                     break;
                                 }
@@ -20132,8 +20321,13 @@ impl Backend for CodexBackend {
                         let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else { break };
-                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                        let Some(interrupt) = interrupt else { break };
+                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=resume");
+                        let result = handle.execute(SessionCommand::CancelConversation).await;
+                        eprintln!("TYDE CODEX INTERRUPT RPC mode=resume result={result:?}");
+                        let accepted = result.is_ok();
+                        let _ = interrupt.reply.send(accepted);
+                        if let Err(err) = result {
                             tracing::error!("Failed to interrupt resumed Codex turn: {err}");
                             break;
                         }
@@ -20188,7 +20382,7 @@ impl Backend for CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
@@ -20345,14 +20539,21 @@ impl Backend for CodexBackend {
                         };
                         match input {
                             AgentInput::SendMessage(payload) => {
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP DEQUEUE mode=fork message={:?}",
+                                    payload.message.chars().take(96).collect::<String>()
+                                );
                                 let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
+                                let result = handle
                                     .execute(SessionCommand::SendMessage {
                                         message: payload.message,
                                         images,
                                     })
-                                    .await
-                                {
+                                    .await;
+                                eprintln!(
+                                    "TYDE CODEX FOLLOWUP RPC mode=fork result={result:?}"
+                                );
+                                if let Err(err) = result {
                                     tracing::error!("Failed to send Codex fork follow-up: {err}");
                                     break;
                                 }
@@ -20385,8 +20586,13 @@ impl Backend for CodexBackend {
                         let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else { break };
-                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                        let Some(interrupt) = interrupt else { break };
+                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=fork");
+                        let result = handle.execute(SessionCommand::CancelConversation).await;
+                        eprintln!("TYDE CODEX INTERRUPT RPC mode=fork result={result:?}");
+                        let accepted = result.is_ok();
+                        let _ = interrupt.reply.send(accepted);
+                        if let Err(err) = result {
                             tracing::error!("Failed to interrupt forked Codex turn: {err}");
                             break;
                         }
@@ -20486,6 +20692,42 @@ impl Backend for CodexBackend {
         }
     }
 
+    async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
+        use crate::backend::SendOutcome;
+
+        let handle = self
+            .compaction_handle
+            .lock()
+            .expect("Codex command handle mutex poisoned")
+            .clone();
+        let (payload, handle) = match (input, handle) {
+            (AgentInput::SendMessage(payload), Some(handle)) if payload.tool_response.is_none() => {
+                (payload, handle)
+            }
+            (input, _) => {
+                return if self.send(input).await {
+                    SendOutcome::Accepted
+                } else {
+                    SendOutcome::Closed
+                };
+            }
+        };
+
+        if !handle.try_reserve_user_turn().await {
+            eprintln!("TYDE CODEX USER TURN ADMISSION busy");
+            return SendOutcome::Busy(AgentInput::SendMessage(payload));
+        }
+        eprintln!("TYDE CODEX USER TURN ADMISSION reserved");
+        match self.input_tx.send(AgentInput::SendMessage(payload)) {
+            Ok(()) => SendOutcome::Accepted,
+            Err(error) => {
+                handle.release_user_turn_reservation().await;
+                let _ = error;
+                SendOutcome::Closed
+            }
+        }
+    }
+
     async fn update_session_settings(
         &mut self,
         payload: protocol::SetSessionSettingsPayload,
@@ -20500,7 +20742,10 @@ impl Backend for CodexBackend {
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).is_ok()
+        let (reply, done) = oneshot::channel();
+        let accepted = self.interrupt_tx.send(CodexInterrupt { reply }).is_ok();
+        eprintln!("TYDE CODEX INTERRUPT ENQUEUE accepted={accepted}");
+        accepted && done.await.unwrap_or(false)
     }
 
     async fn cancel_background_task(&self, tool_call_id: &str) -> bool {

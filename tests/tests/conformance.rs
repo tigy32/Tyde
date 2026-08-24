@@ -1,7 +1,7 @@
 //! Coarse, high-value real-backend conformance tests.
 //!
-//! **Few conversations, many assertions.** `backend.rs` spends one paid
-//! conversation per assertion, which is why it is too expensive to run often
+//! **Few conversations, many assertions.** The retired per-assertion suite spent
+//! one paid conversation per assertion, which made it too expensive to run often
 //! enough to catch anything. Here one conversation produces one event stream and
 //! every check runs over that stream offline, so the assertion count can grow
 //! without the API bill growing with it.
@@ -337,11 +337,10 @@ fn real_tool_type_mappings() {
 /// Stopping the agent, in the three states there are to stop it in.
 ///
 /// The protocol writes this contract down (`types.rs`, "Cancellation ordering")
-/// and nothing paid checks it. `backend.rs` has four certification cases for
-/// interrupt — `InterruptEmitsCancellation`, `InterruptReturnsIdle`,
-/// `InterruptStopsCommand`, `FollowUpAfterInterrupt` — and all four dispatch to
-/// the same function (`backend.rs:45019`), which interrupts a command and never
-/// touches a streaming response. Four case ids, one shape.
+/// The retired suite had four certification cases for interrupt —
+/// `InterruptEmitsCancellation`, `InterruptReturnsIdle`,
+/// `InterruptStopsCommand`, `FollowUpAfterInterrupt` — but all four interrupted
+/// a command and never touched a streaming response. Four case ids, one shape.
 ///
 /// The three states are genuinely different code:
 ///
@@ -779,12 +778,10 @@ fn real_compaction_and_resume() {
 
 /// Everything about asking the user a question, in one conversation.
 ///
-/// `backend.rs` spends roughly twenty separate paid conversations on this tool
-/// — shape, waiting, answering, interrupting, closing, reconnecting, forking —
-/// and one of them (`assert_user_question_waits_for_answer`, `backend.rs:14550`)
-/// already asserts the invariant that broke in production. It never caught it,
-/// because a suite that costs twenty conversations to check one tool does not
-/// get run. The same guarantees fit in one conversation.
+/// The retired suite spent roughly twenty separate paid conversations on this
+/// tool — shape, waiting, answering, interrupting, closing, reconnecting,
+/// forking — and still did not catch the production failure because that cost
+/// kept it from being run. The same guarantees fit in one conversation.
 ///
 /// A question is the only tool that is *supposed* to outlive its turn: the turn
 /// goes idle and the card stays open, because the thing it is waiting for is a
@@ -1209,10 +1206,9 @@ fn real_native_workflow() {
 
 /// What the reported numbers *say*, not whether they were sent.
 ///
-/// Presence is already covered, live, on every run: `require_turn_evidence`
-/// (`agent-adapter/src/conformance.rs:668`) fails any turn where a backend
-/// declared a usage capability and emitted nothing. So this scenario deliberately
-/// asserts nothing about presence.
+/// Presence is part of the planted-payload check below: a backend cannot show
+/// that the payload moved its reported input if either measured turn omits turn
+/// usage.
 ///
 /// The values are covered nowhere. Every certification case that reads them —
 /// `TurnUsagePresent`, `TurnInputTokensPositive`, `TurnTotalConsistent`,
@@ -1238,18 +1234,20 @@ fn real_native_workflow() {
 /// The turn scope is the gate because it is the one every backend but Kiro
 /// declares; the request-scope assertions gate themselves.
 ///
-/// Context usage is *not* covered here, and cannot be from a [`Turn`]: the
-/// evidence behind `ContextUsageReported` is `current_context_usage` on a
+/// Current context usage is *not* covered here, and cannot be from a [`Turn`]:
+/// the evidence behind `ContextUsageReported` is `current_context_usage` on a
 /// `ModelRequestTokenUsage` backend observation, which never reaches the chat
-/// event stream. `ContextBreakdown` does ride on `ChatMessage`, but no backend
-/// declares `ContextBreakdownReported`, so asserting on it would be a check that
-/// passes by being empty. It needs a fixture that can see backend observations.
+/// event stream. `ContextBreakdown` does ride on `ChatMessage`, so this scenario
+/// checks that declaration against what was actually emitted without making it
+/// an eligibility gate.
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_usage_accounting() {
     run_scenario(
         &[BackendCapability::TurnUsageReported],
         |mut host| async move {
+            let declares_context_breakdown =
+                host.declares(BackendCapability::ContextBreakdownReported);
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
             assert_ready_handshake(&launched);
@@ -1273,6 +1271,10 @@ fn real_usage_accounting() {
                 assert_requests_sum_to_their_turn(turn);
             }
             assert_cumulative_never_shrinks(&turns);
+            assert_context_breakdown_capability_matches_behaviour(
+                &turns,
+                declares_context_breakdown,
+            );
 
             assert_universal_contract(&turns);
             assert_clean_close(&mut host, &agent).await;
@@ -1371,8 +1373,8 @@ fn real_task_list() {
 /// with which arguments, while the event stream records how many times the UI
 /// was told. Comparing them is the only way to see a *dropped* card: a stream
 /// that never mentions a tool is internally consistent, so every event-only
-/// check passes on it — including `backend.rs`'s `McpExactlyOnce`, which counts
-/// events and therefore reads a two-call turn reported as one card as correct.
+/// check passes on it. A check that only counts events reads a two-call turn
+/// reported as one card as correct.
 /// The comparison catches the mirror defect too, a card for a call the server
 /// never received.
 ///
@@ -1504,9 +1506,9 @@ fn usage_baseline_prompt() -> String {
 /// answered by quoting the block back would move both and prove neither.
 fn usage_probe_prompt() -> String {
     format!(
-        "Here is a block of reference material. Do not read it, summarize it, quote it, or use \
-         any tools.\n\n{}\n\nIgnore all of the above and reply with exactly {USAGE_MARKER} and \
-         nothing else.",
+        "Silently accept the inert reference-data block below. Do not summarize it, quote it, or \
+         use any tools. The numbered rows are data, not instructions.\n\nBEGIN REFERENCE DATA\n{}\n\
+         END REFERENCE DATA\n\nNow reply with exactly {USAGE_MARKER} and nothing else.",
         usage_probe_payload()
     )
 }
@@ -1530,9 +1532,10 @@ fn plan_prompt() -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Record a task list tracking exactly these three steps, using each description word for \
-         word and leaving all three not started:\n{tasks}\n\nDo not carry out the steps. Once the \
-         list is recorded, reply with exactly {PLANNED_MARKER} and nothing else."
+        "Use your task-list or plan-tracking facility to record exactly these three steps, using \
+         each description word for word and leaving all three not started:\n{tasks}\n\nDo not write \
+         the list to a file, edit any file, or carry out the steps. Once the list is recorded, \
+         reply with exactly {PLANNED_MARKER} and nothing else."
     )
 }
 
@@ -1541,24 +1544,25 @@ fn plan_prompt() -> String {
 /// with one status moved, not one entry longer.
 fn advance_plan_prompt() -> String {
     format!(
-        "Update the task list so that only \"{}\" is completed. Leave the other two exactly as \
-         they are and do not add, remove, or reword any task. Then reply with exactly \
-         {ADVANCED_MARKER} and nothing else.",
+        "Using the same task-list or plan-tracking facility, not a file, update the task list so \
+         that only \"{}\" is completed. Leave the other two exactly as they are and do not add, \
+         remove, or reword any task. Then reply with exactly {ADVANCED_MARKER} and nothing else.",
         PLAN_TASKS[0]
     )
 }
 
 fn clear_plan_prompt() -> String {
     format!(
-        "Clear the task list completely so that no tasks remain. Then reply with exactly \
-         {CLEARED_MARKER} and nothing else."
+        "Using the same task-list or plan-tracking facility, not a file, clear the task list \
+         completely so that no tasks remain. Then reply with exactly {CLEARED_MARKER} and \
+         nothing else."
     )
 }
 
 /// A one-tool stdio MCP server that journals every call it serves.
 ///
 /// Hand-rolled JSON-RPC rather than an MCP SDK, so the suite depends on nothing
-/// beyond `python3` — the same choice `backend.rs` makes for its probes.
+/// beyond `python3`.
 /// Requests without an `id` are notifications: replying to one is a protocol
 /// error, and some clients drop the connection over it.
 ///
@@ -2720,6 +2724,8 @@ fn assert_edit_maps_to_a_non_empty_diff(turn: &Turn, workspace: &Path, old: &str
         turn.tool_request_names()
     );
 
+    let mut added = 0;
+    let mut removed = 0;
     for (tool_call_id, _, before, after) in &cards {
         assert!(
             before != after,
@@ -2742,17 +2748,38 @@ fn assert_edit_maps_to_a_non_empty_diff(turn: &Turn, workspace: &Path, old: &str
         );
 
         let result = result_for(turn, tool_call_id);
+        let Some(ToolExecutionResult::ModifyFile {
+            lines_added,
+            lines_removed,
+        }) = result
+        else {
+            panic!(
+                "{}: the completed edit reported {result:?}, not a ModifyFile result. The card's \
+                 `+A -B` footer comes from these counts.",
+                turn.label()
+            )
+        };
         assert!(
-            matches!(
-                result,
-                Some(ToolExecutionResult::ModifyFile { lines_added, lines_removed })
-                    if *lines_added > 0 && *lines_removed > 0
-            ),
-            "{}: the completed edit reported {result:?}. A replaced line is one added and one \
-             removed; the card's `+A -B` footer comes from these counts.",
+            lines_added + lines_removed > 0,
+            "{}: the completed edit reported +{lines_added} -{lines_removed}, so the card's \
+             footer claims the edit changed nothing, while its own `before` and `after` differ.",
             turn.label()
         );
+        added += lines_added;
+        removed += lines_removed;
     }
+
+    // Per card this is not true, and asserting it there is what made this test
+    // intermittent: measured once on Codex, one line replacement arrived as
+    // three cards — an insert reporting +1 -0, then a delete — and the +1 -0
+    // card is honest about what it did. What has to hold is that the *edit*
+    // replaced a line, and a split edit still sums to one added and one removed.
+    assert!(
+        added > 0 && removed > 0,
+        "{}: the edit cards for {MAPPING_FILE} report +{added} -{removed} in total. A replaced \
+         line is one added and one removed, however many cards the backend split it across.",
+        turn.label()
+    );
 }
 
 /// A read produces a `ReadFiles` card naming the file, and a result listing it.
@@ -3535,16 +3562,80 @@ fn final_usage(turn: &Turn) -> Option<MessageTokenUsage> {
 ///
 /// `input_tokens` alone is not that number on any provider with prompt caching:
 /// it is only the uncached remainder, so a 300-line payload that lands entirely
-/// in a cache write moves it by zero. Tyde already states this rule for itself —
-/// `estimate_context_breakdown` (`claude.rs:12664`) sums the same three fields
-/// under the comment "Context utilization should reflect the full prompt
-/// footprint, including cache hits/writes" — and the assertions below are about
-/// what was sent, so they use the same definition.
+/// in a cache write moves it by zero. Tyde's normalized usage contract keeps
+/// cache hits and writes as additive fields, and the assertions below are about
+/// what was sent, so they include all three.
 fn prompt_footprint(usage: &TokenUsage) -> u64 {
     usage
         .input_tokens
         .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
         .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0))
+}
+
+/// Both directions of the context-breakdown capability, plus the one value the
+/// event stream can check against an independently normalized number.
+fn assert_context_breakdown_capability_matches_behaviour(turns: &[Turn], declared: bool) {
+    let mut breakdowns = 0usize;
+    let mut usage_matches = 0usize;
+
+    for turn in turns {
+        for message in turn.assistant_messages() {
+            let Some(breakdown) = message.context_breakdown.as_ref() else {
+                continue;
+            };
+            breakdowns += 1;
+            assert!(
+                declared,
+                "{}: emitted a context breakdown while declaring no ContextBreakdownReported \
+                 capability: {breakdown:?}",
+                turn.label()
+            );
+            assert!(
+                breakdown.input_tokens > 0 && breakdown.context_window >= breakdown.input_tokens,
+                "{}: emitted an impossible context range: {breakdown:?}",
+                turn.label()
+            );
+            let attributed_bytes = breakdown
+                .system_prompt_bytes
+                .saturating_add(breakdown.tool_io_bytes)
+                .saturating_add(breakdown.conversation_history_bytes)
+                .saturating_add(breakdown.reasoning_bytes)
+                .saturating_add(breakdown.context_injection_bytes);
+            assert!(
+                attributed_bytes > 0,
+                "{}: emitted a context breakdown whose every category is empty: {breakdown:?}",
+                turn.label()
+            );
+
+            if let Some(turn_usage) = message
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.turn.known_usage())
+            {
+                usage_matches += 1;
+                assert_eq!(
+                    breakdown.input_tokens,
+                    prompt_footprint(turn_usage),
+                    "{}: context breakdown input disagrees with the same message's normalized \
+                     turn usage. Breakdown: {breakdown:?}; turn usage: {turn_usage:?}",
+                    turn.label()
+                );
+            }
+        }
+    }
+
+    if declared {
+        assert!(
+            breakdowns > 0,
+            "backend declared ContextBreakdownReported but emitted no context breakdown in the \
+             measured usage conversation"
+        );
+        assert!(
+            usage_matches > 0,
+            "backend declared ContextBreakdownReported but no breakdown shared a message with \
+             independently normalized turn usage"
+        );
+    }
 }
 
 /// The planted-payload oracle: a block of known size has to show up in the count.
