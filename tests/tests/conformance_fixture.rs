@@ -51,9 +51,12 @@ pub const SCRATCH_DIR: &str = "scratch";
 pub fn pinned_models(backend: BackendKind) -> Vec<String> {
     match backend {
         BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
+        // One model, matching `REQUIRED_CODEX_TEST_MODEL` in `backend.rs`, so
+        // both paid suites agree on what Codex conformance means.
+        //
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
-        BackendKind::Codex => vec![env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.3-codex-spark")],
+        BackendKind::Codex => vec![env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")],
         _ => Vec::new(),
     }
 }

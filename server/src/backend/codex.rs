@@ -9839,8 +9839,9 @@ impl CodexInner {
     /// subscriber over `EnvFilter::from_default_env()`, so `RUST_LOG` is all
     /// that is required — without it the events are compiled in but discarded.
     ///
-    /// Keep the model on a cheap pin (`TYDE_CODEX_TEST_MODEL=gpt-5.3-codex-spark`
-    /// reproduces the unowned-`commandExecution` path).
+    /// Keep the model on a cheap pin. The suites run `gpt-5.6-luna`; setting
+    /// `TYDE_CODEX_TEST_MODEL` to another one is how you tell model-specific
+    /// drift from a real defect.
     async fn trace_notification_structure(&self, method: &str, params: &Value) {
         if method == "mcpServer/startupStatus/updated" {
             tracing::info!(?params, "Codex MCP startup status");
