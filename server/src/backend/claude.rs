@@ -1713,6 +1713,49 @@ struct CommittedSkillFailure {
 impl ClaudeInner {
     async fn execute_arc(this: Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
+            SessionCommand::CancelBackgroundTask { tool_call_id } => {
+                // The CLI owns the process, so it does the killing: `stop_task`
+                // takes the task id from `task_started` and runs the same kill
+                // the model's own KillShell tool would. Measured against 2.1.241
+                // — the CLI answers `success` and then reports the task
+                // `stopped`, which is already mapped to a cancelled card, so
+                // nothing here has to close it.
+                let task_id = {
+                    let registry = this
+                        .background_tasks
+                        .lock()
+                        .expect("background task registry mutex poisoned");
+                    registry
+                        .entries
+                        .values()
+                        .find(|entry| {
+                            entry.tool_use_id == tool_call_id
+                                && entry.state.status == BackgroundTaskStatus::Running
+                        })
+                        .map(|entry| entry.state.task_id.clone())
+                };
+                let Some(task_id) = task_id else {
+                    return Err(format!(
+                        "no running Claude background command for card {tool_call_id}"
+                    ));
+                };
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let request = json!({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": {
+                        "subtype": "stop_task",
+                        "task_id": task_id,
+                    },
+                });
+                this.send_control_request_value(
+                    request_id,
+                    request,
+                    CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+                )
+                .await
+                .map(|_| ())
+            }
             SessionCommand::SendMessage { message, images } => {
                 match Self::send_message(this.clone(), message, images, None).await? {
                     ClaudeSendAdmission::Handled => Ok(()),
@@ -7038,6 +7081,7 @@ fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolP
         } else {
             ToolExecutionMode::Foreground
         },
+        cancellable: false,
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: stream.agent_id.clone(),
             agent_name: stream.agent_name.clone(),
@@ -7435,6 +7479,7 @@ fn flush_workflow_snapshots(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry)
             // after the run starts (Claude Code 2.1.220), so every snapshot
             // but the first belongs to a card that has already closed.
             execution_mode: ToolExecutionMode::Background,
+            cancellable: false,
             update: ToolProgressUpdate::Workflow(snapshot),
         });
     }
@@ -7854,6 +7899,7 @@ fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEn
     emitter.tool_progress(&ToolProgressData {
         tool_call_id: entry.tool_use_id.clone(),
         execution_mode: ToolExecutionMode::Background,
+        cancellable: true,
         update: ToolProgressUpdate::Other {
             payload: json!({
                 "task_id": entry.state.task_id,
@@ -13876,6 +13922,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::ForegroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
@@ -14309,6 +14356,25 @@ impl Backend for ClaudeBackend {
                 .then_some(())
                 .ok_or_else(|| "backend terminated before applying session settings".to_owned()),
         }
+    }
+
+    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+        let handle = {
+            let handle = self
+                .command_handle
+                .lock()
+                .expect("Claude command handle mutex poisoned");
+            handle.clone()
+        };
+        let Some(handle) = handle else {
+            return false;
+        };
+        handle
+            .execute(SessionCommand::CancelBackgroundTask {
+                tool_call_id: tool_call_id.to_owned(),
+            })
+            .await
+            .is_ok()
     }
 
     async fn interrupt(&self) -> bool {

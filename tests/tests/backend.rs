@@ -22366,6 +22366,9 @@ fn capability_witness_case(capability: BackendCapability) -> CertificationCase {
             CertificationCase::BackgroundSubagentContractMatrix
         }
         BackendCapability::BackgroundTasks => CertificationCase::BackgroundCommandContractMatrix,
+        BackendCapability::CancelsBackgroundTasks => {
+            CertificationCase::BackgroundCommandContractMatrix
+        }
         BackendCapability::YieldsRunningCommands => {
             CertificationCase::ForegroundCommandContractMatrix
         }
@@ -22453,6 +22456,9 @@ fn capability_reachability_prompt(
         }
         BackendCapability::BackgroundTasks => {
             "Use your native command tool exactly once to run `sleep 1` as detached background work. Do not run it in the foreground."
+        }
+        BackendCapability::CancelsBackgroundTasks => {
+            "Use your native command tool exactly once to run `sleep 60` as detached background work, then report that it is running."
         }
         BackendCapability::YieldsRunningCommands => {
             "Use your native command tool to run `sleep 20` in the foreground, and report whether the tool returned before the command had finished."
@@ -22549,6 +22555,7 @@ fn capability_uses_model_reachability(capability: BackendCapability) -> bool {
             | BackendCapability::ForegroundSubagents
             | BackendCapability::BackgroundSubagents
             | BackendCapability::BackgroundTasks
+            | BackendCapability::CancelsBackgroundTasks
             | BackendCapability::YieldsRunningCommands
             | BackendCapability::AgentInitiatedTurns
             | BackendCapability::MidTurnSteering
@@ -23025,6 +23032,12 @@ fn event_reaches_capability(event: &ChatEvent, capability: BackendCapability) ->
             ChatEvent::ToolProgress(protocol::ToolProgressData {
                 execution_mode: protocol::ToolExecutionMode::Background,
                 ..
+            }),
+        )
+        | (
+            BackendCapability::CancelsBackgroundTasks,
+            ChatEvent::ToolProgress(protocol::ToolProgressData {
+                cancellable: true, ..
             }),
         )
         | (

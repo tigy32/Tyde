@@ -3935,6 +3935,7 @@ impl CodexBackgroundCommand {
         ToolProgressData {
             tool_call_id: self.tool_call_id.clone(),
             execution_mode: ToolExecutionMode::Background,
+            cancellable: true,
             update: ToolProgressUpdate::Other {
                 payload: json!({
                     "task_id": self.task_id,
@@ -5528,6 +5529,72 @@ impl CodexInner {
             state.pending_tool_call_ids.remove(&tool_call_id);
             state.cancelled_tool_call_ids.insert(tool_call_id);
         }
+    }
+
+    /// Stop one background command the user cancelled from its card.
+    ///
+    /// Scoped to that card: `terminate_background_terminals` kills everything
+    /// at shutdown and `terminate_foreground_commands` kills what an interrupt
+    /// covers, but neither can express "this one". A background command is
+    /// tracked either as a task (`background_commands`, keyed by its Codex task
+    /// id) or as a still-running execution (`outstanding_command_executions`,
+    /// keyed by its process id); both are addressed by the same terminate RPC.
+    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+        let target = {
+            let state = self.state.lock().await;
+            state
+                .background_commands
+                .iter()
+                .find(|(_, command)| command.tool_call_id == tool_call_id)
+                .map(|((thread_id, _), command)| (thread_id.clone(), command.task_id.clone()))
+                .or_else(|| {
+                    state
+                        .outstanding_command_executions
+                        .iter()
+                        .find(|(_, command)| command.tool_call_id == tool_call_id)
+                        .and_then(|((thread_id, _), command)| {
+                            command
+                                .process_id
+                                .as_ref()
+                                .map(|process_id| (thread_id.clone(), process_id.clone()))
+                        })
+                })
+        };
+        let Some((thread_id, process_id)) = target else {
+            tracing::warn!(
+                tool_call_id,
+                "no running Codex background command matches the cancelled card"
+            );
+            return false;
+        };
+        if let Err(error) = self
+            .rpc
+            .request(
+                "thread/backgroundTerminals/terminate",
+                json!({ "threadId": thread_id, "processId": process_id }),
+            )
+            .await
+        {
+            tracing::error!(
+                thread_id,
+                process_id,
+                tool_call_id,
+                error = %error,
+                "failed to terminate a cancelled Codex background command"
+            );
+            return false;
+        }
+        // Killing the process makes Codex report the exec as failed, which
+        // would blame the command for what the user did. Close the card as
+        // cancelled and record the id so the late failure is dropped.
+        self.emitter
+            .cancel_pending_tool(tool_call_id, "Tool execution was cancelled by user");
+        let mut state = self.state.lock().await;
+        state.pending_tool_call_ids.remove(tool_call_id);
+        state
+            .cancelled_tool_call_ids
+            .insert(tool_call_id.to_owned());
+        true
     }
 
     async fn terminate_background_terminals(&self) {
@@ -7528,6 +7595,15 @@ impl CodexInner {
                     }),
                 );
                 Ok(())
+            }
+            SessionCommand::CancelBackgroundTask { tool_call_id } => {
+                if self.cancel_background_task(&tool_call_id).await {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no running Codex background command for card {tool_call_id}"
+                    ))
+                }
             }
             SessionCommand::GetSettings => {
                 // Phase 6 handles config/settings parity. Keep non-failing no-op for now.
@@ -12485,6 +12561,7 @@ impl CodexInner {
             self.emitter.tool_progress(&ToolProgressData {
                 tool_call_id: tool_call_id.clone(),
                 execution_mode: ToolExecutionMode::Background,
+                cancellable: false,
                 update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
                     agent_id,
                     agent_name,
@@ -14461,6 +14538,7 @@ impl CodexInner {
                 self.emitter.tool_progress(&ToolProgressData {
                     tool_call_id: progress_tool_call_id.clone(),
                     execution_mode: ToolExecutionMode::Background,
+                    cancellable: false,
                     update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
                         agent_id: spawned_agent,
                         agent_name: spawn_name,
@@ -15046,6 +15124,7 @@ impl CodexInner {
         self.emitter.tool_progress(&ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents,
@@ -18542,6 +18621,7 @@ pub struct CodexBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
     interrupt_tx: mpsc::UnboundedSender<()>,
+    cancel_task_tx: mpsc::UnboundedSender<CodexCancelBackgroundTask>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     compaction_handle: Arc<std::sync::Mutex<Option<CodexCommandHandle>>>,
@@ -18550,6 +18630,11 @@ pub struct CodexBackend {
 struct CodexSettingsUpdate {
     payload: protocol::SetSessionSettingsPayload,
     reply: oneshot::Sender<Result<(), String>>,
+}
+
+struct CodexCancelBackgroundTask {
+    tool_call_id: String,
+    reply: oneshot::Sender<bool>,
 }
 
 impl CodexBackend {
@@ -18585,6 +18670,8 @@ impl CodexBackend {
         let initial_emitter = (!inference_only).then_some(initial_emitter).flatten();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
+        let (cancel_task_tx, mut cancel_task_rx) =
+            mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
@@ -18859,6 +18946,16 @@ impl CodexBackend {
                             }
                         }
                     }
+                    cancel = cancel_task_rx.recv() => {
+                        let Some(cancel) = cancel else { break; };
+                        let cancelled = handle
+                            .execute(SessionCommand::CancelBackgroundTask {
+                                tool_call_id: cancel.tool_call_id,
+                            })
+                            .await
+                            .is_ok();
+                        let _ = cancel.reply.send(cancelled);
+                    }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break; };
                         let result = handle
@@ -18906,6 +19003,7 @@ impl CodexBackend {
                 input_tx,
                 settings_tx,
                 interrupt_tx,
+                cancel_task_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
                 compaction_handle,
@@ -19813,6 +19911,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
@@ -19850,6 +19949,8 @@ impl Backend for CodexBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
+        let (cancel_task_tx, mut cancel_task_rx) =
+            mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
@@ -20013,6 +20114,16 @@ impl Backend for CodexBackend {
                             }
                         }
                     }
+                    cancel = cancel_task_rx.recv() => {
+                        let Some(cancel) = cancel else { break; };
+                        let cancelled = handle
+                            .execute(SessionCommand::CancelBackgroundTask {
+                                tool_call_id: cancel.tool_call_id,
+                            })
+                            .await
+                            .is_ok();
+                        let _ = cancel.reply.send(cancelled);
+                    }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
                         let result = handle
@@ -20050,6 +20161,7 @@ impl Backend for CodexBackend {
                 input_tx,
                 settings_tx,
                 interrupt_tx,
+                cancel_task_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
                 compaction_handle,
@@ -20074,6 +20186,8 @@ impl Backend for CodexBackend {
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
+        let (cancel_task_tx, mut cancel_task_rx) =
+            mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
@@ -20253,6 +20367,16 @@ impl Backend for CodexBackend {
                             }
                         }
                     }
+                    cancel = cancel_task_rx.recv() => {
+                        let Some(cancel) = cancel else { break; };
+                        let cancelled = handle
+                            .execute(SessionCommand::CancelBackgroundTask {
+                                tool_call_id: cancel.tool_call_id,
+                            })
+                            .await
+                            .is_ok();
+                        let _ = cancel.reply.send(cancelled);
+                    }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
                         let result = handle
@@ -20303,6 +20427,7 @@ impl Backend for CodexBackend {
                 input_tx,
                 settings_tx,
                 interrupt_tx,
+                cancel_task_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
                 compaction_handle,
@@ -20376,6 +20501,21 @@ impl Backend for CodexBackend {
 
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).is_ok()
+    }
+
+    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+        let (reply, done) = oneshot::channel();
+        if self
+            .cancel_task_tx
+            .send(CodexCancelBackgroundTask {
+                tool_call_id: tool_call_id.to_owned(),
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        done.await.unwrap_or(false)
     }
 
     async fn shutdown(self) {

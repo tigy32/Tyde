@@ -432,6 +432,7 @@ pub(super) fn background_task_started_frames(tool_call_id: &str) -> Vec<BackendE
         tool_progress(ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
             execution_mode: protocol::ToolExecutionMode::Background,
+            cancellable: false,
             update: protocol::ToolProgressUpdate::Other {
                 payload: json!({ "status": "running" }),
             },

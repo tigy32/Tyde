@@ -34,9 +34,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentId, BackendKind, CancelQueuedMessagePayload, FrameKind,
-    QueuedMessageId, SendQueuedMessageNowPayload, SessionSettingValue, SubAgentProgress,
-    ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
+    AgentActivitySummaryState, AgentId, BackendKind, CancelBackgroundTaskPayload,
+    CancelQueuedMessagePayload, FrameKind, QueuedMessageId, SendQueuedMessageNowPayload,
+    SessionSettingValue, SubAgentProgress, ToolExecutionMode, ToolProgressUpdate, ToolRequestType,
+    WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
@@ -693,6 +694,56 @@ fn CommandRow(
         }
     });
 
+    // Only the backend that can actually address this one command says so.
+    // Offering cancel on a card nothing can stop would be a button that lies.
+    let cancellable: Signal<bool> = Signal::derive({
+        let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
+        move || {
+            let Some(parent) = parent_ref.get() else {
+                return false;
+            };
+            let key = (parent.agent_id, tool_call_id.clone());
+            state
+                .tool_progress
+                .with(|map| map.get(&key).cloned())
+                .is_some_and(|progress| progress.get().cancellable)
+        }
+    });
+
+    let on_cancel = Callback::new({
+        let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
+        move |_: web_sys::MouseEvent| {
+            let Some(active) = parent_ref.get_untracked() else {
+                return;
+            };
+            let agents = state.agents.get_untracked();
+            let Some(agent) = agents.iter().find(|agent| {
+                agent.host_id == active.host_id
+                    && agent.agent_id == active.agent_id
+                    && agent.fatal_error.is_none()
+            }) else {
+                return;
+            };
+            let host_id = agent.host_id.clone();
+            let stream = agent.instance_stream.clone();
+            let tool_call_id = tool_call_id.0.clone();
+            spawn_local(async move {
+                if let Err(error) = send_frame(
+                    &host_id,
+                    stream,
+                    FrameKind::CancelBackgroundTask,
+                    &CancelBackgroundTaskPayload { tool_call_id },
+                )
+                .await
+                {
+                    log::error!("failed to send cancel_background_task: {error}");
+                }
+            });
+        }
+    });
+
     let status_label = || "Running";
     let status_class = || "tool-live-agent-status running";
 
@@ -702,6 +753,19 @@ fn CommandRow(
                 <span class="tool-live-agent-name">{title}</span>
                 <span class=status_class>{status_label}</span>
             </div>
+            <Show when=move || cancellable.get()>
+                <div class="inflight-tray-row-actions">
+                    <button
+                        type="button"
+                        class="inflight-tray-cancel"
+                        title="Stop this background command"
+                        aria-label="Stop this background command"
+                        on:click=move |event| on_cancel.run(event)
+                    >
+                        "\u{00d7}"
+                    </button>
+                </div>
+            </Show>
         </div>
     }
 }
@@ -1355,6 +1419,7 @@ mod wasm_tests {
                     ArcRwSignal::new(ToolProgressData {
                         tool_call_id: "call-fatal".to_owned(),
                         execution_mode: ToolExecutionMode::Foreground,
+                        cancellable: false,
                         update: ToolProgressUpdate::Workflow(WorkflowRunState {
                             workflow_name: "stale-workflow".to_owned(),
                             description: None,
@@ -1403,6 +1468,7 @@ mod wasm_tests {
                     ArcRwSignal::new(ToolProgressData {
                         tool_call_id: "call-1".to_owned(),
                         execution_mode: ToolExecutionMode::Foreground,
+                        cancellable: false,
                         update: ToolProgressUpdate::Workflow(run),
                     }),
                 );
@@ -1428,6 +1494,7 @@ mod wasm_tests {
         ToolProgressData {
             tool_call_id: "toolu_bg_bash".to_owned(),
             execution_mode: ToolExecutionMode::Background,
+            cancellable: false,
             update: ToolProgressUpdate::Other {
                 payload: serde_json::json!({
                     "task_id": "task-bg",
@@ -1601,6 +1668,56 @@ mod wasm_tests {
             count(&replayed_container, ".inflight-tray"),
             0,
             "terminal transcript replay must not resurrect the command row"
+        );
+    }
+
+    /// The stop affordance follows the backend's own claim about the card, not
+    /// the mere fact that a command is running. Offering it on a card nothing
+    /// can address gives the user a button that silently does nothing.
+    #[wasm_bindgen_test]
+    async fn stop_button_appears_only_on_a_cancellable_command() {
+        const STOP: &str = "button[aria-label='Stop this background command']";
+
+        let (plain, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&plain, ".inflight-tray-row"),
+            1,
+            "the non-cancellable command still renders its row"
+        );
+        assert_eq!(
+            count(&plain, STOP),
+            0,
+            "a command the backend cannot stop offers no stop button"
+        );
+
+        let (cancellable, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(ToolProgressData {
+                cancellable: true,
+                ..background_command_progress()
+            }),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&cancellable, ".inflight-tray-row"),
+            1,
+            "marking the command cancellable does not duplicate its row"
+        );
+        assert_eq!(
+            count(&cancellable, STOP),
+            1,
+            "a cancellable command offers exactly one stop button"
+        );
+        let body = text(&cancellable);
+        assert!(
+            body.contains("./dev.sh check --locked"),
+            "the stop button does not displace the command it stops: {body}"
         );
     }
 
@@ -1895,6 +2012,7 @@ mod wasm_tests {
         ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Spawn,
                 agents: vec![AgentControlAgentRef {
@@ -2635,6 +2753,7 @@ mod wasm_tests {
                 ToolProgressData {
                     tool_call_id: "toolu_task".to_owned(),
                     execution_mode: ToolExecutionMode::Foreground,
+                    cancellable: false,
                     update: ToolProgressUpdate::SubAgent(SubAgentProgress {
                         agent_id: AgentId("agent-sub".to_owned()),
                         agent_name: "Explore".to_owned(),
@@ -2771,6 +2890,7 @@ mod wasm_tests {
             ToolProgressData {
                 tool_call_id: format!("toolu_{tool_name}"),
                 execution_mode: ToolExecutionMode::Foreground,
+                cancellable: false,
                 update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                     progress_kind,
                     agents: vec![AgentControlAgentRef {

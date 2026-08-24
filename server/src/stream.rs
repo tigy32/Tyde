@@ -697,6 +697,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SendMessage
         | FrameKind::EditQueuedMessage
         | FrameKind::CancelQueuedMessage
+        | FrameKind::CancelBackgroundTask
         | FrameKind::SendQueuedMessageNow
         | FrameKind::SetAgentName
         | FrameKind::AgentCompact

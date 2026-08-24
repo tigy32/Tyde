@@ -57,6 +57,9 @@ const WORKFLOW_MARKER: &str = "TYDE_WORKFLOW";
 const MEMORIZED_MARKER: &str = "TYDE_MEMORIZED";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
+/// Proof file for the cancelled background command. A separate file from
+/// [`BG_FILE`] so a leftover from another scenario can never stand in for it.
+const CANCEL_FILE: &str = "cancelled.txt";
 const MAPPING_FILE: &str = "mapping.txt";
 const MAPPED_CREATE_MARKER: &str = "TYDE_MAPPED_CREATE";
 const MAPPED_EDIT_MARKER: &str = "TYDE_MAPPED_EDIT";
@@ -156,6 +159,15 @@ const BG_SECONDS_FOR_INTERRUPT: u64 = 45;
 /// early cannot tell that from a command that really died.
 const SLOW_COMMAND_SECONDS: u64 = 25;
 const KILL_SETTLE: Duration = Duration::from_secs(30);
+
+/// How long the cancelled background command would run if nothing stopped it,
+/// and how long the client waits before concluding it really died. The settle
+/// has to outlast the sleep for the same reason `KILL_SETTLE` does: a command
+/// reported cancelled but never actually killed writes its proof file late, and
+/// checking before it would have written cannot tell that from a command that
+/// really died.
+const CANCEL_COMMAND_SECONDS: u64 = 25;
+const CANCEL_SETTLE: Duration = Duration::from_secs(35);
 
 /// How far into the answer the stop lands.
 ///
@@ -397,7 +409,12 @@ fn real_interruption() {
         let mut turns = vec![after_stream, after_tool];
 
         if host.declares(BackendCapability::BackgroundTasks) {
-            let bg_prompt = background_prompt(&workspace, host.backend(), BG_SECONDS_FOR_INTERRUPT);
+            let bg_prompt = background_prompt(
+                &workspace,
+                host.backend(),
+                BG_SECONDS_FOR_INTERRUPT,
+                BG_FILE,
+            );
             let started = ask(&mut host, &agent, &bg_prompt).await;
             assert_final_text_contains(&started, BG_MARKER);
             assert_background_task_is_still_open(&started);
@@ -882,7 +899,7 @@ fn real_background_task_outlives_its_turn() {
         &[BackendCapability::BackgroundTasks],
         |mut host| async move {
             let workspace = host.workspace().to_path_buf();
-            let prompt = background_prompt(&workspace, host.backend(), BG_SECONDS);
+            let prompt = background_prompt(&workspace, host.backend(), BG_SECONDS, BG_FILE);
             let bg_path = host.workspace().join(BG_FILE);
             let agent = spawn_agent(&mut host, &prompt).await;
             let started = collect_turn(&mut host, &agent, &prompt).await;
@@ -978,6 +995,131 @@ fn real_background_task_outlives_its_turn() {
                     .chain(waited.events().iter())
                     .chain(settled.iter())
                     .chain(reported.events().iter()),
+            );
+
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
+/// The user stops one background command from its card.
+///
+/// The oracle is the filesystem, not the card. A backend that reports the card
+/// cancelled while the process keeps running looks identical on the wire to one
+/// that actually killed it — until the command writes its proof file, which is
+/// why this waits past the point where an unkilled command would have.
+///
+/// Cancelling is also not interrupting: the turn is already over when the
+/// cancel is sent, so nothing here can pass by merely tearing the session down.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_background_task_cancel() {
+    run_scenario(
+        &[
+            BackendCapability::BackgroundTasks,
+            BackendCapability::CancelsBackgroundTasks,
+        ],
+        |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
+            let prompt = background_prompt(
+                &workspace,
+                host.backend(),
+                CANCEL_COMMAND_SECONDS,
+                CANCEL_FILE,
+            );
+            let proof = host.workspace().join(CANCEL_FILE);
+            let agent = spawn_agent(&mut host, &prompt).await;
+            let started = collect_turn(&mut host, &agent, &prompt).await;
+
+            assert_no_error_message(&started.label(), started.events());
+            assert_streams_are_balanced(&started);
+            assert_reached_idle(&started);
+
+            // Same guard as `real_background_task_outlives_its_turn`: a backend
+            // that started nothing finishes fast and satisfies every stream
+            // assertion, so without this a green result means nothing.
+            let requests = started.tool_requests().count();
+            assert!(
+                requests >= 1,
+                "{}: emitted zero tool requests, so no command was ever started and there was \
+                 nothing to cancel",
+                started.label()
+            );
+            assert!(
+                !proof.is_file(),
+                "{}: found {} already written when the turn ended, so the command had already \
+                 finished and cancelling it asserted nothing",
+                started.label(),
+                proof.display()
+            );
+
+            // The card the UI would offer cancel on is the one whose progress
+            // says it is cancellable. Selecting it any other way would test a
+            // different thing than the button does.
+            let target = started
+                .events()
+                .iter()
+                .find_map(|event| match event {
+                    ChatEvent::ToolProgress(progress) if progress.cancellable => {
+                        Some(progress.tool_call_id.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: declares CancelsBackgroundTasks but no tool progress marked a card \
+                         cancellable, so the cancel affordance would never appear",
+                        started.label()
+                    )
+                });
+            assert!(
+                !started
+                    .tool_completions()
+                    .any(|completion| completion.tool_call_id == target),
+                "{}: card {target} was already complete when the turn ended, so cancelling it \
+                 asserted nothing",
+                started.label()
+            );
+
+            cancel_background_task(&mut host, &agent, &target).await;
+
+            let settled = drain_events_for(&mut host, CANCEL_SETTLE).await;
+            assert_no_error_message(&format!("{:?} cancel settle", host.backend()), &settled);
+
+            let outcome = settled
+                .iter()
+                .filter_map(|event| match event {
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == target =>
+                    {
+                        Some(&completion.outcome)
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: card {target} never completed after it was cancelled, so it is stuck \
+                         open in the tray forever",
+                        started.label()
+                    )
+                });
+            assert!(
+                matches!(outcome, protocol::ToolExecutionOutcome::Cancelled { .. }),
+                "{}: card {target} completed as {outcome:?} after the user cancelled it, which \
+                 blames the command for what the user did",
+                started.label()
+            );
+
+            // The whole point. Everything above is satisfied by a backend that
+            // closes the card and leaves the process running.
+            assert!(
+                !proof.is_file(),
+                "{}: waited {}s after cancelling and {} was written anyway, so the command was \
+                 reported cancelled but never actually killed",
+                started.label(),
+                CANCEL_SETTLE.as_secs(),
+                proof.display()
             );
 
             assert_clean_close(&mut host, &agent).await;
@@ -1757,18 +1899,23 @@ fn enter_worktree_prompt(worktree: &Path) -> String {
 /// generically, spark ran `/bin/zsh -lc '(sleep 20; echo DONE > f) &'`, whose
 /// outer shell exits immediately and whose subshell the sandbox reaps: nothing
 /// was promoted and the file was never written.
-fn background_prompt(workspace: &Path, backend_kind: BackendKind, seconds: u64) -> String {
+fn background_prompt(
+    workspace: &Path,
+    backend_kind: BackendKind,
+    seconds: u64,
+    file: &str,
+) -> String {
     let root = workspace_root(workspace);
     let launch = match backend_kind {
         BackendKind::Codex => format!(
-            "Run this exact shell command: sleep {seconds}; echo DONE > {BG_FILE}; echo \
+            "Run this exact shell command: sleep {seconds}; echo DONE > {file}; echo \
              {BG_OUTPUT_MARKER}. Run it as an ordinary foreground command in {root} — do not \
              append `&`, and do not use `nohup`, `disown`, or a detached subshell. Do not wait \
              for its output."
         ),
         _ => format!(
             "Start a shell command that sleeps for {seconds} seconds, then writes the word DONE \
-             into a file named {BG_FILE} in {root}, and finally prints {BG_OUTPUT_MARKER} to \
+             into a file named {file} in {root}, and finally prints {BG_OUTPUT_MARKER} to \
              standard output. Run it in the background and do not wait for it to finish, but do \
              arrange to be told its output once it has finished."
         ),

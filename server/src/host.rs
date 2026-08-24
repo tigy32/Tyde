@@ -9294,6 +9294,25 @@ impl HostHandle {
         }
     }
 
+    /// Stop one still-running background command on this agent.
+    ///
+    /// Scoped to the single card the user cancelled: the turn is untouched and
+    /// any other background work keeps running.
+    pub(crate) async fn cancel_background_task(
+        &self,
+        agent_id: &AgentId,
+        tool_call_id: &str,
+    ) -> bool {
+        let agent_handle = {
+            let state = self.state.lock().await;
+            state.registry.agent_handle(agent_id)
+        };
+        match agent_handle {
+            Some(handle) => handle.cancel_background_task(tool_call_id).await,
+            None => false,
+        }
+    }
+
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
         self.close_agent_with_host_visibility(agent_id, false).await
     }

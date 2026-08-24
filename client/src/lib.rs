@@ -12,19 +12,20 @@ use protocol::{
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
     AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
     BackendConfigSnapshotsPayload, BackendSettingsRefreshPayload, BackendSetupPayload,
-    BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
-    FrameError, FrameKind, FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    BrowseBootstrapPayload, CancelBackgroundTaskPayload, CancelQueuedMessagePayload,
+    CancelWorkflowPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload,
+    EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
+    InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -1112,6 +1113,26 @@ impl Connection {
             Envelope::from_payload(stream.path().clone(), FrameKind::Interrupt, seq, &payload)
                 .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn cancel_background_task(
+        &mut self,
+        stream: &StreamPath,
+        payload: CancelBackgroundTaskPayload,
+    ) -> Result<(), FrameError> {
+        let seq =
+            self.outgoing_seq.get(stream).copied().expect(
+                "cancel_background_task on unknown stream — AgentStart must be received first",
+            );
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::CancelBackgroundTask,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
         write_envelope(&mut self.writer, &envelope).await
     }
 

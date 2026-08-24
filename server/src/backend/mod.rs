@@ -237,6 +237,10 @@ pub enum SessionCommand {
         images: Option<Vec<ImageAttachment>>,
     },
     CancelConversation,
+    /// Stop one background command, named by the card it runs on.
+    CancelBackgroundTask {
+        tool_call_id: String,
+    },
     GetSettings,
     ListSessions,
     ResumeSession {
@@ -960,6 +964,19 @@ pub trait Backend: Send + Sync + 'static {
     /// Returns false if the backend has terminated or does not support
     /// interruption.
     fn interrupt(&self) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Stop one still-running background command, named by the card it runs on.
+    ///
+    /// This is the user pressing cancel on a specific card, not an interrupt of
+    /// the turn: other background work keeps running. Returns false when the
+    /// backend cannot address a single background command, which is what keeps
+    /// the cancel affordance off cards that cannot honour it.
+    fn cancel_background_task(
+        &self,
+        _tool_call_id: &str,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(false)
+    }
 
     /// Shut down the live backend session and release any subprocess resources.
     ///

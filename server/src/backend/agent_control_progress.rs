@@ -255,6 +255,7 @@ fn agent_control_progress_data(
     (!agents.is_empty()).then(|| ToolProgressData {
         tool_call_id: tool_call_id.to_string(),
         execution_mode: ToolExecutionMode::Foreground,
+        cancellable: false,
         update: ToolProgressUpdate::AgentControl(AgentControlProgress {
             progress_kind,
             agents,

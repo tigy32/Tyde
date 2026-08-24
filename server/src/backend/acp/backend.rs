@@ -716,6 +716,9 @@ impl KiroInner {
 
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
+            SessionCommand::CancelBackgroundTask { tool_call_id } => Err(format!(
+                "this backend cannot cancel background command {tool_call_id}"
+            )),
             SessionCommand::SendMessage { message, images } => {
                 self.state.lock().await.provider_turn_quarantined = false;
                 self.emit_user_message_added(&message, images.as_deref());

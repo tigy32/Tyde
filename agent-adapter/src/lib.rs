@@ -100,6 +100,11 @@ exhaustive_capabilities! {
     ForegroundSubagents,
     BackgroundSubagents,
     BackgroundTasks,
+    // The runtime can stop one named background command without touching the
+    // turn or any other background work, so the user gets a cancel affordance
+    // on that card. Measured: Claude answers the `stop_task` control request
+    // and reports the task stopped; Codex terminates the background terminal.
+    CancelsBackgroundTasks,
     // The runtime hands a long-running *foreground* command back to the model
     // before it finishes, so continuing to run it is itself a tool call.
     // Measured on codex-cli 0.146.0: one turn running a 25-second foreground
@@ -190,6 +195,10 @@ impl BackendCapabilities {
         )?;
         self.require(
             BackendCapability::BackgroundSubagents,
+            BackendCapability::BackgroundTasks,
+        )?;
+        self.require(
+            BackendCapability::CancelsBackgroundTasks,
             BackendCapability::BackgroundTasks,
         )?;
         Ok(())

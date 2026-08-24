@@ -395,6 +395,10 @@ enum HermesBackendCommand {
     ),
     SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
+    CancelBackgroundTask {
+        tool_call_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     Compact(
         BackendCompactionRequest,
         oneshot::Sender<BackendCompactionStart>,
@@ -900,6 +904,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
@@ -1256,6 +1261,21 @@ impl Backend for HermesBackend {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => false,
         }
+    }
+
+    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+        let (reply, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(HermesBackendCommand::CancelBackgroundTask {
+                tool_call_id: tool_call_id.to_owned(),
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
     }
 
     async fn shutdown(self) {
@@ -2229,6 +2249,13 @@ impl HermesSessionActor {
                             let ok = self.handle_interrupt().await;
                             let _ = reply.send(ok);
                         }
+                        HermesBackendCommand::CancelBackgroundTask {
+                            tool_call_id,
+                            reply,
+                        } => {
+                            let ok = self.handle_cancel_background_task(&tool_call_id).await;
+                            let _ = reply.send(ok);
+                        }
                         HermesBackendCommand::Compact(request, reply) => {
                             let start = self.handle_compaction(request).await;
                             let _ = reply.send(start);
@@ -2634,6 +2661,53 @@ impl HermesSessionActor {
                 false
             }
         }
+    }
+
+    /// Kill one background process and close its card as cancelled.
+    ///
+    /// `process.kill` is session-scoped in Hermes, so this cannot reach another
+    /// window's work. The card is closed here rather than left to the
+    /// `process.list` poll: the poll would see a non-zero exit and report the
+    /// command as failed, blaming it for what the user did.
+    async fn handle_cancel_background_task(&mut self, tool_call_id: &str) -> bool {
+        let Some(task_id) = self
+            .mapper
+            .background_tasks
+            .iter()
+            .find(|(_, task)| task.tool_call_id == tool_call_id)
+            .map(|(task_id, _)| task_id.clone())
+        else {
+            tracing::warn!(
+                tool_call_id,
+                "no running Hermes background task matches the cancelled card"
+            );
+            return false;
+        };
+        if let Err(error) = self
+            .gateway
+            .request(
+                "process.kill",
+                json!({ "session_id": self.live_session_id, "process_id": task_id }),
+            )
+            .await
+        {
+            self.emit_error(format!("Hermes process.kill failed: {error}"));
+            return false;
+        }
+        let Some(background) = self.mapper.background_tasks.remove(&task_id) else {
+            return false;
+        };
+        for event in self.mapper.background_terminal_events(
+            &background,
+            &task_id,
+            BackgroundTaskTerminalStatus::Stopped,
+            -1,
+            String::new(),
+            Some("Background command was cancelled by user".to_owned()),
+        ) {
+            self.emit(event);
+        }
+        true
     }
 
     async fn handle_gateway_event(&mut self, event: HermesGatewayEvent) -> bool {
@@ -4822,6 +4896,7 @@ impl HermesEventMapper {
         Ok(vec![ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id,
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::Other { payload },
         })])
     }
@@ -5101,6 +5176,7 @@ impl HermesEventMapper {
         Some(ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id: background.tool_call_id.clone(),
             execution_mode: ToolExecutionMode::Background,
+            cancellable: true,
             update: ToolProgressUpdate::Other {
                 payload: json!({
                     "task_id": task_id,
@@ -5738,6 +5814,7 @@ fn hermes_subagent_progress(
     ToolProgressData {
         tool_call_id: anchor.tool_call_id.clone(),
         execution_mode: ToolExecutionMode::Background,
+        cancellable: false,
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: handle.agent_id.clone(),
             agent_name: agent_name.to_string(),

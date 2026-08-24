@@ -1045,6 +1045,7 @@ pub enum FrameKind {
     SendMessage,
     EditQueuedMessage,
     CancelQueuedMessage,
+    CancelBackgroundTask,
     SendQueuedMessageNow,
     SetAgentName,
     AgentCompact,
@@ -1239,6 +1240,7 @@ impl fmt::Display for FrameKind {
             Self::SendMessage => f.write_str("send_message"),
             Self::EditQueuedMessage => f.write_str("edit_queued_message"),
             Self::CancelQueuedMessage => f.write_str("cancel_queued_message"),
+            Self::CancelBackgroundTask => f.write_str("cancel_background_task"),
             Self::SendQueuedMessageNow => f.write_str("send_queued_message_now"),
             Self::SetAgentName => f.write_str("set_agent_name"),
             Self::AgentCompact => f.write_str("agent_compact"),
@@ -3471,6 +3473,13 @@ pub struct EditQueuedMessagePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelQueuedMessagePayload {
     pub id: QueuedMessageId,
+}
+
+/// Stop a background command that is still running, identified by the card it
+/// is running on. The card is the only handle the user has on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelBackgroundTaskPayload {
+    pub tool_call_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7557,6 +7566,11 @@ pub struct ToolProgressData {
     /// scheduling, not identity.
     #[serde(default)]
     pub execution_mode: ToolExecutionMode,
+    /// This exact tool call can be stopped on its own, so the card may offer
+    /// cancel. Per call rather than per backend: a backend that can cancel in
+    /// general still loses the handle for work it only observes second-hand.
+    #[serde(default)]
+    pub cancellable: bool,
     pub update: ToolProgressUpdate,
 }
 

@@ -336,6 +336,10 @@ enum AgentCommand {
     Interrupt {
         reply: oneshot::Sender<InterruptOutcome>,
     },
+    CancelBackgroundTask {
+        tool_call_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -1551,6 +1555,21 @@ impl AgentHandle {
         reply_rx.await.unwrap_or(InterruptOutcome::NotRunning)
     }
 
+    pub async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::CancelBackgroundTask {
+                tool_call_id: tool_call_id.to_owned(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
     pub async fn close(&self) -> bool {
         self.begin_closing();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2419,6 +2438,10 @@ trait BackendSender: Send + Sync + 'static {
         payload: protocol::SetSessionSettingsPayload,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    fn cancel_background_task<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     #[cfg(feature = "test-support")]
     fn mock_control(&self) -> Option<crate::backend::mock::MockControl>;
@@ -2454,6 +2477,13 @@ impl<B: Backend> BackendSender for B {
 
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(Backend::interrupt(self))
+    }
+
+    fn cancel_background_task<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(Backend::cancel_background_task(self, tool_call_id))
     }
 
     fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -3090,6 +3120,9 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     match command {
+                        AgentCommand::CancelBackgroundTask { reply, .. } => {
+                            let _ = reply.send(false);
+                        }
                         AgentCommand::Interrupt { reply } => {
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
@@ -7625,6 +7658,18 @@ pub(crate) fn spawn_agent_actor(
                                 &activity_stats,
                             ));
                         }
+                        AgentCommand::CancelBackgroundTask {
+                            tool_call_id,
+                            reply,
+                        } => {
+                            let cancelled = match backend.as_ref() {
+                                Some(backend) => {
+                                    backend.cancel_background_task(&tool_call_id).await
+                                }
+                                None => false,
+                            };
+                            let _ = reply.send(cancelled);
+                        }
                         AgentCommand::Interrupt { reply } => {
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
@@ -8382,6 +8427,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
                     match command {
+                        AgentCommand::CancelBackgroundTask { reply, .. } => {
+                            let _ = reply.send(false);
+                        }
                         AgentCommand::ResumeReplayBarrier { .. } => {}
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
@@ -9116,6 +9164,9 @@ async fn park_terminal_agent(
             break;
         };
         match command {
+            AgentCommand::CancelBackgroundTask { reply, .. } => {
+                let _ = reply.send(false);
+            }
             AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
                 name,
@@ -9307,6 +9358,9 @@ async fn park_relay_terminal_agent(
             break;
         };
         match command {
+            AgentCommand::CancelBackgroundTask { reply, .. } => {
+                let _ = reply.send(false);
+            }
             AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
                 name,

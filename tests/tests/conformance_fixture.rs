@@ -1276,6 +1276,20 @@ impl Interrupted {
 /// Panics when the turn ends before the trigger fires: there is then no
 /// interrupted turn to hand back, and reporting that as a passing cancellation
 /// would be the most misleading thing this harness could do.
+/// Stop one background command from its card, exactly as the tray's cancel
+/// button does — a client frame naming the card, not a session interrupt.
+pub async fn cancel_background_task(host: &mut Host, agent: &Agent, tool_call_id: &str) {
+    host.client
+        .cancel_background_task(
+            &agent.stream,
+            protocol::CancelBackgroundTaskPayload {
+                tool_call_id: tool_call_id.to_owned(),
+            },
+        )
+        .await
+        .expect("cancel_background_task failed");
+}
+
 pub async fn interrupt_turn(
     host: &mut Host,
     agent: &Agent,

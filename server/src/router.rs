@@ -6,8 +6,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendNativeSettingsWritePayload,
-    BackendSettingsRefreshPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
-    ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
+    BackendSettingsRefreshPayload, CancelBackgroundTaskPayload, CancelQueuedMessagePayload,
+    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
     CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
@@ -660,6 +660,25 @@ pub(crate) async fn route_client_envelope(
                 let stream = host_output_stream.with_path(stream_path);
                 host.compact_agent_in_background(agent_id, payload, stream)
                     .await?;
+            }
+            FrameKind::CancelBackgroundTask => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: CancelBackgroundTaskPayload =
+                    parse_payload(&envelope, "cancel_background_task")?;
+
+                // The card stays open when this fails, which is the honest
+                // report: the command is still running.
+                if !host
+                    .cancel_background_task(&agent_id, &payload.tool_call_id)
+                    .await
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        tool_call_id = payload.tool_call_id,
+                        "background task cancel did not reach a running command"
+                    );
+                }
             }
             FrameKind::Interrupt => {
                 let stream_path = envelope.stream.clone();

@@ -1544,6 +1544,7 @@ mod live_card_wasm_tests {
         let progress = ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
             execution_mode: ToolExecutionMode::Background,
+            cancellable: false,
             update: ToolProgressUpdate::Other {
                 payload: json!({
                     "task_id": "task-background",
@@ -1568,6 +1569,7 @@ mod live_card_wasm_tests {
         ToolProgressData {
             tool_call_id: "toolu_wf".to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::Workflow(workflow_state(status)),
         }
     }
@@ -1576,6 +1578,7 @@ mod live_card_wasm_tests {
         ToolProgressData {
             tool_call_id: "toolu_task".to_owned(),
             execution_mode: ToolExecutionMode::Background,
+            cancellable: false,
             update: ToolProgressUpdate::SubAgent(SubAgentProgress {
                 agent_id: AgentId("agent-sub".to_owned()),
                 agent_name: "Explore".to_owned(),
@@ -1595,6 +1598,7 @@ mod live_card_wasm_tests {
         ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind,
                 agents: vec![AgentControlAgentRef {
@@ -1973,6 +1977,7 @@ mod live_card_wasm_tests {
         let progress = ToolProgressData {
             tool_call_id: "toolu_agent_control".to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents: vec![
@@ -2020,6 +2025,7 @@ mod live_card_wasm_tests {
         let progress = ToolProgressData {
             tool_call_id: "native-wait".to_owned(),
             execution_mode: ToolExecutionMode::Foreground,
+            cancellable: false,
             update: ToolProgressUpdate::AgentControl(AgentControlProgress {
                 progress_kind: AgentControlProgressKind::Await,
                 agents: vec![AgentControlAgentRef {

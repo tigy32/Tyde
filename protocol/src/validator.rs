@@ -1175,6 +1175,7 @@ impl ProtocolValidator {
             FrameKind::QueuedMessages => {}
             FrameKind::EditQueuedMessage => {}
             FrameKind::CancelQueuedMessage => {}
+            FrameKind::CancelBackgroundTask => {}
             FrameKind::SendQueuedMessageNow => {}
             FrameKind::CloseAgent => {
                 let _: CloseAgentPayload = envelope.parse_payload().map_err(|error| {
