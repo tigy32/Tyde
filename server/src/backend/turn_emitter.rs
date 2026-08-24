@@ -631,6 +631,11 @@ impl TurnEmitterState {
         model: Option<&str>,
         caller: &'static std::panic::Location<'static>,
     ) -> ResponseHandle {
+        tracing::debug!(
+            agent = self.agent.as_str(),
+            caller = %caller,
+            "Opening a backend response"
+        );
         if let Some((response, previous_caller)) = self
             .current_response
             .as_ref()

@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use protocol::{
     AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, MessageTokenUsage,
-    SessionId, TaskStatus, TokenUsage, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
+    SessionId, TaskStatus, TokenUsage, ToolExecutionMode, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequestType,
 };
 use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
@@ -398,6 +399,7 @@ fn real_interruption() {
         )
         .await;
         assert_cancellation_contract(&mid_tool);
+        assert_foreground_command_stayed_foreground(mid_tool.turn());
         assert_open_tool_was_cancelled(&mid_tool);
         let killed = drain_events_for(&mut host, KILL_SETTLE).await;
         assert_no_error_message(&format!("{:?} kill settle", host.backend()), &killed);
@@ -431,6 +433,7 @@ fn real_interruption() {
 
             let settled = drain_events_for(&mut host, BG_SETTLE).await;
             assert_no_error_message(&format!("{:?} background settle", host.backend()), &settled);
+            assert_no_empty_responses(&format!("{:?} background settle", host.backend()), &settled);
             assert_background_task_survived_the_interrupt(
                 &started,
                 &during_background,
@@ -940,7 +943,9 @@ fn real_background_task_outlives_its_turn() {
             // finishes was tried and left the stream clean.
             let waited = ask(&mut host, &agent, wait_prompt()).await;
             assert_no_error_message(&waited.label(), waited.events());
+            assert_no_empty_response(&waited);
             assert_final_text_contains(&waited, WAITED_MARKER);
+            assert_foreground_command_stayed_foreground(&waited);
             // A backend that declines to run the command produces a clean, fast,
             // meaningless pass — which is what happened when this prompt was a
             // bare `sleep`.
@@ -961,6 +966,7 @@ fn real_background_task_outlives_its_turn() {
                 bg_path.display()
             );
             assert_no_error_message(&format!("{:?} background settle", host.backend()), &settled);
+            assert_no_empty_responses(&format!("{:?} background settle", host.backend()), &settled);
 
             // The cards still open when the launching turn ended: one of them
             // is the background command, and its completion is what has to
@@ -1101,12 +1107,14 @@ fn real_background_task_cancel() {
                         started.label()
                     )
                 });
-            assert!(
-                matches!(outcome, protocol::ToolExecutionOutcome::Cancelled { .. }),
-                "{}: card {target} completed as {outcome:?} after the user cancelled it, which \
-                 blames the command for what the user did",
-                started.label()
-            );
+            let ToolExecutionOutcome::Cancelled { message } = outcome else {
+                panic!(
+                    "{}: card {target} completed as {outcome:?} after the user cancelled it, \
+                     which blames the command for what the user did",
+                    started.label()
+                );
+            };
+            assert_cancelled_card_explains_the_stop(&started.label(), &target, message);
 
             // The whole point. Everything above is satisfied by a backend that
             // closes the card and leaves the process running.
@@ -2145,8 +2153,11 @@ fn assert_no_error_message(label: &str, events: &[ChatEvent]) {
 /// rather than Codex-only, because nothing about "don't publish an empty
 /// message" is backend-specific.
 fn assert_no_empty_response(turn: &Turn) {
-    let responses = turn
-        .events()
+    assert_no_empty_responses(&turn.label(), turn.events());
+}
+
+fn assert_no_empty_responses(label: &str, events: &[ChatEvent]) {
+    let responses = events
         .iter()
         .filter_map(|event| match event {
             ChatEvent::StreamEnd(end) => Some(&end.message),
@@ -2172,9 +2183,8 @@ fn assert_no_empty_response(turn: &Turn) {
         .collect::<Vec<_>>();
     assert!(
         empty.is_empty(),
-        "{}: published {} empty assistant message(s) at response index {:?} of {} — \
+        "{label}: published {} empty assistant message(s) at response index {:?} of {} — \
          each renders as an empty bubble with nothing in it",
-        turn.label(),
         empty.len(),
         empty,
         responses.len(),
@@ -3196,6 +3206,54 @@ fn assert_any_partial_message_is_what_was_streamed(interrupted: &Interrupted) {
     }
 }
 
+/// A foreground command must not acquire the background tray's lifecycle.
+///
+/// Claude 2.1.241 reports `task_started` even when Bash is synchronously
+/// blocking the model. Mapping every such frame to `Background` put an ordinary
+/// foreground sleep in the tray with its own stop button while the turn was
+/// still typing. Interrupting that turn then called the card a stopped
+/// background command. The normalized request IDs tie the assertion to the
+/// command the prompt actually started rather than to unrelated progress.
+fn assert_foreground_command_stayed_foreground(turn: &Turn) {
+    let commands = turn
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
+        .map(|request| request.tool_call_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !commands.is_empty(),
+        "{}: emitted no RunCommand request, so this turn asserted nothing about foreground \
+         command progress",
+        turn.label()
+    );
+
+    let misclassified = turn
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolProgress(progress)
+                if commands.contains(progress.tool_call_id.as_str())
+                    && (progress.execution_mode != ToolExecutionMode::Foreground
+                        || progress.cancellable) =>
+            {
+                Some((
+                    progress.tool_call_id.as_str(),
+                    progress.execution_mode,
+                    progress.cancellable,
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        misclassified.is_empty(),
+        "{}: foreground command progress was exposed as background/cancellable work: \
+         {misclassified:?}. The model is blocked on this command, so it must not appear in the \
+         detached-work tray or offer the tray's per-command stop action.",
+        turn.label()
+    );
+}
+
 /// Step two: each open foreground tool completes as cancelled.
 ///
 /// A tool left open is the card that spins forever — `TurnEmitter` has already
@@ -3255,6 +3313,27 @@ fn assert_cancelled_command_really_stopped(interrupted: &Interrupted, proof: &Pa
          cancelled. The card says the user stopped it and the work happened anyway.",
         interrupted.label(),
         proof.display()
+    );
+}
+
+/// A user-initiated stop is not an unknown command failure.
+///
+/// Claude 2.1.241 can stop the process before its notification carries an exit
+/// code. The output reader's parse error then leaked into the cancelled card as
+/// "status is unknown", even though Tyde knows exactly why it ended: the user
+/// pressed stop.
+fn assert_cancelled_card_explains_the_stop(label: &str, card_id: &str, message: &str) {
+    let message_lower = message.to_ascii_lowercase();
+    let describes_stop = ["cancel", "stop", "interrupt", "kill"]
+        .iter()
+        .any(|word| message_lower.contains(word));
+    assert!(
+        describes_stop
+            && !message_lower.contains("unknown")
+            && !message_lower.contains("did not state an exit code"),
+        "{label}: cancelled card {card_id} explains the user-initiated stop as {message:?}. A \
+         cancelled card must say it was stopped, not report an output-parser error or an unknown \
+         status."
     );
 }
 

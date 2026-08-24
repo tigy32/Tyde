@@ -5284,6 +5284,24 @@ impl AppState {
         self.chat_row_by_id_untracked(agent_id, row_id)
     }
 
+    pub fn chat_row_for_tool(
+        &self,
+        agent_id: &AgentId,
+        tool_call_id: &str,
+    ) -> Option<ChatRowHandle> {
+        let row_id = self.chat_tool_rows.with(|indexes| {
+            indexes.get(agent_id).and_then(|agent_index| {
+                agent_index
+                    .get(&ToolCallId(tool_call_id.to_owned()))
+                    .copied()
+            })
+        })?;
+        self.chat_rows.with(|rows| {
+            rows.get(agent_id)
+                .and_then(|rows| rows.iter().find(|row| row.id == row_id).cloned())
+        })
+    }
+
     pub fn selected_host_settings(&self) -> Option<HostSettings> {
         let host_id = self.selected_host_id.get()?;
         self.host_settings_by_host.get().get(&host_id).cloned()

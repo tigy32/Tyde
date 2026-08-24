@@ -240,7 +240,7 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
                 continue;
             }
             let completed = state
-                .chat_row_for_tool_untracked(agent_id, &call_id.0)
+                .chat_row_for_tool(agent_id, &call_id.0)
                 .and_then(|row| row.message_entry().cloned())
                 .is_some_and(|entry| {
                     entry.with(|entry| {
@@ -672,11 +672,21 @@ fn CommandRow(
             let parent = parent_ref.get()?;
             let key = (parent.agent_id.clone(), tool_call_id.clone());
             let progress = state.tool_progress.with(|map| map.get(&key).cloned())?;
-            if progress.get().execution_mode != ToolExecutionMode::Background {
+            let progress = progress.get();
+            if progress.execution_mode != ToolExecutionMode::Background {
                 return None;
             }
+            let description = match &progress.update {
+                ToolProgressUpdate::Other { payload } => payload
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_owned),
+                _ => None,
+            };
             state
-                .chat_row_for_tool_untracked(&parent.agent_id, &tool_call_id.0)
+                .chat_row_for_tool(&parent.agent_id, &tool_call_id.0)
                 .and_then(|row| row.message_entry().cloned())
                 .and_then(|entry| {
                     entry.with(|entry| {
@@ -690,6 +700,7 @@ fn CommandRow(
                             })
                     })
                 })
+                .or(description)
                 .or_else(|| Some("Background tool".to_owned()))
         }
     });
@@ -1518,7 +1529,7 @@ mod wasm_tests {
         ChatEvent::ToolExecutionCompleted(succeeded_completion("toolu_bg_bash", result))
     }
 
-    fn seed_command_response(state: &AppState) {
+    fn seed_command_declaration(state: &AppState) {
         apply_live(
             state,
             ChatEvent::StreamStart(protocol::StreamStartData {
@@ -1550,6 +1561,10 @@ mod wasm_tests {
                 },
             }),
         );
+    }
+
+    fn seed_command_response(state: &AppState) {
+        seed_command_declaration(state);
         apply_live(state, command_request());
     }
 
@@ -1614,11 +1629,16 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn genuine_background_command_renders_once_then_stays_gone_after_replay() {
-        let (container, state) = mount_tray(seed_command_response);
+        let (container, state) = mount_tray(seed_command_declaration);
         apply_live(
             &state,
             ChatEvent::ToolProgress(background_command_progress()),
         );
+        // Progress is allowed to precede its card. Force the derived snapshot
+        // to observe that state before the request arrives: a same-tick request
+        // hides the missing reactive dependency this flow guards.
+        next_tick().await;
+        apply_live(&state, command_request());
         next_tick().await;
 
         assert_eq!(
@@ -1626,12 +1646,8 @@ mod wasm_tests {
             1,
             "one Running update renders exactly one command row"
         );
-        let body = text(&container);
-        assert_eq!(
-            body.matches("./dev.sh check --locked").count(),
-            1,
-            "the genuine background command renders once: {body}"
-        );
+        let running_body = text(&container);
+        let named = running_body.matches("./dev.sh check --locked").count() == 1;
 
         apply_live(
             &state,
@@ -1642,11 +1658,8 @@ mod wasm_tests {
             }),
         );
         next_tick().await;
-        assert_eq!(
-            count(&container, ".inflight-tray"),
-            0,
-            "terminal progress removes the genuine background row"
-        );
+        let remaining = count(&container, ".inflight-tray");
+        let completed_body = text(&container);
 
         let (replayed_container, _replayed_state) = mount_tray(|state| {
             seed_command_response(state);
@@ -1664,6 +1677,12 @@ mod wasm_tests {
             );
         });
         next_tick().await;
+        assert!(
+            named && remaining == 0,
+            "a progress-before-request command must acquire its real title and leave on \
+             completion; named={named}, remaining trays={remaining}, running={running_body:?}, \
+             completed={completed_body:?}"
+        );
         assert_eq!(
             count(&replayed_container, ".inflight-tray"),
             0,

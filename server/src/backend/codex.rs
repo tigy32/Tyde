@@ -3129,10 +3129,15 @@ impl CodexResponseSplitter {
     /// last of those items, and which is the boundary a resumed thread already
     /// used for want of any raw events.
     fn observe_raw_response_completed(&mut self, turn_id: Option<&str>, response_id: String) {
-        if self.ensure_open(turn_id).is_none() {
+        let Some(response) = self.open.as_mut() else {
             return;
+        };
+        if response.turn_id == "turn"
+            && let Some(turn_id) = turn_id
+        {
+            response.turn_id = turn_id.to_owned();
         }
-        self.open.as_mut().expect("open Codex response").response_id = Some(response_id);
+        response.response_id = Some(response_id);
     }
 
     fn observe_delta(
@@ -3179,6 +3184,14 @@ impl CodexResponseSplitter {
         completed: &str,
         reasoning: bool,
     ) -> Option<CodexResponseDelta> {
+        if !contains_non_whitespace(completed)
+            && self.open.as_ref().is_none_or(|response| {
+                !contains_non_whitespace(&response.text)
+                    && !contains_non_whitespace(&response.reasoning)
+            })
+        {
+            return None;
+        }
         self.ensure_open(turn_id)?;
         let response = self.open.as_mut().expect("open Codex response");
         let item_id = item_id
@@ -3282,11 +3295,12 @@ impl CodexResponseSplitter {
         usage: Option<Value>,
         failed: bool,
     ) -> Option<FinalizedCodexProviderResponse> {
-        if failed && self.open.is_none() {
-            return None;
+        let mut response = self.open.take()?;
+        if response.turn_id == "turn"
+            && let Some(turn_id) = turn_id
+        {
+            response.turn_id = turn_id.to_owned();
         }
-        self.ensure_open(turn_id)?;
-        let response = self.open.take().expect("open Codex response");
         // Off the response, not the closing event: only `rawResponse/completed`
         // ever carries an id, and that is no longer the event that closes it.
         let response_id = response.response_id;
@@ -8361,9 +8375,9 @@ impl CodexInner {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return (false, false);
         };
-        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+        if self.response_projection_target(&thread_id).await.is_none() {
             return (false, false);
-        };
+        }
         let Some(item) = params.get("item") else {
             return (false, false);
         };
@@ -8378,7 +8392,7 @@ impl CodexInner {
             .or_else(|| item.get("call_id"))
             .and_then(Value::as_str);
         let turn_id = extract_turn_id(params);
-        let opened = {
+        {
             let mut state = self.state.lock().await;
             state
                 .response_splitters
@@ -8390,9 +8404,8 @@ impl CodexInner {
                         call_id,
                         item_type,
                     )
-                })
-                .and_then(|(opened, _)| opened)
-        };
+                });
+        }
         let provider_tool = !tool_item || {
             let state = self.state.lock().await;
             item_id.is_some_and(|item_id| {
@@ -8402,9 +8415,6 @@ impl CodexInner {
                     .is_some_and(|splitter| splitter.provider_typed_tool_item_ids.contains(item_id))
             })
         };
-        let _ = opened;
-        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
-            .await;
         (true, provider_tool)
     }
 
@@ -9081,24 +9091,20 @@ impl CodexInner {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return;
         };
-        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
+        if self.response_projection_target(&thread_id).await.is_none() {
             return;
-        };
+        }
         let Some(item) = params.get("item") else {
             return;
         };
         let turn_id = extract_turn_id(params);
-        let opened = {
+        {
             let mut state = self.state.lock().await;
             state
                 .response_splitters
                 .get_mut(&thread_id)
-                .and_then(|splitter| splitter.observe_raw_item(turn_id.as_deref(), item))
-                .and_then(|(opened, _)| opened)
-        };
-        let _ = opened;
-        self.ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
-            .await;
+                .and_then(|splitter| splitter.observe_raw_item(turn_id.as_deref(), item));
+        }
     }
 
     async fn buffer_strict_tool_request(
@@ -9257,7 +9263,35 @@ impl CodexInner {
                 .collect::<Vec<_>>(),
             "Finalizing a Codex provider response"
         );
-        let response = emitter.ensure_open_response(Some(&model));
+        for request in &finalized.evicted_tool_requests {
+            if !emitter.fail_pending_tool(
+                &request.tool_call_id,
+                "Codex discarded an expired tool owner before completion",
+            ) {
+                emitter.backend_error(&format!(
+                    "Codex lost the owner for pending tool '{}'",
+                    request.tool_call_id
+                ));
+            }
+        }
+        let renderable = contains_non_whitespace(&finalized.content)
+            || finalized
+                .reasoning
+                .as_deref()
+                .is_some_and(contains_non_whitespace)
+            || !finalized.tool_requests.is_empty();
+        let response = emitter
+            .open_response()
+            .or_else(|| renderable.then(|| emitter.ensure_open_response(Some(&model))));
+        let Some(response) = response else {
+            tracing::debug!(
+                thread_id,
+                turn_id = finalized.turn_id,
+                response_id = ?finalized.response_id,
+                "Suppressed an empty Codex provider response"
+            );
+            return true;
+        };
         let images = self
             .prepare_strict_response_bookkeeping(
                 &thread_id,
@@ -9311,17 +9345,6 @@ impl CodexInner {
                     &request.tool_call_id,
                     "Codex provider response ended before the tool completed",
                 );
-            }
-        }
-        for request in finalized.evicted_tool_requests {
-            if !emitter.fail_pending_tool(
-                &request.tool_call_id,
-                "Codex discarded an expired tool owner before completion",
-            ) {
-                emitter.backend_error(&format!(
-                    "Codex lost the owner for pending tool '{}'",
-                    request.tool_call_id
-                ));
             }
         }
         // The cards this response declares are open only now, so this is the

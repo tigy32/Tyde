@@ -557,7 +557,7 @@ fn write_disposable_hermes_config(home: &Path, stub: &(Url, String)) -> Result<(
     let base_url = serde_json::to_string(stub.0.as_str())
         .map_err(|error| format!("failed to quote disposable Hermes base URL: {error}"))?;
     let config = format!(
-        "model:\n  provider: openai\n  default: {model}\n  base_url: {base_url}\nbedrock:\n  discovery:\n    enabled: false\n"
+        "model:\n  provider: openai-api\n  default: {model}\n  base_url: {base_url}\nbedrock:\n  discovery:\n    enabled: false\n"
     );
     fs::write(home.join("config.yaml"), config).map_err(|error| {
         format!(

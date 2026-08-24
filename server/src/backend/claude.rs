@@ -868,6 +868,7 @@ struct ClaudeInner {
 struct BackgroundTaskRegistry {
     owner_active: bool,
     entries: HashMap<String, BackgroundTaskEntry>,
+    command_modes: HashMap<String, ToolExecutionMode>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -893,6 +894,7 @@ impl BackgroundTaskRegistry {
         Self {
             owner_active: true,
             entries: HashMap::new(),
+            command_modes: HashMap::new(),
         }
     }
 }
@@ -1707,6 +1709,7 @@ impl ClaudeInner {
                         .find(|entry| {
                             entry.tool_use_id == tool_call_id
                                 && entry.state.status == BackgroundTaskStatus::Running
+                                && entry.execution_mode == Some(ToolExecutionMode::Background)
                         })
                         .map(|entry| entry.state.task_id.clone())
                 };
@@ -4094,7 +4097,7 @@ impl ClaudeInner {
             .lock()
             .expect("Claude background task mutex poisoned");
         registry.owner_active = false;
-        drain_background_task_entries(&mut registry.entries);
+        drain_background_task_entries(&mut registry);
         self.background_work_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.pending_cli_wake
@@ -4136,7 +4139,7 @@ impl ClaudeInner {
         }
         handle_background_bash_task_frame_with_owners(
             value,
-            &mut registry.entries,
+            &mut registry,
             &self.emitter,
             subagent_streams,
         )
@@ -4516,7 +4519,7 @@ impl ClaudeInner {
                 tool_call.id
             );
         }
-        self.adopt_background_task_awaiting_tool_request(&tool_call.id);
+        self.adopt_background_task_awaiting_tool_request(tool_call);
         true
     }
 
@@ -4534,13 +4537,28 @@ impl ClaudeInner {
     /// stays unresolved, which costs the tray its row *and* drops the task's
     /// terminal frame. Resolving here removes the ordering dependency
     /// entirely: whenever the request finally lands, the task adopts it.
-    fn adopt_background_task_awaiting_tool_request(&self, tool_call_id: &str) {
+    fn adopt_background_task_awaiting_tool_request(&self, tool_call: &ClaudeToolCall) {
         let mut registry = self
             .background_tasks
             .lock()
             .expect("Claude background task mutex poisoned");
+        let requested_mode = claude_is_run_command_tool_name(&tool_call.name).then(|| {
+            if tool_call
+                .arguments
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                ToolExecutionMode::Background
+            } else {
+                ToolExecutionMode::Foreground
+            }
+        });
+        if let Some(mode) = requested_mode {
+            registry.command_modes.insert(tool_call.id.clone(), mode);
+        }
         let Some(task_id) = registry.entries.iter().find_map(|(task_id, entry)| {
-            (entry.tool_use_id == tool_call_id).then(|| task_id.clone())
+            (entry.tool_use_id == tool_call.id).then(|| task_id.clone())
         }) else {
             return;
         };
@@ -4548,8 +4566,8 @@ impl ClaudeInner {
             .entries
             .get_mut(&task_id)
             .expect("background task disappeared while registry was locked");
-        if entry.owner.is_some() && entry.tool_name.is_some() {
-            return;
+        if requested_mode.is_some() {
+            entry.execution_mode = requested_mode;
         }
         // Only the root stream reaches this path; a task owned by a sub-agent
         // resolves through that sub-agent's own stream and must not be
@@ -4560,27 +4578,38 @@ impl ClaudeInner {
         let owner = Arc::clone(&self.emitter);
         entry.owner.get_or_insert_with(|| Arc::clone(&owner));
         if entry.tool_name.is_none() {
-            entry.tool_name = owner.tool_request_name(tool_call_id);
+            entry.tool_name = owner.tool_request_name(&tool_call.id);
         }
         if entry.state.description.is_none() {
-            entry.state.description = owner.tool_request_command(tool_call_id);
+            entry.state.description = owner.tool_request_command(&tool_call.id);
         }
         let mut completion_emitted = false;
         if entry.tool_name.is_some() {
             tracing::debug!(
                 task_id = entry.state.task_id,
-                tool_use_id = tool_call_id,
-                "adopted background task on its late tool request"
+                tool_use_id = tool_call.id,
+                execution_mode = ?entry.execution_mode,
+                "classified Bash task on its tool request"
             );
-            if entry.state.status == BackgroundTaskStatus::Running {
+            if entry.state.status == BackgroundTaskStatus::Running
+                && entry.execution_mode == Some(ToolExecutionMode::Background)
+            {
                 emit_background_task_snapshot(&owner, entry);
+                self.set_background_work_active(true);
             } else if entry.terminal_notification_received {
-                emit_background_task_completion(&owner, entry);
-                completion_emitted = true;
+                match entry.execution_mode {
+                    Some(ToolExecutionMode::Background) => {
+                        emit_background_task_completion(&owner, entry);
+                        completion_emitted = true;
+                    }
+                    Some(ToolExecutionMode::Foreground) => completion_emitted = true,
+                    None => {}
+                }
             }
         }
         if completion_emitted {
             registry.entries.remove(&task_id);
+            registry.command_modes.remove(&tool_call.id);
         }
     }
 
@@ -5497,10 +5526,10 @@ async fn sync_persistent_background_activity(
             .lock()
             .expect("Claude background task mutex poisoned");
         registry.owner_active
-            && registry
-                .entries
-                .values()
-                .any(|entry| entry.state.status == BackgroundTaskStatus::Running)
+            && registry.entries.values().any(|entry| {
+                entry.state.status == BackgroundTaskStatus::Running
+                    && entry.execution_mode == Some(ToolExecutionMode::Background)
+            })
     };
     let subagent_active = subagent_streams.values().any(|stream| {
         matches!(
@@ -5807,7 +5836,14 @@ async fn read_claude_stdout_persistent(
         // Arm before the task handlers below consume the frame. A completing
         // task is what makes the CLI wake the model, so this has to see the
         // notification whether it belongs to a workflow or a background task.
-        if claude_frame_arms_cli_wake(&value) {
+        let arms_cli_wake = {
+            let background_tasks = inner
+                .background_tasks
+                .lock()
+                .expect("Claude background task mutex poisoned");
+            claude_frame_arms_cli_wake(&value, &background_tasks)
+        };
+        if arms_cli_wake {
             inner.arm_cli_wake();
         }
         recent_system_subtypes.observe(&value);
@@ -5875,7 +5911,7 @@ async fn read_claude_stdout_persistent(
                     .expect("Claude background task mutex poisoned");
                 refresh_unresolved_background_tasks(
                     &value,
-                    &mut background_tasks.entries,
+                    &mut background_tasks,
                     &inner.emitter,
                     &subagent_streams,
                 );
@@ -5997,7 +6033,7 @@ async fn read_claude_stdout_persistent(
                 .expect("Claude background task mutex poisoned");
             refresh_unresolved_background_tasks(
                 &value,
-                &mut background_tasks.entries,
+                &mut background_tasks,
                 &inner.emitter,
                 &subagent_streams,
             );
@@ -6069,15 +6105,29 @@ async fn read_claude_stdout_persistent(
 }
 
 /// Whether a frame is the kind of completion that makes the CLI wake the
-/// model and run a turn of its own. Any `task_notification` qualifies — the
-/// CLI only emits one when a task reaches a terminal state — but a task owned
+/// model and run a turn of its own. Foreground Bash notifications do not
+/// qualify because the model is already waiting for their result. A task owned
 /// by a sub-agent wakes that sub-agent's stream, not the root, so anything
 /// carrying a parent tool id is excluded. Status strings are deliberately not
 /// matched: an unrecognized one must not silently cost us the wake turn.
-fn claude_frame_arms_cli_wake(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("system")
-        && value.get("subtype").and_then(Value::as_str) == Some("task_notification")
-        && background_task_parent_tool_use_id(value).is_none()
+fn claude_frame_arms_cli_wake(value: &Value, background_tasks: &BackgroundTaskRegistry) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("task_notification")
+        || background_task_parent_tool_use_id(value).is_some()
+    {
+        return false;
+    }
+    let Some(task_id) = value
+        .get("task_id")
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)
+    else {
+        return true;
+    };
+    background_tasks
+        .entries
+        .get(&task_id)
+        .is_none_or(|entry| entry.execution_mode == Some(ToolExecutionMode::Background))
 }
 
 /// Whether a parent-stream frame (already excluded from sub-agent routing)
@@ -7528,6 +7578,7 @@ struct BackgroundTaskEntry {
     tool_name: Option<String>,
     owner: Option<Arc<TurnEmitter>>,
     parent_tool_use_id: Option<String>,
+    execution_mode: Option<ToolExecutionMode>,
     state: BackgroundTaskState,
     output: Option<ClaudeRunCommandResult>,
     output_path: Option<String>,
@@ -7638,32 +7689,89 @@ fn refresh_background_task_owner(
     }
 }
 
+fn background_task_execution_mode(
+    entry: &BackgroundTaskEntry,
+    command_modes: &HashMap<String, ToolExecutionMode>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) -> Option<ToolExecutionMode> {
+    command_modes.get(&entry.tool_use_id).copied().or_else(|| {
+        let stream = subagent_streams.get(entry.parent_tool_use_id.as_deref()?)?;
+        stream
+            .inner
+            .background_tasks
+            .lock()
+            .expect("Claude child background task mutex poisoned")
+            .command_modes
+            .get(&entry.tool_use_id)
+            .copied()
+    })
+}
+
+fn forget_background_task_execution_mode(
+    entry: &BackgroundTaskEntry,
+    command_modes: &mut HashMap<String, ToolExecutionMode>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) {
+    command_modes.remove(&entry.tool_use_id);
+    if let Some(stream) = entry
+        .parent_tool_use_id
+        .as_deref()
+        .and_then(|parent_tool_use_id| subagent_streams.get(parent_tool_use_id))
+    {
+        stream
+            .inner
+            .background_tasks
+            .lock()
+            .expect("Claude child background task mutex poisoned")
+            .command_modes
+            .remove(&entry.tool_use_id);
+    }
+}
+
 fn refresh_unresolved_background_tasks(
     value: &Value,
-    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
+    registry: &mut BackgroundTaskRegistry,
     root_emitter: &Arc<TurnEmitter>,
     subagent_streams: &HashMap<String, SubAgentStream>,
 ) {
+    let BackgroundTaskRegistry {
+        entries,
+        command_modes,
+        ..
+    } = registry;
     let mut resolved_terminals = Vec::new();
-    for entry in background_tasks
-        .values_mut()
-        .filter(|entry| entry.owner.is_none() || entry.tool_name.is_none())
-    {
-        let was_ready = entry.owner.is_some() && entry.tool_name.is_some();
+    for entry in entries.values_mut().filter(|entry| {
+        entry.owner.is_none() || entry.tool_name.is_none() || entry.execution_mode.is_none()
+    }) {
+        let was_ready =
+            entry.owner.is_some() && entry.tool_name.is_some() && entry.execution_mode.is_some();
         refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
+        entry.execution_mode = entry
+            .execution_mode
+            .or_else(|| background_task_execution_mode(entry, command_modes, subagent_streams));
         if !was_ready
-            && let (Some(owner), Some(_)) = (entry.owner.as_deref(), entry.tool_name.as_deref())
+            && let (Some(owner), Some(_), Some(execution_mode)) = (
+                entry.owner.as_deref(),
+                entry.tool_name.as_deref(),
+                entry.execution_mode,
+            )
         {
-            if entry.state.status == BackgroundTaskStatus::Running {
+            if entry.state.status == BackgroundTaskStatus::Running
+                && execution_mode == ToolExecutionMode::Background
+            {
                 emit_background_task_snapshot(owner, entry);
             } else if entry.terminal_notification_received {
-                emit_background_task_completion(owner, entry);
+                if execution_mode == ToolExecutionMode::Background {
+                    emit_background_task_completion(owner, entry);
+                }
                 resolved_terminals.push(entry.state.task_id.clone());
             }
         }
     }
     for task_id in resolved_terminals {
-        background_tasks.remove(&task_id);
+        if let Some(entry) = entries.remove(&task_id) {
+            forget_background_task_execution_mode(&entry, command_modes, subagent_streams);
+        }
     }
 }
 
@@ -7839,11 +7947,7 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
                 None => return,
             },
             BackgroundTaskStatus::Stopped => ToolExecutionOutcome::Cancelled {
-                message: entry
-                    .state
-                    .output_unavailable
-                    .clone()
-                    .unwrap_or_else(|| "Background command stopped".to_owned()),
+                message: "Background command stopped".to_owned(),
             },
             BackgroundTaskStatus::Failed | BackgroundTaskStatus::Unknown => {
                 let message = entry
@@ -7905,8 +8009,17 @@ fn emit_tool_completion_for_known_request(
     true
 }
 
-fn drain_background_task_entries(background_tasks: &mut HashMap<String, BackgroundTaskEntry>) {
-    for (_, mut entry) in background_tasks.drain() {
+fn drain_background_task_entries(registry: &mut BackgroundTaskRegistry) {
+    let BackgroundTaskRegistry {
+        entries,
+        command_modes,
+        ..
+    } = registry;
+    for (_, mut entry) in entries.drain() {
+        command_modes.remove(&entry.tool_use_id);
+        if entry.execution_mode != Some(ToolExecutionMode::Background) {
+            continue;
+        }
         let Some(owner) = entry.owner.as_deref() else {
             continue;
         };
@@ -7924,6 +8037,7 @@ fn drain_background_task_entries(background_tasks: &mut HashMap<String, Backgrou
         }
         emit_background_task_completion(owner, &entry);
     }
+    command_modes.clear();
 }
 
 fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
@@ -7958,10 +8072,15 @@ fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
 /// Once resolved, the owner remains fixed for the detached lifetime.
 fn handle_background_bash_task_frame_with_owners(
     value: &Value,
-    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
+    registry: &mut BackgroundTaskRegistry,
     root_emitter: &Arc<TurnEmitter>,
     subagent_streams: &HashMap<String, SubAgentStream>,
 ) -> bool {
+    let BackgroundTaskRegistry {
+        entries: background_tasks,
+        command_modes,
+        ..
+    } = registry;
     if value.get("type").and_then(Value::as_str) != Some("system") {
         return false;
     }
@@ -7995,11 +8114,12 @@ fn handle_background_bash_task_frame_with_owners(
             let command = owner
                 .as_deref()
                 .and_then(|owner| owner.tool_request_command(&tool_use_id));
-            let entry = BackgroundTaskEntry {
+            let mut entry = BackgroundTaskEntry {
                 tool_use_id,
                 tool_name,
                 owner,
                 parent_tool_use_id,
+                execution_mode: None,
                 state: BackgroundTaskState {
                     task_id: task_id.clone(),
                     description: command,
@@ -8011,15 +8131,19 @@ fn handle_background_bash_task_frame_with_owners(
                 output_path: None,
                 terminal_notification_received: false,
             };
+            entry.execution_mode =
+                background_task_execution_mode(&entry, command_modes, subagent_streams);
             tracing::debug!(
                 task_id,
                 tool_use_id = entry.tool_use_id,
                 parent_tool_use_id = entry.parent_tool_use_id.as_deref().unwrap_or(""),
                 owner_resolved = entry.owner.is_some(),
-                "registered background Bash task ownership"
+                execution_mode = ?entry.execution_mode,
+                "registered Bash task ownership"
             );
             if let Some(owner) = entry.owner.as_deref()
                 && entry.tool_name.is_some()
+                && entry.execution_mode == Some(ToolExecutionMode::Background)
             {
                 emit_background_task_snapshot(owner, &entry);
             }
@@ -8031,6 +8155,9 @@ fn handle_background_bash_task_frame_with_owners(
                 return false;
             };
             refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
+            entry.execution_mode = entry
+                .execution_mode
+                .or_else(|| background_task_execution_mode(entry, command_modes, subagent_streams));
             let patch = system.patch.as_ref();
             if let Some(path) = patch
                 .and_then(|patch| patch.output_file.as_ref().or(patch.path.as_ref()))
@@ -8058,6 +8185,7 @@ fn handle_background_bash_task_frame_with_owners(
             }
             entry.state.status = next_status;
             if entry.state.status == BackgroundTaskStatus::Running
+                && entry.execution_mode == Some(ToolExecutionMode::Background)
                 && let Some(owner) = entry.owner.as_ref().map(Arc::clone)
             {
                 emit_background_task_snapshot(&owner, entry);
@@ -8069,6 +8197,9 @@ fn handle_background_bash_task_frame_with_owners(
                 return false;
             };
             refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
+            entry.execution_mode = entry
+                .execution_mode
+                .or_else(|| background_task_execution_mode(entry, command_modes, subagent_streams));
             entry.state.status = match system.status.as_deref() {
                 Some("completed") => BackgroundTaskStatus::Completed,
                 Some("stopped") | Some("killed") => BackgroundTaskStatus::Stopped,
@@ -8116,8 +8247,11 @@ fn handle_background_bash_task_frame_with_owners(
             let mut completion_emitted = false;
             if let Some(owner) = entry.owner.as_deref()
                 && entry.tool_name.is_some()
+                && let Some(execution_mode) = entry.execution_mode
             {
-                emit_background_task_completion(owner, entry);
+                if execution_mode == ToolExecutionMode::Background {
+                    emit_background_task_completion(owner, entry);
+                }
                 completion_emitted = true;
             } else {
                 tracing::error!(
@@ -8127,8 +8261,8 @@ fn handle_background_bash_task_frame_with_owners(
                     "retaining terminal background task frame until ownership resolves"
                 );
             }
-            if completion_emitted {
-                background_tasks.remove(&task_id);
+            if completion_emitted && let Some(entry) = background_tasks.remove(&task_id) {
+                forget_background_task_execution_mode(&entry, command_modes, subagent_streams);
             }
             true
         }
