@@ -2893,7 +2893,26 @@ impl CodexResponseSplitter {
         let tool_item = is_codex_provider_tool_item_type(item_type);
         if tool_item {
             let item_id = item_id.filter(|item_id| !item_id.trim().is_empty())?;
+            // A typed item owns its call from the moment it starts, whether or
+            // not a raw declaration has been seen yet. The raw one can arrive
+            // after this item's card has completed and its response closed —
+            // measured, an MCP call whose typed card completed, then a raw
+            // declaration for the same call id one response later — and
+            // without the ownership recorded here that late declaration opened
+            // a second card that nothing ever completes.
+            self.typed_owned_call_ids.insert(item_id.to_owned());
+            if let Some(call_id) = call_id.filter(|call_id| !call_id.trim().is_empty()) {
+                self.typed_owned_call_ids.insert(call_id.to_owned());
+            }
             let owner = self.claim_raw_tool_owner(item_id, call_id);
+            tracing::debug!(
+                probe = "typed",
+                item_id,
+                call_id = call_id.unwrap_or("<none>"),
+                item_type,
+                claimed_owner = owner.is_some(),
+                "PROBE typed item recorded"
+            );
             if let Some(owner) = owner {
                 // The typed item's own id *is* the provider `call_id` the raw
                 // output will carry, but record the owner's copy too for the
@@ -2901,6 +2920,15 @@ impl CodexResponseSplitter {
                 self.typed_owned_call_ids.insert(item_id.to_owned());
                 if let Some(call_id) = owner.provider_call_id.clone() {
                     self.typed_owned_call_ids.insert(call_id);
+                }
+                // The raw declaration parked as this item's owner describes
+                // the same call the typed item does, so it must not also be
+                // buffered as a card of its own. Declaring it and claiming it
+                // are two different jobs; only the drop was ever meant to go.
+                if let Some(response) = self.open.as_mut() {
+                    response
+                        .raw_tool_requests
+                        .retain(|raw| raw.tool_call_id != owner.tool_call_id);
                 }
                 self.execution_only_typed_tool_item_ids
                     .insert(item_id.to_owned());
@@ -3011,7 +3039,23 @@ impl CodexResponseSplitter {
         // discarding it dropped the call outright — see
         // `codex_raw_call_is_rendered_elsewhere`.
         if let Some(request) = raw_codex_tool_request(item_id, item) {
-            if codex_raw_call_is_rendered_elsewhere(&request.arguments) {
+            let typed_owns_call = self.typed_item_owns_call(item_id)
+                || request
+                    .provider_call_id
+                    .as_deref()
+                    .is_some_and(|call_id| self.typed_item_owns_call(call_id));
+            tracing::debug!(
+                probe = "raw",
+                item_id,
+                provider_call_id = request.provider_call_id.as_deref().unwrap_or("<none>"),
+                tool_call_id = request.tool_call_id,
+                tool_name = request.tool_name,
+                typed_owns_call,
+                "PROBE raw declaration"
+            );
+            if typed_owns_call
+                || codex_raw_call_is_rendered_elsewhere(&request.tool_name, &request.arguments)
+            {
                 self.typed_owned_call_ids.insert(item_id.to_owned());
                 if let Some(call_id) = request.provider_call_id {
                     self.typed_owned_call_ids.insert(call_id);
@@ -4487,7 +4531,7 @@ impl CodexInner {
         // interaction's. Before interactions owned cards at all they had no
         // owner and fell out one line above; without this they reach the
         // correlation and report every poll as an uncorrelated session.
-        if !codex_raw_call_is_rendered_elsewhere(&owner.arguments) {
+        if !codex_raw_call_is_rendered_elsewhere(&owner.tool_name, &owner.arguments) {
             return Vec::new();
         }
         let session_ids = if declared_session_ids.is_empty() {
@@ -8516,7 +8560,8 @@ impl CodexInner {
         // polled, which belongs to that process's own card — running it through
         // the background correlation below reports a healthy foreground poll as
         // an uncorrelated yield and puts an Error card in front of the user.
-        if !yielded_session_ids.is_empty() && codex_raw_call_is_rendered_elsewhere(&owner.arguments)
+        if !yielded_session_ids.is_empty()
+            && codex_raw_call_is_rendered_elsewhere(&owner.tool_name, &owner.arguments)
         {
             let correlated = {
                 let mut state = self.state.lock().await;
@@ -9649,9 +9694,47 @@ impl CodexInner {
                 self.append_reasoning_to_active_stream(&delta).await;
             }
             "item/started" => {
+                tracing::debug!(
+                    kind = "started",
+                    item_type = params
+                        .get("item")
+                        .and_then(|i| i.get("type"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    id = params
+                        .get("item")
+                        .and_then(|i| i.get("id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    call_id = params
+                        .get("item")
+                        .and_then(|i| i.get("callId").or_else(|| i.get("call_id")))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    "PROBE typed item event"
+                );
                 self.handle_item_started(params).await;
             }
             "item/completed" => {
+                tracing::debug!(
+                    kind = "completed",
+                    item_type = params
+                        .get("item")
+                        .and_then(|i| i.get("type"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    id = params
+                        .get("item")
+                        .and_then(|i| i.get("id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    call_id = params
+                        .get("item")
+                        .and_then(|i| i.get("callId").or_else(|| i.get("call_id")))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<none>"),
+                    "PROBE typed item event"
+                );
                 self.handle_item_completed(params).await;
             }
             "turn/plan/updated" => {
@@ -19077,7 +19160,16 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
 /// Listed the way round that fails safe. An unrecognised tool falls through to
 /// a card carrying its JSON: if it turns out to have a typed item too the user
 /// sees it twice, which is visible and fixable, rather than not at all.
-fn codex_raw_call_is_rendered_elsewhere(arguments: &Value) -> bool {
+fn codex_raw_call_is_rendered_elsewhere(tool_name: &str, arguments: &Value) -> bool {
+    // The same call reaches Tyde in two shapes, and which one the model picks
+    // varies run to run: `exec_command` called directly, with JSON arguments,
+    // and `exec` called with a source string that calls it. Reading only the
+    // source string was measured against a day of runs that happened to
+    // contain nothing but that form, so the direct form went unsuppressed and
+    // left a second, never-completed card open on every command.
+    if codex_function_is_rendered_elsewhere(tool_name) {
+        return true;
+    }
     let Some(source) = arguments.as_str() else {
         return false;
     };
@@ -19088,14 +19180,23 @@ fn codex_raw_call_is_rendered_elsewhere(arguments: &Value) -> bool {
     }) else {
         return false;
     };
-    // Each of these reaches the user through a typed item: `commandExecution`,
-    // `fileChange`, `webSearch`, `imageView`, `sleep`, `mcpToolCall`.
-    //
-    // `update_plan` is deliberately absent. Its effect does show up, in the task
-    // list, but it is still a tool the model called and it gets a card like any
-    // other — without one, a response whose only act was a plan update
-    // published a message with nothing in it, which is what
-    // `real_task_list` was failing on.
+    codex_function_is_rendered_elsewhere(function)
+}
+
+/// Whether this Codex tool already reaches the user through a typed item:
+/// `commandExecution`, `fileChange`, `webSearch`, `imageView`, `sleep`,
+/// `mcpToolCall`.
+///
+/// `write_stdin` is deliberately absent — it gets no typed item, so the raw
+/// declaration is the only record of it and suppressing it drops the call
+/// outright.
+///
+/// `update_plan` is deliberately absent too. Its effect does show up, in the
+/// task list, but it is still a tool the model called and it gets a card like
+/// any other — without one, a response whose only act was a plan update
+/// published a message with nothing in it, which is what `real_task_list` was
+/// failing on.
+fn codex_function_is_rendered_elsewhere(function: &str) -> bool {
     matches!(
         function,
         "exec_command" | "apply_patch" | "web__run" | "view_image" | "sleep"
