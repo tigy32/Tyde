@@ -129,6 +129,17 @@ const PLAN_TASKS: [&str; 3] = [
 /// two or more shell calls orphans every one of them.
 const MULTI_FILES: [&str; 3] = ["multi_a.txt", "multi_b.txt", "multi_c.txt"];
 
+/// A chain each file can only be walked one link at a time: the name of the
+/// next file is *inside* the previous one, so no response can request two of
+/// them at once and the turn is forced to span several provider requests.
+///
+/// `multi_tool_prompt` cannot stand in. It leaves the model free to issue its
+/// three calls in one response, which is one request, and the usage scenario
+/// needs the opposite guarantee. Measured on Hermes/gemini: the chain produced
+/// four provider requests where every other turn in the scenario produced one.
+const USAGE_CHAIN_FILES: [&str; 3] = ["chain_a.txt", "chain_b.txt", "chain_c.txt"];
+const USAGE_CHAIN_MARKER: &str = "TYDE_CHAIN_DONE";
+
 /// A second, untouched triple for the half of a scenario that runs *after* a
 /// resume.
 ///
@@ -214,7 +225,9 @@ fn real_conversation() {
         let deleted = ask(&mut host, &agent, delete_prompt(&workspace)).await;
         assert_deleted_directory(&deleted, host.workspace());
 
-        assert_universal_contract(&[launched, wrote, read_back, multi, deleted]);
+        let turns = [launched, wrote, read_back, multi, deleted];
+        assert_reasoning_reaches_the_client(&turns);
+        assert_universal_contract(&turns);
 
         let session = stored_session(&mut host).await;
         assert!(
@@ -1307,10 +1320,31 @@ fn real_usage_accounting() {
             assert_turn_is_not_the_running_total(&baseline);
             assert_turn_is_not_the_running_total(&planted);
 
-            let turns = vec![launched, baseline, planted];
+            // Every other turn here forbids tools, so all of them are a single
+            // provider request and request-scope usage is trivially equal to
+            // turn-scope usage. A backend that files one request's figure under
+            // `turn` is indistinguishable from a correct one until a turn spans
+            // more than one request.
+            let workspace = host.workspace().to_path_buf();
+            let [first, second, third] = USAGE_CHAIN_FILES;
+            std::fs::write(host.workspace().join(first), format!("{second}\n"))
+                .expect("seed the first chain link");
+            std::fs::write(host.workspace().join(second), format!("{third}\n"))
+                .expect("seed the second chain link");
+            std::fs::write(
+                host.workspace().join(third),
+                format!("{USAGE_CHAIN_MARKER}\n"),
+            )
+            .expect("seed the final chain link");
+            let chained = ask(&mut host, &agent, usage_chain_prompt(&workspace)).await;
+            assert_final_text_contains(&chained, USAGE_CHAIN_MARKER);
+
+            let declares_request_usage =
+                host.declares(BackendCapability::ModelRequestUsageReported);
+            let turns = vec![launched, baseline, planted, chained];
             for turn in &turns {
                 assert_no_well_formed_zeros(turn);
-                assert_requests_sum_to_their_turn(turn);
+                assert_requests_sum_to_their_turn(turn, declares_request_usage);
             }
             assert_cumulative_never_shrinks(&turns);
             assert_context_usage_capability_matches_behaviour(&turns, declares_context_usage);
@@ -1329,10 +1363,12 @@ fn real_usage_accounting() {
 ///
 /// Ungated on purpose, unlike every other capability-sensitive scenario here. A
 /// gate would let a backend excuse itself from the test by not declaring, and
-/// that is not hypothetical: Codex declares no task capability at all while
-/// `codex.rs:15073` maps `update_plan` into a `protocol::TaskList` and
-/// `codex.rs:14395` emits it. Gating on `TaskUpdates` would skip Codex entirely
-/// and report a pass.
+/// that is not hypothetical -- though the Codex task lists this comment used to
+/// cite were already declared by `c2ed1a03` before the claim was written here,
+/// so the example was false the day it landed. The live one is Hermes and
+/// per-request usage: it split every turn at its provider-request boundaries
+/// while reporting the request scope `Unavailable` and declaring nothing, which
+/// took it out of `assert_requests_sum_to_their_turn` entirely.
 ///
 /// So the check runs both ways. Declared-but-silent is the direction the adapter
 /// validator already owns for usage; the direction that matters here is
@@ -1586,6 +1622,20 @@ fn usage_probe_payload() -> String {
 /// whether Tyde maps whatever tool the model picked.
 ///
 /// The descriptions are dictated verbatim so the mapping has a payload to carry.
+/// Walks [`USAGE_CHAIN_FILES`], which is the whole point: each read is
+/// unrequestable until the previous one has come back.
+fn usage_chain_prompt(workspace: &Path) -> String {
+    let [first, _, _] = USAGE_CHAIN_FILES;
+    format!(
+        "In {}, read the file {first}. It names another file in that same \
+         directory. Read that one next, and keep following each name you find, one file per \
+         step, until a file gives you a token instead of a name. Read the files strictly one at \
+         a time and never more than one per step. Then reply with exactly that token and nothing \
+         else.",
+        workspace_root(workspace)
+    )
+}
+
 fn plan_prompt() -> String {
     let tasks = PLAN_TASKS
         .iter()
@@ -2255,10 +2305,24 @@ fn assert_no_empty_responses(label: &str, events: &[ChatEvent]) {
 /// tokens under both halves.
 fn assert_one_message_per_provider_request(turn: &Turn) {
     let usages = turn.reported_usage();
+    let declares_request_usage = turn.declares(BackendCapability::ModelRequestUsageReported);
+    if !declares_request_usage {
+        eprintln!(
+            "COVERAGE: {} does not declare ModelRequestUsageReported, so this run asserts \
+             nothing about one message per provider request.",
+            turn.label()
+        );
+        return;
+    }
     let mut seen: Vec<&TokenUsage> = Vec::new();
     for usage in &usages {
         let Some(request) = usage.request.known_usage() else {
-            continue;
+            panic!(
+                "{}: declares ModelRequestUsageReported but a message reported its request scope \
+                 as {:?}. Full usage: {usage:?}",
+                turn.label(),
+                usage.request
+            );
         };
         assert!(
             !seen.contains(&request),
@@ -2485,6 +2549,11 @@ fn assert_tool_call_ids_are_unique(turns: &[Turn]) {
 fn assert_reported_model_is_pinned(turns: &[Turn]) {
     let expected = pinned_models(turns[0].backend());
     if expected.is_empty() {
+        eprintln!(
+            "COVERAGE: {:?} pins no model in the fixture, so this run asserts nothing about the \
+             reported model.",
+            turns[0].backend()
+        );
         return;
     }
     let mut reported = BTreeSet::new();
@@ -2570,6 +2639,15 @@ fn assert_response_groups_its_tool_calls(turn: &Turn) {
     );
 
     if declarations.len() < 2 {
+        // Not a capability: whether a turn declares two tool calls is the
+        // model's choice, and one declaration has no ownership question to get
+        // wrong. Said out loud so a green run is never read as coverage.
+        eprintln!(
+            "COVERAGE: {} declared {} tool call(s), so this run asserts nothing about which \
+             response owns which call.",
+            turn.label(),
+            declarations.len()
+        );
         return;
     }
     let owners: BTreeSet<&str> = declarations
@@ -3819,17 +3897,29 @@ fn assert_context_breakdown_capability_matches_behaviour(turns: &[Turn], declare
                 turn.label()
             );
 
-            if let Some(turn_usage) = message
-                .token_usage
-                .as_ref()
-                .and_then(|usage| usage.turn.known_usage())
-            {
+            // Occupancy describes one prompt -- the most recent request's --
+            // so it is the request scope it has to agree with, not the turn.
+            // This compared against `turn` and passed only because every turn
+            // in the scenario was a single request, which made the two scopes
+            // the same number. The first genuinely multi-request turn measured
+            // 13504 tokens of occupancy against a 53287-token turn: the
+            // assertion was reading a whole turn's tokens as if they were the
+            // size of the last prompt. Backends that report no request scope
+            // keep the old comparison, where the two coincide by construction.
+            let scoped_usage = message.token_usage.as_ref().and_then(|usage| {
+                usage
+                    .request
+                    .known_usage()
+                    .map(|usage| ("request", usage))
+                    .or_else(|| usage.turn.known_usage().map(|usage| ("turn", usage)))
+            });
+            if let Some((scope, scoped_usage)) = scoped_usage {
                 usage_matches += 1;
                 assert_eq!(
                     breakdown.input_tokens,
-                    prompt_footprint(turn_usage),
+                    prompt_footprint(scoped_usage),
                     "{}: context breakdown input disagrees with the same message's normalized \
-                     turn usage. Breakdown: {breakdown:?}; turn usage: {turn_usage:?}",
+                     {scope} usage. Breakdown: {breakdown:?}; {scope} usage: {scoped_usage:?}",
                     turn.label()
                 );
             }
@@ -3894,6 +3984,14 @@ fn assert_usage_moved_with_the_payload(baseline: &Turn, planted: &Turn) {
 /// the defect that renders as a multiplied cost, and the one `CumulativeUsageGrows`
 /// cannot see, because a running total does grow.
 fn assert_turn_is_not_the_running_total(turn: &Turn) {
+    if !turn.declares(BackendCapability::CumulativeUsageReported) {
+        eprintln!(
+            "COVERAGE: {} does not declare CumulativeUsageReported, so this run asserts nothing \
+             about the turn scope carrying a running total.",
+            turn.label()
+        );
+        return;
+    }
     let usage = final_usage(turn);
     let (Some(scoped), Some(cumulative)) = (
         usage.as_ref().and_then(|usage| usage.turn.known_usage()),
@@ -3901,12 +3999,11 @@ fn assert_turn_is_not_the_running_total(turn: &Turn) {
             .as_ref()
             .and_then(|usage| usage.cumulative.known_usage()),
     ) else {
-        eprintln!(
-            "COVERAGE: {} reported no cumulative usage, so this run asserts nothing about the \
-             turn scope carrying a running total",
-            turn.label()
+        panic!(
+            "{}: declares CumulativeUsageReported, so both the turn and cumulative scopes are \
+             owed on a turn this scenario drove from a fresh session. Full usage: {usage:?}",
+            turn.label(),
         );
-        return;
     };
 
     assert!(
@@ -3923,12 +4020,24 @@ fn assert_turn_is_not_the_running_total(turn: &Turn) {
 fn assert_cumulative_never_shrinks(turns: &[Turn]) {
     let mut highest = 0u64;
     for turn in turns {
+        if !turn.declares(BackendCapability::CumulativeUsageReported) {
+            eprintln!(
+                "COVERAGE: {} does not declare CumulativeUsageReported, so this run asserts \
+                 nothing about the running total never shrinking.",
+                turn.label()
+            );
+            continue;
+        }
         let usage = final_usage(turn);
         let Some(cumulative) = usage
             .as_ref()
             .and_then(|usage| usage.cumulative.known_usage())
         else {
-            continue;
+            panic!(
+                "{}: declares CumulativeUsageReported but reported no cumulative usage on a turn \
+                 this scenario drove from a fresh session. Full usage: {usage:?}",
+                turn.label()
+            );
         };
         assert!(
             cumulative.total_tokens >= highest,
@@ -3971,9 +4080,24 @@ fn assert_no_well_formed_zeros(turn: &Turn) {
     }
 }
 
-/// Where a backend reports both scopes, the requests inside a turn have to add
-/// up to the turn. Off-by-a-request is how a multi-request turn under-bills.
-fn assert_requests_sum_to_their_turn(turn: &Turn) {
+/// The requests inside a turn have to add up to the turn. Off-by-a-request is
+/// how a multi-request turn under-bills.
+///
+/// Checked in both directions, because the single-direction version asserted
+/// nothing at all. It read the request scope and returned the moment one was
+/// `Unavailable` -- so a backend that reported no request usage anywhere passed
+/// by having no data, which is indistinguishable from passing by being right.
+/// Hermes reported `Unavailable` on every message and this function never
+/// reached its `assert_eq!` on any run.
+///
+/// So: a backend that *declares* per-request usage owes a figure on every
+/// message. A backend that does not declare it still owes one once it has split
+/// a turn across several messages, because splitting is itself the claim that it
+/// knows where the request boundaries are -- that is the emitted-but-undeclared
+/// direction, and under-declaring is otherwise a free pass out of this check.
+/// Only a genuinely single-message turn from a non-declaring backend skips, and
+/// it says so out loud rather than returning in silence.
+fn assert_requests_sum_to_their_turn(turn: &Turn, declares_request_usage: bool) {
     let usages = turn.reported_usage();
     let Some(last) = usages.last() else {
         return;
@@ -3983,8 +4107,34 @@ fn assert_requests_sum_to_their_turn(turn: &Turn) {
     };
 
     let mut summed = 0u64;
-    for usage in &usages {
+    for (index, usage) in usages.iter().enumerate() {
         let Some(request) = usage.request.known_usage() else {
+            assert!(
+                !declares_request_usage,
+                "{}: declares ModelRequestUsageReported but message {} of {} reported its request \
+                 scope as {:?}. Full usage for that message: {usage:?}",
+                turn.label(),
+                index + 1,
+                usages.len(),
+                usage.request,
+            );
+            assert!(
+                usages.len() < 2,
+                "{}: split this turn across {} messages that each carry usage, so it knows where \
+                 one provider request ends and the next begins, yet message {} reports its \
+                 request scope as {:?} and declares no per-request capability. The per-request \
+                 figure exists; it is filed under the wrong scope. Full usage for that message: \
+                 {usage:?}",
+                turn.label(),
+                usages.len(),
+                index + 1,
+                usage.request,
+            );
+            eprintln!(
+                "COVERAGE: {} reported no per-request usage on a single-message turn, so this \
+                 run asserts nothing about request/turn agreement for it.",
+                turn.label()
+            );
             return;
         };
         summed += request.total_tokens;
@@ -3997,6 +4147,68 @@ fn assert_requests_sum_to_their_turn(turn: &Turn) {
         turn.label(),
         usages.len(),
         turn_total.total_tokens
+    );
+}
+
+/// A backend that declares `ReasoningDeltas` has to actually put reasoning in
+/// front of the user somewhere in a five-turn conversation.
+///
+/// Nothing asserted this on any backend before, which is how Hermes shipped
+/// reading every reasoning delta and discarding it: `map_reasoning_delta`
+/// returned no events and `finish_stream_events` hardcoded the message's
+/// reasoning to `None`, so the text existed at the boundary and never reached a
+/// client. Both directions are checked, because a backend that declares nothing
+/// and emits nothing is indistinguishable from a broken one until you ask.
+///
+/// Measured at `reasoning_effort: "low"`: Claude carries reasoning on 7 of 7
+/// messages, Hermes/gemini-3.7-flash on 2 of 7, Codex on 1 of 7. So "at least
+/// one message in the conversation" is the threshold that holds across all
+/// three -- per-turn would be Claude-shaped and fail the other two for no
+/// defect.
+fn assert_reasoning_reaches_the_client(turns: &[Turn]) {
+    let Some(first) = turns.first() else {
+        return;
+    };
+    let carried = turns
+        .iter()
+        .flat_map(|turn| turn.assistant_messages())
+        .filter(|message| {
+            message
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
+        })
+        .count();
+    let streamed = turns
+        .iter()
+        .flat_map(Turn::events)
+        .filter(|event| matches!(event, ChatEvent::StreamReasoningDelta(_)))
+        .count();
+
+    if !first.declares(BackendCapability::ReasoningDeltas) {
+        assert_eq!(
+            carried + streamed,
+            0,
+            "{}: declares no reasoning capability but put {carried} message(s) and {streamed} \
+             delta(s) of reasoning in front of the client, so it silently skips every \
+             reasoning-gated check while shipping the behaviour",
+            first.label()
+        );
+        eprintln!(
+            "COVERAGE: {:?} does not declare ReasoningDeltas, so this run asserts nothing \
+             about reasoning reaching the client.",
+            first.backend()
+        );
+        return;
+    }
+
+    assert!(
+        carried > 0,
+        "{}: declares ReasoningDeltas but no message in this {}-turn conversation carried \
+         any reasoning text ({streamed} delta event(s) seen). Reasoning that reaches the \
+         boundary and not the message is reasoning the user never sees.",
+        first.label(),
+        turns.len(),
     );
 }
 

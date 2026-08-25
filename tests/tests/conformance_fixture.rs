@@ -83,9 +83,13 @@ fn hermes_session_settings() -> SessionSettingsValues {
         "model".to_owned(),
         SessionSettingValue::String(json!({"model": model, "provider": provider}).to_string()),
     );
+    // Not "none": that switched reasoning off outright, so every scenario ran
+    // with the reasoning path dark and `ReasoningDeltas` went unasserted for
+    // Hermes on any model. "low" keeps the cost near the floor while leaving
+    // the channel live.
     values.0.insert(
         "reasoning_effort".to_owned(),
-        SessionSettingValue::String("none".to_owned()),
+        SessionSettingValue::String(env_or("TYDE_HERMES_TEST_REASONING", "low")),
     );
     values
 }
@@ -158,6 +162,16 @@ impl Turn {
 
     pub fn backend(&self) -> BackendKind {
         self.backend
+    }
+
+    /// Whether the backend that produced this turn claims a capability.
+    ///
+    /// Mirrors `ConformanceHost::declares` for assertions that run without a
+    /// host in hand, so a check can gate on a declaration rather than on
+    /// whether the data it wanted happens to be present. Gating on the data is
+    /// how an assertion excuses itself from the very defect it exists to catch.
+    pub fn declares(&self, capability: BackendCapability) -> bool {
+        server::backend::capabilities_for_backend_kind(self.backend).contains(capability)
     }
 
     pub fn events(&self) -> &[ChatEvent] {

@@ -92,6 +92,14 @@ exhaustive_capabilities! {
     StartupMcpServers,
     AgentControlTools,
     TurnUsageReported,
+    // Reports a session-cumulative total alongside the turn. Split out from
+    // TurnUsageReported because the two are different claims and the
+    // assertions that need them differ: Tycode and Kiro report a turn and no
+    // running total, so gating the running-total checks on TurnUsageReported
+    // skipped them on data rather than on a declaration. A resumed session that
+    // attached mid-conversation still reports Unavailable here -- session
+    // state, not a retraction of the capability.
+    CumulativeUsageReported,
     ModelRequestUsageReported,
     ContextUsageReported,
     ContextBreakdownReported,
@@ -175,6 +183,10 @@ impl BackendCapabilities {
         )?;
         self.require(
             BackendCapability::ModelRequestUsageReported,
+            BackendCapability::TurnUsageReported,
+        )?;
+        self.require(
+            BackendCapability::CumulativeUsageReported,
             BackendCapability::TurnUsageReported,
         )?;
         self.require(

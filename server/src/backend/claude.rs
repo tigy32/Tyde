@@ -13868,6 +13868,8 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::CumulativeUsageReported,
+            tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::ForegroundSubagents,

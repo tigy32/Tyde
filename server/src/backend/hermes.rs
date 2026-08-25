@@ -10,10 +10,10 @@ use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
     CompactionStage, CompactionTrigger, ContextBreakdown, MessageSender, MessageTokenUsage,
-    ModelInfo, OperationCancelledData, RetryAttemptData, SelectOption, SendMessageToolResponse,
-    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ModelInfo, OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption,
+    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
     ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
 };
@@ -794,6 +794,11 @@ struct HermesEventMapper {
     current_message_id: Option<String>,
     current_text: String,
     current_reasoning_seen: bool,
+    /// Reasoning streamed for the open message. Distinct from
+    /// `current_reasoning_seen`: `reasoning.available` is a 500-character
+    /// preview that proves reasoning happened without carrying the text, so a
+    /// turn can have been seen reasoning while this stays empty.
+    current_reasoning: String,
     typing_active: bool,
     model: Option<String>,
     provider: Option<String>,
@@ -807,6 +812,10 @@ struct HermesEventMapper {
     pending_approval_tool_id: Option<String>,
     last_session_usage: Option<TokenUsage>,
     cumulative_usage_incomplete: bool,
+    /// Running total of the current turn's provider requests. Hermes splits a
+    /// turn into one message per request, so each message's own figure is a
+    /// single request and the turn only exists as their sum.
+    turn_usage_so_far: Option<TokenUsage>,
     current_turn_generation: Option<u64>,
     last_turn_generation: Option<u64>,
     interrupted_turn_generations: VecDeque<u64>,
@@ -926,7 +935,10 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
+            tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::CumulativeUsageReported,
+            tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::ContextBreakdownReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
@@ -4462,7 +4474,7 @@ impl HermesEventMapper {
     fn fail_active_turn(&mut self, message: impl Into<String>) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None, None));
         }
         events.extend(self.complete_pending_tools_as_cancelled(
             "Hermes protocol error closed the active turn before the tool completed",
@@ -4546,7 +4558,7 @@ impl HermesEventMapper {
     fn map_message_start(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None, None));
             events.push(ChatEvent::MessageAdded(error_message(
                 "Hermes emitted message.start before completing the previous message".to_string(),
             )));
@@ -4570,9 +4582,11 @@ impl HermesEventMapper {
             });
         self.next_local_turn_generation = self.next_local_turn_generation.max(generation);
         self.current_turn_generation = Some(generation);
+        self.turn_usage_so_far = None;
         let message_id = Uuid::new_v4().to_string();
         self.current_message_id = Some(message_id.clone());
         self.current_text.clear();
+        self.current_reasoning.clear();
         self.current_reasoning_seen = false;
         if !self.typing_active {
             events.push(ChatEvent::TypingStatusChanged(true));
@@ -4618,7 +4632,8 @@ impl HermesEventMapper {
             .map_or((None, None), |(request, cumulative)| {
                 (Some(request), cumulative)
             });
-        let mut events = self.finish_stream_events(None, request_usage, cumulative_usage, None);
+        let mut events =
+            self.finish_stream_events(None, None, request_usage, cumulative_usage, None);
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
 
@@ -4692,7 +4707,20 @@ impl HermesEventMapper {
             return Ok(Vec::new());
         }
         self.current_reasoning_seen = true;
-        Ok(Vec::new())
+        // `thinking.delta` is not reasoning. Hermes builds it from
+        // `random.choice(KawaiiSpinner.get_thinking_faces())`
+        // (`conversation_loop.py:961`), so it carries decoration like
+        // "(°ロ°) processing..." and nothing the model actually thought.
+        // Measured: forwarding both events put seven spinner frames into the
+        // reasoning panel and no reasoning at all. Only `reasoning.delta`
+        // carries content, from the provider's own reasoning stream.
+        if event_type != "reasoning.delta" {
+            return Ok(Vec::new());
+        }
+        self.current_reasoning.push_str(&text);
+        Ok(vec![ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+            text,
+        })])
     }
 
     fn map_reasoning_available(
@@ -4757,6 +4785,7 @@ impl HermesEventMapper {
             return Err("Hermes emitted message.complete before message.start".to_string());
         }
         let final_text = optional_raw_string(&payload, &["text"], "message.complete")?;
+        let final_reasoning = optional_raw_string(&payload, &["reasoning"], "message.complete")?;
         let usage = payload.get("usage").and_then(token_usage_from_value);
         let cumulative_usage = payload
             .get("cumulative_usage")
@@ -4769,7 +4798,10 @@ impl HermesEventMapper {
             .filter(|text| !text.trim().is_empty())
             .cloned();
         let has_visible_text = stream_final_text.is_some() || !self.current_text.trim().is_empty();
-        let has_reasoning = self.current_reasoning_seen;
+        let has_reasoning = self.current_reasoning_seen
+            || final_reasoning
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty());
         let mut events = Vec::new();
         if !self.pending_tools_finished() && status != "interrupted" {
             events.push(ChatEvent::MessageAdded(error_message(format!(
@@ -4784,6 +4816,7 @@ impl HermesEventMapper {
             "interrupted" => {
                 events.extend(self.finish_stream_events(
                     stream_final_text,
+                    final_reasoning.clone(),
                     usage,
                     cumulative_usage,
                     context_breakdown,
@@ -4805,6 +4838,7 @@ impl HermesEventMapper {
                 });
                 events.extend(self.finish_stream_events(
                     assistant_final,
+                    final_reasoning.clone(),
                     usage,
                     cumulative_usage,
                     context_breakdown,
@@ -4821,6 +4855,7 @@ impl HermesEventMapper {
             "complete" | "completed" => {
                 events.extend(self.finish_stream_events(
                     stream_final_text,
+                    final_reasoning.clone(),
                     usage,
                     cumulative_usage,
                     context_breakdown,
@@ -4841,6 +4876,7 @@ impl HermesEventMapper {
             other => {
                 events.extend(self.finish_stream_events(
                     stream_final_text,
+                    final_reasoning.clone(),
                     usage,
                     cumulative_usage,
                     context_breakdown,
@@ -5361,34 +5397,55 @@ impl HermesEventMapper {
     fn finish_stream_events(
         &mut self,
         final_text: Option<String>,
-        usage: Option<TokenUsage>,
+        final_reasoning: Option<String>,
+        request_usage: Option<TokenUsage>,
         cumulative_usage: Option<TokenUsage>,
         context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
         let content = reconcile_hermes_stream_text(&self.current_text, final_text.as_deref());
         let tool_calls = self.tool_uses_for_message(&self.current_text, &content);
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
-        let reasoning = None;
+        // The completion's own reasoning is the untruncated authority; the
+        // streamed buffer is the same content and only stands in when Hermes
+        // streamed reasoning without repeating it at the end.
+        let reasoning = final_reasoning
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| Some(self.current_reasoning.clone()).filter(|text| !text.trim().is_empty()))
+            .map(|text| ReasoningData {
+                text,
+                tokens: None,
+                signature: None,
+                blob: None,
+            });
         self.current_text.clear();
+        self.current_reasoning.clear();
         self.current_reasoning_seen = false;
-        let turn_usage = usage;
-        let token_usage = match (turn_usage, cumulative_usage) {
-            (Some(turn), cumulative) => Some(MessageTokenUsage {
-                request: TokenUsageScope::Unavailable {
-                    reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
-                },
-                turn: TokenUsageScope::Known {
-                    usage: Box::new(turn),
-                },
-                cumulative: cumulative.map_or(
-                    TokenUsageScope::Unavailable {
-                        reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+        // Hermes reports session-cumulative counters and Tyde samples them at
+        // every provider-request boundary, so the delta between samples is one
+        // request -- never the turn. Filing it under `turn` understated a
+        // four-request turn as a quarter of its cost and left `request`
+        // `Unavailable`, which is the slot the chat row actually renders.
+        let token_usage = match (request_usage, cumulative_usage) {
+            (Some(request), cumulative) => {
+                let turn = add_token_usage(self.turn_usage_so_far.as_ref(), &request);
+                self.turn_usage_so_far = Some(turn.clone());
+                Some(MessageTokenUsage {
+                    request: TokenUsageScope::Known {
+                        usage: Box::new(request),
                     },
-                    |usage| TokenUsageScope::Known {
-                        usage: Box::new(usage),
+                    turn: TokenUsageScope::Known {
+                        usage: Box::new(turn),
                     },
-                ),
-            }),
+                    cumulative: cumulative.map_or(
+                        TokenUsageScope::Unavailable {
+                            reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                        },
+                        |usage| TokenUsageScope::Known {
+                            usage: Box::new(usage),
+                        },
+                    ),
+                })
+            }
             (None, _) => Some(MessageTokenUsage::unavailable(
                 TokenUsageUnavailableReason::BackendDidNotReport,
             )),
@@ -5423,7 +5480,7 @@ impl HermesEventMapper {
             self.interrupted_turn_generations.push_back(generation);
         }
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None, None));
         }
         events.extend(
             self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user"),
@@ -5495,6 +5552,7 @@ impl HermesEventMapper {
         }
         self.current_message_id = None;
         self.current_text.clear();
+        self.current_reasoning.clear();
         self.current_reasoning_seen = false;
         self.clear_turn_tool_state();
     }
@@ -7601,6 +7659,34 @@ fn token_usage_delta(previous: Option<&TokenUsage>, current: &TokenUsage) -> (To
         },
         false,
     )
+}
+
+fn add_token_usage(previous: Option<&TokenUsage>, next: &TokenUsage) -> TokenUsage {
+    let Some(previous) = previous else {
+        return next.clone();
+    };
+    TokenUsage {
+        input_tokens: previous.input_tokens.saturating_add(next.input_tokens),
+        output_tokens: previous.output_tokens.saturating_add(next.output_tokens),
+        total_tokens: previous.total_tokens.saturating_add(next.total_tokens),
+        cached_prompt_tokens: optional_token_sum(
+            previous.cached_prompt_tokens,
+            next.cached_prompt_tokens,
+        ),
+        cache_creation_input_tokens: optional_token_sum(
+            previous.cache_creation_input_tokens,
+            next.cache_creation_input_tokens,
+        ),
+        reasoning_tokens: optional_token_sum(previous.reasoning_tokens, next.reasoning_tokens),
+    }
+}
+
+fn optional_token_sum(previous: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (previous, next) {
+        (Some(previous), Some(next)) => Some(previous.saturating_add(next)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn optional_counter_decreased(previous: Option<u64>, current: Option<u64>) -> bool {

@@ -20123,6 +20123,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
+            tyde_agent_adapter::BackendCapability::CumulativeUsageReported,
             tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
